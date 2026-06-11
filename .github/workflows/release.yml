@@ -58,10 +58,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3 # v6.0.3
+        uses: actions/checkout@v6 # v6.0.3
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0 # 1.96.0 (stable, pinned)
+        uses: dtolnay/rust-toolchain@1.100.0 # 1.96.0 (stable, pinned)
         with:
           targets: ${{ matrix.target }}
 
@@ -151,7 +151,7 @@ jobs:
 
       - name: Import signing certificate
         if: runner.os == 'macOS' && steps.signing.outputs.enabled == 'true'
-        uses: apple-actions/import-codesign-certs@v3 # v3
+        uses: apple-actions/import-codesign-certs@v7 # v3
         with:
           p12-file-base64: ${{ secrets.MACOS_CERTIFICATE }}
           p12-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -205,7 +205,7 @@ jobs:
           subject-path: ${{ steps.package.outputs.archive }}
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2.4.1 # v2 (2.4.1)
+        uses: softprops/action-gh-release@v3.0.0 # v2 (2.4.1)
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |

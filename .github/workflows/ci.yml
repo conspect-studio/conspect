@@ -50,8 +50,8 @@ jobs:
       # 'true' when at least one changed file is NOT in the prose allowlist.
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           # Default `some` would treat the leading `!` negations as ordinary
@@ -128,7 +128,7 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -153,7 +153,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Default features are pure-Rust (no FFmpeg/GPU), so CI needs no native libs.
@@ -226,7 +226,7 @@ jobs:
           - crate: multiview-hal
             feature: i915-pmu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -273,8 +273,8 @@ jobs:
     # prose allowlist), so this validation always runs whenever a spec moves.
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
       - name: install @asyncapi/cli
@@ -293,7 +293,7 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # Run cargo-deny on the runner — the action's musl Docker image cannot
       # honour rust-toolchain.toml's pinned toolchain. Default features only:
       # this is the LGPL-clean build; --all-features would pull the opt-in
@@ -315,7 +315,7 @@ jobs:
     # Checkout + a single grep-based shell script (seconds).
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: ./scripts/check-inclusive-language.sh
 
   docs-sanity:
@@ -324,7 +324,7 @@ jobs:
     # Checkout + a dependency-free markdown link-check script (seconds).
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: check relative markdown links resolve
         # Lightweight, dependency-free link check: for every committed Markdown
         # file, resolve each inline relative link target [..](path) against the
@@ -343,8 +343,8 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
       - name: install
