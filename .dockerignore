@@ -1,0 +1,33 @@
+# Build context exclusions for `docker build` (keeps secrets/artifacts out of the image).
+# CI builds from a clean checkout, but a LOCAL build would otherwise COPY a developer's
+# real .env into the build layers — exclude it and everything else not needed to build.
+
+# Secrets / local environment — never into an image
+.env
+.env.*
+!.env.example
+
+# VCS / CI / dev metadata (not needed to build)
+.git
+.gitignore
+.gitattributes
+.github
+.devcontainer
+
+# Build artifacts & dependencies (regenerated inside the build)
+target
+**/target
+node_modules
+**/node_modules
+web/dist
+
+# Agent / build scratch (also git-ignored)
+.claude
+.multiview-build
+.mosaic-build
+.ndi-sdk
+demo-output
+
+# Editor / OS cruft
+*.log
+.DS_Store

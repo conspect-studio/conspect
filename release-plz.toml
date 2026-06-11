@@ -1,0 +1,30 @@
+# release-plz configuration.
+# https://release-plz.dev/docs/config
+#
+# Multiview ships a single binary (`multiview`, from the `multiview-cli` crate);
+# the library crates are workspace-internal and not published to crates.io. So
+# release-plz manages ONE workspace-wide version + one changelog, and publishes
+# nothing to a registry — the release artifacts are the container image
+# (docker.yml) and the binary tarballs (release.yml), both keyed off the git tag.
+
+[workspace]
+# We don't publish to crates.io — the crates are app-internal.
+publish = false
+# One version + one tag for the whole workspace (the app version).
+release_always = false
+# Single shared changelog at the repo root.
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+# Tag like `v0.1.0` (matches release.yml / docker.yml tag triggers).
+git_tag_name = "v{{ version }}"
+git_release_enable = true
+# Pre-1.0 semantics live in cliff.toml's bump rules + the [bump] policy below.
+git_release_draft = false
+
+# Pre-1.0 (0.y.z) version policy: while < 1.0.0, a breaking change bumps the
+# MINOR (0.y) and feat/fix bump the PATCH (0.0.z). This matches cliff.toml and
+# is the SemVer pre-release convention release-plz applies by default for 0.x,
+# stated explicitly here for clarity.
+[changelog]
+# Reuse the git-cliff config so `release-plz` and a manual `git cliff` agree.
+protect_breaking_commits = true

@@ -1,0 +1,4795 @@
+msgid ""
+msgstr ""
+"POT-Creation-Date: 2026-06-02 23:39+0000\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"X-Generator: @lingui/cli\n"
+"Language: ar\n"
+"Project-Id-Version: \n"
+"Report-Msgid-Bugs-To: \n"
+"PO-Revision-Date: \n"
+"Last-Translator: \n"
+"Language-Team: \n"
+"Plural-Forms: \n"
+
+#: src/layout/components/CellPropertiesPanel.tsx:120
+msgid "\"No signal\" card"
+msgstr ""
+
+#: src/resources/FormControls.tsx:81
+msgid "“prog” is reserved for the program mix — choose another track name."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:831
+msgid "({rawCellCount} absolutely-placed cell(s) ride along unchanged — edit them via Convert to free-form.)"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:52
+msgid "(opens in a new tab)"
+msgstr ""
+
+#. placeholder {0}: names.length
+#. placeholder {1}: editableCells(model).length
+#. placeholder {2}: sourceLabels.size
+#: src/layout/components/GridLayoutEditor.tsx:824
+msgid "{0} area(s) · {1} cell(s) · {2} bound to a source"
+msgstr ""
+
+#. placeholder {0}: editor.model.cells.length
+#. placeholder {1}: editor.model.cells.filter((c) => c.sourceId !== undefined).length
+#: src/layout/components/LayoutEditor.tsx:388
+msgid "{0} cell(s) · {1} bound to a source"
+msgstr ""
+
+#. placeholder {0}: hits.length
+#: src/pages/docs/DocsSearch.tsx:109
+msgid "{0} documentation results"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:124
+#: src/layout/components/CellPropertiesPanel.tsx:221
+#: src/layout/components/CellPropertiesPanel.tsx:317
+msgid "{option} (custom — preserved)"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:147
+msgid "{short} compute utilisation {computeTotal} (device total)"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:148
+msgid "{short} compute utilisation: ours {computeSelf} of {computeTotal} device total"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:174
+msgid "{short} NVENC encode sessions trend"
+msgstr ""
+
+#: src/pages/SimplePages.tsx:578
+#~ msgid "/media/clip.mp4"
+#~ msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:134
+msgid "<0>/etc/multiview/multiview.toml</0> — the config file, mounted read-only."
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:140
+msgid "<0>/var/lib/multiview/hls</0> — the HLS output directory. Back it with a named volume so a sidecar (or your host) can serve the playlist and segments."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:71
+msgid "<0>Composite once, fan out many.</0> The canvas is encoded once per rendition and the same packets feed every transport, rather than re-encoding per destination."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:57
+msgid "<0>Continuous output.</0> One monotonic output clock produces a valid, correctly-timestamped frame every tick, independent of any input."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:78
+msgid "<0>Control never back-pressures the engine.</0> The management API, realtime streams, and preview are best-effort and physically incapable of stalling the output path."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:196
+msgid "<0>fit</0> controls scaling: <1>fill</1>, <2>contain</2>, <3>cover</3>, <4>none</4>, or <5>scale_down</5>."
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:80
+msgid "<0>HLS / file output.</0> Writes a playlist and segments to disk. This is the path the quick-start uses and that works today."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:84
+msgid "<0>HLS:</0> 6–30 s — players deliberately start several segments behind the live edge. <1>LL-HLS</1> brings this to roughly 2–5 s with partial segments."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:64
+msgid "<0>Last-good-frame resilience.</0> Each tile rides a live / stale / reconnecting / no-signal state machine; a failing input cannot block the compositor."
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:99
+msgid "<0>Live RTSP / NDI / RTMP / SRT servers and push.</0> The network output servers are not yet wired into the run command."
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:90
+msgid "<0>Low-latency HLS.</0> Partial-segment HLS for lower glass-to-glass latency."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:59
+msgid "<0>MPEG-TS / UDP multicast:</0> well under a second on a managed network (no recovery buffering at all)."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:53
+msgid "<0>NDI:</0> about a frame on a fast LAN — the lowest of the supported transports."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:129
+msgid "<0>Output clock</0> — decides <1>when</1> each frame is emitted (monotonic, fixed cadence)."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:78
+msgid "<0>RTMP:</0> a few seconds of TCP and player buffering."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:90
+msgid "<0>RTSP vs NDI in one paragraph:</0> RTSP is a pull-style protocol for reaching a specific device by address — ideal for fixed camera installs, works across routed networks, and spends very little bandwidth because the camera's compressed stream is reused as-is. NDI is a discovery-based fabric for a production LAN — sources appear by name, latency is near-frame, and quality is mezzanine-grade, but it expects a fast local network (a 1080p59.94 feed is roughly 100 Mb/s) and does not traverse the internet. Choose RTSP to monitor cameras where they are; choose NDI when the multiview sits inside a production network that already speaks it."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:65
+msgid "<0>RTSP:</0> typically 0.2–1 s — a small network buffer plus the camera's encoder delay."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:114
+msgid "<0>Server-Sent Events</0> (fallback) at <1>/api/v1/events</1> — one-way, for environments where a WebSocket cannot be used."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:71
+msgid "<0>SRT:</0> the configured latency window (commonly 120 ms to a few seconds) — you are explicitly buying loss recovery with delay."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:141
+msgid "<0>Timecode</0> — a per-frame <1>label</1> (HH:MM:SS:FF). Two feeds can carry identical timecode and still be out of phase — which is why genlock/PTP exist alongside it."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:135
+msgid "<0>Wall clock</0> — says <1>what time of day</1> it is (for clocks and stream metadata)."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:108
+msgid "<0>WebSocket</0> (primary) at <1>/api/v1/ws</1> — bidirectional, used for the live UI."
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:98
+msgid "1+5"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:252
+msgid "12-hour clock"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:94
+msgid "2×2"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:412
+msgid "24-hour HH:MM:SS in the timezone below."
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:96
+msgid "3×3"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:63
+msgid "5.1 surround"
+msgstr ""
+
+#: src/pages/SimplePages.tsx:945
+#~ msgid "A codec is required for this output kind."
+#~ msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:125
+msgid "A CSS-grid layout with <0>columns</0> and <1>rows</1> track lists (<2>fr</2> / <3>px</3> / <4>%</4>), a <5>gap</5>, and an <6>areas</6> map that names where each cell sits."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:942
+#~ msgid "A destination is required for this output kind."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:309
+msgid "A feed crossing the internet: SRT (tune the latency window to the link)."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:199
+msgid "A file source plays media from disk, paced to real time so it behaves like a live feed on the wall (and can loop). Synthetic sources — color bars, solid fills, and a ticking clock — are generated in-process with no network or decode at all. They are ideal for layout work, burn-in tests, and proving the output path end to end before any real feed is connected."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:288
+msgid "A grid layout places cells by named areas on column/row tracks — resize whole rows and columns at once, with even gaps."
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:27
+msgid "A layout decides where every tile sits on the canvas. Use a factory preset (such as 2x2 or 1+5), a CSS-grid with named areas and fractional tracks, or absolute normalized rectangles for full control. A cell's fit mode controls how a source is scaled into its tile — contain to letterbox, cover to crop and fill, or fill to stretch."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:19
+msgid "A layout name is required."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:294
+msgid "A location/title drawn on the face. Leave blank for none."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:676
+#~ msgid "A locator is required for this source kind."
+#~ msgstr ""
+
+#: src/resources/FormControls.tsx:70
+msgid "A mount point must start with /, e.g. /multiview."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:26
+msgid "A Multiview deployment is one declarative document. It is authored as TOML and round-trips losslessly to JSON (the API wire form)."
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:40
+msgid "A multiviewer is inherently a transcoder: it must decode every source to composite them into one canvas, and then encode that canvas for its outputs. What it never does is transcode each tile separately — the cost would multiply by the number of tiles for no benefit."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:671
+#: src/pages/SimplePages.tsx:939
+#: src/pages/SimplePages.tsx:1117
+#~ msgid "A name is required."
+#~ msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:119
+msgid "A named factory arrangement: <0>2x2</0>, <1>3x3</1>, <2>1+5</2>, or <3>pip</3>."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:244
+msgid "A named, atomically applied recall of multiview state: one salvo can switch the layout, rebind sources into cells, and update tally and labels in a single action. Borrowed from router control, where a salvo fires many crosspoint takes at once."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:209
+msgid "A per-cell <0>qos</0> block sets a degradation <1>priority</1> and strategy, so the engine sheds the cheapest tiles first under load before touching the program output."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:487
+msgid "A probe watches one cell for a fail state and raises an alarm after its dwell window."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:728
+msgid "A reference only — never a plaintext secret. Leave blank for none."
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:92
+msgid "A salvo id is required"
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:139
+msgid "A salvo is a named, atomically-applied recall. One salvo can switch the layout, rebind sources into cells, set tally colors, and update under-monitor display text — all at once — so an operator can move a whole arrangement (say, a VTR review setup) with a single action instead of a series of separate edits."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:101
+msgid "A small receive-side buffer that absorbs the uneven arrival of network packets so frames can be consumed smoothly. Deeper buffers ride out worse networks but add latency. Each Multiview input has its own bounded buffering; an overflowing input drops its oldest data rather than growing without limit."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:39
+msgid "A small RTSP server that, on start, runs ffmpeg to publish a synthetic test pattern with a sine-wave audio tone to <0>rtsp://testsrc:8554/test</0>."
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:121
+msgid "A software fallback always exists, so a build without any GPU still works — just with less headroom."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:679
+#~ msgid "A solid source needs a hex colour like #101014 or #abc."
+#~ msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:40
+msgid "A source is a managed input. Each one owns its ingest, decode, color handling, and reconnect behaviour, and is referenced by tiles via a stable id. Supported kinds include RTSP, HLS, MPEG-TS, SRT, RTMP, NDI, file, and a built-in synthetic test pattern. When a source stops delivering frames, its tile holds the last good frame and moves through a clear state machine — live, stale, reconnecting, no-signal — while the engine reconnects without disturbing the rest of the wall."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:816
+msgid "A source is an ingest input bound into the multiview by id."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:1120
+#~ msgid "A target is required."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:221
+msgid "A TCP push protocol that remains the most widely accepted way to send a live stream to a platform. Classic RTMP carries H.264 and AAC only; enhanced endpoints negotiate newer codecs. Latency is typically a few seconds."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:53
+msgid "A tiny nginx that serves the HLS volume over HTTP so you can open the stream in a player at <0>http://[::1]:8888/multiview.m3u8</0>."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:53
+#~ msgid "A tiny nginx that serves the HLS volume over HTTP so you can open the stream in a player at <0>http://localhost:8888/multiview.m3u8</0>."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:26
+msgid "A video stream does not just carry pixel values — it carries an agreement about what those values <0>mean</0>. Three standards cover almost everything: <1>BT.601</1> (standard definition), <2>BT.709</2> (high definition — the default assumption for most content today), and <3>BT.2020</3> (ultra-HD and HDR, with a much wider color gamut). Each defines its own recipe for turning the YUV numbers in the stream back into red, green, and blue."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:311
+#: src/pages/OutputsPage.tsx:383
+msgid "About codecs and transcoding"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:106
+msgid "About color spaces and range"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:292
+#: src/pages/LayoutsPage.tsx:204
+msgid "About layouts"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:315
+msgid "About output transports"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:344
+msgid "About outputs and audio"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:220
+msgid "About overlays"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:436
+#: src/pages/ProbesPage.tsx:481
+#: src/pages/ProbesPage.tsx:547
+msgid "About probes and alarms"
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:53
+#: src/pages/SourcesPage.tsx:810
+#: src/pages/SourcesPage.tsx:886
+msgid "About source transports"
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:109
+msgid "About the encode-once output model"
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:57
+msgid "About the tile lifecycle"
+msgstr ""
+
+#: src/pages/MonitoringPage.tsx:159
+#: src/pages/SourcesPage.tsx:773
+msgid "About tile lifecycle states"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:272
+msgid "Accessible editing path: Cells form + Inspector in the editor"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:137
+#~ msgid "Accessible editing path: planned (Cells form + Inspector)"
+#~ msgstr ""
+
+#: src/pages/SettingsPage.tsx:161
+msgid "Accessible toasts announce via a live region."
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:266
+msgid "Acknowledge"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:260
+msgid "Acknowledge alarm"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:220
+#: src/pages/AlarmsPage.tsx:246
+msgid "Acknowledged"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:109
+msgid "Action"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:221
+#: src/pages/AudioPage.tsx:429
+#: src/pages/LayoutsPage.tsx:86
+#: src/pages/OutputsPage.tsx:546
+#: src/pages/OverlaysPage.tsx:194
+#: src/pages/ProbesPage.tsx:452
+#: src/pages/SourcesPage.tsx:784
+#: src/pages/TallyPage.tsx:367
+msgid "Actions"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:66
+msgid "Actions that take time return <0>202 Accepted</0> with an operation id; the final result arrives on the realtime stream, not in the HTTP response body."
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:190
+msgid "Active and cleared"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:154
+msgid "Active and historical faults the engine raised. Acknowledge an alarm to record that an operator has seen it."
+msgstr ""
+
+#: src/pages/SystemPage.tsx:207
+msgid "Active NVENC sessions out of the discovered ceiling"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:191
+msgid "Active only"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:111
+msgid "Actor"
+msgstr ""
+
+#: src/layout/components/SourcePalette.tsx:103
+msgid "Add"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:809
+msgid "Add and manage live ingest sources."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:39
+msgid "Add at least one cell to the layout."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:651
+#: src/layout/components/LayoutEditor.tsx:180
+msgid "Add cell"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:422
+msgid "Add column"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:479
+msgid "Add route"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:432
+msgid "Add row"
+msgstr ""
+
+#: src/layout/components/SourcePalette.tsx:159
+msgid "Add to layout"
+msgstr ""
+
+#: src/auth/LoginPage.tsx:89
+#: src/pages/SettingsPage.tsx:109
+msgid "admin.xxxxxxxx-xxxx-…"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:430
+#: src/pages/SourcesPage.tsx:571
+msgid "Advanced"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:289
+msgid "Advertise the canvas as an NDI source by <0>name</0>."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:460
+msgid "Advisories (saving still allowed):"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:137
+msgid "Alarm acknowledged"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:354
+msgid "Alarm policy (dwell, severity, latching)"
+msgstr ""
+
+#: src/app/navigation.tsx:46
+#: src/docs/registry.ts:231
+#: src/pages/AlarmsPage.tsx:152
+#: src/pages/docs/FeaturesPage.tsx:149
+msgid "Alarms"
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:151
+msgid "Alarms are raised by content-aware fault probes attached to a tile. Probes can detect a black picture, a frozen picture, audio silence, and loudness that drifts from an EBU R128 target. Each probe has a severity and dwell timers, so a brief glitch does not trip an alarm while a sustained fault does. Severities follow the standard cleared / indeterminate / warning / minor / major / critical scale."
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:214
+msgid "Alarms matching the current filter."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:204
+msgid "Align"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:239
+msgid "All configured layouts."
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:207
+msgid "All configured salvos."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:61
+msgid "All endpoints live under <0>/api/v1</0>."
+msgstr ""
+
+#: src/components/TallyLampBadge.tsx:42
+msgid "Amber"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:91
+msgid "AMD"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:212
+msgid "An honest comparison — figures are typical classes, not guarantees; the network you run on dominates:"
+msgstr ""
+
+#: src/pages/SimplePages.tsx:668
+#: src/pages/SimplePages.tsx:936
+#: src/pages/SimplePages.tsx:1114
+#~ msgid "An identifier is required."
+#~ msgstr ""
+
+#: src/pages/OutputsPage.tsx:581
+msgid "An output is a sink/server that publishes the program."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:226
+msgid "An overlay is a layer composited over the program at a stacking order."
+msgstr ""
+
+#: src/resources/FormControls.tsx:49
+msgid "An RTMP URL must start with rtmp:// (or rtmps://)."
+msgstr ""
+
+#: src/resources/FormControls.tsx:45
+msgid "An RTSP source URL must start with rtsp:// (or rtsps://)."
+msgstr ""
+
+#: src/resources/FormControls.tsx:47
+msgid "An SRT URL must start with srt://."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:219
+msgid "Analog (hands on a dial)"
+msgstr ""
+
+#: src/resources/FormControls.tsx:76
+msgid "Another route already claims this track name."
+msgstr ""
+
+#: src/resources/FormControls.tsx:78
+msgid "Another route already uses this input."
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:171
+msgid "Any severity"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:276
+msgid "Anywhere HTTP works, CDN-scalable"
+msgstr ""
+
+#: src/docs/registry.ts:166
+#: src/pages/docs/ApiPage.tsx:24
+msgid "API & realtime"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:89
+msgid "API access"
+msgstr ""
+
+#: src/docs/registry.ts:80
+#: src/pages/docs/ContainerPage.tsx:169
+msgid "API access token"
+msgstr ""
+
+#: src/auth/LoginPage.tsx:83
+msgid "API key"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:103
+msgid "API token"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:36
+#: src/pages/SettingsPage.tsx:126
+msgid "API token cleared"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:36
+msgid "API token saved"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:182
+#: src/pages/SettingsPage.tsx:55
+msgid "Appearance"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:48
+msgid "Appearance and language preferences."
+msgstr ""
+
+#: src/pages/SystemPage.tsx:93
+msgid "Apple"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:101
+msgid "Apply"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:86
+msgid "Apply filter"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:95
+msgid "Apply layout to engine"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:145
+#~ msgid "Apply-layout accepted"
+#~ msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:566
+msgid "Area cell"
+msgstr ""
+
+#: src/layout/components/AreaMatrixEditor.tsx:256
+msgid "Area name"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:567
+msgid "Areas"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:548
+msgid "Areas & cells"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:257
+msgid "Arm"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:251
+msgid "Arm salvo"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:164
+msgid "As an input, HLS arrives in bursts (whole segments at a time), so Multiview paces it back to real time internally before it is sampled onto the wall. As an output it is the easiest way to let many people open the multiview in a browser or player."
+msgstr ""
+
+#: src/layout/components/AreaMatrixEditor.tsx:281
+msgid "Assign to selection"
+msgstr ""
+
+#. placeholder {0}: name.trim()
+#: src/layout/components/AreaMatrixEditor.tsx:159
+msgid "Assigned the selection to area \"{0}\"."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:482
+msgid "At the target"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:90
+msgid "ATSC A/85 (−24 LKFS)"
+msgstr ""
+
+#: src/app/navigation.tsx:41
+#: src/pages/AudioPage.tsx:338
+#: src/pages/OutputsPage.tsx:432
+msgid "Audio"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:293
+msgid "Audio at or below this level counts as silent (e.g. −60)."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:394
+msgid "Audio routes"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:60
+msgid "Audio silence"
+msgstr ""
+
+#: src/app/navigation.tsx:48
+#: src/pages/AuditPage.tsx:55
+msgid "Audit"
+msgstr ""
+
+#: src/docs/registry.ts:187
+#: src/pages/docs/ApiPage.tsx:127
+msgid "Authentication"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:77
+#: src/pages/OverlaysPage.tsx:88
+#: src/pages/OverlaysPage.tsx:99
+msgid "auto"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:371
+msgid "Auto (drop leading zero units)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:547
+msgid "Auto (first usable track)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:152
+msgid "Automatic (default)"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:275
+msgid "Automatic (EDID preferred mode)"
+msgstr ""
+
+#: src/docs/registry.ts:376
+#: src/pages/docs/concepts/CodecsPage.tsx:79
+msgid "AV1"
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:81
+msgid "AV1 is the open, royalty-free codec developed by the Alliance for Open Media. It compresses better than HEVC and has fast hardware decode support arriving across recent GPUs and devices, with hardware encoding available on the newest generations. For live work its software encoders are still heavy, so AV1 is the right choice when the audience's players are known to support it and bandwidth is at a premium."
+msgstr ""
+
+#: src/pages/docs/components.tsx:143
+msgid "Available"
+msgstr ""
+
+#: src/pages/NotFoundPage.tsx:19
+msgid "Back to dashboard"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:94
+msgid "Background fill as a hex color (e.g. #101014)."
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:348
+msgid "Backward"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:60
+msgid "Base path"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:141
+msgid "Being plain TCP, RTMP has no loss-recovery tuning: on a poor link it buffers and falls behind rather than dropping. Latency is typically a few seconds."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:365
+msgid "Bit→colour rules"
+msgstr ""
+
+#: src/docs/registry.ts:476
+#: src/pages/docs/concepts/GlossaryPage.tsx:26
+msgid "Bitrate"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:122
+msgid "Black"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:56
+msgid "Black picture"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:66
+msgid "Blank renders UTC."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:261
+msgid "Border"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:124
+msgid "Border colour"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:47
+msgid "Border colour must be a hex value like #101014 or #abc."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:113
+msgid "Border width (px)"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:45
+msgid "Border width must be a whole number of pixels (0 or more)."
+msgstr ""
+
+#: src/pages/docs/DocsLayout.tsx:151
+msgid "Breadcrumb"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:320
+msgid "Brightness"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:389
+msgid "Bring forward"
+msgstr ""
+
+#: src/docs/registry.ts:99
+#: src/pages/docs/ComposePage.tsx:62
+msgid "Bring it up and down"
+msgstr ""
+
+#: src/docs/registry.ts:471
+msgid "Broadcast and streaming terms used across Multiview, alphabetized and searchable."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:18
+msgid "Broadcast and streaming terms used across Multiview, alphabetized. Use the documentation search to jump straight to a term."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:270
+msgid "Buffers and lags under loss"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:321
+msgid "Bus"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:214
+msgid "Camera 1"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:867
+#: src/layout/components/LayoutEditor.tsx:432
+#: src/pages/LayoutsPage.tsx:310
+#: src/pages/SalvosPage.tsx:281
+#: src/pages/SalvosPage.tsx:395
+#: src/pages/SalvosPage.tsx:433
+#: src/pages/TallyPage.tsx:432
+#: src/resources/CrudPage.tsx:342
+#: src/resources/CrudPage.tsx:387
+msgid "Cancel"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:275
+msgid "Cancel salvo"
+msgstr ""
+
+#: src/layout/components/AreaMatrixEditor.tsx:170
+msgid "Cannot assign: area(s) {broken} would no longer be a rectangle. Areas must stay contiguous rectangles."
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:266
+msgid "Cannot convert this preset"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:254
+msgid "Cannot convert this preset to a grid"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:474
+msgid "Cannot convert: fix the grid errors first so every area solves to a rectangle."
+msgstr ""
+
+#. placeholder {0}: result.areas.join(', ')
+#: src/layout/components/GridLayoutEditor.tsx:623
+msgid "Cannot rename: area(s) {0} would no longer be a rectangle."
+msgstr ""
+
+#: src/docs/registry.ts:128
+#: src/layout/components/GridLayoutEditor.tsx:298
+#: src/layout/components/LayoutEditor.tsx:210
+#: src/layout/components/LayoutEditor.tsx:321
+#: src/pages/docs/ConfigPage.tsx:66
+msgid "Canvas"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:78
+msgid "Canvas height in pixels."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:285
+msgid "canvas or a cell id"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:21
+msgid "Canvas width and height must be positive whole numbers."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:75
+msgid "Canvas width in pixels."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:610
+msgid "Caption field / service"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:573
+msgid "Captions"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:117
+#: src/pages/ProbesPage.tsx:132
+#: src/pages/ProbesPage.tsx:424
+msgid "Cell"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:657
+msgid "Cell id:"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:31
+msgid "Cell identifiers must be unique within a layout."
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:378
+msgid "Cell name"
+msgstr ""
+
+#: src/docs/registry.ts:143
+#: src/layout/components/LayoutEditor.tsx:366
+#: src/pages/docs/ConfigPage.tsx:185
+#: src/pages/LayoutsPage.tsx:79
+msgid "Cells"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:324
+msgid "Cells (accessible)"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:74
+msgid "Centre x (px)"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:85
+msgid "Centre y (px)"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:106
+msgid "Change log, newest first."
+msgstr ""
+
+#: src/resources/FormControls.tsx:379
+msgid "Changes saved here are stored, not yet live: the engine does not hot-add outputs. Apply them by exporting the configuration and restarting Multiview. Layout apply, source swap, routing, and salvos act on the running engine immediately."
+msgstr ""
+
+#: src/resources/FormControls.tsx:333
+#~ msgid "Changes saved here are stored, not yet live: the engine does not hot-add sources or outputs. Apply them by exporting the configuration and restarting Multiview. Layout apply, source swap, routing, and salvos act on the running engine immediately."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:142
+#~ msgid "Changing an output's codec is a controlled restart of that output (consumers reconnect); it never interrupts the compositor or the other outputs. The codec field on an output is validated against what the transport can carry — for example <0>h265</0> is rejected on classic RTMP — and against what the host can actually encode."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:143
+msgid "Changing an output's codec today is a configuration change, not a live switch: stored edits take effect by exporting the config and restarting the engine (the API marks these resources <0>apply: restart</0>). The codec token is also only lightly checked at present — if the build cannot encode the requested codec, the pipeline logs a warning and falls back to MPEG-2 rather than failing the run. So choose a codec your build and transport are known to carry (classic RTMP, for example, carries H.264 only), and verify the output really uses it — for example with <1>ffprobe</1>."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:407
+msgid "Channels"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:138
+msgid "Channels (route {row})"
+msgstr ""
+
+#: src/auth/LoginPage.tsx:102
+msgid "Checking…"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:113
+msgid "Choose an input"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:58
+msgid "Choose light, dark, or follow the system."
+msgstr ""
+
+#: src/docs/registry.ts:299
+#: src/pages/docs/concepts/LatencyPage.tsx:136
+#: src/pages/docs/concepts/TransportsPage.tsx:210
+msgid "Choosing a transport"
+msgstr ""
+
+#: src/docs/registry.ts:481
+#: src/pages/docs/concepts/GlossaryPage.tsx:38
+msgid "Chroma subsampling"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:213
+msgid "Clauses"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:129
+msgid "Clear"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:369
+msgid "Clear dwell (ms)"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:295
+msgid "Clear override"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:70
+msgid "Cleared (no alarm)"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:192
+msgid "Cleared only"
+msgstr ""
+
+#: src/components/HealthBanner.tsx:68
+msgid "Code:"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:374
+#: src/pages/OutputsPage.tsx:523
+msgid "Codec"
+msgstr ""
+
+#: src/docs/registry.ts:355
+#: src/pages/docs/concepts/CodecsPage.tsx:16
+msgid "Codecs & transcoding"
+msgstr ""
+
+#: src/docs/registry.ts:398
+#: src/pages/docs/concepts/ColorPage.tsx:14
+msgid "Color management"
+msgstr ""
+
+#: src/docs/registry.ts:486
+#: src/pages/docs/concepts/GlossaryPage.tsx:51
+msgid "Color range"
+msgstr ""
+
+#: src/docs/registry.ts:404
+#: src/pages/docs/concepts/ColorPage.tsx:24
+msgid "Color spaces"
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:16
+msgid "Color spaces, limited vs full range, and HDR — and why a mismatch makes a tile look washed-out, crushed, or oddly tinted."
+msgstr ""
+
+#: src/docs/registry.ts:399
+msgid "Color spaces, limited vs full range, and HDR — why mismatches look washed-out or crushed."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:760
+#~ msgid "Colour"
+#~ msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:275
+msgid "Colour (hex)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:118
+msgid "Colour bars (line-up signal)"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:399
+msgid "Column gap"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:421
+msgid "Columns"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:153
+msgid "Command accepted"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:159
+msgid "Command failed"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:214
+msgid "Commands"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:303
+msgid "Compliance standard"
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:83
+msgid "Compose merges files left to right. The GPU overlay files swap the <0>multiview</0> image and add device access; the other services are inherited unchanged. Layer an overlay on top of the base file:"
+msgstr ""
+
+#: src/docs/registry.ts:88
+#: src/pages/docs/ComposePage.tsx:20
+msgid "Compose reference"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:336
+msgid "Compose the output multiview. The Canvas tab is drag-and-drop; the Cells tab is the fully keyboard-operable equivalent."
+msgstr ""
+
+#: src/pages/SystemPage.tsx:145
+msgid "Compute"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:153
+msgid "Compute utilisation (device total)"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:154
+msgid "Compute utilisation: ours over device total"
+msgstr ""
+
+#: src/pages/docs/DocsLayout.tsx:143
+msgid "Concepts"
+msgstr ""
+
+#: src/docs/registry.ts:117
+#: src/pages/docs/ConfigPage.tsx:24
+msgid "Config-as-code"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:138
+msgid "Configuration export"
+msgstr ""
+
+#: src/resources/FormControls.tsx:409
+msgid "Configuration exported"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:571
+msgid "Configure output servers and renditions."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:488
+msgid "Configured fail-state probes."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:817
+msgid "Configured ingest sources."
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:61
+msgid "Configured multiview layouts."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:582
+msgid "Configured output sinks."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:227
+msgid "Configured overlay layers."
+msgstr ""
+
+#: src/components/ConnectionStatus.tsx:29
+msgid "Connected"
+msgstr ""
+
+#: src/components/ConnectionStatus.tsx:35
+msgid "Connecting"
+msgstr ""
+
+#: src/auth/RequireAuth.tsx:39
+msgid "Connecting…"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:286
+msgid "Connector"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:351
+msgid "Continue past the target"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:870
+msgid "Convert"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:850
+msgid "Convert to a free-form layout?"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:258
+#: src/pages/LayoutEditorPage.tsx:301
+msgid "Convert to free-form"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:293
+msgid "Convert to grid"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:170
+msgid "Converted to a grid (not yet saved). Save to keep the grid form."
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:192
+msgid "Converted to free-form (not yet saved). Save to keep the absolute placement."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:195
+msgid "Corner radius (px)"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:43
+msgid "Corner radius must be a whole number of pixels (0 or more)."
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:141
+msgid "Could not acknowledge alarm"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:153
+msgid "Could not apply layout"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:243
+msgid "Could not create"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:262
+msgid "Could not delete"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:184
+msgid "Could not delete layout"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:166
+msgid "Could not delete profile"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:138
+msgid "Could not delete salvo"
+msgstr ""
+
+#: src/resources/FormControls.tsx:423
+msgid "Could not export configuration"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:204
+msgid "Could not load alarms:"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:210
+msgid "Could not load for editing"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:223
+msgid "Could not load layouts:"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:585
+msgid "Could not load outputs:"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:230
+msgid "Could not load overlays:"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:491
+msgid "Could not load probes:"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:353
+msgid "Could not load profiles:"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:193
+msgid "Could not load salvos:"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:820
+msgid "Could not load sources:"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:307
+msgid "Could not load tally state:"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:357
+msgid "Could not load the audio routing:"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:96
+msgid "Could not load the audit log:"
+msgstr ""
+
+#: src/auth/LoginPage.tsx:53
+msgid "Could not reach the control plane. Is it running?"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:243
+msgid "Could not save"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:94
+#: src/pages/LayoutEditorPage.tsx:132
+msgid "Could not save layout"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:118
+msgid "Could not save salvo"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:500
+msgid "Could not save the audio routing:"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:339
+msgid "Count down to the target"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:341
+msgid "Count up from the target"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:230
+#: src/pages/SystemPage.tsx:253
+msgid "CPU"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:131
+#: src/pages/SystemPage.tsx:174
+#~ msgid "CPU utilisation trend"
+#~ msgstr ""
+
+#: src/components/SystemFooter.tsx:236
+msgid "CPU utilisation trend (host total)"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:237
+#: src/pages/SystemPage.tsx:268
+msgid "CPU utilisation trend: ours over host total"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:345
+msgid "Create"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:233
+msgid "Create your first layout"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:202
+msgid "Create your first salvo"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:236
+msgid "Created"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:168
+msgid "Credentials are referenced, never inlined: <0>auth</0> holds a <1>secret_ref</1> pointer, not a plaintext secret."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:725
+msgid "Credentials secret reference"
+msgstr ""
+
+#: src/components/HealthBanner.tsx:29
+#: src/pages/ProbesPage.tsx:80
+msgid "Critical"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:50
+msgid "CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for NVIDIA GPUs."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:394
+msgid "Custom codec name"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:378
+msgid "Custom…"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:363
+msgid "D:HH:MM:SS (drop day when zero)"
+msgstr ""
+
+#: src/app/navigation.tsx:36
+#: src/pages/DashboardPage.tsx:50
+msgid "Dashboard"
+msgstr "لوحة القيادة"
+
+#: src/components/SystemFooter.tsx:153
+#~ msgid "DEC"
+#~ msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:114
+msgid "Decide who needs low latency. An operator wall watching for faults wants seconds at most; overflow viewing in a browser can tolerate plain HLS."
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:38
+msgid "Decode a BT.601 stream with the BT.709 recipe (or vice versa) and every pixel is still \"valid\" — just subtly wrong: greens and reds shift, skin tones look off. Because many real-world feeds (especially IP cameras) ship with no color tags at all, Multiview detects what is signaled, fills the gaps with the same resolution-based rules real players use, converts every tile to the canvas color space before compositing, and tags the output so downstream players decode it correctly. A per-source override exists for the cases where a camera tags its stream wrongly."
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:108
+msgid "Decode capacity is budgeted in megapixels per second — many small tiles can be cheaper than a few full-resolution ones."
+msgstr ""
+
+#: src/pages/SystemPage.tsx:185
+msgid "Decoder"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:193
+msgid "Decoder utilisation (device total)"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:194
+msgid "Decoder utilisation: ours over device total"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:278
+msgid "Decoding compressed video and recompressing it into a different codec, resolution, or bitrate. Each transcode costs quality (a new lossy generation), latency, and compute, so well-designed systems transcode once and reuse the result everywhere."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:217
+msgid "Default (auto)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:313
+msgid "Default (balanced)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:116
+msgid "Default (colour bars)"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:725
+msgid "Default (contain)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:250
+msgid "Default (off)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:236
+msgid "Default (visible)"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:43
+msgid "Default software image. Also carries the VAAPI userspace and Mesa or Intel drivers, so it can use an Intel or AMD render node when one is passed through."
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:215
+msgid "Definition"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:295
+msgid "Degradation"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:118
+#: src/pages/LayoutsPage.tsx:313
+#: src/pages/SalvosPage.tsx:307
+#: src/pages/SalvosPage.tsx:436
+#: src/pages/TallyPage.tsx:392
+#: src/pages/TallyPage.tsx:435
+#: src/resources/CrudPage.tsx:109
+#: src/resources/CrudPage.tsx:394
+msgid "Delete"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:112
+msgid "Delete layout"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:287
+msgid "Delete layout?"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:552
+msgid "Delete output"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:200
+msgid "Delete overlay"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:458
+msgid "Delete probe"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:386
+msgid "Delete profile"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:301
+msgid "Delete salvo"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:415
+msgid "Delete salvo?"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:790
+msgid "Delete source"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:414
+msgid "Delete tally profile?"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:364
+msgid "Delete this resource?"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:258
+msgid "Deleted"
+msgstr ""
+
+#: src/docs/registry.ts:31
+#: src/pages/docs/OverviewPage.tsx:54
+msgid "Design pillars"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:514
+msgid "Destination"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:232
+#: src/pages/OutputsPage.tsx:246
+msgid "Destination URL"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:477
+msgid "Detect per-cell fail states — black, freeze, silence, and loudness violations — and raise X.733 alarms."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:265
+msgid "Difference threshold (0–1000 per-mille)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:221
+msgid "Digital (HH:MM:SS readout)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:473
+msgid "Direction"
+msgstr ""
+
+#: src/pages/SimplePages.tsx:672
+#~ msgid "Disabled"
+#~ msgstr ""
+
+#: src/pages/SourcesPage.tsx:567
+msgid "Discard the source wall-clock"
+msgstr ""
+
+#: src/components/ConnectionStatus.tsx:47
+msgid "Disconnected"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:419
+msgid "Discrete track"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:186
+msgid "Discrete track name (route {row})"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:491
+msgid "Display format"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:357
+msgid "Display name"
+msgstr ""
+
+#: src/docs/registry.ts:60
+#: src/pages/docs/ContainerPage.tsx:66
+msgid "docker run"
+msgstr ""
+
+#: src/docs/registry.ts:50
+msgid "docker run and docker compose, GPU access, volumes, healthchecks, and the API token."
+msgstr ""
+
+#: src/app/navigation.tsx:49
+msgid "Docs"
+msgstr ""
+
+#: src/docs/registry.ts:123
+#: src/pages/docs/ConfigPage.tsx:34
+msgid "Document shape"
+msgstr ""
+
+#: src/pages/docs/DocsLayout.tsx:137
+#: src/pages/docs/DocsLayout.tsx:139
+#: src/pages/docs/DocsLayout.tsx:158
+#: src/pages/docs/OverviewPage.tsx:19
+msgid "Documentation"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:141
+msgid "Download the current stores (sources, outputs, overlays, layouts, canvas) as multiview.toml. Stored UI edits take effect when Multiview restarts with this file; live actions (apply layout, swap, routing, salvos) act on the running engine immediately."
+msgstr ""
+
+#: src/layout/components/SourcePalette.tsx:190
+msgid "Drag cancelled."
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:330
+msgid "Drag, resize and rotate cells on the canvas, or drop a source from the palette. The same cells are fully editable on the Cells tab without a pointer."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:317
+msgid "Draw hour numerals (analogue / dual face)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:504
+msgid "Drawn with the count. Leave blank for none."
+msgstr ""
+
+#: src/layout/components/SourcePalette.tsx:188
+msgid "Dropped onto the layout."
+msgstr ""
+
+#: src/layout/components/SourcePalette.tsx:189
+msgid "Dropped outside any target; nothing changed."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:266
+msgid "DST-correct, preferred over a fixed offset (e.g. Australia/Sydney, UTC). Leave blank to use a fixed offset instead."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:439
+msgid "DST-correct, preferred over a fixed offset. Leave blank to use a fixed offset instead."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:223
+msgid "Dual (analogue face + digital readout)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:551
+msgid "DVB teletext page"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:524
+msgid "e.g. black-cam-1"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:863
+msgid "e.g. cam-north"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:189
+msgid "e.g. cam1-clean"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:120
+msgid "e.g. cell-1"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:206
+msgid "e.g. center or top_left"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:241
+#: src/layout/components/LayoutEditor.tsx:153
+msgid "e.g. Main wall"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:503
+msgid "e.g. ON AIR IN"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:618
+msgid "e.g. program-hls"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:286
+msgid "e.g. solid"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:293
+msgid "e.g. Sydney"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:256
+msgid "e.g. wall-clock"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:187
+msgid "Each <0>[[cells]]</0> entry is one tile. It is placed by a grid <1>area</1> or an absolute <2>rect</2>, and binds a source through <3>[cells.source]</3> — usually a reference to a managed source by <4>input_id</4>."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:250
+msgid "Each <0>[[outputs]]</0> entry is one sink, tagged by <1>kind</1>. The canvas is composited and encoded once, then fanned out to every output. Today, file-based HLS output works; the live network output servers are on the roadmap (see the feature guide)."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:228
+msgid "Each <0>[[overlays]]</0> entry attaches a layer to the whole <1>canvas</1> or to a single cell. Common kinds are <2>clock</2>, <3>label</3>, and <4>tally_border</4>. Kind-specific parameters (such as a clock <5>format</5>) sit alongside the common fields and round-trip losslessly."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:143
+msgid "Each <0>[[sources]]</0> entry is a managed input with a stable <1>id</1>, an optional <2>display_name</2>, and a <3>kind</3> that selects the transport. The network kinds carry a <4>url</4>; NDI binds by <5>name</5>; file inputs use a <6>path</6>; <7>test</7> is a built-in synthetic pattern with no parameters."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:61
+msgid "Each axis needs at least one track (e.g. 1fr)."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:133
+msgid "Each cell carries its own normalized rectangle (0.0–1.0) in a <0>rect</0> field."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:79
+msgid "Each input continuously writes its newest decoded frame into a small per-tile store; the compositor reads the latest complete frame from that store at every output tick and never waits for an input. When a source hiccups, the store simply keeps handing out the most recent frame it has — the \"last good\" one. A brief network blip is therefore invisible: the tile holds a fraction-of-a-second-old picture until fresh frames resume."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:265
+msgid "Each output picks its audio from this set: “program” mode carries the prog mix; “tracks” mode selects any of the names above. Manage that per-output choice on the Outputs page."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:88
+msgid "EBU R128 (−23 LUFS)"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:106
+#: src/pages/SalvosPage.tsx:296
+#: src/resources/CrudPage.tsx:97
+msgid "Edit"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:144
+#: src/pages/LayoutEditorPage.tsx:155
+#: src/pages/LayoutEditorPage.tsx:168
+#: src/pages/LayoutEditorPage.tsx:190
+#: src/pages/LayoutEditorPage.tsx:215
+#: src/pages/LayoutEditorPage.tsx:228
+#: src/pages/LayoutEditorPage.tsx:277
+#: src/pages/LayoutEditorPage.tsx:314
+#: src/pages/LayoutEditorPage.tsx:334
+msgid "Edit layout"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:551
+#: src/pages/OutputsPage.tsx:580
+msgid "Edit output"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:199
+#: src/pages/OverlaysPage.tsx:225
+msgid "Edit overlay"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:457
+#: src/pages/ProbesPage.tsx:486
+msgid "Edit probe"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:290
+#: src/pages/SalvosPage.tsx:328
+msgid "Edit salvo"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:789
+#: src/pages/SourcesPage.tsx:815
+msgid "Edit source"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:218
+msgid "Element name"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:555
+msgid "Embedded CEA-608/708"
+msgstr ""
+
+#: src/pages/SimplePages.tsx:667
+#: src/pages/SimplePages.tsx:777
+#~ msgid "Enabled"
+#~ msgstr ""
+
+#: src/docs/registry.ts:386
+#: src/pages/docs/concepts/CodecsPage.tsx:129
+msgid "Encode once, fan out many"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:170
+msgid "Encoder"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:178
+msgid "Encoder utilisation (device total)"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:179
+msgid "Encoder utilisation: ours over device total"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:422
+msgid "Engine default (mixed program bus)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:563
+msgid "Engine default (reclock to house)"
+msgstr ""
+
+#: src/resources/FormControls.tsx:107
+msgid "Enter a 24-hour time of day as HH:MM:SS, e.g. 14:30:00."
+msgstr ""
+
+#: src/resources/FormControls.tsx:39
+msgid "Enter a full URL with a host. Wrap an IPv6 literal in brackets, e.g. rtsp://[2001:db8::1]:8554/cam."
+msgstr ""
+
+#: src/resources/FormControls.tsx:53
+msgid "Enter a hex colour like #101014 or #abc."
+msgstr ""
+
+#: src/resources/FormControls.tsx:110
+msgid "Enter a local date and time as YYYY-MM-DDTHH:MM:SS, e.g. 2026-07-01T09:00:00."
+msgstr ""
+
+#: src/resources/FormControls.tsx:74
+msgid "Enter a number (decibels may be negative, e.g. -3)."
+msgstr ""
+
+#: src/resources/FormControls.tsx:61
+msgid "Enter a number (decimals allowed, e.g. -23.5)."
+msgstr ""
+
+#: src/layout/components/AreaMatrixEditor.tsx:165
+#: src/layout/components/GridLayoutEditor.tsx:620
+msgid "Enter a single-word area name (no spaces)."
+msgstr ""
+
+#: src/resources/FormControls.tsx:101
+msgid "Enter a valid IANA timezone id, e.g. Australia/Sydney or UTC. Leave blank to use a fixed UTC offset instead."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:131
+msgid "Enter a valid target"
+msgstr ""
+
+#: src/resources/FormControls.tsx:59
+msgid "Enter a whole number greater than zero."
+msgstr ""
+
+#: src/resources/FormControls.tsx:57
+msgid "Enter a whole number within the allowed range."
+msgstr ""
+
+#: src/resources/FormControls.tsx:55
+msgid "Enter a whole number."
+msgstr ""
+
+#: src/auth/LoginPage.tsx:39
+msgid "Enter an API key."
+msgstr ""
+
+#: src/resources/FormControls.tsx:94
+msgid "Enter an exact rational rate like 60000/1001, or a whole number like 50 — never a decimal."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:86
+msgid "Errors"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:29
+msgid "Every cell needs a non-empty identifier."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:36
+msgid "Every document starts with a <0>schema_version</0> and then declares the canvas, the layout strategy, the managed sources, the cells (tiles) that place those sources, overlays, and outputs. Optional blocks add fault probes, tally profiles, salvos, and video walls."
+msgstr ""
+
+#: src/resources/FormControls.tsx:87
+msgid "Every input on the program mix is muted. Unmute at least one, or take them all off the mix."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:69
+msgid "Every named area must form a contiguous rectangle."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:28
+msgid "Every tile rides its own four-state ladder, independently of every other tile. The state is shown as a badge in the UI and decides what the tile draws:"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:273
+msgid "Exact \"num/den\", e.g. 30/1 or 30000/1001 — never a float."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:343
+msgid "Exact rational Hz (60000/1001) or a whole number — never a decimal."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:426
+msgid "Explicit track list"
+msgstr ""
+
+#: src/resources/FormControls.tsx:432
+msgid "Export configuration"
+msgstr ""
+
+#: src/resources/FormControls.tsx:416
+msgid "Export not available"
+msgstr ""
+
+#: src/docs/registry.ts:109
+#: src/pages/docs/ComposePage.tsx:102
+msgid "Exposed ports and roadmap"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:52
+#: src/pages/SourcesPage.tsx:242
+msgid "Face"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:87
+msgid "Failures use RFC 9457 problem documents (<0>application/problem+json</0>) with a machine-readable type and a human-readable detail."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:255
+msgid "Fast production LAN"
+msgstr ""
+
+#: src/docs/registry.ts:195
+#: src/pages/docs/FeaturesPage.tsx:16
+msgid "Feature guide"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:288
+msgid "File / synthetic"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:181
+msgid "File path"
+msgstr ""
+
+#: src/docs/registry.ts:294
+#: src/pages/docs/concepts/TransportsPage.tsx:197
+msgid "Files and synthetic sources"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:195
+msgid "Fill colour"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:73
+msgid "Filter by object id"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:384
+#: src/layout/components/GridLayoutEditor.tsx:704
+msgid "Fit"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:337
+msgid "Fix the highlighted fields, then save again."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:446
+#: src/layout/components/LayoutEditor.tsx:306
+msgid "Fix these before saving:"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:285
+msgid "Force lamp"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:279
+msgid "Forced CVT-RB timing (EDID-less screen)"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:335
+msgid "Forward"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:209
+msgid "Fractions of the tile, so a static logo or lower-third cannot mask a black or frozen background."
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:119
+msgid "Frame rate"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:344
+#: src/layout/components/LayoutEditor.tsx:256
+msgid "Frame rate (rational)"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:24
+msgid "Frame rate must be an exact rational like 30000/1001 — not a decimal."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:93
+msgid "Frame-accurate facilities use PTP because it is the only way to make many independent devices agree on \"now\" tightly enough to cut between them mid-frame. Two cameras of the same event locked to the same grandmaster produce frames that genuinely correspond in time — something no amount of buffering can recreate after the fact."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:36
+msgid "Fresh frames are arriving; the tile shows the newest one. This is the normal state."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:58
+msgid "Frozen picture"
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:71
+msgid "Full content interpreted as limited: shadows <0>crush to solid black</0> and highlights clip to white."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:291
+msgid "Fully deterministic"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:413
+msgid "Gain (dB)"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:162
+msgid "Gain in dB (route {row})"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:365
+msgid "Gap"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:361
+msgid "Gaps (px)"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:67
+msgid "Gaps must be whole pixel counts (0 or more)."
+msgstr ""
+
+#: src/docs/registry.ts:325
+#: src/docs/registry.ts:491
+#: src/pages/docs/concepts/GlossaryPage.tsx:63
+#: src/pages/docs/concepts/TimingSyncPage.tsx:51
+msgid "Genlock"
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:53
+msgid "Genlock is the broadcast practice of locking every device's frame timing to one shared reference signal — historically an analog \"black burst\" or tri-level sync feed distributed around the facility. When everything is genlocked, every camera and every output starts its frames at the same instant, so video can be switched and mixed without glitches or re-buffering."
+msgstr ""
+
+#: src/docs/registry.ts:36
+#: src/pages/docs/OverviewPage.tsx:87
+msgid "Getting started"
+msgstr ""
+
+#: src/docs/registry.ts:452
+#: src/pages/docs/concepts/LatencyPage.tsx:26
+msgid "Glass-to-glass latency"
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:28
+msgid "Glass-to-glass latency is the time from light hitting a camera sensor (\"first glass\") to the picture appearing on a display (\"second glass\"). It is a chain of small budgets, and every hop adds some: the camera's own encoder, the network transport, any receive/jitter buffering, decoding, compositing, re-encoding the canvas, the output transport, and finally the viewer's player buffer. No single component \"is\" the latency — the chain is."
+msgstr ""
+
+#: src/docs/registry.ts:447
+msgid "Glass-to-glass latency, what each protocol adds, and the trade-offs against robustness."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:115
+msgid "Glitchy, corrupt, and malformed inputs are the expected workload, not an edge case: decode errors on one stream are tolerated and recovered per tile, and a broken track inside a transport (for example a damaged subtitle rendition) is warned about and recovered without killing the streams alongside it."
+msgstr ""
+
+#: src/docs/registry.ts:470
+#: src/pages/docs/concepts/GlossaryPage.tsx:16
+msgid "Glossary"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:245
+msgid "Glossary: program bus and tracks"
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:151
+msgid "Glossary: PTP"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:256
+msgid "Good on LAN; not for WAN"
+msgstr ""
+
+#: src/docs/registry.ts:496
+#: src/pages/docs/concepts/GlossaryPage.tsx:75
+msgid "GOP (Group of Pictures)"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:202
+msgid "GOP (ms)"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:242
+msgid "GPU"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:137
+#~ msgid "GPU 0 compute utilisation trend"
+#~ msgstr ""
+
+#: src/components/SystemFooter.tsx:156
+#~ msgid "GPU 0 decoder utilisation trend"
+#~ msgstr ""
+
+#: src/components/SystemFooter.tsx:143
+#~ msgid "GPU 0 VRAM usage trend"
+#~ msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:85
+msgid "GPU acceleration is opt-in. The compose stack ships two overlay files that add the right device access; you can apply the same settings to a plain <0>docker run</0>."
+msgstr ""
+
+#: src/docs/registry.ts:65
+#: src/pages/docs/ContainerPage.tsx:83
+msgid "GPU access"
+msgstr ""
+
+#: src/docs/registry.ts:104
+#: src/pages/docs/ComposePage.tsx:81
+msgid "GPU overlays"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:469
+#: src/pages/SourcesPage.tsx:692
+msgid "GPU vendor"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:134
+#~ msgid "GPU0"
+#~ msgstr ""
+
+#: src/pages/SystemPage.tsx:342
+msgid "GPUs"
+msgstr ""
+
+#: src/components/TallyLampBadge.tsx:36
+msgid "Green"
+msgstr ""
+
+#: src/layout/components/AreaMatrixEditor.tsx:187
+#: src/layout/components/GridLayoutEditor.tsx:557
+msgid "Grid areas"
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:52
+msgid "H.264 (also called AVC) is the most widely supported video codec in existence: every browser, phone, set-top box, and hardware decoder of the last 15+ years plays it. It is the safe default for compatibility. Note that software H.264/H.265 encoders carry a GPL license obligation in Multiview's build, so the default (license-clean) image encodes them only with a hardware encoder; choosing a software H.264 encode means using the GPL image variant."
+msgstr ""
+
+#: src/docs/registry.ts:366
+#: src/pages/docs/concepts/CodecsPage.tsx:50
+msgid "H.264 / AVC"
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:67
+msgid "H.265 (HEVC) compresses roughly 30–50% better than H.264 at the same quality, which matters most at 4K and for 10-bit/HDR content. The trade-offs: encoding costs more compute, patent licensing is more complicated, and playback support — while now broad on hardware — is still patchier in browsers than H.264. Classic RTMP cannot carry it; newer endpoints and MPEG-TS based transports can."
+msgstr ""
+
+#: src/docs/registry.ts:371
+#: src/pages/docs/concepts/CodecsPage.tsx:65
+msgid "H.265 / HEVC"
+msgstr ""
+
+#: src/docs/registry.ts:381
+#: src/pages/docs/concepts/CodecsPage.tsx:93
+msgid "Hardware acceleration"
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:114
+msgid "Hardware encoders also sidestep the GPL obligation of the software H.264/H.265 encoders, keeping the default build license-clean."
+msgstr ""
+
+#: src/docs/registry.ts:414
+#: src/pages/docs/concepts/ColorPage.tsx:89
+msgid "HDR"
+msgstr ""
+
+#: src/docs/registry.ts:501
+#: src/pages/docs/concepts/GlossaryPage.tsx:88
+msgid "HDR (High Dynamic Range)"
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:91
+msgid "HDR (high dynamic range) streams use a different brightness curve — PQ or HLG instead of the SDR gamma — and usually the BT.2020 gamut, letting them represent far brighter highlights and deeper shadow detail. An HDR tile dropped onto an SDR canvas without conversion looks dim and grey (its values are being read with the wrong curve), and an SDR tile pushed through an HDR curve blows out."
+msgstr ""
+
+#: src/docs/registry.ts:75
+#: src/pages/docs/ContainerPage.tsx:149
+msgid "Healthcheck"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:382
+msgid "Height (%)"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:323
+#: src/layout/components/LayoutEditor.tsx:235
+#: src/pages/OutputsPage.tsx:326
+msgid "Height (px)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:365
+msgid "HH:MM:SS"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:369
+msgid "HH:MM:SS:FF (with frames)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:238
+msgid "Hidden (decode-skip)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:275
+msgid "High (6–30 s) / medium (2–5 s)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:301
+msgid "Higher priority is shed last under load."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:151
+msgid "HLS (HTTP Live Streaming) delivers video as a playlist of small media segments over plain HTTP. That makes it the most firewall-friendly and scalable transport — any web server or CDN can fan it out to thousands of viewers — at the cost of latency: a player typically starts several segments behind the live edge, so 6–30 seconds of delay is normal. Low-Latency HLS (LL-HLS) publishes partial segments and lets players request the next part before it is complete, bringing latency down to roughly 2–5 seconds while keeping HTTP delivery."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:274
+msgid "HLS / LL-HLS"
+msgstr ""
+
+#: src/docs/registry.ts:284
+#: src/pages/docs/concepts/TransportsPage.tsx:149
+msgid "HLS and LL-HLS"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:349
+msgid "Hold at 00:00:00"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:247
+msgid "Host"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:303
+msgid "Host memory used of total"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:304
+msgid "Host memory: ours / used / total"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:351
+#: src/pages/OutputsPage.tsx:590
+#: src/pages/ProbesPage.tsx:496
+#: src/pages/SourcesPage.tsx:825
+msgid "How configuration applies"
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:19
+msgid "How Multiview paces its output, what genlock and PTP mean, and how wall-clock time fits in."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:103
+msgid "How Multiview relates: the fixed-cadence output clock free-runs on the host's monotonic clock by default — no timing hardware needed. In a PTP facility the same clock can be <0>disciplined</0> to the grandmaster (its rate gently steered, never stepped), and if the reference disappears the output coasts and then free-runs — it never stops. Inputs remain sampled, never pacing, in every mode; PTP changes how well sources line up with each other, not who controls the output."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:21
+msgid "How Multiview works, how to run it, and how to drive it from config-as-code or the API."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:46
+msgid "How RTSP, NDI, SRT, RTMP, HLS, MPEG-TS, and file sources carry video — and which one fits which job."
+msgstr ""
+
+#: src/components/HealthBanner.tsx:63
+msgid "How to fix:"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:80
+msgid "Idempotency"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:70
+#: src/pages/OutputsPage.tsx:614
+#: src/pages/OverlaysPage.tsx:252
+#: src/pages/ProbesPage.tsx:520
+#: src/pages/SalvosPage.tsx:211
+#: src/pages/SalvosPage.tsx:341
+#: src/pages/SourcesPage.tsx:859
+#: src/pages/TallyPage.tsx:364
+msgid "Identifier"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:197
+msgid "IEEE 1588 — distributing time over Ethernet from a grandmaster clock so every device agrees on \"now\" to about a microsecond. Under the SMPTE ST 2059 broadcast profile, frame boundaries are computable from the time itself, making PTP the IP facility's replacement for both genlock and timecode distribution."
+msgstr ""
+
+#: src/docs/registry.ts:55
+#: src/pages/docs/ContainerPage.tsx:33
+msgid "Images"
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:40
+msgid "In a multiview chain there are two transports in the path: the one each source arrives on, and the one the composed wall goes out on. Both choices matter, and they are independent — a wall of low-latency RTSP cameras served out over plain HLS is still tens of seconds behind for its viewers."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:141
+msgid "In this UI, set your token under Settings, then API access. For a container, supply it as the <0>MULTIVIEW_CONTROL_TOKEN</0> environment variable — the presented token is <1>admin.<secret></1>. When that variable is unset, the server generates a token and logs it once at startup. The unauthenticated surface is just <2>/</2>, <3>/docs</3>, and <4>/api/v1/openapi.json</4>; every <5>/api/v1</5> data route requires the token."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:285
+msgid "In-facility broadcast distribution"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:72
+msgid "Indeterminate"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:226
+msgid "Index"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:366
+msgid "Index→cell rules"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:404
+msgid "Input"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:109
+#: src/pages/AudioPage.tsx:124
+msgid "Input (route {row})"
+msgstr ""
+
+#: src/pages/MonitoringPage.tsx:156
+msgid "Inputs"
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:44
+msgid "Inputs are sampled, never trusted to pace the output. A single fixed-cadence clock emits exactly one frame per tick. When a source drops, its tile holds its last good frame and shows a clear state while the engine reconnects in the background — the rest of the wall keeps running."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:304
+msgid "Inside a production network that already speaks it: NDI."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:316
+msgid "Integrated target (LKFS)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:317
+msgid "Integrated target (LUFS)"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:89
+msgid "Intel"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:112
+msgid "Intel / AMD (VAAPI)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:269
+msgid "Internet (TCP)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:262
+msgid "Internet / unmanaged links"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:250
+msgid "IP cameras, fixed encoders"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:255
+msgid "Its tiles overlap (picture-in-picture), which a grid cannot express. Convert to free-form instead."
+msgstr ""
+
+#: src/docs/registry.ts:506
+#: src/pages/docs/concepts/GlossaryPage.tsx:99
+msgid "Jitter buffer"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:218
+#: src/pages/OverlaysPage.tsx:173
+#: src/pages/OverlaysPage.tsx:273
+#: src/pages/ProbesPage.tsx:419
+#: src/pages/ProbesPage.tsx:542
+#: src/pages/SourcesPage.tsx:754
+#: src/pages/SourcesPage.tsx:880
+msgid "Kind"
+msgstr ""
+
+#. placeholder {0}: ctx.row.original.rawKind
+#: src/pages/OutputsPage.tsx:556
+#: src/pages/OverlaysPage.tsx:204
+#: src/pages/ProbesPage.tsx:462
+#: src/pages/SourcesPage.tsx:794
+msgid "kind \"{0}\" isn't editable in this UI; the document is preserved as authored"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:154
+msgid "Kinds: <0>test</0>, <1>rtsp</1>, <2>hls</2>, <3>ts</3>, <4>srt</4>, <5>rtmp</5>, <6>ndi</6>, <7>file</7>."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:291
+#: src/pages/SourcesPage.tsx:501
+msgid "Label (optional)"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:256
+#: src/pages/TallyPage.tsx:319
+msgid "Lamp"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:248
+msgid "LAN / routed networks"
+msgstr ""
+
+#: src/components/LocaleSwitcher.tsx:35
+#: src/pages/AudioPage.tsx:422
+#: src/pages/SettingsPage.tsx:72
+msgid "Language"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:199
+msgid "Language (route {row})"
+msgstr ""
+
+#: src/docs/registry.ts:511
+#: src/pages/docs/concepts/GlossaryPage.tsx:111
+msgid "Last-good frame"
+msgstr ""
+
+#: src/docs/registry.ts:433
+#: src/pages/docs/concepts/ResiliencePage.tsx:77
+msgid "Last-good frames"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:390
+msgid "Latch the alarm (held until explicitly reset)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:444
+msgid "latched"
+msgstr ""
+
+#: src/docs/registry.ts:446
+#: src/pages/docs/concepts/LatencyPage.tsx:16
+msgid "Latency"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:574
+msgid "Latency & protocol guide"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:231
+msgid "Latency class"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:127
+msgid "Latency profile (optional)"
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:102
+msgid "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
+msgstr ""
+
+#: src/docs/registry.ts:133
+#: src/pages/docs/ConfigPage.tsx:110
+msgid "Layout"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:147
+msgid "Layout applied live"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:180
+msgid "Layout deleted"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:232
+#: src/layout/components/LayoutEditor.tsx:144
+msgid "Layout name"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:377
+msgid "Layout or preset name (optional)"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:89
+msgid "Layout saved"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:117
+msgid "Layout saved & applied live"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:124
+msgid "Layout saved, but apply failed"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:115
+#~ msgid "Layout saved; apply accepted"
+#~ msgstr ""
+
+#: src/app/navigation.tsx:37
+#: src/docs/registry.ts:201
+#: src/pages/DashboardPage.tsx:58
+#: src/pages/docs/FeaturesPage.tsx:25
+#: src/pages/LayoutsPage.tsx:196
+msgid "Layouts"
+msgstr "التخطيطات"
+
+#: src/docs/registry.ts:196
+msgid "Layouts, sources, outputs, overlays, tally, salvos, and alarms — what each one is."
+msgstr ""
+
+#: src/pages/AuditPage.tsx:79
+msgid "Leave empty for all objects"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:379
+msgid "Left (%)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:315
+msgid "Letting many viewers watch the composed wall: HLS, or LL-HLS when delay matters."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:164
+msgid "Limit detection to a zone (default: the full frame)"
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:65
+msgid "Limited content interpreted as full: blacks turn grey, the picture looks <0>washed out and low-contrast</0>."
+msgstr ""
+
+#: src/docs/registry.ts:409
+#: src/pages/docs/concepts/ColorPage.tsx:52
+msgid "Limited vs full range"
+msgstr ""
+
+#: src/pages/docs/components.tsx:44
+msgid "Link to section"
+msgstr ""
+
+#: src/resources/FormControls.tsx:72
+msgid "List at least one track name (comma-separated)."
+msgstr ""
+
+#: src/components/SystemFooter.tsx:27
+#: src/components/TileStateBadge.tsx:29
+msgid "Live"
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:35
+msgid "LIVE"
+msgstr ""
+
+#: src/docs/registry.ts:172
+#: src/pages/docs/ApiPage.tsx:34
+msgid "Live API playground"
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:51
+msgid "Live engine status at a glance."
+msgstr ""
+
+#: src/pages/SystemPage.tsx:238
+msgid "Live host and accelerator utilisation streaming from the engine."
+msgstr ""
+
+#: src/pages/MonitoringPage.tsx:148
+msgid "Live program output"
+msgstr ""
+
+#: src/pages/MonitoringPage.tsx:133
+msgid "Live program output and per-input previews, with each tile's lifecycle state from the engine stream."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:770
+msgid "Live status"
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:87
+msgid "Live tiles from the engine stream."
+msgstr ""
+
+#: src/docs/registry.ts:516
+#: src/pages/docs/concepts/GlossaryPage.tsx:123
+msgid "LL-HLS (Low-Latency HLS)"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:200
+msgid "Loading alarms…"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:362
+msgid "Loading audio routing…"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:92
+msgid "Loading audit log…"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:349
+msgid "Loading canvas…"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:146
+msgid "Loading layout…"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:219
+msgid "Loading layouts…"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:584
+msgid "Loading outputs…"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:229
+msgid "Loading overlays…"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:808
+msgid "Loading preview…"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:490
+msgid "Loading probes…"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:349
+msgid "Loading profiles…"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:189
+msgid "Loading salvos…"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:819
+msgid "Loading sources…"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:303
+msgid "Loading tally state…"
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:67
+msgid "Loading…"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:425
+msgid "Local YYYY-MM-DDTHH:MM:SS, resolved in the timezone below."
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:80
+msgid "Locale"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:759
+msgid "Locator"
+msgstr ""
+
+#: src/pages/SimplePages.tsx:570
+#~ msgid "Locator URL"
+#~ msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:65
+msgid "Locking every device's frame timing to one shared reference signal so all frames start at the same instant across a facility. Classically an analog black-burst or tri-level signal; in IP facilities PTP carries the same role. Genlock aligns <0>phase</0>; timecode merely labels frames."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:65
+msgid "Long-running ops"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:263
+msgid "Loss recovery + encryption"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:62
+msgid "Loudness violation"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:247
+msgid "Low (~0.2–1 s)"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:266
+msgid "Low-latency HLS, adding <0>part_target_ms</0> and <1>gop_ms</1> tuning."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:261
+msgid "Low–medium (window-tuned)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:241
+msgid "Luma threshold (0–255)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:589
+msgid "Magazine-addressed page, 100–899."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:78
+msgid "Major"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:219
+msgid "Manage overlay layers and subtitles."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:283
+msgid "Managed facility LAN"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:200
+msgid "Manual override"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:662
+msgid "Matrix"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:328
+msgid "Max true-peak (dBTP)"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:112
+msgid "Media time"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:268
+msgid "Medium (~2–5 s)"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:279
+msgid "Memory"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:164
+msgid "Minimum severity"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:76
+msgid "Minor"
+msgstr ""
+
+#. placeholder {0}: cell.area
+#: src/layout/components/GridLayoutEditor.tsx:499
+msgid "missing area: {0}"
+msgstr ""
+
+#: src/docs/registry.ts:521
+#: src/pages/docs/concepts/GlossaryPage.tsx:134
+msgid "MLDv2"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:367
+msgid "MM:SS"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:302
+msgid "Mode"
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:95
+msgid "Modern GPUs and SoCs contain dedicated video engines — separate silicon for decode and encode that runs at a fraction of the power of a CPU doing the same work. Multiview uses them through each platform's standard interface: NVDEC/NVENC on NVIDIA, VAAPI on Intel and AMD (including Quick Sync), and VideoToolbox on Apple Silicon. With acceleration, decoding a wall of sources and encoding the canvas leaves the CPU almost idle; without it, a handful of HD decodes can saturate a machine."
+msgstr ""
+
+#: src/app/navigation.tsx:42
+#: src/pages/MonitoringPage.tsx:131
+msgid "Monitoring"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:299
+msgid "Monitoring cameras where they are installed: RTSP."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:59
+msgid "Mono"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:252
+msgid "Mostly static"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:68
+msgid "Mount a config file and an output directory, then point the binary at the config. The current binary composites, encodes, and writes HLS or file output to disk."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:116
+msgid "Mount point"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:510
+msgid "Move cell to area"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:514
+msgid "Move to area…"
+msgstr ""
+
+#: src/docs/registry.ts:526
+#: src/pages/docs/concepts/GlossaryPage.tsx:146
+msgid "MPEG-TS (Transport Stream)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:281
+msgid "MPEG-TS / UDP multicast"
+msgstr ""
+
+#: src/docs/registry.ts:289
+#: src/pages/docs/concepts/TransportsPage.tsx:173
+msgid "MPEG-TS over UDP and multicast"
+msgstr ""
+
+#: src/docs/registry.ts:531
+#: src/pages/docs/concepts/GlossaryPage.tsx:158
+msgid "Multicast"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:136
+msgid "Multicast Listener Discovery version 2 — the IPv6 protocol a receiver uses to tell the network which multicast groups (and, with source-specific multicast, which senders) it wants. It is the IPv6 successor to IPv4's IGMP and the primary group-join mechanism in Multiview's IPv6-first multicast support."
+msgstr ""
+
+#: src/app/Sidebar.tsx:22
+msgid "Multiview"
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:131
+#~ msgid "Multiview composites the canvas <0>once</0> per tick, encodes it <1>once per rendition</1>, and fans the same encoded packets out to every output that wants that rendition. Serving the wall over HLS, RTSP, and an SRT push at the same codec, resolution, and bitrate costs one encode — not three. A second encode is created only when an output genuinely needs a different codec, resolution, or bitrate."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:131
+msgid "Multiview composites the canvas <0>once</0> per tick, encodes it <1>once per rendition</1>, and fans the same encoded packets out to every output that wants that rendition. Writing the wall to HLS while pushing it to an RTMP and an SRT destination at the same codec, resolution, and bitrate costs one encode — not three. A second encode is created only when an output genuinely needs a different codec, resolution, or bitrate."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:35
+msgid "Multiview is a hardware-accelerated live video multiview generator. It ingests many live sources, composites them into a templated grid on the GPU, and serves the combined picture as a continuous output stream. It is designed for monitoring walls and production multiviewers where the output must never stall."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:127
+msgid "Multiview itself never trades the output cadence away: under load it degrades the cheapest tiles first and keeps the program output's timing intact."
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:156
+#~ msgid "Multiview layouts. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas."
+#~ msgstr ""
+
+#: src/pages/LayoutsPage.tsx:199
+msgid "Multiview layouts. The accessible editor offers a form-based path equivalent to the drag-and-drop canvas. Apply is live on the running engine."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:221
+msgid "Multiview Program"
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:102
+msgid "Multiview tone-maps HDR tiles into an SDR canvas (anchored so normal \"reference white\" content stays at a sensible brightness rather than scaling everything down), and only treats a stream as HDR when it is explicitly tagged as such — resolution alone never implies HDR. The canvas itself can also be configured as HDR (PQ or HLG) for monitoring HDR productions."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:29
+msgid "Multiview's output is paced by exactly one thing: a fixed-cadence internal clock. At every tick — for example every 1/50 s for a 50 fps canvas — it emits one finished frame, forever. Sources never set that pace. Each input writes its newest decoded frame into a per-tile store, and at each tick the compositor <0>samples</0> whatever is freshest there. A source that bursts, stalls, or dies changes only what its own tile shows — never when the next output frame goes out."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:73
+msgid "Mutable resources carry an <0>ETag</0>. Send it back as <1>If-Match</1> on a write; a stale tag is rejected with <2>412 Precondition Failed</2> so two editors never silently clobber each other."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:416
+msgid "Mute"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:175
+msgid "Mute on the program mix (route {row})"
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:61
+#: src/pages/OutputsPage.tsx:504
+#: src/pages/OutputsPage.tsx:626
+#: src/pages/OverlaysPage.tsx:168
+#: src/pages/OverlaysPage.tsx:264
+#: src/pages/ProbesPage.tsx:414
+#: src/pages/ProbesPage.tsx:532
+#: src/pages/SalvosPage.tsx:210
+#: src/pages/SourcesPage.tsx:749
+#: src/pages/SourcesPage.tsx:871
+#: src/pages/TallyPage.tsx:241
+msgid "Name"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:173
+msgid "Named recalls. Arm stages a salvo, Take applies it, and Cancel drops a staged one. Each command is accepted asynchronously; its outcome arrives on the realtime stream."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:448
+msgid "Names declared by the audio routing block; the program bus is always available as \"prog\"."
+msgstr ""
+
+#: src/app/AppLayout.tsx:68
+msgid "Navigation"
+msgstr ""
+
+#: src/docs/registry.ts:261
+#: src/docs/registry.ts:536
+#: src/pages/docs/concepts/GlossaryPage.tsx:171
+#: src/pages/docs/concepts/TransportsPage.tsx:78
+#: src/pages/docs/concepts/TransportsPage.tsx:253
+msgid "NDI"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:80
+msgid "NDI (Network Device Interface) is a production-LAN video transport: senders announce themselves on the network, receivers discover them by name, and video flows with very low latency (around a frame) at high bitrates using NDI's own lightweight codec. There are no URLs to manage — a source is selected by its advertised name."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:167
+msgid "NDI source name"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:218
+msgid "NDI source name to advertise"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:160
+msgid "Network delivery where one sender transmits a single copy of a stream to a group address and the network fans it out to every subscribed receiver. Extremely efficient for in-facility distribution, but requires a managed network that routes multicast. Receivers subscribe via MLDv2 (IPv6) or IGMP (legacy IPv4)."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:173
+msgid "Network Device Interface — a production-LAN video transport in which senders advertise themselves by name and receivers discover them automatically. Near-frame latency at mezzanine quality, at the cost of high bandwidth and LAN-only reach."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:234
+msgid "Network fit"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:176
+msgid "New cell"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:334
+#: src/pages/LayoutsPage.tsx:211
+msgid "New layout"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:578
+#: src/pages/OutputsPage.tsx:579
+msgid "New output"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:223
+#: src/pages/OverlaysPage.tsx:224
+msgid "New overlay"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:484
+#: src/pages/ProbesPage.tsx:485
+msgid "New probe"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:182
+#: src/pages/SalvosPage.tsx:328
+msgid "New salvo"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:813
+#: src/pages/SourcesPage.tsx:814
+msgid "New source"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:209
+msgid "No alarms match the current filter."
+msgstr ""
+
+#: src/pages/AuditPage.tsx:101
+msgid "No audit entries match."
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:396
+msgid "No cells yet. Add one to start composing the multiview."
+msgstr ""
+
+#: src/layout/components/SourcePalette.tsx:185
+msgid "No drop target."
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:123
+msgid "No frame-rate sample."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:42
+msgid "No fresh frame has arrived for a short hold window. The tile keeps showing its last good frame — visually nothing changes yet, but the engine has noticed."
+msgstr ""
+
+#: src/components/SystemFooter.tsx:245
+msgid "No GPU reported"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:350
+msgid "No GPUs are reported on this host."
+msgstr ""
+
+#: src/pages/SystemPage.tsx:309
+msgid "No host-memory sample."
+msgstr ""
+
+#: src/pages/MonitoringPage.tsx:165
+msgid "No inputs are available to preview."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:122
+msgid "No layout cells found — enter the cell id to watch."
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:228
+msgid "No layouts are defined yet."
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:102
+msgid "No live tiles yet. They appear once the engine streams a snapshot."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:583
+msgid "No outputs configured."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:228
+msgid "No overlays configured."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:489
+msgid "No probes configured."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:284
+msgid "No recovery; loss = glitch"
+msgstr ""
+
+#: src/pages/docs/DocsSearch.tsx:149
+msgid "No results."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:438
+msgid "No routes yet — without routes the multiview carries no managed audio."
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:198
+msgid "No salvos are defined yet."
+msgstr ""
+
+#: src/components/TileStateBadge.tsx:47
+msgid "No signal"
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:56
+msgid "NO SIGNAL"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:386
+#: src/layout/components/GridLayoutEditor.tsx:686
+msgid "No source"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:818
+msgid "No sources configured."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:357
+msgid "No tally profiles are defined."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:311
+msgid "No tally targets are reporting a lamp state."
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:240
+msgid "None"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:289
+msgid "None (local)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:545
+msgid "None (no captions decoded)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:290
+msgid "None needed"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:201
+msgid "Not editable in this UI"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:83
+#~ msgid "Not in the running engine — no live state until a config export + restart binds it to a tile."
+#~ msgstr ""
+
+#: src/pages/SourcesPage.tsx:93
+msgid "Not in the running engine — no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:252
+msgid "Not static"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:93
+msgid "Not yet runnable in this build"
+msgstr ""
+
+#: src/components/HealthBanner.tsx:41
+msgid "Notice"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:158
+msgid "Notifications"
+msgstr ""
+
+#: src/docs/registry.ts:541
+#: src/pages/docs/concepts/GlossaryPage.tsx:182
+msgid "NV12"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:160
+msgid "NVENC"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:150
+#~ msgid "NVENC encode sessions trend"
+#~ msgstr ""
+
+#: src/pages/SystemPage.tsx:201
+msgid "NVENC sessions"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:93
+#: src/pages/SystemPage.tsx:87
+msgid "NVIDIA"
+msgstr ""
+
+#: src/pages/AuditPage.tsx:110
+msgid "Object"
+msgstr ""
+
+#: src/components/TallyLampBadge.tsx:48
+msgid "Off"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:549
+msgid "Off (pinned off)"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:27
+msgid "Offline"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:166
+msgid "On signal loss"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:151
+msgid "On the program mix (route {row})"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:396
+msgid "One route per input. No track name means the input contributes to the program mix only."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:186
+msgid "Opacity (0–1)"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:41
+msgid "Opacity must be between 0 and 1."
+msgstr ""
+
+#: src/components/HelpLink.tsx:50
+msgid "open documentation"
+msgstr ""
+
+#: src/app/AppLayout.tsx:62
+msgid "Open navigation"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:50
+msgid "Open the API playground"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:225
+msgid "Open the system metrics page"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:118
+#: src/pages/LayoutsPage.tsx:148
+#: src/pages/SalvosPage.tsx:154
+#: src/pages/TallyPage.tsx:142
+msgid "Operation id"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:72
+msgid "Optimistic concurrency"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:161
+msgid "Optional <0>captions</0> select a caption or subtitle track (auto, teletext page, CEA-608/708 service, a track id, or a sidecar file). The engine never decodes a track it will not show."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:483
+msgid "Orphaned cells"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:95
+msgid "Other"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:208
+msgid "Our NVENC sessions / device-wide sessions / ceiling"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:256
+msgid "Ours of host total"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:81
+msgid "Output cadence as a <0>\"num/den\"</0> rational string, for example <1>\"30000/1001\"</1> for exact NTSC 29.97. A bare float is rejected on purpose, because frame rates must be exact."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:141
+#: src/pages/OutputsPage.tsx:168
+msgid "Output path"
+msgstr ""
+
+#: src/app/navigation.tsx:39
+#: src/docs/registry.ts:153
+#: src/docs/registry.ts:211
+#: src/pages/docs/ConfigPage.tsx:248
+#: src/pages/docs/FeaturesPage.tsx:65
+#: src/pages/OutputsPage.tsx:568
+msgid "Outputs"
+msgstr "المخرجات"
+
+#: src/layout/components/SourcePalette.tsx:185
+msgid "Over the layout drop zone."
+msgstr ""
+
+#: src/app/navigation.tsx:40
+#: src/docs/registry.ts:148
+#: src/docs/registry.ts:216
+#: src/layout/components/SourcePalette.tsx:224
+#: src/pages/docs/ConfigPage.tsx:226
+#: src/pages/docs/FeaturesPage.tsx:113
+#: src/pages/OverlaysPage.tsx:216
+msgid "Overlays"
+msgstr "الطبقات"
+
+#: src/pages/docs/FeaturesPage.tsx:115
+msgid "Overlays draw on top of the canvas or a single tile: clocks, text labels and under-monitor displays, and tally borders. A clock overlay sourced from the wall clock keeps ticking every frame, which doubles as a visible sentinel that the output is still alive."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:141
+msgid "Override accepted"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:141
+msgid "Override cleared"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:147
+msgid "Override failed"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:634
+msgid "Override the detected colour metadata"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:511
+msgid "Overrun prefix (optional)"
+msgstr ""
+
+#: src/docs/registry.ts:20
+msgid "Overview"
+msgstr ""
+
+#: src/pages/NotFoundPage.tsx:14
+msgid "Page not found"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:180
+msgid "Part target (ms)"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:115
+msgid "Pass through the host render node and add the container user to the group that owns it. The render group id varies by host — look it up with <0>getent group render</0>."
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:92
+msgid "Paste the control-plane bearer token. Set it from the MULTIVIEW_CONTROL_TOKEN environment variable, or copy the bootstrap token the server logs once at startup. Stored in this browser only and sent as a Bearer token to the same-origin API."
+msgstr ""
+
+#: src/layout/components/AreaMatrixEditor.tsx:179
+msgid "Pick a rectangle of squares with the arrow keys (hold Shift to extend) or by click-dragging, then type a name and assign it. Every named area must form a contiguous rectangle."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:277
+msgid "Pick an exact EDID mode"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:142
+msgid "Pick the cell this probe watches."
+msgstr ""
+
+#. placeholder {0}: String(active.id)
+#: src/layout/components/SourcePalette.tsx:183
+msgid "Picked up {0}."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:683
+msgid "Pin decode to a specific GPU"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:460
+msgid "Pin encode to a specific GPU"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:100
+msgid "PIP"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:248
+msgid "Pixels at or below this 8-bit luma count as black (16 = broadcast black)."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:186
+msgid "Plain UDP has no recovery at all: a lost packet is a glitch on screen. That is acceptable on a managed facility LAN and wrong for the internet (use SRT there, which wraps the same transport stream in a recovering envelope). Multicast group management is IPv6-first: receivers join groups via MLDv2, with IPv4/IGMP as the legacy path."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:551
+msgid "Preview"
+msgstr ""
+
+#. placeholder {0}: props.id
+#: src/pages/MonitoringPage.tsx:191
+msgid "Preview of input {0}"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:644
+msgid "Primaries"
+msgstr ""
+
+#: src/app/Sidebar.tsx:20
+msgid "Primary"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:299
+msgid "Priority"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:49
+msgid "Priority must be a whole number (higher is shed last)."
+msgstr ""
+
+#: src/app/navigation.tsx:45
+#: src/pages/ProbesPage.tsx:474
+msgid "Probes"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:162
+msgid "Profile deleted"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:193
+msgid "Profiles"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:258
+msgid "PROG"
+msgstr ""
+
+#: src/pages/MonitoringPage.tsx:143
+msgid "Program"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:424
+msgid "Program bus only"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:410
+msgid "Program mix"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:318
+msgid "Program output"
+msgstr ""
+
+#: src/components/SystemFooter.tsx:262
+#: src/pages/SystemPage.tsx:330
+msgid "Program output frame rate trend"
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:78
+msgid "PTP (IEEE 1588) is genlock's IP-network successor. A \"grandmaster\" clock distributes time over ordinary Ethernet, and every device on the network disciplines its own clock to it — typically to within a microsecond. The broadcast profile, SMPTE ST 2059, adds the convention that frame boundaries are computable from the time itself, so two PTP-locked devices agree not just on the time of day but on exactly when each frame starts. This single mechanism replaces both the genlock signal (phase) and timecode distribution (labels) in an IP facility, and is the timing backbone of SMPTE ST 2110 installations."
+msgstr ""
+
+#: src/docs/registry.ts:330
+#: src/docs/registry.ts:546
+#: src/pages/docs/concepts/GlossaryPage.tsx:195
+#: src/pages/docs/concepts/TimingSyncPage.tsx:76
+msgid "PTP (Precision Time Protocol)"
+msgstr ""
+
+#: src/docs/registry.ts:551
+#: src/pages/docs/concepts/GlossaryPage.tsx:207
+msgid "PTS (Presentation Timestamp)"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:284
+msgid "Push the encoded stream to a destination <0>url</0>."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:271
+msgid "Push to/from streaming platforms"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:96
+msgid "Radius (px)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:358
+msgid "Raise dwell (ms)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:671
+msgid "Range"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:355
+msgid "Re-arm to the next occurrence (recurring daily)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:353
+msgid "Reach zero, then count the overrun up"
+msgstr ""
+
+#: src/docs/registry.ts:182
+#: src/pages/docs/ApiPage.tsx:96
+msgid "Realtime streams"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:212
+#: src/pages/SalvosPage.tsx:372
+msgid "Recalled layout"
+msgstr ""
+
+#: src/docs/registry.ts:438
+#: src/pages/docs/concepts/ResiliencePage.tsx:100
+msgid "Reconnect behaviour"
+msgstr ""
+
+#: src/components/ConnectionStatus.tsx:41
+#: src/components/TileStateBadge.tsx:41
+msgid "Reconnecting"
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:48
+msgid "RECONNECTING"
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:57
+msgid "Recovery has not succeeded within the no-signal timeout. The tile switches to a clear \"signal lost\" slate — an honest statement that what is on screen is no longer recent video."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:465
+msgid "Recur daily (re-arm each day)"
+msgstr ""
+
+#: src/components/TallyLampBadge.tsx:30
+msgid "Red"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:338
+msgid "Refresh (exact rational)"
+msgstr ""
+
+#: src/pages/docs/DocsLayout.tsx:174
+msgid "Related"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:264
+msgid "Remote contribution feeds"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:364
+#: src/layout/components/GridLayoutEditor.tsx:537
+msgid "Remove"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:388
+#: src/layout/components/GridLayoutEditor.tsx:530
+#: src/layout/components/GridLayoutEditor.tsx:782
+msgid "Remove cell"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:423
+msgid "Remove column"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:226
+msgid "Remove route {row}"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:433
+msgid "Remove row"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:594
+#: src/pages/OverlaysPage.tsx:232
+#: src/pages/ProbesPage.tsx:500
+msgid "Removed from the store. The running engine is unchanged until a config export + restart."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:839
+msgid "Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:628
+msgid "Rename"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:595
+msgid "Rename area {selectedArea}"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:442
+msgid "Replace cells"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:416
+msgid "Replace the current cells?"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:39
+msgid "Requests will be unauthenticated."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:82
+msgid "Requires a display-kms build"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:96
+msgid "Requires the NVIDIA driver and the NVIDIA Container Toolkit on the host. The modern path requests devices through CDI; NVENC and NVDEC also need the <0>video</0> driver capability."
+msgstr ""
+
+#: src/docs/registry.ts:422
+#: src/pages/docs/concepts/ResiliencePage.tsx:16
+msgid "Resilience & the tile lifecycle"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:190
+msgid "Resolved state"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:315
+msgid "Resolved tally lamp per target."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:180
+msgid "Resolved tally lamps, a manual override, and the tally profiles that map incoming protocol words to lamps."
+msgstr ""
+
+#: src/docs/registry.ts:177
+#: src/pages/docs/ApiPage.tsx:58
+msgid "REST conventions"
+msgstr ""
+
+#: src/pages/docs/components.tsx:147
+msgid "Roadmap"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:237
+msgid "Robustness"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:383
+msgid "Rotation (°)"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:37
+msgid "Rotation must be between 0 and 359 degrees."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:341
+msgid "Route each input's audio: program-mix membership and discrete tracks."
+msgstr ""
+
+#. placeholder {0}: String(rowIndex + 1)
+#. placeholder {1}: String(colIndex + 1)
+#: src/layout/components/AreaMatrixEditor.tsx:217
+msgid "Row {0}, column {1}: area {token}"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:382
+msgid "Row gap"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:431
+msgid "Rows"
+msgstr ""
+
+#: src/docs/registry.ts:279
+#: src/docs/registry.ts:556
+#: src/pages/docs/concepts/GlossaryPage.tsx:219
+#: src/pages/docs/concepts/TransportsPage.tsx:128
+#: src/pages/docs/concepts/TransportsPage.tsx:267
+msgid "RTMP"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:130
+msgid "RTMP is a TCP push protocol that remains the lingua franca for sending a stream <0>to</0> a service — most streaming platforms still ingest it. Classic RTMP carries H.264 video and AAC audio only; newer \"enhanced\" endpoints negotiate H.265 and AV1. As an input it appears when an encoder or app pushes to Multiview; as an output it is how Multiview pushes the composed canvas to a platform."
+msgstr ""
+
+#: src/docs/registry.ts:256
+#: src/docs/registry.ts:561
+#: src/pages/docs/concepts/GlossaryPage.tsx:230
+#: src/pages/docs/concepts/TransportsPage.tsx:54
+#: src/pages/docs/concepts/TransportsPage.tsx:246
+msgid "RTSP"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:56
+msgid "RTSP (Real Time Streaming Protocol) is the standard way IP cameras and encoders publish a live stream on a local network. The client asks the device to describe and play its stream; the media itself then flows as RTP packets, either over UDP or interleaved in the same TCP connection. Latency is low (commonly a few hundred milliseconds) and the URL form is simple: <0>rtsp://camera.local:8554/main</0>."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:67
+msgid "RTSP carries whatever the camera encodes — usually H.264 or H.265 — so the picture quality and bitrate are set at the camera. It has no built-in recovery beyond TCP retransmission; on flaky links a stream simply stalls and must reconnect, which Multiview handles per tile without disturbing the rest of the wall."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:148
+msgid "RTSP transport"
+msgstr ""
+
+#: src/docs/registry.ts:244
+msgid "RTSP, NDI, SRT, RTMP, HLS, MPEG-TS, and files: how each carries video and which to use where."
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:25
+msgid "Run Multiview with Docker — single container or the compose stack — with optional GPU access, persistent volumes, and healthchecks."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:71
+msgid "Runnable"
+msgstr ""
+
+#: src/docs/registry.ts:49
+#: src/pages/docs/ContainerPage.tsx:23
+msgid "Running in containers"
+msgstr ""
+
+#: src/docs/registry.ts:566
+#: src/pages/docs/concepts/GlossaryPage.tsx:242
+msgid "Salvo"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:113
+msgid "Salvo created"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:134
+msgid "Salvo deleted"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:113
+msgid "Salvo saved"
+msgstr ""
+
+#: src/app/navigation.tsx:44
+#: src/docs/registry.ts:226
+#: src/pages/docs/FeaturesPage.tsx:137
+#: src/pages/SalvosPage.tsx:171
+msgid "Salvos"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:370
+msgid "Sample rate (Hz)"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:398
+#: src/pages/SettingsPage.tsx:118
+#: src/resources/CrudPage.tsx:345
+msgid "Save"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:281
+#: src/layout/components/LayoutEditor.tsx:201
+msgid "Save & apply to engine"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:487
+msgid "Save audio routing"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:268
+#: src/layout/components/LayoutEditor.tsx:189
+msgid "Save layout"
+msgstr ""
+
+#: src/resources/CrudPage.tsx:236
+msgid "Saved"
+msgstr ""
+
+#. placeholder {0}: result.filename
+#: src/resources/FormControls.tsx:410
+msgid "Saved as {0}. Restart Multiview with this file to apply stored changes."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:268
+#: src/layout/components/LayoutEditor.tsx:189
+msgid "Saving…"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:212
+msgid "Scaler"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:292
+msgid "Scan the canvas out to a local HDMI/DisplayPort screen by KMS <0>connector</0> (a <1>display-kms</1> build), with an optional exact <2>mode</2> override or a <3>forced_mode</3> for screens that report no EDID. The refresh is an exact rational like <4>\"60000/1001\"</4>, never a decimal."
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:219
+msgid "Scope"
+msgstr ""
+
+#: src/pages/docs/DocsSearch.tsx:99
+msgid "Search docs…"
+msgstr ""
+
+#: src/pages/docs/DocsSearch.tsx:98
+msgid "Search documentation"
+msgstr ""
+
+#: src/pages/docs/DocsSearch.tsx:117
+msgid "Search results"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:255
+msgid "Secure Reliable Transport — an open-source UDP protocol for carrying streams across unmanaged networks. It repairs packet loss by retransmission inside a configurable latency window and encrypts with AES, making it the standard choice for contribution over the internet."
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:288
+msgid "Seed cells from preset"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:280
+msgid "Seed from a preset"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:419
+msgid "Seeding from a preset replaces every cell in this draft. Nothing is saved until you save the layout."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:191
+msgid "Segment (ms)"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:152
+msgid "Segment duration (ms, optional)"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:588
+msgid "Select an area to edit its cell."
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:387
+msgid "Select cell"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:242
+msgid "Selectable tracks"
+msgstr ""
+
+#. placeholder {0}: String(selection.top + 1)
+#. placeholder {1}: String(selection.bottom + 1)
+#. placeholder {2}: String(selection.left + 1)
+#. placeholder {3}: String(selection.right + 1)
+#: src/layout/components/AreaMatrixEditor.tsx:174
+msgid "Selected rows {0}–{1}, columns {2}–{3}"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:390
+msgid "Send backward"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:272
+msgid "Serves the canvas at a <0>mount</0> with a <1>latency_profile</1> hint."
+msgstr ""
+
+#: src/app/navigation.tsx:50
+#: src/pages/SettingsPage.tsx:47
+msgid "Settings"
+msgstr "الإعدادات"
+
+#: src/pages/AlarmsPage.tsx:217
+#: src/pages/ProbesPage.tsx:435
+msgid "Severity"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:380
+msgid "Severity (X.733)"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:174
+msgid "Show a test notification"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:521
+msgid "Show the overrun badge (OVER / ELAPSED)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:309
+msgid "Show the reference-lock badge (PTP/NTP/SYS)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:301
+msgid "Show the UTC offset badge"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:514
+msgid "Shown past the target. Blank uses the default “+”."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:557
+msgid "Sidecar file (SRT/WebVTT)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:622
+msgid "Sidecar file path"
+msgstr ""
+
+#: src/auth/LoginPage.tsx:64
+#: src/auth/LoginPage.tsx:102
+msgid "Sign in"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:288
+msgid "Silence level (dBFS)"
+msgstr ""
+
+#: src/app/AppLayout.tsx:45
+msgid "Skip to content"
+msgstr ""
+
+#: src/layout/components/LayoutEditor.tsx:170
+msgid "Snap to grid"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:385
+#: src/layout/components/GridLayoutEditor.tsx:666
+msgid "Source"
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:102
+msgid "Source connections are supervised. A stalled read times out rather than hanging forever; the supervisor then reconnects with exponential backoff (so a dead camera is not hammered) and keeps trying indefinitely — sources recover without operator action whenever the far end comes back. Mid-stream surprises that normally break players, like a camera changing resolution or a stream resetting its timestamps, are absorbed inside the tile: the decoder re-initializes behind the frame store while the compositor keeps drawing the last good frame."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:128
+msgid "source id"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:137
+msgid "Source URL"
+msgstr ""
+
+#: src/app/navigation.tsx:38
+#: src/docs/registry.ts:138
+#: src/docs/registry.ts:206
+#: src/layout/components/SourcePalette.tsx:203
+#: src/pages/docs/ConfigPage.tsx:141
+#: src/pages/docs/FeaturesPage.tsx:38
+#: src/pages/SourcesPage.tsx:806
+msgid "Sources"
+msgstr "المصادر"
+
+#: src/pages/SourcesPage.tsx:332
+msgid "Specific date & time"
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:121
+msgid "Spend buffer where the network is bad (the internet leg), not where it is good (the facility LAN)."
+msgstr ""
+
+#: src/docs/registry.ts:266
+#: src/docs/registry.ts:571
+#: src/pages/docs/concepts/GlossaryPage.tsx:253
+#: src/pages/docs/concepts/TransportsPage.tsx:106
+#: src/pages/docs/concepts/TransportsPage.tsx:260
+msgid "SRT"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:108
+msgid "SRT (Secure Reliable Transport) is an open-source UDP transport built for contribution over unmanaged networks — the public internet included. It recovers lost packets by selective retransmission inside a configurable latency window, encrypts with AES, and connects in caller, listener, or rendezvous mode so either side can initiate through firewalls."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:478
+#: src/pages/SourcesPage.tsx:701
+msgid "Stable device id"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:187
+msgid "Stacking"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:293
+msgid "Stacking order"
+msgstr ""
+
+#: src/components/TileStateBadge.tsx:35
+msgid "Stale"
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:41
+msgid "STALE"
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:81
+msgid "Start, stop, and swap actions accept an <0>Idempotency-Key</0> so a retried request is applied at most once."
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:183
+msgid "State"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:245
+msgid "Static source hint"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:532
+msgid "Status"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:61
+msgid "Stereo"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:492
+#: src/pages/OutputsPage.tsx:593
+#: src/pages/OverlaysPage.tsx:231
+#: src/pages/ProbesPage.tsx:499
+msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:838
+msgid "Stored. Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately; other kinds go live via config export + restart."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:540
+#~ msgid "Stored. Synthetic sources (bars, solid colour, clock) apply to the running engine immediately; other kinds go live via config export + restart."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:40
+msgid "Storing color information at lower resolution than brightness, exploiting the eye's lower sensitivity to color detail. Written as ratios: 4:4:4 keeps full color, 4:2:2 halves it horizontally (production quality), and 4:2:0 quarters it (virtually all delivery video). Almost every stream Multiview ingests and emits is 4:2:0."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:308
+msgid "Strategy"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:170
+msgid "STUDIO (CAM 1)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:257
+msgid "Studio sources, production fabric"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:284
+msgid "Style"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:203
+msgid "Styling: <0>z</0> stacking order, <1>opacity</1>, <2>corner_radius</2>, and a <3>border</3>."
+msgstr ""
+
+#: src/components/HealthBanner.tsx:72
+msgid "Subsystem:"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:553
+msgid "Subtitle track (id / language)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:272
+msgid "Successive frames differing by less than this per-mille of full-scale luma count as frozen."
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:75
+msgid "Switch the interface language and text direction."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:827
+msgid "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:530
+#~ msgid "Synthetic sources (bars, solid colour, clock) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
+#~ msgstr ""
+
+#: src/app/navigation.tsx:47
+#: src/pages/SystemPage.tsx:236
+msgid "System"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:269
+msgid "Take"
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:263
+msgid "Take salvo"
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:118
+#: src/pages/LayoutsPage.tsx:148
+msgid "Takes effect at the next frame boundary."
+msgstr ""
+
+#: src/app/navigation.tsx:43
+#: src/docs/registry.ts:221
+#: src/docs/registry.ts:576
+#: src/pages/docs/concepts/GlossaryPage.tsx:265
+#: src/pages/docs/FeaturesPage.tsx:124
+#: src/pages/TallyPage.tsx:178
+msgid "Tally"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:134
+msgid "Tally binding (optional)"
+msgstr ""
+
+#: src/pages/TallyPage.tsx:361
+msgid "Tally profiles and their rule counts."
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:126
+msgid "Tally shows which sources are on-air. A tally profile maps the bits of an external tally bus to colors (for example red for program, green for preview) and maps bus index positions to specific tiles. A <0>tally_border</0> overlay then lights the tile's edge to match. This lets an upstream router or mixer drive the borders on the wall."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:178
+#: src/pages/OverlaysPage.tsx:282
+#: src/pages/SourcesPage.tsx:396
+#: src/pages/TallyPage.tsx:205
+#: src/pages/TallyPage.tsx:318
+msgid "Target"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:420
+msgid "Target date &amp; time"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:407
+msgid "Target time of day"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:249
+msgid "TCP only; stalls then reconnects"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:584
+msgid "Teletext page"
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:169
+msgid "Test notification"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:292
+msgid "Testing, placeholders, layout work"
+msgstr ""
+
+#: src/auth/LoginPage.tsx:50
+msgid "That key was not accepted. Check it and try again."
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:157
+msgid "That layout no longer exists."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:112
+msgid "The <0>[layout]</0> block selects how cells are placed, tagged by <1>kind</1>:"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:184
+msgid "The 8-bit 4:2:0 pixel layout (full-resolution brightness plane plus interleaved half-resolution color plane, 1.5 bytes per pixel) that GPUs and hardware codecs natively produce and consume. It is Multiview's working pixel format end to end — frames stay NV12 through the pipeline and color conversion happens on the GPU at tile size."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:28
+msgid "The amount of data a stream uses per second, usually in megabits per second (Mb/s). For a given codec, more bitrate means better picture quality and more bandwidth used. Encoders trade bitrate against quality and resolution; a multiview canvas is typically encoded at one fixed bitrate per rendition."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:133
+msgid "The API authenticates each request with a bearer token in the <0>Authorization</0> header. A coarse role (admin, operator, or viewer) gates what actions a token may take, and a per-object check confines a token to the resources it owns."
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:18
+msgid "The building blocks of a Multiview deployment, and what each one does."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:33
+msgid "The cell extends outside the canvas."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:35
+msgid "The cell is too small."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:688
+#~ msgid "The clock timezone offset must be a whole number between −720 and 840 minutes."
+#~ msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:151
+msgid "The compose stack uses a real liveness check: the HLS playlist must have been rewritten within the last 30 seconds. Because the segmenter rewrites the playlist every segment, a fresh timestamp proves the output clock is still producing frames. The check uses only coreutils, so it works on the slim runtime."
+msgstr ""
+
+#: src/pages/docs/FeaturesPage.tsx:70
+msgid "The composited canvas is encoded once per rendition and the same packets are fanned out to every output. Be honest about the current state of each transport:"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:362
+msgid "The condition must persist this long before the alarm raises."
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:373
+msgid "The condition must stay clear this long before the alarm clears."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:36
+msgid "The control plane serves an interactive OpenAPI reference at the backend <0>/docs</0> path. It is generated from the same spec the UI client is generated from, so it always matches the running server. Open it to browse every endpoint, see schemas, and try requests."
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:57
+msgid "The default image encodes <0>mpeg2video</0> (plays in VLC or ffplay). For browser-friendly H.264 or H.265 output, use the <1>-gpl</1> image variant — note that H.264 / H.265 make the build GPL."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:73
+msgid "The default image encodes <0>mpeg2video</0>, which plays in VLC and ffplay. For browser playback, switch to the GPL image and an H.264 codec (see the config section)."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:321
+msgid "The document is validated as a whole: source and cell ids must be unique, every <0>input_id</0> must resolve to a declared source, every grid cell must reference an existing area, and the cadence must be a usable rational. Because TOML and JSON encode the same model, a config can be authored by hand and exported as JSON over the API, or vice versa."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:46
+msgid "The engine. It ingests that feed plus three built-in test patterns into a 2x2 canvas, encodes once, and writes HLS to a named volume."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:137
+msgid "The external tally state that drives this border."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:89
+msgid "The fastest way to see Multiview running is the quick-start compose stack. It publishes a synthetic test feed, composites a 2x2 canvas, and serves the result over HTTP so you can open it in a player — no real cameras or private feeds required."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:795
+msgid "The grid cannot be solved yet — fix the validation errors to see the placement preview."
+msgstr ""
+
+#: src/pages/SalvosPage.tsx:331
+msgid "The identifier is fixed once created. Source, tally, and UMD recall clauses already on this salvo are preserved when you save."
+msgstr ""
+
+#: src/pages/AuditPage.tsx:57
+msgid "The immutable change log: who changed what, and when, on the engine media timeline. Read-only."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:63
+msgid "The key idea to keep: a <0>reference</0> is trusted timing infrastructure that carries only rate and phase — it is not a video source. Facilities lock outputs to a reference and then frame-align sources to those outputs; nobody lets program content drive a device's clock, because content can stall or lie. Multiview follows the same discipline in software: its output cadence can be disciplined by a reference, but never by a source."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:292
+msgid "The KMS connector name (DP-1, HDMI-A-1). Use \"auto\" for the first connected screen."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:118
+msgid "The latency window is the key dial: it is the time budget SRT has to repair loss. A small window (~120 ms) keeps the feed snappy but tolerates little loss; a large window (1–4 s) rides out bad networks at the cost of delay. The payload is an MPEG transport stream, so codec choices follow the MPEG-TS rules."
+msgstr ""
+
+#: src/docs/registry.ts:423
+msgid "The LIVE / STALE / RECONNECTING / NO SIGNAL ladder, last-good frames, and why output never stalls."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:125
+msgid "The low-latency extension of HLS: segments are published in partial chunks and players can request the next part before it is finished, cutting typical delay from 6–30 s to roughly 2–5 s while keeping plain-HTTP delivery and CDN scalability."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:26
+msgid "The management API, its conventions, the realtime event streams, and where to find the live, interactive reference."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:257
+msgid "the mixed program bus, always available"
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:65
+msgid "The moment a fresh frame arrives — from any state — the tile snaps straight back to LIVE. The hold, stale, and no-signal windows are automatic: the engine uses built-in, broadcast-tuned values and derives its stream-liveness checks from each source's own frame cadence, so a low-frame-rate source is not misread as stalled. There is nothing for an operator to configure."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:65
+#~ msgid "The moment a fresh frame arrives — from any state — the tile snaps straight back to LIVE. The hold, stale, and no-signal windows are configurable per deployment."
+#~ msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:113
+msgid "The most recent valid frame a tile has received, held on screen whenever its source hiccups so a brief dropout is invisible. Tiles escalate from holding the last-good frame to a reconnect indicator and finally a \"no signal\" slate if the source stays away."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:148
+msgid "The MPEG transport stream container used throughout broadcast: fixed 188-byte packets multiplexing video, audio, subtitles, and data on numbered PIDs, designed to stay decodable through noise and joins. Carried over UDP/multicast in facilities and inside SRT across the internet."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:175
+msgid "The MPEG transport stream is the container broadcast infrastructure speaks: a self-synchronizing packet format that multiplexes video, audio, subtitles, and data on numbered PIDs. Sent over UDP — usually to a multicast group so one sender feeds any number of receivers on the network — it is the classic in-facility distribution method, with latency well under a second."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:68
+msgid "The output canvas: geometry, cadence, working pixel format, background, and color space."
+msgstr ""
+
+#: src/docs/registry.ts:320
+#: src/pages/docs/concepts/TimingSyncPage.tsx:27
+msgid "The output clock"
+msgstr ""
+
+#: src/docs/registry.ts:308
+msgid "The output clock, genlock, PTP, and wall-clock time — how frames are paced and aligned."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:22
+msgid "The quick-start compose stack, the services it defines, the GPU overlays, and how to bring it up and down."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:32
+msgid "The quick-start file at <0>deploy/compose.yaml</0> brings up three services. It is self-contained — no real or private feeds."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:232
+msgid "The Real Time Streaming Protocol — the standard way IP cameras and encoders serve a live stream by URL (for example <0>rtsp://camera.local:8554/main</0>). The control channel negotiates the session and the media flows as RTP, over UDP or interleaved in TCP, with latency well under a second."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:77
+msgid "The repeating pattern between keyframes in compressed video: a self-contained keyframe (I-frame) followed by frames that only encode differences. A viewer can only start decoding at a keyframe, so the GOP length sets a floor on channel-change and segment latency. Live encoders typically use a fixed GOP of one or two seconds."
+msgstr ""
+
+#: src/pages/NotFoundPage.tsx:15
+msgid "The requested screen does not exist."
+msgstr ""
+
+#: src/docs/registry.ts:167
+msgid "The REST base, long-running operations, ETags, the WebSocket and SSE streams, and the live API playground."
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:54
+msgid "The same 8-bit pixel can use two different scales. <0>Limited (\"TV\") range</0> puts black at code 16 and white at 235 — the broadcast convention virtually all video uses. <1>Full (\"PC\") range</1> uses the whole 0–255 scale — common for computer graphics, screen captures, and some webcams."
+msgstr ""
+
+#: src/docs/registry.ts:89
+msgid "The services in the quick-start compose file and how to bring them up and down."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:267
+msgid "The signalling that shows which sources are on-air: classically a red light on the program camera and green on preview. On a multiview wall, tally renders as colored borders around tiles, driven by an upstream switcher or router."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:49
+msgid "The source has been quiet long enough that the engine is actively re-establishing it. The tile still shows the last good frame, now with a reconnect indicator, so an operator can tell a frozen feed from a live one."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:104
+msgid "The stack publishes the management API and this web UI on <0>8080</0> (the mounted config carries a <1>[control]</1> listener; authenticate with the <2>MULTIVIEW_CONTROL_TOKEN</2> bearer token), the test RTSP feed on <3>8554</3> (for host inspection), and the HLS HTTP server on <4>8888</4>. HLS/LL-HLS plus RTMP and SRT push outputs run today; the live RTSP and NDI output <5>servers</5> are on the roadmap."
+msgstr ""
+
+#: src/pages/docs/ComposePage.tsx:104
+#~ msgid "The stack publishes the test RTSP feed on <0>8554</0> (for host inspection) and the HLS HTTP server on <1>8888</1>. There is no control-API or web-UI port yet: the current binary composites, encodes, and writes HLS or file output to disk, but does not yet bind a network listener. The live RTSP, NDI, and RTMP output <2>servers</2> and the API listener are on the roadmap."
+#~ msgstr ""
+
+#: src/layout/components/validationMessages.tsx:79
+msgid "The stored area map was ragged and has been normalized for editing; saving will persist the repaired map."
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:267
+msgid "The stored preset body could not be expanded."
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:289
+msgid "The text label strip under (or on) each tile showing the source name — named for the physical display modules mounted under monitors in traditional galleries. UMD text can be static or driven dynamically by a router or automation system."
+msgstr ""
+
+#: src/docs/registry.ts:94
+#: src/pages/docs/ComposePage.tsx:30
+msgid "The three services"
+msgstr ""
+
+#: src/docs/registry.ts:428
+#: src/pages/docs/concepts/ResiliencePage.tsx:26
+msgid "The tile lifecycle"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:209
+msgid "The timestamp on each frame saying when it should be shown. Real-world streams wrap, jump, and reset their PTS, so Multiview normalizes every input's timestamps onto one internal timeline and stamps its output purely from its own output clock — raw input timestamps never reach the output."
+msgstr ""
+
+#: src/docs/registry.ts:118
+msgid "The TOML schema: canvas, layout, sources, cells, overlays, and outputs."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:72
+msgid "The tracks overflow the canvas (fixed sizes or percentages exceed it) — an area would land outside the output frame."
+msgstr ""
+
+#: src/pages/docs/ApiPage.tsx:98
+msgid "The UI subscribes to engine events for tile states, operation results, alarms, and telemetry. These streams are strictly best-effort: they can drop or conflate events under load and are physically incapable of slowing the engine, so a client must tolerate gaps and reconcile against the REST state."
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:40
+msgid "The UI will authenticate with this token."
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:195
+msgid "The unauthenticated surface is just <0>/</0>, <1>/docs</1>, and <2>/api/v1/openapi.json</2>; every <3>/api/v1</3> data route requires the token. The image must be built with the <4>web</4> feature for the UI to be embedded (the published image is)."
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:482
+#: src/pages/SourcesPage.tsx:705
+msgid "The vendor's stable handle (UUID / PCI bus id), never the index."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:97
+msgid "The working color space. <0>profile</0> names a preset (e.g. <1>sdr-bt709-limited</1>); <2>custom</2> lets you set primaries, transfer, matrix, and range explicitly."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:377
+msgid "The working rate every input is resampled to (48000 is the broadcast default)."
+msgstr ""
+
+#: src/resources/FormControls.tsx:64
+msgid "The zone must fit inside the frame: x, y at least 0, width and height above 0, and x+width / y+height at most 1."
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:63
+msgid "Theme"
+msgstr ""
+
+#: src/components/ThemeToggle.tsx:23
+msgid "Theme: dark. Switch to system."
+msgstr ""
+
+#: src/components/ThemeToggle.tsx:21
+msgid "Theme: light. Switch to dark."
+msgstr ""
+
+#: src/components/ThemeToggle.tsx:24
+msgid "Theme: system. Switch to light."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:92
+msgid "These are classes, not promises — encoder settings (especially keyframe interval), network conditions, and the viewer's player all move the number."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:487
+msgid "These cells reference areas that are no longer in the grid. Move each to a live area (its source binding is kept) or remove it."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:640
+msgid "This area has no cell yet."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:94
+msgid "This area has no cell, so nothing will render in it."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:86
+msgid "This cell declares both an area and a rect — keep exactly one (the engine rejects the pair)."
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:92
+msgid "This cell references an area that is not in the grid."
+msgstr ""
+
+#: src/resources/FormControls.tsx:417
+msgid "This control plane does not serve config export yet. Update the server to use it."
+msgstr ""
+
+#: src/resources/CrudPage.tsx:202
+msgid "This entry's kind has no form here; the stored document is preserved as authored."
+msgstr ""
+
+#: src/resources/FormControls.tsx:36
+msgid "This field is required."
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:217
+msgid "This grid layout's body could not be parsed (its track or area lists are malformed). Fix the stored document via the API."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:90
+msgid "This is also why one bad source can never take down the wall: the disturbance is contained to that tile's rectangle. The output keeps emitting a complete, valid frame every tick regardless — even if every source died at once, the canvas would show slates and a still-ticking clock, not stop."
+msgstr ""
+
+#: src/pages/docs/concepts/ColorPage.tsx:78
+msgid "This is one of the most common picture-quality bugs in any video chain. Multiview expands each tile's range exactly once on ingest, composites in a common working space, and compresses exactly once on output — and tags the result, because an untagged-but-correct stream still gets guessed wrong by some players."
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:853
+msgid "This is one-way: the grid's tracks and areas become fixed rectangles you move and resize individually. Nothing is saved until you save the layout."
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:41
+msgid "This is why the wall keeps running through any input failure: the output's timing is independent of every input by construction. Frame rates are handled as exact fractions (NTSC 29.97 is <0>30000/1001</0>, never a rounded decimal), so the cadence cannot drift over long runs."
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:148
+#~ msgid "This layout uses a grid or preset placement that the free-form editor cannot modify yet. Editing is read-only."
+#~ msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:286
+msgid "This layout uses the factory preset \"{preset}\". To edit it, convert it to an editable form first — nothing changes until you save."
+msgstr ""
+
+#: src/pages/LayoutEditorPage.tsx:322
+msgid "This layout's body could not be parsed into an editable form. Fix the stored document via the API."
+msgstr ""
+
+#: src/auth/LoginPage.tsx:67
+msgid "This Multiview control plane requires an API key. Paste your admin or operator key to continue."
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:148
+msgid "This overlay kind has no configurable parameters in this build. Parameters authored in a config file are preserved unchanged."
+msgstr ""
+
+#: src/pages/LayoutsPage.tsx:290
+msgid "This permanently removes the layout. Running outputs are not affected until a new layout is applied."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:417
+msgid "This permanently removes the profile's mapping rules."
+msgstr ""
+
+#: src/pages/SimplePages.tsx:424
+#~ msgid "This permanently removes the resource. Running outputs are not affected until a new configuration is applied."
+#~ msgstr ""
+
+#: src/pages/SalvosPage.tsx:418
+msgid "This permanently removes the salvo definition."
+msgstr ""
+
+#: src/resources/CrudPage.tsx:367
+msgid "This permanently removes the stored resource. The running engine is not affected until a new configuration is applied."
+msgstr ""
+
+#: src/pages/PlaceholderPage.tsx:27
+msgid "This screen is part of an upcoming milestone."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:79
+#~ msgid "This source is not part of the running engine, so it has no live state. It joins after a config export + restart binds it to a tile."
+#~ msgstr ""
+
+#: src/pages/SourcesPage.tsx:89
+msgid "This source is not part of the running engine, so it has no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart."
+msgstr ""
+
+#: src/pages/SettingsPage.tsx:170
+msgid "This toast is announced to assistive technology."
+msgstr ""
+
+#: src/resources/FormControls.tsx:51
+msgid "This URL must start with http:// or https://."
+msgstr ""
+
+#: src/pages/TallyPage.tsx:217
+msgid "Tile index"
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:98
+msgid "Tile status"
+msgstr ""
+
+#: src/pages/DashboardPage.tsx:84
+msgid "Tiles"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:330
+msgid "Time of day (recurring)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:260
+#: src/pages/SourcesPage.tsx:433
+msgid "Timezone (IANA id)"
+msgstr ""
+
+#: src/pages/OverlaysPage.tsx:61
+msgid "Timezone offset (minutes from UTC, optional)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:278
+#: src/pages/SourcesPage.tsx:451
+msgid "Timezone offset (minutes from UTC)"
+msgstr ""
+
+#: src/pages/SimplePages.tsx:796
+#~ msgid "Timezone offset (minutes)"
+#~ msgstr ""
+
+#: src/docs/registry.ts:307
+#: src/pages/docs/concepts/TimingSyncPage.tsx:17
+msgid "Timing & sync"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:425
+msgid "Title"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:380
+msgid "Top (%)"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:598
+msgid "Track id or language tag"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:211
+msgid "Track title (route {row})"
+msgstr ""
+
+#: src/pages/OutputsPage.tsx:443
+msgid "Tracks (comma-separated)"
+msgstr ""
+
+#: src/layout/components/validationMessages.tsx:64
+msgid "Tracks must be a number with a unit: 1fr, 200px or 25%."
+msgstr ""
+
+#: src/docs/registry.ts:462
+#: src/pages/docs/concepts/LatencyPage.tsx:100
+msgid "Trade-offs"
+msgstr ""
+
+#: src/docs/registry.ts:581
+#: src/pages/docs/concepts/GlossaryPage.tsx:276
+msgid "Transcoding"
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:28
+msgid "Transcoding is decoding compressed video back to raw pictures and recompressing it — usually into a different codec, size, or bitrate. Every transcode costs three things: <0>quality</0> (each recompression is a new lossy generation), <1>latency</1> (decoding and re-encoding both buffer frames), and <2>compute</2> (encoding is by far the most expensive step in a video pipeline). Good systems therefore transcode only when they must, and exactly once."
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:653
+msgid "Transfer"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:228
+#: src/pages/OutputsPage.tsx:509
+#: src/pages/OutputsPage.tsx:635
+msgid "Transport"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:220
+msgid "Transport comparison: latency class, network fit, robustness, and typical use."
+msgstr ""
+
+#: src/docs/registry.ts:243
+#: src/pages/docs/concepts/TransportsPage.tsx:44
+msgid "Transports compared"
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:35
+msgid "Two image families are published. The default image is LGPL-clean and software-only; the NVIDIA image adds CUDA-based decode, encode, and compositing."
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:240
+msgid "Typical use"
+msgstr ""
+
+#: src/docs/registry.ts:586
+#: src/pages/docs/concepts/GlossaryPage.tsx:287
+msgid "UMD (Under-Monitor Display)"
+msgstr ""
+
+#: src/pages/AlarmsPage.tsx:251
+msgid "Unacknowledged"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:565
+msgid "Use the source wall-clock when trusted"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:286
+msgid "Used"
+msgstr ""
+
+#: src/docs/registry.ts:158
+#: src/pages/docs/ConfigPage.tsx:319
+msgid "Validation and import / export"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:277
+msgid "Very high (plain HTTP)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:282
+msgid "Very low (<1 s)"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:254
+msgid "Very low (~1 frame)"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:90
+msgid "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:231
+msgid "Visibility"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:238
+msgid "Visible"
+msgstr ""
+
+#: src/docs/registry.ts:70
+#: src/pages/docs/ContainerPage.tsx:131
+msgid "Volumes"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:158
+msgid "VRAM"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:164
+msgid "VRAM used of total"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:165
+msgid "VRAM: ours / device used / device total"
+msgstr ""
+
+#: src/pages/MonitoringPage.tsx:113
+msgid "Waiting for a frame…"
+msgstr ""
+
+#: src/pages/SystemPage.tsx:346
+msgid "Waiting for the first metrics sample…"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:714
+msgid "Wall-clock handling"
+msgstr ""
+
+#: src/docs/registry.ts:343
+#: src/pages/docs/concepts/TimingSyncPage.tsx:116
+msgid "Wall-clock time"
+msgstr ""
+
+#: src/pages/docs/concepts/TimingSyncPage.tsx:118
+msgid "Wall-clock time is ordinary time-of-day (UTC), kept by the host's system clock and disciplined by NTP or PTP. Multiview uses it for <0>labels only</0>: on-screen clock overlays, log timestamps, and the date-time stamps in HLS playlists. It never paces frames, because a system clock can step backwards or jump when corrected — exactly what an output clock must never do."
+msgstr ""
+
+#: src/components/HealthBanner.tsx:35
+#: src/pages/ProbesPage.tsx:74
+msgid "Warning"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:137
+msgid "Watch / live / channel URL"
+msgstr ""
+
+#: src/docs/registry.ts:457
+#: src/pages/docs/concepts/LatencyPage.tsx:50
+msgid "What each protocol adds"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:323
+msgid "What each protocol adds to latency"
+msgstr ""
+
+#: src/docs/registry.ts:26
+#: src/pages/docs/OverviewPage.tsx:33
+msgid "What Multiview is"
+msgstr ""
+
+#: src/docs/registry.ts:21
+msgid "What Multiview is, the design pillars, and how to get started."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:18
+msgid "What the LIVE, STALE, RECONNECTING, and NO SIGNAL badges mean, and why the output never stalls on a bad input."
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:18
+msgid "What transcoding actually is, the common video codecs, hardware acceleration, and how Multiview encodes its output."
+msgstr ""
+
+#: src/docs/registry.ts:361
+#: src/pages/docs/concepts/CodecsPage.tsx:26
+msgid "What transcoding is"
+msgstr ""
+
+#: src/docs/registry.ts:356
+msgid "What transcoding is, the common video codecs, hardware acceleration, and the encode-once model."
+msgstr ""
+
+#: src/pages/docs/ContainerPage.tsx:175
+msgid "When the config has a <0>[control]</0> section, the binary binds that listener and serves the web UI, REST API, and docs alongside the engine. Authenticate callers with a bearer token — supply it through the <1>MULTIVIEW_CONTROL_TOKEN</1> environment variable so it is never baked into an image or written to the config file. The presented token is <2>admin.<secret></2>; if the variable is unset, the server generates one and logs it once at startup. Publish the listener's port (default <3>8080</3>) to reach it."
+msgstr ""
+
+#: src/pages/docs/concepts/LatencyPage.tsx:18
+msgid "Where the delay between a camera and your screen comes from, what each protocol adds, and the trade-offs against robustness."
+msgstr ""
+
+#: src/docs/registry.ts:41
+#: src/pages/docs/OverviewPage.tsx:110
+msgid "Where to go next"
+msgstr ""
+
+#: src/pages/docs/concepts/GlossaryPage.tsx:53
+msgid "Whether pixel values use the limited \"TV\" scale (black at 16, white at 235 in 8-bit) or the full \"PC\" scale (0–255). Reading a stream with the wrong range makes it look washed-out (limited read as full) or crushed (full read as limited). One of the most common picture-quality faults in any video chain."
+msgstr ""
+
+#: src/pages/docs/concepts/CodecsPage.tsx:158
+msgid "Which transports carry which codecs"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:283
+#: src/pages/SourcesPage.tsx:456
+msgid "Whole minutes between −720 and 840 (e.g. 600 = UTC+10)."
+msgstr ""
+
+#: src/pages/docs/concepts/ResiliencePage.tsx:125
+msgid "Why the output clock never depends on inputs"
+msgstr ""
+
+#: src/pages/docs/concepts/TransportsPage.tsx:278
+msgid "Wide distribution, browser viewing"
+msgstr ""
+
+#: src/layout/components/CellsForm.tsx:381
+msgid "Width (%)"
+msgstr ""
+
+#: src/layout/components/CellPropertiesPanel.tsx:266
+#: src/layout/components/GridLayoutEditor.tsx:302
+#: src/layout/components/LayoutEditor.tsx:214
+#: src/pages/OutputsPage.tsx:314
+msgid "Width (px)"
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:88
+msgid "Working pixel format: <0>nv12</0> (8-bit) or <1>p010</1> (10-bit)."
+msgstr ""
+
+#: src/pages/docs/ConfigPage.tsx:260
+msgid "Writes an HLS playlist and segments to <0>path</0> with a <1>codec</1> and a <2>segment_ms</2> duration."
+msgstr ""
+
+#: src/pages/docs/OverviewPage.tsx:102
+msgid "You can also run the binary directly against a config file with <0>multiview run path/to/multiview.toml</0>. See the sections below for the container, compose, config, and API details."
+msgstr ""
+
+#. placeholder {0}: cell.z
+#: src/layout/components/CellsForm.tsx:351
+msgid "z = {0}"
+msgstr ""
+
+#: src/layout/components/GridLayoutEditor.tsx:738
+msgid "Z order"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:204
+msgid "Zone height (0–1)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:174
+msgid "Zone left (x, 0–1)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:184
+msgid "Zone top (y, 0–1)"
+msgstr ""
+
+#: src/pages/ProbesPage.tsx:194
+msgid "Zone width (0–1)"
+msgstr ""

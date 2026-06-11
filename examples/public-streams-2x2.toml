@@ -1,0 +1,113 @@
+# examples/public-streams-2x2.toml — a 2x2 of synthetic + license-clean public samples.
+#
+# Deliberately heterogeneous to exercise the engine's normalization:
+#   - Synthetic untagged : built-in `test` source standing in for a 25 fps PAL,
+#                          UNTAGGED-color feed (the untagged-defaulting trap).
+#   - Synthetic BT.709   : built-in `test` source standing in for a 29.97 fps NTSC,
+#                          BT.709-limited feed.
+#   - RTSP camera        : RTSP, HEVC 50p, BT.709 limited — an EXAMPLE host
+#                          (rtsp://camera.example.net, RFC-2606 example domain).
+#   - Public BBB         : HLS, H.264 60p, untagged, 44.1 kHz audio — Big Buck Bunny
+#                          (a Blender open movie; license-clean public sample).
+#
+# The synthetic tiles need no network. The RTSP host is an example placeholder; swap
+# it for your own camera. See docs/reference/example-streams.md for the full gotcha
+# matrix and offline synthetic recipes that reproduce each colour/fps failure mode.
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "60000/1001"          # output cadence; inputs are resampled onto it
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"   # all tiles normalized to this working space
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr", "1fr"]
+gap = 8
+areas = ["pal ntsc", "cam bbb"]
+
+[[sources]]
+id = "in_pal"
+display_name = "Synthetic untagged (25p stand-in)"
+kind = "test"               # built-in synthetic pattern; no network needed
+[sources.color_override]
+# Untagged source: let detection apply the player-style default policy.
+primaries = "auto"
+transfer = "auto"
+matrix = "auto"
+range = "auto"
+
+[[sources]]
+id = "in_ntsc"
+display_name = "Synthetic BT.709 limited (29.97p stand-in)"
+kind = "test"
+
+[[sources]]
+id = "in_cam"
+display_name = "RTSP camera (HEVC 50p, example host)"
+kind = "rtsp"
+url = "rtsp://camera.example.net:8554/stream"
+[sources.rtsp]
+transport = "tcp"
+
+[[sources]]
+id = "in_bbb"
+display_name = "Big Buck Bunny (public sample)"
+kind = "hls"
+url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+
+[[cells]]
+id = "cell_pal"
+area = "pal"
+fit = "contain"
+[cells.source]
+input_id = "in_pal"
+[[cells]]
+id = "cell_ntsc"
+area = "ntsc"
+fit = "contain"
+[cells.source]
+input_id = "in_ntsc"
+[[cells]]
+id = "cell_cam"
+area = "cam"
+fit = "cover"
+[cells.source]
+input_id = "in_cam"
+[[cells]]
+id = "cell_bbb"
+area = "bbb"
+fit = "contain"
+[cells.source]
+input_id = "in_bbb"
+
+[[overlays]]
+id = "ov_clock"
+kind = "clock"
+target = "canvas"
+anchor = "bottom_right"
+offset = { x = -20, y = -16 }
+z = 100
+format = "%H:%M:%S"
+tz = "Australia/Sydney"
+source = "wall"
+
+[[outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+latency_profile = "low_latency"
+
+[[outputs]]
+kind = "ll_hls"
+path = "/hls/multiview"
+codec = "h264"
+part_target_ms = 250
+segment_ms = 2000
+gop_ms = 2000

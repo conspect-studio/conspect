@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a problem with Multiview
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the report. Please include enough detail to reproduce.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Include the config/template and source URLs (redact secrets) if relevant.
+      placeholder: |
+        1. multiview run examples/2x2.toml
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + arch, GPU/driver, FFmpeg version, build features (e.g. nvidia/apple/vaapi), commit.
+      placeholder: |
+        OS: Ubuntu 24.04 x86_64 / macOS 15 arm64
+        GPU: NVIDIA RTX A2000 (driver 555) / Apple M3
+        FFmpeg: 7.1
+        Build: --features nvidia
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant `tracing` output (set `RUST_LOG=debug`). Redact any credentials.
+      render: shell

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.local
+.vite/
+
+# Playwright e2e artifacts (traces, screenshots, the HTML report) are transient.
+test-results/
+playwright-report/
+
+# `pseudo` is a dev-only pseudo-localization locale used by the extract
+# workflow; the shipped app never imports its compiled catalog. `lingui
+# compile` regenerates it, so keep the artifact out of the tree (the `en`/`ar`
+# compiled catalogs the app imports are committed).
+src/locales/pseudo/messages.ts

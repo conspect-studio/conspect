@@ -1,0 +1,1977 @@
+{
+  "asyncapi": "3.0.0",
+  "channels": {
+    "sse": {
+      "address": "/api/v1/events",
+      "description": "Server-Sent Events fallback for proxies or environments that strip the WebSocket Upgrade header. Server-to-client only: identical envelope shape, no client subscription control frames or WHEP signaling.",
+      "messages": {
+        "EnvelopeMessage": {
+          "$ref": "#/components/messages/Envelope"
+        }
+      },
+      "servers": [
+        {
+          "$ref": "#/servers/sse-server"
+        }
+      ],
+      "title": "SSE realtime channel (fallback)"
+    },
+    "ws": {
+      "address": "/api/v1/ws",
+      "bindings": {
+        "ws": {
+          "bindingVersion": "0.1.0",
+          "headers": {
+            "properties": {
+              "Authorization": {
+                "description": "Bearer token: `Bearer <jwt>`",
+                "type": "string"
+              },
+              "Sec-WebSocket-Protocol": {
+                "description": "Subprotocol selection; makes the envelope major explicit.",
+                "enum": [
+                  "multiview.v1",
+                  "multiview.bin.v1"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "method": "GET",
+          "query": {
+            "description": "Optional authentication token as a query parameter.",
+            "properties": {
+              "token": {
+                "description": "Bearer token (alternative to Authorization header).",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "description": "Bidirectional WebSocket channel. The server sends event envelopes; the client sends subscription control frames ($subscribe, $unsubscribe, $set_rate, $resume, $pong). Negotiated subprotocol: `multiview.v1` (or `multiview.bin.v1` for compact binary meter frames).",
+      "messages": {
+        "EnvelopeMessage": {
+          "$ref": "#/components/messages/Envelope"
+        }
+      },
+      "servers": [
+        {
+          "$ref": "#/servers/ws-server"
+        }
+      ],
+      "title": "WebSocket realtime channel"
+    }
+  },
+  "components": {
+    "messages": {
+      "AlarmTransition": {
+        "contentType": "application/json",
+        "name": "AlarmTransition",
+        "payload": {
+          "$ref": "#/components/schemas/AlarmTransition"
+        },
+        "summary": "An alarm was raised, updated, cleared, or acknowledged (topic `alarms`).",
+        "title": "Monitoring alarm lifecycle event"
+      },
+      "Alert": {
+        "contentType": "application/json",
+        "description": "The `key` field is a stable dedupe identifier for the condition; multiple `alert.raised` frames with the same key coalesce rather than stacking.",
+        "name": "Alert",
+        "payload": {
+          "$ref": "#/components/schemas/Alert"
+        },
+        "summary": "An alert was raised (alert.raised) or cleared (alert.cleared) on topic `alerts`.",
+        "title": "Operator alert raised or cleared"
+      },
+      "AudioMeter": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `audio.meters`. This is the sole high-rate conflated topic; frames are conflated/sampled at 10–30 Hz on the wire. A slow consumer can only lose its own meter frames — the engine never back-pressures. The binary fast-path (subprotocol `multiview.bin.v1`) carries the same fields in compact form; this schema describes the decoded (JSON) shape.",
+        "name": "AudioMeter",
+        "payload": {
+          "$ref": "#/components/schemas/AudioMeter"
+        },
+        "summary": "Per-input/track peak/RMS/clip meter sample (numeric only, never audio data).",
+        "title": "High-rate audio meter sample"
+      },
+      "DeviceAdopted": {
+        "contentType": "application/json",
+        "name": "DeviceAdopted",
+        "payload": {
+          "$ref": "#/components/schemas/DeviceAdopted"
+        },
+        "summary": "A device was adopted (device.adopted on topic `devices`; lossless lifecycle lane).",
+        "title": "Device adopted into the registry"
+      },
+      "DeviceDiscovered": {
+        "contentType": "application/json",
+        "description": "Discovery results are an UNTRUSTED inventory requiring explicit confirm-adopt — never auto-ingested. IPv6-first: IPv4 results are explicitly labelled `ipv4-legacy`.",
+        "name": "DeviceDiscovered",
+        "payload": {
+          "$ref": "#/components/schemas/DeviceDiscovered"
+        },
+        "summary": "A discovery row streamed while a scan operation runs (device.discovered on topic `devices`, correlated via `corr`).",
+        "title": "Untrusted discovery-inventory row"
+      },
+      "DeviceError": {
+        "contentType": "application/json",
+        "name": "DeviceError",
+        "payload": {
+          "$ref": "#/components/schemas/DeviceError"
+        },
+        "summary": "A device error was reported (device.error on topic `devices`; lossless lifecycle lane).",
+        "title": "Driver-reported device error"
+      },
+      "DeviceMode": {
+        "contentType": "application/json",
+        "description": "Carries the impact declared BEFORE apply per the instant-apply doctrine: vendor-decoder mode convergence is `dev`-class (the device pipeline restarts; Multiview program output is unaffected).",
+        "name": "DeviceMode",
+        "payload": {
+          "$ref": "#/components/schemas/DeviceMode"
+        },
+        "summary": "Mode convergence started/finished/failed with its declared impact (device.mode on topic `devices`).",
+        "title": "Device mode convergence"
+      },
+      "DeviceRemoved": {
+        "contentType": "application/json",
+        "name": "DeviceRemoved",
+        "payload": {
+          "$ref": "#/components/schemas/DeviceRemoved"
+        },
+        "summary": "A device was removed (device.removed on topic `devices`; lossless lifecycle lane).",
+        "title": "Device removed from the registry"
+      },
+      "DeviceStatus": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `devices` with envelope `id` = device id. CONFLATED latest-wins telemetry (vendor-polled at ~1 s cadence): the latest value supersedes all prior values, and the event is excluded from the lossless replay ring — a re-snapshot heals it (ADR-RT007 extends ADR-RT003's ring-exclusion rule to per-event-type granularity on this mixed-cadence topic). Staleness is surfaced via `last_seen_ts`, never papered over.",
+        "name": "DeviceStatus",
+        "payload": {
+          "$ref": "#/components/schemas/DeviceStatus"
+        },
+        "summary": "Latest-wins device status: state/mode/capabilities/streams/sync/temperature (device.status on topic `devices`).",
+        "title": "Conflated per-device runtime snapshot"
+      },
+      "DeviceSync": {
+        "contentType": "application/json",
+        "name": "DeviceSync",
+        "payload": {
+          "$ref": "#/components/schemas/DeviceSync"
+        },
+        "summary": "Sync-group membership / achieved-tier change or drift-threshold crossing (device.sync on topic `devices`).",
+        "title": "Device sync participation change"
+      },
+      "Envelope": {
+        "contentType": "application/json",
+        "description": "Every message in both directions uses this envelope. The `t` field is the discriminator selecting the `data` schema. The `seq` field is a per-connection monotonic cursor; gaps indicate dropped frames and trigger resume/resync. The `ts` field carries engine-monotonic nanoseconds (same clock family as output PTS). `v` is the envelope schema major; clients MUST reject unknown majors.",
+        "name": "Envelope",
+        "payload": {
+          "properties": {
+            "corr": {
+              "description": "Optional correlation id echoing a REST command / job.",
+              "type": "string"
+            },
+            "data": {
+              "description": "Typed payload selected by `t`. Schema depends on the event type.",
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/TileState"
+                },
+                {
+                  "$ref": "#/components/schemas/TilesSnapshot"
+                },
+                {
+                  "$ref": "#/components/schemas/AudioMeter"
+                },
+                {
+                  "$ref": "#/components/schemas/OutputStatus"
+                },
+                {
+                  "$ref": "#/components/schemas/Alert"
+                },
+                {
+                  "$ref": "#/components/schemas/HealthWarning"
+                },
+                {
+                  "$ref": "#/components/schemas/InputConnection"
+                },
+                {
+                  "$ref": "#/components/schemas/InputStreams"
+                },
+                {
+                  "$ref": "#/components/schemas/JobProgress"
+                },
+                {
+                  "$ref": "#/components/schemas/AlarmTransition"
+                },
+                {
+                  "$ref": "#/components/schemas/TallyEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/SalvoEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/DeviceStatus"
+                },
+                {
+                  "$ref": "#/components/schemas/DeviceAdopted"
+                },
+                {
+                  "$ref": "#/components/schemas/DeviceRemoved"
+                },
+                {
+                  "$ref": "#/components/schemas/DeviceMode"
+                },
+                {
+                  "$ref": "#/components/schemas/DeviceError"
+                },
+                {
+                  "$ref": "#/components/schemas/DeviceSync"
+                },
+                {
+                  "$ref": "#/components/schemas/DeviceDiscovered"
+                },
+                {
+                  "$ref": "#/components/schemas/TimingStatus"
+                },
+                {
+                  "$ref": "#/components/schemas/Hello"
+                },
+                {
+                  "$ref": "#/components/schemas/Subscribe"
+                },
+                {
+                  "$ref": "#/components/schemas/Subscribed"
+                },
+                {
+                  "$ref": "#/components/schemas/Unsubscribe"
+                },
+                {
+                  "$ref": "#/components/schemas/SetRate"
+                },
+                {
+                  "$ref": "#/components/schemas/Resume"
+                },
+                {
+                  "$ref": "#/components/schemas/Resync"
+                },
+                {
+                  "$ref": "#/components/schemas/Lag"
+                },
+                {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              ],
+              "type": "object"
+            },
+            "id": {
+              "description": "Optional resource scope (tile/input/output/job id).",
+              "type": "string"
+            },
+            "seq": {
+              "description": "Per-connection monotonic resume cursor. A gap means frames were dropped.",
+              "format": "uint64",
+              "type": "integer"
+            },
+            "t": {
+              "description": "Dotted event type; the discriminator selecting the `data` schema.",
+              "type": "string"
+            },
+            "topic": {
+              "description": "Subscription routing key. Control frames use `$control`.",
+              "enum": [
+                "$control",
+                "system",
+                "capabilities",
+                "inputs",
+                "tiles",
+                "outputs",
+                "audio.meters",
+                "audio.loudness",
+                "alerts",
+                "alarms",
+                "tally",
+                "layout",
+                "config",
+                "logs",
+                "jobs",
+                "preview",
+                "devices"
+              ],
+              "type": "string"
+            },
+            "ts": {
+              "description": "Engine monotonic nanoseconds (same clock family as output PTS).",
+              "format": "int64",
+              "type": "integer"
+            },
+            "v": {
+              "const": 1,
+              "description": "Envelope schema major. A receiver MUST reject an unknown major.",
+              "format": "uint16",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "v",
+            "t",
+            "topic",
+            "seq",
+            "ts",
+            "data"
+          ],
+          "type": "object"
+        },
+        "summary": "The single wire frame used for all realtime messages (ADR-RT002).",
+        "title": "Versioned realtime envelope"
+      },
+      "HealthWarning": {
+        "contentType": "application/json",
+        "description": "A richer sibling of `Alert` carrying a stable `code`, the affected `subsystem`, and a concrete `remediation`. The `code` is the dedupe key: frames with the same code coalesce rather than stacking. Capability-mismatch codes (e.g. `gpu-present-no-vulkan-adapter`) are latched build-time facts — raised once, cleared on reconfigure/restart.",
+        "name": "HealthWarning",
+        "payload": {
+          "$ref": "#/components/schemas/HealthWarning"
+        },
+        "summary": "A health warning was raised (health.warning.raised) or cleared (health.warning.cleared) on topic `alerts`.",
+        "title": "Actionable health warning raised or cleared"
+      },
+      "Hello": {
+        "contentType": "application/json",
+        "name": "Hello",
+        "payload": {
+          "$ref": "#/components/schemas/Hello"
+        },
+        "summary": "First server frame after auth; advertises connection parameters.",
+        "title": "$hello control frame"
+      },
+      "InputConnection": {
+        "contentType": "application/json",
+        "name": "InputConnection",
+        "payload": {
+          "$ref": "#/components/schemas/InputConnection"
+        },
+        "summary": "An input source transitioned connection state (input.connection on topic `inputs`).",
+        "title": "Input source connection state change"
+      },
+      "InputStreams": {
+        "contentType": "application/json",
+        "description": "Read-only discovery: every elementary stream (video / audio tracks / subtitles / SCTE-35 / KLV / timecode) the input offers, each with a stable kind-scoped id. Emitted on first appearance and as a delta on re-probe / PMT-version bump.",
+        "name": "InputStreams",
+        "payload": {
+          "$ref": "#/components/schemas/InputStreams"
+        },
+        "summary": "An input's stream inventory appeared or changed on re-probe (input.streams on topic `inputs`).",
+        "title": "Input elementary-stream inventory"
+      },
+      "JobProgress": {
+        "contentType": "application/json",
+        "name": "JobProgress",
+        "payload": {
+          "$ref": "#/components/schemas/JobProgress"
+        },
+        "summary": "Progress of a REST command job correlated by `corr` (topic `jobs`).",
+        "title": "Long-running job progress"
+      },
+      "OutputStatus": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `outputs`. Make-before-break migration emits `migrating` during the parallel-output window.",
+        "name": "OutputStatus",
+        "payload": {
+          "$ref": "#/components/schemas/OutputStatus"
+        },
+        "summary": "An output sink changed run state (starting/running/migrating/error).",
+        "title": "Output sink status update"
+      },
+      "SalvoEvent": {
+        "contentType": "application/json",
+        "name": "SalvoEvent",
+        "payload": {
+          "$ref": "#/components/schemas/SalvoEvent"
+        },
+        "summary": "A salvo was armed, taken, or cancelled (topic `tally`).",
+        "title": "Salvo arm/take lifecycle"
+      },
+      "ShedLoad": {
+        "contentType": "application/json",
+        "description": "A discrete, lossless degradation-signal event (invariant #9): the engine relieved sustained overload by shedding work rather than blocking the output clock (invariants #1 + #10). The `reason` says why a shed was chosen over hold/migrate; `scope` says what was shed (program / a specific input / a shared resource); `level` is the degradation-ladder rung after the shed and `dropped` the cumulative frames/units shed. The consent-independent retention store records these for the §7.2 support bundle (ADR-0052).",
+        "name": "ShedLoad",
+        "payload": {
+          "$ref": "#/components/schemas/ShedLoad"
+        },
+        "summary": "The engine shed work to relieve sustained overload (shed.load on topic `alerts`).",
+        "title": "Resource-adaptive shed-load decision"
+      },
+      "Subscribe": {
+        "contentType": "application/json",
+        "name": "Subscribe",
+        "payload": {
+          "$ref": "#/components/schemas/Subscribe"
+        },
+        "summary": "Client requests subscription to one or more topics.",
+        "title": "$subscribe control frame (client to server)"
+      },
+      "SystemMetrics": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `system`. A high-rate conflated lane like `audio.meters`: samples are latest-only at ~1-2 Hz on the wire and excluded from the lossless replay ring. PUSHED, never polled — a slow UI loses only its own samples and the engine never back-pressures (inv #10). Live values only; historic windows (the data decisions are made from) are a separate cold REST query.",
+        "name": "SystemMetrics",
+        "payload": {
+          "$ref": "#/components/schemas/SystemMetrics"
+        },
+        "summary": "CPU / GPU / encoder-decoder utilisation sample (numeric only).",
+        "title": "High-rate whole-system metrics sample"
+      },
+      "TallyEvent": {
+        "contentType": "application/json",
+        "name": "TallyEvent",
+        "payload": {
+          "$ref": "#/components/schemas/TallyEvent"
+        },
+        "summary": "Resolved tally state for one tile/element changed (topic `tally`).",
+        "title": "Tally lamp/UMD state change"
+      },
+      "TileState": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `tiles` whenever a tile's state machine transitions. Invariant #2: Live → Stale → Reconnecting → NoSignal. The compositor holds the last-good frame while STALE/RECONNECTING; renders a placeholder on NO_SIGNAL.",
+        "name": "TileState",
+        "payload": {
+          "$ref": "#/components/schemas/TileState"
+        },
+        "summary": "A tile transitioned between lifecycle states (LIVE/STALE/RECONNECTING/NO_SIGNAL).",
+        "title": "Tile state machine transition"
+      },
+      "TilesSnapshot": {
+        "contentType": "application/json",
+        "description": "Emitted once at connect (after `$hello`) on topic `tiles` with `t` `$snapshot` (realtime.md §5): the snapshot-then-delta baseline (`snapshot ⊕ ordered deltas = current truth`, ADR-RT003). A receiver MUST treat it as a state REBUILD, never a merge. Despite the `$`-prefixed tag it rides its data topic, not `$control`.",
+        "name": "TilesSnapshot",
+        "payload": {
+          "$ref": "#/components/schemas/TilesSnapshot"
+        },
+        "summary": "Full current per-tile lifecycle state a fresh client rebuilds its tile cache from.",
+        "title": "Connect-time tiles baseline ($snapshot on topic tiles)"
+      },
+      "TimingStatus": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `devices` with envelope `id` = program or sync-group id (ADR-M010). CONFLATED latest-wins and excluded from the lossless replay ring: the epoch is an exact affine map that stays valid when stale, so a receiver that misses updates keeps the last epoch and free-runs — it degrades, never stalls. The achieved tier is the MEASURED tier, never an aspirational one.",
+        "name": "TimingStatus",
+        "payload": {
+          "$ref": "#/components/schemas/TimingStatus"
+        },
+        "summary": "The per-program WallClockRef epoch, link offset, clock source/quality, and per-sync-group achieved skew (timing.status on topic `devices`).",
+        "title": "Outbound presentation epoch + sync telemetry"
+      }
+    },
+    "schemas": {
+      "AchievedSync": {
+        "description": "The MEASURED sync tier actually achieved (never aspirational): frame-accurate (our nodes), bounded-skew (vendor decoders, ±100–500 ms drift), or none (never part of a synchronized canvas).",
+        "enum": [
+          "frame-accurate",
+          "bounded-skew",
+          "none"
+        ],
+        "type": "string"
+      },
+      "AlarmTransition": {
+        "description": "Data body of `alarm.raised`, `alarm.updated`, `alarm.cleared`, `alarm.acked`. Carries the current AlarmRecord value after the transition (X.733-aligned).",
+        "properties": {
+          "record": {
+            "additionalProperties": true,
+            "description": "The current alarm record after the transition.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "record"
+        ],
+        "type": "object"
+      },
+      "Alert": {
+        "description": "Data body of `alert.raised` and `alert.cleared` events. The `key` field is a stable dedupe identifier: multiple raised frames with the same key coalesce.",
+        "properties": {
+          "active": {
+            "description": "Whether the condition is currently active.",
+            "type": "boolean"
+          },
+          "detail": {
+            "description": "Optional longer detail.",
+            "type": "string"
+          },
+          "key": {
+            "description": "Stable dedupe key for the condition.",
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/AlertSeverity"
+          },
+          "title": {
+            "description": "Short human-readable title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "severity",
+          "title",
+          "active"
+        ],
+        "type": "object"
+      },
+      "AlertSeverity": {
+        "description": "Severity of an operator alert.",
+        "enum": [
+          "info",
+          "warning",
+          "critical"
+        ],
+        "type": "string"
+      },
+      "AudioMeter": {
+        "description": "Data body of the `audio.meter` event: a high-rate per-input/track peak/RMS/clip sample. This is numeric metadata only — never audio content. Conflated/sampled at 10–30 Hz on the wire (high-rate lane).",
+        "properties": {
+          "clip": {
+            "description": "Whether any channel clipped in this window.",
+            "type": "boolean"
+          },
+          "overflow": {
+            "description": "Whether the meter pipeline overflowed (dropped windows).",
+            "type": "boolean"
+          },
+          "peak_db": {
+            "description": "Per-channel peak level (dBFS).",
+            "items": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "rms_db": {
+            "description": "Per-channel RMS level (dBFS).",
+            "items": {
+              "format": "float",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "sampled_hz": {
+            "description": "Effective wire cadence (Hz).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "track": {
+            "description": "Track index.",
+            "format": "uint32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "track",
+          "peak_db",
+          "rms_db",
+          "clip",
+          "overflow",
+          "sampled_hz"
+        ],
+        "type": "object"
+      },
+      "DeviceAdopted": {
+        "description": "Data body of `device.adopted`: a device was adopted into the registry.",
+        "properties": {
+          "device_id": {
+            "description": "The registry device id.",
+            "type": "string"
+          },
+          "driver": {
+            "description": "The compiled-in driver managing it (e.g. `zowietek`).",
+            "type": "string"
+          },
+          "name": {
+            "description": "The operator-facing display name, if set.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "driver"
+        ],
+        "type": "object"
+      },
+      "DeviceCapabilities": {
+        "description": "Fixed probed capability flags — a driver maps its device into exactly this shape.",
+        "properties": {
+          "audio": {
+            "description": "The device handles audio.",
+            "type": "boolean"
+          },
+          "decode": {
+            "description": "The device can decode (receive a Multiview output).",
+            "type": "boolean"
+          },
+          "display": {
+            "description": "The device drives a physical display.",
+            "type": "boolean"
+          },
+          "encode": {
+            "description": "The device can encode (offers streams Multiview ingests as Sources).",
+            "type": "boolean"
+          },
+          "firmware_update": {
+            "description": "The device supports managed firmware update.",
+            "type": "boolean"
+          },
+          "reboot": {
+            "description": "The device can be rebooted via the management channel.",
+            "type": "boolean"
+          },
+          "sync": {
+            "$ref": "#/components/schemas/SyncCapability"
+          }
+        },
+        "required": [
+          "encode",
+          "decode",
+          "display",
+          "sync",
+          "audio",
+          "reboot",
+          "firmware_update"
+        ],
+        "type": "object"
+      },
+      "DeviceDiscovered": {
+        "description": "Data body of `device.discovered`: one untrusted discovery-inventory row streamed while a scan runs (correlated via the envelope `corr`). Requires explicit confirm-adopt; never auto-ingested.",
+        "properties": {
+          "address": {
+            "description": "The management endpoint (URL/host; IPv6 literals bracketed).",
+            "type": "string"
+          },
+          "driver": {
+            "description": "The candidate driver that recognised the device.",
+            "type": "string"
+          },
+          "family": {
+            "description": "Address family — IPv6-first; IPv4 results are labelled legacy.",
+            "enum": [
+              "ipv6",
+              "ipv4-legacy"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "The advertised device name, if any.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "driver",
+          "address",
+          "family"
+        ],
+        "type": "object"
+      },
+      "DeviceError": {
+        "description": "Data body of `device.error`: a driver-reported device error.",
+        "properties": {
+          "code": {
+            "description": "Short machine-readable code where the driver has one (vendor codes pass through verbatim).",
+            "type": "string"
+          },
+          "device_id": {
+            "description": "The registry device id the error concerns.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable description of the error.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "DeviceMode": {
+        "description": "Data body of `device.mode`: a mode convergence started/finished/failed, carrying the impact declared BEFORE apply (instant-apply doctrine).",
+        "properties": {
+          "detail": {
+            "description": "The human-readable declared-impact statement, if the driver provides one.",
+            "type": "string"
+          },
+          "device_id": {
+            "description": "The registry device id converging.",
+            "type": "string"
+          },
+          "impact": {
+            "$ref": "#/components/schemas/ImpactClass"
+          },
+          "mode": {
+            "description": "The target mode being converged to (driver vocabulary).",
+            "type": "string"
+          },
+          "phase": {
+            "description": "Which convergence phase this event reports.",
+            "enum": [
+              "started",
+              "finished",
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "mode",
+          "phase",
+          "impact"
+        ],
+        "type": "object"
+      },
+      "DeviceRemoved": {
+        "description": "Data body of `device.removed`: a device was removed from the registry.",
+        "properties": {
+          "device_id": {
+            "description": "The registry device id that was removed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id"
+        ],
+        "type": "object"
+      },
+      "DeviceState": {
+        "description": "Managed-device lifecycle state (managed-devices.md §2.2), uppercase on the wire.",
+        "enum": [
+          "DISCOVERED",
+          "ADOPTING",
+          "ONLINE",
+          "DEGRADED",
+          "AUTH_FAILED",
+          "UNREACHABLE"
+        ],
+        "type": "string"
+      },
+      "DeviceStatus": {
+        "description": "Data body of `device.status` (managed-devices.md §2.1): the conflated latest-wins per-device runtime snapshot, envelope `id` = device id. Excluded from the lossless replay ring (a re-snapshot heals it); staleness is surfaced via `last_seen_ts`.",
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/DeviceCapabilities"
+          },
+          "device_id": {
+            "description": "The registry device id this snapshot describes.",
+            "type": "string"
+          },
+          "last_seen_ts": {
+            "description": "When the device last answered (engine monotonic nanoseconds).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "mode": {
+            "description": "The device's current converged mode (driver vocabulary), once known.",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeviceState"
+          },
+          "streams": {
+            "description": "Device-reported active streams (omitted when none / unknown).",
+            "items": {
+              "$ref": "#/components/schemas/DeviceStreamStatus"
+            },
+            "type": "array"
+          },
+          "sync": {
+            "$ref": "#/components/schemas/DeviceSyncSummary"
+          },
+          "temperature_c": {
+            "description": "Device-reported temperature (°C), where exposed.",
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "device_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "DeviceStreamStatus": {
+        "description": "One device-reported active stream. Optional fields are absent where the vendor does not report that figure.",
+        "properties": {
+          "bitrate_bps": {
+            "description": "Device-reported stream bitrate (bits/sec), if reported.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "fps": {
+            "description": "Device-reported stream rate (fps), if reported.",
+            "format": "float",
+            "type": "number"
+          },
+          "healthy": {
+            "description": "Whether the device reports this stream as healthy.",
+            "type": "boolean"
+          },
+          "output_ref": {
+            "description": "The Multiview output this decode stream is bound to, if any.",
+            "type": "string"
+          },
+          "role": {
+            "description": "Whether the device is encoding or decoding this stream.",
+            "enum": [
+              "encode",
+              "decode"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "healthy"
+        ],
+        "type": "object"
+      },
+      "DeviceSync": {
+        "description": "Data body of `device.sync`: sync-group membership / achieved-tier / drift change.",
+        "properties": {
+          "change": {
+            "$ref": "#/components/schemas/SyncChange"
+          },
+          "device_id": {
+            "description": "The member device id.",
+            "type": "string"
+          },
+          "group": {
+            "description": "The sync group concerned.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "group",
+          "change"
+        ],
+        "type": "object"
+      },
+      "DeviceSyncSummary": {
+        "description": "A device's sync-group membership summary inside a device.status snapshot.",
+        "properties": {
+          "achieved": {
+            "$ref": "#/components/schemas/AchievedSync"
+          },
+          "group": {
+            "description": "The sync group this device belongs to.",
+            "type": "string"
+          },
+          "offset_ms": {
+            "description": "Per-member presentation offset trim (ms, AES67 link-offset semantics).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "group",
+          "offset_ms",
+          "achieved"
+        ],
+        "type": "object"
+      },
+      "GpuMetrics": {
+        "description": "A per-GPU utilisation sample. Optional fields are absent where the vendor does not expose that signal.",
+        "properties": {
+          "compute_util": {
+            "description": "Compute (graphics/CUDA) utilisation, 0.0-1.0.",
+            "format": "float",
+            "type": "number"
+          },
+          "decoder_util": {
+            "description": "Decoder (NVDEC/QSV) ASIC utilisation, 0.0-1.0 (vendor-dependent).",
+            "format": "float",
+            "type": "number"
+          },
+          "encoder_session_ceiling": {
+            "description": "Runtime-discovered concurrent encode-session ceiling (NVIDIA).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "encoder_sessions": {
+            "description": "DEVICE-WIDE active concurrent encode sessions (NVIDIA) across all processes.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "encoder_util": {
+            "description": "Encoder (NVENC/QSV) ASIC utilisation, 0.0-1.0 (vendor-dependent).",
+            "format": "float",
+            "type": "number"
+          },
+          "id": {
+            "description": "Stable device identity (UUID where available, else an index).",
+            "type": "string"
+          },
+          "mem_total_bytes": {
+            "description": "Total VRAM (bytes).",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "mem_used_bytes": {
+            "description": "VRAM in use (bytes).",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "name": {
+            "description": "Human-readable device name, if known.",
+            "type": "string"
+          },
+          "self_compute_util": {
+            "description": "Our process's compute (SM) utilisation on this GPU, 0.0-1.0.",
+            "format": "float",
+            "type": "number"
+          },
+          "self_decoder_util": {
+            "description": "Our process's decoder (NVDEC) utilisation, 0.0-1.0.",
+            "format": "float",
+            "type": "number"
+          },
+          "self_encoder_sessions": {
+            "description": "Encode sessions owned by our process on this GPU.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "self_encoder_util": {
+            "description": "Our process's encoder (NVENC) utilisation, 0.0-1.0.",
+            "format": "float",
+            "type": "number"
+          },
+          "self_mem_used_bytes": {
+            "description": "VRAM (bytes) attributed to our process on this GPU.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "vendor": {
+            "$ref": "#/components/schemas/GpuVendor"
+          }
+        },
+        "required": [
+          "id",
+          "vendor",
+          "compute_util",
+          "mem_used_bytes",
+          "mem_total_bytes"
+        ],
+        "type": "object"
+      },
+      "GpuVendor": {
+        "description": "GPU/accelerator hardware vendor (selects which per-engine signals to expect).",
+        "enum": [
+          "nvidia",
+          "intel",
+          "amd",
+          "apple",
+          "other"
+        ],
+        "type": "string"
+      },
+      "HealthWarning": {
+        "description": "Data body of `health.warning.raised` and `health.warning.cleared`. A richer sibling of `Alert`: the `code` is the stable dedupe key, and `remediation` carries the concrete fix. Capability-mismatch codes are latched build-time facts (raised once, cleared on reconfigure/restart).",
+        "properties": {
+          "active": {
+            "description": "Whether the condition is currently active (raise vs clear).",
+            "type": "boolean"
+          },
+          "code": {
+            "$ref": "#/components/schemas/WarningCode"
+          },
+          "message": {
+            "description": "A clear, human-readable description of the condition.",
+            "type": "string"
+          },
+          "remediation": {
+            "description": "The concrete remediation — what the operator must do to fix it.",
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/WarningSeverity"
+          },
+          "since": {
+            "description": "When the condition was first raised (engine monotonic nanoseconds).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "subsystem": {
+            "description": "The affected subsystem (e.g. `compositor`, `decode`, `encode`, `gpu`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "severity",
+          "subsystem",
+          "message",
+          "remediation",
+          "since",
+          "active"
+        ],
+        "type": "object"
+      },
+      "Hello": {
+        "description": "Data body of `$hello`: the first server frame after auth.",
+        "properties": {
+          "default_rate_hz": {
+            "description": "Default wire cadence when `rate_hz` is omitted from `$subscribe`.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "heartbeat_ms": {
+            "description": "Heartbeat interval (milliseconds).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "max_rate_hz": {
+            "description": "Maximum clamped wire cadence (Hz).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "min_rate_hz": {
+            "description": "Minimum clamped wire cadence (Hz).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "replay_ring": {
+            "description": "Replay ring size (frames per session/topic).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "server_v": {
+            "description": "Envelope schema majors this server can speak.",
+            "items": {
+              "format": "uint16",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "description": "Server-assigned session id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "server_v",
+          "heartbeat_ms",
+          "min_rate_hz",
+          "max_rate_hz",
+          "default_rate_hz",
+          "replay_ring"
+        ],
+        "type": "object"
+      },
+      "ImpactClass": {
+        "description": "Declared impact class of a management change: cp (control-plane only), c1 (hot/seamless at a frame boundary), c2 (controlled reset via make-before-break), dev (the DEVICE pipeline restarts; Multiview program output is unaffected).",
+        "enum": [
+          "cp",
+          "c1",
+          "c2",
+          "dev"
+        ],
+        "type": "string"
+      },
+      "InputConnection": {
+        "description": "Data body of the `input.connection` event.",
+        "properties": {
+          "attempt": {
+            "description": "Reconnect attempt counter, if reconnecting.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/LifecycleState"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "InputStreams": {
+        "description": "Data body of the `input.streams` event: an input's full elementary-stream inventory (RT-3).",
+        "properties": {
+          "input_id": {
+            "description": "The owning input's configured source id.",
+            "type": "string"
+          },
+          "inventory": {
+            "description": "The StreamInventory (multiview_core::stream::StreamInventory): every elementary stream the input offers.",
+            "properties": {
+              "input_id": {
+                "description": "The input id the inventory is bound to, if known.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "streams": {
+                "description": "Every elementary stream, in container order.",
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "streams"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "input_id",
+          "inventory"
+        ],
+        "type": "object"
+      },
+      "JobProgress": {
+        "description": "Data body of `job.progress`; correlated to a REST command via the envelope `corr`.",
+        "properties": {
+          "message": {
+            "description": "Optional human-readable progress message.",
+            "type": "string"
+          },
+          "pct": {
+            "description": "Percent complete (0–100).",
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "phase": {
+            "description": "Short machine-readable phase label.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "phase",
+          "pct"
+        ],
+        "type": "object"
+      },
+      "Lag": {
+        "description": "Data body of `$lag`: this connection's queue overflowed for a topic.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/LagAction"
+          },
+          "dropped_n": {
+            "description": "Number of frames dropped.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "topic": {
+            "description": "Topic whose frames were dropped.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "dropped_n",
+          "action"
+        ],
+        "type": "object"
+      },
+      "LagAction": {
+        "description": "What the server did with the dropped frames.",
+        "enum": [
+          "conflated",
+          "resnapshot"
+        ],
+        "type": "string"
+      },
+      "LifecycleState": {
+        "description": "Tile/input lifecycle state (invariant #2: Live → Stale → Reconnecting → NoSignal).",
+        "enum": [
+          "LIVE",
+          "STALE",
+          "RECONNECTING",
+          "NO_SIGNAL"
+        ],
+        "type": "string"
+      },
+      "OutputRunState": {
+        "description": "Running state of an output sink.",
+        "enum": [
+          "starting",
+          "running",
+          "migrating",
+          "error"
+        ],
+        "type": "string"
+      },
+      "OutputStatus": {
+        "description": "Data body of the `output.status` event.",
+        "properties": {
+          "bitrate_bps": {
+            "description": "Measured output bitrate (bits/sec), if known.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "clients": {
+            "description": "Number of currently-connected consumers, if known.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/OutputRunState"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "ProtocolError": {
+        "description": "Data body of `$error`: a control-plane error.",
+        "properties": {
+          "code": {
+            "description": "Short stable machine-readable error code.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable description.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Resume": {
+        "description": "Data body of `$resume` (client→server): present last-seen cursor on reconnect.",
+        "properties": {
+          "last_seq": {
+            "description": "Last `seq` the client successfully observed.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "session_id": {
+            "description": "Session to resume.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "last_seq"
+        ],
+        "type": "object"
+      },
+      "Resync": {
+        "description": "Data body of `$resync`: the gap is unrecoverable; the client MUST rebuild state from the fresh snapshot that follows.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/ResyncReason"
+          },
+          "resubscribe": {
+            "description": "Topics the client must rebuild.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "reason",
+          "resubscribe"
+        ],
+        "type": "object"
+      },
+      "ResyncReason": {
+        "description": "Why a $resync was issued.",
+        "enum": [
+          "seq_evicted",
+          "unknown_session",
+          "session_expired"
+        ],
+        "type": "string"
+      },
+      "SalvoEvent": {
+        "description": "Data body of `salvo.armed`, `salvo.taken`, `salvo.cancelled`.",
+        "properties": {
+          "head": {
+            "description": "Output head this recall applies to, if scoped.",
+            "type": "string"
+          },
+          "phase": {
+            "description": "The lifecycle phase this event reports.",
+            "enum": [
+              "armed",
+              "taken",
+              "cancelled"
+            ],
+            "type": "string"
+          },
+          "salvo": {
+            "description": "Stable salvo identifier/name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "salvo",
+          "phase"
+        ],
+        "type": "object"
+      },
+      "SetRate": {
+        "description": "Data body of `$set_rate` (client→server): change a topic's wire cadence.",
+        "properties": {
+          "rate_hz": {
+            "description": "Requested cadence (Hz); server clamps to [min, max].",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "topic": {
+            "description": "Topic whose cadence is changing.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "rate_hz"
+        ],
+        "type": "object"
+      },
+      "ShedLoad": {
+        "description": "Data body of the `shed.load` event: a resource-adaptive shed-load decision (invariant #9). The consent-independent retention store records these for the §7.2 support bundle (ADR-0052).",
+        "properties": {
+          "dropped": {
+            "description": "Cumulative frames/units shed under this condition at the time of the event.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "level": {
+            "description": "The degradation-ladder level after the shed (0 = full quality).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/ShedReason"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ShedScope"
+          }
+        },
+        "required": [
+          "reason",
+          "scope",
+          "level",
+          "dropped"
+        ],
+        "type": "object"
+      },
+      "ShedReason": {
+        "description": "Why the resource-adaptive controller shed load rather than holding or migrating the pipeline (invariant #9). Mirrors the engine's `ShedReason`; additive + non-exhaustive (ADR-RT002/RT003).",
+        "enum": [
+          "pinned",
+          "display_bound",
+          "no_better_home",
+          "anti_storm",
+          "encoder_overload"
+        ],
+        "type": "string"
+      },
+      "ShedScope": {
+        "description": "What a shed-load decision applied to (tagged by `kind`).",
+        "discriminator": "kind",
+        "oneOf": [
+          {
+            "description": "The shed touched the whole-program encode/egress path (a composited frame was dropped).",
+            "properties": {
+              "kind": {
+                "const": "program",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The shed degraded a specific input/tile (cheapest-impact-first ladder).",
+            "properties": {
+              "id": {
+                "description": "The configured input/source id the shed degraded.",
+                "type": "string"
+              },
+              "kind": {
+                "const": "input",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "id"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The shed degraded a shared resource (e.g. a preview/encode pool).",
+            "properties": {
+              "kind": {
+                "const": "shared",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ],
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "Subscribe": {
+        "description": "Data body of `$subscribe` (client→server): subscribe to topics.",
+        "properties": {
+          "ids": {
+            "description": "Optional resource-id allowlist.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rate_hz": {
+            "description": "Optional max cadence (Hz); server clamps and reports effective.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "since_seq": {
+            "description": "Optional resume cursor: subscribe + replay from after this seq.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "topics": {
+            "description": "Topics to subscribe to.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "topics"
+        ],
+        "type": "object"
+      },
+      "Subscribed": {
+        "description": "Data body of `$subscribed`: per-topic ack before the snapshot.",
+        "properties": {
+          "effective_rate_hz": {
+            "description": "Actual cadence after server clamping.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "snapshot_seq": {
+            "description": "The `seq` the forthcoming snapshot is current as of.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "topic": {
+            "description": "The topic that was subscribed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "effective_rate_hz",
+          "snapshot_seq"
+        ],
+        "type": "object"
+      },
+      "SyncCapability": {
+        "description": "How well a device can participate in synchronized presentation (fixed probed tri-state).",
+        "enum": [
+          "frame-accurate",
+          "offset-only",
+          "none"
+        ],
+        "type": "string"
+      },
+      "SyncChange": {
+        "description": "What changed about a device's sync participation (tagged by `kind`, never untagged).",
+        "discriminator": "kind",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "joined",
+                "type": "string"
+              },
+              "offset_ms": {
+                "description": "The per-member offset trim (ms).",
+                "format": "int64",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "offset_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "left",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "achieved": {
+                "$ref": "#/components/schemas/AchievedSync"
+              },
+              "kind": {
+                "const": "tier",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "achieved"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "exceeded": {
+                "description": "true = crossed above the target; false = recovered back inside it.",
+                "type": "boolean"
+              },
+              "kind": {
+                "const": "drift",
+                "type": "string"
+              },
+              "measured_skew_ms": {
+                "description": "The measured skew for this member (ms).",
+                "format": "float",
+                "type": "number"
+              },
+              "target_skew_ms": {
+                "description": "The group's configured skew target (ms).",
+                "format": "uint32",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "measured_skew_ms",
+              "target_skew_ms",
+              "exceeded"
+            ],
+            "type": "object"
+          }
+        ],
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "SyncGroupSkew": {
+        "description": "One sync group's MEASURED skew/tier (achieved tier = weakest member, never over-claimed).",
+        "properties": {
+          "achieved": {
+            "$ref": "#/components/schemas/AchievedSync"
+          },
+          "group": {
+            "description": "The sync group measured.",
+            "type": "string"
+          },
+          "measured_skew_ms": {
+            "description": "The worst measured member skew (ms), where a measurement exists.",
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "group",
+          "achieved"
+        ],
+        "type": "object"
+      },
+      "SystemMetrics": {
+        "description": "Data body of the `system.metrics` event: a high-rate whole-system sample (cpu / gpu / encoder-decoder). Numeric only; conflated at ~1-2 Hz (high-rate lane).",
+        "properties": {
+          "cpu_util": {
+            "description": "Whole-system CPU utilisation, 0.0-1.0.",
+            "format": "float",
+            "type": "number"
+          },
+          "gpus": {
+            "description": "Per-GPU utilisation samples; empty on a GPU-free host.",
+            "items": {
+              "$ref": "#/components/schemas/GpuMetrics"
+            },
+            "type": "array"
+          },
+          "mem_total_bytes": {
+            "description": "Total host memory (bytes), if known.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "mem_used_bytes": {
+            "description": "Host memory in use (bytes), if known.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "program_fps": {
+            "description": "Aggregate program output rate (fps), if running.",
+            "format": "float",
+            "type": "number"
+          },
+          "sampled_hz": {
+            "description": "Effective wire sampling cadence (Hz).",
+            "format": "uint32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cpu_util",
+          "sampled_hz"
+        ],
+        "type": "object"
+      },
+      "TallyEvent": {
+        "description": "Data body of `tally.state`: resolved tally lamp/UMD state for one element.",
+        "properties": {
+          "state": {
+            "additionalProperties": true,
+            "description": "The resolved tally lamp/UMD state.",
+            "type": "object"
+          },
+          "target": {
+            "$ref": "#/components/schemas/TallyTarget"
+          }
+        },
+        "required": [
+          "target",
+          "state"
+        ],
+        "type": "object"
+      },
+      "TallyTarget": {
+        "description": "What a tally state applies to (tagged by `kind`).",
+        "discriminator": "kind",
+        "oneOf": [
+          {
+            "properties": {
+              "index": {
+                "description": "Zero-based tile index.",
+                "format": "uint32",
+                "type": "integer"
+              },
+              "kind": {
+                "const": "tile",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "index"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "element",
+                "type": "string"
+              },
+              "name": {
+                "description": "Element name.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "name"
+            ],
+            "type": "object"
+          }
+        ],
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "TileSnapshotEntry": {
+        "description": "One tile's current lifecycle state inside a `tiles` `$snapshot`. The `id` is the same key the sparse `tile.state` deltas scope their envelope `id` with, so a snapshot-rebuilt cache and its delta patches address the same rows.",
+        "properties": {
+          "id": {
+            "description": "The tile id (the bound source id in the run projection).",
+            "type": "string"
+          },
+          "input": {
+            "description": "The input bound to the tile, if known.",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/LifecycleState"
+          }
+        },
+        "required": [
+          "id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "TileState": {
+        "description": "Data body of the `tile.state` event: a tile lifecycle transition.",
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/LifecycleState"
+          },
+          "input": {
+            "description": "The input bound to the tile at the time of the transition, if any.",
+            "type": "string"
+          },
+          "to": {
+            "$ref": "#/components/schemas/LifecycleState"
+          },
+          "trigger": {
+            "description": "Short machine-readable trigger label (e.g. `nosignal_timeout`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "trigger"
+        ],
+        "type": "object"
+      },
+      "TilesSnapshot": {
+        "description": "Data body of the `tiles`-topic `$snapshot` frame: the full current per-tile lifecycle baseline sent once at connect (after `$hello`). A receiver MUST rebuild (replace) its tile state from it, never merge.",
+        "properties": {
+          "as_of_seq": {
+            "description": "The engine state sequence this baseline is current as of.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "tiles": {
+            "description": "Every tile's current lifecycle state.",
+            "items": {
+              "$ref": "#/components/schemas/TileSnapshotEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "as_of_seq",
+          "tiles"
+        ],
+        "type": "object"
+      },
+      "TimingStatus": {
+        "description": "Data body of `timing.status` (ADR-M010): the outbound presentation epoch plus per-sync-group achieved skew, envelope `id` = program or sync-group id. Latest-wins and ring-excluded: the affine epoch stays valid when stale, so receivers free-run on a missed update — they never stall.",
+        "properties": {
+          "clock_quality": {
+            "description": "The discipline quality of that clock (the engine servo's lock-state lifecycle).",
+            "enum": [
+              "locked",
+              "holdover",
+              "acquiring",
+              "freerun"
+            ],
+            "type": "string"
+          },
+          "clock_source": {
+            "description": "What disciplines the wall estimate (ST 2059-2 PTP servo or chrony-disciplined system time). The clock labels the timeline; it never paces the tick loop.",
+            "enum": [
+              "ptp",
+              "system"
+            ],
+            "type": "string"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/WallClockRef"
+          },
+          "groups": {
+            "description": "Per-sync-group measured skew/tier (omitted when no groups exist).",
+            "items": {
+              "$ref": "#/components/schemas/SyncGroupSkew"
+            },
+            "type": "array"
+          },
+          "link_offset_ns": {
+            "description": "Fixed receiver-side presentation delay (ns, AES67 link-offset semantics): uniformity is the goal, not smallness.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "stream_id": {
+            "description": "The program/output stream this epoch maps.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream_id",
+          "epoch",
+          "link_offset_ns",
+          "clock_source",
+          "clock_quality"
+        ],
+        "type": "object"
+      },
+      "Unsubscribe": {
+        "description": "Data body of `$unsubscribe` (client→server): stop receiving topics.",
+        "properties": {
+          "topics": {
+            "description": "Topics to stop receiving.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "topics"
+        ],
+        "type": "object"
+      },
+      "WallClockRef": {
+        "description": "The exact affine media↔wall map (multiview_core::wallclock::WallClockRef, ADR-0038): wall(pts) = wall_at_anchor_ns + rescale(pts − media_at_anchor). Integer/rational arithmetic only — never float.",
+        "properties": {
+          "media_at_anchor": {
+            "description": "Media PTS of the anchor sample, in units of `rate`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "rate": {
+            "description": "The media rate (ticks per second) as an exact rational.",
+            "properties": {
+              "den": {
+                "description": "Denominator.",
+                "format": "int64",
+                "type": "integer"
+              },
+              "num": {
+                "description": "Numerator.",
+                "format": "int64",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "num",
+              "den"
+            ],
+            "type": "object"
+          },
+          "wall_at_anchor_ns": {
+            "description": "Wall-clock instant (ns past the Unix epoch) at the anchor sample.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "wall_at_anchor_ns",
+          "media_at_anchor",
+          "rate"
+        ],
+        "type": "object"
+      },
+      "WarningCode": {
+        "description": "Stable catalog code of a health warning (kebab-case). `#[non_exhaustive]`: the catalog grows over time, so a client must treat an unknown code as a forward-compatible warning, not an error.",
+        "enum": [
+          "gpu-present-no-vulkan-adapter"
+        ],
+        "type": "string"
+      },
+      "WarningSeverity": {
+        "description": "Severity of a health warning (sibling of AlertSeverity).",
+        "enum": [
+          "info",
+          "warning",
+          "critical"
+        ],
+        "type": "string"
+      }
+    }
+  },
+  "info": {
+    "contact": {
+      "name": "The Multiview Authors",
+      "url": "https://github.com/aperim/multiview"
+    },
+    "description": "WebSocket and SSE realtime event stream for the Multiview engine. Every message uses a single versioned envelope (ADR-RT002). Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, layout, config, logs, jobs, preview, system, capabilities, devices. The WebSocket endpoint (/api/v1/ws) is bidirectional (events + subscription control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
+    "externalDocs": {
+      "description": "Realtime API reference",
+      "url": "https://github.com/aperim/multiview/blob/main/docs/api/realtime.md"
+    },
+    "license": {
+      "name": "Multiview Source-Available Non-Commercial License",
+      "url": "https://github.com/aperim/multiview/blob/main/LICENSE"
+    },
+    "title": "Multiview Realtime API",
+    "version": "1.0.0"
+  },
+  "operations": {
+    "subscribe-sse": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/sse"
+      },
+      "description": "Receive all event types on the SSE fallback channel.",
+      "messages": [
+        {
+          "$ref": "#/channels/sse/messages/EnvelopeMessage"
+        }
+      ],
+      "title": "Receive realtime events (SSE)"
+    },
+    "subscribe-ws": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/ws"
+      },
+      "description": "Receive all event types on the WebSocket channel after subscribing to the desired topics via $subscribe control frames.",
+      "messages": [
+        {
+          "$ref": "#/channels/ws/messages/EnvelopeMessage"
+        }
+      ],
+      "title": "Receive realtime events (WebSocket)"
+    }
+  },
+  "servers": {
+    "sse-server": {
+      "description": "Server-Sent Events endpoint (server→client only). Fallback transport.",
+      "host": "{host}",
+      "pathname": "/api/v1/events",
+      "protocol": "http",
+      "variables": {
+        "host": {
+          "default": "[::1]:8080",
+          "description": "Hostname and optional port of the Multiview daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host."
+        }
+      }
+    },
+    "ws-server": {
+      "description": "WebSocket endpoint (bidirectional). Primary transport.",
+      "host": "{host}",
+      "pathname": "/api/v1/ws",
+      "protocol": "ws",
+      "variables": {
+        "host": {
+          "default": "[::1]:8080",
+          "description": "Hostname and optional port of the Multiview daemon. IPv6-first: the default is the IPv6 loopback `[::1]`; override with your host."
+        }
+      }
+    }
+  }
+}

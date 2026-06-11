@@ -1,0 +1,123 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license-file = "LICENSE"
+repository = "https://github.com/aperim/multiview"
+authors = ["The Multiview Authors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `ReaderStream` for streaming HLS segment bodies straight off disk (no whole-
+# segment RAM buffering on the unauthenticated delivery surface). MIT-licensed,
+# already in the workspace graph transitively (tokio-stream / tokio-tungstenite).
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+# Runtime `dlopen`/`dlsym` for the off-by-default `ndi` path (resolving the
+# proprietary NDI runtime via `NDIlib_v6_load` at RUN time — never linked at
+# build time; ADR-0008). Dual ISC-licensed (LGPL-clean) and already transitively
+# in the workspace graph. Only `multiview-ndi-sys` (pulled solely by the `ndi`
+# feature) depends on it; the default build never links it.
+libloading = "0.8"
+# Off-by-default `rtsp-server` path ONLY (OUT-2 / ADR-0006): the in-process RTSP
+# server fans the already-encoded canvas to RTSP clients via `gst-rtsp-server`,
+# with no re-encode. These are the SAFE Rust bindings (MIT/Apache-2.0) over the
+# GStreamer/GLib C libraries; the C libs are LGPL-2.1 and resolved by DYNAMIC
+# LINK at run time (never vendored/statically linked), keeping the default build
+# LGPL-clean. Pulled in ONLY by `multiview-output`'s `rtsp-server` feature, so the
+# default build links nothing and `cargo deny` (`all-features = false`) never
+# scans them. Pinned to the 0.23.x series (MSRV 1.82-compatible).
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-rtsp-server = "0.23"
+glib = "0.20"
+# Date/time + IANA timezone database for the clock synthetic source (ADR-0047):
+# resolve an IANA zone id (e.g. `Australia/Sydney`) to a DST-correct concrete UTC
+# offset for the displayed instant. Both `MIT OR Apache-2.0` (deny-clean), pure
+# Rust, no native deps; `chrono-tz` bundles the public-domain IANA tz database at
+# build time (no runtime network). `chrono` carries no `default-features` (no
+# `clock`/`std`-time reads — the clock model samples the host wall clock itself in
+# `multiview-cli`); `chrono-tz` keeps its bundled-db default. Lands in the default
+# build (no `ffmpeg`, no `gpl-codecs`).
+chrono = { version = "0.4.45", default-features = false }
+chrono-tz = { version = "0.10.4", default-features = false }
+# Off-by-default `display-kms` path ONLY (DEV-B1 / ADR-0044): the local
+# DRM/KMS display sink. `drm`/`drm-ffi` are Smithay's SAFE pure-ioctl
+# wrappers (MIT, no C linkage); `gbm` binds Mesa's libgbm (MIT bindings; the
+# Mesa C library is resolved by DYNAMIC LINK at run time, never vendored) for
+# scanout-buffer allocation, with KMS dumb buffers as the GBM-less fallback;
+# `rustix` (already in the graph transitively via drm) provides the safe
+# poll(2) wait on the DRM event fd. Pulled in ONLY by `multiview-output`'s
+# `display-kms` feature, so the default build links nothing and `cargo deny`
+# (`all-features = false`) never scans them.
+drm = "0.15"
+drm-ffi = "0.9"
+gbm = { version = "0.18", default-features = false }
+rustix = { version = "0.38", features = ["event"] }
+# Internal crates
+multiview-core = { path = "crates/multiview-core" }
+multiview-hal = { path = "crates/multiview-hal" }
+multiview-ffmpeg = { path = "crates/multiview-ffmpeg" }
+multiview-compositor = { path = "crates/multiview-compositor" }
+multiview-framestore = { path = "crates/multiview-framestore" }
+multiview-audio = { path = "crates/multiview-audio" }
+multiview-overlay = { path = "crates/multiview-overlay" }
+multiview-input = { path = "crates/multiview-input" }
+multiview-output = { path = "crates/multiview-output" }
+multiview-engine = { path = "crates/multiview-engine" }
+multiview-config = { path = "crates/multiview-config" }
+multiview-events = { path = "crates/multiview-events" }
+multiview-licence = { path = "crates/multiview-licence" }
+multiview-control = { path = "crates/multiview-control" }
+multiview-preview = { path = "crates/multiview-preview" }
+multiview-telemetry = { path = "crates/multiview-telemetry" }
+multiview-ntpsys = { path = "crates/multiview-ntpsys" }
+multiview-i915pmu = { path = "crates/multiview-i915pmu" }
+multiview-ndi-sys = { path = "crates/multiview-ndi-sys" }
+multiview-cli = { path = "crates/multiview-cli" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "forbid"          # FFI crates override locally to "deny" + // SAFETY:
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# Groups MUST carry priority < 0 so individual overrides below are not clobbered
+# (cargo emits lints alphabetically on the rustc command line).
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+
+# No panics / panicking accessors in non-test code.
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+# No untyped/lossy conversions — use TryFrom / TryInto / From.
+as_conversions   = "deny"
+# No process exit, leaks, stray debug / stdio (use `tracing`).
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+# Force documenting failure modes.
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

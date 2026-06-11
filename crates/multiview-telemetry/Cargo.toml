@@ -1,0 +1,38 @@
+[package]
+name = "multiview-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json = { workspace = true }
+
+[features]
+"default" = []
+# Wire delivery of RFC 5424 syslog messages over UDP/TCP. OFF by default: the
+# pure RFC 5424 formatter (`syslog::SyslogMessage`) always compiles; only the
+# socket sender is feature-gated. Adds no native deps and stays
+# `unsafe_code = forbid` (uses std::net only).
+"syslog" = []
+# SNMP trap / MIB scaffold (types + OID model). OFF by default and currently a
+# pure type scaffold; a future SNMP transport will live behind this flag. Adds
+# no native deps.
+"snmp" = []
+
+[lints]
+workspace = true

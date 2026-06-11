@@ -1,0 +1,112 @@
+# examples/world-clock.toml — a 2×2 "world-clock wall" of dual clock sources.
+#
+# Each tile is a single `clock` SOURCE rendered in-process, pure-Rust (no ffmpeg,
+# no GPL/native deps) — the dual-face + IANA-timezone extension of ADR-0027,
+# decided in ADR-0047 (docs/research/clock-timer-sources.md):
+#   - face = "dual"   : an analogue dial with a digital HH:MM:SS readout beneath.
+#   - timezone        : an IANA zone id (e.g. "Australia/Sydney"); the displayed
+#                       UTC offset is resolved DST-correct PER instant — Sydney
+#                       reads UTC+11:00 in the austral summer and UTC+10:00 in
+#                       winter automatically. Preferred over `tz_offset_minutes`.
+#   - label           : the operator location drawn in the metadata strip.
+#   - show_offset      : draws a "UTC±HH:MM" badge for the displayed instant.
+#   - numerals (opt)  : hour numerals on the analogue dial.
+#
+# The clock face needs the `overlay` feature in the full pipeline (it reuses the
+# clock rasterizer); the schema parses/validates in every build.
+# Schema: docs/templates/layout-and-config.md
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"          # rational string, never a float (NTSC 29.97 exact)
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr", "1fr"]
+gap = 8
+areas = ["syd lon", "nyc lax"]
+
+[[sources]]
+id = "clk_syd"
+display_name = "Sydney"
+kind = "clock"
+face = "dual"
+timezone = "Australia/Sydney"   # DST-correct (UTC+11 summer / UTC+10 winter)
+twelve_hour = false             # 24-hour dial + readout
+label = "Sydney"
+show_offset = true
+numerals = true
+
+[[sources]]
+id = "clk_lon"
+display_name = "London"
+kind = "clock"
+face = "dual"
+timezone = "Europe/London"      # DST-correct (UTC+1 summer / UTC+0 winter)
+twelve_hour = false
+label = "London"
+show_offset = true
+
+[[sources]]
+id = "clk_nyc"
+display_name = "New York"
+kind = "clock"
+face = "dual"
+timezone = "America/New_York"   # DST-correct (UTC-4 EDT / UTC-5 EST)
+twelve_hour = true              # 12-hour dial + AM/PM readout
+label = "NY DESK"
+show_offset = true
+
+[[sources]]
+id = "clk_lax"
+display_name = "Los Angeles"
+kind = "clock"
+face = "dual"
+timezone = "America/Los_Angeles"  # DST-correct (UTC-7 PDT / UTC-8 PST)
+twelve_hour = true
+label = "LA"
+show_offset = true
+
+[[cells]]
+id = "cell_syd"
+area = "syd"
+fit = "contain"
+[cells.source]
+input_id = "clk_syd"
+
+[[cells]]
+id = "cell_lon"
+area = "lon"
+fit = "contain"
+[cells.source]
+input_id = "clk_lon"
+
+[[cells]]
+id = "cell_nyc"
+area = "nyc"
+fit = "contain"
+[cells.source]
+input_id = "clk_nyc"
+
+[[cells]]
+id = "cell_lax"
+area = "lax"
+fit = "contain"
+[cells.source]
+input_id = "clk_lax"
+
+# HLS packager; codec is a free-form hint (mpeg2video here for a patent-clean,
+# license-clean default that needs no GPL codec).
+[[outputs]]
+kind = "hls"
+path = "/hls/world-clock"
+codec = "mpeg2video"
+segment_ms = 2000

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 293a27d66bc9360db94af35ff4f053ff7700ea63c635fc45a34fc7414b12cc73 # shrinks to facts = [TallyFact { tile: 0, state: TallyState { color: Off, brightness: Brightness(3), source: Program }, priority: 0 }, TallyFact { tile: 0, state: TallyState { color: Red, brightness: Brightness(3), source: Program }, priority: 0 }, TallyFact { tile: 0, state: TallyState { color: Off, brightness: Brightness(3), source: Program }, priority: 1 }]

@@ -1,0 +1,254 @@
+# syntax=docker/dockerfile:1
+#
+# Multiview NVIDIA runtime image (NVDEC/NVENC/CUDA, LGPL-clean default build).
+#
+# Multi-stage:
+#   * ffmpeg   — pulled from the SEPARATELY-PUBLISHED FFmpeg base image
+#                (ghcr.io/aperim/multiview-ffmpeg:8.1.1-nvidia, ADR-0031 §5). It
+#                ships OUR OWN pinned, GPG+SHA-256-verified FFmpeg 8.1.1 under the
+#                ADR-0031 LGPL-clean allowlist (NVENC/NVDEC/cuvid/scale_cuda via
+#                nv-codec-headers + --enable-cuda-llvm; NO CUDA SDK; NO GPL/
+#                nonfree) at /opt/multiview-ffmpeg (libavcodec.so.62). Replaces
+#                the old jellyfin-ffmpeg7 apt repo entirely. The ~10-min source
+#                build is amortised to a multi-second COPY — see
+#                deploy/Dockerfile.ffmpeg + .github/workflows/ffmpeg-base.yml. Pin
+#                FFMPEG_IMAGE by @sha256: for a release.
+#   * web      — Node 22, builds the React SPA to `web/dist` (npm ci + npm run
+#                build). MUST precede the rust build: the `web` feature embeds
+#                `web/dist` into the binary at compile time (rust_embed).
+#   * chef     — Debian trixie + Rust + cargo-chef + OUR FFmpeg 8.1.1 headers
+#                (COPY --from=ffmpeg) on PKG_CONFIG_PATH. Shared base for planner
+#                + builder so rustc/pkg-config are identical across the recipe.
+#   * planner  — `cargo chef prepare` → recipe.json (manifests + Cargo.lock only).
+#   * builder  — `cargo chef cook` pre-builds the dependency graph as a CACHED
+#                layer keyed on recipe.json, THEN copies the source + web/dist and
+#                builds `multiview` with `--features ${CARGO_FEATURES}` (default
+#                ffmpeg,nvidia,web — CUDA decode/encode + wgpu, plus the embedded
+#                web UI + control API). ffmpeg-sys-next's build.rs probes OUR
+#                pkg-config, so the ffmpeg headers are COPYed in BEFORE cook.
+#   * runtime  — nvidia/cuda:12.6.3-runtime-ubuntu24.04 with OUR FFmpeg 8.1.1
+#                runtime sonames (libavcodec.so.62, …) + the binary, run as a
+#                non-root user via the device-group-resolving entrypoint.
+#
+# IMPORTANT host prerequisite: this image does NOT contain the NVIDIA kernel
+# driver. The host must have the driver + the NVIDIA Container Toolkit (CDI);
+# the toolkit injects the host driver libraries (libcuda, NVENC/NVDEC) at run
+# time. See deploy/compose.gpu-nvidia.yaml.
+#
+# FFmpeg provenance (ADR-0031 FF-0/FF-0b): the base image builds FFmpeg 8.1.1 from
+# the pinned ffmpeg.org tarball, verified by BOTH the FFmpeg release GPG key
+# (FCF986EA15E6E293A5644F10B4322F04D67658D8) AND a pinned SHA-256, under our
+# `--disable-everything` allowlist. This kills the opaque foreign jellyfin
+# patchset/cadence AND its GPL x264/x265 (jellyfin-ffmpeg is `--enable-gpl`,
+# which mislabelled a GPL artifact as the project's "default build"). Our build
+# is genuinely LGPL-clean yet still ships h264_nvenc/hevc_nvenc, so the old
+# `select_encoder` fallback-to-mpeg2 concern disappears WITHOUT going GPL.
+#
+# 8.1.1 → libavcodec.so.62 / libavutil.so.60 / libavformat.so.62, matching
+# `ffmpeg-sys-next 8.1.0` (build.rs `ffmpeg_8_1` → libavcodec 62), the version
+# the workspace lockfile resolves — so the binary links .so.62.
+#
+# Base-image pinning: the FFmpeg base (FFMPEG_IMAGE) and the `rust:1-trixie` /
+# `nvidia/cuda:…` tags below are floating lines. For a reproducible release pin
+# each by digest, e.g.
+#   ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:8.1.1-nvidia@sha256:<digest>
+#   FROM rust:1-trixie@sha256:<digest> AS chef
+#   FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04@sha256:<digest> AS runtime
+# (Renovate adds + bumps these digests; CI provenance/SBOM record them anyway.)
+
+# FFmpeg base image — the app build COPYs /opt/multiview-ffmpeg from here. Default
+# is the published NVIDIA flavour so a plain `docker build` works; CI / the box
+# override with `--build-arg FFMPEG_IMAGE=…@sha256:<digest>`.
+ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:8.1.1-nvidia
+
+# -----------------------------------------------------------------------------
+# Stage 0: ffmpeg — the published FFmpeg 8.1.1 base (NVENC/NVDEC, LGPL-clean).
+# Ships /opt/multiview-ffmpeg/{lib,include,lib/pkgconfig}. Built by
+# deploy/Dockerfile.ffmpeg; here it is just a pulled, digest-pinnable layer.
+# -----------------------------------------------------------------------------
+FROM ${FFMPEG_IMAGE} AS ffmpeg
+
+# -----------------------------------------------------------------------------
+# Stage 1: web — build the React SPA to web/dist (Node 22). The `web` cargo
+# feature embeds web/dist at compile time, so this must precede the rust build.
+# `npm ci` installs from web/package-lock.json; `npm run build` runs
+# `lingui compile && tsc --noEmit && vite build` and writes web/dist.
+# -----------------------------------------------------------------------------
+FROM node:22-trixie-slim AS web
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+COPY web/ ./
+RUN npm run build
+
+# -----------------------------------------------------------------------------
+# Stage 2a: chef — Rust toolchain + native build deps + OUR FFmpeg 8.1.1 headers
+# + cargo-chef. Shared base for `planner` and `builder` so rustc + pkg-config are
+# byte-identical across the recipe (a toolchain mismatch silently invalidates the
+# cooked dependency layer). Links against OUR FFmpeg 8.1.1 (libavcodec.so.62).
+# -----------------------------------------------------------------------------
+FROM rust:1-trixie AS chef
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Native build deps: pkg-config + clang/libclang for the FFI bindgen and to
+# locate libav* via pkg-config. The libav* themselves come from the published
+# ffmpeg base (COPY --from=ffmpeg below) — NOT from apt (no libav*-dev here).
+# Also install OUR FFmpeg's transitive runtime libs (libopus/libsrt/gnutls/libdrm)
+# here: the `builder` stage's `multiview --version` smoke test dynamically loads
+# libavcodec.so.62, which NEEDs them — without them the loader exits 127
+# ("error while loading shared libraries"). Same set the runtime stage installs.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      pkg-config clang llvm-dev libclang-dev nasm \
+      libopus0 libsrt1.5-openssl libgnutls30t64 libdrm2 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Our pinned FFmpeg 8.1.1 (headers + .so + .pc) from the published base image.
+# Point pkg-config + the loader at it so `ffmpeg-sys-next`'s build.rs discovers
+# FFmpeg 8.1.1 (detects ffmpeg_8_1 → libavcodec 62) and the build links .so.62.
+# This MUST precede `cargo chef cook`: build.rs probes pkg-config at dep-compile
+# time, so the headers have to be present for the cooked layer to be valid.
+COPY --from=ffmpeg /opt/multiview-ffmpeg /opt/multiview-ffmpeg
+ENV PKG_CONFIG_PATH=/opt/multiview-ffmpeg/lib/pkgconfig \
+    LD_LIBRARY_PATH=/opt/multiview-ffmpeg/lib
+
+# cargo-chef turns the dependency graph into a cacheable layer keyed on
+# recipe.json (manifests + Cargo.lock), which `type=gha`/registry cache persists
+# across runs — unlike a bare `--mount=type=cache,target=target` (builder-local
+# scratch that the cache backends do NOT export).
+RUN cargo install cargo-chef --locked
+
+WORKDIR /build
+
+# -----------------------------------------------------------------------------
+# Stage 2b: planner — distil the whole workspace down to recipe.json (the
+# manifests + Cargo.lock). Only THIS file feeds the cook layer, so app-source
+# edits that don't touch Cargo.{toml,lock} reuse the cooked deps.
+# -----------------------------------------------------------------------------
+FROM chef AS planner
+
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# -----------------------------------------------------------------------------
+# Stage 2c: builder — cook the deps (cached), then build the binary.
+# -----------------------------------------------------------------------------
+FROM chef AS builder
+
+# Build-time feature set. Default features include `web` (embeds the SPA + serves
+# the control API). No GPL deps; pass a different CARGO_FEATURES to vary the
+# build. CARGO_FEATURES is threaded IDENTICALLY into `cook` and `build` — a
+# mismatch pre-builds the wrong dependency closure and silently triggers a
+# near-full rebuild while appearing to hit the cache.
+ARG CARGO_FEATURES=ffmpeg,nvidia,web
+
+# Cook the dependency graph from recipe.json ONLY. This is the expensive,
+# cacheable layer: it busts only when Cargo.{toml,lock} (→ recipe.json) change,
+# not on first-party source edits. `--locked` enforces the committed Cargo.lock.
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo chef cook --release --locked -p multiview-cli \
+      --features "${CARGO_FEATURES}" --recipe-path recipe.json
+
+# Now the source. With deps already cooked, this rebuilds only first-party crates.
+COPY . .
+
+# Bring in the SPA built by the `web` stage (rust_embed folder `web/dist` must
+# exist before `cargo build`); overwrites any web/dist from `COPY . .`.
+COPY --from=web /web/dist ./web/dist
+
+# Build the release binary. The same cargo registry/git mounts plus the target
+# mount accelerate the intra-build step; the cross-run dep cache is carried by
+# the cooked layer above. `--locked` enforces the committed Cargo.lock.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release --locked -p multiview-cli --features "${CARGO_FEATURES}" \
+ && cp /build/target/release/multiview /usr/local/bin/multiview \
+ && /usr/local/bin/multiview --version
+
+# -----------------------------------------------------------------------------
+# Stage 3: runtime (CUDA 12.6 runtime on Ubuntu 24.04 + OUR FFmpeg 8.1.1 sonames)
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime deps for OUR FFmpeg 8.1.1 shared libs + the wgpu/Vulkan compositor.
+# We build FFmpeg with --enable-shared against libopus/libsrt/gnutls/libdrm, so
+# the runtime needs those shared libs present (the loader resolves them when the
+# binary pulls in libavcodec.so.62 et al). libvulkan1 + libx11-6 + libxext6 are
+# for the wgpu compositor; util-linux supplies `setpriv` for the entrypoint's
+# privilege drop. Our LGPL build INCLUDES h264_nvenc/hevc_nvenc (--enable-nvenc),
+# so NVENC GPU-encode works without GPL x264 (the driver's libnvidia-encode is
+# injected at RUN time by the NVIDIA Container Toolkit).
+#
+# libglvnd0/libegl1/libgl1 (the GLVND OpenGL/EGL loaders) let wgpu fall back to
+# its GL backend via the toolkit-injected nvidia EGL/GL (libEGL_nvidia, which DOES
+# initialise here — `eglinfo` enumerates NVIDIA) when this box's nvidia VULKAN ICD
+# refuses to create an instance (a Vulkan-specific driver fault — NVENC + GL work,
+# Vulkan does not). Without these GLVND loaders wgpu's GL path errors
+# "gl drivers/libraries could not be loaded" and the only adapter left is llvmpipe.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      libopus0 libsrt1.5-openssl libgnutls30t64 libdrm2 \
+      libvulkan1 libx11-6 libxext6 util-linux \
+      libglvnd0 libegl1 libgl1 libgles2 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Our FFmpeg 8.1.1 shared libraries (libavcodec.so.62, libavutil.so.60,
+# libavformat.so.62, libavfilter.so.11, libswscale.so.9, libswresample.so.6, and
+# their symlinks). Install into /usr/local/lib and ldconfig so the binary finds
+# them with NO LD_LIBRARY_PATH override. Assert the 8.1.1 soname (.so.62, NOT
+# .61) so a version/layout drift fails the BUILD, not the demo.
+COPY --from=ffmpeg /opt/multiview-ffmpeg/lib /usr/local/lib
+RUN ldconfig \
+ && test -e /usr/local/lib/libavcodec.so.62 \
+ && test -e /usr/local/lib/libavutil.so.60
+
+# Driver capabilities the container needs from the NVIDIA Container Toolkit:
+#  - compute  → CUDA (NVDEC/NVENC compute side)
+#  - video    → NVENC/NVDEC
+#  - utility  → nvidia-smi / NVML (the per-process monitor)
+#  - graphics → the GPU's Vulkan/GL stack — REQUIRED for the wgpu compositor.
+# Without `graphics` the toolkit doesn't mount the Vulkan ICD, so wgpu finds no
+# adapter and the GPU compositor SILENTLY falls back to CPU (5+ cores at 4K). The
+# `graphics` cap mounts nvidia_icd.json + libGLX/EGL_nvidia; `libvulkan1` (the
+# Vulkan loader, installed above) then resolves the ICD so wgpu sees the GPU.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
+ENV NVIDIA_VISIBLE_DEVICES=all
+
+RUN groupadd --gid 10001 multiview \
+ && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin multiview \
+ && mkdir -p /etc/multiview /var/lib/multiview/hls \
+ && chown -R 10001:10001 /etc/multiview /var/lib/multiview
+
+COPY --from=builder /usr/local/bin/multiview /usr/local/bin/multiview
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
+# NO `USER` directive — by design. The wgpu/Vulkan compositor must open the DRM
+# render node /dev/dri/renderD* (root:render 0660), and the host's `render` group
+# GID is NOT fixed (105 on Debian/Ubuntu, but varies by host) so it cannot be
+# baked in. The entrypoint therefore starts as root ONLY to detect the GID(s) of
+# the GPU device nodes actually mounted into this container, then IMMEDIATELY
+# drops to the unprivileged uid:gid 10001 via `setpriv`, granting exactly those
+# device groups. The multiview process never runs as root. To skip the drop (e.g.
+# a hardened deploy that pins `user: "10001"` + supplies the render GID via
+# `group_add` itself), the entrypoint honors the explicit non-root uid as-is.
+WORKDIR /var/lib/multiview
+
+# Control plane: web UI at `/`, REST `/api/v1`, WS `/api/v1/ws`, SSE
+# `/api/v1/events`, OpenAPI `/api/v1/openapi.json`, Scalar docs `/docs`. Bound by
+# `multiview run` when the config has a [control] section; the SPA serves because
+# this image is built with the `web` feature. Set MULTIVIEW_CONTROL_TOKEN for a
+# stable `admin.<secret>` bearer token (else one is generated + logged once).
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["run", "/etc/multiview/multiview.toml"]

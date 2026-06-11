@@ -1,0 +1,48 @@
+name: release-plz
+
+# Open/update the Release PR (version bump + changelog) on every push to main.
+# release-plz reads Conventional Commits since the last release, computes the
+# next version per the pre-1.0 policy in release-plz.toml + cliff.toml, and keeps
+# a "release PR" open. Merging that PR is what tags the release (which then
+# triggers release.yml + docker.yml on the tag).
+#
+# This job ONLY runs the `release-pr` command (not `release`), so it never tags
+# directly — a human merges the PR. To also auto-tag on merge, add a second job
+# running `command: release` (omitted here to keep tagging human-gated).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: release PR
+    runs-on: ubuntu-24.04
+    # Full-history checkout + toolchain + release-plz changelog/version compute
+    # and PR open/update (~2-5min). 20min absorbs a large history or slow API.
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3 # v6.0.3
+        with:
+          fetch-depth: 0 # full history for changelog generation
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0 # 1.96.0 (stable, pinned)
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5.129 # v0.5.129
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

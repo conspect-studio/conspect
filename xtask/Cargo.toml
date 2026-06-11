@@ -1,0 +1,51 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Expose a library target so the pure `iptv` selection logic (JOIN, classifier,
+# stratified sampler, container/URL parsing, catalog+prober seams) can be
+# exercised by the offline integration tests under `tests/` with no network.
+[lib]
+name = "xtask"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[features]
+default = []
+# The `net` feature pulls a real (blocking, rustls-backed) HTTP client so the
+# `soak-iptv` task can fetch the live iptv-org catalog and probe stream
+# liveness. It is OFF by default: the default build (and `cargo deny`, which
+# scans `all-features = false`) stays dependency-light and the pure selection
+# logic + its offline tests need no network crates at all.
+net = ["dep:ureq"]
+
+[dependencies]
+# gen-openapi serializes multiview-control's utoipa OpenApi document. The `openapi`
+# feature (default-on in multiview-control) is what brings in utoipa + the ApiDoc.
+multiview-control = { workspace = true, features = ["openapi"] }
+# gen-asyncapi calls multiview-events::asyncapi::generate_asyncapi_document().
+multiview-events = { workspace = true }
+utoipa = { version = "5.5.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `tokio` powers the async `SourceCatalog`/`Prober` seams (the live HTTP impl
+# runs the blocking client on a `spawn_blocking` worker). Only the lightweight
+# runtime + macros are needed.
+tokio = { workspace = true }
+# Real HTTP client for the `net` feature ONLY (live fetch + liveness probe).
+# `ureq` 3.x is a small, blocking, rustls-backed client (MIT OR Apache-2.0); it
+# is never linked into the default build.
+ureq = { version = "3", optional = true }
+
+[lints]
+workspace = true

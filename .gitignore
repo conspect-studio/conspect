@@ -1,0 +1,50 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo — Cargo.lock IS committed (this workspace ships the `multiview` binary)
+
+# Build working dir (transient research/build artifacts — not part of the product)
+/.multiview-build/
+
+# Proprietary NDI SDK drop-spot (NewTek/Vizrt; NEVER vendored/committed — ADR-0008).
+# The operator places the licensed SDK tarball here; it is extracted into the
+# image/container at build time and never enters git history.
+/.ndi-sdk/
+
+# Web / Node
+web/node_modules/
+web/dist/
+node_modules/
+dist/
+*.local
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# Logs / runtime
+*.log
+/data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Per-host, uncommitted dev container override (e.g. VAAPI /dev/dri device + render GID)
+.devcontainer/devcontainer.local.json
+
+# Demo/multiview screenshots for manual inspection (not part of the product)
+/demo-output/
+
+# Coding-agent local working directory (sessions, scratch) — never part of the product
+/.claude/
+demo-output/

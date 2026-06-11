@@ -1,0 +1,85 @@
+# examples/2x2.toml — four equal tiles. Self-contained (built-in test sources).
+# Schema: docs/templates/layout-and-config.md
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"          # rational string, never a float (NTSC 29.97 exact)
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr", "1fr"]
+gap = 8
+areas = ["a b", "c d"]
+
+[[sources]]
+id = "in_a"
+display_name = "Source A"
+kind = "test"               # built-in test pattern; change to rtsp/hls/ts/srt/ndi
+
+[[sources]]
+id = "in_b"
+display_name = "Source B"
+kind = "test"
+
+[[sources]]
+id = "in_c"
+display_name = "Source C"
+kind = "test"
+
+[[sources]]
+id = "in_d"
+display_name = "Source D"
+kind = "test"
+
+[[cells]]
+id = "cell_a"
+area = "a"
+fit = "contain"
+[cells.source]
+input_id = "in_a"
+
+[[cells]]
+id = "cell_b"
+area = "b"
+fit = "contain"
+[cells.source]
+input_id = "in_b"
+
+[[cells]]
+id = "cell_c"
+area = "c"
+fit = "contain"
+[cells.source]
+input_id = "in_c"
+
+[[cells]]
+id = "cell_d"
+area = "d"
+fit = "contain"
+[cells.source]
+input_id = "in_d"
+
+[[overlays]]
+id = "ov_clock"
+kind = "clock"
+target = "canvas"
+anchor = "bottom_right"
+offset = { x = -20, y = -16 }
+z = 100
+format = "%H:%M:%S"
+source = "wall"             # the always-ticking clock doubles as a falter sentinel
+
+# Encode once, fan out to many transports.
+[[outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+latency_profile = "low_latency"

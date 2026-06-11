@@ -1,0 +1,81 @@
+[
+  {
+    "channel": "NewsOne.us",
+    "url": "https://stream.example.com/news-one/master.m3u8",
+    "quality": "1080p",
+    "user_agent": null,
+    "referrer": null
+  },
+  {
+    "channel": "NewsOne.us",
+    "url": "http://stream.example.net/news-one-backup/index.m3u8",
+    "quality": "720p",
+    "user_agent": "MultiviewProbe/1.0",
+    "referrer": "https://portal.example.net/"
+  },
+  {
+    "channel": "SportsTwo.gb",
+    "url": "https://stream.example.org/sports-two/manifest.mpd",
+    "quality": "2160p",
+    "user_agent": null,
+    "referrer": null
+  },
+  {
+    "channel": "SportsTwo.gb",
+    "url": "https://stream.example.org/sports-two/raw.ts",
+    "quality": "576i",
+    "user_agent": null,
+    "referrer": null,
+    "label": "Geo-blocked (GB)"
+  },
+  {
+    "channel": "MovieThree.fr",
+    "url": "https://stream.example.com/movie-three/master.m3u8",
+    "quality": "1080p",
+    "user_agent": null,
+    "referrer": null,
+    "label": "Not 24/7"
+  },
+  {
+    "channel": "MusicFour.de",
+    "url": "https://stream.example.com/music-four/master.m3u8",
+    "quality": null,
+    "user_agent": null,
+    "referrer": null
+  },
+  {
+    "channel": "KidsFive.au",
+    "url": "https://stream.example.com/kids-five/playlist.m3u8?token=abc",
+    "quality": "144p",
+    "user_agent": null,
+    "referrer": null
+  },
+  {
+    "channel": "WeatherSix.ca",
+    "url": "http://stream.example.net/weather-six/live.m3u8",
+    "quality": "480p",
+    "user_agent": "WeatherClient/2",
+    "referrer": null
+  },
+  {
+    "channel": "AdultSeven.xx",
+    "url": "https://stream.example.com/adult-seven/master.m3u8",
+    "quality": "1080p",
+    "user_agent": null,
+    "referrer": null
+  },
+  {
+    "channel": "GeneralEight.us",
+    "url": "https://blocked.example.com/general-eight/master.m3u8",
+    "quality": "720p",
+    "user_agent": null,
+    "referrer": null
+  },
+  {
+    "channel": "OrphanNine.zz",
+    "url": "https://stream.example.com/orphan-nine/master.m3u8",
+    "quality": "720p",
+    "user_agent": null,
+    "referrer": null
+  }
+]

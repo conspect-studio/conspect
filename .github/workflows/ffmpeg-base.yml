@@ -1,0 +1,217 @@
+name: ffmpeg-base
+
+# Build + publish the pinned, LGPL-clean (and opt-in GPL / nvidia) FFmpeg base
+# images consumed by the app Dockerfiles via the FFMPEG_IMAGE build-arg
+# (ADR-0031 §5). Runs ONLY when the FFmpeg builder inputs change — never on
+# app-code commits — plus a weekly CVE-rebuild and manual dispatch. The ~10-min
+# source build is amortised to ~0 on every app build, which then just
+# `COPY --from` this image's /opt/multiview-ffmpeg.
+#
+# NATIVE runners (no QEMU): each (flavour, arch) leg builds + pushes BY DIGEST;
+# a per-flavour `merge` job assembles the manifest, then attests provenance +
+# SBOM and signs (keyless cosign, --recursive). On pull_request we BUILD ONLY
+# (no login/push) so forks/PRs can't publish.
+#
+# Flavours (deploy/Dockerfile.ffmpeg selects via FF_HWACCEL + FF_LICENSE):
+#   * lgpl   — vaapi + Intel QSV/libvpl (amd64) + VAAPI; multi-arch; LGPL-clean.
+#   * nvidia — NVENC/NVDEC/cuvid/scale_cuda; amd64-only for now; still LGPL-clean.
+#   * gpl    — vaapi + x264/x265 (whole build GPLv2+); opt-in; multi-arch.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/ffmpeg-build.sh"
+      - "deploy/Dockerfile.ffmpeg"
+      - ".github/workflows/ffmpeg-base.yml"
+  pull_request:
+    paths:
+      - "deploy/ffmpeg-build.sh"
+      - "deploy/Dockerfile.ffmpeg"
+      - ".github/workflows/ffmpeg-base.yml"
+  schedule:
+    - cron: "17 4 * * 1" # weekly Mon 04:17 UTC — pick up upstream CVE fixes
+  workflow_dispatch:
+
+concurrency:
+  group: ffmpeg-base-${{ github.ref }}
+  # Never cancel an in-flight publish (a cancelled merge leaves pushed per-arch
+  # digests with no manifest); only cancel superseded PR (build-only) runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/aperim/multiview-ffmpeg
+  # FFmpeg source pin (ADR-0031 FF-0b) — libavcodec .so.62, matching the binding.
+  # The SHA-256 + GPG key + nv-codec-headers commit are pinned in
+  # deploy/Dockerfile.ffmpeg's ARGs; the build verifies BOTH the GPG signature
+  # and the SHA-256 (either failing aborts).
+  FFMPEG_VERSION: "8.1.1"
+
+permissions:
+  contents: read
+
+jobs:
+  # ── per (flavour, arch) build → push by digest ──────────────────────────────
+  build:
+    name: ffmpeg ${{ matrix.flavour }}/${{ matrix.arch }}
+    # ~10-min FFmpeg-from-source compile per leg (per the workflow header) + push
+    # by digest, on native amd64/arm64 runners. A cold cache or the arm64 native
+    # leg runs materially longer; 90min is generous headroom, still far below 6h.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # lgpl (default) — multi-arch; QSV/libvpl guarded amd64-only INSIDE
+          # deploy/Dockerfile.ffmpeg + deploy/ffmpeg-build.sh.
+          - { flavour: lgpl, hwaccel: vaapi, ff_license: lgpl, platform: linux/amd64, runner: ubuntu-24.04, arch: amd64 }
+          - { flavour: lgpl, hwaccel: vaapi, ff_license: lgpl, platform: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+          # nvidia (NVENC/NVDEC, still LGPL) — amd64 only until arm64 nv-codec path is validated.
+          - { flavour: nvidia, hwaccel: nvidia, ff_license: lgpl, platform: linux/amd64, runner: ubuntu-24.04, arch: amd64 }
+          # gpl (opt-in x264/x265) — multi-arch.
+          - { flavour: gpl, hwaccel: vaapi, ff_license: gpl, platform: linux/amd64, runner: ubuntu-24.04, arch: amd64 }
+          - { flavour: gpl, hwaccel: vaapi, ff_license: gpl, platform: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      # Per (flavour, arch) digest outputs — the merge job collects them.
+      digest-lgpl-amd64: ${{ steps.export.outputs.digest-lgpl-amd64 }}
+      digest-lgpl-arm64: ${{ steps.export.outputs.digest-lgpl-arm64 }}
+      digest-nvidia-amd64: ${{ steps.export.outputs.digest-nvidia-amd64 }}
+      digest-gpl-amd64: ${{ steps.export.outputs.digest-gpl-amd64 }}
+      digest-gpl-arm64: ${{ steps.export.outputs.digest-gpl-arm64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          file: deploy/Dockerfile.ffmpeg
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          provenance: mode=max
+          sbom: true
+          # FFMPEG_VERSION drives the build; the SHA/GPG/NVCODEC pins live in the
+          # Dockerfile.ffmpeg ARGs (defaults). FF_HWACCEL + FF_LICENSE select the
+          # flavour. The build verifies GPG + SHA-256 and enforces the LGPL/
+          # nonfree guardrail.
+          build-args: |
+            FFMPEG_VERSION=${{ env.FFMPEG_VERSION }}
+            FF_HWACCEL=${{ matrix.hwaccel }}
+            FF_LICENSE=${{ matrix.ff_license }}
+          # Registry cache (durable, cross-branch, unbounded) on push; GHA
+          # read-only fallback always present for PRs/forks (no GHCR write).
+          # Keyed per (flavour, arch) so legs never thrash a shared cache.
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.flavour }}-${{ matrix.arch }}
+            type=gha,scope=ffmpeg-${{ matrix.flavour }}-${{ matrix.arch }}
+          cache-to: ${{ github.event_name != 'pull_request'
+            && format('type=registry,ref={0}:buildcache-{1}-{2},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd', env.IMAGE, matrix.flavour, matrix.arch)
+            || format('type=gha,scope=ffmpeg-{0}-{1},mode=max', matrix.flavour, matrix.arch) }}
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+
+      - name: Export digest
+        id: export
+        if: github.event_name != 'pull_request'
+        run: echo "digest-${{ matrix.flavour }}-${{ matrix.arch }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  # ── per-flavour manifest merge + attest + sign ──────────────────────────────
+  merge:
+    name: merge ${{ matrix.flavour }} + attest + sign
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    # No image build — imagetools manifest create + provenance/SBOM verify +
+    # attest + keyless cosign sign. Network/registry-bound (a few min); 30min
+    # absorbs a slow registry round-trip while failing a wedge fast.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavour: lgpl
+            digests: '["${{ needs.build.outputs.digest-lgpl-amd64 }}","${{ needs.build.outputs.digest-lgpl-arm64 }}"]'
+          - flavour: nvidia
+            digests: '["${{ needs.build.outputs.digest-nvidia-amd64 }}"]'
+          - flavour: gpl
+            digests: '["${{ needs.build.outputs.digest-gpl-amd64 }}","${{ needs.build.outputs.digest-gpl-arm64 }}"]'
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        id: manifest
+        env:
+          DIGESTS: ${{ matrix.digests }}
+          FLAVOUR: ${{ matrix.flavour }}
+        run: |
+          set -euo pipefail
+          TAG="${IMAGE}:${FFMPEG_VERSION}-${FLAVOUR}"
+          # Source refs from the flavour's per-arch digests (1 for nvidia, 2 else).
+          SRC=()
+          while IFS= read -r d; do
+            [ -n "$d" ] && SRC+=("${IMAGE}@${d}")
+          done < <(printf '%s' "$DIGESTS" | jq -r '.[]')
+          if [ "${#SRC[@]}" -eq 0 ]; then
+            echo "::error::no source digests for flavour ${FLAVOUR}"; exit 1
+          fi
+          docker buildx imagetools create -t "${TAG}" "${SRC[@]}"
+          DIGEST="$(docker buildx imagetools inspect "${TAG}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify attestations survived the merge
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}@${DIGEST}"
+          prov="$(docker buildx imagetools inspect "$REF" --format '{{json .Provenance}}')"
+          sbom="$(docker buildx imagetools inspect "$REF" --format '{{json .SBOM}}')"
+          if [ "$prov" = "null" ] || [ -z "$prov" ]; then echo "::error::merged manifest lost provenance"; exit 1; fi
+          if [ "$sbom" = "null" ] || [ -z "$sbom" ]; then echo "::error::merged manifest lost SBOM"; exit 1; fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Keyless sign (recursive — signs per-arch child manifests too)
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: cosign sign --yes --recursive "${IMAGE}@${DIGEST}"

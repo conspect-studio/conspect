@@ -1,0 +1,73 @@
+[package]
+name = "multiview-preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+multiview-engine = { workspace = true }
+multiview-events = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+# HMAC-SHA256 for short-lived signed preview access tokens. RustCrypto, pinned;
+# hmac/sha2/digest/crypto-common are MIT OR Apache-2.0 (cargo-deny allowlisted).
+hmac = "0.12.1"
+sha2 = "0.10.9"
+# Pure-Rust baseline JPEG encoder for the default (GPU-free) preview build. Pinned
+# EXACTLY to 0.6.0: that single release is licensed `MIT OR Apache-2.0` (cargo-deny
+# allowlisted) and, with the `simd` feature OFF (we never enable it), the crate is
+# itself `forbid(unsafe_code)` and dependency-free. Both 0.6.1 and the 0.7 line add
+# an extra `IJG` license term that is NOT in our allowlist and would fail
+# `cargo deny`, so we deliberately do not float to them.
+jpeg-encoder = { version = "=0.6.0", default-features = false, features = ["std"] }
+# Native WebRTC (ICE/DTLS/SRTP) stack for the off-by-default `webrtc-native`
+# transport (PRV-1b). str0m is a sans-IO WebRTC library (`MIT OR Apache-2.0`).
+# It is OPTIONAL and only pulled in by the `webrtc-native` feature, so the
+# default and `webrtc`-only builds never link it and stay pure-Rust. The
+# `rust-crypto` backend selects str0m's RustCrypto SRTP provider; its DTLS impl
+# (`dimpl`) in this 0.16.x line transitively links `aws-lc-rs` (licensed
+# `ISC AND (Apache-2.0 OR ISC)` — already in the cargo-deny allowlist) for the
+# elliptic-curve / cert primitives, which builds a small bundled C/assembly blob.
+# That native toolchain requirement rides ONLY behind `webrtc-native`; cargo-deny
+# scans the default build only (`all-features = false`) so the gate is clean.
+str0m = { version = "0.16.2", default-features = false, features = ["rust-crypto"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+# Decoder used ONLY in tests to prove the bytes we emit are a real, decodable JPEG
+# of the expected geometry and colour — never linked into the shipped crate.
+zune-jpeg = { version = "0.4", default-features = false }
+
+[features]
+"default" = []
+# Off-by-default: the WHEP/WebRTC focus surface. The default build is pure-Rust
+# (MJPEG/snapshot model + tokens only). Enabling `webrtc` turns on the WHEP
+# offer/answer + preview-encoder selection AND the transport *seam*
+# (`whep::transport`): the `WhepTransport` trait, the session lifecycle state
+# machine, the transport-supplied SDP answer attributes, and the bounded
+# drop-oldest sample feed. The seam is socket-free and pulls NO native dep, so
+# the gated build stays green and deny-clean; a native (str0m) ICE/DTLS/SRTP
+# implementation of the seam lands behind a *further* gate (it needs UDP/STUN +
+# DTLS certificates).
+"webrtc" = []
+# Off-by-default: the NATIVE str0m ICE/DTLS/SRTP `WhepTransport` implementation
+# (PRV-1b). Implies `webrtc` (the seam it satisfies) and pulls the optional
+# `str0m` dependency. This is the *further* gate the `webrtc` seam's docs refer
+# to: it links a real WebRTC stack (and, transitively, an `aws-lc-rs` C/assembly
+# blob for DTLS), so it is NOT part of the pure-Rust CI default. The pure
+# negotiation seam (SDP munging, the lifecycle state machine, the transport trait
+# wiring) is unit-tested in CI; the live DTLS-SRTP handshake + ffprobe egress need
+# a real socket/peer and run only under an env-gated, `#[ignore]`d loopback test.
+"webrtc-native" = ["webrtc", "dep:str0m"]
+
+[lints]
+workspace = true

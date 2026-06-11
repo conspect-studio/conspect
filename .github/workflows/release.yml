@@ -1,0 +1,213 @@
+name: release
+
+# Build the `multiview` binary for each supported target on a version tag,
+# tar.gz + sha256 each artifact, attest provenance, and attach them to the
+# GitHub Release. macOS builds are codesigned + notarized when the signing
+# secrets are present, and ship unsigned otherwise (so dev/fork builds still
+# work).
+#
+# We build linux `ffmpeg,linux-vaapi` and macOS `ffmpeg,apple` (the LGPL-clean
+# default + the platform HW backend). The GPL `gpl-codecs` build is NOT a
+# release artifact.
+
+on:
+  push:
+    tags:
+      # SemVer release tags, including pre-releases (e.g. v1.2.3, v1.2.3-rc.1).
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    # Per-target release build: FFmpeg install (apt PPA / brew) + a `--release
+    # --locked` cargo build, plus (macOS) codesign + notarytool --wait, which can
+    # block on Apple's notarization service. 60min covers a cold cache + a slow
+    # notarization round-trip while still capping a wedged runner well under 6h.
+    timeout-minutes: 60
+    permissions:
+      contents: write # attach assets to the Release
+      id-token: write # provenance attestation
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            features: ffmpeg,linux-vaapi
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: ffmpeg,linux-vaapi
+          # macOS-15 (Apple Silicon runner) builds BOTH macOS arches as TWO
+          # SEPARATE binaries — NOT a universal2 lipo. Homebrew's FFmpeg bottle
+          # is arm64-only on Apple Silicon runners, so an x86_64 link against it
+          # would fail; we cross-compile the x86_64 binary against the same
+          # arm64 Homebrew FFmpeg headers (ABI-compatible at the C boundary) and
+          # ship it separately, leaving universal2 muxing for a future release
+          # when a true x86_64 libav is available.
+          - os: macos-15
+            target: aarch64-apple-darwin
+            features: ffmpeg,apple
+          - os: macos-15
+            target: x86_64-apple-darwin
+            features: ffmpeg,apple
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3 # v6.0.3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0 # 1.96.0 (stable, pinned)
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2.8.0 # v2.8.0
+        with:
+          key: ${{ matrix.target }}
+
+      # ---------------------------------------------------------------------
+      # FFmpeg 7.x.
+      #
+      # GOTCHA: Ubuntu 24.04 apt ships FFmpeg 6.1 (libavcodec.so.60), NOT 7.x.
+      # The build links the FFmpeg 7.x soname family (libavcodec.so.61), so we
+      # install 7.x from the maintained `ubuntuhandbook1/ffmpeg7` PPA and then
+      # ASSERT `pkg-config --modversion libavcodec` reports 61.x. If the PPA is
+      # ever unavailable, the documented fallback is a source build of an
+      # LGPL-clean FFmpeg 7.x (configure --disable-gpl --disable-nonfree).
+      #
+      # macOS: `brew install ffmpeg` is 7.x already; we just verify the version.
+      # ---------------------------------------------------------------------
+      - name: Install FFmpeg 7.x (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends software-properties-common
+          sudo add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang nasm \
+            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+            libavdevice-dev libswscale-dev libswresample-dev \
+            libva-dev
+          MODVER="$(pkg-config --modversion libavcodec)"
+          echo "libavcodec modversion: ${MODVER}"
+          case "${MODVER}" in
+            61.*) echo "FFmpeg 7.x confirmed (libavcodec ${MODVER})." ;;
+            *) echo "::error::Expected libavcodec 61.x (FFmpeg 7.x), got ${MODVER}"; exit 1 ;;
+          esac
+
+      - name: Install FFmpeg 7.x (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew update
+          brew install ffmpeg pkg-config
+          # Make the Homebrew FFmpeg discoverable to pkg-config/clang for both
+          # the native arm64 link and the x86_64 cross-link.
+          BREW_PREFIX="$(brew --prefix)"
+          echo "PKG_CONFIG_PATH=${BREW_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
+          MODVER="$(PKG_CONFIG_PATH="${BREW_PREFIX}/lib/pkgconfig" pkg-config --modversion libavcodec)"
+          echo "libavcodec modversion: ${MODVER}"
+          case "${MODVER}" in
+            61.*) echo "FFmpeg 7.x confirmed (libavcodec ${MODVER})." ;;
+            *) echo "::error::Expected libavcodec 61.x (FFmpeg 7.x), got ${MODVER}"; exit 1 ;;
+          esac
+
+      - name: Build release binary
+        run: |
+          cargo build --release --locked \
+            -p multiview-cli \
+            --target ${{ matrix.target }} \
+            --features ${{ matrix.features }}
+
+      # ---------------------------------------------------------------------
+      # macOS code-sign + notarize, GATED on the signing secrets being present.
+      # Required repo/org secrets (skip cleanly if any are absent):
+      #   MACOS_CERTIFICATE      base64 of the Developer ID Application .p12
+      #   MACOS_CERTIFICATE_PWD  password for that .p12
+      #   AC_API_KEY_ID          App Store Connect API key id
+      #   AC_API_ISSUER_ID       App Store Connect issuer id
+      #   AC_API_KEY_P8          contents of the AuthKey_*.p8 (private key)
+      # ---------------------------------------------------------------------
+      - name: Detect signing secrets
+        if: runner.os == 'macOS'
+        id: signing
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+        run: |
+          if [ -n "${MACOS_CERTIFICATE:-}" ] && [ -n "${AC_API_KEY_P8:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::macOS signing secrets absent; shipping an unsigned binary."
+          fi
+
+      - name: Import signing certificate
+        if: runner.os == 'macOS' && steps.signing.outputs.enabled == 'true'
+        uses: apple-actions/import-codesign-certs@v3 # v3
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERTIFICATE }}
+          p12-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+
+      - name: Codesign + notarize (macOS)
+        if: runner.os == 'macOS' && steps.signing.outputs.enabled == 'true'
+        env:
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/multiview"
+          # Hardened-runtime codesign with a secure timestamp. The signing
+          # identity is the first Developer ID Application in the keychain.
+          IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          codesign --force --options runtime --timestamp --sign "${IDENTITY}" "${BIN}"
+          codesign --verify --strict --verbose=2 "${BIN}"
+          # Notarize: notarytool wants an archive; zip the signed binary.
+          KEYFILE="$(mktemp)"
+          printf '%s' "${AC_API_KEY_P8}" > "${KEYFILE}"
+          ZIP="$(mktemp -d)/multiview.zip"
+          /usr/bin/ditto -c -k --keepParent "${BIN}" "${ZIP}"
+          xcrun notarytool submit "${ZIP}" \
+            --key "${KEYFILE}" \
+            --key-id "${AC_API_KEY_ID}" \
+            --issuer "${AC_API_ISSUER_ID}" \
+            --wait
+          rm -f "${KEYFILE}"
+          # CLI binaries can't be stapled (no bundle); the notarization ticket is
+          # served by Apple and checked online at first run.
+
+      - name: Package tar.gz + sha256
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/multiview"
+          STAGE="multiview-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/${STAGE}"
+          cp "${BIN}" "dist/${STAGE}/multiview"
+          cp README.md LICENSE LICENSE-COMMERCIAL.md NOTICE THIRD-PARTY-NOTICES.md "dist/${STAGE}/" 2>/dev/null || true
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          ( cd dist && shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
+          echo "archive=dist/${STAGE}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${STAGE}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.1.0 # v4 (4.1.0)
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2.4.1 # v2 (2.4.1)
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}

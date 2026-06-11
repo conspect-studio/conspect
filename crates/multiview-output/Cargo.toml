@@ -1,0 +1,171 @@
+[package]
+name = "multiview-output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+# GP-5 packet-liveness watchdog (`PacketLiveness`): a pure-Rust, native-dep-free
+# crate (it depends only on `multiview-core`), so the GP-7 guarded-passthrough
+# splice seam reuses the watchdog with NO native escalation. Dependency direction
+# is clean (output is a leaf media crate; framestore depends only on core — no
+# cycle), and `cargo deny` (all-features=false) sees only this pure-Rust crate.
+multiview-framestore = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# `fs` + `io-util` serve the HLS delivery surface (`hls::http`): async file
+# metadata/reads (with seek for Range requests) off the engine hot path.
+tokio = { workspace = true, features = ["fs", "io-util"] }
+# `ReaderStream` streams a (bounded) segment span straight off disk into the
+# response body — never buffering a whole multi-MB segment into RAM on the
+# unauthenticated HLS delivery surface (`hls::http`).
+tokio-util = { workspace = true }
+
+# The HLS delivery origin (`hls::http`, ADR-0032 §6): an axum router serving
+# playlists/segments/init with the documented header contract (Content-Type per
+# extension, Cache-Control tiers, Origin-reflecting CORS, Accept-Ranges/206).
+# Pure Rust (no native dep), stays in the default LGPL-clean build; trimmed to
+# the core router + `tokio` feature (no HTTP/1 server here — the listener that
+# serves this router lives with the caller, e.g. the control listener).
+axum = { version = "0.8.9", default-features = false, features = ["tokio"] }
+
+# Off-by-default `ndi` path ONLY. The proprietary NDI® runtime is resolved at RUN
+# time via `NDIlib_v6_load` (never linked/vendored at build time; ADR-0008). All
+# the raw `dlopen`/`dlsym` `unsafe` lives in this tiny FFI leaf crate, so
+# `multiview-output` stays `forbid(unsafe_code)`. Pulled in ONLY by the `ndi`
+# feature, so the default build never links it and `cargo deny`
+# (`all-features = false`) never scans it.
+multiview-ndi-sys = { workspace = true, optional = true }
+
+# Off-by-default `rtsp-server` path ONLY (OUT-2 / ADR-0006): the in-process RTSP
+# server. These are the SAFE Rust bindings over GStreamer/GLib; this crate writes
+# NO `unsafe` and stays `forbid(unsafe_code)`. The GStreamer/GLib C libraries are
+# LGPL-2.1 and resolved by DYNAMIC LINK at run time (never vendored), so the
+# default build is unaffected and LGPL-clean. Pulled in ONLY by the `rtsp-server`
+# feature; `cargo deny` runs with all-features=false so it never sees them.
+gstreamer = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+gstreamer-rtsp-server = { workspace = true, optional = true }
+glib = { workspace = true, optional = true }
+
+# Off-by-default `display-kms` path ONLY (DEV-B1 / ADR-0044): the real DRM/KMS
+# backend of the display sink (`display::kms`). `drm`/`drm-ffi` are Smithay's
+# SAFE pure-ioctl wrappers (no C linkage); `gbm` links Mesa's libgbm at run
+# time for scanout allocation (dumb buffers are the GBM-less fallback);
+# `rustix` provides the safe poll(2) on the DRM event fd. This crate writes NO
+# `unsafe` and stays `forbid(unsafe_code)` — GBM GEM handles cross into DRM via
+# prime-fd export/import, never the C union accessor. The pure sink seam
+# (mailbox, mode policy, flip state machine, the sink thread over the
+# `KmsBackend` trait) is ALWAYS compiled and CI-tested; this feature only adds
+# the ioctl-speaking device. `cargo deny` runs with all-features=false so the
+# default graph never sees these.
+drm = { workspace = true, optional = true }
+drm-ffi = { workspace = true, optional = true }
+gbm = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+
+# Real libav* encode/mux path — opt-in only behind the `ffmpeg` feature so the
+# DEFAULT build stays pure-Rust / native-dep-free. All raw FFI is owned by
+# `multiview-ffmpeg`; this crate only calls its SAFE wrappers (it stays
+# `unsafe_code = forbid`). `cargo deny check` runs with all-features=false so it
+# never sees this opt-in dependency.
+multiview-ffmpeg = { workspace = true, optional = true }
+
+# Opt-in alongside `multiview-ffmpeg`, used ONLY to name `ffmpeg-next`'s safe value
+# types (`format::Pixel`, the encoded-packet/`Video` frame types) when calling
+# `multiview-ffmpeg`'s safe encoder/scaler/muxer wrappers — e.g. naming the
+# `yuv420p` working format LGPL software codecs require. This crate writes NO
+# `unsafe` and performs NO FFI (it stays `unsafe_code = forbid`); all raw libav*
+# remains owned by `multiview-ffmpeg`. Pinned to match its binding. `cargo deny`
+# runs with all-features=false so it never sees this opt-in dependency.
+ffmpeg-next = { version = "8.1", optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3"
+# In-process HTTP tests for the `hls::http` delivery router (the workspace's
+# `tower::oneshot` route-test pattern, as in multiview-control).
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Round-trip codec tests ONLY: encode here, decode with multiview-input's TSL
+# decoders, asserting encode∘decode == identity on the wire. A DEV-dependency
+# only — it never enters the (non-test) crate graph, so the sibling relationship
+# (multiview-input and multiview-output do not depend on each other) is preserved.
+# multiview-input's default build is pure-Rust (no `ffmpeg`/`ndi` pulled here), so
+# the baseline stays native-dep-free. `cargo deny` runs with all-features=false
+# and ignores dev-dependencies, so this is invisible to the licence gate.
+multiview-input = { workspace = true }
+# NOTE: the `ffmpeg`-feature integration tests also use `ffmpeg-next` (to bridge
+# demux -> decode when feeding the sinks). It is NOT listed here as a
+# dev-dependency on purpose: an unconditional dev-dependency would compile native
+# libav* even for the DEFAULT `cargo test` (dev-deps ignore features), breaking
+# the pure-Rust baseline. Instead those tests rely on the *optional* `ffmpeg-next`
+# dependency above, which is only present (and only buildable) when the `ffmpeg`
+# feature is enabled — exactly when the tests that need it are compiled.
+
+[features]
+"default" = []
+# Wires the real encode-once-mux-many output (FileSink / SegmentSink) onto
+# multiview-ffmpeg's safe Encoder/Muxer wrappers. Pulls multiview-ffmpeg with its own
+# `ffmpeg` feature; never escalates to GPL (LGPL software codecs only).
+"ffmpeg" = ["dep:multiview-ffmpeg", "multiview-ffmpeg/ffmpeg", "dep:ffmpeg-next"]
+# License-escalating: forwards multiview-ffmpeg's `gpl-codecs` so a sink may target
+# the GPL software encoders (libx264/libx265). Enabling this makes the whole
+# build GPL; it is NEVER pulled in by `ffmpeg` alone and never enters the default
+# (LGPL-clean) build. Implies `ffmpeg` (the sinks need the real encode path).
+"gpl-codecs" = ["ffmpeg", "multiview-ffmpeg/gpl-codecs"]
+# NVENC hardware-encoder selection (compile-only here; no native crate). Forwards
+# multiview-ffmpeg's `cuda` so the codec selector may consider h264_nvenc/hevc_nvenc.
+# Implies `ffmpeg` (selection's run-time probe needs libav).
+"cuda" = ["ffmpeg", "multiview-ffmpeg/cuda"]
+# Proprietary NDI® output (ADR-0008). OFF by default and LICENSE-ISOLATING: it is
+# NOT part of the `full` preset and is requested explicitly. Pulls the
+# `multiview-ndi-sys` FFI leaf crate, which resolves the NDI runtime at RUN time
+# via `NDIlib_v6_load` — NOTHING is linked or vendored at build time, so both the
+# default build AND this `ndi` build compile and link WITHOUT the SDK present. NDI
+# I/O additionally stays inert until an operator accepts the runtime license gate
+# (see `crate::ndi::NdiLicense`).
+"ndi" = ["dep:multiview-ndi-sys"]
+# The LIVE NDI binding (ADR-0028): turns on multiview-ndi-sys's `bindings` feature
+# (bindgen over the licensed SDK header at BUILD time) and compiles the real
+# `SdkNdiApi` that delegates to the safe `NdiSender`. OFF by default and NOT in any
+# preset: it requires the operator-provided NDI SDK header present at build time
+# (NDI_SDK_INCLUDE_DIR / /opt/ndi/include), so plain `--features ndi` stays
+# SDK-free and CI-buildable while `--features ndi-bindings` is a box/operator
+# concern. Implies `ndi`. The default build remains LGPL-clean (nothing linked).
+"ndi-bindings" = ["ndi", "multiview-ndi-sys/bindings"]
+# In-process RTSP server (OUT-2 / ADR-0006 primary path). OFF by default: it pulls
+# the GStreamer/GLib C stack (a GLib main loop) via the SAFE `gst-rtsp-server`
+# Rust bindings. The bindings are MIT/Apache-2.0 and the C libraries are LGPL-2.1,
+# resolved by DYNAMIC LINK at run time — never vendored — so enabling this does
+# NOT make the build GPL and the DEFAULT build links nothing GStreamer. The pure
+# typed seam (bounded drop-oldest queue, `RtspServerSink`, mount/caps) is ALWAYS
+# compiled and CI-tested; this feature only adds the `rtsp_server::server` serving
+# thread. NOTE: building this feature requires the GStreamer dev libraries present
+# (gstreamer-1.0, gstreamer-app, gstreamer-rtsp-server-1.0); without them the
+# link/build fails — it is a GStreamer-equipped-runner concern, not CI.
+"rtsp-server" = [
+    "dep:gstreamer",
+    "dep:gstreamer-app",
+    "dep:gstreamer-rtsp-server",
+    "dep:glib",
+]
+# Local DRM/KMS display output (DEV-B1 / ADR-0044): compiles the real
+# ioctl-speaking `display::kms` backend (drm-rs atomic commits + GBM/dumb
+# scanout buffers). OFF by default — the default build stays pure-Rust and the
+# always-compiled display seam (mailbox/mode-policy/flip-loop over the mock)
+# is what CI tests. Building this feature needs Mesa's libgbm development
+# files present (libgbm-dev); the binary then dynamically links libgbm.
+"display-kms" = ["dep:drm", "dep:drm-ffi", "dep:gbm", "dep:rustix"]
+
+[lints]
+workspace = true

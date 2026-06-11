@@ -1,0 +1,214 @@
+[package]
+name = "multiview-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+multiview-engine = { workspace = true }
+multiview-events = { workspace = true }
+multiview-config = { workspace = true }
+multiview-telemetry = { workspace = true }
+# The local entitlement plane (Conspect, ADR-0050): the verified-lease store, the
+# enforcement-ladder-as-data, and the lease-verification path the licence routes
+# render. Pure-Rust leaf crate (no engine, no GPU, no FFmpeg), so it stays in the
+# CI-green default build; enforcement is DATA the control plane renders, never a
+# control-flow decision that could touch the engine (invariant #1/#10).
+multiview-licence = { workspace = true }
+# The `FocusGate` admission primitive (pure-Rust default build: counters only, no
+# native/codec dep) bounds concurrent WHEP focus sessions. The control plane wraps
+# its codec-free `WhepProvider` seam with the gate; both Tier-A control-plane
+# crates, an acyclic edge (preview never depends on control).
+multiview-preview = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# `net` adds `tokio::net::TcpListener` for `serve` (the real-socket bind that lets
+# `multiview run` expose the API+WebUI); pure Rust, stays in the default build.
+tokio = { workspace = true, features = ["net"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP stack (pure Rust; the default-feature build pulls no native libs).
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["trace", "cors"] }
+bytes = "1.10.1"
+async-stream = "0.3.6"
+uuid = { version = "1.23.2", features = ["v4"] }
+
+# Auth: HMAC-SHA256 verification of API keys (high-entropy keys -> no slow KDF,
+# per the web-api-stack brief) and HS256 JWT signature verification. RustCrypto
+# crates, all MIT/Apache-2.0. `base64` (MIT/Apache-2.0, pure Rust) decodes the
+# base64url JWT segments — no native deps, stays in the CI-green default build.
+sha2 = "0.10.9"
+hmac = "0.12.1"
+subtle = "2.6.1"
+base64 = "0.22.1"
+
+# OpenAPI 3.1 (utoipa) + Scalar try-it-out, behind the default `openapi` feature.
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid"], optional = true }
+utoipa-axum = { version = "0.2.0", optional = true }
+utoipa-scalar = { version = "0.3.0", features = ["axum"], optional = true }
+
+# Embedded web UI (behind the off-by-default `embed-web` feature). `rust-embed`
+# inlines the built SPA (`web/dist`, staged by the web build) into the binary so
+# the management UI ships self-contained; `debug-embed` embeds in EVERY profile
+# (so debug builds + tests exercise the real bytes, not a disk read), matching
+# the font-embedding precedent in multiview-compositor. `mime_guess` derives the
+# Content-Type per asset. Both MIT, pure Rust, in the cargo-deny allowlist.
+rust-embed = { version = "8", default-features = false, features = [
+    "debug-embed",
+    "include-exclude",
+], optional = true }
+mime_guess = { version = "2", optional = true }
+
+# SQLite persistence: OFF by default. SQLite's bundled license is NOT in the
+# cargo-deny allowlist, so sqlx/sqlite must never appear in the default build.
+sqlx = { version = "0.8.6", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+], optional = true }
+
+# Email (SMTP) notifier: OFF by default. `lettre` pulls a TLS/SMTP stack that
+# the default pure-Rust build does not need; the pure EmailMessage builder is
+# always compiled, only the `to_lettre()`/send path is gated behind `email`.
+lettre = { version = "0.11.20", default-features = false, features = [
+    "builder",
+], optional = true }
+
+# IS-07 MQTT broker client: OFF by default (`is07-mqtt`). The pure IS-07
+# message/codec model + topic convention is always compiled; only the live
+# broker publish/subscribe path needs this client. `rumqttc` is async,
+# permissively licensed (Apache-2.0, in the deny.toml allowlist), and pure
+# Rust with no native deps when built without a TLS feature — so the feature
+# stays LGPL-clean. No TLS feature here: the binding speaks plain MQTT to a
+# broker on the trusted facility network (TLS is a deployment-side proxy
+# concern, mirroring the lettre/SMTP posture).
+rumqttc = { version = "0.25.1", default-features = false, optional = true }
+
+# mDNS/DNS-SD device discovery: OFF by default (`discovery`). The untrusted
+# inventory model, the driver-kind inference, and the injected-browser seam are
+# always compiled and tested socket-free (an injected `DiscoveryBrowser`); only
+# the real multicast browse needs `mdns-sd`. `mdns-sd` is `Apache-2.0 OR MIT`
+# and its whole dependency closure (`flume`, `if-addrs`, `socket2`, `mio`,
+# `socket-pktinfo`, `fastrand`) resolves to licenses already on the deny.toml
+# allowlist (MIT / Apache-2.0 / BSD-3-Clause); it is pure Rust with no native C
+# deps and ships its own runtime-agnostic background thread, so the feature
+# stays LGPL-clean and out of the CI-green default build. The `async` feature
+# gives the browse `Receiver` a `recv_async()` the scan's interleaved drain
+# (`drain_interleaved`, one task per browsed type on a scan-local runtime)
+# awaits concurrently across every browse channel, so no service type can
+# starve another and the daemon's bounded blocking send never wedges on an
+# undrained channel.
+mdns-sd = { version = "0.20.0", default-features = false, features = [
+    "async",
+], optional = true }
+serde_path_to_error = "0.1"
+
+# The live HTTP transport for the `zowietek` managed-device driver: OFF by
+# default (`zowietek` / `devices-net`). The typed JSON-RPC client + driver logic
+# and the scripted-transport tests are ALWAYS compiled and tested socket-free
+# (the transport seam is an async trait); only the real reqwest-backed transport
+# needs this client. `reqwest` is pinned to the `rustls-tls` backend (NEVER
+# OpenSSL/native-tls) so the dependency graph stays native-lib-free; the vendor
+# API is plain HTTP, but the rustls backend keeps an `https://` device address
+# working too. Because `deny.toml` has `[graph] all-features = false`, this
+# off-by-default dep is not in the scanned default graph (mirroring the
+# `ureq`/`ring` posture already documented there).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+    # `test-util` pauses the clock in the zowietek driver/client tests so the
+    # per-device backoff (00009/00010) is exercised without real sleeps.
+    "test-util",
+] }
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.3"
+# Property tests for the pure value-machines in this crate (the IS-07 tally/GPI
+# codec and the tally mirror/override registry).
+proptest = "1.11.0"
+rumqttd = { version = "0.20", default-features = false }
+toml = "0.8"
+# Build signed lease bindings in the licence-route tests (Conspect, ADR-0050):
+# generate a test keypair, sign a lease, and CBOR-encode the binding the
+# `POST /api/v1/licence/lease` route ingests, and drive the store clock across
+# day boundaries. Test-only; the non-test control build never mints keys nor
+# reads a clock (the licence crate is verification-only / clock-injected). All
+# `MIT`/`Apache-2.0`, already on the deny.toml allowlist.
+chrono = { workspace = true, features = ["alloc"] }
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "alloc",
+    "rand_core",
+] }
+rand_core = { version = "0.6", default-features = false, features = [
+    "getrandom",
+] }
+ciborium = "0.2.2"
+
+[features]
+"default" = ["openapi"]
+"openapi" = ["dep:utoipa", "dep:utoipa-axum", "dep:utoipa-scalar"]
+"embed-web" = ["dep:rust-embed", "dep:mime_guess"]
+# Off-by-default SQLite-backed repository. NOT part of the CI-green default
+# build (SQLite license is outside the deny.toml allowlist).
+"sqlite" = ["dep:sqlx"]
+# Off-by-default SMTP email notifier (lettre). The pure builder is always
+# compiled; only the live send path needs this feature.
+"email" = ["dep:lettre"]
+# Off-by-default MQTT transport binding for NMOS IS-07 event/tally. The pure
+# IS-07 message/codec model is always compiled and tested; only the MQTT
+# topic-convention seam (and any future live broker client) needs this feature,
+# which therefore stays out of the CI-green default build.
+"is07-mqtt" = ["dep:rumqttc"]
+# Off-by-default NMOS IP-facility transport: mDNS/DNS-SD registry discovery and
+# the live ST 2110 receiver bind for IS-04/05/08. The pure NMOS JSON/HTTP models
+# and handlers are always compiled and tested in-process; only the discovery +
+# socket seam needs this feature, so it stays out of the CI-green default build.
+"nmos" = []
+# Off-by-default router transport: the live TCP/serial socket to a SW-P-08 or
+# Ember+ router. The protocol codecs are always compiled and tested; only the
+# socket seam needs this feature, so it stays out of the CI-green default build.
+"router" = []
+# Off-by-default mDNS/DNS-SD device discovery (ADR-M008 §6 / ADR-0041 doctrine):
+# the real multicast browse for `_googlecast._tcp` (Cast), `_ndi._tcp` (NDI
+# sources incl. ZowieBox), and any configured zowietek-control service type. The
+# untrusted-inventory model, the driver-kind inference, and the injected
+# `DiscoveryBrowser` seam are always compiled and tested socket-free; only the
+# live `mdns-sd` browser needs this feature, so it stays out of the CI-green
+# default build. Discovered services are an untrusted inventory requiring
+# explicit confirm-adopt — discovery never creates a device.
+"discovery" = ["dep:mdns-sd"]
+# Off-by-default live HTTP transport for the `zowietek` managed-device driver
+# (DEV-A4, ADR-M009). The typed JSON-RPC client + the driver actor + the three
+# facets + mode convergence are ALWAYS compiled and tested socket-free against a
+# scripted transport seam; only the real reqwest-backed transport
+# (`ReqwestTransport`) needs this feature, so the default build stays
+# pure-Rust/socket-free and CI-green.
+"zowietek" = ["dep:reqwest"]
+# The umbrella feature for managed-device network I/O (so a deployment can turn
+# on every device driver's live transport + the mDNS discovery browse with one
+# flag). Today: the `zowietek` live transport + `discovery`; future drivers
+# (cast, …) join here.
+"devices-net" = ["zowietek", "discovery"]
+
+[lints]
+workspace = true

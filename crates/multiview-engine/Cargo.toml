@@ -1,0 +1,91 @@
+[package]
+name = "multiview-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+arc-swap = "1.9.1"
+multiview-core = { workspace = true }
+multiview-hal = { workspace = true }
+multiview-framestore = { workspace = true }
+multiview-input = { workspace = true }
+multiview-output = { workspace = true }
+multiview-compositor = { workspace = true }
+multiview-audio = { workspace = true }
+multiview-overlay = { workspace = true }
+multiview-config = { workspace = true }
+multiview-events = { workspace = true }
+multiview-telemetry = { workspace = true }
+serde = { workspace = true }
+# JSON wire encoding for the HA cluster transport (snapshots/deltas/heartbeats
+# across nodes). Optional + activated only by the off-by-default `cluster`
+# feature — the default pure-Rust build does not link it.
+serde_json = { workspace = true, optional = true }
+# Safe POSIX/Linux syscall wrappers for the PHC (PTP Hardware Clock) read:
+# `clock_gettime` on the dynamic clock id derived from a `/dev/ptpN` fd. Optional
+# + activated only by the off-by-default `ptp` feature — the default pure-Rust
+# build does not link it. Keeps the engine `forbid(unsafe_code)`: rustix owns the
+# FFI, so there is no `unsafe` in this crate. License: MIT OR Apache-2.0 OR
+# BSD-2-Clause (LGPL-clean).
+rustix = { version = "1.1.4", features = ["time"], optional = true }
+# Safe wrapper over the Linux `adjtimex(2)` NTP clock-discipline read for the
+# wall-clock reference badge (`sysref::live`). Optional + activated only by the
+# off-by-default `ntp` feature — the default pure-Rust build does not link it.
+# Keeps the engine `forbid(unsafe_code)`: the single `unsafe` syscall lives in
+# this leaf crate (which is `unsafe_code = "deny"` + `// SAFETY:`), so there is no
+# `unsafe` in the engine. License: MIT OR Apache-2.0 (LGPL-clean).
+multiview-ntpsys = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
+
+[features]
+"default" = []
+# Map the configurable failover-slate policy onto the PASSTHROUGH / TRANSCODE
+# program's pre-baked output slate (`slate::output_slate_kind` /
+# `output_slate_audio` → `multiview_output::slate::SlateKind` / `SlateAudio`).
+# OFF by default because the output slate baker lives behind
+# `multiview-output/ffmpeg` (it bakes a real coded slate via libav). The
+# LAYOUT-tile half (`slate::failover_slate_image`, the per-cell drive slate) is
+# pure-Rust and always compiled — this feature only adds the output-program
+# mapping. Pulled in by the CLI's `ffmpeg`-bearing presets alongside the live
+# guarded-passthrough path.
+"ffmpeg" = ["multiview-output/ffmpeg"]
+# PTP / ST 2059-2 hardware binding (PTP NIC + PHC discipline). OFF by default:
+# it needs a real PTP-capable NIC, so it is compile-verified only here. The PURE
+# servo math (`ptp::PtpServo`) is always compiled and fully tested; this feature
+# only adds the thin `ptp::phc` disciplined-reference wrapper. The output clock
+# (`out_pts = f(tick)`) is never paced by PTP — see the `ptp` module docs.
+"ptp" = ["dep:rustix"]
+# Live system-clock NTP/chrony discipline read for the wall-clock badge
+# (`sysref::live`). OFF by default: the *Locked* result needs a host actually
+# synchronised by ntpd/chrony, so it is compile-verified here and live-gated in
+# tests. The PURE classification + source-selection (`sysref::classify_system`,
+# `sysref::ReferenceSelector`) is always compiled and fully tested; this feature
+# only adds the thin `adjtimex` adapter over the `multiview-ntpsys` FFI leaf
+# crate. The discipline reference never paces the output clock — see `sysref`.
+"ntp" = ["dep:multiview-ntpsys"]
+# M9 high-availability cluster transport (peer heartbeat sockets + state
+# replication wire I/O). OFF by default: it needs a real network and a live
+# multi-node cluster, so it is compile-verified only here. The PURE HA model —
+# the heartbeat/failover state machine (`ha::HaStateMachine`, `ha::Cluster`) and
+# the replication model (`ha::repl`) — is always compiled and fully tested; this
+# feature only adds the thin `ha::transport` wire wrapper around them. HA never
+# paces or back-pressures the active node's output clock — see the `ha` docs.
+"cluster" = ["dep:serde_json"]
+
+[lints]
+workspace = true

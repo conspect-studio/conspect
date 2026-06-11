@@ -1,0 +1,76 @@
+[package]
+name = "multiview-ndi-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+description = "Minimal safe runtime-load wrapper over the proprietary NDI® SDK (NDIlib_v6_load). dlopen + symbol-table FFI is isolated here so multiview-output stays forbid(unsafe_code). The SDK is NEVER vendored or linked at build time (ADR-0008)."
+
+[dependencies]
+# Runtime `dlopen`/`dlsym` of the operator-provided NDI runtime dylib. There is
+# NO build-time link to `libndi` and the proprietary SDK is never vendored: this
+# crate resolves the v6 entry point (`NDIlib_v6_load`) at RUN time and reads the
+# returned function table, exactly as ADR-0008 / docs/io/ndi.md require. So the
+# default build (and even an `ndi`-feature build) compiles and links WITHOUT the
+# SDK present. License: ISC (LGPL-clean), already in the workspace graph. This is
+# the ONLY raw FFI dependency in the NDI path, and this leaf crate is the sole
+# `unsafe` boundary so `multiview-output` can stay `forbid(unsafe_code)`.
+libloading = { workspace = true }
+
+[features]
+# Generate the typed NDIlib v6 ABI (the function table + frame/source structs)
+# from the **licensed** SDK header at build time via `bindgen`. OFF by default;
+# the consumers' `ndi` feature pulls it. The header is located at build time
+# (NDI_SDK_INCLUDE_DIR, else /opt/ndi/include, else the workspace `.ndi-sdk/include`
+# drop-spot) and is NEVER vendored or committed (ADR-0008); the runtime `.so` is
+# still `dlopen`-loaded, never linked. With this feature OFF the crate is exactly
+# the pure runtime-loader and needs no SDK present.
+bindings = ["dep:bindgen"]
+
+[build-dependencies]
+# Only compiled when the `bindings` feature is on (optional). Pinned to the
+# version already resolved in the workspace lockfile.
+bindgen = { version = "0.70", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+# FFI crate exception. The workspace forbids `unsafe_code`, and a `forbid` level
+# can never be relaxed by a downstream manifest or inner attribute — so this crate
+# cannot use `[lints] workspace = true` (cargo also rejects inheriting + overriding
+# in one table). Instead it restates the workspace lint set verbatim with the single
+# change of `unsafe_code` from `forbid` to `deny`, so the raw `dlopen`/`dlsym`
+# resolution of the NDI runtime is allowed only with a justified `// SAFETY:`
+# comment. Keep in sync with the root Cargo.toml `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+as_conversions   = "deny"
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

@@ -1,0 +1,39 @@
+[package]
+name = "multiview-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8.19"
+# IANA timezone validation for the clock synthetic source (ADR-0047): a
+# `timezone` id is rejected at config load if it is not a known IANA zone, via
+# the canonical `multiview_overlay::clock::parse_tz` (one source of truth shared
+# with the render-time `resolve_offset`). Pure Rust, no native deps; the IANA tz
+# database is bundled at build time by `chrono-tz` (deny-clean, default build).
+multiview-overlay = { workspace = true }
+# Date/time + IANA-zone instant resolution for the timer synthetic source
+# (ADR-0047): a `timer` target ("HH:MM:SS" time-of-day or RFC3339 "datetime") is
+# parsed and resolved to an absolute UTC instant in its zone (DST-correct via
+# `chrono-tz`), so the displayed count is integer seconds against a real instant —
+# never float fps. `default-features = false` (no system-clock features): every
+# instant is injected, so the math is deterministic and testable.
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.5.0"
+
+[lints]
+workspace = true

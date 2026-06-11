@@ -1,0 +1,111 @@
+[package]
+name = "multiview-ffmpeg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+# The unified caption-cue model (`caption` module) is pure and always compiled;
+# it round-trips TOML/JSON via serde (adjacently-tagged, never `untagged`).
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# libav* binding — opt-in only behind the `ffmpeg` feature so the DEFAULT build
+# stays pure-Rust / native-dep-free. `ffmpeg-next` (+ its `ffmpeg-sys-next` build
+# crate) links the SYSTEM libav* via pkg-config and auto-detects the installed
+# FFmpeg version in build.rs (no per-version Cargo feature needed). Pinned to the
+# 7.x line to match the FFmpeg 7.1 / libavcodec 61 in the dev/CI image. WTFPL
+# (public-domain-equivalent, permissive) — acceptable for an opt-in feature; the
+# default `cargo deny check` runs with all-features=false so it never sees this.
+ffmpeg-next = { version = "8.1", optional = true }
+# C ABI scalar types (`c_int`/`c_void`) for the GP-0 `AVIOInterruptCB` callback,
+# whose libav-bound signature is `extern "C" fn(*mut libc::c_void) -> libc::c_int`
+# (ffmpeg-sys-next's bindings use `libc::*`). Only pulled in with `ffmpeg`; it is
+# already in the dependency tree via `ffmpeg-sys-next`, so this adds no new
+# native/license surface. MIT OR Apache-2.0.
+libc = { version = "0.2", optional = true }
+
+[features]
+"default" = []
+"ffmpeg" = ["dep:ffmpeg-next", "dep:libc"]
+"gpl-codecs" = []
+# NVENC hardware-encoder selection (h264_nvenc / hevc_nvenc). Compile-only here:
+# the NVENC encoders live in the linked libavcodec, so this gates only which
+# encoder *names* the codec selector is allowed to consider — it pulls no native
+# crate. Best paired with `ffmpeg` (selection's run-time availability probe needs
+# libav); on a box with no GPU the NVENC name simply fails to resolve and the
+# selector falls through to software (graceful degradation).
+"cuda" = []
+# Test-only DVB-sub MPEG-TS fixture generator (`test_fixtures` module). The
+# Debian/CI FFmpeg CLI cannot transcode a text subtitle into a bitmap `dvbsub`
+# stream, so the cross-crate DVB-sub caption tests build the fixture directly
+# through libav here (the only crate allowed `unsafe` for raw libav* FFI). Pulls
+# in `ffmpeg`. NEVER enabled by a normal build — only by dev/test targets that
+# need a real dvbsub clip. `#[doc(hidden)]`; not part of the public API.
+"test-fixtures" = ["ffmpeg"]
+
+[build-dependencies]
+# Compile the libav log-callback C shim (`csrc/log_shim.c`) under the `ffmpeg`
+# feature. The shim owns the libav `va_list` so the Rust side never spells that
+# ABI-fragile type in function-parameter position (fixes the x86-64 SysV
+# ingest-thread SIGSEGV). Both build-deps are already in the lockfile via
+# `ffmpeg-sys-next` — they add NO new dependency or license surface, and the
+# build.rs only invokes them when `CARGO_FEATURE_FFMPEG` is set, so the default
+# pure-Rust build does no native compilation. MIT OR Apache-2.0 (cc) / MIT OR
+# Apache-2.0 (pkg-config) — both LGPL-clean.
+cc = "1"
+# Locates the libav include path (`<libavutil/log.h>`) for the shim compile; the
+# deploy build points it at our FFmpeg via PKG_CONFIG_PATH, the same headers
+# `ffmpeg-sys-next` itself binds against.
+pkg-config = "0.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
+# Captures the records the libav→tracing bridge emits so the FFI integration
+# smoke test (`tests/log_bridge_ffi.rs`, `ffmpeg` feature) can assert routing +
+# rate-limiting actually happened. Already a workspace dependency.
+tracing-subscriber = { workspace = true }
+
+# FFI crate exception. The workspace forbids `unsafe_code`, and a `forbid` level
+# can never be relaxed by a downstream manifest or inner attribute — so this crate
+# cannot use `[lints] workspace = true` (cargo also rejects inheriting + overriding
+# in one table). Instead it restates the workspace lint set verbatim with the single
+# change of `unsafe_code` from `forbid` to `deny`, so raw libav* bindings are allowed
+# only with a justified `// SAFETY:` comment per block. Keep in sync with the root
+# Cargo.toml `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+as_conversions   = "deny"
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

@@ -1,0 +1,127 @@
+[package]
+name = "multiview-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+multiview-framestore = { workspace = true }
+# Lock-free read-copy-update for the per-source caption cue store (same
+# primitive the frame stores use); no native deps, keeps the crate `unsafe`-free.
+arc-swap = "1.9.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+# multiview-ffmpeg is pulled in UNCONDITIONALLY but with NO features: its DEFAULT
+# build is pure-Rust / native-dep-free (the libav* `ffmpeg-next` link is opt-in
+# behind ITS `ffmpeg` feature, off here by default), so the default multiview-input
+# build stays pure-Rust and LGPL-clean. We depend on it for the always-compiled,
+# libav-free GP-1 byte-parser types (`idr::{CodecKind, NalFraming}`) that the GP-2
+# pure parameter-set probe (`param_probe`) reuses instead of reinventing bitstream
+# framing. The real demux/decode SAFE wrappers stay gated: THIS crate's `ffmpeg`
+# feature turns on multiview-ffmpeg's `ffmpeg` feature. multiview-input never links
+# libav directly (it forbids `unsafe`); it only calls multiview-ffmpeg's safe API.
+multiview-ffmpeg = { workspace = true }
+
+# JSON info-dict parser + derive for the YouTube resolver (the `youtube`
+# feature). Pulled in only behind that off-by-default feature; the default build
+# stays without them. Pure-Rust, no native deps — the crate stays
+# `unsafe_code = forbid`.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+# NDI® ingest (the off-by-default `ndi` feature, ADR-0008 / IN-3). This is the
+# OUT-3 runtime-load FFI leaf crate: it resolves the operator-provided NDI runtime
+# dylib (`NDIlib_v6_load`) at RUN time via `dlopen` and reads the returned function
+# table — there is NO build-time link and the proprietary SDK is NEVER vendored.
+# The single `unsafe` boundary lives entirely in that leaf crate, so
+# `multiview-input` stays `unsafe_code = forbid`. Pulled in ONLY by the `ndi`
+# feature, so the default build (and `cargo deny check --all-features=false`) never
+# sees it. License: ISC (LGPL-clean), already in the workspace lock.
+multiview-ndi-sys = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+# Self-contained ffmpeg-feature tests generate their own tiny clip at runtime
+# (via the `ffmpeg` CLI) into a tempdir — no checked-in media.
+tempfile = "3"
+# `test-util` enables `tokio::time` pause/advance so the YouTube re-resolution
+# loop test drives an expiry boundary deterministically with NO real sleeping and
+# NO network. `macros`/`rt` bring `#[tokio::test]`. Feature flags only — the
+# `tokio` package is already in the workspace lock (no new dependency).
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+
+[features]
+"default" = []
+# Enable real libav ingest. Pulls multiview-ffmpeg's `ffmpeg` feature; multiview-ffmpeg
+# is always a (pure-Rust, feature-free) dependency, so this only escalates its
+# feature set. multiview-input itself adds NO native deps and stays
+# `unsafe_code = forbid` — all FFI is owned by multiview-ffmpeg.
+"ffmpeg" = ["multiview-ffmpeg/ffmpeg"]
+# NDI® ingest (ADR-0008 / IN-3). OFF by default and **license-isolating**: it
+# pulls the runtime-load FFI leaf crate `multiview-ndi-sys` (the OUT-3 seam), which
+# `dlopen`s the operator-provided NDI runtime at RUN time — the proprietary SDK is
+# never vendored or linked at build time, and the default build contains zero NDI
+# code and zero proprietary obligations. The PURE receive→NV12 conversion + the
+# `NdiProducer` adapter (over an injected receive seam) are fully unit-tested under
+# this feature without any runtime; the real receive needs the proprietary runtime
+# + a live NDI network and is gated behind an `#[ignore]`d test. `multiview-input`
+# itself adds NO `unsafe` (the FFI is owned by `multiview-ndi-sys`) — it stays
+# `unsafe_code = forbid`. A runtime license gate refuses NDI ingest until an
+# operator accepts the SDK license (audited who/when).
+"ndi" = ["dep:multiview-ndi-sys"]
+# The LIVE NDI receive binding (ADR-0028): turns on multiview-ndi-sys's `bindings`
+# feature (build-time `bindgen` over the licensed SDK header) and compiles the real
+# `SdkNdiReceiver` that delegates to the safe `NdiReceiver`. OFF by default and NOT
+# in any preset: it needs the operator-provided NDI SDK header at build time
+# (NDI_SDK_INCLUDE_DIR / /opt/ndi/include), so plain `--features ndi` stays SDK-free
+# and CI-buildable while `--features ndi-bindings` is a box/operator concern.
+# Implies `ndi`; the default build stays LGPL-clean. multiview-input adds NO
+# `unsafe` — all FFI is owned by multiview-ndi-sys.
+"ndi-bindings" = ["ndi", "multiview-ndi-sys/bindings"]
+# SMPTE ST 2110 UDP/RTP receive transport. OFF by default: it needs a real
+# ST 2110 network + PTP-disciplined NIC, so it is compile-verified only here.
+# The PURE depacketizers (rtp/v20/v30/v40) and the ST 2022-7 reconstructor are
+# always compiled and fully tested; this feature only adds the thin tokio
+# `UdpSocket` binding in `st2110::transport`. No native deps, no FFI — the crate
+# stays `unsafe_code = forbid`.
+"st2110" = ["tokio/net"]
+# WebRTC ingest transport. OFF by default: a real session needs an ICE/DTLS/SRTP
+# media engine and a network stack, none of which exist in CI here, so the
+# transport shell is compile-verified only. The PURE SDP offer/answer model
+# (parse + negotiate) is always compiled and fully tested; this feature only adds
+# the thin `webrtc::transport` shell. No native deps, no FFI — the crate stays
+# `unsafe_code = forbid`. (The concrete media-engine binding is supplied by the
+# application layer; this crate never links a WebRTC native library, keeping the
+# default build pure-Rust and LGPL-clean.)
+"webrtc" = []
+# YouTube live ingest via a runtime-discovered `yt-dlp` binary (ADR-0015). OFF by
+# default: it spawns an external, operator-supplied resolver process, so the
+# default build neither contains nor requires it. The PURE info-dict parser
+# (`parse_info_dict` / `parse_expire` — no network, no subprocess), the thin
+# `tokio::process` spawn wrapper, and the off-data-plane re-resolution loop live in
+# `youtube`, gated entirely behind this feature. It is **pure Rust and libav-free**:
+# this feature deliberately does NOT pull `ffmpeg`. The resolver only turns a watch
+# URL into a `*.googlevideo.com` HLS master URL; that URL is then fed *verbatim* to
+# the standard HLS ingest path, which is the `ffmpeg`-gated libav code. The consumer
+# that actually opens the URL (e.g. `multiview-cli`) enables `ffmpeg` on its OWN
+# `youtube` feature (`youtube = ["ffmpeg", …]`), so the end-to-end path stays wired
+# without coupling the resolver crate to libav. Keeping `youtube` libav-free lets
+# `cargo clippy -p multiview-input --features youtube` lint on a libav-free runner
+# (the dedicated CI leg) — pulling `ffmpeg` here would panic ffmpeg-sys-next's build
+# script (no libavutil.pc) on that runner. `serde_json` parses the `yt-dlp -J`
+# output; `tokio/process` spawns the binary with a hard timeout. No native deps in
+# THIS crate, no FFI — it stays `unsafe_code = forbid`.
+"youtube" = ["dep:serde", "dep:serde_json", "tokio/process", "tokio/io-util"]
+
+[lints]
+workspace = true

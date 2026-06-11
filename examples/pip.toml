@@ -1,0 +1,52 @@
+# examples/pip.toml — picture-in-picture: one full-frame source + one inset at higher z.
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"
+pixel_format = "nv12"
+background = "#000000"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "absolute"           # arbitrary overlap via normalized rects
+
+[[sources]]
+id = "in_main"
+display_name = "Main"
+kind = "test"
+
+[[sources]]
+id = "in_pip"
+display_name = "Inset"
+kind = "test"
+
+[[cells]]
+id = "cell_main"
+z = 0
+fit = "cover"
+rect = { x = 0.0, y = 0.0, w = 1.0, h = 1.0 }
+[cells.source]
+input_id = "in_main"
+
+[[cells]]
+id = "cell_pip"
+z = 10                       # higher z draws on top
+fit = "cover"
+corner_radius = 8
+rect = { x = 0.70, y = 0.72, w = 0.27, h = 0.24 }
+[cells.border]
+width_px = 3
+color = "#FFCC00"
+style = "solid"
+[cells.source]
+input_id = "in_pip"
+
+[[outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+latency_profile = "low_latency"

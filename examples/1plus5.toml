@@ -1,0 +1,103 @@
+# examples/1plus5.toml — one large tile + five small (broadcast multiviewer style).
+# The "big" area spans a 2x2 block; s1..s5 fill the remaining L-shape.
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "60000/1001"          # 59.94 fps
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr", "1fr"]
+rows = ["1fr", "1fr", "1fr"]
+gap = 8
+areas = [
+  "big big s1",
+  "big big s2",
+  "s3  s4  s5",
+]
+
+[[sources]]
+id = "in_big"
+display_name = "Program"
+kind = "test"
+[[sources]]
+id = "in_s1"
+kind = "test"
+[[sources]]
+id = "in_s2"
+kind = "test"
+[[sources]]
+id = "in_s3"
+kind = "test"
+[[sources]]
+id = "in_s4"
+kind = "test"
+[[sources]]
+id = "in_s5"
+kind = "test"
+
+[[cells]]
+id = "cell_big"
+area = "big"
+z = 0
+fit = "cover"
+corner_radius = 6
+scaler = "lanczos"
+[cells.qos]
+priority = 100
+degradation = "maintain-resolution"
+[cells.source]
+input_id = "in_big"
+
+[[cells]]
+id = "cell_s1"
+area = "s1"
+fit = "contain"
+[cells.source]
+input_id = "in_s1"
+[[cells]]
+id = "cell_s2"
+area = "s2"
+fit = "contain"
+[cells.source]
+input_id = "in_s2"
+[[cells]]
+id = "cell_s3"
+area = "s3"
+fit = "contain"
+[cells.source]
+input_id = "in_s3"
+[[cells]]
+id = "cell_s4"
+area = "s4"
+fit = "contain"
+[cells.source]
+input_id = "in_s4"
+[[cells]]
+id = "cell_s5"
+area = "s5"
+fit = "contain"
+[cells.source]
+input_id = "in_s5"
+
+[[overlays]]
+id = "ov_tally_big"
+kind = "tally_border"
+target = "cell_big"
+z = 50
+width_px = 6
+color = "#FF0000"
+binding = "tally://cell_big"
+
+[[outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+latency_profile = "low_latency"

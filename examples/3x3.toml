@@ -1,0 +1,110 @@
+# examples/3x3.toml — nine equal tiles (density demo). Self-contained.
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "25/1"                # PAL 25 fps
+pixel_format = "nv12"
+background = "#0c0c10"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr", "1fr"]
+rows = ["1fr", "1fr", "1fr"]
+gap = 6
+areas = ["a b c", "d e f", "g h i"]
+
+[[sources]]
+id = "in_a"
+kind = "test"
+[[sources]]
+id = "in_b"
+kind = "test"
+[[sources]]
+id = "in_c"
+kind = "test"
+[[sources]]
+id = "in_d"
+kind = "test"
+[[sources]]
+id = "in_e"
+kind = "test"
+[[sources]]
+id = "in_f"
+kind = "test"
+[[sources]]
+id = "in_g"
+kind = "test"
+[[sources]]
+id = "in_h"
+kind = "test"
+[[sources]]
+id = "in_i"
+kind = "test"
+
+[[cells]]
+id = "cell_a"
+area = "a"
+fit = "cover"
+[cells.source]
+input_id = "in_a"
+[[cells]]
+id = "cell_b"
+area = "b"
+fit = "cover"
+[cells.source]
+input_id = "in_b"
+[[cells]]
+id = "cell_c"
+area = "c"
+fit = "cover"
+[cells.source]
+input_id = "in_c"
+[[cells]]
+id = "cell_d"
+area = "d"
+fit = "cover"
+[cells.source]
+input_id = "in_d"
+[[cells]]
+id = "cell_e"
+area = "e"
+fit = "cover"
+[cells.source]
+input_id = "in_e"
+[[cells]]
+id = "cell_f"
+area = "f"
+fit = "cover"
+[cells.source]
+input_id = "in_f"
+[[cells]]
+id = "cell_g"
+area = "g"
+fit = "cover"
+[cells.source]
+input_id = "in_g"
+[[cells]]
+id = "cell_h"
+area = "h"
+fit = "cover"
+[cells.source]
+input_id = "in_h"
+[[cells]]
+id = "cell_i"
+area = "i"
+fit = "cover"
+[cells.source]
+input_id = "in_i"
+
+[[outputs]]
+kind = "ll_hls"
+path = "/hls/multiview"
+codec = "h264"
+part_target_ms = 250
+segment_ms = 2000
+gop_ms = 2000

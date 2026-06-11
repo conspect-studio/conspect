@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1
+#
+# deploy/Dockerfile.ffmpeg — the Multiview FFmpeg base image (ADR-0031 §5).
+#
+# This is the SEPARATELY-PUBLISHED, digest-referenced base image the app
+# Dockerfiles consume via `FROM ${FFMPEG_IMAGE} AS ffmpeg` + `COPY --from=ffmpeg
+# /opt/multiview-ffmpeg …`. It builds OUR OWN pinned FFmpeg 8.1.1 from a GPG- AND
+# SHA-256-verified ffmpeg.org source tarball under the exact ADR-0031 LGPL-clean
+# allowlist. The audited configure-flag list lives in ONE place —
+# deploy/ffmpeg-build.sh — which both this builder and the GPL/nonfree guardrail
+# share. Publishing it as its own image (see .github/workflows/ffmpeg-base.yml)
+# turns the ~10-min source build into a multi-second `COPY` in every app build,
+# escaping GHA cache's branch-isolation + 10 GB LRU eviction.
+#
+# Flavours (selected by build-args, published as ghcr.io/aperim/multiview-ffmpeg
+# :8.1.1-{lgpl,nvidia,gpl}):
+#   * lgpl   — FF_HWACCEL=vaapi  FF_LICENSE=lgpl  (VAAPI + Intel QSV/libvpl on
+#              amd64; multi-arch; the genuinely LGPL-clean default).
+#   * nvidia — FF_HWACCEL=nvidia FF_LICENSE=lgpl  (NVENC/NVDEC/cuvid/scale_cuda
+#              via nv-codec-headers + --enable-cuda-llvm, NO CUDA SDK; still
+#              LGPL-clean; amd64-only for now).
+#   * gpl    — FF_HWACCEL=vaapi  FF_LICENSE=gpl   (adds x264/x265; whole build
+#              becomes GPLv2+; opt-in only).
+#
+# 8.1.1 → libavcodec.so.62 / libavutil.so.60 / libavformat.so.62, matching
+# `ffmpeg-sys-next 8.1.0` (build.rs `ffmpeg_8_1` → libavcodec 62), the version
+# the workspace lockfile resolves — so the app binary links .so.62.
+#
+# Base-image pinning: the `debian:trixie` tag below is a floating minor line. For
+# a reproducible release pin it by digest, e.g.
+#   FROM debian:trixie@sha256:<digest> AS builder
+# (Renovate adds + bumps the digest; CI provenance/SBOM record it regardless.)
+
+# -----------------------------------------------------------------------------
+# Stage: builder — toolchain + the LGPL-clean external libs our allowlist enables,
+# then run the audited deploy/ffmpeg-build.sh to produce /opt/multiview-ffmpeg.
+# -----------------------------------------------------------------------------
+FROM debian:trixie AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# FFmpeg source pin. FFMPEG_SHA256 is the SHA-256 of ffmpeg-8.1.1.tar.xz from
+# ffmpeg.org/releases, verified end-to-end (the GPG good-signature + this digest
+# both checked against the real tarball at author time). The build ALSO verifies
+# the detached GPG .asc against FFMPEG_GPG_KEY; BOTH must pass or the build aborts.
+ARG FFMPEG_VERSION=8.1.1
+ARG FFMPEG_SHA256=b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+ARG FFMPEG_GPG_KEY=FCF986EA15E6E293A5644F10B4322F04D67658D8
+# nv-codec-headers content-pinned by git commit (tag n13.0.19.0 → this commit).
+# Only consumed when FF_HWACCEL=nvidia.
+ARG NVCODEC_COMMIT=e844e5b26f46bb77479f063029595293aa8f812d
+# Hardware-acceleration profile: vaapi (default) | nvidia. Selects the hwaccel
+# configure block in deploy/ffmpeg-build.sh.
+ARG FF_HWACCEL=vaapi
+# Licensing profile: lgpl (default) | gpl. gpl adds x264/x265 (whole build GPLv2+).
+ARG FF_LICENSE=lgpl
+# Buildx supplies TARGETARCH (amd64|arm64); QSV/libvpl is gated amd64-only both
+# in the apt install below and in deploy/ffmpeg-build.sh.
+ARG TARGETARCH
+
+# Build toolchain + the LGPL-clean external libs our allowlist enables (libopus,
+# libsrt, gnutls/nettle, libdrm) + VAAPI (libva) and, on amd64 vaapi builds,
+# Intel QSV (libvpl) userspace. `git` is needed for the nv-codec-headers clone on
+# the nvidia path; clang/llvm provide --enable-cuda-llvm (JIT scale_cuda, no CUDA
+# SDK). libvpl-dev is amd64-only — install it only there so the arm64 leg builds
+# (the script also gates --enable-libvpl on TARGETARCH=amd64). No x264/x265-dev
+# here in the lgpl default; the gpl profile pulls them in below.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg git \
+      build-essential clang llvm pkg-config nasm yasm make \
+      libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev \
+ && if [ "${FF_HWACCEL}" = "vaapi" ] && [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+      apt-get install -y --no-install-recommends libvpl-dev; \
+    fi \
+ && if [ "${FF_LICENSE}" = "gpl" ]; then \
+      apt-get install -y --no-install-recommends libx264-dev libx265-dev; \
+    fi \
+ && rm -rf /var/lib/apt/lists/*
+
+# deploy/ffmpeg-build.sh owns the audited configure flag list (LGPL-clean by
+# default) AND the hard GPL/nonfree guardrail: a banned --enable-nonfree/libnpp/
+# cuda-nvcc/libfdk-aac/openssl flag, or a GPL flag without FF_LICENSE=gpl, aborts
+# the build. The GPG signature AND the SHA-256 are BOTH verified; either failing
+# aborts. Output: /opt/multiview-ffmpeg/{lib,include,lib/pkgconfig}.
+COPY deploy/ffmpeg-build.sh /usr/local/bin/ffmpeg-build.sh
+RUN chmod 0755 /usr/local/bin/ffmpeg-build.sh \
+ && FF_HWACCEL="${FF_HWACCEL}" \
+    FFMPEG_VERSION="${FFMPEG_VERSION}" \
+    FFMPEG_SHA256="${FFMPEG_SHA256}" \
+    FFMPEG_GPG_KEY="${FFMPEG_GPG_KEY}" \
+    NVCODEC_COMMIT="${NVCODEC_COMMIT}" \
+    FF_LICENSE="${FF_LICENSE}" \
+    TARGETARCH="${TARGETARCH:-amd64}" \
+    FF_PREFIX=/opt/multiview-ffmpeg \
+    /usr/local/bin/ffmpeg-build.sh
+
+# -----------------------------------------------------------------------------
+# Stage: export — the published image content. A minimal scratch layer carrying
+# ONLY /opt/multiview-ffmpeg, so the app Dockerfiles `COPY --from=ffmpeg
+# /opt/multiview-ffmpeg /opt/multiview-ffmpeg` pull exactly the prefix and
+# nothing else (no Debian build toolchain in the consumer's cache).
+# -----------------------------------------------------------------------------
+FROM scratch AS export
+
+COPY --from=builder /opt/multiview-ffmpeg /opt/multiview-ffmpeg

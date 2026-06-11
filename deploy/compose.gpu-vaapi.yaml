@@ -1,0 +1,28 @@
+# deploy/compose.gpu-vaapi.yaml — Intel/AMD VAAPI GPU overlay for the quick-start.
+#
+# Merge it ON TOP of compose.yaml:
+#   RENDER_GID=$(getent group render | cut -d: -f3) \
+#     docker compose -f deploy/compose.yaml -f deploy/compose.gpu-vaapi.yaml up -d
+#
+# Uses the default LGPL image (the VAAPI userspace + mesa/intel drivers are
+# baked in) and passes the host render node through. The non-root container user
+# (uid 10001) must belong to the host `render` group that owns /dev/dri/renderD128,
+# so set RENDER_GID to that group's numeric id (it varies per host/distro:
+# commonly 44 `video` or 992/993 `render` — check `getent group render`).
+
+services:
+  multiview:
+    # The default LGPL image already carries libva2 + mesa/intel VAAPI drivers.
+    image: ghcr.io/aperim/multiview:latest
+    devices:
+      # The render node (Intel/AMD). Add /dev/dri/card0 too if your driver needs it.
+      - "/dev/dri/renderD128:/dev/dri/renderD128"
+    group_add:
+      # Numeric GID of the host `render` group that owns the render node. Export
+      # RENDER_GID before `up` (see the header), or hard-code your host's value.
+      - "${RENDER_GID:-render}"
+    environment:
+      # Hint libva at the render node (driver auto-detected: iHD for recent Intel,
+      # radeonsi for AMD). Uncomment LIBVA_DRIVER_NAME to force one.
+      LIBVA_DEVICE: /dev/dri/renderD128
+      # LIBVA_DRIVER_NAME: iHD

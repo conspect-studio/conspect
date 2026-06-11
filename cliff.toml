@@ -1,0 +1,72 @@
+# git-cliff configuration — Conventional Commits -> Keep a Changelog.
+# https://git-cliff.org/docs/configuration
+#
+# Shared by `release-plz` (release-plz.toml points its changelog at this file's
+# conventions) and by a manual `git cliff`. The output style matches the existing
+# CHANGELOG.md (Keep a Changelog + SemVer).
+#
+# Pre-1.0 (0.y.z) policy lives in [bump]: while < 1.0.0, a breaking change bumps
+# the MINOR (0.y) and feat/fix bump the PATCH (0.0.z) — see the bump rules.
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to **Multiview** are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+# Map Conventional Commit types to Keep a Changelog sections; the order here is
+# the rendering order.
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^deprecat", group = "Deprecated" },
+  { message = "^remove", group = "Removed" },
+  { message = "^revert", group = "Changed" },
+  { message = "^sec", group = "Security" },
+  # Drop noise from the changelog.
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^chore", skip = true },
+  { message = "^test", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^build", skip = true },
+  { message = "^style", skip = true },
+]
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "oldest"
+
+[bump]
+# Pre-1.0 policy: while major == 0, a breaking change bumps the MINOR (0.y) and
+# everything else (feat/fix) bumps the PATCH (0.0.z). At >= 1.0 the normal
+# SemVer rules apply (breaking -> major, feat -> minor, fix -> patch).
+features_always_bump_minor = false
+breaking_always_bump_major = false

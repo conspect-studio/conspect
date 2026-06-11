@@ -1,0 +1,84 @@
+# examples/countdown-timer.toml — the TIMER synthetic source (ADR-0047 §3).
+#
+# A `timer` renders a digital countdown / count-up to a target instant, pure-Rust
+# and in-process (no ffmpeg, no GPL codec) like the other synthetic sources. The
+# target is either:
+#   - time_of_day : the next/most-recent occurrence of a wall-clock time in a zone
+#                   (optionally recurring daily — a perpetual "show starts at"); or
+#   - date_time   : an absolute date+time, tz-resolved (DST-correct).
+#
+# Behaviour at/after the target is `on_target` (hold | continue | zero_then_up |
+# recur); the display `format` is d_hh_mm_ss | hh_mm_ss | mm_ss | hh_mm_ss_ff |
+# auto. The displayed duration is INTEGER seconds (never float fps); frames come
+# from the canvas cadence by integer division.
+#
+# The timer readout reuses the clock's digital-text rasterizer, so it needs the
+# `overlay` feature in the full pipeline.
+# Schema: docs/research/clock-timer-sources.md §6
+schema_version = 1
+
+[canvas]
+width = 1280
+height = 720
+fps = "25/1"                # exact rational, never a float
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+gap = 8
+areas = ["on_air launch"]
+
+# A daily "ON AIR IN" countdown to 14:30 Sydney time that, on reaching zero,
+# counts the overrun up ("we're N over") — the live-production case.
+[[sources]]
+id = "tmr_show"
+display_name = "ON AIR IN (daily 14:30 Sydney)"
+kind = "timer"
+target = "time_of_day"
+at = "14:30:00"
+timezone = "Australia/Sydney"   # IANA zone (DST-correct), preferred over an offset
+recur_daily = true
+direction = "down"
+on_target = "zero_then_up"      # count down to 00:00:00, then count the overrun up
+format = "auto"                 # drop leading zero units (5:00, 1:05:00, …)
+label = "ON AIR IN"
+
+# A fixed-deadline countdown to an absolute instant, frozen at zero when reached.
+[[sources]]
+id = "tmr_launch"
+display_name = "Launch countdown"
+kind = "timer"
+target = "date_time"
+at = "2026-07-01T09:00:00"
+timezone = "UTC"
+direction = "down"
+on_target = "hold"              # freeze at 00:00:00 at the deadline
+format = "d_hh_mm_ss"           # D:HH:MM:SS, day field dropped when zero
+
+[[cells]]
+id = "cell_on_air"
+area = "on_air"
+fit = "contain"
+[cells.source]
+input_id = "tmr_show"
+
+[[cells]]
+id = "cell_launch"
+area = "launch"
+fit = "contain"
+[cells.source]
+input_id = "tmr_launch"
+
+# HLS packager; codec is a free-form hint (mpeg2video = patent/licence-clean,
+# no GPL codec needed).
+[[outputs]]
+kind = "hls"
+path = "/hls/countdown"
+codec = "mpeg2video"
+segment_ms = 2000

@@ -1,0 +1,226 @@
+# Management & Feature Completeness Checklist
+
+Derived from the management-capability, preview, and realtime design briefs. Used to verify that the web UI + API FULLY manage the engine and that every required capability is delivered. 212 items.
+
+## Preview
+
+- [ ] INPUT: Can preview an OFF-AIR input source (not yet bound to any tile) before binding it — cue/confirm-before-take
+- [ ] INPUT: Cueing an off-air source pre-warms its worker so a subsequent bind-to-tile is instant (atomic scene-graph swap, no connect/decode glitch)
+- [ ] INPUT: On-air inputs are previewed by reading the EXISTING decoded frame store — no second decode of an on-air source is ever spun up
+- [ ] INPUT: Multiviewer grid of many sources uses cheap low-res thumbnails (JPEG/MJPEG, 1-5 fps), not full-rate streams
+- [ ] INPUT: A single focused source can be expanded to a low-latency WebRTC/WHEP view (sub-250ms), one focus at a time per operator
+- [ ] INPUT: Off-air cue decode is low-res + thumbnail-rate + I-frames-only (a fraction of a full pipeline)
+- [ ] INPUT: Off-air cue endpoints are auth'd, scheme-allowlisted, and rate-limited (SSRF/DoS guard)
+- [ ] PROGRAM: Can preview the composed multiview (program) via a downscaled canvas tap that does NOT load the encode path
+- [ ] PROGRAM: Program preview is explicitly labeled as a PRE-ENCODE canvas tap (not the encoded output) with its canvas color tags shown
+- [ ] PROGRAM: Default program view is the cheap WS-JPEG path; WHEP focus is on-demand only
+- [ ] OUTPUT: Can preview EACH individual output/rendition separately (RTSP/LL-HLS/RTMP/SRT/NDI)
+- [ ] OUTPUT: Each output preview shows what the CONSUMER actually gets — a tap of the REAL encoded bitstream by default, not a pre-encode approximation
+- [ ] OUTPUT: Every output preview surface carries a non-negotiable fidelity label: REAL ENCODED OUTPUT vs PRE-ENCODE CANVAS APPROX (approx only with an explicit reason)
+- [ ] OUTPUT: Output preview surfaces the resolved color tuple (primaries/transfer/matrix/range, HDR transfer, bit-depth) read from the actual bitstream VUI/SEI + colr atom, not from config
+- [ ] OUTPUT: Output editor verification panel shows CONFIGURED vs DELIVERED with per-field pass/fail across all four color axes + HDR signaling
+- [ ] OUTPUT: HLS/LL-HLS outputs can be previewed by playing their OWN already-published playlist (true consumer experience, zero extra encode)
+- [ ] OUTPUT: NDI / host-only outputs preview the emitted host frame with its color CONVENTION labeled (no encoded bitstream to tap)
+- [ ] OUTPUT: ffprobe verification re-runs after every encode (re)init / remux / parallel-output cutover; stale verification shows amber not green
+- [ ] ISOLATION: Preview is best-effort and provably cannot back-pressure or add frame-interval jitter to the program output (chaos test stalls/kills preview consumers, asserts zero output impact)
+- [ ] ISOLATION: All preview taps read from lock-free latest-wins/drop-oldest slots/rings, never a queue the decoder/compositor/encoder pushes into synchronously
+- [ ] ISOLATION: Preview lives in its own (Tier A) task tier, never the protected output/clock core; preview panic/OOM/stall does not violate the output invariant
+- [ ] ISOLATION: Preview encoder/decode is admission-controlled at LOWEST priority and is the FIRST thing the degradation ladder sheds, before any program lever
+- [ ] ISOLATION: Program output encoder sessions are reserved BEFORE any preview encoder session; preview is refused (503) rather than displacing a real output
+- [ ] EFFICIENCY: Previews cost ~zero when nobody is watching (on-demand activation; GPU tap blit skipped at 0 subscribers)
+- [ ] EFFICIENCY: Previews auto-stop with no subscribers (after a short linger), including on ICE/RTCP/socket-drop timeout and an idle watchdog
+- [ ] EFFICIENCY: One shared low-res tap per source/output feeds all viewers (N viewers cost the same as one)
+- [ ] EFFICIENCY: Grid is viewport-driven — only on-screen tiles are subscribed/generated (a 200-source list never costs 200 live previews)
+- [ ] EFFICIENCY: Hard caps on concurrent WHEP focus sessions and concurrent off-air cue decoders (deterministic worst-case load)
+- [ ] EFFICIENCY: Program/multiviewer JPEG is multiplexed over ONE WebSocket to avoid the browser ~6-connections-per-host cap
+- [ ] EFFICIENCY: Preview stays NV12-throughout (never materializes full-res RGBA) and stays on-device (only small thumbnails cross to host)
+- [ ] TRANSPORT: WebRTC/WHEP is feature-gated with automatic fallback to LL-HLS then JPEG; preview works even where WebRTC cannot connect
+- [ ] TRANSPORT: A single-shot JPEG snapshot endpoint exists for super-cheap polling, lazy grid cells, and alert/email thumbnails
+- [ ] STATUS: Health/metrics (state machine, fps, jitter, reconnect/backoff, circuit-breaker, audio meters, verification, subscriber counts) ride the existing control WS at 10-25Hz, rendered client-side
+- [ ] STATUS: Status is decoupled from pixels — a frozen/missing preview still shows accurate live state, and the client can render its own NO-SIGNAL/STALE/CONNECTING card
+- [ ] STATUS: Health is never burned into preview pixels server-side by default (optional burn-in only for headless/recording)
+- [ ] CAPABILITY: Available preview transports are advertised per build/deployment so the UI greys out unavailable modes (mirrors the capability-aware validator)
+- [ ] CAPABILITY: Preview decode/encode is budgeted against the SAME per-engine registry budgets (NVDEC MP/s, NVENC sessions, VRAM, cgroup CPU) as program work
+- [ ] UX: Clear on-air vs off-air distinction in the multiviewer (tally border vs cue affordance)
+- [ ] UX: Graceful degradation is shown honestly (preview reduced / sub-second unavailable / lowered fps) rather than silently freezing
+- [ ] UX: Preview health is decoupled from program health in the UI; a preview hitch never implies the output is impaired (separate authoritative output-validity/SLO indicator)
+- [ ] SECURITY: All preview and cue endpoints are authenticated and authorized; per-session/per-user resource consumption is bounded
+
+## Realtime API
+
+- [ ] WebSocket is the PRIMARY realtime channel; SSE is documented as a one-way degraded fallback carrying the identical envelope (no WHEP, no client subscribes over SSE)
+- [ ] REST vs realtime split is stated verbatim in both specs: REST = commands/CRUD, WS = events/state + WHEP signaling
+- [ ] WS carries a full SNAPSHOT on connect then DELTAS (snapshot ⊕ ordered deltas = current truth)
+- [ ] Snapshot is built from engine watch channels (borrow), non-blocking, with a race-free snapshot→first-delta boundary (borrow_and_update + changed / subscribe-before-snapshot)
+- [ ] Versioned message envelope {v,t,topic,id,seq,ts,corr,data} used for ALL frames both directions, including control frames on topic "$control"
+- [ ] Envelope versioning policy documented: additive=minor (ignore unknown t/fields), breaking=major; hello.server_v advertises majors; multiview.v1 subprotocol makes wire major explicit
+- [ ] Event taxonomy table present: event type | topic | trigger | payload | rate, covering tiles/inputs/outputs/audio.meters/audio.loudness/alerts/layout/config/logs/jobs/system/capabilities/preview
+- [ ] Per-tile state-machine transitions LIVE/STALE/RECONNECTING/NO_SIGNAL carried as tile.state deltas (aligned with resilience-av §1.3)
+- [ ] Input events carried: connected/disconnected/reconnecting/connecting, format-change, supervision (backoff/circuit-breaker), error
+- [ ] Audio METERS are HIGH-RATE and SAMPLED/CONFLATED (coalesce-to-latest, clamp 10–30 Hz) in the per-connection task, never on the audio/compositor thread
+- [ ] Per-output status carried: running/error/starting/migrating, current bitrate, connected client count, validity probe
+- [ ] ALERTS carried with severity/category/source/dedupe-key (raised/cleared/updated)
+- [ ] Live LAYOUT and CONFIG changes carried so multiple operators stay in sync (with who-applied), and multi-operator reconciliation is shown client-side
+- [ ] LOG tail carried as rate-limited log.line with drop-oldest + dropped-count marker
+- [ ] COMMAND/JOB results/progress carried on jobs topic correlated to the originating REST call via corr/correlationId
+- [ ] Subscription model documented: subscribe/unsubscribe by topic, optional ids filter (server-side), per-topic rate_hz (clamped), since_seq, set_rate; scopes gate topics/ids
+- [ ] WS AUTH handshake documented for browsers: one-time ticket (default), subprotocol token (with mandatory echo-back of one subprotocol), and same-origin cookie (with mandatory Origin allow-list / CSWSH mitigation); validation before on_upgrade; close codes 4401/4403
+- [ ] Token-in-URL leakage mitigated via short-TTL single-use IP/origin-bound ticket; never log full query strings
+- [ ] RESILIENCE: app-level + WS ping/pong heartbeat (~15s) with pong deadline; SSE comment heartbeat; handshake auth deadline; idle timeout
+- [ ] Auto-reconnect documented as a client contract with exponential backoff + jitter, shipped in the typed client; 1008/4401 → re-ticket, 1013 → back off harder
+- [ ] RESUME via per-connection/topic seq and Last-Event-ID with bounded replay ring: gap replayable → silent replay; gap too large/unknown session → $resync + fresh snapshot (UI rebuilds, not merges)
+- [ ] Self-healing $lag emitted on this-connection overflow, triggering targeted re-snapshot; meters excluded from the replay ring
+- [ ] BACKPRESSURE: a slow/stalled WS consumer CANNOT back-pressure the engine — engine publishes into watch/broadcast and never awaits a client; per-connection bounded mpsc (try_send) is the only client-fillable queue
+- [ ] broadcast Lagged(n) is converted to $lag + re-snapshot (unit-tested per topic); no realtime future is .awaited on a data-plane thread
+- [ ] Overflow policy per stream documented: state/meters conflate, lossless streams emit gap marker + re-snapshot, logs drop-oldest, persistent wedge → disconnect (one socket, never a frame/stall)
+- [ ] WHEP preview offer/answer/ICE rides the same WS on its own bounded best-effort lane (preview_id/session), is NOT subject to the meter drop policy, decoupled from program output, with reconnect tear-down to avoid orphaned encoder sessions; SSE clients get a plain-HTTP WHEP endpoint
+- [ ] Documentation: AsyncAPI 3.0 generated from the same serde+schemars Rust types as OpenAPI, served interactively at /docs/events alongside Scalar/Swagger at /docs
+- [ ] Interactive in-browser WS test console provided next to AsyncAPI docs (connect, send from examples, view decoded envelopes/seq, meter toggle)
+- [ ] Typed client generation pipeline: Modelina types from AsyncAPI + thin hand-written client owning lifecycle/resume; CI regenerates and fails on git diff (no spec drift)
+- [ ] Web app reconciliation: snapshot seeds TanStack Query caches, deltas reconcile immutably by type→reducer map, meters bypass Query to a ref/zustand store, optimistic mutations confirmed (not double-applied) by echoed delta keyed on corr/mutationId
+- [ ] Concrete axum/tokio wiring present: WebSocketUpgrade + ticket extractor pre-on_upgrade, split writer/pump tasks, watch/broadcast/bounded-mpsc/flume, CancellationToken+TaskTracker, backon; SSE via axum Sse adapting the same stream
+- [ ] Mermaid diagram of the realtime data flow included (engine channels → per-conn pump conflation/seq/ring → bounded mpsc → writer → client; WHEP + REST corr loop)
+- [ ] Metrics bound cardinality (no per-connection-id labels); documented close codes; backpressure conformance test asserts zero engine/output-validity impact + bounded memory
+
+## Management
+
+- [ ] INPUTS: create/list/get/delete/duplicate a source (POST/GET/DELETE /api/v1/sources, :duplicate)
+- [ ] INPUTS: enable/disable a source without deleting config
+- [ ] INPUTS: set source display_name (cosmetic label)
+- [ ] INPUTS: select protocol/kind (rtsp/hls/ts/srt/rtmp/ndi/file/test) with dynamic transport form
+- [ ] INPUTS: set source URL/URI with ffprobe Test validation
+- [ ] INPUTS: RTSP transport (tcp/udp/udp_multicast/prefer_tcp), reorder queue, max_delay, ingest backend (ffmpeg/retina)
+- [ ] INPUTS: HLS headers, user-agent, persistent, reconnect flags, live_start_index, pace-to-wallclock
+- [ ] INPUTS: requested rendition / substream selection (auto/lowest/highest/index/res)
+- [ ] INPUTS: MPEG-TS scan_all_pmts and program/PMT selection
+- [ ] INPUTS: SRT mode, latency (microseconds), passphrase+pbkeylen, streamid, backend
+- [ ] INPUTS: RTMP app + stream key (secret)
+- [ ] INPUTS: NDI source bind-by-name (discovery + manual), receive color format, bandwidth mode
+- [ ] INPUTS: in-process synthetic sources — `bars` (75% colour bars; `test` alias), `solid`
+      (`color`), `clock` (`face`/`twelve_hour`/`tz_offset_minutes`) per [ADR-0027](../decisions/ADR-0027.md) — and file source (path/loop)
+- [ ] INPUTS: I/O + connect timeouts (us) and DNS watchdog (ms)
+- [ ] INPUTS: reconnect backoff (initial/max/multiplier/jitter), max_attempts, circuit breaker, reconnect-now/reset
+- [ ] INPUTS: jitter buffer ms, queue depth, leaky drop policy
+- [ ] INPUTS: frame-rate handling mode (passthrough/harmonize/cap) + target, static-friendly
+- [ ] INPUTS: per-source color override — primaries (AXIS 1)
+- [ ] INPUTS: per-source color override — transfer/TRC (AXIS 2) with PQ/HLG-on-SDR warning
+- [ ] INPUTS: per-source color override — matrix (AXIS 3)
+- [ ] INPUTS: per-source color override — range limited/full (AXIS 4)
+- [ ] INPUTS: per-source color override — chroma siting and bit-depth hint
+- [ ] INPUTS: read resolved detected color 4-tuple + per-axis provenance (GET /api/v1/sources/{id}/color)
+- [ ] INPUTS: per-source HDR tone-map (enable/curve/peak/anchor/desat)
+- [ ] INPUTS: decode backend preference (ordered) + auto fallback
+- [ ] INPUTS: decode-at-display-resolution toggle + realized-tier badge
+- [ ] INPUTS: target decode size, skip_frame level, hwaccel output format, extradata normalize
+- [ ] INPUTS: deinterlace, crop, rotate/flip transforms
+- [ ] INPUTS: per-input audio track selection, gain_db, mute, include-in-program-bus, resample/silence-fill, metering+true-peak
+- [ ] INPUTS: subtitle/caption ingest source+track+page+language (608/708/dvbsub/teletext/webvtt/srt/ass/mov_text)
+- [ ] INPUTS: pre-warm / cue off-air, off-air preview (MJPEG/thumbnail)
+- [ ] INPUTS: per-source resilience timers (hold/stale/nosignal) + placeholder/slate card
+- [ ] INPUTS: credentials via secret store (never plaintext, audit-logged)
+- [ ] INPUTS: per-tile QoS priority + degradation preference + manual lever pins
+- [ ] INPUTS: read source status (LIVE/STALE/RECONNECTING/NO_SIGNAL, breaker, attempts), info, metrics
+- [ ] LAYOUT: create/duplicate/delete/save layout; revisions + rollback + draft-vs-published
+- [ ] LAYOUT: layout name/description/tags/schema_version/thumbnail
+- [ ] LAYOUT: apply named preset (2x2/3x3/1+5/PiP/custom) preserving bindings by area name
+- [ ] LAYOUT: canvas width/height (reset-if-bound)
+- [ ] LAYOUT: canvas fps as rational (reset-if-bound)
+- [ ] LAYOUT: canvas pixel_format nv12/p010 (reset-if-bound)
+- [ ] LAYOUT: canvas WORKING COLOR SPACE (sdr-bt709 / hdr-pq-bt2020 / hdr-hlg-bt2020 / custom axes) (reset-if-bound)
+- [ ] LAYOUT: canvas HDR static metadata (ST 2086 / MaxCLL / MaxFALL)
+- [ ] LAYOUT: canvas background (color/image), default HDR tone-map policy
+- [ ] LAYOUT: layout kind (preset/grid/absolute); grid columns/rows/areas/gaps
+- [ ] LAYOUT: per-cell area or absolute rect (x,y,w,h 0..1) + z-order
+- [ ] LAYOUT: per-cell fit (fill/contain/cover/none/scale_down) + align/anchor
+- [ ] LAYOUT: per-cell source crop, rotation/flip, opacity, visibility
+- [ ] LAYOUT: per-cell border, corner_radius, margin, background
+- [ ] LAYOUT: per-cell color override + tone-map override + scaler hint
+- [ ] LAYOUT: per-cell QoS (priority/degradation) + static-friendly
+- [ ] LAYOUT: add/remove cell; bind source (input_id or inline); hot source swap; unbind; NDI bind+fallback; no-signal card; per-cell audio+subtitle
+- [ ] LAYOUT: overlays add/remove/duplicate/reorder; kinds label/clock/timecode/image/logo/tally/box/meter/alert/subtitle/lower_third
+- [ ] LAYOUT: overlay target/anchor/offset/rect/z/opacity/blend/clip/visibility/color_space + kind-specific params + data_binding
+- [ ] LAYOUT: transitions cut/crossfade + duration/curve + keyframe-aligned apply
+- [ ] LAYOUT: Program/Preview cue-then-take (PUT preview, POST take, GET/PUT program)
+- [ ] LAYOUT: live program preview + per-cell thumbnails/health badges (WHEP/MJPEG/WS)
+- [ ] LAYOUT: semantic validation (rects, overlap, z, required cells) + JSON Schema; export/import; diff/dry-run with reset_required
+- [ ] OUTPUT: create/list/delete output; name/description; enable/start/stop
+- [ ] OUTPUT: protocol/kind selection (rtsp_server/hls/ll_hls/dash/ndi/rtmp_push/srt/rist/file) capability-gated
+- [ ] OUTPUT: bind canvas + rendition; ABR rendition CRUD (resolution/bitrate/codec per rung, GOP-aligned)
+- [ ] TRANSCODE: video codec h264/hevc/av1 (Class-2)
+- [ ] TRANSCODE: encoder backend auto/nvenc/videotoolbox/vaapi/qsv/x264/x265/svt_av1/aom (Class-2)
+- [ ] TRANSCODE: profile/level/tier
+- [ ] TRANSCODE: output resolution/scaling + max_width/height + scaler kernel
+- [ ] TRANSCODE: output frame rate (rational, hot via NVENC reconfig)
+- [ ] TRANSCODE: pixel format/bit depth/chroma subsampling
+- [ ] TRANSCODE: rate-control mode (cbr/vbr/cq/cqp/icq)
+- [ ] TRANSCODE: bitrate, maxrate, VBV bufsize, CQ/CRF/QP min-max
+- [ ] TRANSCODE: encoder preset + tune
+- [ ] TRANSCODE: GOP mode/length/closed/scene-cut (cadence hot, structure Class-2)
+- [ ] TRANSCODE: B-frames, lookahead, reference frames
+- [ ] TRANSCODE: slices/tiles/multipass/SFE split-frame-encoding
+- [ ] TRANSCODE: one-click low-latency/quality-VOD/custom latency profile bundle
+- [ ] TRANSCODE: intra-refresh on/off + period
+- [ ] TRANSCODE: hot-standby encoder + proactive recycle schedule
+- [ ] COLOR OUT: output primaries tag (CICP)
+- [ ] COLOR OUT: output transfer/TRC tag (incl PQ/HLG)
+- [ ] COLOR OUT: output matrix/colorspace tag
+- [ ] COLOR OUT: output range tag (limited/full) with NVENC JPEG-range + VT pitfalls handled
+- [ ] COLOR OUT: inherit-from-canvas toggle + disagreement warning
+- [ ] COLOR OUT: HDR signalling mode off/hdr10/hlg (explicit-only, couples 10-bit+main10)
+- [ ] COLOR OUT: mastering display (ST 2086), MaxCLL/MaxFALL, in-band SEI vs container placement
+- [ ] COLOR OUT: tone-map enable/algorithm/target-nits/desat/peak-percentile (HDR<->SDR)
+- [ ] COLOR OUT: post-encode ffprobe verify gate + on-fail action (alert/restart/stop), re-run after remux
+- [ ] AUDIO OUT: program bus enable/codec/channels/SR/bitrate/label/language
+- [ ] AUDIO OUT: program loudness normalization (EBU R128 target LUFS / true-peak / LRA)
+- [ ] AUDIO OUT: discrete per-input track set add/remove/order (capability-aware, Class-2 layout)
+- [ ] AUDIO OUT: per-track input + source channel selection (clean decode->re-encode)
+- [ ] AUDIO OUT: per-track codec/channels/SR/bitrate
+- [ ] AUDIO OUT: per-track label/language/default/autoselect
+- [ ] AUDIO OUT: per-track include-in-program-bus + program gain + program mute
+- [ ] AUDIO OUT: NDI channel-map vs multi-sender mode; E-RTMP multitrack negotiation/degrade
+- [ ] AUDIO: capability-aware routing matrix (inputs x output tracks/channels) showing degradation taken
+- [ ] SUBTITLE OUT: burn-in on/off + per-tile/canvas target + style
+- [ ] SUBTITLE OUT: passthrough track set add/remove (webvtt/dvbsub/teletext/cea608/cea708, capability-aware)
+- [ ] SUBTITLE OUT: per-track source input/track/teletext-page/language/format
+- [ ] CONTAINER HLS: segment + part duration (GOP-tied), playlist window/DVR depth
+- [ ] CONTAINER HLS: fMP4/CMAF vs TS segments; LL-HLS server-control tags; CODECS/VIDEO-RANGE/STREAM-INF
+- [ ] CONTAINER TS/SRT/RIST: continuity/PSI cadence, PID/program assignment, push endpoint+auth+SRT/RIST opts
+- [ ] CONTAINER RTSP: mount/transport/config-interval/shared
+- [ ] CONTAINER NDI: sender name/groups/color format/clock-video; file: path/format/rotate/write_colr
+- [ ] OUTPUT: pinned-params readback + plan dry-run (seamless/reset-lite/migration)
+- [ ] OUTPUT: controlled reset / parallel-output migration (make-before-break, cutover mode)
+- [ ] OUTPUT: per-output on-fail policy, backup endpoints/redundancy, whole-output slate on blackout
+- [ ] OUTPUT: per-output health/metrics/validity-SLO, consumer count, live preview/thumbnail
+- [ ] OUTPUT: per-output adaptive participation + pins (resolution/fps/bitrate/preset)
+- [ ] SYSTEM: read CapabilityReport — detected GPUs/devices, backends matrix, codec support
+- [ ] SYSTEM: read NVENC/VideoToolbox session caps (live used/available, probed) + VRAM + host cpu/cgroup/ram/psi
+- [ ] SYSTEM: read effective license/build profile + NDI attribution
+- [ ] POLICY: adaptive mode (auto/assisted/manual)
+- [ ] POLICY: control loop tick/hysteresis/recovery-cooldown; targets fps/latency/power
+- [ ] POLICY: admission control enable/headroom + cost model (read/recalibrate/override)
+- [ ] POLICY: degradation ladder ordering/enable/floors (incl output-resolution lever flagged Class-2)
+- [ ] POLICY: live degradation level/active-lever/why (read)
+- [ ] POLICY: per-tile QoS priority + degradation preference (two views, one object) + static-friendly
+- [ ] POLICY: manual lever pins
+- [ ] RESILIENCE: tile timers (hold/stale/nosignal) global + per-input override
+- [ ] RESILIENCE: slate/placeholder assets (upload/assign, atlas-resident) + always-ticking clock overlay
+- [ ] RESILIENCE: reconnect backoff + circuit breaker (global + per-entity)
+- [ ] RESILIENCE: supervision restart intensity + watchdog heartbeat deadlines
+- [ ] RESILIENCE: encoder hot-standby + recycle; GPU-loss fallback chain + slate-during-rebuild; output on-fail default
+- [ ] OBSERVABILITY: Prometheus metrics export config; tracing/OTLP/tokio-console; structured logs query+live-tail
+- [ ] OBSERVABILITY: alert rules CRUD + active alerts feed; output-validity SLO dashboard
+- [ ] OBSERVABILITY: composited live preview (start/stop/res/fps/bitrate); per-tile thumbnails; multiplexed audio meters WS
+- [ ] CONFIG-AS-CODE: full config get/validate/dry-run/apply with hot-vs-Class-2 diff classification
+- [ ] CONFIG-AS-CODE: version history + diff + rollback (with reset-impact preview)
+- [ ] CONFIG-AS-CODE: import/export TOML/JSON with secrets=ref|redact (never plaintext)
+- [ ] USERS: user CRUD + enable/disable; RBAC roles (admin/operator/viewer) + role definitions; password/MFA/OIDC-SSO
+- [ ] SECURITY: API tokens create(scoped/expiry)/list/revoke; secret store CRUD (write-only, op:// refs)
+- [ ] SECURITY: immutable append-only audit log (who/what/when/diff) + export
+- [ ] SETTINGS: API/health/metrics bind+port (listener-restart, media unaffected); /livez in-process-only enforced
+- [ ] SETTINGS: TLS enable/cert/key/min-version/mTLS (GnuTLS); CORS policy; media output base ports
+- [ ] SETTINGS: runtime/allocator/RT-priority diagnostics (read-only); NDI attribution (read-only)
+- [ ] GLOBAL: every edit surfaces Class-1 (hot) vs reset-lite vs Class-2 (reset) before apply
+- [ ] GLOBAL: capability matrix gates UI + validator as single source of truth (no impossible selections)
+- [ ] GLOBAL: encode-once-fan-out vs separate-encode-session shown with live NVENC budget
+- [ ] GLOBAL: NDI live discovery resolution + offline-card fallback for unresolved sources
+

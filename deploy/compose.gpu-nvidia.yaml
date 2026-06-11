@@ -1,0 +1,60 @@
+# deploy/compose.gpu-nvidia.yaml — NVIDIA GPU overlay for the quick-start.
+#
+# Merge it ON TOP of compose.yaml (it overrides the `multiview` image + adds GPU
+# access; `testsrc` is inherited unchanged):
+#   docker compose -f deploy/compose.yaml -f deploy/compose.gpu-nvidia.yaml up -d
+#
+# Host prerequisites: NVIDIA driver + NVIDIA Container Toolkit (CDI generated:
+# `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`). The toolkit
+# injects the host driver libs (libcuda, NVENC/NVDEC) into the container.
+
+services:
+  multiview:
+    # The CUDA-enabled image (NVDEC/NVENC + wgpu), built from Dockerfile.nvidia.
+    image: ghcr.io/aperim/multiview:latest-nvidia
+    # Modern path: CDI device request (Docker >= 25 / Compose v2.21+).
+    devices:
+      - "nvidia.com/gpu=all"
+    environment:
+      # compute=CUDA, video=NVENC/NVDEC, utility=NVML/nvidia-smi, graphics=Vulkan/GL.
+      # `graphics` is REQUIRED for the wgpu GPU compositor — without it the toolkit
+      # won't mount the Vulkan ICD, wgpu finds no adapter, and compositing silently
+      # falls back to CPU (5+ cores at 4K). Pairs with `libvulkan1` in the image.
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility,graphics
+      NVIDIA_VISIBLE_DEVICES: all
+    # GPU render-node access is handled automatically by the image entrypoint —
+    # NO `group_add` with magic GIDs is needed here. Background: the wgpu/Vulkan
+    # compositor must open the DRM render node /dev/dri/renderD* (root:render 0660);
+    # the toolkit mounts the node but does NOT add the container user to the host's
+    # `render` group, and that GID is host-specific (105 on Debian/Ubuntu, varies
+    # elsewhere). docker-entrypoint.sh detects the mounted nodes' GIDs at runtime
+    # and grants exactly those to the unprivileged uid 10001 — portable to any host,
+    # zero config. (Without it: "vkCreateInstance failed" → CPU fallback; SA-0 warns
+    # "GPU present but compositing unavailable".) For a BARE-METAL `multiview run`
+    # (no container) instead, add the service user to the groups:
+    #   sudo usermod -aG render,video <user>
+    # ---------------------------------------------------------------------------
+    # Per-process GPU attribution ("ours vs total" in the System monitor):
+    # NVML keys per-process counters (encode sessions, VRAM, SM/NVENC util) by the
+    # HOST-namespace PID, but a PID-namespaced container only knows its own local
+    # PID — so on a GPU SHARED with co-tenant processes (e.g. an NVR), Multiview
+    # cannot tell which sessions are ITS own. Sharing the host PID namespace makes
+    # `getpid()` == the NVML host PID, so the monitor can separate our load from
+    # the pre-existing load. OPT-IN (it lets the container see host process names —
+    # a small isolation trade-off); WITHOUT it the poller degrades gracefully to
+    # device-wide totals only (the `self_*` GPU fields stay absent — never a false
+    # zero). Uncomment to enable:
+    #
+    # pid: "host"
+    # ---------------------------------------------------------------------------
+    # Legacy alternative (pre-CDI, with nvidia-container-runtime as the default
+    # docker runtime). Comment out the `devices:` block above and uncomment this:
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu, video, utility]
+    # ---------------------------------------------------------------------------

@@ -1,0 +1,131 @@
+// Multiview dev container — Rust + FFmpeg/libav* + GPU (NVIDIA NVDEC/NVENC + Intel/AMD VAAPI) + Node + 1Password CLI.
+//
+// Cross-platform by design:
+//   * Linux NVIDIA host  -> --gpus all is auto-injected by hostRequirements.gpu:"optional"
+//                           (requires the NVIDIA Container Toolkit configured into Docker on the HOST).
+//   * Linux Intel/AMD     -> /dev/dri is mounted CONDITIONALLY by runArgs only when it exists on the host.
+//   * macOS Apple Silicon -> Docker Desktop CANNOT pass through the host GPU at all. The container still
+//                           builds and runs on CPU/software codec paths. Hardware decode/encode (Metal /
+//                           VideoToolbox) must be tested with a NATIVE macOS build outside this container.
+//
+// JSONC: comments are allowed in devcontainer.json.
+{
+  "name": "Multiview (Rust + FFmpeg + GPU)",
+
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // -------------------------------------------------------------------------
+  // GPU: declarative, graceful-degradation. "optional" => the Dev Containers
+  // tooling auto-adds `--gpus all` on Linux hosts where an NVIDIA GPU + the
+  // NVIDIA Container Toolkit are detected, and silently OMITS it elsewhere
+  // (macOS, GPU-less Linux). Do NOT hardcode `--gpus all` in runArgs: that
+  // flag is unconditional and BREAKS `devcontainer up` on every host lacking
+  // the NVIDIA runtime.
+  // -------------------------------------------------------------------------
+  "hostRequirements": {
+    "gpu": "optional"
+  },
+
+  // -------------------------------------------------------------------------
+  // runArgs is kept minimal and ALWAYS SAFE on every host:
+  //   --env-file loads the gitignored repo-root .env (OP_SERVICE_ACCOUNT_TOKEN, ...).
+  //   initialize.sh ALWAYS creates .env (empty if no token) so `docker run --env-file`
+  //   can never fail with "no such file or directory".
+  //
+  // NVIDIA: do NOT add `--gpus all` here — it is unconditional and would break
+  // startup on macOS / GPU-less Linux. `hostRequirements.gpu: "optional"` above
+  // handles NVIDIA auto-injection on capable Linux hosts.
+  //
+  // VAAPI (Intel/AMD): `--device /dev/dri` is also intentionally NOT here, because
+  // an absent device fails container creation (macOS, NVIDIA-only Linux). Enable it
+  // per-host via an UNCOMMITTED override file `.devcontainer/devcontainer.local.json`
+  // (initialize.sh prints the exact runArgs incl. the host render-group GID). See
+  // docs/operations/devcontainer.md.
+  // -------------------------------------------------------------------------
+  "runArgs": [
+    "--env-file",
+    "${localWorkspaceFolder}/.env"
+  ],
+
+  // -------------------------------------------------------------------------
+  // containerEnv = visible to ALL processes (cargo test, the engine, op),
+  // not just VS Code terminals. NVIDIA caps MUST include `video` or NVENC/NVDEC
+  // silently fail even though CUDA works. These vars are inert on hosts without
+  // a GPU, so they are safe everywhere (macOS included).
+  // -------------------------------------------------------------------------
+  "containerEnv": {
+    "NVIDIA_VISIBLE_DEVICES": "all",
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,video",
+    "CARGO_HOME": "/usr/local/cargo",
+    "CARGO_TARGET_DIR": "${containerWorkspaceFolder}/target",
+    "RUST_BACKTRACE": "1"
+  },
+
+  // OP_SERVICE_ACCOUNT_TOKEN is supplied at runtime by --env-file (.env), NOT
+  // baked into the image. As a convenience, if a dev already exported the token
+  // in the host shell that launched VS Code, surface it too (harmless if unset).
+  "remoteEnv": {
+    "OP_SERVICE_ACCOUNT_TOKEN": "${localEnv:OP_SERVICE_ACCOUNT_TOKEN}"
+  },
+
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // Named volumes for the cargo registry/git cache and the build target dir.
+  // Empty named volumes mount as root; post-create.sh chowns them to vscode.
+  "mounts": [
+    "source=multiview-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=multiview-cargo-git,target=/usr/local/cargo/git,type=volume",
+    "source=multiview-target,target=${containerWorkspaceFolder}/target,type=volume"
+  ],
+
+  // HOST script: guarantees .env exists (so --env-file never fails), seeds the
+  // 1Password token from ~/.onepassword_token if present, and prints VAAPI
+  // device-args guidance when /dev/dri exists. Runs on the host; idempotent.
+  "initializeCommand": ".devcontainer/initialize.sh",
+
+  // IN-CONTAINER setup: chown caches, verify toolchain, cargo fetch, print a
+  // capability summary. Runs once on create.
+  "postCreateCommand": ".devcontainer/post-create.sh",
+
+  // Per-start, non-fatal capability probe (GPU / VAAPI / op token).
+  "postStartCommand": "bash -lc 'command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | head -1 || true; [ -e /dev/dri/renderD128 ] && echo \"VAAPI: /dev/dri present\" || echo \"VAAPI: no /dev/dri (software paths only)\"'",
+
+  // API/serving port + Vite dev server.
+  "forwardPorts": [8080, 5173],
+  "portsAttributes": {
+    "8080": { "label": "Multiview API / serving", "onAutoForward": "notify" },
+    "5173": { "label": "Web SPA (Vite dev)", "onAutoForward": "silent" }
+  },
+
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "editor.formatOnSave": true,
+        "[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer" },
+        "files.watcherExclude": {
+          "**/target/**": true,
+          "**/node_modules/**": true,
+          "**/.multiview-build/**": true
+        }
+      }
+    }
+  }
+}

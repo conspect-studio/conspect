@@ -1,0 +1,91 @@
+# cargo-deny configuration — license + advisory gating for the default build.
+# Run locally: cargo deny check    (see CONTRIBUTING.md)
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# RUSTSEC-IDs ignored here MUST carry a justification (no silent suppression).
+ignore = [
+  # RUSTSEC-2024-0436: `paste` is unmaintained (informational advisory, not a
+  # vulnerability). It is a compile-time-only proc-macro with no runtime attack
+  # surface, pulled in transitively only by `utoipa-axum` (the OpenAPI/axum
+  # bindings used by multiview-control). RustSec reports "No safe upgrade is
+  # available" and there is no `utoipa-axum` release that drops it, so this is
+  # unavoidable until the upstream migrates (e.g. to `pastey`). Scoped to this
+  # single advisory id; revisit when `utoipa-axum` updates.
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time proc-macro `paste`, transitive via utoipa-axum; no safe upgrade upstream" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Our own workspace crates carry a non-SPDX `license-file` (the Multiview
+# Source-Available Non-Commercial License) and are all `publish = false`. This
+# license check gates THIRD-PARTY DEPENDENCIES, not Multiview's own code, so skip
+# our unpublished workspace members (otherwise cargo-deny cannot match the custom
+# license against the SPDX allowlist below and would fail by design).
+private = { ignore = true }
+# This allowlist gates the licenses of THIRD-PARTY DEPENDENCIES only; it does
+# not describe Multiview's own license. Multiview's own code is source-available,
+# non-commercial (the Multiview Source-Available Non-Commercial License v1.0,
+# © Aperim Pty Ltd; see LICENSE) — that is NOT one of the dependency licenses
+# below and is out of scope for cargo-deny. The default build must keep its
+# dependency closure permissively-licensed / LGPL-clean (FFmpeg linked LGPL).
+# The `gpl-codecs` feature (x264/x265) intentionally makes a build GPL — that is
+# opt-in and NOT covered by this allowlist; see docs/architecture/conventions.md §7.
+#
+# The off-by-default `webrtc-native` feature (multiview-preview, PRV-1b) pulls
+# `str0m` (the native ICE/DTLS/SRTP WebRTC stack — `MIT OR Apache-2.0`) and its
+# sans-IO crypto closure (`str0m-rust-crypto`, `dimpl`, the RustCrypto crates,
+# and `aws-lc-rs`/`aws-lc-sys` for the elliptic-curve / DTLS-cert primitives).
+# Every crate in that closure resolves to a license already on this allowlist —
+# `MIT`, `Apache-2.0`, `ISC`, and `BSD-3-Clause` (`aws-lc-sys` is the union of
+# all four). NOTE: this str0m 0.16.x line uses `aws-lc-rs`, NOT `ring`, for its
+# pure-Rust crypto backend. Because `[graph] all-features = false`, cargo-deny
+# scans only the default (str0m-free) build, so none of these appear in the
+# scanned graph today; they are listed here so a future `--all-features` scan
+# (or moving the feature on) is already license-clean with no surprise additions.
+#
+# The off-by-default `net` feature of the dev-only `xtask` crate (the
+# `soak-iptv` iptv-org test-source selection tool, IPTV-SOAK) pulls a small
+# blocking rustls-backed HTTP client (`ureq` 3.x → `rustls` + `ring` +
+# `rustls-webpki` + `webpki-roots` + `flate2`). `ureq`/`rustls`/`rustls-webpki`/
+# `webpki-roots`/`flate2` resolve to allowlisted licenses (`MIT`/`Apache-2.0`/
+# `ISC`), but `ring` carries a bespoke non-SPDX license that is deliberately
+# NOT added to the allowlist below. This is sound because `[graph]
+# all-features = false`: the default build (and `xtask` itself sans `net`)
+# never links `ureq`/`ring`, so the scanned graph stays clean and LGPL-clean.
+# `xtask` is `publish = false`, dev-automation only, and the live fetch is run
+# manually where there is network — never in the product build. If a future
+# `--all-features` scan is wanted, gate `ring`'s license behind a clarify/
+# exception rather than blanket-allowing it.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# Deny real `version = "*"` wildcards on registry crates, but exempt
+# intra-workspace `path` dependencies: the `multiview-*` crates depend on each
+# other by path and carry no version requirement (which cargo-deny otherwise
+# reports as a wildcard). This narrowly excludes path deps only — a `"*"`
+# version requirement on a crates.io dependency is still denied.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,60 @@
+[package]
+name = "multiview-i915pmu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask / multiview-ntpsys). This lets cargo-deny's allow-wildcard-paths
+# exempt the intra-workspace path deps while still denying real "*" version
+# wildcards.
+publish = false
+description = "Minimal safe wrapper over the Linux i915 PMU per-engine busy-ns counter (perf_event_open(2)) for the Intel GPU-load probe."
+
+[dependencies]
+# Raw `perf_event_open(2)` via `libc::syscall(SYS_perf_event_open, …)` + the
+# `read(2)`/`close(2)` of the counter fd. libc 0.2 does NOT carry a
+# `perf_event_attr` struct, so this crate declares the minimal `#[repr(C)]`
+# layout itself and owns the single `unsafe` syscall behind a safe
+# `Option`-returning API. Pure FFI; no transitive deps. License: MIT OR
+# Apache-2.0 (LGPL-clean). `cargo deny` runs with all-features=false, but
+# `multiview-hal` only pulls this crate in under its off-by-default `i915-pmu`
+# feature, so the default workspace build never links it.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+
+# FFI crate exception. The workspace forbids `unsafe_code`, and a `forbid` level
+# can never be relaxed by a downstream manifest or inner attribute — so this crate
+# cannot use `[lints] workspace = true` (cargo also rejects inheriting + overriding
+# in one table). Instead it restates the workspace lint set verbatim with the single
+# change of `unsafe_code` from `forbid` to `deny`, so the one raw `perf_event_open`
+# syscall is allowed only with a justified `// SAFETY:` comment. Keep in sync with
+# the root Cargo.toml `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+as_conversions   = "deny"
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

@@ -1,0 +1,62 @@
+[package]
+name = "multiview-hal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# NVIDIA NVML live-load probe (ADR-0017). Runtime-loaded via `libloading`
+# (no build-time native link), dual MIT OR Apache-2.0 (matches the project
+# licence). OFF by default and pulled in ONLY by the `cuda` feature, so the
+# default pure-Rust build never sees it and `cargo deny check`
+# (`all-features = false`) does not scan it.
+nvml-wrapper = { version = "0.10", optional = true }
+# Intel i915 PMU per-engine busy-ns counter (ADR-0017). The single
+# `perf_event_open(2)` syscall lives in this FFI leaf crate (which is
+# `unsafe_code = "deny"` + `// SAFETY:`), so `multiview-hal` stays
+# `forbid(unsafe_code)`. OFF by default and pulled in ONLY by the `i915-pmu`
+# feature, so the default pure-Rust build never links it and `cargo deny check`
+# (`all-features = false`) does not scan it. License: MIT OR Apache-2.0
+# (LGPL-clean).
+multiview-i915pmu = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+
+[features]
+"default" = []
+"cuda" = ["dep:nvml-wrapper"]
+"vaapi" = []
+"qsv" = []
+"videotoolbox" = []
+# KMS scanout discovery: enable the REAL DRM card-node / connector enumeration
+# (`scanout::DrmScanoutProbe`) for the local display sink's scanout affinity
+# (DEV-B2 / ADR-0044 §3). Read-only `/sys/class/drm` reads with std ONLY — no
+# native link, no extra dependency — so this carries no `cargo deny` exposure and
+# stays `forbid(unsafe_code)`. OFF by default: the connector -> owning-GPU
+# mapping + the `ScanoutProbe` seam are always compiled and CI-tested via an
+# injected mock; with the feature off the real probe returns an EMPTY inventory
+# (the GPU-less CI contract). Named to mirror `multiview-output/display-kms`.
+"display-kms" = []
+# Intel-only per-engine encode/decode utilisation via the i915 PMU
+# (`perf_event_open`), the fallback for hosts where the per-process DRM fdinfo
+# enc/dec counters are unavailable. Builds on the sysfs probe (`vaapi`/`qsv`)
+# and adds the FFI leaf crate that owns the syscall. OFF by default: it needs a
+# real i915 device + perf permission, so it is compile-verified here and the
+# live read is gated. The pure busy-ns -> fraction diff is always tested.
+# Implies `vaapi` so the `SysfsLoadProbe` (the Intel/AMD sysfs+fdinfo seam this
+# folds into) is built; the PMU term enriches that probe's Intel devices.
+"i915-pmu" = ["dep:multiview-i915pmu", "vaapi"]
+
+[lints]
+workspace = true

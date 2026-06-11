@@ -1,0 +1,11 @@
+# Test-only lint relaxations. These relax the denied lints ONLY in
+# `#[cfg(test)]` / `#[test]` code — NOT in integration tests under `tests/`,
+# examples/, or benches/. Each `tests/*.rs` file must start with:
+#   #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+# See docs/development/agent-guardrails.md §A.1.
+allow-unwrap-in-tests           = true
+allow-expect-in-tests           = true
+allow-panic-in-tests            = true
+allow-dbg-in-tests              = true
+allow-print-in-tests            = true
+allow-indexing-slicing-in-tests = true

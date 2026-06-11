@@ -1,0 +1,44 @@
+[package]
+name = "multiview-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Lock-free atomic `Arc` slot backing the bounded last-good audio store
+# (`store.rs`): the engine reader loads an immutable snapshot wait-free while a
+# decode thread swaps a fresh one in — same primitive (and version) the video
+# tile store uses in `multiview-framestore`. Safe, no `unsafe`, no new vendor.
+arc-swap = "1.9.1"
+
+# Real audio demux/decode/resample lives behind the off-by-default `ffmpeg`
+# feature so the DEFAULT build stays pure-Rust with no native deps. multiview-audio
+# NEVER touches libav directly (this crate is `unsafe_code = forbid`); it calls
+# only multiview-ffmpeg's SAFE wrappers, whose own `ffmpeg` feature is enabled by
+# ours. Decode/test use only LGPL software codecs (the default build stays
+# LGPL-clean; x264/x265 remain behind `gpl-codecs` and are never pulled here).
+multiview-ffmpeg = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx = "0.5.1"
+proptest = "1.11.0"
+tempfile = "3"
+
+[features]
+"default" = []
+"ffmpeg" = ["dep:multiview-ffmpeg", "multiview-ffmpeg/ffmpeg"]
+
+[lints]
+workspace = true

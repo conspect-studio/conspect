@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/aperim/multiview/tree/main/docs
+    about: Architecture, API, decisions (ADRs), and operations guides.
+  - name: Security report
+    url: https://github.com/aperim/multiview/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately, per SECURITY.md — do not open a public issue.

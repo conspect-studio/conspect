@@ -1,0 +1,309 @@
+Multiview Source-Available Non-Commercial License
+Version 1.0
+
+Copyright © 2026 Aperim Pty Ltd (ABN 46 150 699 737), Suite 108, 9 Hutchinson
+Street, St Peters, NSW 2044, Australia. All rights reserved except as expressly
+granted in this License.
+
+PLAIN-LANGUAGE SUMMARY (not part of the License). The source of Multiview is made
+available to you. You may use, modify, and share it FOR FREE for genuine personal,
+home, hobby, and other non-commercial use, and under the three free exceptions in
+Section 5. ALL OTHER USE — including by businesses, educational institutions,
+governments, product/appliance makers, and content creators/streamers — is
+Commercial Use and requires a paid Commercial License from us. This is a
+source-available license; it is NOT an open-source or free-software license.
+
+This License adapts the structure and several phrases of the PolyForm Noncommercial
+License 1.0.0 (https://polyformproject.org/licenses/noncommercial/1.0.0).
+
+---
+
+## Multiview Source-Available Non-Commercial License
+
+Licensor: Aperim Pty Ltd (ABN 46 150 699 737) ("we", "us", "our").
+Software: the Multiview software and any files distributed with this License ("the
+software").
+
+### 0. Purpose and intent (recital)
+
+We make the source of the software available and grant free use for genuine
+personal, home, hobby, and non-commercial purposes, together with three specific
+free exceptions defined below. All other use is commercial use and requires a
+separate Commercial License from us. We deliberately treat use by businesses,
+educational institutions, governments, product/appliance makers, and content
+creators/streamers as commercial use. This is a departure from some licenses that
+call themselves "non-commercial"; any industry custom that would treat educational
+or governmental use as free does not apply to this License.
+
+### 1. Acceptance
+
+In order to receive this License, you must agree to its rules. Those rules are both
+obligations under this License and conditions to your license. You must not do
+anything with the software that triggers a rule you cannot or will not follow.
+
+### 2. Grant of free use
+
+We grant you a copyright license to use, copy, modify, and distribute the software,
+for free, but only for a Permitted Purpose (Section 3) and subject to the rules and
+notices below. This License does not grant rights in any third-party material except
+as that material's own license allows (Section 9).
+
+### 3. Permitted Purpose (free use)
+
+A Permitted Purpose is only one of the following:
+
+3.1 Personal / home use. Use unconnected with any trade, business, or profession of
+the user — that is, for private study, private entertainment, hobby projects,
+amateur pursuits, experiment, and testing — by a natural person acting in a personal
+capacity, without any anticipated commercial application. Eligibility under this
+clause turns on the capacity in which the software is used, not on the user's status:
+a person who is a sole trader, business owner, employee, teacher, public servant, or
+content creator may still use the software under this clause for genuinely personal
+use unconnected with their trade, business, profession, or institution. The same
+person's use in or for their trade, business, profession, institution, government
+role, or content production is Commercial Use (Section 4), not personal use.
+
+3.2 First Nations Owned Broadcaster Exception (Section 5.1).
+
+3.3 Community Broadcaster Exception (Section 5.2).
+
+3.4 Content Creator Exception (Section 5.3).
+
+Any use that is not a Permitted Purpose is Commercial Use and requires a Commercial
+License (Section 6).
+
+### 4. Commercial Use (requires a paid Commercial License)
+
+"Commercial Use" means any use of the software other than a Permitted Purpose.
+
+The trigger is use. It is irrelevant whether you have modified the software, whether
+you obtained it directly from us or from a fork, mirror, redistribution, or any other
+third party, and whether or not you further distribute it. Running or otherwise using
+the software — as supplied by us or as modified, and whether standalone or
+incorporated into anything else — for any purpose that is not a Permitted Purpose is
+Commercial Use and requires a Commercial License. Building a product, service, fork,
+or derivative on the software does not escape this License: a fork or derivative is
+licensed to its recipients only on these same terms, and any commercial use of it (or
+of the unmodified software) is Commercial Use.
+
+For the avoidance of doubt and without limitation, Commercial Use includes:
+
+(a) any use in or for the trade, business, or profession of any business, company,
+partnership, sole trader, or other for-profit entity (including internal use), or by
+a person acting in the course of such a trade, business, or profession. For clarity,
+the genuinely personal, non-trade use of a natural person who happens to be a sole
+trader or business owner is governed by Section 3.1, not this paragraph;
+
+(b) any use by or for, or in connection with the activities of, an educational
+institution — including a school, college, university, or training organisation — or
+by its staff or students acting in that capacity (a person who is a teacher or
+student may still use the software for genuinely personal, non-institutional purposes
+under Section 3.1);
+
+(c) any use by or for, or in connection with the activities of, a government,
+government agency, statutory authority, or public body at any level (local, state or
+territory, national, or supranational), or by an officer or employee acting in that
+capacity;
+
+(d) incorporating, bundling, embedding, or distributing the software (modified or
+not) in or as a product, appliance, hardware unit, image, container, or service
+supplied or offered to any third party, whether or not for charge ("productization");
+
+(e) use by a streamer, content creator, influencer, journalist, or media producer to
+create, produce, or distribute content, except as permitted by the Content Creator
+Exception (5.3);
+
+(f) any use directly or indirectly intended for or directed towards commercial
+advantage, revenue, sponsorship, audience-building for gain, or monetary
+compensation.
+
+A user's status as a non-profit, charity, or not-for-profit does not by itself make a
+use a Permitted Purpose.
+
+### 5. The three free exceptions
+
+Each exception applies only to the exempt entity's own activities. It does not permit
+any non-exempt third party (including an integrator, contractor, agent, or commercial
+service provider) to operate the software as, or as part of, a commercial product or
+service by relying on the exception (the "no-conduit rule"). Where two or more
+entities or Channels are under common ownership or control, or operate as a single
+brand or undertaking in substance, they are treated as one user for the purposes of
+every threshold in this Section (the "aggregation rule"). Eligibility is assessed by
+substance, not labels.
+
+5.1 First Nations Owned Broadcaster Exception. Free use is permitted by a First
+Nations Owned Broadcaster, meaning an entity that produces or distributes broadcast
+or streamed media content and satisfies either limb:
+
+(A) Registry limb — in Australia, it is registered under the Corporations (Aboriginal
+and Torres Strait Islander) Act 2006 (Cth) with the Office of the Registrar of
+Indigenous Corporations; or holds an Australian community broadcasting licence
+allocated to represent an Aboriginal and/or Torres Strait Islander community interest;
+or is a member of First Nations Media Australia; or, outside Australia, is recognised
+as an Indigenous broadcaster by the relevant national Indigenous broadcasting body or
+regulator (including, without limitation, an iwi radio station or Whakaata Māori in
+Aotearoa New Zealand, an Indigenous broadcaster recognised by the CRTC in Canada, or
+a Tribal radio licensee recognised by the U.S. FCC); or
+
+(B) Ownership-and-control limb — more than fifty percent (50%) of both (i) the
+beneficial ownership of the entity and (ii) the persons who control its financial and
+operational decisions are First Nations persons (being Aboriginal and/or Torres
+Strait Islander persons in Australia, Māori in Aotearoa New Zealand, or Indigenous,
+Aboriginal, First Nations, Métis, Inuit, or Native peoples recognised in the relevant
+country), and the entity is not Controlled in Substance, directly or indirectly, by
+any person who is not a First Nations person or First Nations entity. "Controlled in
+Substance" means having the practical ability to direct or veto the entity's
+financial or operational decisions, whether through shareholding, board composition,
+financing arrangements, intellectual-property licensing, contractual veto or approval
+rights, or any similar means, regardless of formal ownership percentages.
+
+5.2 Community Broadcaster Exception. Free use is permitted by a Community
+Broadcaster, meaning an entity that (a) holds a community broadcasting licence (or an
+equivalent community or non-profit broadcasting licence class issued by a national
+broadcasting regulator), is operated on a not-for-profit basis, and is not controlled
+by a government or political party; and (b) whose total Sponsorship Revenue in its
+most recently completed financial year did not exceed USD $1,000,000.
+
+"Sponsorship Revenue" means the gross aggregate amount received or receivable, in
+money or money's worth, by the entity and its related and commonly-controlled
+entities in that financial year as consideration for broadcasting, streaming, or
+publishing sponsorship announcements, acknowledgements of financial support, or
+equivalent paid acknowledgements (in Australia, "sponsorship" within the meaning of
+the Broadcasting Services Act 1992 (Cth) and the ACMA Community Broadcasting
+Sponsorship Guidelines), before deduction of any costs, agency fees, or commissions.
+It excludes genuine grants, donations, and membership subscriptions that are not
+consideration for a sponsorship announcement. Amounts in a substance equivalent to
+sponsorship are counted even if labelled otherwise (e.g. "underwriting" or
+"partnership fees").
+
+5.3 Content Creator Exception. Free use is permitted by a natural person, or a group
+of natural persons acting together, who uses the software to produce or distribute
+their own content and whose total Audience Count is fewer than 55,000.
+
+"Channel" means any account, page, feed, profile, show, list, or comparable presence
+operated by the user (or under their control or in their name) on any platform
+through which content is distributed to an audience (video, audio, streaming, social,
+messaging, podcast, newsletter).
+
+"Audience Count" means the simple arithmetic sum, across all of the user's Channels,
+of the largest applicable audience figure natively reported by each platform for that
+Channel (subscribers, followers, members, paid subscribers, or mailing-list
+subscribers; for podcasts, the average unique downloads per episode over the trailing
+90 days). The user is not required or permitted to de-duplicate the same person across
+Channels; the figure is the plain sum of per-Channel counts.
+
+Channels operated by an entity the user controls, where the content is the user's,
+are included. Where two or more nominally separate creators or Channels are under
+common ownership or control, or operate as a single brand or undertaking in substance,
+their Audience Counts are aggregated under the Section 5 aggregation rule.
+
+### 6. Commercial License
+
+For any Commercial Use you must obtain a Commercial License from us before that use.
+See the LICENSE-COMMERCIAL file for how to obtain one.
+
+### 7. Self-certification, audit, currency, and growing out of an exception
+
+7.1 Self-certification. Eligibility for a Permitted Purpose or exception is based on
+your good-faith self-certification of the relevant facts, assessed at first use and
+on the first day of each calendar quarter. We may, on at least 14 days' written notice
+and no more than once in any 12-month period, ask you for reasonable evidence that you
+meet a claimed exception (e.g. registry records, the relevant revenue line, or native
+platform audience dashboards). If you cannot or do not substantiate eligibility within
+the notice period, or you have materially misrepresented eligibility, you are treated
+as having made Commercial Use without a license from the date the misrepresentation
+began, and you must obtain a Commercial License (and may owe back-fees).
+
+7.2 Currency conversion. Where an amount is in a currency other than US dollars, it is
+converted to US dollars at the exchange rate published by the Reserve Bank of
+Australia (or, where the entity is outside Australia, the principal central bank of
+the entity's home country) on the last day of the relevant financial year (or the most
+recent prior published rate).
+
+7.3 Growing out of an exception (transition). If you qualified for an exception and
+later cease to qualify (by exceeding a threshold, losing not-for-profit status, or
+otherwise), you may continue to use the version(s) of the software you were already
+using under that exception for a transition period of 90 days after the first
+quarterly assessment date on which you cease to qualify. After that, continued use —
+and any upgrade, new version, or new installation — requires a Commercial License.
+Later falling back below a threshold does not retroactively restore the exception.
+
+### 8. Notices
+
+You must keep this License, our copyright and attribution notices, and the
+THIRD-PARTY-NOTICES file intact in any copy or distribution of the software, and pass
+them on to anyone who receives the software from you. You must not misrepresent the
+software as "open source" or "free software".
+
+### 9. Third-party and dependency materials (LGPL and others)
+
+The software is distributed with third-party components under their own licenses,
+listed in THIRD-PARTY-NOTICES. Those components are licensed to you under their own
+terms, not under this License, and you must comply with them.
+
+In particular, the software is designed to use the FFmpeg/libav libraries (and certain
+other libraries) under the GNU LGPL by dynamic linking. Notwithstanding anything else
+in this License, with respect to those LGPL-covered libraries you have the right to
+modify the software for your own use and to reverse-engineer it for debugging such
+modifications, and to relink against a modified version of those libraries, to the
+extent the LGPL requires. Nothing in this License limits any right granted to you by
+the LGPL or any other applicable open-source license of a third-party component.
+
+GPL codecs are excluded. The software's optional GPL-licensed codec components (e.g. a
+"gpl-codecs" build linking x264/x265) are not licensed to you under this License and
+are not distributed by us under this License. If you choose to build the software with
+those GPL components, the resulting combined work is governed by the GNU GPL, and this
+License does not apply to that combined work.
+
+### 10. No other rights; reservation of the Licensor's rights
+
+These terms do not allow you to sublicense or transfer any of your licenses to anyone
+else, or prevent us from licensing the software to anyone else. They do not grant you
+any trademark, branding, or naming rights; the Multiview and Aperim names and logos
+are reserved and governed by our separate trademark policy. This License does not
+grant rights in our patents except as necessary to exercise the express copyright
+permissions for a Permitted Purpose.
+
+10.1 Reservation of the Licensor's rights. This License governs your use of the
+software; it does not govern, bind, or limit us. As the owner of the copyright in the
+software, we (Aperim Pty Ltd) retain all rights, title, and interest in the software,
+are not required to obtain any license — including any Commercial License — from
+ourselves to use the software for any purpose (including commercial purposes), and may
+at any time and without limitation under this License use, reproduce, modify,
+distribute, sublicense, relicense, dual-license, and grant commercial or other
+licenses to the software (in whole or in part, and to any person, including ourselves
+and our affiliates) on any terms we choose. Nothing in this License is a covenant by
+us not to exploit the software ourselves.
+
+### 11. Termination and cure
+
+If you breach these terms, your license ends. The first time you are notified in
+writing that you have violated these terms, your license may nonetheless continue if
+you come into full compliance, and take practical steps to correct past violations
+(including, where applicable, obtaining a Commercial License), within 32 days of
+receiving notice. Otherwise, your license ends immediately.
+
+### 12. Severability
+
+If any provision of this License (including any exception, threshold, or reference to
+an external statute, register, or regulator) is held invalid, unenforceable, or
+inapplicable, it is to be read down to the minimum extent necessary or, if it cannot
+be, severed, and the rest of this License continues in full force. The invalidity of
+any exception does not invalidate the default rule that Commercial Use requires a
+Commercial License.
+
+### 13. No warranty; limitation of liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT ANY WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
+TITLE, AND NON-INFRINGEMENT. To the maximum extent permitted by law, in no event will
+we be liable for any damages arising out of or related to the software or this
+License, however caused. Nothing in this License excludes, restricts, or modifies any
+consumer guarantee, right, or remedy that cannot lawfully be excluded (including under
+the Australian Consumer Law).
+
+### 14. Governing law
+
+This License is governed by the laws of New South Wales, Australia, and the courts of
+New South Wales (and the courts competent to hear appeals from them) have
+jurisdiction, without limiting our right to enforce our copyright in any country.

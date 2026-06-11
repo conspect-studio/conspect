@@ -1,0 +1,99 @@
+# examples/synthetic-sources.toml — a 2×2 of the first-class SYNTHETIC sources.
+#
+# Every tile is rendered in-process, pure-Rust (no ffmpeg), so this config runs
+# with no network and no GPL/native deps (ADR-0027):
+#   - bars   : SMPTE/EBU 75% colour bars (`test` is a back-compat alias for it).
+#   - solid  : a solid-colour slate (`color` = #RRGGBB hex).
+#   - clock  : a full-frame clock; `face` = analog | digital | dual, with the
+#              `twelve_hour` flag and either a `tz_offset_minutes` UTC offset or
+#              an IANA `timezone` (DST-correct). See examples/world-clock.toml for
+#              the dual-face, labelled, multi-zone "world-clock wall" (ADR-0047).
+#
+# bars/solid render in every build; the clock face needs the `overlay` feature in
+# the full pipeline (it reuses the clock rasterizer). The bars audio companion
+# (tone) is not part of this slice.
+# Schema: docs/templates/layout-and-config.md
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"          # rational string, never a float (NTSC 29.97 exact)
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr", "1fr"]
+gap = 8
+areas = ["bars solid", "analog digital"]
+
+[[sources]]
+id = "in_bars"
+display_name = "Colour bars"
+kind = "bars"               # 75% colour bars; `test` is an alias for this
+
+[[sources]]
+id = "in_solid"
+display_name = "Solid slate"
+kind = "solid"
+color = "#103a6b"           # #RRGGBB fill colour
+
+[[sources]]
+id = "in_analog"
+display_name = "Analog clock (UTC, 24h dial)"
+kind = "clock"
+face = "analog"
+# `twelve_hour` selects the dial for BOTH faces: false (default) = a 24-hour
+# analog dial (24 ticks, one hour-hand revolution/day); true = a conventional
+# 12-hour dial.
+twelve_hour = false
+tz_offset_minutes = 0       # UTC; real offsets span -720..=840
+
+[[sources]]
+id = "in_digital"
+display_name = "Digital clock (UTC+10, 12h)"
+kind = "clock"
+face = "digital"
+twelve_hour = true          # 12-hour readout with AM/PM (digital only)
+tz_offset_minutes = 600     # UTC+10:00
+
+[[cells]]
+id = "cell_bars"
+area = "bars"
+fit = "contain"
+[cells.source]
+input_id = "in_bars"
+
+[[cells]]
+id = "cell_solid"
+area = "solid"
+fit = "contain"
+[cells.source]
+input_id = "in_solid"
+
+[[cells]]
+id = "cell_analog"
+area = "analog"
+fit = "contain"
+[cells.source]
+input_id = "in_analog"
+
+[[cells]]
+id = "cell_digital"
+area = "digital"
+fit = "contain"
+[cells.source]
+input_id = "in_digital"
+
+# HLS packager; codec is a free-form hint (mpeg2video here for a patent-clean,
+# license-clean default that needs no GPL codec).
+[[outputs]]
+kind = "hls"
+path = "/hls/multiview"
+codec = "mpeg2video"
+segment_ms = 2000

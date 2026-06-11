@@ -1,0 +1,397 @@
+[package]
+name = "multiview-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[lib]
+name = "multiview_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "multiview"
+path = "src/main.rs"
+
+[dependencies]
+multiview-core = { workspace = true }
+multiview-engine = { workspace = true }
+multiview-control = { workspace = true }
+multiview-config = { workspace = true }
+multiview-events = { workspace = true }
+# The local entitlement plane (Conspect, ADR-0050): the cli reads the published
+# EnforcementLevel to drive the engine seams — refuse a NEW engine instance at
+# the block-new-instance rung (S1) and stamp the tile watermark (S3). Pure-Rust
+# leaf crate (no engine, no GPU, no FFmpeg), so it stays in the CI-green default
+# build; enforcement is DATA the cli samples, never a path that touches a running
+# program (invariant #1/#10).
+multiview-licence = { workspace = true }
+arc-swap = "1.9.1"
+multiview-telemetry = { workspace = true }
+multiview-compositor = { workspace = true }
+multiview-framestore = { workspace = true }
+multiview-hal = { workspace = true }
+# wgpu types (DeviceType / Backend / AdapterInfo) for the SA-0 build-time
+# composite cross-check (ADR-0035): mapping `GpuContext::adapter().get_info()` into
+# the wgpu-free `multiview_hal::AdapterReport`. OFF by default, pulled in ONLY by
+# the `gpu` feature (the cli already links wgpu transitively via the compositor's
+# `wgpu` feature there), so the default pure-Rust build never sees it. `std` only —
+# no backend feature is needed to read the adapter-info enums.
+wgpu = { version = "29", default-features = false, features = [
+  "std",
+], optional = true }
+multiview-ffmpeg = { workspace = true }
+multiview-input = { workspace = true }
+multiview-output = { workspace = true }
+multiview-audio = { workspace = true }
+multiview-overlay = { workspace = true }
+multiview-preview = { workspace = true }
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["signal", "net"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Opt-in alongside the `ffmpeg` feature, used ONLY to name `ffmpeg-next`'s safe
+# value types (`format::Pixel`, the `Video` host-frame type) when bridging
+# `multiview-compositor`'s `Nv12Image` canvas into the `multiview-output` sinks and
+# feeding `multiview-ffmpeg`'s safe decoder. This crate writes NO `unsafe` and
+# performs NO FFI (it stays `unsafe_code = forbid`); all raw libav* remains owned
+# by `multiview-ffmpeg`. Pinned to match its binding. `cargo deny` runs with
+# all-features=false so it never sees this opt-in dependency.
+ffmpeg-next = { version = "8.1", optional = true }
+
+# Used by the real `ffmpeg`-feature pipeline to stage a generated `test`-source
+# clip into a tempdir before decoding it. Optional + gated by the `ffmpeg`
+# feature so the default pure-Rust build never pulls it. `cargo deny` runs with
+# all-features=false so it never sees this opt-in dependency.
+tempfile = { version = "3", optional = true }
+
+# Used by the control bridge (the compact per-tick engine state snapshot the
+# control plane republishes is a `serde_json::Value`) and by the `overlay`
+# pipeline (reading kind-specific `[[overlays]]` params out of
+# `multiview_config::Overlay::params`, a `serde_json::Map`). Pure Rust
+# (MIT/Apache-2.0); stays in the default build.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "test-util",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "io-util",
+] }
+tempfile = "3"
+
+# The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
+# build + the `ffmpeg`/`ffprobe` CLIs at runtime).
+[[test]]
+name = "pipeline_ingest"
+required-features = ["ffmpeg"]
+
+# The streaming-encode behavioural tests (ADR-0025) drive the bounded
+# bake→encode→fan-out path with injected fake sinks; they need the `ffmpeg`
+# feature (the streaming machinery lives in the `pipeline` module) but no
+# `ffprobe`/codec at runtime.
+[[test]]
+name = "streaming_encode"
+required-features = ["ffmpeg"]
+
+# The overlay-baking end-to-end test needs both `ffmpeg` and `overlay`.
+[[test]]
+name = "overlay_pipeline"
+required-features = ["ffmpeg", "overlay"]
+
+# The subtitle-burn-in + real-audio-meter test needs both `ffmpeg` and `overlay`.
+[[test]]
+name = "subtitle_meter_pipeline"
+required-features = ["ffmpeg", "overlay"]
+
+# RT-10b: the per-layer SubtitleRouter run-path sampling + breakaway re-point
+# end-to-end test needs both `ffmpeg` and `overlay`.
+[[test]]
+name = "subtitle_route_pipeline"
+required-features = ["ffmpeg", "overlay"]
+
+# The live HLS WebVTT caption-ingest proof needs both `ffmpeg` and `overlay`. Its
+# only test is `#[ignore]`d (it hits the network); run with `-- --ignored`.
+[[test]]
+name = "caption_ingest"
+required-features = ["ffmpeg", "overlay"]
+
+# The native DVB-sub (bitmap) caption ingest + burn-in end-to-end proof needs
+# both `ffmpeg` and `overlay`; the libav fixture generator comes from the
+# `multiview-ffmpeg/test-fixtures` dev-dependency feature.
+[[test]]
+name = "dvbsub_ingest"
+required-features = ["ffmpeg", "overlay"]
+
+# The embedded CEA-608 (A53 side-data) caption ingest end-to-end proof needs both
+# `ffmpeg` and `overlay`; the libav A53 fixture comes from the
+# `multiview-ffmpeg/test-fixtures` feature forwarded by `ffmpeg`.
+[[test]]
+name = "embedded_cc_ingest"
+required-features = ["ffmpeg", "overlay"]
+
+# The in-container TEXT subtitle (mov_text / ass) caption ingest end-to-end proof
+# needs both `ffmpeg` and `overlay`; its fixtures are built with the `ffmpeg` CLI.
+[[test]]
+name = "incontainer_text_ingest"
+required-features = ["ffmpeg", "overlay"]
+
+# Feature presets for the `multiview` binary. The DEFAULT build is `software`:
+# pure Rust, no native libs, no GPU — the CI-green baseline. The hardware
+# presets aggregate the owning sub-crates' feature flags exactly as documented
+# in docs/architecture/conventions.md §4. They are NOT built in CI (they need
+# the vendor toolchains/SDKs installed); they exist so a release build can opt
+# in with one flag.
+[features]
+default = ["software"]
+
+# Software-only reference path (always available).
+software = []
+
+# NVIDIA live-load telemetry (NVML): select the real `NvmlLoadPoller`
+# (multiview-hal's `cuda` feature) as the per-GPU source the system-metrics task
+# polls, instead of the always-compiled `NullLoadPoller`. Runtime-loaded
+# (libnvidia-ml) so the build is GPU-free; OFF by default and implied by the
+# `nvidia` preset. Pure telemetry — pulls no codec/compositor backend on its own.
+cuda = ["multiview-hal/cuda"]
+
+# Embed + serve the built web UI from `multiview run` (same-origin with the API).
+# Pure Rust (rust-embed); requires the web build (`npm --prefix web run build`)
+# to have produced `web/dist` first. GPU-free and LGPL-clean, so a software
+# build can serve the full management UI: `run --features web,overlay`.
+web = ["multiview-control/embed-web"]
+
+# mDNS/DNS-SD managed-device discovery (DEV-A5 / ADR-M008 §6 / ADR-0041): install
+# the real `mdns-sd`-backed browser so `POST /api/v1/discovery/devices/scan`
+# browses the LAN for Cast / NDI / (configured) zowietek-control services. The
+# untrusted-inventory model + endpoints are always compiled; this feature only
+# adds the multicast socket. Pure Rust, LGPL-clean, GPU-free.
+discovery = ["multiview-control/discovery"]
+# Managed-device network I/O (DEV-A4, ADR-M009): the live HTTP transport for the
+# `zowietek` driver poller. With this on, a `multiview run` whose config declares
+# `[[devices]]` with `driver = "zowietek"` spawns a supervised control-plane
+# poller per device (login → probe → enumerate facets → poll status → drive the
+# lifecycle), so the projection routes return real candidates/targets and
+# `set-mode` dispatches convergence. OFF by default so the baseline build stays
+# pure-Rust/socket-free and CI-green; forwards `multiview-control/zowietek`.
+devices-net = ["multiview-control/zowietek"]
+
+# Overlay rasterization: bakes the configured overlays (clock/labels, dB
+# meters, safe-area graticules, tally borders, burned-in SRT/VTT subtitles) into
+# the composited program before encode, via multiview-compositor's pure-Rust
+# overlay sub-pass (cosmic-text + swash + bundled OFL fonts). OFF by default so
+# the baseline build stays minimal; GPU-free and LGPL-clean. Combine with
+# `ffmpeg` (`run --features ffmpeg,overlay`) to overlay the real pipeline's
+# output; it works alone with the headless software run too.
+overlay = ["multiview-compositor/overlay"]
+
+# GPU compositing (opt-in): prefer the portable wgpu GPU compositor for the
+# per-tick composite, via multiview-compositor's off-by-default `wgpu` feature.
+# DEGRADATION-SAFE: the run uses the GPU only if an adapter initializes and
+# otherwise transparently falls back to the CPU reference (invariant #1 — a
+# missing or failed GPU never stalls or crashes the run). OFF by default so the
+# baseline build stays pure-Rust, GPU-free, fast, and `cargo deny`-clean (deny
+# runs with `all-features = false`, so the wgpu graphics stack never enters the
+# default graph). Wires no FFI here; the CLI stays `unsafe_code = forbid`.
+gpu = ["multiview-compositor/wgpu", "dep:wgpu"]
+
+# Local DRM/KMS display output (DEV-B1 / ADR-0044): wire `Output::Display`
+# heads into the run as raw-frame scanout sinks (the pre-encode canvas through
+# wait-free mailboxes; never the packet fan-out). OFF by default: it pulls the
+# drm/gbm native path in multiview-output (building needs libgbm-dev; the
+# binary dynamically links Mesa's libgbm). Without this feature a config
+# declaring a display output FAILS the run with a clear error -- never a silent
+# skip. The CLI itself adds NO unsafe and stays `forbid(unsafe_code)`. The
+# run wiring lives in the `ffmpeg`-gated pipeline (the only live run path), so
+# a deploy build combines them: `--features nvidia,display-kms` etc.
+display-kms = ["multiview-output/display-kms"]
+
+# Report the MEASURED kernel NTP/PTP discipline status on the wall-clock badge
+# (ENG-3b) instead of an assumed one. Off by default: it pulls the engine's `ntp`
+# feature, which links the `multiview-ntpsys` FFI leaf crate (the one `adjtimex`
+# syscall). `multiview-cli` itself stays `forbid(unsafe_code)`. Linux-only effect;
+# elsewhere / on a denied read the badge honestly shows the assumed default.
+ntp = ["multiview-engine/ntp"]
+
+# Real libav* end-to-end pipeline: ingest (demux/decode) -> per-tile framestores
+# -> EngineRuntime drive (CPU reference compositor) -> encode the canvas once
+# (LGPL `mpeg2video` by default) -> fan out to the file + HLS output sinks. Wires
+# the owning sub-crates' `ffmpeg` features and pulls `ffmpeg-next` only to name
+# its SAFE value types (no FFI in this crate). LGPL-clean: never escalates to GPL.
+ffmpeg = [
+    "dep:ffmpeg-next",
+    "dep:tempfile",
+    # `test-fixtures` (⊇ `multiview-ffmpeg/ffmpeg`) exposes the libav-built `dvbsub`
+    # MPEG-TS fixture generator the DVB-sub end-to-end test needs (the FFmpeg CLI
+    # cannot transcode text → bitmap subtitle). It is forwarded via the `ffmpeg`
+    # feature — not as a hard dev-dependency — so `ffmpeg-next` (WTFPL) stays
+    # behind the off-by-default `ffmpeg` feature and never enters the default
+    # `cargo deny check --all-features=false` graph. The `#[doc(hidden)]` module
+    # is test-only and adds no product surface.
+    "multiview-ffmpeg/test-fixtures",
+    "multiview-input/ffmpeg",
+    "multiview-output/ffmpeg",
+    "multiview-audio/ffmpeg",
+]
+
+# YouTube live ingest (ADR-0015): resolve a `youtube` source's watch URL to a
+# time-limited `*.googlevideo.com` HLS master via a runtime-discovered `yt-dlp`
+# (multiview-input's off-by-default `youtube` feature), feed it into the existing
+# HLS ingest path, and run an off-data-plane re-resolution loop that refreshes the
+# URL before it expires. OFF by default: it spawns an external resolver process and
+# is network-bound (no CI network), so the default build neither contains nor
+# requires it. Enables `ffmpeg` directly here (this crate opens the resolved master
+# via the libav/HLS ingest path); `multiview-input/youtube` is itself libav-free
+# (the pure resolver), so the `ffmpeg` it needs is pulled by this list, NOT by the
+# resolver feature — that keeps `multiview-input --features youtube` lintable on a
+# libav-free runner. LGPL-clean: `yt-dlp` is a subprocess, never vendored or linked.
+youtube = ["ffmpeg", "multiview-input/youtube"]
+
+# NDI® ingest (ADR-0008 / IN-3): wire a `ndi` source into the ingest path via
+# `multiview-input`'s off-by-default, license-isolating `ndi` feature (the
+# runtime-load `multiview-ndi-sys` seam — the proprietary SDK is never vendored or
+# linked at build time). OFF by default: it pulls a proprietary runtime-load
+# obligation and the real receive needs the NDI runtime + a live NDI network (no CI
+# network), so the default build neither contains nor requires it. The NDI
+# *receive* in `multiview-input` bypasses libav (host-memory), but the CLI's NDI
+# run path lives in the `ffmpeg`-gated `pipeline` module (it feeds the same
+# compositor + encode/mux fan-out as every other source), so the CLI `ndi` feature
+# implies `ffmpeg` — otherwise the NDI wiring would not compile into a runnable
+# binary. The CLI itself adds NO `unsafe` and NO native deps (it stays
+# `unsafe_code = forbid`); all NDI FFI is owned by `multiview-ndi-sys`. `cargo deny`
+# runs with `all-features = false` so this opt-in obligation never enters the
+# default LGPL-clean deny graph. LGPL-clean: the SDK is dynamically loaded at run
+# time, not linked.
+ndi = ["multiview-input/ndi", "ffmpeg"]
+
+# License-escalating: forwards the GPL software encoders (libx264/libx265) so a
+# `run --features ffmpeg,gpl-codecs` may target H.264/H.265. Enabling this makes
+# the whole build GPL; it is NEVER pulled in by `ffmpeg` alone and never enters
+# the default (LGPL-clean) build. Implies `ffmpeg` (the real encode path).
+gpl-codecs = [
+    "ffmpeg",
+    "multiview-ffmpeg/gpl-codecs",
+    "multiview-output/gpl-codecs",
+]
+
+# NVIDIA: CUDA decode/encode + CUDA compositor fast path + FFmpeg demux/mux,
+# wgpu baseline compositor. (cuda + ffmpeg + wgpu.)
+nvidia = [
+    # The cli's OWN `ffmpeg` feature — gates the run/pipeline path itself; without
+    # it `multiview run` has no ingest/encode pipeline at all (GPU-6b: the presets
+    # forwarded the dependency crates' ffmpeg but not the cli's, so a `--features
+    # nvidia` binary could not run a pipeline — surfaced by the on-hardware run).
+    "ffmpeg",
+    # Native overlay / caption burn-in. The native HLS-WebVTT caption ingest +
+    # per-tile burn-in path (the `#47` fix) is entirely `#[cfg(feature =
+    # "overlay")]`-gated (`prefetch_caption_plans` / `wire_source_captions` / the
+    # `SubtitleRouter` / the overlay baker), so WITHOUT this the deploy image
+    # silently ships the caption code compiled but inert — no cue stores, no
+    # reader threads, nothing burned in. It is GPU-free and LGPL-clean (the
+    # pure-Rust cosmic-text + swash + bundled OFL text engine via
+    # `multiview-compositor/overlay`; it pulls NO native lib and NO GPL crate, and
+    # `cargo deny` runs `all-features = false` so these opt-in deps never enter the
+    # graph). This is what makes the shipped nvidia/deploy image actually render
+    # captions/clock/tally/meters.
+    "overlay",
+    # The cli's own `cuda` feature selects the NVML system-metrics poller.
+    "cuda",
+    # The cli's own `gpu` feature — gates the RUN-PATH GPU-compositor SELECTION
+    # (`#[cfg(feature = "gpu")] RunBackend::select(true)` in pipeline.rs). Without
+    # it `multiview-compositor/wgpu` only COMPILES the GPU compositor but the run
+    # SILENTLY keeps the CPU reference backend (the on-hardware "GPU never engages,
+    # CPU pegged at 4K" bug). `gpu` pulls `multiview-compositor/wgpu` + `dep:wgpu`.
+    "gpu",
+    "multiview-hal/cuda",
+    "multiview-compositor/cuda",
+    "multiview-compositor/wgpu",
+    "multiview-ffmpeg/ffmpeg",
+    # GPU-6b: forward the NVENC encoder-name gate so the codec selector considers
+    # `h264_nvenc`/`hevc_nvenc` (else an H.264 output on a CUDA box silently falls
+    # back to LGPL mpeg2video).
+    "multiview-ffmpeg/cuda",
+    "multiview-input/ffmpeg",
+    "multiview-output/ffmpeg",
+    "multiview-audio/ffmpeg",
+]
+
+# Apple Silicon / Intel macOS: VideoToolbox codecs + Metal compositor + FFmpeg.
+# (videotoolbox + metal + ffmpeg.)
+apple = [
+    "ffmpeg",
+    # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
+    # LGPL-clean pure-Rust text engine; without it the shipped Apple deploy image
+    # would silently render no native captions/overlays.
+    "overlay",
+    "multiview-hal/videotoolbox",
+    "multiview-compositor/metal",
+    "multiview-ffmpeg/ffmpeg",
+    "multiview-input/ffmpeg",
+    "multiview-output/ffmpeg",
+    "multiview-audio/ffmpeg",
+]
+
+# Linux VAAPI/QSV: VAAPI + QuickSync codecs + wgpu compositor + FFmpeg.
+# (vaapi + qsv + ffmpeg + wgpu.)
+linux-vaapi = [
+    "ffmpeg",
+    # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
+    # LGPL-clean pure-Rust text engine; without it the shipped VAAPI deploy image
+    # would silently render no native captions/overlays.
+    "overlay",
+    # `gpu` gates the run-path GPU-compositor SELECTION (see the `nvidia` note);
+    # without it the wgpu compositor compiles but the run stays on the CPU backend.
+    "gpu",
+    "multiview-hal/vaapi",
+    "multiview-hal/qsv",
+    "multiview-compositor/vaapi",
+    "multiview-compositor/wgpu",
+    "multiview-ffmpeg/ffmpeg",
+    "multiview-input/ffmpeg",
+    "multiview-output/ffmpeg",
+    "multiview-audio/ffmpeg",
+]
+
+# Everything non-GPL: all codec backends, every compositor backend, FFmpeg,
+# libass overlays, the embedded SPA, OpenAPI docs, WebRTC preview, and NDI I/O.
+# Deliberately excludes `gpl-codecs` (which would relicense the whole build GPL).
+full = [
+    "nvidia",
+    "linux-vaapi",
+    "multiview-hal/videotoolbox",
+    "multiview-compositor/metal",
+    # The cli `overlay` feature (the pure-Rust overlay/caption burn-in path) comes
+    # transitively via `nvidia` + `linux-vaapi`; `multiview-overlay/libass` adds
+    # the OPTIONAL native ASS/SSA styling capability ON TOP (a compile-time
+    # capability marker — it links no native lib in-tree today and degrades ASS/SSA
+    # to the pure-Rust text fallback when absent). LGPL/ISC, never GPL.
+    "multiview-overlay/libass",
+    # NDI I/O: the cli `ndi` feature wires NDI *ingest* (and forwards
+    # `multiview-input/ndi`); `multiview-output/ndi` adds the NDI *output* sink.
+    "ndi",
+    "multiview-output/ndi",
+    "multiview-control/embed-web",
+    "multiview-control/openapi",
+    "multiview-preview/webrtc",
+    # mDNS managed-device discovery (DEV-A5): pure-Rust, LGPL-clean, GPU-free.
+    "multiview-control/discovery",
+    # Managed-device live transport (DEV-A4): the `zowietek` driver poller's real
+    # HTTP backend. LGPL-clean (reqwest + rustls, no native lib), so it belongs
+    # in the non-GPL `full` build.
+    "devices-net",
+]
+
+[lints]
+workspace = true

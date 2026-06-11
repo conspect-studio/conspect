@@ -1,0 +1,355 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # paths-filter reads the PR diff via the API on pull_request events.
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── change classification (CI efficiency, ADR-0046) ──────────────────────────
+  # Classify the PR diff as "code" (anything that can affect build/test/lint or a
+  # generated spec) vs "docs-only" (a STRICT prose allowlist). The heavy matrix
+  # below is gated on `code == 'true'`; a docs-only PR skips it and only the
+  # always-run light jobs (inclusive-language, docs-sanity) report green.
+  #
+  # SAFETY: this can only ever SKIP work for a PR whose entire diff is prose docs
+  # that cannot influence the build/test/lint/spec surface. The `code` filter is
+  # built to FAIL SAFE — it matches `**` (every changed file) and then negates
+  # ONLY the strict prose allowlist, under `predicate-quantifier: every`. The
+  # documented effect (see dorny/paths-filter README) is: a changed file makes
+  # `code` true unless it matches one of the prose negations. Therefore ANY file
+  # type we did not explicitly allowlist as prose (a new extension, a dotfile, a
+  # config, a lockfile, a spec under docs/api/**, anything under web/ .github/
+  # xtask/ deploy/ crates/) → `code = true` → the FULL matrix runs. "When in
+  # doubt, run everything" is the default, not the exception.
+  #
+  # On `push` to main (no PR base to diff against) we do NOT gate: the heavy jobs
+  # below also key on `github.event_name == 'pull_request'` so a push always runs
+  # the full matrix. This also means that if branch protection is later added,
+  # required checks on a docs-only PR are satisfied by the always-run light jobs,
+  # while every code PR still runs (and reports) the full set unchanged.
+  changes:
+    name: classify changes
+    runs-on: ubuntu-latest
+    # Single checkout + paths-filter API call (~30s). Fail fast if a runner wedges.
+    timeout-minutes: 10
+    outputs:
+      # 'true' when at least one changed file is NOT in the prose allowlist.
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # Default `some` would treat the leading `!` negations as ordinary
+          # match patterns; `every` makes a file count for `code` only when it
+          # matches `**` AND none of the prose negations — i.e. it is non-prose.
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              # ─── Prose allowlist (negations) — files that CANNOT affect the
+              # build/test/lint/spec surface. Every negation is scoped narrowly:
+              # docs/api/** (the generated OpenAPI/AsyncAPI specs) is NEVER
+              # excluded, and same-extension files that ARE build/test inputs
+              # (proptest-regressions *.txt, bundled crate assets/font licences,
+              # web/ images) stay `code`. When in doubt the file stays `code`.
+              # Verified empirically against all tracked files: the only files
+              # classified docs-only are .md / .txt / images / LICENSE* / NOTICE
+              # outside docs/api/** (see ADR-0046 truth table).
+              #
+              # Markdown prose. docs/!(api)/** excludes the docs tree EXCEPT the
+              # docs/api spec dir, so docs/api/*.md prose pages stay `code` (the
+              # task treats all of docs/api/** as code). No *.md is embedded via
+              # include_str!/bytes! anywhere in this repo (verified).
+              - '!docs/!(api)/**/*.md'
+              - '!docs/*.md'
+              - '!*.md'
+              - '!crates/**/*.md'
+              - '!web/**/*.md'
+              - '!examples/**/*.md'
+              - '!.github/**/*.md'
+              # Plain-text docs + licence/notice in the docs tree (NOT docs/api/)
+              # or at the repo root. Crate/test *.txt (proptest regressions,
+              # bundled font OFL.txt) deliberately stay `code`.
+              - '!docs/!(api)/**/*.txt'
+              - '!docs/*.txt'
+              - '!*.txt'
+              - '!LICENSE'
+              - '!LICENSE-COMMERCIAL'
+              - '!NOTICE'
+              - '!docs/**/LICENSE*'
+              - '!docs/**/NOTICE'
+              # Documentation images in the docs tree (NOT docs/api/) or at the
+              # repo root. Crate/web asset images stay `code` (compiled-in or
+              # part of the SPA build).
+              - '!docs/!(api)/**/*.png'
+              - '!docs/!(api)/**/*.jpg'
+              - '!docs/!(api)/**/*.jpeg'
+              - '!docs/!(api)/**/*.gif'
+              - '!docs/!(api)/**/*.svg'
+              - '!docs/!(api)/**/*.webp'
+              - '!docs/*.png'
+              - '!docs/*.jpg'
+              - '!docs/*.jpeg'
+              - '!docs/*.gif'
+              - '!docs/*.svg'
+              - '!docs/*.webp'
+              - '!*.png'
+              - '!*.jpg'
+              - '!*.jpeg'
+              - '!*.gif'
+              - '!*.svg'
+              - '!*.webp'
+              # docs/api/** (openapi.json/asyncapi.json + the *.md spec pages) is
+              # excluded nowhere above → matches `**`, fails no negation →
+              # `code = true` → spec validation runs. (asyncapi.json is also
+              # include_str!'d into the multiview-control binary.)
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    # fmt + clippy run ~1-2min warm; a cold cargo cache pushes the full clippy
+    # build higher. 20min is ~3x worst-case while still well under the 6h default.
+    timeout-minutes: 20
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: check + test (${{ matrix.os }})
+    # The long pole of CI: macOS check+test runs ~15min warm (the slowest leg);
+    # a cold cargo cache on macOS is materially slower. 40min gives the macOS leg
+    # generous headroom while still failing a wedged runner far under 6h. ubuntu
+    # (~7min) shares the same cap with ample margin.
+    timeout-minutes: 40
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Default features are pure-Rust (no FFmpeg/GPU), so CI needs no native libs.
+      - name: cargo check
+        run: cargo check --workspace
+      - name: cargo test
+        # Skip the compositor per-tick perf BUDGET test on shared CI runners: it
+        # asserts a wall-clock ceiling only meaningful on consistent hardware
+        # (ADR-E009 — perf gates run on dedicated runners). The tile-driven
+        # SCALING correctness is covered unconditionally by
+        # tile_driven_scales_with_coverage_not_tile_count.
+        run: cargo test --workspace -- --skip tile_driven_meets_budget
+
+  # ── feature-gated clippy + test matrix (IN-7) ────────────────────────────────
+  # The default `lint` and `test` jobs run with default features only (pure-Rust,
+  # no native deps). These off-by-default features are compile-verified here so
+  # their type-check and lint coverage matches the default build.
+  #
+  # Feature → crate mapping:
+  #   multiview-input:   st2110  (UDP/RTP depacketizer seam, tokio::net only)
+  #                      webrtc  (SDP model + transport shell, pure Rust)
+  #                      youtube (yt-dlp resolver + info-dict parser)
+  #   multiview-engine:  ptp     (PHC discipline read, rustix/clock_gettime)
+  #                      cluster (HA wire transport, serde_json)
+  #                      ntp     (adjtimex read via multiview-ntpsys FFI leaf)
+  #   multiview-control: is07-mqtt (MQTT transport for IS-07 tally, rumqttc)
+  #                      nmos    (NMOS IS-04/05/08 discovery + receiver bind)
+  #   multiview-hal:     i915-pmu (Intel perf_event_open PMU, multiview-i915pmu)
+  #
+  # NDI (IN-3) is NOT a Cargo feature yet: the grafton-ndi link requires the
+  # proprietary SDK fetched at build time (ADR-0008). It lives in a separate
+  # Docker lane that fetches the SDK under NDA; that lane is not modelled here.
+  #
+  # `cargo deny check` intentionally stays on default features only (see `deny`
+  # job below) — enabling these features would pull rumqttc/rustix into the
+  # license scan, all of which are already in deny.toml's allow-list, but
+  # --all-features would also surface gpl-codecs and ndi which are not.
+  feature-clippy:
+    name: feature-gated clippy (${{ matrix.crate }}, ${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    # Each leg clippy+tests one crate under one feature (~1min warm). A cold,
+    # per-feature-scoped cargo cache can take several minutes; 20min is safe.
+    timeout-minutes: 20
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # multiview-input off-by-default features
+          - crate: multiview-input
+            feature: st2110
+          - crate: multiview-input
+            feature: webrtc
+          - crate: multiview-input
+            feature: youtube
+          # multiview-engine off-by-default features
+          - crate: multiview-engine
+            feature: ptp
+          - crate: multiview-engine
+            feature: cluster
+          - crate: multiview-engine
+            feature: ntp
+          # multiview-control off-by-default features
+          - crate: multiview-control
+            feature: is07-mqtt
+          - crate: multiview-control
+            feature: nmos
+          # multiview-hal off-by-default features
+          - crate: multiview-hal
+            feature: i915-pmu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Scope the cache per feature so entries don't collide across matrix legs.
+          key: feature-${{ matrix.crate }}-${{ matrix.feature }}
+      - name: clippy (${{ matrix.feature }})
+        # --all-targets: also lints integration-test binaries under the feature.
+        # -D warnings: matches the default `lint` job gate.
+        # Hardware/network live paths are gated in the tests themselves via
+        # #[ignore] or cfg_attr(not(feature=...), ignore), so this never needs
+        # a real NIC, PTP device, MQTT broker, or NDI sender.
+        run: >
+          cargo clippy
+          -p ${{ matrix.crate }}
+          --features ${{ matrix.feature }}
+          --all-targets
+          -- -D warnings
+      - name: test (${{ matrix.feature }})
+        # cargo test --no-fail-fast: surface all failures, not just the first.
+        # Hardware-gated tests carry #[ignore] and are excluded from shared CI
+        # by default; they run on dedicated self-hosted runners with the real
+        # devices attached.
+        run: >
+          cargo test
+          -p ${{ matrix.crate }}
+          --features ${{ matrix.feature }}
+
+  # ── AsyncAPI 3.0 spec validation (SUR-6b follow-on, folded into IN-7) ────────
+  # Validates docs/api/asyncapi.json against the AsyncAPI 3.0 JSON Schema using
+  # the official @asyncapi/cli. The spec is generated by `cargo xtask gen-asyncapi`
+  # and committed; this job fails if the committed file is not valid AsyncAPI 3.0.
+  # The job does NOT re-generate the spec (that would require the full Rust build
+  # here); it validates the already-committed artifact. Regeneration + diff-check
+  # is deferred until SUR-6 (the gen-asyncapi xtask) lands.
+  asyncapi-validate:
+    name: AsyncAPI 3.0 spec validation
+    runs-on: ubuntu-latest
+    # Node setup + global @asyncapi/cli install + a single validate (~1min).
+    timeout-minutes: 15
+    needs: changes
+    # A docs/api/** spec change keeps `code == 'true'` (the spec is NOT in the
+    # prose allowlist), so this validation always runs whenever a spec moves.
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: install @asyncapi/cli
+        # Pin to a specific version for reproducibility; asyncapi/cli 2.x supports
+        # AsyncAPI 3.0. Install globally so `asyncapi` is on PATH.
+        run: npm install --global @asyncapi/cli@2.17.0
+      - name: validate asyncapi.json
+        run: asyncapi validate docs/api/asyncapi.json
+
+  deny:
+    name: cargo-deny (licenses + advisories)
+    runs-on: ubuntu-latest
+    # `cargo deny check` is ~30s, but the leg also installs a toolchain and the
+    # cargo-deny binary (taiki-e/install-action) — 20min covers a cold install.
+    timeout-minutes: 20
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      # Run cargo-deny on the runner — the action's musl Docker image cannot
+      # honour rust-toolchain.toml's pinned toolchain. Default features only:
+      # this is the LGPL-clean build; --all-features would pull the opt-in
+      # gpl-codecs (GPL) and fail the license allowlist by design.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  # ── always-run light jobs ────────────────────────────────────────────────
+  # These run on EVERY push and PR — including docs-only PRs that skip the heavy
+  # matrix above — so a prose-docs PR still gets a real green signal (and stays
+  # safe as a required check if branch protection is later added). They are
+  # intentionally NOT gated on `changes`.
+  inclusive-language:
+    name: inclusive language
+    runs-on: ubuntu-latest
+    # Checkout + a single grep-based shell script (seconds).
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-inclusive-language.sh
+
+  docs-sanity:
+    name: docs link sanity
+    runs-on: ubuntu-latest
+    # Checkout + a dependency-free markdown link-check script (seconds).
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: check relative markdown links resolve
+        # Lightweight, dependency-free link check: for every committed Markdown
+        # file, resolve each inline relative link target [..](path) against the
+        # repo and fail if a referenced file/dir is missing. Skips external
+        # (http/https/mailto/tel), in-page anchors (#…), and template/example
+        # placeholders. Catches the common docs-PR breakage (renamed/moved brief
+        # or ADR) without pulling a Node/Ruby link-checker toolchain.
+        run: ./scripts/check-markdown-links.sh
+
+  web:
+    name: web build
+    runs-on: ubuntu-latest
+    # npm install + Vite production build (~1-5min). 20min absorbs a cold npm
+    # cache and a slow registry while still failing a wedge well under 6h.
+    timeout-minutes: 20
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: install
+        working-directory: web
+        run: npm install
+      - name: build
+        working-directory: web
+        run: npm run build

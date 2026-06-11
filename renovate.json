@@ -1,0 +1,41 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Multiview dependency automation (Renovate — free OSS). Digest-pins the container base images + the FFmpeg base-image (FFMPEG_IMAGE) tags, and SHA-pins GitHub Actions. NO paid services.",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Australia/Sydney",
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "git-submodules": {
+    "enabled": false
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Pin all GitHub Actions to an immutable commit SHA (keep the human-readable version as a comment). Group the bumps into one PR.",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true,
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Pin every Docker base image (FROM <ref>) to a @sha256: digest and keep the tag. Covers deploy/Dockerfile, deploy/Dockerfile.nvidia, deploy/Dockerfile.ffmpeg. Excludes the FFMPEG_IMAGE build-arg, handled below.",
+      "matchManagers": ["dockerfile"],
+      "matchDepTypes": ["final", "stage"],
+      "pinDigests": true,
+      "groupName": "docker base images"
+    },
+    {
+      "description": "Pin + bump the published Multiview FFmpeg base image referenced via the FFMPEG_IMAGE build-arg default and the FROM ${FFMPEG_IMAGE} stage. Keep the 8.1.1-<flavour> tag; add/refresh the @sha256: digest on first run so the app images link an immutable base. A separate PR so the FFmpeg-rebuild → app-pin coupling is reviewable.",
+      "matchPackageNames": ["ghcr.io/aperim/multiview-ffmpeg"],
+      "pinDigests": true,
+      "groupName": "multiview-ffmpeg base image"
+    }
+  ]
+}

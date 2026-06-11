@@ -1,0 +1,24 @@
+[package]
+name = "multiview-framestore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+arc-swap = "1.9.1"
+multiview-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+proptest-state-machine = "0.3.1"

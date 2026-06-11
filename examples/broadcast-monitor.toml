@@ -1,0 +1,172 @@
+# examples/broadcast-monitor.toml — a broadcast multiviewer slice exercising the
+# config-as-code monitoring surface: content-aware fault PROBES, a named SALVO
+# (atomic recall of layout + sources + tally + UMD), a TALLY PROFILE, and a
+# 2-head video WALL. Self-contained (built-in test sources).
+# Schema: docs/templates/layout-and-config.md
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "25/1"                 # rational string, never a float
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr", "1fr"]
+gap = 8
+areas = ["a b", "c d"]
+
+[[sources]]
+id = "cam_a"
+display_name = "Camera A"
+kind = "test"
+
+[[sources]]
+id = "cam_b"
+display_name = "Camera B"
+kind = "test"
+
+[[sources]]
+id = "cam_c"
+display_name = "Camera C"
+kind = "test"
+
+[[sources]]
+id = "cam_d"
+display_name = "Camera D"
+kind = "test"
+
+[[sources]]
+id = "vtr_1"
+display_name = "VTR 1"
+kind = "test"
+
+[[cells]]
+id = "tile_a"
+area = "a"
+fit = "contain"
+[cells.source]
+input_id = "cam_a"
+
+[[cells]]
+id = "tile_b"
+area = "b"
+fit = "contain"
+[cells.source]
+input_id = "cam_b"
+
+[[cells]]
+id = "tile_c"
+area = "c"
+fit = "contain"
+[cells.source]
+input_id = "cam_c"
+
+[[cells]]
+id = "tile_d"
+area = "d"
+fit = "contain"
+[cells.source]
+input_id = "cam_d"
+
+# --- Content-aware fault probes (broadcast-multiviewer §4) ---
+
+# Severity uses the X.733 PerceivedSeverity tokens from multiview-core
+# (Cleared / Indeterminate / Warning / Minor / Major / Critical); tally/colour
+# tokens are the shared TallyColor names (Off / Red / Green / Amber).
+
+# Black detection on the centre of tile A (ignore a static logo bug in a corner).
+[[probes]]
+id = "black_a"
+cell = "tile_a"
+kind = "black"
+luma_threshold = 16
+severity = "Major"
+latched = false
+zone = { x = 0.1, y = 0.1, w = 0.8, h = 0.8 }
+dwell = { up_ms = 2000, down_ms = 500 }
+
+# Freeze detection on the whole of tile B.
+[[probes]]
+id = "freeze_b"
+cell = "tile_b"
+kind = "freeze"
+difference_threshold = 5
+severity = "Minor"
+dwell = { up_ms = 3000, down_ms = 1000 }
+
+# Audio silence on tile C.
+[[probes]]
+id = "silence_c"
+cell = "tile_c"
+kind = "silence"
+level_dbfs = -60.0
+severity = "Warning"
+
+# Loudness compliance (EBU R128) on tile D.
+[[probes]]
+id = "loud_d"
+cell = "tile_d"
+kind = "loudness"
+severity = "Minor"
+target = { kind = "r128", target_lufs = -23.0, max_true_peak_dbtp = -1.0 }
+
+# --- Tally profile (TSL UMD bit↔colour + index↔cell) ---
+[[tally_profiles]]
+id = "main_router"
+bit_colors = [
+  { bit = 0, color = "Red" },
+  { bit = 1, color = "Green" },
+  { bit = 2, color = "Amber" },
+]
+index_cells = [
+  { index = 0, cell = "tile_a" },
+  { index = 1, cell = "tile_b" },
+  { index = 2, cell = "tile_c" },
+  { index = 3, cell = "tile_d" },
+]
+
+# --- Salvo: atomic recall of a "VTR review" arrangement ---
+[[salvos]]
+id = "vtr_review"
+display_name = "VTR Review"
+layout = "1+5"
+sources = [
+  { cell = "tile_a", input_id = "vtr_1" },
+]
+tally = [
+  { cell = "tile_a", color = "Amber" },
+]
+umd = [
+  { cell = "tile_a", text = "VTR 1 — REVIEW" },
+]
+
+# --- 2-head video wall (bezel-compensated) ---
+[[walls]]
+name = "control_room_wall"
+cols = 2
+rows = 1
+bezel = { horizontal_px = 12, vertical_px = 0 }
+heads = [
+  { id = "head_left",  width = 1920, height = 1080, fps = "25/1", layout = "main" },
+  { id = "head_right", width = 1920, height = 1080, fps = "25/1", layout = "review" },
+]
+
+[[overlays]]
+id = "ov_clock"
+kind = "clock"
+target = "canvas"
+z = 100
+format = "%H:%M:%S"
+
+[[outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+latency_profile = "low_latency"

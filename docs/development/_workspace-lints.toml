@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DOC SNIPPET — paste into the workspace root Cargo.toml. This is NOT the live
+# manifest. See docs/development/agent-guardrails.md §A.1.
+#
+# Lint categories can move between clippy releases (a lint's category sets its
+# default level). Re-verify against the live index when bumping the toolchain:
+#   https://rust-lang.github.io/rust-clippy/master/index.html
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ===== root Cargo.toml =====
+[workspace.lints.rust]
+unsafe_code = "forbid"          # FFI crates override locally to "deny" + // SAFETY:
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# Groups MUST carry priority < 0 so individual overrides below are not clobbered
+# (cargo emits lints alphabetically on the rustc command line).
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+
+# No panics / panicking accessors in non-test code.
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+# No untyped/lossy conversions — use TryFrom / TryInto / From.
+as_conversions   = "deny"
+# No process exit, leaks, stray debug / stdio (use `tracing`).
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+# Force documenting failure modes.
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"
+
+# ===== every member crate's Cargo.toml (crates/*/Cargo.toml, xtask/Cargo.toml) =====
+# [lints]
+# workspace = true
+
+# ===== FFI/vendor crates only (e.g. crates/multiview-ffmpeg/Cargo.toml) =====
+# Inherit the workspace set, then relax unsafe (every block needs a // SAFETY: comment).
+# [lints.rust]
+# unsafe_code = "deny"
+
+# ===== root clippy.toml =====
+# allow-unwrap-in-tests          = true
+# allow-expect-in-tests          = true
+# allow-panic-in-tests           = true
+# allow-dbg-in-tests             = true
+# allow-print-in-tests           = true
+# allow-indexing-slicing-in-tests = true   # recent clippy (PR #13854) — needs a recent toolchain
+#
+# These relax lints ONLY for #[cfg(test)]/#[test] code — NOT for integration
+# tests in tests/, examples/, or benches/. Each tests/*.rs file must start with:
+#   #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]

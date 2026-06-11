@@ -1,0 +1,58 @@
+[
+  {
+    "id": "NewsOne.us",
+    "name": "News One",
+    "categories": ["news"],
+    "country": "US",
+    "is_nsfw": false
+  },
+  {
+    "id": "SportsTwo.gb",
+    "name": "Sports Two",
+    "categories": ["sports"],
+    "country": "GB",
+    "is_nsfw": false
+  },
+  {
+    "id": "MovieThree.fr",
+    "name": "Movie Three",
+    "categories": ["movies"],
+    "country": "FR",
+    "is_nsfw": false
+  },
+  {
+    "id": "MusicFour.de",
+    "name": "Music Four",
+    "categories": ["music"],
+    "country": "DE",
+    "is_nsfw": false
+  },
+  {
+    "id": "KidsFive.au",
+    "name": "Kids Five",
+    "categories": ["kids"],
+    "country": "AU",
+    "is_nsfw": false
+  },
+  {
+    "id": "WeatherSix.ca",
+    "name": "Weather Six",
+    "categories": ["weather"],
+    "country": "CA",
+    "is_nsfw": false
+  },
+  {
+    "id": "AdultSeven.xx",
+    "name": "Adult Seven",
+    "categories": ["xxx"],
+    "country": "US",
+    "is_nsfw": true
+  },
+  {
+    "id": "GeneralEight.us",
+    "name": "General Eight",
+    "categories": ["general"],
+    "country": "US",
+    "is_nsfw": false
+  }
+]

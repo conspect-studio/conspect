@@ -1,0 +1,175 @@
+[package]
+name = "multiview-compositor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches xtask). This lets cargo-deny's allow-wildcard-paths exempt the
+# intra-workspace path deps while still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# wgpu GPU compositor stack — pulled in ONLY by the off-by-default `wgpu`
+# feature so the default build stays pure-Rust, GPU-free, fast, and cargo-deny
+# clean (deny.toml uses `all-features = false`). All four are permissively
+# licensed (MIT OR Apache-2.0 [+ Zlib for bytemuck]); `naga` ships in the wgpu
+# workspace and lets us STATICALLY validate the WGSL shaders without a GPU.
+#
+# `default-features = false` drops wgpu's web (`webgpu`) and Windows (`dx12`)
+# backends — both project non-goals — and we re-enable exactly the platform
+# backends Multiview targets: `vulkan` + `gles` (Linux: NVIDIA/Intel/AMD) and
+# `metal` (macOS). Each backend crate is internally target-gated, so listing
+# all three is portable; `std` + `wgsl` are required for the native runtime and
+# the WGSL front-end.
+wgpu = { version = "29", default-features = false, features = [
+  "std",
+  "wgsl",
+  "vulkan",
+  "gles",
+  "metal",
+], optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+naga = { version = "29", features = ["wgsl-in"], optional = true }
+
+# Overlay TEXT-ENGINE stack — pulled in ONLY by the off-by-default `overlay`
+# feature so the default build stays pure-Rust and cargo-deny clean. All four
+# are permissively licensed (MIT OR Apache-2.0 [+ Zlib]); the bundled OFL fonts
+# are embedded via `rust-embed` and attributed separately (OFL 1.1, see NOTICE).
+#
+# `cosmic-text` is taken WITHOUT default features: we drop `fontconfig`
+# (the system-font scan) so the engine renders ONLY from the two bundled,
+# deterministic OFL faces — no host-font dependency, identical metrics on every
+# platform. `swash` is the rasterizer; `etagere` shelf-packs glyph coverage into
+# the bounded atlas; `shape-run-cache` caches shape plans per run (efficiency).
+cosmic-text = { version = "0.14", default-features = false, features = [
+  "std",
+  "swash",
+  "shape-run-cache",
+], optional = true }
+etagere = { version = "0.3", optional = true }
+# `debug-embed` forces the fonts to be embedded in the binary in EVERY profile
+# (rust-embed otherwise reads them from disk in debug builds) so the bundle is
+# truly self-contained and tests exercise the embedded bytes. No extra runtime
+# deps; the macro just inlines the file bytes.
+rust-embed = { version = "8", default-features = false, features = [
+  "debug-embed",
+  "include-exclude",
+], optional = true }
+# Re-exported from `cosmic-text`'s public `Fallback` trait signature
+# (`script_fallback(&self, script: Script, ...)`), so we name the type directly.
+# Same crate/version cosmic-text already pulls in — no graph change for deny.
+unicode-script = { version = "0.5", optional = true }
+
+[dev-dependencies]
+proptest = "1.11.0"
+# Criterion drives the overlay efficiency BENCHMARKS (ADR-0016 T1-T5). It is
+# taken WITHOUT default features to drop the `plotters`/`rayon`/`tinytemplate`
+# HTML-report graph: we only need the timing harness + the `cargo bench`
+# regression machinery (the perf-regression CI gate, ADR-E009). `cargo_bench_support`
+# keeps the `criterion_group!`/`criterion_main!` runner working under `cargo bench`.
+# Dropping the defaults keeps the dev-dependency graph small and cargo-deny green
+# (all transitive crates stay permissive).
+criterion = { version = "0.7", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
+# GPU tests only build/run under the `wgpu` feature; the `#![cfg(feature =
+# "wgpu")]` inside also makes them compile to an empty crate when the feature
+# is off, but `required-features` keeps `cargo test` (default) from even trying.
+[[test]]
+name = "gpu_shader_validate"
+required-features = ["wgpu"]
+
+[[test]]
+name = "gpu_compositor"
+required-features = ["wgpu"]
+
+# The GPU surface-pool allocation-count test (EFF-0): drives N composite ticks
+# against a real adapter and asserts the GPU buffer/texture CREATION count is
+# bounded (one-time setup), not proportional to N. Skips gracefully GPU-free.
+[[test]]
+name = "gpu_surface_pool"
+required-features = ["wgpu"]
+
+# The overlay text-engine tests only build/run under the `overlay` feature.
+[[test]]
+name = "overlay_text"
+required-features = ["overlay"]
+
+# The overlay compositing sub-pass CPU-reference tests need only `overlay`.
+[[test]]
+name = "overlay_subpass"
+required-features = ["overlay"]
+
+# The analog clock-face primitive (ring + angled hand) tests need only `overlay`.
+[[test]]
+name = "overlay_clockface"
+required-features = ["overlay"]
+
+# The audio meters/scopes draw-data tests need only `overlay`.
+[[test]]
+name = "overlay_meters"
+required-features = ["overlay"]
+
+# The region-limited overlay bake (ADR-0023) tests need only `overlay`.
+[[test]]
+name = "overlay_bake_region"
+required-features = ["overlay"]
+
+# The GPU overlay sub-pass shader validation needs `overlay` + `wgpu` (naga
+# validates the WGSL with no GPU).
+[[test]]
+name = "overlay_gpu_subpass"
+required-features = ["overlay", "wgpu"]
+
+# The overlay efficiency benchmarks (ADR-0016 T1-T5) need the text engine, so
+# they build only under `overlay`. `harness = false` hands the binary to
+# criterion's own runner (not libtest). GPU-free: the benches measure the CPU
+# draw path + atlas/prepare cost, which is the same hot-path code the GPU sub-pass
+# feeds.
+[[bench]]
+name = "overlay_efficiency"
+harness = false
+required-features = ["overlay"]
+
+# The real-time composite budget bench (ADR-0022) runs on the DEFAULT build (no
+# `required-features`) so the per-tick perf gate is exercised GPU-free in CI; it
+# measures the parallel LUT compositor and hard-asserts the 1080p×9 ≤ 40 ms
+# budget. `harness = false` hands the binary to criterion's runner.
+[[bench]]
+name = "composite_realtime"
+harness = false
+
+[features]
+# DEFAULT IS PURE RUST (no GPU, no native libs) — the CI-green baseline.
+#
+# The `wgpu` feature wires the portable GPU compositor (device/queue setup,
+# NV12 upload, the fixed-order WGSL pipeline). It is OFF by default in this
+# change so `cargo check --workspace` and `cargo deny check` stay green and
+# fast and pull no native graphics deps. conventions §3 lists wgpu as the
+# NOMINAL DEFAULT compositor backend, so flipping `default = ["wgpu"]` is a
+# deliberate, reviewed follow-up (it adds wgpu to the default deny graph and CI
+# build time) — recommended, but not done here.
+"default" = []
+"wgpu" = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:naga"]
+# The `overlay` feature wires the pure-Rust text engine (cosmic-text + swash
+# shaping/rasterization, etagere shelf-packed bounded atlas with LRU eviction,
+# rust-embed bundled OFL fonts). It is OFF by default so `cargo check
+# --workspace` and `cargo deny check` stay green and pull no extra deps. It is
+# GPU-free: the GPU overlay sub-pass (a later stage) will combine `overlay`
+# with `wgpu`; the CPU reference text-run rasterizer needs only `overlay`.
+"overlay" = ["dep:cosmic-text", "dep:etagere", "dep:rust-embed", "dep:unicode-script"]
+"cuda" = []
+"metal" = []
+"vaapi" = []
+
+[lints]
+workspace = true
