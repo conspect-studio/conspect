@@ -39,7 +39,7 @@ serde_json = { workspace = true }
 # HTTP stack (pure Rust; the default-feature build pulls no native libs).
 axum = { version = "0.8.9", features = ["ws", "macros"] }
 tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.6.11", features = ["trace", "cors"] }
+tower-http = { version = "0.7.0", features = ["trace", "cors"] }
 bytes = "1.10.1"
 async-stream = "0.3.6"
 uuid = { version = "1.23.2", features = ["v4"] }
@@ -48,8 +48,8 @@ uuid = { version = "1.23.2", features = ["v4"] }
 # per the web-api-stack brief) and HS256 JWT signature verification. RustCrypto
 # crates, all MIT/Apache-2.0. `base64` (MIT/Apache-2.0, pure Rust) decodes the
 # base64url JWT segments — no native deps, stays in the CI-green default build.
-sha2 = "0.10.9"
-hmac = "0.12.1"
+sha2 = "0.11.0"
+hmac = "0.13.0"
 subtle = "2.6.1"
 base64 = "0.22.1"
 
@@ -72,7 +72,7 @@ mime_guess = { version = "2", optional = true }
 
 # SQLite persistence: OFF by default. SQLite's bundled license is NOT in the
 # cargo-deny allowlist, so sqlx/sqlite must never appear in the default build.
-sqlx = { version = "0.8.6", default-features = false, features = [
+sqlx = { version = "0.9.0", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
     "macros",
@@ -147,7 +147,7 @@ http-body-util = "0.1.3"
 # codec and the tally mirror/override registry).
 proptest = "1.11.0"
 rumqttd = { version = "0.20", default-features = false }
-toml = "0.8"
+toml = "1.1"
 # Build signed lease bindings in the licence-route tests (Conspect, ADR-0050):
 # generate a test keypair, sign a lease, and CBOR-encode the binding the
 # `POST /api/v1/licence/lease` route ingests, and drive the store clock across

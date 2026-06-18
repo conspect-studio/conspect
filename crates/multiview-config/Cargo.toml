@@ -16,7 +16,7 @@ multiview-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-toml = "0.8.19"
+toml = "1.1.2"
 # IANA timezone validation for the clock synthetic source (ADR-0047): a
 # `timezone` id is rejected at config load if it is not a known IANA zone, via
 # the canonical `multiview_overlay::clock::parse_tz` (one source of truth shared
