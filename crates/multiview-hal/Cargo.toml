@@ -20,7 +20,7 @@ tracing = { workspace = true }
 # licence). OFF by default and pulled in ONLY by the `cuda` feature, so the
 # default pure-Rust build never sees it and `cargo deny check`
 # (`all-features = false`) does not scan it.
-nvml-wrapper = { version = "0.10", optional = true }
+nvml-wrapper = { version = "0.12", optional = true }
 # Intel i915 PMU per-engine busy-ns counter (ADR-0017). The single
 # `perf_event_open(2)` syscall lives in this FFI leaf crate (which is
 # `unsafe_code = "deny"` + `// SAFETY:`), so `multiview-hal` stays
