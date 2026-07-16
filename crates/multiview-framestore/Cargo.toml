@@ -21,4 +21,4 @@ workspace = true
 
 [dev-dependencies]
 proptest = "1.11.0"
-proptest-state-machine = "0.3.1"
+proptest-state-machine = "0.8.0"

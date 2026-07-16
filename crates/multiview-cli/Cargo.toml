@@ -43,7 +43,7 @@ multiview-hal = { workspace = true }
 # the `gpu` feature (the cli already links wgpu transitively via the compositor's
 # `wgpu` feature there), so the default pure-Rust build never sees it. `std` only —
 # no backend feature is needed to read the adapter-info enums.
-wgpu = { version = "29", default-features = false, features = [
+wgpu = { version = "30", default-features = false, features = [
   "std",
 ], optional = true }
 multiview-ffmpeg = { workspace = true }
