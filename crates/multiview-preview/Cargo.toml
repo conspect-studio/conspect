@@ -20,15 +20,15 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 # HMAC-SHA256 for short-lived signed preview access tokens. RustCrypto, pinned;
 # hmac/sha2/digest/crypto-common are MIT OR Apache-2.0 (cargo-deny allowlisted).
-hmac = "0.12.1"
-sha2 = "0.10.9"
+hmac = "0.13.0"
+sha2 = "0.11.0"
 # Pure-Rust baseline JPEG encoder for the default (GPU-free) preview build. Pinned
 # EXACTLY to 0.6.0: that single release is licensed `MIT OR Apache-2.0` (cargo-deny
 # allowlisted) and, with the `simd` feature OFF (we never enable it), the crate is
 # itself `forbid(unsafe_code)` and dependency-free. Both 0.6.1 and the 0.7 line add
 # an extra `IJG` license term that is NOT in our allowlist and would fail
 # `cargo deny`, so we deliberately do not float to them.
-jpeg-encoder = { version = "=0.6.0", default-features = false, features = ["std"] }
+jpeg-encoder = { version = "=0.7.0", default-features = false, features = ["std"] }
 # Native WebRTC (ICE/DTLS/SRTP) stack for the off-by-default `webrtc-native`
 # transport (PRV-1b). str0m is a sans-IO WebRTC library (`MIT OR Apache-2.0`).
 # It is OPTIONAL and only pulled in by the `webrtc-native` feature, so the
@@ -45,7 +45,7 @@ str0m = { version = "0.16.2", default-features = false, features = ["rust-crypto
 tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
 # Decoder used ONLY in tests to prove the bytes we emit are a real, decodable JPEG
 # of the expected geometry and colour — never linked into the shipped crate.
-zune-jpeg = { version = "0.4", default-features = false }
+zune-jpeg = { version = "0.5", default-features = false }
 
 [features]
 "default" = []
