@@ -36,7 +36,7 @@ bindings = ["dep:bindgen"]
 [build-dependencies]
 # Only compiled when the `bindings` feature is on (optional). Pinned to the
 # version already resolved in the workspace lockfile.
-bindgen = { version = "0.70", optional = true }
+bindgen = { version = "0.72", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
