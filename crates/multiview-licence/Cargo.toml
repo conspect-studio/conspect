@@ -36,7 +36,7 @@ chrono = { workspace = true, features = ["serde", "alloc"] }
 # mints keys, it checks signatures handed to it). Default features are disabled
 # and only `alloc` (for the `Signature`/key parsing surface) is enabled; the
 # `rand_core` keygen feature is pulled in dev-dependencies for test keypairs only.
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 # CBOR encode/decode for the local lease lifecycle: the dropped lease/binding
 # file (the directory-watcher reads it) and the `<host>.challenge` export (salted
 # digests + counters only — data minimisation, brief §3/§8). `ciborium` and its
