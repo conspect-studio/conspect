@@ -21,7 +21,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 # apt layer. clang/libclang are mandatory for FFI bindgen; pkg-config is how the
 # FFmpeg-sys crates locate the system libraries.
 # -----------------------------------------------------------------------------
-RUN apt-get update \
+# The base image's deb822 sources enable only `main`; intel-media-va-driver-non-free
+# lives in Debian's `non-free` component, so enable it (idempotent) before update.
+RUN sed -i -E '/^Components:/{/non-free( |$)/!s/$/ non-free/}' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
  && apt-get install -y --no-install-recommends \
       # toolchain / build
       build-essential clang llvm-dev libclang-dev pkg-config nasm yasm \
