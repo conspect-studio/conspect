@@ -4,9 +4,12 @@ name: docker
 # NATIVE runners (no QEMU). Each (variant, arch) leg builds + pushes BY DIGEST; a
 # per-variant `merge` job assembles the manifest, then attests provenance + SBOM
 # (verifying they survived the merge) and signs (keyless cosign, --recursive).
-# FFmpeg is NOT built here — it is pulled from the published base image
-# ghcr.io/aperim/multiview-ffmpeg via the FFMPEG_IMAGE build-arg (see
-# .github/workflows/ffmpeg-base.yml + deploy/Dockerfile.ffmpeg, ADR-0031 §5).
+# FFmpeg is NOT built here — it is pulled from the published base image via the
+# FFMPEG_IMAGE build-arg (see .github/workflows/ffmpeg-base.yml +
+# deploy/Dockerfile.ffmpeg, ADR-0031 §5). The image is resolved per leg by
+# scripts/resolve-ffmpeg-image.sh: this owner's ghcr.io/<owner>/multiview-ffmpeg
+# when the tag is published, else the public upstream
+# ghcr.io/aperim/multiview-ffmpeg (the Dockerfiles' own ARG default).
 #
 # On pull_request we BUILD ONLY (no login/push) so forks/PRs can't publish.
 
@@ -53,14 +56,14 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_image: ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl
+            ffmpeg_tag: 8.1.1-lgpl
             features: "ffmpeg,linux-vaapi,web"
           - variant: generic
             dockerfile: deploy/Dockerfile
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-            ffmpeg_image: ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl
+            ffmpeg_tag: 8.1.1-lgpl
             features: "ffmpeg,linux-vaapi,web"
           # nvidia (CUDA/NVENC) — amd64 ONLY until arm64 CUDA base + nv-codec are validated.
           - variant: nvidia
@@ -68,7 +71,7 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_image: ghcr.io/aperim/multiview-ffmpeg:8.1.1-nvidia
+            ffmpeg_tag: 8.1.1-nvidia
             features: "ffmpeg,nvidia,web"
     runs-on: ${{ matrix.runner }}
     outputs:
@@ -92,6 +95,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve FFmpeg base image
+        # Owner-published base if the tag exists, else the public upstream one.
+        id: ffmpeg
+        run: echo "image=$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${{ matrix.ffmpeg_tag }}")" >> "$GITHUB_OUTPUT"
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7.3.0
@@ -106,7 +114,7 @@ jobs:
           # FFMPEG_IMAGE pulls the published FFmpeg base (COPY --from=ffmpeg);
           # CARGO_FEATURES is threaded identically into chef `cook` and `build`.
           build-args: |
-            FFMPEG_IMAGE=${{ matrix.ffmpeg_image }}
+            FFMPEG_IMAGE=${{ steps.ffmpeg.outputs.image }}
             CARGO_FEATURES=${{ matrix.features }}
           # Registry cache (durable, cross-branch, unbounded) on push; GHA
           # read-only fallback always present for PRs/forks (no GHCR write).

@@ -325,7 +325,7 @@ jobs:
           # is itself pure-Rust — it links NO ffmpeg — but its lint coverage rides
           # the same ffmpeg-equipped leg as the cli for one cohesive webrtc gate.)
           # Guarding the ffmpeg-linked cli surface needs the pinned FFmpeg base
-          # image (ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl, libavcodec .so.62) —
+          # image (ghcr.io/<owner>/multiview-ffmpeg:8.1.1-lgpl, libavcodec .so.62) —
           # that is the dedicated `feature-clippy-ffmpeg-webrtc` job below. The
           # crate leg here already guards the pure-str0m Session/egress API
           # surface that broke.
@@ -447,7 +447,7 @@ jobs:
   # built these features.
   #
   # This leg clippies them against the SAME pinned FFmpeg the deploy images link:
-  # ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl (libavcodec .so.62 — the soname
+  # ghcr.io/<owner>/multiview-ffmpeg:8.1.1-lgpl (libavcodec .so.62 — the soname
   # `ffmpeg-sys-next 8.1.0` binds, NOT ubuntu apt's 6.x/so.60, which would
   # generate the WRONG bindings). That base image is `FROM scratch` (it ships
   # ONLY /opt/multiview-ffmpeg — no shell/apt, so it cannot be a job `container:`),
@@ -470,7 +470,11 @@ jobs:
     env:
       # The pinned, LGPL-clean FFmpeg 8.1.1 base (libavcodec .so.62) — the same
       # image the docker app build COPYs /opt/multiview-ffmpeg from (ADR-0031 §5).
-      FFMPEG_IMAGE: ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl
+      # Only the TAG is fixed here; the extract step resolves the image via
+      # scripts/resolve-ffmpeg-image.sh: this owner's ghcr.io/<owner>/multiview-ffmpeg
+      # (published by ffmpeg-base.yml) when that tag exists, else the public
+      # upstream ghcr.io/aperim/multiview-ffmpeg (before the owner's first publish).
+      FFMPEG_TAG: 8.1.1-lgpl
       # Where we extract /opt/multiview-ffmpeg to on the runner. pkg-config + the
       # dynamic loader are pointed here so ffmpeg-sys-next's build.rs discovers
       # FFmpeg 8.1.1 (detects ffmpeg_8_1 → libavcodec 62) and the link finds .so.62.
@@ -523,6 +527,7 @@ jobs:
         # libav* tree deploy/Dockerfile pulls via `COPY --from=ffmpeg`.
         run: |
           set -euo pipefail
+          FFMPEG_IMAGE="$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${FFMPEG_TAG}")"
           docker pull "${FFMPEG_IMAGE}"
           # `docker create` on a `FROM scratch` image with no CMD/ENTRYPOINT fails
           # with "no command specified"; pass a dummy argv so the create succeeds.

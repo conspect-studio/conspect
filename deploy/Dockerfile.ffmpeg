@@ -12,7 +12,7 @@
 # turns the ~10-min source build into a multi-second `COPY` in every app build,
 # escaping GHA cache's branch-isolation + 10 GB LRU eviction.
 #
-# Flavours (selected by build-args, published as ghcr.io/aperim/multiview-ffmpeg
+# Flavours (selected by build-args, published as ghcr.io/<owner>/multiview-ffmpeg
 # :8.1.1-{lgpl,nvidia,gpl}):
 #   * lgpl   — FF_HWACCEL=vaapi  FF_LICENSE=lgpl  (VAAPI + Intel QSV/libvpl on
 #              amd64; multi-arch; the genuinely LGPL-clean default).

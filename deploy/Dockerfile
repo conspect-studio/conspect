@@ -55,7 +55,9 @@
 
 # FFmpeg base image — the app build COPYs /opt/multiview-ffmpeg from here. Default
 # is the published LGPL flavour so a plain `docker build` works; CI / the box
-# override with `--build-arg FFMPEG_IMAGE=…@sha256:<digest>`.
+# override with `--build-arg FFMPEG_IMAGE=…@sha256:<digest>`. The default stays the public
+# upstream image; docker.yml passes the repo owner's own base once published
+# (scripts/resolve-ffmpeg-image.sh).
 ARG FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl
 
 # -----------------------------------------------------------------------------

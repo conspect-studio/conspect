@@ -41,7 +41,12 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: ghcr.io/aperim/multiview-ffmpeg
+  # Publish under THIS repository owner's namespace — the workflow token can
+  # only write packages it owns. Consumers (ci.yml, docker.yml) resolve
+  # ghcr.io/<owner>/multiview-ffmpeg first and fall back to the public upstream
+  # ghcr.io/aperim/multiview-ffmpeg until the owner's first publish lands
+  # (scripts/resolve-ffmpeg-image.sh).
+  IMAGE: ghcr.io/${{ github.repository_owner }}/multiview-ffmpeg
   # FFmpeg source pin (ADR-0031 FF-0b) — libavcodec .so.62, matching the binding.
   # The SHA-256 + GPG key + nv-codec-headers commit are pinned in
   # deploy/Dockerfile.ffmpeg's ARGs; the build verifies BOTH the GPG signature
