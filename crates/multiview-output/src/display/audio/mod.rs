@@ -44,7 +44,7 @@
 //! PCM live in [`alsa`] behind the off-by-default `display-kms` feature and run
 //! only on hardware (the t630 / Raspberry Pi node legs).
 //!
-//! [ADR-0044]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0044.md
+//! [ADR-0044]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0044.md
 
 pub mod discover;
 pub mod eld;

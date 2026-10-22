@@ -6,7 +6,7 @@
 //! [`Cli::parse_from`] / [`clap::Parser::try_parse_from`] without spawning a
 //! process or touching a network/display.
 //!
-//! [ADR-0045]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0045.md
+//! [ADR-0045]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0045.md
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

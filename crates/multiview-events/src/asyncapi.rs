@@ -90,16 +90,16 @@ fn build_info() -> Value {
         ),
         "license": {
             "name": "Multiview Source-Available Non-Commercial License",
-            "url": "https://github.com/aperim/multiview/blob/main/LICENSE"
+            "url": "https://github.com/conspect-studio/conspect/blob/main/LICENSE"
         },
         "contact": {
             "name": "The Multiview Authors",
-            "url": "https://github.com/aperim/multiview"
+            "url": "https://github.com/conspect-studio/conspect"
         },
         "externalDocs": {
             // AsyncAPI 3.0 requires `format: uri` — an absolute URL, not a repo-relative path.
             "description": "Realtime API reference",
-            "url": "https://github.com/aperim/multiview/blob/main/docs/api/realtime.md"
+            "url": "https://github.com/conspect-studio/conspect/blob/main/docs/api/realtime.md"
         }
     })
 }

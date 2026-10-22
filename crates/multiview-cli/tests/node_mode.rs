@@ -6,7 +6,7 @@
 //! hardware-decode → scanout path and the real `POST /devices/enroll` HTTP are
 //! hardware/network follow-ons (rule 26), deliberately out of this slice.
 //!
-//! [ADR-0045]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0045.md
+//! [ADR-0045]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0045.md
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

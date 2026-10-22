@@ -1077,7 +1077,7 @@ mod tests {
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
         inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, past, None));
-        assert!(inv.snapshot().is_empty());
+        assert_eq!(inv.snapshot().len(), 0);
     }
 
     #[test]
@@ -1095,9 +1095,11 @@ mod tests {
     #[test]
     fn null_browser_finds_nothing() {
         let b = NullBrowser;
-        assert!(b
-            .browse(&default_service_types(None), Duration::from_millis(1))
-            .is_empty());
+        assert_eq!(
+            b.browse(&default_service_types(None), Duration::from_millis(1))
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -1110,9 +1112,11 @@ mod tests {
             1
         );
         // Only Cast requested → the NDI service is not returned.
-        assert!(b
-            .browse(&[CAST_SERVICE_TYPE.to_owned()], Duration::from_millis(1))
-            .is_empty());
+        assert_eq!(
+            b.browse(&[CAST_SERVICE_TYPE.to_owned()], Duration::from_millis(1))
+                .len(),
+            0
+        );
     }
 
     #[test]

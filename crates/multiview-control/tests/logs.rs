@@ -153,7 +153,7 @@ async fn empty_ring_returns_empty_list() {
     let resp = send(&h.router, get("/api/v1/logs", VIEWER_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let arr = body_json(resp).await;
-    assert!(arr.as_array().unwrap().is_empty());
+    assert_eq!(arr.as_array().unwrap().len(), 0);
 }
 
 // ---- SEC-12 (BOLA, ADR-W005/W025/W026): kind-aware log-tail scope filter ----

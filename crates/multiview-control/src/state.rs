@@ -1992,10 +1992,10 @@ areas = ["a"]
         let config = MultiviewConfig::load_from_toml(EMPTY_DOC).expect("parse empty config");
         let seeded = seed_resources(&config).expect("seed resources");
 
-        assert!(seeded.sources.list().expect("list").is_empty());
-        assert!(seeded.outputs.list().expect("list").is_empty());
-        assert!(seeded.overlays.list().expect("list").is_empty());
-        assert!(seeded.probes.list().expect("list").is_empty());
+        assert_eq!(seeded.sources.list().expect("list").len(), 0);
+        assert_eq!(seeded.outputs.list().expect("list").len(), 0);
+        assert_eq!(seeded.overlays.list().expect("list").len(), 0);
+        assert_eq!(seeded.probes.list().expect("list").len(), 0);
         let (audio, _) = seeded.audio.snapshot();
         assert!(
             audio.is_none(),

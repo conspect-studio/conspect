@@ -3,7 +3,7 @@
   "effortLevel": "medium",
   "enableAllProjectMcpServers": true,
   "env": {
-    "OTEL_RESOURCE_ATTRIBUTES": "estate.repo=aperim/multiview"
+    "OTEL_RESOURCE_ATTRIBUTES": "estate.repo=conspect-studio/conspect"
   },
   "permissions": {
     "deny": [

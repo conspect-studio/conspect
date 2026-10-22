@@ -12,7 +12,7 @@
 //! preview consumer can never back-pressure the decode / composite / encode /
 //! mux path. See [`docs/research/preview-subsystem.md`] and ADR-P001..P005.
 //!
-//! [`docs/research/preview-subsystem.md`]: https://github.com/aperim/multiview/blob/main/docs/research/preview-subsystem.md
+//! [`docs/research/preview-subsystem.md`]: https://github.com/conspect-studio/conspect/blob/main/docs/research/preview-subsystem.md
 //!
 //! ## What this crate provides (pure-Rust default build)
 //!

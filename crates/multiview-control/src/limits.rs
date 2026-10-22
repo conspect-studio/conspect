@@ -706,7 +706,10 @@ pub(crate) struct ConcurrencyPermitClaim(pub(crate) Option<OwnedSemaphorePermit>
 impl<St: Send + Sync> FromRequestParts<St> for ConcurrencyPermitClaim {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &St) -> Result<Self, Self::Rejection> {
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &St,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         // Take the permit out of the shared slot, if a `concurrency_cap` layer put one
         // there. A poisoned lock still yields its inner Option (recover, never panic).
         let permit = parts.extensions.get::<CarriedPermit>().and_then(|carried| {
@@ -716,7 +719,7 @@ impl<St: Send + Sync> FromRequestParts<St> for ConcurrencyPermitClaim {
             };
             slot.take()
         });
-        Ok(Self(permit))
+        std::future::ready(Ok(Self(permit)))
     }
 }
 

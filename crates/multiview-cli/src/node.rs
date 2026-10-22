@@ -42,8 +42,8 @@
 //!   `multiview-control` device routes (DEV-B6);
 //! * DRM-master takeover, ALSA PCM open, and the systemd unit (deployment).
 //!
-//! [ADR-0044]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0044.md
-//! [ADR-0045]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0045.md
+//! [ADR-0044]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0044.md
+//! [ADR-0045]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0045.md
 
 use base64::Engine as _;
 use multiview_core::wallclock::WallClockRef;

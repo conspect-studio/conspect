@@ -72,7 +72,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         description = "REST + WebSocket + SSE management API for the Multiview engine.",
         license(
             name = "Multiview Source-Available Non-Commercial License",
-            url = "https://github.com/aperim/multiview/blob/main/LICENSE",
+            url = "https://github.com/conspect-studio/conspect/blob/main/LICENSE",
         ),
     ),
     modifiers(&SecurityAddon),

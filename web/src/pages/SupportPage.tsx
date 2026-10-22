@@ -359,7 +359,7 @@ function CommunitySupport({ sla }: { readonly sla: string }): JSX.Element {
           </li>
           <li>
             <a
-              href="https://github.com/aperim/multiview/discussions"
+              href="https://github.com/conspect-studio/conspect/discussions"
               className="underline underline-offset-2"
               rel="noreferrer"
             >

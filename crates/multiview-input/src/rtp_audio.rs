@@ -26,9 +26,9 @@
 //! store rides silence-fill ([`crate::rtp_audio`] never manufactures a fill
 //! block; [`multiview_audio::store::AudioStore::read`] is gap-free).
 //!
-//! [ADR-T013]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-T013.md
-//! [ADR-T014]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-T014.md
-//! [ADR-0033]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0033.md
+//! [ADR-T013]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-T013.md
+//! [ADR-T014]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-T014.md
+//! [ADR-0033]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0033.md
 
 use multiview_core::time::{rescale, Rational};
 
@@ -43,7 +43,7 @@ const RTP_HALF_MODULUS: i64 = 1_i64 << 31;
 /// ~10 s at the canonical 48 kHz store rate — the frame-space equivalent of
 /// [ADR-T003]'s ~10 s `PtsNormalizer` guard.
 ///
-/// [ADR-T003]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-T013.md
+/// [ADR-T003]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-T013.md
 const DEFAULT_DISCONTINUITY_FRAMES: i64 = 480_000;
 
 /// The result of mapping one RTP-audio packet onto the store timeline.

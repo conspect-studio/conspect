@@ -478,7 +478,7 @@ multiview-cli v0.1.0 (/w/crates/multiview-cli)|default,ffmpeg,full,software
 multiview-control v0.1.0 (/w/crates/multiview-control)|cast,default,devices-net,openapi
 arc-swap v1.9.2|
 hybrid-array v0.4.12| (*)";
-        assert!(find_seam_activations(tree).is_empty());
+        assert_eq!(find_seam_activations(tree).len(), 0);
     }
 
     #[test]
@@ -573,7 +573,7 @@ beta v0.1.0 (/w/beta)|_test-seams,default (*)";
             .iter()
             .find(|o| o.spec == "nvidia")
             .expect("nvidia outcome present");
-        assert!(nvidia.violations.is_empty());
+        assert_eq!(nvidia.violations.len(), 0);
     }
 
     #[test]
@@ -687,7 +687,7 @@ beta v0.1.0 (/w/beta)|_test-seams,default (*)";
         // `linux-vaapi,ffmpeg` (reordered) is covered by `ffmpeg,linux-vaapi`.
         let derived = vec!["linux-vaapi,ffmpeg".to_owned(), "ffmpeg,apple".to_owned()];
         let covered = ["ffmpeg,linux-vaapi", "ffmpeg,apple", "full"];
-        assert!(uncovered_specs(&derived, &covered).is_empty());
+        assert_eq!(uncovered_specs(&derived, &covered).len(), 0);
     }
 
     #[test]

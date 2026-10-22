@@ -22,8 +22,8 @@ best available backend at runtime.
 
 ```bash
 # 1. Clone
-git clone https://github.com/aperim/multiview.git
-cd multiview
+git clone https://github.com/conspect-studio/conspect.git
+cd conspect
 
 # 2. Default build — pure Rust, no native deps, LGPL-clean, no GPU/FFmpeg/NDI
 cargo build --release

@@ -66,7 +66,7 @@ async fn viewer_reads_the_default_capability_surface() {
 
     let body = body_json(resp).await;
     let backends = body["backends"].as_array().expect("backends array");
-    assert!(!backends.is_empty());
+    assert_ne!(backends.len(), 0);
     // The software path is always available (the universal fallback).
     assert!(backends
         .iter()

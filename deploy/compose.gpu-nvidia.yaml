@@ -11,7 +11,7 @@
 services:
   multiview:
     # The CUDA-enabled image (NVDEC/NVENC + wgpu), built from Dockerfile.nvidia.
-    image: ghcr.io/aperim/multiview:latest-nvidia
+    image: ghcr.io/conspect-studio/conspect:latest-nvidia
     # Modern path: CDI device request (Docker >= 25 / Compose v2.21+).
     devices:
       - "nvidia.com/gpu=all"

@@ -199,10 +199,13 @@ mod tests {
     fn router_routes_nothing_below_every_threshold() {
         let router =
             SeverityRouter::new().with_rule(PerceivedSeverity::Major, webhook("https://page"));
-        assert!(router.route(&record(PerceivedSeverity::Warning)).is_empty());
+        assert_eq!(router.route(&record(PerceivedSeverity::Warning)).len(), 0);
         // An empty router routes nothing regardless of severity.
-        assert!(SeverityRouter::new()
-            .route(&record(PerceivedSeverity::Critical))
-            .is_empty());
+        assert_eq!(
+            SeverityRouter::new()
+                .route(&record(PerceivedSeverity::Critical))
+                .len(),
+            0
+        );
     }
 }

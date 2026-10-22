@@ -368,6 +368,9 @@ mod discovery_scope_tests {
     #[test]
     fn empty_domain_allowlist_sees_nothing() {
         let rows = vec![row(Some("site-a")), row(None)];
-        assert!(visible_discovery_rows(&principal(Some(vec![])), rows).is_empty());
+        assert_eq!(
+            visible_discovery_rows(&principal(Some(vec![])), rows).len(),
+            0
+        );
     }
 }

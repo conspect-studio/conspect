@@ -143,7 +143,7 @@ Additional rules for this project:
 
 ---
 
-[Unreleased]: https://github.com/aperim/multiview/compare/HEAD
+[Unreleased]: https://github.com/conspect-studio/conspect/compare/HEAD
 
 <!-- Architecture & docs -->
 [conventions]: docs/architecture/conventions.md

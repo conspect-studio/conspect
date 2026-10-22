@@ -168,10 +168,7 @@ mod tests {
         assert_eq!(store.list(&WarningFilter::active_only()).unwrap().len(), 1);
         // Clearing the same code (active=false) removes it from the active list.
         store.upsert(warning(false)).unwrap();
-        assert!(store
-            .list(&WarningFilter::active_only())
-            .unwrap()
-            .is_empty());
+        assert_eq!(store.list(&WarningFilter::active_only()).unwrap().len(), 0);
         // ...but it is still in the store (both).
         assert_eq!(store.list(&WarningFilter::default()).unwrap().len(), 1);
     }
@@ -179,9 +176,6 @@ mod tests {
     #[test]
     fn empty_store_lists_nothing() {
         let store = InMemoryWarningStore::new();
-        assert!(store
-            .list(&WarningFilter::active_only())
-            .unwrap()
-            .is_empty());
+        assert_eq!(store.list(&WarningFilter::active_only()).unwrap().len(), 0);
     }
 }

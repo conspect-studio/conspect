@@ -8,7 +8,7 @@
 //!
 //! Run with: `cargo run -p multiview-webrtc --features native --example whip_publish`
 //!
-//! [ADR-0049]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0049.md
+//! [ADR-0049]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0049.md
 // An example is runnable documentation; printing the SDP it builds to stdout is
 // the whole point, so the workspace `print_stdout` deny is relaxed here.
 #![allow(clippy::print_stdout)]

@@ -743,24 +743,34 @@ fn adopt_layout_from_body(model: &crate::boot_model::BootModel, body: &serde_jso
 impl axum::extract::FromRequestParts<AppState> for Principal {
     type Rejection = ControlError;
 
-    async fn from_request_parts(
+    fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        // Auth disabled (explicit trusted-network mode): every request is a local
-        // admin, no credential required.
-        if state.auth_disabled {
-            return Ok(Principal::local_admin());
-        }
-        let header = header_value(&parts.headers, header::AUTHORIZATION);
-        // Primary: native API key. If that fails and a JWT validator is
-        // configured, fall back to OAuth2/JWT (the alternative authn path).
-        match state.api_keys.verify_authorization(header.as_deref()) {
-            Ok(principal) => Ok(principal),
-            Err(api_key_err) => state
-                .authenticate_jwt(header.as_deref())
-                .ok_or(api_key_err)?,
-        }
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        // Authentication is synchronous (no I/O), so resolve it now and hand
+        // axum an already-ready future.
+        std::future::ready(authenticate_principal(parts, state))
+    }
+}
+
+/// Resolve the request's [`Principal`] from its headers (synchronous).
+fn authenticate_principal(
+    parts: &axum::http::request::Parts,
+    state: &AppState,
+) -> Result<Principal, ControlError> {
+    // Auth disabled (explicit trusted-network mode): every request is a local
+    // admin, no credential required.
+    if state.auth_disabled {
+        return Ok(Principal::local_admin());
+    }
+    let header = header_value(&parts.headers, header::AUTHORIZATION);
+    // Primary: native API key. If that fails and a JWT validator is
+    // configured, fall back to OAuth2/JWT (the alternative authn path).
+    match state.api_keys.verify_authorization(header.as_deref()) {
+        Ok(principal) => Ok(principal),
+        Err(api_key_err) => state
+            .authenticate_jwt(header.as_deref())
+            .ok_or(api_key_err)?,
     }
 }
 

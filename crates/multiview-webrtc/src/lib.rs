@@ -28,10 +28,10 @@
 //! peer (UDP send is non-blocking; a full ring drops oldest). A wedged or
 //! saturated endpoint loses *preview/ingest media*, never output ticks.
 //!
-//! [ADR-0048]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0048.md
-//! [ADR-0049]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0049.md
-//! [ADR-T014]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-T014.md
-//! [ADR-P006]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-P006.md
+//! [ADR-0048]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0048.md
+//! [ADR-0049]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0049.md
+//! [ADR-T014]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-T014.md
+//! [ADR-P006]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-P006.md
 #![warn(missing_docs)]
 
 pub mod config;

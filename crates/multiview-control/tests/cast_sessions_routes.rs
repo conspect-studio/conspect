@@ -140,7 +140,7 @@ async fn start_list_get_stop_round_trips() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let resp = send(&h.router, get("/api/v1/cast/sessions", VIEWER_TOKEN)).await;
     let list = body_json(resp).await;
-    assert!(list.as_array().expect("an array").is_empty());
+    assert_eq!(list.as_array().expect("an array").len(), 0);
     let resp = send(
         &h.router,
         get(&format!("/api/v1/cast/sessions/{id}"), VIEWER_TOKEN),
@@ -427,7 +427,7 @@ async fn save_promotes_the_session_to_a_cast_device() {
     // The ephemeral session is gone.
     let resp = send(&h.router, get("/api/v1/cast/sessions", OPERATOR_TOKEN)).await;
     let list = body_json(resp).await;
-    assert!(list.as_array().expect("an array").is_empty());
+    assert_eq!(list.as_array().expect("an array").len(), 0);
 
     // Saving the same id again conflicts (the device exists).
     let resp = send(

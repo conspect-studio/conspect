@@ -198,10 +198,13 @@ mod tests {
         }));
 
         assert_eq!(ingest_step(&mut sub, &store).await, IngestStep::Skipped);
-        assert!(store
-            .list(&crate::alarm_store::AlarmFilter::default())
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store
+                .list(&crate::alarm_store::AlarmFilter::default())
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]

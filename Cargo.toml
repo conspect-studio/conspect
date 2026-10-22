@@ -13,7 +13,7 @@ edition = "2021"
 # `channel = "stable"` (floating), so this is a declaration/reality alignment.
 rust-version = "1.85"
 license-file = "LICENSE"
-repository = "https://github.com/aperim/multiview"
+repository = "https://github.com/conspect-studio/conspect"
 authors = ["The Multiview Authors"]
 
 [workspace.dependencies]

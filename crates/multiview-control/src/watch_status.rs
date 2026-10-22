@@ -143,7 +143,7 @@ mod tests {
         assert!(snap.path.is_none());
         assert_eq!(snap.applied_count, 0);
         assert!(snap.last_applied.is_none() && snap.last_rejected.is_none());
-        assert!(snap.restart_pending.is_empty());
+        assert_eq!(snap.restart_pending.len(), 0);
     }
 
     #[test]

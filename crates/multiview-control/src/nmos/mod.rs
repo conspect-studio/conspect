@@ -493,7 +493,7 @@ mod tests {
     fn registry_seeds_an_empty_connection_for_each_receiver() {
         let reg = seeded();
         let conn = reg.connection("rcv-1").expect("receiver connection exists");
-        assert!(conn.active.is_empty());
+        assert_eq!(conn.active.len(), 0);
         assert!(conn.staged.is_none());
     }
 

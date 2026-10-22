@@ -24,7 +24,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }} # aperim/multiview
+  IMAGE_NAME: ${{ github.repository }} # conspect-studio/conspect
 
 permissions:
   contents: read

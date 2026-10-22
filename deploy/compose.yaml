@@ -64,7 +64,7 @@ services:
       start_period: 10s
 
   multiview:
-    image: ghcr.io/aperim/multiview:latest
+    image: ghcr.io/conspect-studio/conspect:latest
     restart: unless-stopped
     depends_on:
       testsrc:

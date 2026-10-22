@@ -2213,16 +2213,16 @@
   "info": {
     "contact": {
       "name": "The Multiview Authors",
-      "url": "https://github.com/aperim/multiview"
+      "url": "https://github.com/conspect-studio/conspect"
     },
     "description": "WebSocket and SSE realtime event stream for the Multiview engine. Every message uses a single versioned envelope (ADR-RT002). Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, layout, config, logs, jobs, preview, system, capabilities, devices, switcher. The WebSocket endpoint (/api/v1/ws) is bidirectional (events + subscription control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
     "externalDocs": {
       "description": "Realtime API reference",
-      "url": "https://github.com/aperim/multiview/blob/main/docs/api/realtime.md"
+      "url": "https://github.com/conspect-studio/conspect/blob/main/docs/api/realtime.md"
     },
     "license": {
       "name": "Multiview Source-Available Non-Commercial License",
-      "url": "https://github.com/aperim/multiview/blob/main/LICENSE"
+      "url": "https://github.com/conspect-studio/conspect/blob/main/LICENSE"
     },
     "title": "Multiview Realtime API",
     "version": "1.0.0"

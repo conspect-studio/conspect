@@ -1133,14 +1133,17 @@ impl ScriptedChannel {
 }
 
 impl CastChannel for ScriptedChannel {
-    async fn send(&mut self, frame: CastFrame) -> Result<(), CastChannelError> {
+    fn send(
+        &mut self,
+        frame: CastFrame,
+    ) -> impl Future<Output = Result<(), CastChannelError>> + Send {
         match self.sent.lock() {
             Ok(mut sent) => sent.push(frame),
             // A test that panicked while holding the log lock is already
             // failing; keep the channel usable rather than cascade.
             Err(poisoned) => poisoned.into_inner().push(frame),
         }
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn recv(&mut self) -> Result<CastFrame, CastChannelError> {
@@ -1186,13 +1189,16 @@ impl ScriptedConnector {
 impl CastConnector for ScriptedConnector {
     type Channel = ScriptedChannel;
 
-    async fn connect(&self, _authority: &str) -> Result<ScriptedChannel, CastChannelError> {
+    fn connect(
+        &self,
+        _authority: &str,
+    ) -> impl Future<Output = Result<ScriptedChannel, CastChannelError>> + Send {
         self.connects
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let next = match self.channels.lock() {
             Ok(mut channels) => channels.pop_front(),
             Err(poisoned) => poisoned.into_inner().pop_front(),
         };
-        next.ok_or_else(|| CastChannelError::new("scripted connect refused"))
+        std::future::ready(next.ok_or_else(|| CastChannelError::new("scripted connect refused")))
     }
 }

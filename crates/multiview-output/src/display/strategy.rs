@@ -24,7 +24,7 @@
 //! selector chooses *only* when their preconditions are proven by the runtime
 //! probe — never assumed from a static vendor table.
 //!
-//! [ADR-0044]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0044.md
+//! [ADR-0044]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0044.md
 
 /// `DRM_FORMAT_MOD_LINEAR` — untiled, the default framebuffer layout.
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;

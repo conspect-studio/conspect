@@ -729,7 +729,7 @@ mod tests {
         // The whole `auth` subtree (a secret-bearing key) is gone.
         assert!(out.get("auth").is_none());
         // Every removal is listed, and none of the redaction PATHS leak a value.
-        assert!(!redactions.is_empty());
+        assert_ne!(redactions.len(), 0);
         assert!(redactions
             .iter()
             .any(|r| r.reason == RedactionReason::Secret));
