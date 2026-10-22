@@ -25,9 +25,9 @@
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SrtError {
-    /// A passphrase was outside SRT's valid length (10..=79 characters) while
+    /// A passphrase was outside SRT's valid length (10..=80 characters) while
     /// encryption was requested.
-    #[error("srt passphrase length {0} is outside the valid range 10..=79")]
+    #[error("srt passphrase length {0} is outside the valid range 10..=80")]
     PassphraseLength(usize),
 
     /// Encryption (a non-zero key length) was requested without a passphrase, or
@@ -179,7 +179,15 @@ pub struct SrtConfig {
     pub passphrase: Option<String>,
     /// The SRT Access Control stream id, if any.
     pub stream_id: Option<StreamId>,
-    /// The receive latency in milliseconds (SRT `latency`/`rcvlatency`).
+    /// The receive latency in **milliseconds** (libsrt's native
+    /// `SRTO_RCVLATENCY` unit; SRT `latency`/`rcvlatency`).
+    ///
+    /// **Unit boundary (verified defect, ADR-0039 §3):** libsrt's native API
+    /// takes milliseconds, but `FFmpeg`'s `libsrt` `AVOption` `latency=` takes
+    /// **microseconds** (`latency=200000` ⇒ 200 ms). [`SrtConfig::to_url`]
+    /// therefore emits the raw millisecond value today; the `×1000` conversion
+    /// belongs at the Tier-0 `FFmpeg` boundary (SRT-2 wiring), never here — the
+    /// model stays in exact milliseconds, never float (invariant #3).
     pub latency_ms: u32,
 }
 
@@ -224,8 +232,14 @@ impl SrtConfig {
                 ))
             }
             (true, Some(pp)) => {
-                // SRT mandates 10..=79 character passphrases.
-                if pp.len() < 10 || pp.len() > 79 {
+                // libsrt accepts 10..=80 characters (`HAICRYPT_SECRET_MAX_SZ = 80`);
+                // Haivision's product docs say 79, which the old bound here copied.
+                // The FFmpeg wrapper inherits the 79 cap, so an 80-character
+                // passphrase is valid at this model layer but a Tier-0 (FFmpeg)
+                // backend rejects it at connect time; the wiring that resolves a
+                // backend must therefore warn (never error) on the 80-character
+                // case (ADR-0039 §5).
+                if pp.len() < 10 || pp.len() > 80 {
                     return Err(SrtError::PassphraseLength(pp.len()));
                 }
             }
@@ -240,6 +254,13 @@ impl SrtConfig {
     /// `pbkeylen`, `passphrase`, `streamid`). The passphrase is included verbatim
     /// because the libav demuxer requires it; callers wishing to keep it out of
     /// logs should use [`SrtConfig::to_url_redacted`].
+    ///
+    /// **Latency units:** the emitted `latency=` value is the raw
+    /// [`latency_ms`](SrtConfig::latency_ms) millisecond figure, but `FFmpeg`'s
+    /// `libsrt` `AVOption` is in **microseconds** — the caller that hands this
+    /// URL to libav must multiply by `1000` at that boundary (ADR-0039 §3). The
+    /// conversion is deliberately not applied here so the pure model keeps
+    /// libsrt's native millisecond unit; it is fixed as part of the SRT-2 wiring.
     ///
     /// # Errors
     ///

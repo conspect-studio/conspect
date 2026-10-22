@@ -220,6 +220,7 @@ fn srt_with(meta: OutputMetadata) -> Output {
         audio: None,
         metadata: Some(meta),
         orientation: None,
+        srt: None,
     }
 }
 
@@ -417,6 +418,7 @@ fn tag_mode_rejected_on_mpegts_transport() {
             OrientationMode::Tag,
             OutputFlip::None,
         )),
+        srt: None,
     };
     let err = srt.validate().expect_err("tag on TS is rejected");
     assert!(format!("{err}").contains("tag"), "names the mode");

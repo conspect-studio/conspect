@@ -8155,7 +8155,7 @@ fn ingest_plan_for(
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url }
         | SourceKind::Ts { url }
-        | SourceKind::Srt { url }
+        | SourceKind::Srt { url, .. }
         | SourceKind::Rtmp { url } => (SourceLocation::Url(url.clone()), true),
         // RIST ingest (ADR-0095): the open-standard sibling of SRT. The typed
         // options lower to the `rist://…?…` AVIO URL (PSK resolved from its
@@ -8515,7 +8515,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url }
         | SourceKind::Ts { url }
-        | SourceKind::Srt { url }
+        | SourceKind::Srt { url, .. }
         | SourceKind::Rtmp { url } => (url.clone(), true),
         // RIST audio is decoded from the SAME lowered `rist://` URL as its video
         // (the audio peer opens its own libav context). A lowering error (bonding

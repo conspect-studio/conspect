@@ -216,7 +216,13 @@ fn srt_passphrase_boundary_accepts_80_and_rejects_81() {
     // libsrt enforces `10..=80` inclusive (`HAICRYPT_SECRET_MAX_SZ = 80`); the
     // old `10..=79` bound was a verified off-by-one (ADR-0039). 79 and 80 are
     // both valid; 9 and 81 are both rejected.
-    for (len, valid) in [(9usize, false), (10, true), (79, true), (80, true), (81, false)] {
+    for (len, valid) in [
+        (9usize, false),
+        (10, true),
+        (79, true),
+        (80, true),
+        (81, false),
+    ] {
         match (valid, encrypted_with_passphrase_len(len).validate()) {
             (true, Ok(())) => {}
             (false, Err(SrtError::PassphraseLength(reported))) => assert_eq!(reported, len),

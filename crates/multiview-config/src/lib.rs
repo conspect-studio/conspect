@@ -93,7 +93,7 @@ pub use schema::{
     OrientationMechanism, OrientationMode, OrientationTagCapability, Output, OutputFlip,
     OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata, Overlay, Rect,
     RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
-    SourceAuth, SourceKind,
+    SourceAuth, SourceKind, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -1518,6 +1518,10 @@ impl Source {
                     validate_rist_options(&self.id, opts)?;
                 }
             }
+            // SRT (ADR-0039): the typed options validate structurally here —
+            // stream-id 512-byte cap + passphrase-reference consistency; the
+            // URL's reachability is a runtime concern.
+            SourceKind::Srt { srt: Some(opts), .. } => validate_srt_options(&self.id, opts)?,
             // Network/synthetic kinds carry no kind-specific field that can be
             // validated structurally here (a URL's reachability is a runtime
             // concern, not a config one). The `youtube` URL is resolved at
@@ -1528,7 +1532,7 @@ impl Source {
             | SourceKind::Hls { .. }
             | SourceKind::Youtube { .. }
             | SourceKind::Ts { .. }
-            | SourceKind::Srt { .. }
+            | SourceKind::Srt { srt: None, .. }
             | SourceKind::Rtmp { .. }
             | SourceKind::Ndi { .. }
             | SourceKind::File { .. }
@@ -1637,6 +1641,14 @@ impl Output {
         } = self
         {
             validate_rist_options(&self.label(), opts)?;
+        }
+        // SRT push options (stream-id cap + passphrase-reference consistency) are
+        // validated by the same shared helper the `srt` source uses (ADR-0039 §2).
+        if let Output::Srt {
+            srt: Some(opts), ..
+        } = self
+        {
+            validate_srt_options(&self.label(), opts)?;
         }
         // Per-output metadata (ADR-0088): reject contradictions only
         // (service_id range, ISO-639-2 language). An unsupported-but-harmless
@@ -1780,6 +1792,45 @@ fn validate_rist_options(
             return Err(ConfigError::Validation(format!(
                 "rist {owner:?}: encryption is configured but secret_ref is empty (the PSK is a \
                  secret-manager reference, e.g. `op://…` or `env:VAR`; it is never a plaintext key)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a [`crate::schema::SrtOptions`] block (shared by the `srt` source and
+/// the `srt` push output).
+///
+/// Admission-time structural checks only — never the data plane (ADR-0039 §2):
+/// - the stream id is capped at SRT's 512-byte protocol limit;
+/// - an `encryption` block must name a real cipher (`key_length != none`) and
+///   carry a non-empty `passphrase_ref` — the passphrase is a secret-manager
+///   reference, never a plaintext key in config (ADR-0039 §5).
+///
+/// Latency is carried as exact milliseconds; the `FFmpeg` `×1000` µs conversion is
+/// the SRT-2 wiring boundary, not a config concern.
+fn validate_srt_options(owner: &str, opts: &crate::schema::SrtOptions) -> Result<(), ConfigError> {
+    if let Some(stream_id) = &opts.stream_id {
+        let max = crate::schema::SrtOptions::STREAM_ID_MAX_BYTES;
+        if stream_id.len() > max {
+            return Err(ConfigError::Validation(format!(
+                "srt {owner:?}: stream_id is {} bytes, exceeding SRT's {max}-byte limit",
+                stream_id.len()
+            )));
+        }
+    }
+    if let Some(enc) = &opts.encryption {
+        if enc.key_length == crate::schema::SrtKeyLength::None {
+            return Err(ConfigError::Validation(format!(
+                "srt {owner:?}: encryption is configured with key_length = \"none\" — omit the \
+                 `encryption` block for an unencrypted link"
+            )));
+        }
+        if enc.passphrase_ref.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "srt {owner:?}: encryption is configured but passphrase_ref is empty (the \
+                 passphrase is a secret-manager reference, e.g. `op://…` or `env:VAR`; it is \
+                 never a plaintext key)"
             )));
         }
     }

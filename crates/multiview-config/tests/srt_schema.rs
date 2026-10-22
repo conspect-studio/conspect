@@ -23,7 +23,7 @@
 )]
 
 use multiview_config::{
-    Output, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions, Source, SourceKind,
+    Output, Source, SourceKind, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 use proptest::prelude::*;
 
@@ -31,7 +31,8 @@ use proptest::prelude::*;
 const LEGACY_SOURCE_JSON: &str = r#"{"id":"srt_legacy","kind":"srt","url":"srt://[::1]:9000"}"#;
 
 /// The same document in canonical TOML.
-const LEGACY_SOURCE_TOML: &str = "id = \"srt_legacy\"\nkind = \"srt\"\nurl = \"srt://[::1]:9000\"\n";
+const LEGACY_SOURCE_TOML: &str =
+    "id = \"srt_legacy\"\nkind = \"srt\"\nurl = \"srt://[::1]:9000\"\n";
 
 /// A minimal legacy SRT push output (no `srt` block) in canonical JSON.
 const LEGACY_OUTPUT_JSON: &str =
@@ -177,9 +178,15 @@ fn srt_passphrase_is_reference_never_plaintext() {
         "[srt.encryption]\nkey_length = \"aes128\"\npassphrase_ref = \"env:SRT_PASSPHRASE\"\n",
     );
     let json = serde_json::to_string(&src).expect("serialize");
-    assert!(json.contains("env:SRT_PASSPHRASE"), "the secret_ref is carried");
+    assert!(
+        json.contains("env:SRT_PASSPHRASE"),
+        "the secret_ref is carried"
+    );
     // There is no plaintext `passphrase`/`secret`/`key` field on the model.
-    assert!(!json.contains("\"passphrase\""), "no plaintext passphrase field");
+    assert!(
+        !json.contains("\"passphrase\""),
+        "no plaintext passphrase field"
+    );
     assert!(!json.contains("\"secret\""));
     assert!(!json.contains("\"key\""));
 }
@@ -296,16 +303,22 @@ fn srt_mode_tokens_are_the_libav_mode_tokens() {
 fn srt_stream_id_at_the_512_byte_cap_accepted() {
     let id = "x".repeat(SrtOptions::STREAM_ID_MAX_BYTES);
     let src = srt_source_with_block(&format!("stream_id = {id:?}\n"));
-    src.validate().expect("a stream id exactly at the cap is valid");
+    src.validate()
+        .expect("a stream id exactly at the cap is valid");
 }
 
 #[test]
 fn srt_stream_id_over_the_512_byte_cap_rejected() {
     let id = "x".repeat(SrtOptions::STREAM_ID_MAX_BYTES + 1);
     let src = srt_source_with_block(&format!("stream_id = {id:?}\n"));
-    let err = src.validate().expect_err("a stream id over the cap is rejected");
+    let err = src
+        .validate()
+        .expect_err("a stream id over the cap is rejected");
     let msg = format!("{err}");
-    assert!(msg.contains("512"), "the error names the 512-byte cap: {msg}");
+    assert!(
+        msg.contains("512"),
+        "the error names the 512-byte cap: {msg}"
+    );
 }
 
 #[test]
@@ -315,12 +328,16 @@ fn srt_output_stream_id_over_the_cap_rejected() {
         "kind = \"srt\"\nurl = \"srt://[::1]:9000\"\ncodec = \"h264\"\n\n[srt]\nstream_id = {id:?}\n"
     );
     let out: Output = toml::from_str(&toml_str).expect("parse");
-    assert!(out.validate().is_err(), "the push sink enforces the same cap");
+    assert!(
+        out.validate().is_err(),
+        "the push sink enforces the same cap"
+    );
 }
 
 #[test]
 fn srt_encryption_requires_passphrase_ref() {
-    let src = srt_source_with_block("[srt.encryption]\nkey_length = \"aes128\"\npassphrase_ref = \"\"\n");
+    let src =
+        srt_source_with_block("[srt.encryption]\nkey_length = \"aes128\"\npassphrase_ref = \"\"\n");
     let err = src
         .validate()
         .expect_err("encryption with an empty passphrase_ref is inconsistent");
@@ -342,7 +359,10 @@ fn srt_encryption_rejects_key_length_none() {
         .validate()
         .expect_err("key_length = none inside encryption is contradictory");
     let msg = format!("{err}");
-    assert!(msg.contains("key_length"), "the error names the field: {msg}");
+    assert!(
+        msg.contains("key_length"),
+        "the error names the field: {msg}"
+    );
 }
 
 #[test]
@@ -351,7 +371,8 @@ fn srt_valid_options_validate_ok() {
         "mode = \"listener\"\nlatency_ms = 200\nstream_id = \"#!::r=live/feed,m=publish\"\n\n\
          [srt.encryption]\nkey_length = \"aes256\"\npassphrase_ref = \"env:SRT_PASSPHRASE\"\n",
     );
-    src.validate().expect("a fully populated SRT source validates");
+    src.validate()
+        .expect("a fully populated SRT source validates");
 }
 
 // ---------------------------------------------------------------------------
