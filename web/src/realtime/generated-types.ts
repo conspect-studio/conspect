@@ -29,6 +29,32 @@ export interface Alert {
 /** Severity of an operator alert. */
 export type AlertSeverity = "info" | "warning" | "critical";
 
+/** Data body of the `audio.loudness` event: a program-bus EBU R128 loudness sample (M/S/I LUFS, LRA, true-peak dBTP) plus the compliance reference. Numeric metadata only — never audio content. Conflated/sampled at ~10 Hz on the wire (high-rate lane); ballistics are applied client-side. The integrating fields are absent below the -70 LUFS absolute gate (no fabricated value). */
+export interface AudioLoudness {
+  /** True-peak ceiling, dBTP (compliance reference, e.g. -1.5). */
+  readonly ceiling_dbtp: number;
+  /** Makeup gain the loudnorm processor is applying, dB. Absent when no normaliser is engaged. */
+  readonly gain_db?: number;
+  /** Integrated (gated) loudness, LUFS. Absent until enough gated audio. */
+  readonly integrated?: number;
+  /** Loudness range (EBU Tech 3342), LU. Absent until enough gated audio. */
+  readonly lra?: number;
+  /** Momentary loudness (400 ms window), LUFS. Absent below the absolute gate. */
+  readonly momentary?: number;
+  /** Program/bus index this loudness sample is for. */
+  readonly program: number;
+  /** Effective wire cadence (Hz). */
+  readonly sampled_hz: number;
+  /** Short-term loudness (3 s window), LUFS. Absent below the absolute gate. */
+  readonly short_term?: number;
+  /** Normalisation target loudness, LUFS (compliance reference, e.g. -23 / -16). */
+  readonly target_lufs: number;
+  /** Live convergence tolerance, LU (the in-spec band is target ± tolerance). */
+  readonly tolerance_lu: number;
+  /** Maximum true-peak across channels (4x oversampled), dBTP. Absent when disabled. */
+  readonly true_peak_dbtp?: number;
+}
+
 /** Data body of the `audio.meter` event: a high-rate per-input/track peak/RMS/clip sample. This is numeric metadata only — never audio content. Conflated/sampled at 10–30 Hz on the wire (high-rate lane). */
 export interface AudioMeter {
   /** Whether any channel clipped in this window. */
@@ -43,6 +69,24 @@ export interface AudioMeter {
   readonly sampled_hz: number;
   /** Track index. */
   readonly track: number;
+}
+
+/** Data body of `cast.session.removed`: an ephemeral cast session was removed — stopped (the receiver STOP that clears the TV) or promoted to a saved device (playback continues under the promoted device id). */
+export interface CastSessionRemoved {
+  /** The runtime session id that was removed. */
+  readonly session_id: string;
+}
+
+/** Data body of `cast.session.started`: an ephemeral cast session was started (session-list membership changed). The session's live state rides the conflated `device.status` lane keyed by the same session id. */
+export interface CastSessionStarted {
+  /** The device authority dialled (`host[:port]`, IPv6 bracketed). */
+  readonly address: string;
+  /** The operator-facing name, if given. */
+  readonly name?: string;
+  /** The output id whose HLS rendition the session casts. */
+  readonly output: string;
+  /** The runtime session id (`cast-session-…`, UUID-fresh per start). */
+  readonly session_id: string;
 }
 
 /** Data body of `device.adopted`: a device was adopted into the registry. */
@@ -76,6 +120,8 @@ export interface DeviceCapabilities {
 export interface DeviceDiscovered {
   /** The management endpoint (URL/host; IPv6 literals bracketed). */
   readonly address: string;
+  /** The discovery domain the observing node stamped on this row (ADR-W026), sourced solely from that node's operator-declared `[discovery] domain` config — never from the responder payload or TXT records. Absent when the observing node declared no domain; a discovery-scoped principal is then denied the row (fail-closed). */
+  readonly domain?: string;
   /** The candidate driver that recognised the device. */
   readonly driver: string;
   /** Address family — IPv6-first; IPv4 results are labelled legacy. */
@@ -242,6 +288,8 @@ export type ImpactClass = "cp" | "c1" | "c2" | "dev";
 export interface InputConnection {
   /** Reconnect attempt counter, if reconnecting. */
   readonly attempt?: number;
+  /** The owning input's id (the configured source id) — the object axis this lifecycle event is authorized under (ADR-W026). */
+  readonly input_id: string;
   readonly state: LifecycleState;
 }
 
@@ -283,6 +331,43 @@ export type LagAction = "conflated" | "resnapshot";
 /** Tile/input lifecycle state (invariant #2: Live → Stale → Reconnecting → NoSignal). */
 export type LifecycleState = "LIVE" | "STALE" | "RECONNECTING" | "NO_SIGNAL";
 
+/** Data body of `media.player_state` (ADR-RT008): a media player's discrete transport-state transition, envelope `id` = player id. LOSSLESS — kept in the replay ring, never conflated. `position_frames` is the playhead in integer frames at the output cadence (never a float; clients interpolate between events). */
+export interface MediaPlayerEvent {
+  /** The asset currently loaded in the player, if any. */
+  readonly asset?: string;
+  /** Stable media-player id (matches the envelope `id`). */
+  readonly player: string;
+  /** Playhead position at the transition, in integer frames at the output cadence. */
+  readonly position_frames: number;
+  readonly state: MediaPlayerState;
+}
+
+/** A media player's discrete transport state (tagged by `kind`, never untagged). The `vamping` variant carries `exit_armed`: when set, the current vamp lap finishes then the player exits cleanly at the boundary. `#[non_exhaustive]`: a client must treat an unknown kind as forward-compatible, not an error. */
+export type MediaPlayerState =
+  | {
+  readonly kind: "loading";
+}
+  | {
+  readonly kind: "cued";
+}
+  | {
+  readonly kind: "playing";
+}
+  | {
+  readonly kind: "paused";
+}
+  | {
+  readonly kind: "stopped";
+}
+  | {
+  /** Whether a clean exit is armed: finish the current lap, then leave the vamp at the boundary. */
+  readonly exit_armed: boolean;
+  readonly kind: "vamping";
+}
+  | {
+  readonly kind: "eof";
+};
+
 /** Running state of an output sink. */
 export type OutputRunState = "starting" | "running" | "migrating" | "error";
 
@@ -318,8 +403,8 @@ export interface Resync {
   readonly resubscribe: readonly string[];
 }
 
-/** Why a $resync was issued. */
-export type ResyncReason = "seq_evicted" | "unknown_session" | "session_expired";
+/** Why a $resync was issued (the client must rebuild, not merge). The first three are unrecoverable resume gaps; `authz_changed` is a mid-session authorization change (object scope narrowed/widened) on an intact connection (ADR-RT010). */
+export type ResyncReason = "seq_evicted" | "unknown_session" | "session_expired" | "authz_changed";
 
 /** Data body of `salvo.armed`, `salvo.taken`, `salvo.cancelled`. */
 export interface SalvoEvent {
@@ -524,7 +609,7 @@ export interface WallClockRef {
 }
 
 /** Stable catalog code of a health warning (kebab-case). `#[non_exhaustive]`: the catalog grows over time, so a client must treat an unknown code as a forward-compatible warning, not an error. */
-export type WarningCode = "gpu-present-no-vulkan-adapter";
+export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete";
 
 /** Severity of a health warning (sibling of AlertSeverity). */
 export type WarningSeverity = "info" | "warning" | "critical";

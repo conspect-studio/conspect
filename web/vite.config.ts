@@ -30,5 +30,12 @@ export default defineConfig({
   },
   build: {
     outDir: "dist",
+    // Raise the JS target to es2022: the SPA is served from localhost and embedded
+    // in the multiview daemon, so there is no legacy-browser requirement. es2022 is
+    // supported by all browsers released since late 2021 (Chrome 94+, Firefox 93+,
+    // Safari 15+). This is required because esbuild ≥ 0.28 cannot downgrade certain
+    // modern syntax patterns (e.g. lingui destructuring) to the older default target
+    // set ("chrome87", "edge88", "es2020", "firefox78", "safari14").
+    target: "es2022",
   },
 });

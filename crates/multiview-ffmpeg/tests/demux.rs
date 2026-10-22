@@ -139,3 +139,83 @@ fn demuxer_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<Demuxer>();
 }
+
+// ---- mechanism B: AVClassMap registration at demuxer open (ADR-0060 §3.2) ----
+//
+// Opening a demuxer while the owning thread holds a `ResourceGuard` must record
+// the opened `AVFormatContext*` → resource_id in the process-global AVClassMap,
+// so a libav line emitted on a libav-owned decoder/sub-demuxer thread (where the
+// thread-local is NOT set) can still be attributed by walking up to this format
+// context. The registration must be removed when the demuxer is dropped, BEFORE
+// the context's memory is freed (pointer-reuse safety).
+
+#[test]
+fn open_under_resource_guard_registers_format_ctx_then_clears_on_drop() {
+    use multiview_ffmpeg::log_bridge::{resolve_av_context, ResourceContext, ResourceGuard};
+
+    let dir = TempDir::new().unwrap();
+    let clip = generate_av_clip(dir.path());
+
+    let ptr;
+    {
+        // The ingest thread enters its resource scope BEFORE opening the demuxer
+        // (mirrors pipeline.rs ingest ordering).
+        let _scope = ResourceGuard::enter(ResourceContext::source("cnn"));
+        let demux = Demuxer::open(&clip).expect("open container");
+        ptr = demux.format_ctx_ptr();
+        assert_ne!(ptr, 0, "an opened demuxer exposes its format-ctx pointer");
+
+        let got = resolve_av_context(ptr).expect("the format ctx is registered while open");
+        assert_eq!(got.id(), "cnn", "registered to the guard's resource id");
+        assert_eq!(got.kind(), "source");
+        // Demuxer (and its registration) dropped here.
+    }
+    assert_eq!(
+        resolve_av_context(ptr),
+        None,
+        "dropping the demuxer removed the registration"
+    );
+}
+
+#[test]
+fn open_with_no_resource_guard_does_not_register() {
+    use multiview_ffmpeg::log_bridge::resolve_av_context;
+
+    let dir = TempDir::new().unwrap();
+    let clip = generate_av_clip(dir.path());
+
+    // No ResourceGuard active: honest — register no id (mechanism C fall-through).
+    let demux = Demuxer::open(&clip).expect("open container");
+    let ptr = demux.format_ctx_ptr();
+    assert_ne!(ptr, 0, "the pointer is still exposed");
+    assert_eq!(
+        resolve_av_context(ptr),
+        None,
+        "with no owned resource at open time, nothing is registered (no guessed id)"
+    );
+}
+
+#[test]
+fn open_with_interrupt_under_guard_also_registers() {
+    use multiview_ffmpeg::log_bridge::{resolve_av_context, ResourceContext, ResourceGuard};
+    use multiview_ffmpeg::DemuxOptions;
+
+    let dir = TempDir::new().unwrap();
+    let clip = generate_av_clip(dir.path());
+
+    let ptr;
+    {
+        let _scope = ResourceGuard::enter(ResourceContext::output("rtsp-main"));
+        let demux = Demuxer::open_with_interrupt(&clip, DemuxOptions::new())
+            .expect("open container with interrupt");
+        ptr = demux.format_ctx_ptr();
+        let got = resolve_av_context(ptr).expect("the interrupt-open ctx is registered");
+        assert_eq!(got.id(), "rtsp-main");
+        assert_eq!(got.kind(), "output");
+    }
+    assert_eq!(
+        resolve_av_context(ptr),
+        None,
+        "dropping the interrupt demuxer removed the registration"
+    );
+}

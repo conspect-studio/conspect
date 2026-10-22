@@ -8,7 +8,7 @@
 - **Relates to:** [ADR-0048](ADR-0048.md) (the shared WebRTC transport endpoint —
   `multiview-webrtc` crate, single-socket mux, full ICE, session GC),
   [ADR-0049](ADR-0049.md) (WebRTC program outputs), [ADR-P006](ADR-P006.md) (WHEP
-  preview completion), [ADR-W020](ADR-W020.md) (SPA player + forms),
+  preview completion), [ADR-W023](ADR-W023.md) (SPA player + forms),
   [ADR-T002](ADR-T002.md) (last-good-frame + tile state machine),
   [ADR-T003](ADR-T003.md) (PTS normalization — `WrapBits::Rtp32`),
   [ADR-T013](ADR-T013.md) (the shared RTP-audio → `AudioStore` rebase seam),
@@ -26,9 +26,10 @@ hardware encoders) publish low-latency WebRTC streams via **WHIP — the WebRTC-
 Ingestion Protocol, RFC 9725**: one HTTP `POST` of an SDP offer, one `201` answer,
 then ICE/DTLS/SRTP media to the server. Multiview has the *pure* half of a WebRTC
 receive path already built and tested in
-`crates/multiview-input/src/webrtc/`: SDP offer/answer negotiation
-(`sdp.rs::SessionDescription::negotiate_answer`, H.264 + Opus codec selection), the
-session lifecycle state machine, the application-layer **`MediaEngine`** seam
+`crates/multiview-input/src/webrtc/`: the negotiated-media model (`sdp.rs` —
+H.264/Opus codecs, payload types, directions) and payload-type router (`route.rs`);
+SDP offer/answer negotiation itself is str0m's (see §10), not hand-rolled here. Plus
+the application-layer **`MediaEngine`** seam
 (`transport.rs` — the engine pulls decrypted RTP; the crate never links a
 socket/crypto stack), and the bounded, keyframe-gated **`H264Depacketizer`**
 (RFC 6184 single-NAL/STAP-A/FU-A, `MAX_REORDER_PACKETS = 128`,
@@ -80,7 +81,7 @@ The WHIP endpoint URL is **derived, never configured**:
 `https://[2001:db8::10]:8443/api/v1/whip/cam-field-1`); the session resource is
 `/api/v1/whip/{source_id}/sessions/{session_id}`. One publisher per source at a
 time. The SPA source form displays the derived URL + token with a copy button
-([ADR-W020](ADR-W020.md)). The plaintext `token` follows the existing
+([ADR-W023](ADR-W023.md)). The plaintext `token` follows the existing
 config-secret posture (rtmp/srt URLs already embed stream keys in config): it is
 returned to authorized readers, present in config export, and migrates together
 with url-embedded keys if/when a `secret_ref` indirection lands.
@@ -96,7 +97,7 @@ at **64 KiB** (an explicit axum body limit on these routes).
 
 | Request | Response |
 |---|---|
-| `OPTIONS /whip/{source_id}` | CORS preflight; `Accept-Post: application/sdp`. No `Link` ICE-server headers — no STUN/TURN is offered (host + advertised-address candidates only, ADR-0048). |
+| `OPTIONS /whip/{source_id}` | CORS preflight; `Accept-Post: application/sdp`. No `Link` ICE-server headers — Multiview does not hand clients STUN/TURN servers to use; its own candidates (host + advertised, plus relayed via the in-crate TURN client where configured — [ADR-0048 §5.1](ADR-0048.md), Amendment 2026-06-13) are gathered server-side and returned in the answer. |
 | `POST /whip/{source_id}` (`application/sdp` offer) | **`201 Created`** + `Location: …/sessions/{session_id}` + `application/sdp` answer body. No `ETag`: RFC 9725 ties the entity-tag to ICE-restart support, which we do not implement — advertising it would be a lie. |
 | `POST` with any other content type | **`415 Unsupported Media Type`**. |
 | `POST` with a malformed offer | **`400 Bad Request`**. |
@@ -117,7 +118,7 @@ the `POST` that created the session — the session URL alone is not a capabilit
 The media-signalling CORS layer (`webrtc.cors_allow_origins`, default `*`,
 ADR-0048) exposes `Location`/`Link` (`Access-Control-Expose-Headers: location,
 link`) so browser publishers can read the session URL cross-origin
-([ADR-W020](ADR-W020.md)).
+([ADR-W023](ADR-W023.md)).
 
 ### 3. Control stays native-free — the `WhipProvider` seam
 

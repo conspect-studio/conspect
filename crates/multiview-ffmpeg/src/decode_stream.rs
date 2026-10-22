@@ -124,6 +124,24 @@ impl StreamVideoDecoder {
         })
     }
 
+    /// Wrap an already-opened libav video decoder (crate-internal): the
+    /// receive path — NV12 conversion, color detection, A53 extraction, genpts
+    /// fallback — for decoders that are **not** built from container
+    /// parameters, e.g. the packet-fed WHIP H.264 decoder
+    /// ([`H264PacketDecoder`](crate::packet_decode::H264PacketDecoder),
+    /// ADR-T014) whose geometry comes from the in-band SPS.
+    pub(crate) fn from_parts(decoder: ffmpeg::decoder::Video, time_base: Rational) -> Self {
+        Self {
+            decoder,
+            time_base,
+            to_nv12: None,
+            last_pts_ns: None,
+            fallback_step_ns: Self::DEFAULT_FALLBACK_STEP_NS,
+            hw_decoder_name: None,
+            hw_device: None,
+        }
+    }
+
     /// Build a decoder for `parameters`, **preferring NVDEC hardware decode**
     /// (`*_cuvid`) when `want_hw` is set, the build compiled the `cuda` feature,
     /// and the linked libav offers a cuvid wrapper for the stream's codec — else
@@ -280,6 +298,50 @@ impl StreamVideoDecoder {
     /// Returns [`FfmpegError::Decode`] on a libav error.
     pub fn send_eof(&mut self) -> Result<()> {
         self.decoder.send_eof().map_err(FfmpegError::Decode)
+    }
+
+    /// Flush the decoder's buffered state (`avcodec_flush_buffers`), discarding
+    /// every buffered/reordered frame so decoding can resume cleanly from a new
+    /// position.
+    ///
+    /// **Call this after every [`Demuxer::seek`](crate::demux::Demuxer::seek)**
+    /// (e.g. the media-player loop/vamp wrap): a seek without a flush leaves the
+    /// decoder holding pictures decoded *before* the seek — for codecs that
+    /// reorder (B-frames) those stale frames would surface after the wrap as
+    /// out-of-order garbage. Flushing drops them so the first frame after the
+    /// seek is the seek target's frame.
+    ///
+    /// It is safe to call between packets (including on a fresh or already-drained
+    /// decoder, where it is a harmless no-op), and the decoder stays usable for
+    /// the next [`send_packet`](Self::send_packet). The genpts fallback origin
+    /// ([`next_pts`](Self::next_pts)'s `last_pts_ns`) is reset so a frame that
+    /// carries no usable timestamp after the seek re-bases from the new position
+    /// rather than from the pre-seek timeline (invariant #3); the NV12 converter
+    /// is retained because a seek does not change the source geometry, and
+    /// [`ensure_nv12`](Self::ensure_nv12) rebuilds it anyway on any geometry
+    /// change.
+    ///
+    /// # Safety / FFI invariant
+    /// The flush runs through `ffmpeg_next`'s safe
+    /// [`Decoder::flush`](ffmpeg_next::decoder::decoder::Opened) wrapper, which
+    /// owns the single `unsafe` `avcodec_flush_buffers` call (this crate adds no
+    /// raw FFI here — the decode path is zero-`unsafe`). The invariant that makes
+    /// it sound: the `AVCodecContext` is **owned** by this decoder and accessed
+    /// only through `&mut self` (the type is `Send + !Sync`, so libav's
+    /// single-threaded-access requirement holds); flushing merely drops buffered
+    /// frames and resets internal decode state, which is valid between packets.
+    ///
+    /// # Errors
+    /// Returns [`Result::Ok`] — the underlying libav flush is infallible. The
+    /// `Result` return matches the rest of this decoder's API
+    /// ([`send_packet`](Self::send_packet)/[`send_eof`](Self::send_eof)) and
+    /// leaves room for a future fallible flush without a breaking change.
+    pub fn flush(&mut self) -> Result<()> {
+        self.decoder.flush();
+        // A seek is a deliberate timeline discontinuity: drop the genpts origin
+        // so a post-seek frame with no PTS re-bases from the new position.
+        self.last_pts_ns = None;
+        Ok(())
     }
 
     /// Pull the next decoded frame, converting to NV12 if needed.

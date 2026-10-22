@@ -30,7 +30,7 @@ import type {
   OverlayFormState,
 } from '../resources/forms';
 import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
-import { FormField, SelectField } from '../resources/FormControls';
+import { ApplySemanticsCallout, FormField, SelectField } from '../resources/FormControls';
 import { HelpLink } from '../components/HelpLink';
 
 /** The kind-specific parameter fields. */
@@ -228,8 +228,24 @@ export function OverlaysPage(): JSX.Element {
       emptyMessage={<Trans>No overlays configured.</Trans>}
       loadingMessage={<Trans>Loading overlays…</Trans>}
       errorPrefix={<Trans>Could not load overlays:</Trans>}
-      savedDescription={t`Stored. It goes live via config export + restart; the running engine is unchanged until then.`}
-      deletedDescription={t`Removed from the store. The running engine is unchanged until a config export + restart.`}
+      callout={
+        <ApplySemanticsCallout
+          helpTo="/help/config#overlays"
+          helpLabel={t`How configuration applies`}
+          message={
+            <Trans>
+              Analog clock overlays apply to the running engine immediately
+              when saved or deleted — the face appears, moves, or disappears
+              at the next frame. Other overlay kinds are stored losslessly and
+              go live via config export + restart (this build draws no
+              renderer for them). Each save response declares which applied
+              (X-Multiview-Apply: live or restart).
+            </Trans>
+          }
+        />
+      }
+      savedDescription={t`Stored. Analog clock overlays apply to the running engine immediately; other kinds go live via config export + restart.`}
+      deletedDescription={t`Removed. An analog clock overlay disappears from the running engine immediately (the response header confirms); other kinds change nothing until a config export + restart.`}
       list={overlays.data ?? []}
       isPending={overlays.isPending}
       isError={overlays.isError}

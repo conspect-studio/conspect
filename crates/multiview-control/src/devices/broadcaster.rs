@@ -21,7 +21,9 @@
 //!
 //! `device.status` (and `timing.status`) are conflated, latest-wins telemetry
 //! **excluded from the lossless replay ring**; the device lifecycle events
-//! (`device.adopted`/`.removed`/`.mode`/`.error`/`.sync`) are lossless. The
+//! (`device.adopted`/`.removed`/`.mode`/`.error`/`.sync`) and the cast-session
+//! membership events (`cast.session.started`/`.removed`, DEV-D3.1) are
+//! lossless. The
 //! session pump applies `topic.is_high_rate() || event.is_conflated()` to
 //! decide ring-exclusion per event type. This broadcaster's job is only to
 //! *publish* those events with the correct types + the registry update; the
@@ -32,8 +34,8 @@ use std::sync::Arc;
 use multiview_config::DeviceDriver;
 use multiview_engine::EnginePublisher;
 use multiview_events::{
-    DeviceAdopted, DeviceError, DeviceMode, DeviceRemoved, DeviceState, DeviceStatus, Event,
-    ImpactClass, ModePhase,
+    CastSessionRemoved, CastSessionStarted, DeviceAdopted, DeviceError, DeviceMode, DeviceRemoved,
+    DeviceState, DeviceStatus, Event, ImpactClass, ModePhase,
 };
 
 use super::registry::DeviceStatusRegistry;
@@ -152,6 +154,11 @@ impl DeviceBroadcaster {
     /// confirm-adopt (`POST /devices/{id}`). The `driver` string is the discovered
     /// driver-kind wire token (e.g. `ndi-source`); `address` is the IPv6-first
     /// management address and `family` labels IPv4 as legacy (ADR-0042).
+    ///
+    /// `domain` is the observing node's operator-declared discovery domain
+    /// (ADR-W026), stamped onto the row so a discovery-scoped principal can be
+    /// confined to it. The caller must pass its own local config value, never a
+    /// value read off the wire — a discovered device cannot assert its own scope.
     #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
     pub fn discovered(
         &self,
@@ -159,15 +166,17 @@ impl DeviceBroadcaster {
         address: &str,
         family: multiview_events::AddressFamily,
         name: Option<String>,
+        domain: Option<String>,
     ) -> u64 {
-        self.engine.publish_event(Event::DeviceDiscovered(
-            multiview_events::DeviceDiscovered {
-                driver: driver.to_owned(),
-                address: address.to_owned(),
-                family,
-                name,
-            },
-        ))
+        let mut event =
+            multiview_events::DeviceDiscovered::new(driver.to_owned(), address.to_owned(), family);
+        if let Some(name) = name {
+            event = event.with_name(name);
+        }
+        if let Some(domain) = domain {
+            event = event.with_domain(domain);
+        }
+        self.engine.publish_event(Event::DeviceDiscovered(event))
     }
 
     /// Publish `device.error` (lossless lifecycle).
@@ -178,6 +187,38 @@ impl DeviceBroadcaster {
             code: None,
             message: message.to_owned(),
         }))
+    }
+
+    /// Publish `cast.session.started` (lossless lifecycle, DEV-D3.1): an
+    /// ephemeral cast session joined the runtime session list. A **pure
+    /// publish** — the cast routes own the status-registry seeding (`ensure`)
+    /// and the session-store insert, exactly as they did before this event.
+    #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
+    pub fn cast_session_started(
+        &self,
+        session_id: &str,
+        name: Option<String>,
+        address: &str,
+        output: &str,
+    ) -> u64 {
+        self.engine
+            .publish_event(Event::CastSessionStarted(CastSessionStarted {
+                session_id: session_id.to_owned(),
+                name,
+                address: address.to_owned(),
+                output: output.to_owned(),
+            }))
+    }
+
+    /// Publish `cast.session.removed` (lossless lifecycle, DEV-D3.1): the
+    /// session was stopped, or promoted to a saved device. A pure publish —
+    /// the routes own the registry/store teardown.
+    #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
+    pub fn cast_session_removed(&self, session_id: &str) -> u64 {
+        self.engine
+            .publish_event(Event::CastSessionRemoved(CastSessionRemoved::new(
+                session_id,
+            )))
     }
 }
 

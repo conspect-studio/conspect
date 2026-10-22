@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use multiview_preview::whep::transport::{
     sample_feed, DtlsFingerprint, DtlsSetup, EncodedSample, PreviewMediaSource, SampleFeed,
-    SampleSink, SessionHandle, SessionId, SessionState, TransportAnswer, WhepTransport,
+    SampleKind, SampleSink, SessionHandle, SessionId, SessionState, TransportAnswer, WhepTransport,
 };
 use multiview_preview::whep::{PreviewCodec, WhepSession};
 use multiview_preview::AccessScope;
@@ -34,12 +34,17 @@ a=rtpmap:96 H264/90000\r\n\
 a=rtpmap:97 VP8/90000\r\n\
 a=sendrecv\r\n";
 
-/// An in-memory media source: hands out the producer end so the test can feed
-/// samples, and the consumer end (the `SampleFeed`) to the transport.
+/// An in-memory media source: hands out the producer ends so the test can feed
+/// samples, and the consumer ends (the `SampleFeed`s) to the transport. Audio
+/// (Opus by definition on this seam, ADR-P006) is optional — `new` builds a
+/// video-only source whose `audio_feed` is `None`; `with_audio` adds an Opus
+/// feed handed out at most once, mirroring the `feed()` take-once contract.
 struct FakeMediaSource {
     codec: PreviewCodec,
     sink: SampleSink,
     feed: std::sync::Mutex<Option<SampleFeed>>,
+    audio_sink: Option<SampleSink>,
+    audio: std::sync::Mutex<Option<SampleFeed>>,
 }
 
 impl FakeMediaSource {
@@ -49,7 +54,17 @@ impl FakeMediaSource {
             codec,
             sink,
             feed: std::sync::Mutex::new(Some(feed)),
+            audio_sink: None,
+            audio: std::sync::Mutex::new(None),
         }
+    }
+
+    fn with_audio(codec: PreviewCodec, depth: usize, audio_depth: usize) -> Self {
+        let mut source = Self::new(codec, depth);
+        let (audio_sink, audio_feed) = sample_feed(audio_depth);
+        source.audio_sink = Some(audio_sink);
+        source.audio = std::sync::Mutex::new(Some(audio_feed));
+        source
     }
 }
 
@@ -66,6 +81,10 @@ impl PreviewMediaSource for FakeMediaSource {
             .and_then(|mut g| g.take())
             .unwrap_or_else(|| sample_feed(1).1)
     }
+    fn audio_feed(&self) -> Option<SampleFeed> {
+        // At most once, like `feed()`: once taken, audio reads as absent.
+        self.audio.lock().ok().and_then(|mut g| g.take())
+    }
 }
 
 /// An in-memory transport: assigns deterministic, **non-placeholder** ICE/DTLS
@@ -73,9 +92,10 @@ impl PreviewMediaSource for FakeMediaSource {
 /// `SampleFeed` (drop-oldest) — never an engine handle.
 struct FakeTransport {
     handle: std::sync::Mutex<Option<SessionHandle>>,
-    // The feed the transport drained from the media source, kept to prove the
+    // The feeds the transport drained from the media source, kept to prove the
     // transport reads samples (and holds nothing the engine awaits).
     held_feed: std::sync::Mutex<Option<SampleFeed>>,
+    held_audio_feed: std::sync::Mutex<Option<SampleFeed>>,
 }
 
 impl FakeTransport {
@@ -83,6 +103,7 @@ impl FakeTransport {
         Self {
             handle: std::sync::Mutex::new(None),
             held_feed: std::sync::Mutex::new(None),
+            held_audio_feed: std::sync::Mutex::new(None),
         }
     }
     fn handle(&self) -> SessionHandle {
@@ -94,6 +115,13 @@ impl FakeTransport {
     }
     fn held_feed_buffered(&self) -> usize {
         self.held_feed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, SampleFeed::buffered)
+    }
+    fn held_audio_feed_buffered(&self) -> usize {
+        self.held_audio_feed
             .lock()
             .unwrap()
             .as_ref()
@@ -113,6 +141,9 @@ impl WhepTransport for FakeTransport {
         let handle = SessionHandle::new(id.clone());
         *self.handle.lock().unwrap() = Some(handle);
         *self.held_feed.lock().unwrap() = Some(media.feed());
+        // The audio feed is optional (ADR-P006): the fake takes it when the
+        // source has one, at most once, exactly like the video feed.
+        *self.held_audio_feed.lock().unwrap() = media.audio_feed();
         Ok(TransportAnswer {
             session_id: id,
             ice_ufrag: "Fk9aZ".to_owned(),
@@ -226,6 +257,7 @@ fn sample_feed_drops_oldest_never_blocks() {
         data: Arc::from(ts.to_le_bytes().as_slice()),
         rtp_timestamp: ts,
         keyframe: ts == 0,
+        kind: SampleKind::Video,
     };
 
     // Push 5 samples into a depth-2 ring with NO draining: the producer never
@@ -261,6 +293,7 @@ fn transport_holds_only_the_media_feed_not_the_engine() {
             data: Arc::from([ts].as_slice()),
             rtp_timestamp: u32::from(ts),
             keyframe: ts == 0,
+            kind: SampleKind::Video,
         });
         assert!(!lagging, "depth-3 ring with 2 samples never evicts");
     }
@@ -269,4 +302,115 @@ fn transport_holds_only_the_media_feed_not_the_engine() {
         2,
         "transport reads the lossy media feed and nothing else"
     );
+}
+
+#[test]
+fn sample_kind_pins_the_per_kind_rtp_clocks() {
+    // ADR-P006 move 3: video samples ride the 90 kHz RTP clock every video
+    // payload advertises; audio (Opus by definition on this seam) rides the
+    // 48 kHz clock RFC 7587 fixes for Opus.
+    assert_eq!(SampleKind::Video.rtp_clock_hz(), 90_000);
+    assert_eq!(SampleKind::Audio.rtp_clock_hz(), 48_000);
+}
+
+#[test]
+fn one_feed_carries_video_and_audio_samples_in_order() {
+    // The audio seam reuses the proven drop-oldest feed (ADR-P006 rejected a
+    // parallel AudioFeed): one ring carries both kinds, tagged per sample, and
+    // pops in push order.
+    let (sink, feed) = sample_feed(4);
+    let push = |kind: SampleKind, ts: u32, key: bool| {
+        let _ = sink.push(EncodedSample {
+            data: Arc::from([0u8].as_slice()),
+            rtp_timestamp: ts,
+            keyframe: key,
+            kind,
+        });
+    };
+    push(SampleKind::Video, 0, true);
+    push(SampleKind::Audio, 960, false); // one 20 ms Opus frame at 48 kHz
+    push(SampleKind::Video, 3_000, false); // one 30 fps video frame at 90 kHz
+
+    let first = feed.pop().expect("first sample");
+    assert_eq!(first.kind, SampleKind::Video);
+    assert!(first.keyframe);
+    let second = feed.pop().expect("second sample");
+    assert_eq!(second.kind, SampleKind::Audio);
+    assert_eq!(
+        second.rtp_timestamp, 960,
+        "audio timestamps are 48 kHz units"
+    );
+    let third = feed.pop().expect("third sample");
+    assert_eq!(third.kind, SampleKind::Video);
+    assert_eq!(third.rtp_timestamp, 3_000);
+    assert!(feed.pop().is_none());
+}
+
+#[test]
+fn audio_feed_defaults_to_absent() {
+    // ADR-P006: the audio feed is OPTIONAL per source — scopes with no audio
+    // source simply leave it absent — so the trait defaults to `None` and a
+    // video-only source needs no override.
+    struct VideoOnly;
+    impl PreviewMediaSource for VideoOnly {
+        fn codec(&self) -> PreviewCodec {
+            PreviewCodec::H264
+        }
+        fn feed(&self) -> SampleFeed {
+            sample_feed(1).1
+        }
+    }
+    assert!(
+        VideoOnly.audio_feed().is_none(),
+        "the default audio feed is absent"
+    );
+}
+
+#[test]
+fn transport_takes_the_audio_feed_at_most_once_when_present() {
+    // ADR-P006: `audio_feed` is called at most once per session, like `feed()`.
+    // The fake transport takes it at accept; the producer can then push Opus
+    // samples (48 kHz clock) through the same bounded drop-oldest seam.
+    let transport = FakeTransport::new();
+    let media = FakeMediaSource::with_audio(PreviewCodec::H264, 2, 3);
+    transport.accept(OFFER, PreviewCodec::H264, &media).unwrap();
+
+    assert!(
+        media.audio_feed().is_none(),
+        "the transport took the audio feed exactly once"
+    );
+    let lagging = media.audio_sink.as_ref().unwrap().push(EncodedSample {
+        data: Arc::from([7u8].as_slice()),
+        rtp_timestamp: 960, // one 20 ms Opus frame at 48 kHz
+        keyframe: false,
+        kind: SampleKind::Audio,
+    });
+    assert!(!lagging, "depth-3 audio ring with 1 sample never evicts");
+    assert_eq!(
+        transport.held_audio_feed_buffered(),
+        1,
+        "the transport drains the held audio feed"
+    );
+}
+
+#[test]
+fn folded_answer_stays_ipv6_first_and_bundled() {
+    // ADR-P006 move 2 + ADR-0042: the transport-folded answer keeps the honest
+    // browser shape — IPv6-first c= lines (never IN IP4), session-level
+    // BUNDLE, per-media mid, rtcp-mux — alongside the real ICE/DTLS lines.
+    let session = WhepSession::negotiate(OFFER, AccessScope::Focus).expect("focus offer");
+    let transport = FakeTransport::new();
+    let media = FakeMediaSource::new(PreviewCodec::H264, 2);
+    let ta = transport
+        .accept(OFFER, session.codec(), &media)
+        .expect("transport accepts");
+    let answer = session.build_answer(&ta);
+    assert!(answer.contains("c=IN IP6 ::\r\n"), "answer: {answer}");
+    assert!(
+        !answer.contains("IN IP4"),
+        "never IN IP4 (ADR-0042): {answer}"
+    );
+    assert!(answer.contains("a=group:BUNDLE 0\r\n"), "answer: {answer}");
+    assert!(answer.contains("a=mid:0\r\n"), "answer: {answer}");
+    assert!(answer.contains("a=rtcp-mux\r\n"), "answer: {answer}");
 }

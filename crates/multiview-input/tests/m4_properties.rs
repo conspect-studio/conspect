@@ -17,7 +17,6 @@ use multiview_input::mpegts::{Cat, Nit, Pat, Pmt, Sdt, Tdt, Tot};
 use multiview_input::scte::scte104::Scte104Message;
 use multiview_input::scte::splice35::SpliceInfoSection;
 use multiview_input::srt::StreamId;
-use multiview_input::webrtc::SessionDescription;
 
 proptest! {
     // Wide net: every PSI/SI table parser is total on arbitrary bytes.
@@ -90,12 +89,6 @@ proptest! {
     #[test]
     fn mpd_parser_never_panics(text in ".{0,2000}") {
         let _ = Mpd::parse(&text);
-    }
-
-    // The SDP parser is total on arbitrary text.
-    #[test]
-    fn sdp_parser_never_panics(text in ".{0,2000}") {
-        let _ = SessionDescription::parse(&text);
     }
 
     // StreamId acceptance is exactly the 0..=512-byte band.

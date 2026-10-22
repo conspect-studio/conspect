@@ -23,8 +23,8 @@ fn cell(x: f32, y: f32, w: f32, h: f32) -> Cell {
         z: 0,
         fit: FitMode::Contain,
         source: None,
-        // Broadcast extras (crop/rotation) are additive and defaulted; spread
-        // their defaults so this helper keeps exercising the original shape.
+        // `opacity` is additive and defaulted; spread its default so this
+        // helper keeps exercising the original shape.
         ..Cell::default()
     }
 }

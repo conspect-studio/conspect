@@ -74,6 +74,8 @@ use ffmpeg_next::util::frame::Video;
 
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
+#[cfg(feature = "rist")]
+use multiview_config::{lower_rist_url, RistOptions};
 use multiview_config::{MultiviewConfig, Output, Source, SourceKind};
 use multiview_control::EngineStateSnapshot;
 use multiview_core::frame::FrameMeta;
@@ -83,16 +85,20 @@ use multiview_core::time::{MediaTime, Rational};
 use multiview_core::traits::SourceState;
 use multiview_engine::{
     CompositedFrame, CompositorDrive, EnginePublisher, MonotonicTimeSource, MultiviewProgram,
-    OutputClock, Pacer, RealtimePacer, StopSignal, TimeSource,
+    OutputClock, Pacer, RealtimePacer, RequestedSize, SourceHandle, SourceKey, SourceRegistry,
+    StopSignal, TimeSource,
 };
 use multiview_events::Event;
 use multiview_ffmpeg::{
     DecodedVideoFrame, EncodedPacket, ScaleSpec, Scaler, StreamCodecParameters, StreamVideoDecoder,
 };
 use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+#[cfg(all(feature = "ndi", any(feature = "ndi-bindings", test)))]
+use multiview_output::ndi::NdiOutput;
 use multiview_output::sink::{
     EncodeConfig, PacketMuxOutcome, PacketMuxSink, PacketSource, ProgramEncoder, PushProtocol,
 };
+use multiview_output::{display_matrix, DisplayMatrix};
 
 /// The per-subscriber drop-oldest depth of the engine's outbound event stream.
 /// The pipeline has no realtime consumers wired here, but the publisher still
@@ -461,7 +467,40 @@ struct AdmissionPick {
     /// The chosen device's CUDA enumeration ordinal (e.g. `Some("1")`) for the
     /// NVDEC decode + NVENC encode pin, or `None` in lockstep with `wgpu_target`.
     cuda_ordinal: Option<String>,
+    /// The chosen device's stable identity — the **island device** every later
+    /// runtime decode placement is pinned to (ADR-W018 §7 / ADR-0018: a
+    /// runtime add never fragments or migrates the island). `None` in lockstep
+    /// with `wgpu_target`.
+    device: Option<multiview_hal::DeviceId>,
 }
+
+/// The running pipeline's pinned **island** (ADR-W018 §7): the device the
+/// decide-once admission pick placed the whole `decode → composite → encode`
+/// island on, its CUDA ordinal, and the tile count the startup demand modelled.
+/// Published by `drive_streaming` into a shared slot the
+/// [`LiveIngestSpawner`] reads, so every runtime decode placement consults the
+/// same admission scorer **pinned to this device** — never a different GPU,
+/// never a migration.
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone)]
+struct LiveIsland {
+    /// The island device's stable identity (the runtime-placement pin).
+    device: multiview_hal::DeviceId,
+    /// The island device's CUDA enumeration ordinal (stamped onto an admitted
+    /// runtime decode so NVDEC co-locates with the compositor). `None` when
+    /// the device resolved no ordinal — then an admit keeps the default CUDA
+    /// device, in lockstep with the startup plans.
+    cuda_ordinal: Option<String>,
+    /// The startup island's tile count (the layout's cells) — the base demand
+    /// a runtime add extends by one decode.
+    tile_count: usize,
+}
+
+/// The shared slot `drive_streaming` publishes the pinned [`LiveIsland`] into
+/// (empty until — and unless — admission names a device). Lock-free reads on
+/// the hub worker; never touched by the output clock.
+#[cfg(feature = "gpu")]
+type LiveIslandSlot = Arc<arc_swap::ArcSwapOption<LiveIsland>>;
 
 /// Choose the GPU to host the whole pipeline island at **admission** — the
 /// load-aware, decide-once pick (ADR-0035 Tier-1, ADR-0018; the GPU-placement
@@ -528,10 +567,11 @@ fn select_admission_pick(
     // A conservative per-engine budget large enough not to gate a typical
     // multiview on a real GPU; the LIVE 4060-vs-P2000 routing on the contended
     // box rests on the VRAM headroom gate (the 95%-full 4060 exceeds the 0.85
-    // ceiling) + VRAM-dominant scoring, which need no perf-class table. A real
-    // per-GPU perf-class `CostBudget` table is the documented Tier-2 refinement
-    // (ADR-0035 §5) — until then every candidate shares this permissive budget,
-    // so the budget gate is effectively inert and the headroom/score do the work.
+    // ceiling) + VRAM-dominant scoring, which need no perf-class table. ADR-0018
+    // makes the hard gates (headroom + capability + NVENC-session) "the real
+    // safety", so this permissive Mpix/s budget is effectively inert and the
+    // headroom/score do the work. A real per-GPU perf-class `CostBudget` table
+    // is future work (not yet built).
     let budget = CostBudget::new(100_000.0, 100_000.0, 100_000.0);
 
     // One candidate per visible GPU. We treat each as capable of the whole island
@@ -640,6 +680,161 @@ fn select_admission_pick(
     AdmissionPick {
         wgpu_target: Some(target),
         cuda_ordinal: info.cuda_ordinal,
+        device: Some(selection.device),
+    }
+}
+
+/// Place ONE runtime-added decode (ADR-W018 §7, level 2): consult the **same**
+/// [`multiview_hal::select_device`] scorer the startup admission uses, with two
+/// changes honouring the GPU-placement principle:
+///
+/// * the candidate set is **exactly the running island's device** — a runtime
+///   add may never fragment or migrate the island, and a single-candidate
+///   consult makes naming any other GPU impossible. (ADR-W018 §7 sketched
+///   `Pins::pin_pipeline`; a pin deliberately *bypasses* the headroom ceiling
+///   — operator-pins-always-win — which would defeat the §7 reject →
+///   software-decode ladder, so the implementation restricts the candidate set
+///   instead: identical never-fragment guarantee, headroom still gates.)
+/// * the demand is the island's current tile set **plus** the new decode
+///   (`TileLoad::new(Decode, …)`), re-polling NVML at decision time. The
+///   demand opens **no** new encode session (the island's NVENC session is
+///   already open and counted in the *measured* snapshot — modelling it again
+///   would double-count it against the session ceiling).
+///
+/// An **admit** returns [`DecodePlacement::Pinned`] with the island's CUDA
+/// ordinal (NVDEC co-located with the compositor — ADR-0035 affinity). A
+/// **reject** (budget / headroom / the island gone from the snapshot) — AND an
+/// admit where the island resolved **no** CUDA ordinal — returns
+/// [`DecodePlacement::SoftwareOnly`]: the decoder open for that one source is
+/// FORCED to software (the [`decoder_open_args`] gate). This NEVER returns
+/// `Default` on the live path: `Default` opens NVDEC on libav's default device,
+/// which here is fragmentation/overcommit — the compositor island is *already*
+/// pinned at runtime, so an un-pinnable (no-ordinal) admit cannot co-locate
+/// NVDEC with it and must fall to software, not the default GPU. (`Default` is
+/// correct only at startup, where nothing is pinned yet.) The island is never
+/// overcommitted or fragmented and the output never falters (inv #1).
+///
+/// Runs on the hub worker thread only (it polls NVML) — never on the clock.
+#[cfg(feature = "gpu")]
+fn select_live_decode_placement(
+    load_source: &dyn multiview_hal::LoadSource,
+    island: &LiveIsland,
+    canvas_w: u32,
+    canvas_h: u32,
+    cadence: Rational,
+) -> DecodePlacement {
+    use multiview_core::pixel::PixelFormat;
+    use multiview_core::traits::BackendKind;
+    use multiview_hal::{
+        select_device, Capability, CostBudget, GpuCandidate, Pins, PipelineDemand, PlacementPolicy,
+        Resolution, Stage, StageCaps, TileLoad,
+    };
+
+    // Fresh measured load at decision time (the ADR-W018 §7 re-poll): a
+    // removed source's NVDEC/VRAM consumption has already vanished from these
+    // counters when its decoder closed — the measured-load model needs no
+    // booking ledger to return budget.
+    let loads = load_source.poll();
+    let Some(island_load) = loads.iter().find(|l| l.device_id == island.device) else {
+        tracing::warn!(
+            island = island.device.stable_id(),
+            "live decode placement: the island device is absent from the load \
+             snapshot at decision time; FORCING software decode for this source \
+             (hardware on the default device could overcommit or fragment the island)"
+        );
+        return DecodePlacement::SoftwareOnly;
+    };
+
+    let canvas_res = Resolution::new(canvas_w.max(1), canvas_h.max(1));
+    // The same conservative per-engine budget the startup admission uses. The
+    // per-engine Mpix/s budget is intentionally permissive: ADR-0018 makes the
+    // VRAM-headroom hard gate + VRAM-dominant score the real safety net ("hard
+    // gates are the real safety"), so this Mpix/s budget does not gate a typical
+    // multiview on a real GPU — a real per-GPU perf-class budget table is future
+    // work, not yet built. KNOWN RESIDUAL (disclosed): a VRAM-roomy but
+    // decode-engine-saturated GPU passes both this budget and the headroom gate,
+    // so a live add CAN be admitted onto a GPU that cannot sustain another
+    // decode. That is acceptable for this ship: the never-off-air contract holds
+    // (an over-subscribed decode degrades the NEW tile, never the program — the
+    // output clock samples last-good, inv #1/#2) and invariant #9's closed-loop
+    // degradation sheds the cheapest tile if the saturation bites.
+    let budget = CostBudget::new(100_000.0, 100_000.0, 100_000.0);
+    let cap = |stage: Stage| {
+        Capability::new(
+            BackendKind::Cuda,
+            stage,
+            canvas_res,
+            vec![PixelFormat::Nv12],
+        )
+    };
+    // ONE candidate: the island device. select_device physically cannot name
+    // another GPU — the affinity hard constraint by construction.
+    let candidates = vec![GpuCandidate {
+        device_id: island_load.device_id.clone(),
+        stage_caps: StageCaps::new(
+            cap(Stage::Decode),
+            cap(Stage::Composite),
+            cap(Stage::Encode),
+        ),
+        budget,
+    }];
+
+    // Demand: the island's current tile set PLUS the new decode. The +2 covers
+    // the island's composite + encode loads, exactly as the startup demand
+    // models them. `opens_encode_session = false`: no NEW session is opened by
+    // a decode-only add (the running session is in the measured snapshot).
+    let mut tile_loads: Vec<TileLoad> = Vec::with_capacity(island.tile_count.saturating_add(3));
+    for _ in 0..island.tile_count.max(1) {
+        tile_loads.push(TileLoad::new(Stage::Decode, canvas_res));
+    }
+    tile_loads.push(TileLoad::new(Stage::Decode, canvas_res)); // the new source
+    tile_loads.push(TileLoad::new(Stage::Composite, canvas_res));
+    tile_loads.push(TileLoad::new(Stage::Encode, canvas_res));
+    let demand = PipelineDemand::new(cadence, tile_loads, canvas_res, PixelFormat::Nv12, 0, false);
+
+    match select_device(
+        &candidates,
+        &demand,
+        &loads,
+        &Pins::none(),
+        PlacementPolicy::default(),
+    ) {
+        Ok(selection) => {
+            if let Some(ordinal) = island.cuda_ordinal.clone() {
+                tracing::info!(
+                    island = island.device.stable_id(),
+                    cuda_ordinal = %ordinal,
+                    score = selection.score,
+                    "live decode placement: admitted onto the running island device \
+                     (NVDEC co-located, ADR-W018 §7)"
+                );
+                DecodePlacement::Pinned(ordinal)
+            } else {
+                // Admitted by budget/headroom, but the island device resolved
+                // no CUDA ordinal — on the LIVE path the compositor island is
+                // already pinned, so an un-pinnable decode cannot co-locate and
+                // `Default` (libav's default device) would fragment/overcommit.
+                // Fail closed to software for this one source (ADR-W018 §7).
+                tracing::warn!(
+                    island = island.device.stable_id(),
+                    score = selection.score,
+                    "live decode placement: admitted but the island resolved no \
+                     CUDA ordinal; FORCING software decode for this source (the \
+                     default device would fragment/overcommit the pinned island)"
+                );
+                DecodePlacement::SoftwareOnly
+            }
+        }
+        Err(reason) => {
+            tracing::warn!(
+                island = island.device.stable_id(),
+                ?reason,
+                "live decode placement REJECTED for this source: its decoder \
+                 open is FORCED to software (the island is never overcommitted \
+                 and never fragmented; the output never falters — ADR-W018 §7)"
+            );
+            DecodePlacement::SoftwareOnly
+        }
     }
 }
 
@@ -805,12 +1000,375 @@ mod admission_target_tests {
         let target = gpu_target_from_info(&GpuTargetInfo::default());
         assert!(!target.is_some());
     }
+
+    // -----------------------------------------------------------------------
+    // ADR-W018 §7 — the LIVE decode placement consult (level 2): a runtime
+    // add consults the SAME select_device scorer, candidate-restricted to the
+    // running island's device (never fragments/migrates), and a reject
+    // degrades THAT source to software decode only.
+    // -----------------------------------------------------------------------
+
+    use super::{LiveIngestSpawner, LiveIsland};
+
+    fn island(uuid: &str, index: u32, ordinal: &str) -> LiveIsland {
+        LiveIsland {
+            device: DeviceId::new(Vendor::Nvidia, uuid, index),
+            cuda_ordinal: Some(ordinal.to_owned()),
+            tile_count: 4,
+        }
+    }
+
+    /// An island whose device admits by headroom but resolved NO CUDA ordinal
+    /// — the admit-with-no-pin case (finding #2): on the live path this must
+    /// fall to software, never the default device.
+    fn island_no_ordinal(uuid: &str, index: u32) -> LiveIsland {
+        LiveIsland {
+            device: DeviceId::new(Vendor::Nvidia, uuid, index),
+            cuda_ordinal: None,
+            tile_count: 4,
+        }
+    }
+
+    #[test]
+    fn live_decode_placement_admits_but_forces_software_when_the_island_has_no_ordinal() {
+        // The idle P2000 PASSES the headroom/budget gate, but its LiveIsland
+        // resolved no CUDA ordinal. On the live path the compositor island is
+        // already pinned, so an un-pinnable admit must NOT fall to
+        // `Default` (= libav default-device NVDEC, fragment/overcommit) — it
+        // must FORCE software (finding #2). The decode-open gate confirms
+        // (want_hw=false, no ordinal).
+        let placement = super::select_live_decode_placement(
+            &FakeTwoGpu,
+            &island_no_ordinal(FakeTwoGpu::GPU1_UUID, 1),
+            1920,
+            1080,
+            Rational::new(25, 1),
+        );
+        assert_eq!(
+            placement,
+            super::DecodePlacement::SoftwareOnly,
+            "an admitted-but-un-pinnable live decode must force software, never Default"
+        );
+        assert_eq!(
+            super::decoder_open_args(&placement, None),
+            (false, None),
+            "the un-pinnable admit's decoder open must not WANT hardware at all"
+        );
+    }
+
+    #[test]
+    fn live_decode_placement_admits_onto_the_idle_island_pinned_to_its_ordinal() {
+        // The island is the idle P2000: the consult (island tile set + the new
+        // decode, fresh load poll) admits as `Pinned` with the ISLAND's
+        // ordinal — NVDEC co-locates with the running compositor, never a
+        // different GPU (even though the fake topology has two) — and the
+        // decode-open gate keeps the hardware preference + threads the pin.
+        let placement = super::select_live_decode_placement(
+            &FakeTwoGpu,
+            &island(FakeTwoGpu::GPU1_UUID, 1, "1"),
+            1920,
+            1080,
+            Rational::new(25, 1),
+        );
+        assert_eq!(
+            placement,
+            super::DecodePlacement::Pinned("1".to_owned()),
+            "an admitted live decode must be pinned to the ISLAND device's ordinal"
+        );
+        let (want_hw, ordinal) = super::decoder_open_args(&placement, None);
+        assert_eq!(
+            want_hw,
+            multiview_ffmpeg::want_hw_decode(None),
+            "an admitted placement keeps the canonical hardware preference"
+        );
+        assert_eq!(
+            ordinal,
+            Some("1"),
+            "the island ordinal reaches the decoder open"
+        );
+    }
+
+    #[test]
+    fn live_decode_placement_rejects_an_over_headroom_island_to_forced_software() {
+        // The island is the 95%-VRAM 4060 (over the 0.85 headroom ceiling):
+        // the consult REJECTS — and because the candidate set is exactly the
+        // island device, the scorer cannot escape to the idle P2000 (that
+        // would fragment the pipeline). The reject is the EXPLICIT
+        // `SoftwareOnly` placement, and the decode-open gate turns it into a
+        // software open (want_hw = false, no ordinal) even though NVDEC is
+        // otherwise enabled — `None` ordinal alone would have opened NVDEC on
+        // the DEFAULT device, i.e. the over-headroom island itself.
+        let placement = super::select_live_decode_placement(
+            &FakeTwoGpu,
+            &island(FakeTwoGpu::GPU0_UUID, 0, "0"),
+            1920,
+            1080,
+            Rational::new(25, 1),
+        );
+        assert_eq!(
+            placement,
+            super::DecodePlacement::SoftwareOnly,
+            "an over-headroom island must FORCE software decode — never \
+             overcommit the island or migrate to another GPU"
+        );
+        assert_eq!(
+            super::decoder_open_args(&placement, None),
+            (false, None),
+            "the rejected source's decoder open must not WANT hardware at all"
+        );
+    }
+
+    #[test]
+    fn live_decode_placement_forces_software_when_the_island_vanishes() {
+        // No load snapshot carries the island device (NVML gone, device lost):
+        // the consult cannot verify the pin — hardware on the default device
+        // could overcommit or fragment the (unverifiable) island, so the
+        // placement is the explicit forced-software outcome.
+        let placement = super::select_live_decode_placement(
+            &NullLoadPoller::new(),
+            &island(FakeTwoGpu::GPU1_UUID, 1, "1"),
+            1920,
+            1080,
+            Rational::new(25, 1),
+        );
+        assert_eq!(placement, super::DecodePlacement::SoftwareOnly);
+        assert_eq!(super::decoder_open_args(&placement, None), (false, None));
+    }
+
+    #[test]
+    fn live_spawner_forces_software_when_no_island_was_admitted() {
+        // FINDING #1 — empty island must FAIL CLOSED. Under `gpu`, startup
+        // admission published NO island (scorer rejection / no NVML / no
+        // admissible GPU), so the slot is empty. A runtime-added decode must
+        // NOT keep the constructor `Default` (= libav default-device NVDEC, the
+        // very GPU admission declined) — it must force `SoftwareOnly`. We also
+        // confirm the consult is SKIPPED (no load poll) on the empty path.
+        use multiview_compositor::pipeline::CanvasColor;
+
+        let doc = r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "/tmp/live-spawner-empty-island.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        let config =
+            multiview_config::MultiviewConfig::load_from_toml(doc).expect("test config parses");
+        let layout = config.solve_layout().expect("test layout solves");
+
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawner = LiveIngestSpawner {
+            layout: std::sync::Arc::new(layout),
+            canvas_color: CanvasColor::default(),
+            cadence: Rational::new(25, 1),
+            // EMPTY island slot — admission named no device.
+            island: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            load_source: Box::new(CountingLoadSource {
+                polls: std::sync::Arc::clone(&polls),
+            }),
+        };
+
+        let placement = spawner.decode_placement_for("live1");
+        assert_eq!(
+            placement,
+            super::DecodePlacement::SoftwareOnly,
+            "an empty island (admission named none) must FORCE software, never Default"
+        );
+        assert_eq!(
+            super::decoder_open_args(&placement, None),
+            (false, None),
+            "the empty-island decode open must not WANT hardware at all"
+        );
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the empty-island path must SKIP the admission consult (no load poll)"
+        );
+    }
+
+    /// A spy [`LoadSource`]: counts polls (proof the spawn path re-polls the
+    /// admission inputs at decision time) and otherwise answers as the fake
+    /// two-GPU host.
+    struct CountingLoadSource {
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LoadSource for CountingLoadSource {
+        fn poll(&self) -> Vec<DeviceLoad> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            FakeTwoGpu.poll()
+        }
+
+        fn device_target(&self, device: &DeviceId) -> Option<GpuTargetInfo> {
+            FakeTwoGpu.device_target(device)
+        }
+    }
+
+    #[test]
+    fn live_spawner_consults_the_admission_path_on_every_decoded_spawn() {
+        // THE SEAM PIN (ADR-W018 §7): `LiveIngestSpawner::spawn` — the hub's
+        // decoded-producer path — must consult the admission scorer (observed
+        // via the injected load-source spy: exactly one fresh poll per spawn)
+        // when an island is pinned, and still spawn the SAME supervised
+        // ingest producer either way.
+        use crate::live_sources::{SourceSpawn, SpawnedProducer};
+        use multiview_compositor::pipeline::CanvasColor;
+
+        let doc = r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "/tmp/live-spawner-consult.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        let config =
+            multiview_config::MultiviewConfig::load_from_toml(doc).expect("test config parses");
+        let layout = config.solve_layout().expect("test layout solves");
+
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawner = LiveIngestSpawner {
+            layout: std::sync::Arc::new(layout),
+            canvas_color: CanvasColor::default(),
+            cadence: Rational::new(25, 1),
+            island: std::sync::Arc::new(arc_swap::ArcSwapOption::from_pointee(island(
+                FakeTwoGpu::GPU1_UUID,
+                1,
+                "1",
+            ))),
+            load_source: Box::new(CountingLoadSource {
+                polls: std::sync::Arc::clone(&polls),
+            }),
+        };
+
+        let source: multiview_config::Source = serde_json::from_value(serde_json::json!({
+            "id": "live1", "kind": "file", "path": "/nonexistent/clip.ts"
+        }))
+        .expect("test source parses");
+        let store = std::sync::Arc::new(
+            multiview_framestore::TileStore::<super::Nv12Image>::with_defaults("live1"),
+        );
+        let registry = crate::live_sources::stop_registry();
+        let produced = crate::live_sources::IngestSpawner::spawn(
+            &spawner,
+            SourceSpawn { source, store },
+            &registry,
+        );
+
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the decoded spawn path must consult the admission inputs exactly \
+             once (a fresh measured-load poll at decision time)"
+        );
+        let Some(SpawnedProducer { stop, handle }) = produced else {
+            panic!("the spawner must spawn the supervised ingest producer");
+        };
+        assert!(
+            registry.lock().is_ok_and(|map| map.contains_key("live1")),
+            "the spawned producer registers its per-source stop flag"
+        );
+        // The nonexistent file fails its open and the finite ingest thread
+        // ends on its own; raise the flag anyway and join (bounded by the
+        // thread's own prompt exit) so the test leaks nothing.
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("ingest thread joins");
+    }
 }
 
 #[cfg(test)]
 mod encoder_format_tests {
-    use super::encoder_input_format;
+    use super::{encoder_input_format, output_codec};
     use ffmpeg_next::format::Pixel;
+    use multiview_config::Output;
+
+    /// Deserialize a JSON `[[outputs]]` fragment into an [`Output`] (the
+    /// `#[non_exhaustive]`, `#[serde(tag = "kind")]` enum has no cross-crate
+    /// struct literal).
+    fn output(json: serde_json::Value) -> Output {
+        serde_json::from_value::<Output>(json).expect("output fragment parses")
+    }
+
+    #[test]
+    fn webrtc_output_codec_drives_the_program_encoder() {
+        // ADR-0049: a WHEP-serve `webrtc` output consumes the encode-once program
+        // rendition, which MUST be the codec it names (default h264). The program
+        // encoder is resolved from the first output naming a codec — so a
+        // webrtc-only config must select h264, not silently fall back to mpeg2video
+        // (which the SRTP packetizer cannot carry). This is the live-path defect.
+        let whep = output(serde_json::json!({
+            "kind": "webrtc", "label": "Program WHEP", "codec": "h264"
+        }));
+        assert_eq!(
+            output_codec(&whep),
+            Some("h264"),
+            "a webrtc output names its codec for the program encoder"
+        );
+        // The default codec (field omitted) is also surfaced as h264.
+        let whep_default = output(serde_json::json!({
+            "kind": "webrtc", "label": "Program WHEP"
+        }));
+        assert_eq!(
+            output_codec(&whep_default),
+            Some("h264"),
+            "a webrtc output's default codec (h264) drives the program encoder"
+        );
+    }
+
+    #[test]
+    fn whip_push_output_codec_drives_the_program_encoder() {
+        // ADR-0049: a whip_push output likewise consumes the encoded program; its
+        // named codec (default h264) must select the program encoder.
+        let push = output(serde_json::json!({
+            "kind": "whip_push", "url": "https://[2001:db8::1]:8443/whip/p", "codec": "h264"
+        }));
+        assert_eq!(
+            output_codec(&push),
+            Some("h264"),
+            "a whip_push output names its codec for the program encoder"
+        );
+    }
 
     #[test]
     fn nvenc_encoders_are_fed_nv12_to_skip_the_per_tick_swscale() {
@@ -844,6 +1402,9 @@ mod encoder_format_tests {
 enum RunnableOutput {
     /// A single container file (container inferred from the path extension).
     File {
+        /// The output's stable config id, for the ADR-0060 `output` resource
+        /// scope so this sink's libav mux lines name the output.
+        id: String,
         /// The packet-fed file muxer.
         sink: PacketMuxSink,
         /// Where the container is written (for the run report).
@@ -855,6 +1416,9 @@ enum RunnableOutput {
     /// infinite live run writes (and bounds) the playlist + segment set instead of
     /// rendering once at a finalize that never arrives.
     Hls {
+        /// The output's stable config id, for the ADR-0060 `output` resource
+        /// scope so this sink's libav segment/mux lines name the output.
+        id: String,
         /// The packet-fed GOP-segment muxer (live flavour).
         sink: PacketMuxSink,
         /// Where the `.m3u8` playlist is published (owned + written by the live
@@ -867,6 +1431,9 @@ enum RunnableOutput {
     /// network URL. A push whose peer is unreachable is reported and dropped,
     /// never allowed to fail the program (invariants #1/#10).
     Push {
+        /// The output's stable config id, for the ADR-0060 `output` resource
+        /// scope so this push's libav mux/transport lines name the output.
+        id: String,
         /// The packet-fed push muxer.
         sink: PacketMuxSink,
         /// A short transport label (`rtmp`/`srt`) for the run report + logs.
@@ -874,6 +1441,98 @@ enum RunnableOutput {
         /// The destination URL (for the run report + logs).
         url: String,
     },
+    /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
+    /// sink that re-stamps each coded [`EncodedPacket`] into an
+    /// [`EgressSample`](multiview_webrtc::egress::EgressSample) and pushes it onto
+    /// a bounded drop-oldest [`EgressSink`](multiview_webrtc::egress::EgressSink)
+    /// — the encode-once program AUs the WHEP-serve driver / `whip_push` client
+    /// packetize into SRTP per session (invariant #7: no re-encode; per-viewer
+    /// cost is packetization only). A stalled viewer / dead WHIP target drops on
+    /// the feed, never stalling the fan-out (invariants #1/#10). Only under
+    /// `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    WebRtc {
+        /// The output's stable config id, for the ADR-0060 `output` resource
+        /// scope (this mux-free sink emits no libav lines, but our own logs on
+        /// its runner thread are still attributed to the output).
+        id: String,
+        /// The bounded drop-oldest egress sink the program AUs are pushed onto.
+        sink: multiview_webrtc::egress::EgressSink,
+        /// A short label (`webrtc`/`whip_push`) + the output id for the report.
+        label: String,
+    },
+    /// An NDI program output (OUT-4b / NDI-L2): a **raw-canvas** sink that sends
+    /// the composited pre-encode NV12 canvas (converted NV12→UYVY at the
+    /// host-copy boundary, ADR-0004) to a single NDI source — a distinct canvas
+    /// consumer, NOT a packet sink (it never joins the encode-once fan-out, like
+    /// the display head). The live sender is gated by an **accepted** NDI license
+    /// by construction (`NdiOutput::new`), so this variant only exists once the
+    /// `[system.ndi] accept_license` gate has passed. The engine publishes each
+    /// canvas into the paired wait-free mailbox; this runner reads the
+    /// newest-wins slot, so a slow/absent NDI consumer drops at the tap and can
+    /// never back-pressure the engine (invariants #1 + #10). Built only under
+    /// `ndi-bindings` (the live `SdkNdiApi` over the licensed SDK table).
+    #[cfg(feature = "ndi-bindings")]
+    Ndi {
+        /// The output's stable config id (ADR-0060 `output` resource scope).
+        id: String,
+        /// The live, license-gated NDI sender (host-memory canvas frames only).
+        sink: NdiOutput<multiview_output::ndi::SdkNdiApi>,
+        /// The sink-side reader of the wait-free canvas tap the engine publishes
+        /// into; newest-wins (drop-oldest), so the engine never blocks here.
+        reader: multiview_output::display::FrameReader<NdiCanvasFrame>,
+        /// The output cadence (exact rational) the NDI 100 ns timecode + the
+        /// frame-rate descriptor are derived from (invariant #3).
+        cadence: Rational,
+        /// The advertised NDI source name (for the run report).
+        name: String,
+    },
+    /// An AES67 / ST 2110-30 raw-PCM audio output (#103, ADR-0033/T013): a
+    /// **mux-free** sink that multicasts the mixed program audio as L16/L24 RTP.
+    /// It consumes NO coded packets — the packet fan-out `rx` is used purely as
+    /// the end-of-program pulse (like the NDI / display heads) — because the
+    /// program audio arrives out-of-band via the paired
+    /// [`Aes67SenderHandle`](multiview_output::aes67::Aes67SenderHandle) the bake
+    /// consumer pushes each post-loudnorm block into. The serve side
+    /// ([`Aes67Sender`](multiview_output::aes67::Aes67Sender)) drains that shared
+    /// drop-oldest FIFO on its OWN media-clock timer and sends UDP; a slow/absent
+    /// network drops at the FIFO and can never back-pressure the bake consumer, let
+    /// alone the engine (invariants #1 + #10). Only under `aes67`.
+    #[cfg(feature = "aes67")]
+    Aes67 {
+        /// The output's stable config id (ADR-0060 `output` resource scope).
+        id: String,
+        /// The serve-side sender: drains the shared FIFO the bake consumer's
+        /// [`Aes67SenderHandle`](multiview_output::aes67::Aes67SenderHandle) feeds
+        /// and frames each packet-time of PCM into a continuous RTP packet.
+        sender: multiview_output::aes67::Aes67Sender,
+        /// The local bind address (an ephemeral port on the group's-family
+        /// wildcard) the sender egresses from.
+        local: std::net::SocketAddr,
+        /// The multicast `group:port` destination the RTP is sent to.
+        dest: std::net::SocketAddr,
+        /// The multicast egress interface (default: OS-chosen).
+        interface: multiview_output::aes67::transport::MulticastInterface,
+        /// A short label + the output id (for the run report + logs).
+        label: String,
+    },
+}
+
+impl RunnableOutput {
+    /// The output's stable config id, for the ADR-0060 `output` resource scope
+    /// [`run_one_output`] enters so this sink's logs (ours and libav's mux
+    /// lines) name the output.
+    fn id(&self) -> &str {
+        match self {
+            Self::File { id, .. } | Self::Hls { id, .. } | Self::Push { id, .. } => id,
+            #[cfg(feature = "webrtc-native")]
+            Self::WebRtc { id, .. } => id,
+            #[cfg(feature = "ndi-bindings")]
+            Self::Ndi { id, .. } => id,
+            #[cfg(feature = "aes67")]
+            Self::Aes67 { id, .. } => id,
+        }
+    }
 }
 
 /// A built, ready-to-run pipeline.
@@ -950,23 +1609,79 @@ pub struct Pipeline {
     /// wins (config validation already rejects duplicate probe ids).
     #[cfg(feature = "overlay")]
     declared_probes: Vec<multiview_config::probe::Probe>,
-    /// An optional **analog** clock face requested by a `[[overlays]]` entry with
-    /// `kind = "clock"` + `face = "analog"`. `None` ⇒ only the default digital
-    /// clock label is drawn.
+    /// The **analog** clock faces requested by `[[overlays]]` entries with
+    /// `kind = "clock"` + `face = "analog"` — one face per entry, working-set
+    /// order (ADR-W022). Empty ⇒ only the default digital clock label is drawn.
     #[cfg(feature = "overlay")]
-    analog_clock: Option<crate::overlays::AnalogClockSpec>,
+    analog_clocks: Vec<crate::overlays::AnalogClockSpec>,
+    /// ADR-W022: the live overlay working-set slot, seeded with the boot
+    /// config's overlays (generation 0). The command drain publishes each
+    /// applied overlay change through it (via
+    /// [`overlay_apply_slot`](Self::overlay_apply_slot) → the binary's drain
+    /// wiring) and the bake consumer re-derives its overlay render state from
+    /// it at the next frame — a lock-free `ArcSwap`, so neither side can pace
+    /// the other (inv #1/#10).
+    #[cfg(feature = "overlay")]
+    overlay_apply: crate::live_overlays::OverlayApplySlot,
     /// Per-source last-good-frame stores, keyed by source id. Shared (`Arc`)
     /// between the engine's drive loop (reader) and the ingest threads (writers).
+    /// Each entry is an `Arc` clone of the store the [`source_registry`](Self::source_registry)
+    /// owns (MP-2, ADR-0030 §3) — this map is a lock-free reader, not the owner.
     stores: HashMapStores,
+    /// MP-2 (ADR-0030 §3): the source registry that OWNS each source's shared
+    /// [`TileStore`] and its decode sizing (the per-axis supremum across that
+    /// source's cells). [`stores`](Self::stores) and each ingest plan hold `Arc`
+    /// clones of the registry's stores; the registry is the single owner. Keyed by
+    /// source id in this single-program build (one entry per id, exactly the old
+    /// `stores` map); the URL-canonical cross-id share is a later milestone.
+    source_registry: Arc<SourceRegistry<Nv12Image>>,
+    /// The registry references this pipeline holds — one [`SourceHandle`] per
+    /// startup source — keeping each registry entry (and its shared store) alive for
+    /// the pipeline's lifetime (the program's reference to the source). Dropping the
+    /// pipeline drops these, releasing each reference (last-release removes the entry).
+    // reason: held purely for that RAII `Drop`; it is never read, and the dead_code
+    // lint cannot observe a Drop side-effect (rule 20 justification).
+    #[allow(dead_code)]
+    source_handles: Vec<SourceHandle<Nv12Image>>,
     /// The per-source producer stop flags (ADR-W018): every startup ingest
     /// thread registers its flag here, and the live-source hub shares the same
     /// registry, so a live `RemoveSource` can tear down exactly one producer.
     stop_registry: crate::live_sources::StopRegistry,
+    /// The pinned island slot (ADR-W018 §7): `drive_streaming` publishes the
+    /// admission pick's device here so the [`LiveIngestSpawner`] places every
+    /// runtime-added decode on the SAME island device (never a fragment/
+    /// migration). Empty until — and unless — admission names a device.
+    #[cfg(feature = "gpu")]
+    live_island: LiveIslandSlot,
     /// Per-source streaming ingest plans: how to open + decode each source, and
     /// the tile size its frames are scaled to. The drive starts one decode
     /// thread per plan; the threads publish into [`Self::stores`] as frames
     /// arrive (never buffered ahead of the clock — the BUG-2 fix).
     ingest_plans: Vec<IngestPlan>,
+    /// Per-media-player transport mailboxes (ADR-0057 / ADR-0097), keyed by
+    /// player id: the bounded two-class seam (state verbs conflated latest-wins;
+    /// targeted load/cue/seek a bounded drop-oldest FIFO) the control-plane
+    /// command drain submits transport verbs to, drained by each player's ingest
+    /// thread between frames. Exposed to the run wiring via
+    /// [`Self::player_mailboxes`] so the command drain
+    /// ([`crate::control::command_drain_with_seams`]) can address every declared
+    /// channel. Empty when no media players are configured.
+    player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    /// The shared WHIP publisher rendezvous (ADR-T014): the control plane's
+    /// `WhipProvider` writes a negotiated publisher into it and each webrtc
+    /// source's `drive_webrtc` loop reads. Exposed to the run wiring via
+    /// [`Self::webrtc_registry`] so the same registry backs the provider. Only
+    /// under `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    webrtc_registry: crate::webrtc_ingest::WhipRegistry,
+    /// The shared WebRTC **output** egress rendezvous (ADR-0049): one
+    /// [`EgressFeed`](multiview_webrtc::egress::EgressFeed) per `webrtc`/`whip_push`
+    /// output, fed the encode-once program AUs by that output's
+    /// `RunnableOutput::WebRtc` sink runner; the run wiring hands it to the
+    /// WHEP-serve provider (viewers) + the `whip_push` clients. Only under
+    /// `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    egress_registry: crate::webrtc_outputs::EgressRegistry,
     /// Per-source last-good **audio** stores (AUD-2), keyed by source id. Shared
     /// (`Arc`) between each source's audio decode thread (writer) and the
     /// [`ProgramBus`](multiview_audio::program::ProgramBus) the bake consumer
@@ -989,6 +1704,25 @@ pub struct Pipeline {
     /// Built only for `bars` synthetic sources; empty when this run did not opt
     /// into program audio.
     tone_ingest_plans: Vec<crate::audio::ToneIngestPlan>,
+    /// Media-player channel **audio loop** plans (ADR-T019): how to prime + loop
+    /// each player's embedded audio onto the program bus on the same wrap instant
+    /// as the video. The drive starts one player-audio loop thread per plan,
+    /// writing into that player's [`Self::audio_stores`] entry (routed onto the bus
+    /// like any source's audio). Built only for media players whose default asset
+    /// declares a vamp window; empty when this run did not opt into program audio.
+    player_audio_ingest_plans: Vec<crate::audio::PlayerAudioPlan>,
+    /// Per-source **AES67 / ST 2110-30** audio RX plans (#103, ADR-0033/T013):
+    /// how to bind + receive each AES67 multicast PCM source. The drive starts one
+    /// supervised RX thread per plan (a peer of the audio decode threads) that
+    /// depacketizes → rebases (ADR-T013) → publishes into that source's
+    /// [`Self::audio_stores`] entry, which the program bus samples like any
+    /// source's audio. An AES67 source is AUDIO-ONLY — it takes no video
+    /// [`TileStore`], no [`source_registry`](Self::source_registry) entry, and no
+    /// layout tile. Built only for `SourceKind::Aes67` sources; spawned only when
+    /// this run opted into program audio (else there is no bus to consume the
+    /// store). Only under the off-by-default `aes67` feature.
+    #[cfg(feature = "aes67")]
+    aes67_rx_plans: Vec<Aes67RxPlan>,
     /// The fixed canvas color (ADR-C001 SDR BT.709 limited).
     canvas_color: CanvasColor,
     /// The "no signal" slate composited for tiles with no usable frame.
@@ -1003,12 +1737,29 @@ pub struct Pipeline {
     encode_cfg: EncodeConfig,
     /// The runnable outputs declared in the config.
     outputs: Vec<RunnableOutput>,
+    /// The bake-consumer push handles for the configured AES67 outputs (#103),
+    /// paired with the serve-side `Aes67Sender` inside each `RunnableOutput::Aes67`.
+    /// `drive_streaming` hands these to the bake consumer, which pushes every
+    /// post-loudnorm program block into each (drop-oldest) — exactly like it feeds
+    /// the display heads. A slow/absent AES67 network drops at the FIFO and can
+    /// never back-pressure the consumer or the engine (invariants #1 + #10). Empty
+    /// when no AES67 output is configured. Only under `aes67`.
+    #[cfg(feature = "aes67")]
+    aes67_send_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
     /// The configured DRM/KMS display heads (DEV-B1 / ADR-0044, feature
     /// `display-kms`): **raw-frame** sinks fed the pre-encode NV12 canvas
     /// through wait-free mailboxes — never part of the packet fan-out. Taken
     /// (and started) once at stream start; the sinks live for the run.
     #[cfg(feature = "display-kms")]
     display_plans: Vec<DisplayOutputPlan>,
+    /// The engine-side canvas-tap publishers for the configured NDI outputs
+    /// (OUT-4b / NDI-L2, feature `ndi-bindings`): the hot loop publishes the
+    /// shared pre-encode NV12 canvas `Arc` into each (wait-free, newest-wins),
+    /// exactly like the display heads — the matching `FrameReader` lives inside
+    /// the `RunnableOutput::Ndi` in [`Self::outputs`]. Taken at stream start and
+    /// fed in the per-tick projection; the engine never blocks here (inv #1/#10).
+    #[cfg(feature = "ndi-bindings")]
+    ndi_publishers: Vec<multiview_output::display::FramePublisher<NdiCanvasFrame>>,
     /// Per-input elementary-stream inventories, keyed (and id-sorted) by source
     /// id (RT-3, ADR-0034 §9). Probed **once at build time** — off the
     /// output-clock thread — from each path-backed source's demuxer (the
@@ -1030,9 +1781,79 @@ pub struct Pipeline {
     /// (invariant #1). Only consumed under `overlay` (the bake renders it).
     #[cfg(feature = "overlay")]
     watermark_signal: Option<crate::licence::WatermarkSignal>,
+    /// The shared outbound presentation epoch (DEV-C1 / ADR-M010): written at
+    /// ~1 Hz by the timing-status task, read by the HLS rolling playlist at
+    /// each segment close to stamp `EXT-X-PROGRAM-DATE-TIME` from the same
+    /// map the control WS publishes. Cloned into each HLS sink at build time.
+    epoch: multiview_output::SharedEpoch,
+    /// The run's epoch **anchor** slot (DEV-C1): `drive_streaming` stores the
+    /// tick-0 seed + the run's monotonic source here when the program clock
+    /// seeds; the timing-status task binds to it lazily (lock-free load —
+    /// publishing/reading can never block the engine, inv #1/#10).
+    epoch_anchor: crate::timing_status::EpochAnchorSlot,
+    /// The **program-audio preview tap** (ADR-P006 audio): when set (and this run
+    /// carries program audio), the bake consumer pushes each emitted post-loudnorm
+    /// [`AudioBlock`](multiview_audio::format::AudioBlock) into this bounded
+    /// drop-oldest slot, which the live WHEP egress provider drains to Opus-encode
+    /// and send to the peer. `None` on a build/run with no WHEP egress wired, in
+    /// which case the consumer pushes nothing (zero overhead). A preview tap off
+    /// the bake consumer thread — never the output-clock loop; a slow/absent WHEP
+    /// consumer only loses the oldest blocks (inv #1/#10).
+    program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
 }
 
 type HashMapStores = std::collections::HashMap<String, Arc<TileStore<Nv12Image>>>;
+
+/// Where a source's video decode is allowed to open — the explicit tri-state
+/// outcome of decode placement (ADR-W018 §7 / ADR-0018's never-fragment rule).
+///
+/// `Option<ordinal>` cannot express this: "no ordinal" must distinguish *no
+/// placement decision* (hardware on libav's default device is fine — today's
+/// GPU-free behaviour) from *placement rejected* (hardware must NOT open: on a
+/// single-GPU host the default device IS the over-headroom island — admitting
+/// would overcommit it — and on a multi-GPU host the default device may be a
+/// **different** GPU, silently fragmenting the pipeline island). The
+/// tri-state is closed by design (no `#[non_exhaustive]`): a placement
+/// outcome is exactly one of default / pinned / forced-software.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DecodePlacement {
+    /// No placement decision: hardware decode (when the build/runtime offers
+    /// it) on libav's default device — the GPU-free / no-admission path.
+    #[default]
+    Default,
+    /// Pinned to the admission-chosen island device's CUDA enumeration
+    /// ordinal: NVDEC opens co-located with the compositor (affinity).
+    Pinned(String),
+    /// Placement REJECTED this source: the decoder open is forced to
+    /// **software** regardless of the build's hardware capability, so the
+    /// island is never overcommitted and never fragmented.
+    SoftwareOnly,
+}
+
+/// The `(want_hw, cuda_device)` pair [`open_and_stream`] hands
+/// [`StreamVideoDecoder::new_preferring_hw`] for a plan's [`DecodePlacement`].
+///
+/// This is **the** decode-open gate for placement (ADR-W018 §7):
+/// [`DecodePlacement::SoftwareOnly`] forces `(false, None)` — the hardware
+/// path is never attempted, even when NVDEC is compiled, present, and not
+/// env-disabled. The other placements keep the canonical hardware preference
+/// ([`multiview_ffmpeg::want_hw_decode`] over the `MULTIVIEW_DISABLE_NVDEC`
+/// reading) and thread the pinned ordinal through when one exists (the
+/// operator opt-out still wins over a pin).
+#[must_use]
+pub fn decoder_open_args<'p>(
+    placement: &'p DecodePlacement,
+    nvdec_disable_env: Option<&str>,
+) -> (bool, Option<&'p str>) {
+    match placement {
+        DecodePlacement::SoftwareOnly => (false, None),
+        DecodePlacement::Pinned(ordinal) => (
+            multiview_ffmpeg::want_hw_decode(nvdec_disable_env),
+            Some(ordinal.as_str()),
+        ),
+        DecodePlacement::Default => (multiview_ffmpeg::want_hw_decode(nvdec_disable_env), None),
+    }
+}
 
 /// Everything one source needs to be ingested on its own decode thread: where
 /// its media lives, the store to publish into, the tile size to scale to, the
@@ -1042,6 +1863,17 @@ struct IngestPlan {
     id: String,
     /// Where the media lives.
     location: SourceLocation,
+    /// When `Some`, this source is a **media-player channel** (ADR-0057 /
+    /// ADR-0097): [`open_and_stream`] runs the transport-driven decode loop
+    /// ([`stream_player`]) instead of the plain pace-and-publish pump — it
+    /// consults the thread-local [`MediaPlayer`](crate::player::MediaPlayer)
+    /// per decoded frame, performs the in-place loop seek + decoder flush at a
+    /// wrap, and stamps each frame from the player's own monotone
+    /// output-anchored timeline (bypassing the [`PtsNormalizer`]). The shared
+    /// [`TransportMailbox`](crate::player::TransportMailbox) inside the handle
+    /// is the only control-plane seam, drained between frames. `None` for every
+    /// non-player source (the existing ingest path is unchanged).
+    player: Option<crate::player::PlayerHandle>,
     /// The destination tile size (even pixels) the frames are scaled to.
     tile_w: u32,
     /// The destination tile height.
@@ -1074,17 +1906,187 @@ struct IngestPlan {
     canvas_color: CanvasColor,
     /// The output cadence a synthetic generator paces its publishes to.
     cadence: Rational,
-    /// The CUDA enumeration **ordinal** (e.g. `Some("1")`) the NVDEC `*_cuvid`
-    /// decoder for this source is pinned to — the SAME GPU the load-aware
-    /// admission pick pinned the compositor to (ADR-0035 Tier-1 / the
-    /// GPU-placement principle: decode + composite + encode follow one chosen
-    /// device, never split across GPUs). Stamped from the admission selection in
-    /// [`Pipeline::drive_streaming`] before the ingest threads spawn; `None` when
-    /// admission named no specific device (no NVML / GPU-free / scorer rejection)
-    /// — in **lockstep** with the compositor's `None`, so neither stage pins a GPU
-    /// and decode opens libav's default CUDA device (today's behaviour). Consumed
-    /// by [`open_and_stream`] → [`StreamVideoDecoder::new_preferring_hw`].
-    cuda_ordinal: Option<String>,
+    /// Where this source's video decode opens ([`DecodePlacement`]):
+    /// [`DecodePlacement::Pinned`] to the admission-chosen island device
+    /// (ADR-0035 Tier-1 — stamped in [`Pipeline::drive_streaming`] before the
+    /// startup threads spawn, or by the live placement consult on an admitted
+    /// runtime add), [`DecodePlacement::Default`] when no placement decision
+    /// exists (GPU-free / no NVML — in lockstep with the compositor's default
+    /// adapter), or [`DecodePlacement::SoftwareOnly`] when the live consult
+    /// REJECTED this source (ADR-W018 §7 — hardware decode must not open at
+    /// all, lest it land back on the over-headroom island or fragment onto a
+    /// different GPU). Consumed by [`open_and_stream`] → [`decoder_open_args`]
+    /// → [`StreamVideoDecoder::new_preferring_hw`].
+    decode_placement: DecodePlacement,
+    /// The shared WHIP publisher rendezvous (ADR-T014), present only for a
+    /// `webrtc` source under `webrtc-native`: [`drive_webrtc`] samples this
+    /// registry for the source's connected publisher (the negotiated RTP ring).
+    /// `None` for every other source kind / build.
+    #[cfg(feature = "webrtc-native")]
+    webrtc_registry: Option<crate::webrtc_ingest::WhipRegistry>,
+    /// The source's `AudioStore` for a `webrtc` source's de-embedded Opus
+    /// (ADR-T014 §5): WHIP video + audio arrive on one RTP flow, so the WHIP
+    /// drive loop publishes the decoded 48 kHz PCM here directly (unlike file/URL
+    /// sources, whose audio is a separate decode thread). `None` when audio is
+    /// off / not a webrtc source. Only under `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    webrtc_audio_store: Option<Arc<multiview_audio::store::AudioStore>>,
+    /// The `[system.ndi] accept_license` flag for this run (ADR-0008 §7.5),
+    /// stamped from `config.system` in [`Pipeline::build`]. Defaults to `false`
+    /// (declined): an NDI source is refused (`ndi_unlicensed`) and never starts
+    /// receiving until the operator accepts.
+    #[cfg(feature = "ndi")]
+    ndi_accept_license: bool,
+    /// The audited acceptance record (who/when) the NDI license gate consumes via
+    /// `NdiLicense::from_setting` at the receive construction point
+    /// ([`connect_ndi_receiver`]). Empty fields when unaccepted.
+    #[cfg(feature = "ndi")]
+    ndi_acceptance: multiview_input::ndi::license::LicenseAcceptance,
+    /// The **swappable resolved-URL slot** for a `YouTube` source (IN-5b): the
+    /// lock-free cell the **proactive** re-resolution loop ([`run_reresolve_loop`])
+    /// publishes each freshly resolved `*.googlevideo.com` HLS master into, ahead
+    /// of the active URL's `expire` deadline (make-before-break, ADR-0015 P2–P4).
+    /// [`open_and_stream`] reads it on every (re)open and prefers a fresh URL over
+    /// resolving inline — so when the active manifest ages out and the reconnect
+    /// bracket re-enters, the next-up URL is already in hand and the tile reopens
+    /// without waiting on a cold `yt-dlp` resolve (it rides last-good across the
+    /// brief reopen rather than degrading on a synchronous resolve at the boundary).
+    ///
+    /// The loop runs on its **own supervised thread** (a sibling of the decode
+    /// thread, off the data plane); it only ever *writes* this lock-free slot, so
+    /// it can neither pace nor stall the output clock (invariant #1) nor
+    /// back-pressure the engine (invariant #10). `None` for every non-`YouTube`
+    /// source / build (the slot is allocated per youtube plan in
+    /// [`ingest_plan_for`]). The bridge thread is spawned in
+    /// [`IngestSupervisor::start`].
+    #[cfg(feature = "youtube")]
+    youtube_url_slot: Option<Arc<arc_swap::ArcSwapOption<String>>>,
+}
+
+/// Everything one AES67 / ST 2110-30 audio source needs to be received on its own
+/// supervised RX thread (#103, ADR-0033/T013): the resolved SDP session (PCM
+/// format + RTP clock + payload type), the multicast `group:port` to bind + join,
+/// and the last-good [`AudioStore`](multiview_audio::store::AudioStore) its
+/// rebased 48 kHz PCM is published into (shared with the program bus). Audio-only
+/// — there is no [`TileStore`], no cell, and no video decode.
+#[cfg(feature = "aes67")]
+struct Aes67RxPlan {
+    /// The source id (diagnostics + the run's stop-flag key).
+    id: String,
+    /// The parsed SDP session: PCM format (channels + L16/L24), RTP clock rate,
+    /// and dynamic payload type. The multicast binding is deliberately NOT read
+    /// from here (the SDP parser ignores the `c=` line — the transport binding is
+    /// a config concern); it comes from [`Self::group`].
+    session: multiview_input::st2110::sdp::AudioSdpSession,
+    /// The resolved multicast `group:port` (from the config `multicast` override)
+    /// the receiver binds the port of and joins the group of.
+    group: std::net::SocketAddr,
+    /// The last-good `AudioStore` the rebased 48 kHz PCM is published into — shared
+    /// with the [`ProgramBus`](multiview_audio::program::ProgramBus), which samples
+    /// it per tick (a best-effort writer of a lock-free store, inv #1/#10).
+    store: Arc<multiview_audio::store::AudioStore>,
+}
+
+/// Reject a layout cell bound to an audio-only AES67 source (#103).
+///
+/// An AES67 / ST 2110-30 source decodes no pixels — it has no `TileStore` — so a
+/// layout cell referencing it would carry tile geometry with nothing to
+/// composite. This checks the RAW config bindings (`cells[].source.input_id`),
+/// independent of geometry solving, so the audio-binding is rejected with a clear
+/// message even when the cell's area does not resolve — which `solve_layout` would
+/// otherwise report as a generic "unknown grid area" error, masking the root
+/// cause. Fail-closed, and decoupled from any tile-sizing predicate.
+///
+/// # Errors
+///
+/// [`PipelineError::Config`] naming the source when any cell binds an AES67 source.
+#[cfg(feature = "aes67")]
+fn ensure_no_cell_binds_an_aes67_source(config: &MultiviewConfig) -> Result<(), PipelineError> {
+    for cell in &config.cells {
+        let Some(bound) = cell.source.input_id.as_deref() else {
+            continue;
+        };
+        let binds_aes67 = config
+            .sources
+            .iter()
+            .any(|source| source.id == bound && matches!(source.kind, SourceKind::Aes67 { .. }));
+        if binds_aes67 {
+            return Err(PipelineError::Config(
+                multiview_config::ConfigError::Validation(format!(
+                    "layout cell bound to audio-only AES67 source `{bound}`: an AES67 / \
+                     ST 2110-30 source carries no video and cannot occupy a layout tile"
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve an AES67 source's SDP session + multicast `group:port` binding (#103).
+///
+/// The SDP (RFC 4566/8866) carries the PCM format, RTP clock, and payload type;
+/// the multicast binding comes from the config `multicast` override (the SDP
+/// parser ignores the `c=` connection line by design — the transport binding is a
+/// config concern, `multiview-input`'s `st2110::sdp` module contract). A
+/// missing/malformed SDP or a missing/invalid override is a typed refusal at build
+/// time (never a silent skip — the fail-closed contract).
+///
+/// # Errors
+/// [`PipelineError::Ingest`] when the source is not AES67, the SDP does not parse,
+/// the `multicast` override is absent, or it is not a valid `group:port`.
+#[cfg(feature = "aes67")]
+fn resolve_aes67_source(
+    source: &Source,
+) -> Result<
+    (
+        multiview_input::st2110::sdp::AudioSdpSession,
+        std::net::SocketAddr,
+    ),
+    PipelineError,
+> {
+    let SourceKind::Aes67 { sdp, multicast, .. } = &source.kind else {
+        return Err(PipelineError::Ingest {
+            id: source.id.clone(),
+            reason: "resolve_aes67_source called on a non-aes67 source".to_owned(),
+        });
+    };
+    let session = multiview_input::st2110::sdp::AudioSdpSession::parse(sdp).map_err(|e| {
+        PipelineError::Ingest {
+            id: source.id.clone(),
+            reason: format!("aes67 sdp parse failed: {e}"),
+        }
+    })?;
+    let group_str = multicast.as_deref().ok_or_else(|| PipelineError::Ingest {
+        id: source.id.clone(),
+        reason: "aes67 source requires a `multicast` group:port override (e.g. \
+                 \"[ff3e::1]:5004\"); the SDP connection line is not used for the \
+                 transport binding"
+            .to_owned(),
+    })?;
+    let group = group_str
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| PipelineError::Ingest {
+            id: source.id.clone(),
+            reason: format!("aes67 multicast `{group_str}` is not a valid group:port: {e}"),
+        })?;
+    // The RX publishes into the canonical 48 kHz program-audio store and the
+    // shared ADR-T013 rebaser only rescales the RTP *timestamp* onto that index —
+    // it does NOT resample the PCM. A non-48 kHz wire clock would deliver a sample
+    // count per packet that disagrees with the rebased store cadence
+    // (overlaps/gaps/wrong pitch), so a non-48 kHz session is rejected fail-closed
+    // rather than silently mis-timed. (A resampling RX is a later slice.)
+    if session.clock_rate != AES67_STORE_RATE_HZ {
+        return Err(PipelineError::Ingest {
+            id: source.id.clone(),
+            reason: format!(
+                "aes67 session clock rate {} Hz is unsupported: only 48 kHz \
+                 ST 2110-30 sessions are supported (the RX publishes at the \
+                 canonical 48 kHz store rate and does not resample)",
+                session.clock_rate
+            ),
+        });
+    }
+    Ok((session, group))
 }
 
 /// The in-container subtitle decode route stashed on an [`IngestPlan`]: which
@@ -1136,6 +2138,21 @@ impl Pipeline {
     // ingest plan per source, wires native captions, and assembles the outputs —
     // each step is in-scope and splitting it would only scatter the wiring.
     pub fn build(config: &MultiviewConfig) -> Result<Self, PipelineError> {
+        // Fail-closed (#103): an AES67 PCM-audio source in a non-`aes67` build is a
+        // config this binary cannot honour — reject it clearly up front, never wire
+        // it dark (the same contract as a `display` source/output in a non-
+        // `display-kms` build).
+        crate::outputs::ensure_aes67_sources_supported(&config.sources).map_err(|reason| {
+            PipelineError::Config(multiview_config::ConfigError::Validation(reason))
+        })?;
+        // #103: an AES67 / ST 2110-30 source is AUDIO-ONLY (no TileStore). Reject a
+        // layout cell bound to one here — on the RAW config bindings, BEFORE
+        // `solve_layout` — so the audio-binding is named clearly and rejected
+        // whether or not the cell's geometry resolves (a bad-geometry cell would
+        // otherwise be masked by `solve_layout`'s generic area error, and the guard
+        // must not depend on tile-sizing at all). Fail-closed.
+        #[cfg(feature = "aes67")]
+        ensure_no_cell_binds_an_aes67_source(config)?;
         let layout = Arc::new(config.solve_layout()?);
         let cadence = config.canvas.fps.rational();
         let canvas_color = CanvasColor::default();
@@ -1158,6 +2175,13 @@ impl Pipeline {
         let mut audio_ingest_plans: Vec<crate::audio::AudioIngestPlan> = Vec::new();
         // AUD-5: synthetic line-up tone plans (the `bars` source's 1 kHz companion).
         let mut tone_ingest_plans: Vec<crate::audio::ToneIngestPlan> = Vec::new();
+        // #103: AES67 / ST 2110-30 audio RX plans. Each `SourceKind::Aes67` source
+        // is AUDIO-ONLY — the source loop below SKIPS the entire video path for it
+        // (no TileStore, no registry entry, no ingest plan) and queues one RX plan
+        // here, spawned in `drive_streaming`. Only under the `aes67` feature; a
+        // non-`aes67` build rejected any aes67 source up front (the gate above).
+        #[cfg(feature = "aes67")]
+        let mut aes67_rx_plans: Vec<Aes67RxPlan> = Vec::new();
 
         // Per-source native caption stores + reader plans. Built best-effort: a
         // source whose selector resolves to an HLS WebVTT rendition gets a store
@@ -1178,14 +2202,63 @@ impl Pipeline {
         #[cfg(feature = "overlay")]
         let mut prefetched_captions = prefetch_caption_plans(config);
 
+        // MP-2 (ADR-0030 §3): the SourceRegistry owns each source's shared TileStore
+        // and its decode sizing. In this single-program build it keys by source id —
+        // one entry per id, exactly today's `stores` map; a later milestone folds the
+        // URL-canonical StableStreamId so two ids at one location share ONE decode.
+        // The decode threads spawn later (drive_streaming) and their stop/join stays
+        // with the run's StopRegistry, so store creation goes through `acquire_store`
+        // (no decode actor to own yet). Holding each handle keeps its entry alive for
+        // the pipeline's lifetime (the program's reference); dropping it releases.
+        let source_registry = SourceRegistry::<Nv12Image>::new();
+        let mut source_handles: Vec<SourceHandle<Nv12Image>> =
+            Vec::with_capacity(config.sources.len());
+
         for source in &config.sources {
+            // #103: an AES67 / ST 2110-30 source is AUDIO-ONLY. It decodes no
+            // pixels, so it takes NO video TileStore, NO SourceRegistry entry, and
+            // NO layout tile — the MP-2 decode-once video seam (ADR-0030 §3) never
+            // sees it. It contributes an AudioStore (routed onto the program bus
+            // like any source's audio, so it "joins" the bus at the routing loop
+            // below) plus a supervised RX plan (bound + received on its own thread
+            // in `drive_streaming`). Skip the entire video path for it.
+            #[cfg(feature = "aes67")]
+            if matches!(source.kind, SourceKind::Aes67 { .. }) {
+                // An AES67 source decodes no pixels, so it takes NO video path (no
+                // TileStore / registry entry / layout tile). A cell bound to it is
+                // already rejected up front by `ensure_no_cell_binds_an_aes67_source`
+                // (before `solve_layout`), so here it is purely audio-only.
+                let (session, group) = resolve_aes67_source(source)?;
+                let store = crate::audio::new_store();
+                audio_stores.insert(source.id.clone(), Arc::clone(&store));
+                aes67_rx_plans.push(Aes67RxPlan {
+                    id: source.id.clone(),
+                    session,
+                    group,
+                    store,
+                });
+                continue;
+            }
             let (tile_w, tile_h) = cell_pixel_size(&layout, &source.id)
                 .unwrap_or((config.canvas.width, config.canvas.height));
-            let store = Arc::new(TileStore::new(
-                source.id.clone(),
-                TileThresholds::default(),
-                NoSignalPolicy::HoldForever,
-            ));
+            // The registry owns the shared store, sized to the per-axis supremum;
+            // `stores` + the ingest plan below hold Arc clones (lock-free readers).
+            let source_handle = source_registry.acquire_store(
+                SourceKey::from_canonical(source.id.as_str()),
+                RequestedSize {
+                    width: tile_w,
+                    height: tile_h,
+                },
+                |_requested| -> Result<Arc<TileStore<Nv12Image>>, PipelineError> {
+                    Ok(Arc::new(TileStore::new(
+                        source.id.clone(),
+                        TileThresholds::default(),
+                        NoSignalPolicy::HoldForever,
+                    )))
+                },
+            )?;
+            let store = Arc::clone(source_handle.store());
+            source_handles.push(source_handle);
             #[cfg_attr(not(feature = "overlay"), allow(unused_mut))]
             let mut plan = ingest_plan_for(
                 source,
@@ -1195,6 +2268,20 @@ impl Pipeline {
                 canvas_color,
                 cadence,
             )?;
+
+            // Stamp this source's NDI license acceptance from `[system.ndi]`
+            // (ADR-0008 §7.5), like `cuda_ordinal` below — the per-source drive
+            // loop's gate (`connect_ndi_receiver`) reads it before any receive
+            // starts. Absent/false ⇒ declined (the plan's `false` default stands)
+            // and the source is refused (`ndi_unlicensed`).
+            #[cfg(feature = "ndi")]
+            if let Some(ndi) = config.system.as_ref().and_then(|s| s.ndi.as_ref()) {
+                plan.ndi_accept_license = ndi.accept_license;
+                plan.ndi_acceptance = multiview_input::ndi::license::LicenseAcceptance {
+                    accepted_by: ndi.accepted_by.clone().unwrap_or_default(),
+                    accepted_at: ndi.accepted_at.clone().unwrap_or_default(),
+                };
+            }
 
             // Wire this source's native captions (HLS WebVTT rendition thread +/or
             // in-container DVB-sub route), registering any cue store + reader plan
@@ -1234,6 +2321,48 @@ impl Pipeline {
             }
         }
 
+        // Boot-spawn the configured media-player channels (ADR-0057 / ADR-0097):
+        // each rolling player gets its own player `IngestPlan` (driven by the
+        // transport state machine) + last-good store; every declared player gets
+        // a registered transport mailbox the control-plane command drain submits
+        // verbs to. A player channel is a source like any other — the engine only
+        // samples its store per tick (inv #1/#10).
+        let media_player_boot = build_media_player_boot(config, &layout, cadence, canvas_color);
+        let player_mailboxes = media_player_boot.mailboxes;
+        for (id, store) in media_player_boot.stores {
+            stores.insert(id, store);
+        }
+        ingest_plans.extend(media_player_boot.plans);
+        // ADR-T019: register each rolling player's `AudioStore` (so the program-bus
+        // routing below picks it up at unity gain, like any source's audio) and
+        // collect its audio loop plan (spawned in `drive_streaming`). A player with
+        // a silent asset still gets a store; its deck primes empty → it rides
+        // silence (no special-casing — exactly as a silent source does).
+        let player_audio_ingest_plans = media_player_boot.audio_plans;
+        for (id, audio_store) in media_player_boot.audio_stores {
+            audio_stores.insert(id, audio_store);
+        }
+
+        // WHIP ingest wiring (ADR-T014, `webrtc-native`): one shared publisher
+        // rendezvous registry the control plane's WhipProvider writes to and each
+        // webrtc source's `drive_webrtc` loop reads from. Stamp it (and, for an
+        // audio-accepting source, a freshly-built AudioStore that joins the
+        // program bus below) onto every webrtc ingest plan — the peer of the
+        // `cuda_ordinal` stamping. Without the feature this is absent.
+        #[cfg(feature = "webrtc-native")]
+        let webrtc_registry = crate::webrtc_ingest::WhipRegistry::new();
+        #[cfg(feature = "webrtc-native")]
+        for plan in &mut ingest_plans {
+            if let SourceLocation::Webrtc { audio } = &plan.location {
+                plan.webrtc_registry = Some(webrtc_registry.clone());
+                if *audio {
+                    let store = crate::audio::new_store();
+                    audio_stores.insert(plan.id.clone(), Arc::clone(&store));
+                    plan.webrtc_audio_store = Some(store);
+                }
+            }
+        }
+
         let nosignal_card =
             Nv12Image::solid(config.canvas.width, config.canvas.height, 16, 128, 128, tag)
                 .map_err(|e| PipelineError::Engine(e.to_string()))?;
@@ -1268,7 +2397,24 @@ impl Pipeline {
             cuda_ordinal: None,
         };
 
-        let built = build_outputs(&config.outputs)?;
+        // The shared outbound presentation epoch (DEV-C1 / ADR-M010): one cell
+        // per pipeline, written by the timing-status task and read by every
+        // HLS rolling playlist (PDT) — one anchor, every surface agrees.
+        let epoch = multiview_output::SharedEpoch::new();
+        // The WebRTC output egress rendezvous (ADR-0049): one drop-oldest feed per
+        // `webrtc`/`whip_push` output, with the paired `EgressSink` keyed by output
+        // id for the sink runners. The run wiring reads the registry to bind the
+        // WHEP-serve endpoint + spawn the whip_push clients. Under `webrtc-native`.
+        #[cfg(feature = "webrtc-native")]
+        let (egress_registry, egress_sinks) = crate::webrtc_outputs::build_egress_registry(config);
+        let built = build_outputs(
+            &config.outputs,
+            &epoch,
+            #[cfg(feature = "webrtc-native")]
+            &egress_sinks,
+            config.system.as_ref().and_then(|s| s.ndi.as_ref()),
+            cadence,
+        )?;
         #[cfg(feature = "display-kms")]
         let has_display = !built.display.is_empty();
         #[cfg(not(feature = "display-kms"))]
@@ -1296,10 +2442,10 @@ impl Pipeline {
                 (s.id.clone(), label)
             })
             .collect();
-        // Read an optional analog clock face from a `[[overlays]]` clock entry.
+        // Read the analog clock faces from the `[[overlays]]` clock entries.
         #[cfg(feature = "overlay")]
-        let analog_clock =
-            analog_clock_from_config(&config.overlays, config.canvas.width, config.canvas.height);
+        let analog_clocks =
+            analog_clocks_from_config(&config.overlays, config.canvas.width, config.canvas.height);
 
         // The legacy `--subtitles` sidecar (if attached later) burns into the
         // first source-bound cell. Pre-resolve that target id once here.
@@ -1333,11 +2479,23 @@ impl Pipeline {
             cadence,
             program_spec,
             stores,
+            source_registry,
+            source_handles,
             stop_registry: crate::live_sources::stop_registry(),
+            #[cfg(feature = "gpu")]
+            live_island: Arc::new(arc_swap::ArcSwapOption::empty()),
             ingest_plans,
+            player_mailboxes,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_registry,
+            #[cfg(feature = "webrtc-native")]
+            egress_registry,
             audio_stores,
             audio_ingest_plans,
             tone_ingest_plans,
+            player_audio_ingest_plans,
+            #[cfg(feature = "aes67")]
+            aes67_rx_plans,
             inventories,
             #[cfg(feature = "overlay")]
             caption_stores,
@@ -1353,6 +2511,10 @@ impl Pipeline {
             outputs,
             #[cfg(feature = "display-kms")]
             display_plans: built.display,
+            #[cfg(feature = "ndi-bindings")]
+            ndi_publishers: built.ndi_publishers,
+            #[cfg(feature = "aes67")]
+            aes67_send_handles: built.aes67_handles,
             #[cfg(feature = "overlay")]
             subtitles: None,
             #[cfg(feature = "overlay")]
@@ -1364,9 +2526,14 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             declared_probes: config.probes.clone(),
             #[cfg(feature = "overlay")]
-            analog_clock,
+            analog_clocks,
             #[cfg(feature = "overlay")]
             watermark_signal: None,
+            #[cfg(feature = "overlay")]
+            overlay_apply: crate::live_overlays::overlay_apply_slot(config.overlays.clone()),
+            epoch,
+            epoch_anchor: crate::timing_status::anchor_slot(),
+            program_audio_preview: None,
         })
     }
 
@@ -1457,12 +2624,89 @@ impl Pipeline {
         self.stores.len()
     }
 
+    /// The number of layout tiles (cells) the canvas composites — the decode-stage
+    /// demand magnitude the placement controller admits against (GPU-5c).
+    #[must_use]
+    pub fn tile_count(&self) -> usize {
+        self.layout.cells.len()
+    }
+
+    /// The output canvas resolution (the placement controller's per-stage demand
+    /// resolution, GPU-5c).
+    #[must_use]
+    pub fn canvas_resolution(&self) -> multiview_hal::Resolution {
+        multiview_hal::Resolution::new(
+            self.layout.canvas.width.max(1),
+            self.layout.canvas.height.max(1),
+        )
+    }
+
+    /// Whether this run's encode opens an NVENC session (the session-ceiling gate
+    /// applies in placement admission, GPU-5c).
+    #[must_use]
+    pub fn opens_encode_session(&self) -> bool {
+        self.encoder.name.ends_with("_nvenc")
+    }
+
+    /// The per-media-player transport mailboxes (ADR-0057 / ADR-0097), keyed by
+    /// player id: hand this to the control-plane command drain
+    /// ([`crate::control::command_drain_with_seams`] /
+    /// [`crate::control::command_drain_with_live_sources`]) so a `MediaTransport`
+    /// or exit command reaches the addressed running player channel. Cloned
+    /// (the `Arc<TransportMailbox>` values are shared with the ingest threads).
+    #[must_use]
+    pub fn player_mailboxes(
+        &self,
+    ) -> std::collections::HashMap<String, Arc<crate::player::TransportMailbox>> {
+        self.player_mailboxes.clone()
+    }
+
     /// The shared per-source producer stop registry (ADR-W018): hand this to
     /// the [`LiveSourceHub`](crate::live_sources::LiveSourceHub) so a live
     /// remove can tear down a startup producer (ingest thread or generator).
     #[must_use]
     pub fn stop_registry(&self) -> crate::live_sources::StopRegistry {
         Arc::clone(&self.stop_registry)
+    }
+
+    /// The run's decoded-ingest spawner for the live-source hub (ADR-W018
+    /// level 2): hand this to
+    /// [`LiveSourceHub::start_with_ingest`](crate::live_sources::LiveSourceHub::start_with_ingest)
+    /// so a runtime-added network/file source spawns the **same** supervised
+    /// [`ingest_loop`] the startup path runs (one uniform ingest path), with
+    /// its decode placement consulted against the **same** admission scorer —
+    /// pinned to the running island's device — that placed the startup island.
+    #[must_use]
+    pub fn live_ingest_spawner(&self) -> Arc<dyn crate::live_sources::IngestSpawner> {
+        Arc::new(LiveIngestSpawner {
+            layout: Arc::clone(&self.layout),
+            canvas_color: self.canvas_color,
+            cadence: self.cadence,
+            #[cfg(feature = "gpu")]
+            island: Arc::clone(&self.live_island),
+            #[cfg(feature = "gpu")]
+            load_source: crate::system_metrics::default_load_source(),
+        })
+    }
+
+    /// The shared WHIP publisher rendezvous registry (ADR-T014). The run wiring
+    /// hands this to the control plane's `WhipProvider` so a `POST` rendezvous'd
+    /// publisher reaches the matching webrtc source's `drive_webrtc` loop. Only
+    /// under `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    #[must_use]
+    pub fn webrtc_registry(&self) -> crate::webrtc_ingest::WhipRegistry {
+        self.webrtc_registry.clone()
+    }
+
+    /// The shared WebRTC **output** egress rendezvous (ADR-0049). The run wiring
+    /// reads it to build the WHEP-serve provider (browser viewers) and spawn the
+    /// `whip_push` clients, both fed the encode-once program over the per-output
+    /// drop-oldest feed. Only under `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    #[must_use]
+    pub fn egress_registry(&self) -> crate::webrtc_outputs::EgressRegistry {
+        self.egress_registry.clone()
     }
 
     /// The resolved concrete encoder name.
@@ -1489,6 +2733,59 @@ impl Pipeline {
     /// canonical program format).
     pub fn enable_program_audio(&mut self) {
         self.encode_cfg.audio = Some(multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000));
+    }
+
+    /// Whether this run carries **program audio** (`enable_program_audio` was
+    /// called): the bake consumer mixes + encodes a program-audio stream. The
+    /// binary checks this to decide whether to wire a WHEP program-audio tap.
+    #[must_use]
+    pub fn has_program_audio(&self) -> bool {
+        self.encode_cfg.audio.is_some()
+    }
+
+    /// Fail closed if this run declares an AES67 source or output but carries no
+    /// program audio (#103).
+    ///
+    /// The ST 2110-30 RX publishes into, and the TX taps, the **program-audio
+    /// bus** — which only exists when `enable_program_audio` was called (the
+    /// `--program-audio` invocation). Without it the RX would be spawned to
+    /// nowhere and the TX would multicast silence, both silently. Rather than go
+    /// on air doing neither, refuse the run with a clear message. A no-op when the
+    /// config declares no AES67 endpoint (empty plans/handles) or when program
+    /// audio is on, so non-AES67 and correctly-configured runs are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Config`] when an AES67 endpoint is configured without
+    /// program audio.
+    #[cfg(feature = "aes67")]
+    fn ensure_aes67_has_program_audio(&self) -> Result<(), PipelineError> {
+        if self.encode_cfg.audio.is_some()
+            || (self.aes67_rx_plans.is_empty() && self.aes67_send_handles.is_empty())
+        {
+            return Ok(());
+        }
+        Err(PipelineError::Config(
+            multiview_config::ConfigError::Validation(
+                "an AES67 / ST 2110-30 source or output requires program audio: run \
+                 with `--program-audio` (the ST 2110-30 RX/TX only exists on the \
+                 program-audio bus)"
+                    .to_owned(),
+            ),
+        ))
+    }
+
+    /// Attach the **program-audio preview tap** (ADR-P006 audio): the bake
+    /// consumer pushes each emitted post-loudnorm program
+    /// [`AudioBlock`](multiview_audio::format::AudioBlock) into `slot`, which the
+    /// live WHEP egress provider drains to Opus-encode + send to the peer. The cli
+    /// shares the SAME slot here and in `CliWhepProvider::spawn`, so program audio
+    /// reaches a WHEP peer when (and only when) program audio is configured. A
+    /// no-op tap when this run has no program audio (the consumer pushes nothing).
+    /// The push is off the output-clock loop and bounded drop-oldest, so a
+    /// slow/absent WHEP consumer can never back-pressure the engine (inv #1/#10).
+    pub fn set_program_audio_preview(&mut self, slot: crate::preview::ProgramAudioSlot) {
+        self.program_audio_preview = Some(slot);
     }
 
     /// Run the engine for exactly `max_ticks` ticks under the realtime pacer,
@@ -1625,6 +2922,33 @@ impl Pipeline {
         self.stores.clone()
     }
 
+    /// The source registry that owns this pipeline's per-source shared stores +
+    /// their decode sizing (MP-2, ADR-0030 §3). The run/drive path reads it to
+    /// resolve a source's shared decode; `stores` holds `Arc` clones of the same
+    /// stores for lock-free sampling.
+    #[must_use]
+    pub fn source_registry(&self) -> &Arc<SourceRegistry<Nv12Image>> {
+        &self.source_registry
+    }
+
+    /// DEV-C1 (ADR-M010): the shared outbound presentation-epoch cell this
+    /// pipeline's HLS sinks stamp `EXT-X-PROGRAM-DATE-TIME` from. The
+    /// timing-status task writes it (~1 Hz); reading/writing is a tiny
+    /// lock-guarded `Copy` access on off-hot-path threads only.
+    #[must_use]
+    pub fn shared_epoch(&self) -> multiview_output::SharedEpoch {
+        self.epoch.clone()
+    }
+
+    /// DEV-C1 (ADR-M010): the run's epoch **anchor** slot. `drive_streaming`
+    /// publishes the tick-0 seed + the run's monotonic source into it when the
+    /// program clock seeds; the timing-status task binds to it lazily with a
+    /// lock-free load (inv #1/#10 — neither side can block the engine).
+    #[must_use]
+    pub fn epoch_anchor_slot(&self) -> crate::timing_status::EpochAnchorSlot {
+        Arc::clone(&self.epoch_anchor)
+    }
+
     /// RT-10b: the live subtitle re-point handle for the running pipeline, or
     /// [`None`] before a `drive` has started (or on a run with no caption stores).
     ///
@@ -1656,6 +2980,19 @@ impl Pipeline {
         &self,
     ) -> Arc<arc_swap::ArcSwapOption<crate::captions::SubtitleRouteHandle>> {
         Arc::clone(&self.subtitle_route)
+    }
+
+    /// ADR-W022: the **shared** live overlay working-set slot. The binary
+    /// threads a clone into the command drain
+    /// ([`command_drain_with_seams`](crate::control::command_drain_with_seams))
+    /// so `UpsertOverlay`/`RemoveOverlay` publish through it at the frame
+    /// boundary; the bake consumer re-derives its overlay render state from it
+    /// at the next frame. Reading/writing is a lock-free `ArcSwap` load/store,
+    /// so neither side can pace or stall the output clock (inv #1/#10).
+    #[cfg(feature = "overlay")]
+    #[must_use]
+    pub fn overlay_apply_slot(&self) -> crate::live_overlays::OverlayApplySlot {
+        Arc::clone(&self.overlay_apply)
     }
 
     /// Build one [`SinkRunner`] per configured runnable output. Each runner
@@ -1791,6 +3128,11 @@ impl Pipeline {
         P: Pacer,
         FC: FnMut(&mut CompositorDrive<Nv12Image>),
     {
+        // #103: an AES67 source/output only functions on the program-audio bus, so
+        // fail closed BEFORE the output clock starts if this run carries none —
+        // never go on air silently receiving/emitting silence.
+        #[cfg(feature = "aes67")]
+        self.ensure_aes67_has_program_audio()?;
         let StreamPlan {
             policy,
             runners,
@@ -1841,13 +3183,25 @@ impl Pipeline {
             );
             // Stamp the chosen device's CUDA ordinal onto every ingest plan BEFORE
             // the threads spawn, so decode co-locates with the compositor on the
-            // one chosen GPU (affinity). `None` leaves the plans on the default
-            // CUDA device — in lockstep with `wgpu_target` being `None`, so neither
-            // stage pins a GPU.
+            // one chosen GPU (affinity). No ordinal leaves the plans on
+            // `DecodePlacement::Default` (libav's default CUDA device) — in
+            // lockstep with `wgpu_target` being `None`, so neither stage pins a GPU.
             if let Some(ordinal) = pick.cuda_ordinal.as_deref() {
                 for plan in &mut self.ingest_plans {
-                    plan.cuda_ordinal = Some(ordinal.to_owned());
+                    plan.decode_placement = DecodePlacement::Pinned(ordinal.to_owned());
                 }
+            }
+            // Publish the pinned island (ADR-W018 §7) so every RUNTIME-added
+            // decode consults the same admission scorer pinned to THIS device —
+            // a live add never fragments or migrates the island. Stays empty
+            // when admission named no device (the live spawner then skips the
+            // consult, in lockstep with the startup plans' `None`).
+            if let Some(device) = pick.device.clone() {
+                self.live_island.store(Some(Arc::new(LiveIsland {
+                    device,
+                    cuda_ordinal: pick.cuda_ordinal.clone(),
+                    tile_count: self.layout.cells.len(),
+                })));
             }
             // The pinned chosen device, or `GpuTarget::none()` (prefer the GPU at
             // the default adapter) when admission did not name a specific GPU — so
@@ -1918,6 +3272,36 @@ impl Pipeline {
         } else {
             Vec::new()
         };
+        // Media-player channels with embedded audio (ADR-T019): each loops its
+        // asset's vamp-segment audio onto the program bus on the same wrap instant
+        // as the video. Spawned ONLY when this run opted into program audio (else no
+        // `ProgramBus` consumes the store). Each pairs the player's audio plan with
+        // its `AudioStore` (already routed onto the bus below).
+        let player_audio_plans: Vec<(
+            crate::audio::PlayerAudioPlan,
+            Arc<multiview_audio::store::AudioStore>,
+        )> = if self.encode_cfg.audio.is_some() {
+            std::mem::take(&mut self.player_audio_ingest_plans)
+                .into_iter()
+                .filter_map(|plan| {
+                    self.audio_stores
+                        .get(&plan.id)
+                        .map(|store| (plan, Arc::clone(store)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // #103: AES67 / ST 2110-30 audio RX plans (audio-only ST 2110-30 sources).
+        // Spawned ONLY when this run opted into program audio — mirroring the audio
+        // decode plans above: without a `ProgramBus` consuming the store, the
+        // received PCM would go nowhere. Left in place (untouched) when audio is off.
+        #[cfg(feature = "aes67")]
+        let aes67_plans: Vec<Aes67RxPlan> = if self.encode_cfg.audio.is_some() {
+            std::mem::take(&mut self.aes67_rx_plans)
+        } else {
+            Vec::new()
+        };
         // The supervisor registers every producer's per-thread stop flag in the
         // run's shared registry (ADR-W018) — the video decode thread under `{id}`,
         // its audio/tone/caption companions under `{id}/<role>` — so a live
@@ -1926,9 +3310,20 @@ impl Pipeline {
             plans,
             audio_plans,
             tone_plans,
+            player_audio_plans,
             caption_plans,
             &self.stop_registry,
         );
+        // #103: spawn the AES67 RX threads into the SAME supervisor (its bounded
+        // stop+join teardown), registered under `{id}` like a video source's
+        // producer. An AES67 source has no video decode thread, so `{id}` is its
+        // primary producer flag (a live `RemoveSource` stops it).
+        #[cfg(feature = "aes67")]
+        let supervisor = {
+            let mut supervisor = supervisor;
+            supervisor.spawn_aes67_receivers(aes67_plans, &self.stop_registry);
+            supervisor
+        };
 
         // Prime the first frame per tile BEFORE constructing the runtime (whose
         // `new` seeds tick 0 to "now") and therefore before the output clock's
@@ -1980,6 +3375,95 @@ impl Pipeline {
         // streaming/web level (this output is a live streaming multiview).
         let audio_loudnorm = self.encode_cfg.audio.as_ref().and_then(program_loudnorm);
 
+        // The program-bus EBU R128 loudness telemetry (AUD-8): a read-only
+        // compliance meter measuring the EMITTED program (post-loudnorm) and
+        // pushing a conflated `audio.loudness` sample (M/S/I/LRA/dBTP +
+        // compliance reference) onto the engine event stream at ~10 Hz. Built
+        // when (and only when) audio is on, at the same format as the bus + the
+        // SAME compliance target/ceiling/tolerance the loudnorm processor uses
+        // (so the browser meter colours against exactly that). `None` when audio
+        // is off (no loudness lane) OR when the meter fails to build (the run
+        // continues without the meter rather than failing — telemetry is
+        // best-effort, inv #10). Moves into the bake consumer (it is `Send`); it
+        // never runs on the engine hot loop.
+        let audio_loudness = self
+            .encode_cfg
+            .audio
+            .as_ref()
+            .and_then(|cfg| program_loudness_telemetry(cfg, audio_loudnorm.as_ref()));
+
+        // A cheap clone of the engine's outbound publisher (Arc-backed, drop-
+        // oldest): the bake consumer publishes loudness samples through it. The
+        // clone shares the same broadcast, so a sample published from the consumer
+        // thread reaches every subscriber exactly like a hot-loop event; it can
+        // neither block the engine nor be back-pressured by a slow UI (inv #10).
+        let loudness_publisher = audio_loudness.is_some().then(|| publisher.clone());
+
+        // DEV-B1 / ADR-0044: start the configured DRM/KMS display heads NOW —
+        // startup, before the output clock runs — and keep their handles alive
+        // for the whole run (drop = stop + join, off the hot path). Each sink
+        // owns its device on a dedicated thread; the engine side holds only
+        // wait-free mailbox publishers, fed in `state_of` exactly where the
+        // live-preview slot is filled. A startup failure (no such connector,
+        // no usable mode, modeset rejected) fails the run like any other
+        // misconfigured output; after startup the sinks can never fail the
+        // engine (invariants #1 + #10). Audio-enabled heads (DEV-B4) also get
+        // an ELD-gated ALSA audio sink wired to their flip clock; the
+        // publishers feed from the bake consumer below.
+        #[cfg(feature = "display-kms")]
+        let started_displays = start_display_sinks(
+            std::mem::take(&mut self.display_plans),
+            self.cadence,
+            display_audio_format(self.encode_cfg.audio.as_ref()),
+        )?;
+        #[cfg(feature = "display-kms")]
+        let display_publishers = started_displays.publishers;
+        // Keep the video + audio sink threads alive for the whole run; dropping
+        // the handles at end of run stops + joins them (off the hot path).
+        #[cfg(feature = "display-kms")]
+        let _display_handles = started_displays.handles;
+        #[cfg(feature = "display-kms")]
+        let _display_audio_handles = started_displays.audio_handles;
+        #[cfg(feature = "display-kms")]
+        let display_audio_publishers = started_displays.audio_publishers;
+        #[cfg(not(feature = "display-kms"))]
+        let display_audio_publishers: Vec<
+            multiview_output::display::audio::DisplayAudioPublisher,
+        > = Vec::new();
+        // The display-audio feed (DEV-B4): heads receive the SAME post-loudnorm
+        // program block the stream encodes when this run carries program audio;
+        // a video-only run with audio-enabled heads gets a dedicated program
+        // bus (currently silence, correctly paced by tick index) so the audio
+        // path is real either way.
+        let display_audio = DisplayAudioFeed {
+            dedicated_bus: if audio_bus.is_none() && !display_audio_publishers.is_empty() {
+                Some(multiview_audio::program::ProgramBus::new(
+                    display_audio_format(self.encode_cfg.audio.as_ref()),
+                    self.cadence,
+                ))
+            } else {
+                None
+            },
+            publishers: display_audio_publishers,
+        };
+
+        // OUT-4b / NDI-L2: take the engine-side canvas-tap publishers for the
+        // configured NDI outputs. The hot loop publishes the SAME pre-encode
+        // canvas `Arc` into each (wait-free, newest-wins) exactly like the display
+        // heads; the paired `FrameReader` rides inside each `RunnableOutput::Ndi`
+        // sink (which the egress spawns below). The engine never blocks on an NDI
+        // send (inv #1/#10). Empty when no NDI output is configured/licensed.
+        #[cfg(feature = "ndi-bindings")]
+        let ndi_publishers = std::mem::take(&mut self.ndi_publishers);
+
+        // #103: take the AES67 output push handles for the bake consumer. It pushes
+        // each post-loudnorm program block into every handle (drop-oldest), exactly
+        // like it feeds the display heads; the paired serve-side `Aes67Sender` rides
+        // inside each `RunnableOutput::Aes67` sink runner (spawned by the egress
+        // below). Empty when no AES67 output is configured. Only under `aes67`.
+        #[cfg(feature = "aes67")]
+        let aes67_send_handles = std::mem::take(&mut self.aes67_send_handles);
+
         // Spawn the per-sink fan-out threads + the single bake consumer thread
         // BEFORE the engine loop, so a frame produced this tick is baked +
         // encoded WHILE the engine keeps ticking (streaming, not batch — ADR-0025).
@@ -1994,6 +3478,12 @@ impl Pipeline {
             encoder,
             audio_bus,
             audio_loudnorm,
+            audio_loudness,
+            loudness_publisher,
+            display_audio,
+            self.program_audio_preview.clone(),
+            #[cfg(feature = "aes67")]
+            aes67_send_handles,
         );
 
         // Build the single program now (post-prime, ADR-0030 MP-0): the run path
@@ -2006,12 +3496,25 @@ impl Pipeline {
         // caller's `stop` (Arc-backed) as its own handle, so the existing Ctrl-C /
         // control-plane stop still ends the run unchanged. A spec/cadence mismatch
         // is a build-assembly bug, surfaced as a typed error (never a panic).
+        // The timing-status task (DEV-C1 / ADR-M010) needs the run's monotonic
+        // source to bracket its wall reads on the SAME timeline tick 0 is
+        // seeded on; clone the handle before the program takes ownership.
+        let ts_for_anchor = Arc::clone(&ts);
         let mut program =
             MultiviewProgram::new(&self.program_spec, clock, drive, ts, pacer, stop.clone())
                 .map_err(|e| PipelineError::Program {
                     program: self.program_spec.id.clone(),
                     reason: e.to_string(),
                 })?;
+        // Publish the run's epoch anchor (tick-0 seed + monotonic source) into
+        // the shared slot — a single lock-free store the off-hot-path
+        // timing-status task reads to derive the outbound presentation epoch.
+        // Publishing a value can never pace the clock (inv #1/#10).
+        self.epoch_anchor
+            .store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+                ts_for_anchor,
+                program.seed_nanos(),
+            ))));
 
         // The hot-loop drop counter (live drop-on-overload) and the queue
         // high-watermark probe. Both are wait-free atomics shared with the
@@ -2080,18 +3583,10 @@ impl Pipeline {
             publisher.publish_event(event);
         }
         let input_fragment = crate::control::input_inventories_fragment(&self.inventories);
-        // DEV-B1 / ADR-0044: start the configured DRM/KMS display heads NOW —
-        // startup, before the output clock runs — and keep their handles alive
-        // for the whole run (drop = stop + join, off the hot path). Each sink
-        // owns its device on a dedicated thread; the engine side holds only
-        // wait-free mailbox publishers, fed in `state_of` exactly where the
-        // live-preview slot is filled. A startup failure (no such connector,
-        // no usable mode, modeset rejected) fails the run like any other
-        // misconfigured output; after startup the sinks can never fail the
-        // engine (invariants #1 + #10).
-        #[cfg(feature = "display-kms")]
-        let (_display_handles, display_publishers) =
-            start_display_sinks(std::mem::take(&mut self.display_plans), self.cadence)?;
+        // (The DRM/KMS display heads — and their DEV-B4 audio sinks — were
+        // started above, before the egress spawn, so the bake consumer received
+        // the audio publishers; `display_publishers` feeds the video mailboxes
+        // in `state_of` below.)
         // The hot-loop projection runs once per tick. It SAMPLES the caption/fault
         // state (kept here on the hot loop — the bounded cue store holds only a
         // small live window, so it must be sampled now, not after the run), clones
@@ -2126,6 +3621,17 @@ impl Pipeline {
             #[cfg(feature = "display-kms")]
             for display in &display_publishers {
                 display.publish(CanvasFrame(Arc::clone(&canvas)));
+            }
+            // The NDI outputs ride the SAME pre-encode canvas `Arc` through their
+            // wait-free mailboxes (newest-wins drop-oldest) — one lock-free swap
+            // each, off the hot path; the NDI sink thread converts NV12→UYVY and
+            // sends. The engine never awaits the SDK send (OUT-4b, inv #1/#10).
+            #[cfg(feature = "ndi-bindings")]
+            for ndi in &ndi_publishers {
+                ndi.publish(NdiCanvasFrame {
+                    canvas: Arc::clone(&canvas),
+                    tick_index: frame.tick.index,
+                });
             }
             let item = StreamItem {
                 canvas: Arc::clone(&canvas),
@@ -2377,12 +3883,13 @@ impl Pipeline {
             meter_db_timelines: self.meter_db_timelines.clone(),
             subtitles: self.subtitles.clone(),
             sidecar_target: self.sidecar_target.clone(),
-            analog_clock: self.analog_clock,
+            analog_clocks: self.analog_clocks.clone(),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             watermark_signal: self.watermark_signal.clone(),
             canvas_width: self.layout.canvas.width,
             canvas_height: self.layout.canvas.height,
+            overlay_apply: Some(Arc::clone(&self.overlay_apply)),
         }
     }
 
@@ -2413,9 +3920,9 @@ struct BakeContext {
     /// The source id the sidecar burns into (the first source-bound cell).
     #[cfg(feature = "overlay")]
     sidecar_target: Option<String>,
-    /// An optional analog clock face placement.
+    /// The analog clock face placements (one per analog-face entry).
     #[cfg(feature = "overlay")]
-    analog_clock: Option<crate::overlays::AnalogClockSpec>,
+    analog_clocks: Vec<crate::overlays::AnalogClockSpec>,
     /// The fixed canvas color (for the overlay blend + output tag).
     #[cfg(feature = "overlay")]
     canvas_color: CanvasColor,
@@ -2432,6 +3939,11 @@ struct BakeContext {
     /// The canvas height the corner watermark anchors to.
     #[cfg(feature = "overlay")]
     canvas_height: u32,
+    /// ADR-W022: the live overlay working-set slot the consumer re-derives
+    /// from (one wait-free load + generation compare per frame). `None` ⇒ no
+    /// live seam (the boot-derived overlay set stands for the whole run).
+    #[cfg(feature = "overlay")]
+    overlay_apply: Option<crate::live_overlays::OverlayApplySlot>,
 }
 
 impl BakeContext {
@@ -2475,6 +3987,10 @@ struct StreamBaker {
     canvas_color: CanvasColor,
     cadence: Rational,
     meter: BakeContext,
+    /// The last live overlay-set generation this baker derived its render
+    /// state from (ADR-W022). `None` until the first bake, so a wired slot's
+    /// seeded set drives the very first frame (one truth: the slot).
+    overlay_generation: Option<u64>,
 }
 
 #[cfg(not(feature = "overlay"))]
@@ -2496,9 +4012,7 @@ impl StreamBaker {
             crate::wallclock::WallClockSource::system(),
         )
         .map_err(|e| PipelineError::Engine(format!("overlay baker: {e}")))?;
-        if let Some(spec) = ctx.analog_clock {
-            baker = baker.with_analog_clock(spec);
-        }
+        baker.set_analog_clocks(ctx.analog_clocks.clone());
         // The Conspect tile-watermark seam (S3, ADR-0050 §5): when a signal is
         // wired, the bake stamps the corner watermark on the composited multiview
         // canvas whenever the published ladder level is at a watermark rung. The
@@ -2511,7 +4025,31 @@ impl StreamBaker {
             canvas_color: ctx.canvas_color,
             cadence: ctx.cadence,
             meter: ctx,
+            overlay_generation: None,
         })
+    }
+
+    /// Re-derive the overlay render state from the live working-set slot iff
+    /// its generation advanced (ADR-W022). The steady-state per-frame cost is
+    /// one wait-free `ArcSwap` load plus an integer compare; on a change the
+    /// re-derivation is O(overlays) pure math (no I/O, no rasterization), and
+    /// the frame baked next is drawn entirely from the new set — a clean
+    /// frame-boundary (Class-1) transition. Without a wired slot the
+    /// boot-derived state stands.
+    fn refresh_overlays(&mut self, canvas_w: u32, canvas_h: u32) {
+        let Some(slot) = self.meter.overlay_apply.as_ref() else {
+            return;
+        };
+        let set = slot.load();
+        if self.overlay_generation == Some(set.generation()) {
+            return;
+        }
+        self.baker.set_analog_clocks(analog_clocks_from_config(
+            set.overlays(),
+            canvas_w,
+            canvas_h,
+        ));
+        self.overlay_generation = Some(set.generation());
     }
 
     /// Bake one streamed tick's overlays into its canvas, returning the overlaid
@@ -2522,6 +4060,10 @@ impl StreamBaker {
     /// Returns [`PipelineError::Engine`] if the baker/sub-pass rejects the canvas.
     fn bake(&mut self, item: &StreamItem) -> Result<Arc<Nv12Image>, PipelineError> {
         use multiview_compositor::overlay::apply_overlays_to_nv12;
+
+        // ADR-W022: pick up a live overlay-set change before drawing, so this
+        // frame is baked entirely from one set (frame-boundary apply).
+        self.refresh_overlays(item.canvas.width(), item.canvas.height());
 
         let i = usize::try_from(item.tick_index).unwrap_or(usize::MAX);
         let pts = MediaTime::from_tick(i64::try_from(i).unwrap_or(i64::MAX), self.cadence);
@@ -2765,6 +4307,7 @@ impl StreamEgress {
     /// on. Dropping that sender (when the engine loop ends) closes the hot queue
     /// → the consumer drains, fans the remainder, drops the sink senders → each
     /// sink sees end-of-program and finalises → [`StreamEgress::join`] folds stats.
+    #[allow(clippy::too_many_arguments)] // reason: the bake consumer threads the encode, the audio bus + loudnorm + loudness meter, and the publisher — each a distinct, irreducible owned input to the off-hot-path consumer.
     fn spawn(
         ctx: BakeContext,
         runners: Vec<SinkRunner>,
@@ -2772,6 +4315,13 @@ impl StreamEgress {
         encoder: ProgramEncoder,
         audio_bus: Option<multiview_audio::program::ProgramBus>,
         audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
+        audio_loudness: Option<crate::loudness_telemetry::LoudnessTelemetry>,
+        loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
+        display_audio: DisplayAudioFeed,
+        program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
+        #[cfg(feature = "aes67")] aes67_send_handles: Vec<
+            multiview_output::aes67::Aes67SenderHandle,
+        >,
     ) -> (Self, SyncSender<StreamItem>) {
         let in_flight = Arc::new(AtomicI64::new(0));
         let peak_occupancy = Arc::new(AtomicUsize::new(0));
@@ -2829,6 +4379,12 @@ impl StreamEgress {
                     encoder,
                     audio_bus,
                     audio_loudnorm,
+                    audio_loudness,
+                    loudness_publisher,
+                    display_audio,
+                    program_audio_preview,
+                    #[cfg(feature = "aes67")]
+                    aes67_send_handles,
                     &consumer_in_flight,
                 )
             })
@@ -2948,6 +4504,41 @@ fn program_audio_bus(
     multiview_audio::program::ProgramBus::new(format, cadence)
 }
 
+/// The audio format the display heads' audio sinks are fed in (DEV-B4): the
+/// run's program-audio format when this run encodes audio (so the heads hear
+/// exactly the stream program), else the canonical 48 kHz stereo a dedicated
+/// display bus mixes. Mirrors [`program_audio_bus`]'s layout mapping so pushed
+/// blocks always match the sink FIFO's channel count.
+fn display_audio_format(
+    cfg: Option<&multiview_output::AudioEncodeConfig>,
+) -> multiview_audio::AudioFormat {
+    let Some(cfg) = cfg else {
+        return multiview_audio::AudioFormat::new(48_000, multiview_audio::ChannelLayout::Stereo);
+    };
+    let layout = match cfg.channels {
+        1 => multiview_audio::ChannelLayout::Mono,
+        _ => multiview_audio::ChannelLayout::Stereo,
+    };
+    multiview_audio::AudioFormat::new(cfg.sample_rate, layout)
+}
+
+/// The display-head audio feed (DEV-B4): the bounded FIFO publishers of every
+/// audio-enabled display output, plus — when the run carries no encode-side
+/// program audio — a dedicated tick-driven program bus so the heads still
+/// receive correctly-paced program audio (silence until sources are routed,
+/// exactly like the encode-side bus). Empty publishers ⇒ the consumer skips
+/// the display branch entirely; each push is a bounded short critical section
+/// into the drop-oldest FIFO (the sink holds that lock only for in-memory
+/// copies, never across a PCM call), so a wedged ALSA device can never reach
+/// back to the bake consumer, let alone the engine (invariants #1 + #10).
+struct DisplayAudioFeed {
+    /// One bounded drop-oldest FIFO publisher per audio-enabled display head.
+    publishers: Vec<multiview_output::display::audio::DisplayAudioPublisher>,
+    /// `Some` only when the run has no encode-side audio bus AND there are
+    /// display publishers to feed.
+    dedicated_bus: Option<multiview_audio::program::ProgramBus>,
+}
+
 /// Build the program-bus loudness normaliser (AUD-6) for the run's audio config.
 ///
 /// EBU R128 / ITU-R BS.1770 normalisation applies to the **program bus only**
@@ -2967,6 +4558,47 @@ fn program_loudnorm(
     };
     let format = multiview_audio::AudioFormat::new(cfg.sample_rate, layout);
     multiview_audio::LoudnormProcessor::new(format, multiview_audio::LoudnessTarget::Streaming).ok()
+}
+
+/// Build the program-bus loudness **telemetry** meter (AUD-8) for the run's audio
+/// config: a read-only EBU R128 compliance meter (true-peak ON) over the EMITTED
+/// program, reporting against the same target/ceiling/tolerance the loudnorm
+/// processor uses (so the browser meter colours against exactly that compliance).
+///
+/// When a [`LoudnormProcessor`](multiview_audio::LoudnormProcessor) is present the
+/// reference is read from it (its `target_lufs` / `ceiling_dbtp`); otherwise the
+/// streaming defaults (`-16` LUFS, `-1.5` dBTP) — matching [`program_loudnorm`].
+/// The live tolerance is the `±1 LU` single-pass live bound (ADR-R006). The format
+/// mirrors [`program_audio_bus`]. Returns `None` if the format is unusable (the
+/// run then continues with no loudness lane — telemetry is best-effort, inv #10).
+fn program_loudness_telemetry(
+    cfg: &multiview_output::AudioEncodeConfig,
+    loudnorm: Option<&multiview_audio::LoudnormProcessor>,
+) -> Option<crate::loudness_telemetry::LoudnessTelemetry> {
+    let layout = match cfg.channels {
+        1 => multiview_audio::ChannelLayout::Mono,
+        _ => multiview_audio::ChannelLayout::Stereo,
+    };
+    let format = multiview_audio::AudioFormat::new(cfg.sample_rate, layout);
+    // The compliance reference: prefer the loudnorm processor's live target +
+    // ceiling so the meter and the normaliser agree; else the streaming defaults.
+    let (target_lufs, ceiling_dbtp) = loudnorm.map_or(
+        (
+            multiview_audio::LoudnessTarget::Streaming.lufs(),
+            multiview_audio::DEFAULT_TRUE_PEAK_CEILING_DBTP,
+        ),
+        |n| (n.target_lufs(), n.ceiling_dbtp()),
+    );
+    // Narrow the f64 reference values to the wire f32 without an `as` cast.
+    let to_f32 = |v: f64| v.to_string().parse::<f32>().unwrap_or(0.0);
+    crate::loudness_telemetry::LoudnessTelemetry::new(
+        format,
+        0,
+        to_f32(target_lufs),
+        to_f32(ceiling_dbtp),
+        to_f32(multiview_audio::LIVE_TOLERANCE_LU),
+    )
+    .ok()
 }
 
 /// Drive the program-audio bus to the output **tick index** of one surviving
@@ -3012,6 +4644,9 @@ fn drive_audio_for_item(
 /// # Errors
 /// Returns [`PipelineError`] if building the baker, baking a frame, or the single
 /// encode fails.
+#[allow(clippy::too_many_arguments)]
+// reason: the consumer owns each pipeline tail input distinctly (encode, audio bus + loudnorm + loudness meter + publisher, display feed, in-flight counter); bundling them would only obscure the data flow.
+#[allow(clippy::needless_pass_by_value)] // reason: `loudness_publisher` is owned BY VALUE so it lives in the consumer thread's frame for the whole run (it cannot borrow from `drive_streaming`, which returns before this thread joins); the body only needs `&` access but the ownership is load-bearing.
 fn consumer_main(
     ctx: BakeContext,
     hot_rx: &Receiver<StreamItem>,
@@ -3019,9 +4654,18 @@ fn consumer_main(
     mut encoder: ProgramEncoder,
     mut audio_bus: Option<multiview_audio::program::ProgramBus>,
     mut audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
+    mut audio_loudness: Option<crate::loudness_telemetry::LoudnessTelemetry>,
+    loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
+    mut display_audio: DisplayAudioFeed,
+    program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
+    #[cfg(feature = "aes67")] aes67_send_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
     in_flight: &AtomicI64,
 ) -> Result<(), PipelineError> {
     let mut baker = StreamBaker::new(ctx)?;
+    // A monotonic clock for rate-bounding the loudness emit, sampled OFF the hot
+    // loop (this is the bake-consumer thread). The epoch is the consumer start;
+    // the conflator only ever sees a non-decreasing `now_ns`.
+    let loudness_epoch = Instant::now();
     // Track which sinks are still live (their receiver has not hung up) so a sink
     // that ended early does not wedge or repeatedly error the consumer.
     let mut live: Vec<bool> = vec![true; sink_txs.len()];
@@ -3060,10 +4704,66 @@ fn consumer_main(
             // preserved exactly, so the AAC encode sees the same frame count it
             // would have. `None` (no normaliser) emits the mixed bus unaltered.
             // Discrete tracks never pass through here (program-bus-only — ADR-R006).
+            let gain_db = audio_loudnorm
+                .as_ref()
+                .map(multiview_audio::LoudnormProcessor::current_gain_db);
             let block = match audio_loudnorm.as_mut() {
                 Some(norm) => norm.process(block),
                 None => block,
             };
+            // Program-bus loudness telemetry (AUD-8), still on THIS bake-consumer
+            // thread (off the engine hot loop): meter the EMITTED block read-only
+            // and, at ~10 Hz (conflated/drop-oldest), publish an `audio.loudness`
+            // sample onto the engine event stream so the UI loudness meter lights
+            // up. The publish is a single non-blocking broadcast send — it can
+            // neither block the engine nor be back-pressured by a slow UI (inv
+            // #10); a stalled UI just skips loudness samples. `None` (audio off /
+            // meter unavailable) skips this entirely.
+            if let (Some(meter), Some(publisher)) =
+                (audio_loudness.as_mut(), loudness_publisher.as_ref())
+            {
+                // Narrow the makeup gain to the wire `f32` without an `as` cast.
+                let gain_f32 = gain_db.map(|g| g.to_string().parse::<f32>().unwrap_or(0.0));
+                let now_ns = loudness_epoch.elapsed().as_nanos();
+                let now_ns = i64::try_from(now_ns).unwrap_or(i64::MAX);
+                if let Some(sample) = meter.push(&block, gain_f32, now_ns) {
+                    publisher.publish_event(Event::AudioLoudness(sample));
+                }
+            }
+            // DEV-B4: the display heads hear the SAME post-loudnorm program
+            // block the stream encodes. Each push is a bounded short critical
+            // section into the drop-oldest FIFO (never held across a PCM
+            // call) — a wedged HDMI audio device sheds frames and can never
+            // back-pressure this consumer, let alone the engine
+            // (invariants #1 + #10).
+            for publisher in &display_audio.publishers {
+                publisher.push_audio(&block);
+            }
+            // #103: feed the SAME post-loudnorm program block to every AES67
+            // output's send FIFO (drop-oldest, `&self`) — exactly like the display
+            // heads. The serve-side `Aes67Sender` drains it on its own media-clock
+            // timer; a stalled network drops at the FIFO and can never
+            // back-pressure this consumer, let alone the engine (invariants #1 +
+            // #10). When a run has no program audio the bus is absent and this
+            // branch never runs, so the FIFO stays empty and the serve loop emits
+            // silence (`Aes67Sender::next_packet_into` silence-fills an underrun) —
+            // no dedicated bus is needed here.
+            #[cfg(feature = "aes67")]
+            for handle in &aes67_send_handles {
+                handle.push(&block);
+            }
+            // ADR-P006 audio: tap the SAME post-loudnorm program block into the
+            // WHEP egress preview slot (when wired), so the live WHEP provider can
+            // Opus-encode it and send it to the peer. A bounded drop-oldest push
+            // off this bake-consumer thread — a slow/absent WHEP consumer only
+            // loses the oldest blocks and can never back-pressure this consumer or
+            // the engine (invariants #1/#10). `None` (no WHEP egress wired) is a
+            // no-op, so a build/run without WHEP egress is byte-identical.
+            if let Some(slot) = program_audio_preview.as_ref() {
+                // The eviction flag is the "WHEP consumer behind" signal we
+                // intentionally ignore here (drop-oldest; inv #10).
+                let _ = slot.push(block.clone());
+            }
             let audio_packets = encoder
                 .encode_audio_interleaved(block.interleaved(), block.frame_count())
                 .map_err(|e| PipelineError::Output {
@@ -3071,6 +4771,16 @@ fn consumer_main(
                     reason: e.to_string(),
                 })?;
             fan_packets(&sink_txs, &mut live, audio_packets);
+        } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
+            // A video-only run with audio-enabled display heads: drive the
+            // dedicated display bus by the same absolute tick index (RT-8b —
+            // catching up across shed ticks keeps the sample clock a pure
+            // function of the tick counter) and feed the heads. No encode, no
+            // packets — the stream stays byte-identical to a video-only run.
+            let block = drive_audio_for_item(bus, item.tick_index);
+            for publisher in &display_audio.publishers {
+                publisher.push_audio(&block);
+            }
         }
     }
     // End-of-program: flush the encoder and fan its trailing packets, then drop
@@ -3156,6 +4866,11 @@ fn send_bounded(tx: &SyncSender<EncodedPacket>, packet: EncodedPacket) -> bool {
 /// peer is unreachable, by contrast, never fails the run: it is reported and
 /// dropped so the program's local outputs still complete (invariants #1/#10 — a
 /// dead remote consumer must not back-pressure or fail the program).
+#[allow(clippy::too_many_lines)]
+// reason: a flat dispatch `match` over every runnable output kind (file / HLS /
+// push / WebRTC / NDI / AES67), each arm a short delegation to that kind's runner;
+// its value is reading the whole per-kind mapping in one place. Splitting it would
+// scatter the dispatch without reducing complexity.
 fn run_one_output(
     output: RunnableOutput,
     rx: Receiver<EncodedPacket>,
@@ -3163,8 +4878,21 @@ fn run_one_output(
     time_base: Rational,
     audio: Option<&(StreamCodecParameters, Rational)>,
 ) -> Result<SinkRunOutcome, PipelineError> {
+    // ADR-0060: run this sink's mux region inside an `output` resource scope so
+    // our own logs (via the span) AND libav's synchronous mux/transport lines
+    // (via the thread-local ResourceContext the bridge resolves) name this output
+    // by its stable config id. Both clear on return (scoped, never stale).
+    let _span = tracing::info_span!(
+        "output",
+        resource_kind = "output",
+        resource_id = %output.id(),
+    )
+    .entered();
+    let _resource = multiview_ffmpeg::ResourceGuard::enter(
+        multiview_ffmpeg::ResourceContext::output(output.id()),
+    );
     match output {
-        RunnableOutput::File { sink, path } => {
+        RunnableOutput::File { id: _, sink, path } => {
             let mut source = StreamingPacketSource::new(rx);
             let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
             let outcome = sink
@@ -3191,6 +4919,7 @@ fn run_one_output(
             })
         }
         RunnableOutput::Hls {
+            id: _,
             sink,
             playlist_path,
         } => {
@@ -3238,9 +4967,352 @@ fn run_one_output(
                 }),
             }
         }
-        RunnableOutput::Push { sink, label, url } => Ok(run_push_output(
+        RunnableOutput::Push {
+            id: _,
+            sink,
+            label,
+            url,
+        } => Ok(run_push_output(
             &sink, label, &url, rx, params, time_base, audio,
         )),
+        #[cfg(feature = "webrtc-native")]
+        RunnableOutput::WebRtc { id: _, sink, label } => {
+            Ok(run_webrtc_output(&sink, &label, rx, time_base))
+        }
+        // NDI is a raw-canvas consumer (NV12→UYVY → send), NOT a packet sink: it
+        // ignores the coded-packet fan-out and instead reads the latest tapped
+        // canvas. The packet `rx` is used purely as the shared end-of-program
+        // pulse (one item per emitted tick; it closes at end-of-program), which
+        // also paces the send at the output cadence (invariants #1/#3/#10).
+        #[cfg(feature = "ndi-bindings")]
+        RunnableOutput::Ndi {
+            id: _,
+            mut sink,
+            reader,
+            cadence,
+            name,
+        } => Ok(run_ndi_output(&mut sink, &reader, rx, cadence, &name)),
+        // AES67 is a raw-PCM audio consumer (program AudioBlock → L16/L24 RTP), NOT
+        // a packet sink: it ignores the coded-packet fan-out and instead drains the
+        // program audio the bake consumer pushes into its send FIFO. The packet
+        // `rx` is used purely as the shared end-of-program pulse (it closes at
+        // end-of-program), which resolves the serve loop's stop future (inv
+        // #1/#10). Under `aes67`.
+        #[cfg(feature = "aes67")]
+        RunnableOutput::Aes67 {
+            id: _,
+            sender,
+            local,
+            dest,
+            interface,
+            label,
+        } => Ok(run_aes67_output(sender, local, dest, interface, rx, &label)),
+    }
+}
+
+/// Drive an AES67 / ST 2110-30 raw-PCM output (#103, ADR-0033/T013): multicast the
+/// mixed program audio as a continuous L16/L24 RTP stream until end-of-program.
+///
+/// **Mux-free** — it consumes NO coded packets. The program audio arrives via the
+/// [`Aes67SenderHandle`](multiview_output::aes67::Aes67SenderHandle) the bake
+/// consumer pushes each post-loudnorm block into; this runner drains the paired
+/// serve-side [`Aes67Sender`](multiview_output::aes67::Aes67Sender)'s FIFO on its
+/// OWN media-clock timer ([`Aes67UdpSender::serve`](multiview_output::aes67::transport::Aes67UdpSender::serve))
+/// and sends UDP. The `eop` packet receiver is used purely as the end-of-program
+/// pulse (one item per emitted tick, closing at end-of-program), which resolves the
+/// serve loop's stop future.
+///
+/// The socket + its send loop are async, so this runs them on a small
+/// **current-thread** Tokio runtime on the sink thread (the peer of
+/// [`run_ndi_output`]). **Infallible** by design (returns a [`SinkRunOutcome`],
+/// never an error): an AES67 output whose socket cannot bind or whose send faults
+/// must NOT fail the program — the file/HLS/push outputs keep producing (invariants
+/// #1/#10). The serve loop silence-fills any FIFO underrun, so the multicast never
+/// gaps even when this run carries no program audio.
+///
+/// The `eop` receiver is always fully drained (on a blocking task, off the async
+/// reactor) so the encode-once fan-out can never wedge on this sink.
+#[cfg(feature = "aes67")]
+fn run_aes67_output(
+    mut sender: multiview_output::aes67::Aes67Sender,
+    local: std::net::SocketAddr,
+    dest: std::net::SocketAddr,
+    interface: multiview_output::aes67::transport::MulticastInterface,
+    eop: Receiver<EncodedPacket>,
+    label: &str,
+) -> SinkRunOutcome {
+    use multiview_output::aes67::transport::Aes67UdpSender;
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!(output = label, error = %e, "aes67 output runtime build failed; skipping");
+            // Drain the end-of-program pulses so the fan-out never wedges.
+            let frames = eop.into_iter().count();
+            return SinkRunOutcome {
+                line: format!("{label}: aes67 runtime unavailable"),
+                playlist: None,
+                frames,
+            };
+        }
+    };
+    runtime.block_on(async move {
+        let udp = match Aes67UdpSender::bind(local, dest).await {
+            Ok(u) => u.with_interface(interface),
+            Err(e) => {
+                tracing::warn!(output = label, error = %e, dest = %dest, "aes67 bind failed; skipping");
+                // Drain the pulses off the reactor so the fan-out never wedges.
+                let frames = tokio::task::spawn_blocking(move || eop.into_iter().count())
+                    .await
+                    .unwrap_or(0);
+                return SinkRunOutcome {
+                    line: format!("{label}: aes67 bind failed"),
+                    playlist: None,
+                    frames,
+                };
+            }
+        };
+        tracing::info!(output = label, dest = %dest, "aes67 output sending");
+        // The end-of-program pulses are a std mpsc — drain them on a blocking task
+        // (off the async reactor) so a `recv` never blocks it; the task ends (and
+        // yields the pulse count) when the channel closes at end-of-program.
+        let mut eop_task = tokio::task::spawn_blocking(move || eop.into_iter().count());
+        // Serve on the media-clock timer (its own absolute-deadline cadence +
+        // multicast egress config) with a never-resolving stop, so it runs until
+        // end-of-program cancels it OR it faults. `select!` stops it on whichever
+        // comes first, capturing the pulse count for the report.
+        let frames = tokio::select! {
+            joined = &mut eop_task => joined.unwrap_or(0),
+            result = udp.serve(&mut sender, std::future::pending::<()>()) => {
+                if let Err(e) = result {
+                    tracing::warn!(output = label, error = %e, "aes67 serve faulted; stopping output");
+                }
+                // Wait for end-of-program to fully drain the fan-out (never wedge).
+                (&mut eop_task).await.unwrap_or(0)
+            }
+        };
+        SinkRunOutcome {
+            line: format!("{label}: {frames} tick(s) multicast to {dest}"),
+            playlist: None,
+            frames,
+        }
+    })
+}
+
+/// Drive a WebRTC program output (`webrtc` / `whip_push`) over its fan-out channel
+/// of coded packets: re-stamp each [`EncodedPacket`] into an
+/// [`EgressSample`](multiview_webrtc::egress::EgressSample) (the AU bytes + its
+/// 90 kHz video / 48 kHz audio RTP timestamp derived from the packet's
+/// tick-stamped PTS, invariant #3) and push it onto the bounded drop-oldest
+/// [`EgressSink`](multiview_webrtc::egress::EgressSink) the WHEP-serve driver /
+/// `whip_push` client drains. No re-encode (invariant #7): the SAME coded bytes
+/// the file/HLS/push sinks mux are packetized into SRTP per session.
+///
+/// **Infallible** by design (returns a [`SinkRunOutcome`], never an error): a
+/// WebRTC output with no viewers / a dead WHIP target must not fail the program.
+/// On end-of-program (the channel closes) the egress feed is closed so the
+/// sessions tear down. A slow consumer drops on the feed — never stalls this
+/// off-hot-path drain, the fan-out, or the output clock (invariants #1/#10).
+#[cfg(feature = "webrtc-native")]
+fn run_webrtc_output(
+    sink: &multiview_webrtc::egress::EgressSink,
+    label: &str,
+    rx: Receiver<EncodedPacket>,
+    time_base: Rational,
+) -> SinkRunOutcome {
+    use multiview_ffmpeg::StreamKind;
+    use multiview_webrtc::egress::{EgressMedia, EgressSample};
+
+    // The video RTP clock is 90 kHz; the encoder time-base is `1/cadence`, so a
+    // packet PTS in encoder ticks rescales to 90 kHz video RTP units. Audio
+    // packets are stamped in `1/sample_rate` already; the AAC→Opus distinction
+    // does not change the 48 kHz Opus RTP clock the driver writes them at.
+    let video_rtp = Rational::new(1, 90_000);
+    let audio_rtp = Rational::new(1, 48_000);
+    let mut delivered = 0usize;
+    let mut dropped = 0u64;
+    // Block on each fanned packet; the iterator ends when the channel closes
+    // (end-of-program), consuming `rx` so it is dropped here.
+    for packet in rx {
+        delivered += 1;
+        let Some(bytes) = packet.payload() else {
+            continue;
+        };
+        let (media, rtp_timestamp) = match packet.kind() {
+            StreamKind::Video => {
+                let ts =
+                    multiview_core::time::rescale(packet.pts().unwrap_or(0), time_base, video_rtp);
+                (EgressMedia::Video, u32::try_from(ts.max(0)).unwrap_or(0))
+            }
+            StreamKind::Audio => {
+                // Audio packets carry their PTS in the audio encoder time-base
+                // (1/sample_rate); it is already the 48 kHz Opus RTP clock unit, so
+                // the rescale is identity — kept explicit for the timeline contract.
+                let ts =
+                    multiview_core::time::rescale(packet.pts().unwrap_or(0), audio_rtp, audio_rtp);
+                (EgressMedia::Audio, u32::try_from(ts.max(0)).unwrap_or(0))
+            }
+            // A future elementary-stream kind is not carried over WebRTC.
+            _ => continue,
+        };
+        let sample = EgressSample {
+            media,
+            rtp_timestamp,
+            keyframe: matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe(),
+            data: bytes.to_vec(),
+        };
+        if sink.push(sample) {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    // End-of-program: close the feed so the sessions tear down cleanly.
+    sink.close();
+    if dropped > 0 {
+        tracing::debug!(
+            output = label,
+            dropped,
+            "webrtc egress dropped (slow/absent consumers)"
+        );
+    }
+    SinkRunOutcome {
+        line: format!("{label}: {delivered} packet(s) fanned to WebRTC egress"),
+        playlist: None,
+        frames: delivered,
+    }
+}
+
+/// One composited program canvas tapped for the NDI output sink (OUT-4b /
+/// NDI-L2): an `Arc` clone of the **same** pre-encode NV12 canvas the encode
+/// fan-out + preview slot + display heads share (no extra pixel copy on the hot
+/// loop), plus the tick index its NDI 100 ns timecode is re-stamped from
+/// (invariant #3). Published into a wait-free single-slot mailbox (drop-oldest:
+/// newest-wins), so the engine never blocks on — and is never back-pressured by —
+/// a slow/absent NDI consumer (invariants #1 + #10), exactly like the display
+/// head canvas tap (ADR-0044).
+#[cfg(all(feature = "ndi", any(feature = "ndi-bindings", test)))]
+#[derive(Debug, Clone)]
+pub(crate) struct NdiCanvasFrame {
+    /// The shared pre-encode NV12 canvas (one `Arc` clone, no copy).
+    pub(crate) canvas: Arc<Nv12Image>,
+    /// The output-clock tick index this canvas was produced on (invariant #3 —
+    /// the NDI timecode is derived from this, never a wall clock / input PTS).
+    pub(crate) tick_index: u64,
+}
+
+/// Derive the NDI 100 ns timecode for output `tick_index` at the exact-rational
+/// output `cadence` (invariant #3 — tick-derived, never wall clock or a raw input
+/// PTS; never float fps). The NDI timecode unit is 100 ns, so one tick is
+/// `den/num` seconds = `tick * den * 10_000_000 / num` (100 ns units), computed
+/// in `i128` to stay overflow-free over an unbounded run, then clamped to the
+/// `i64` the descriptor carries. A non-positive denominator/numerator (never
+/// produced by a validated cadence) degrades to `0` rather than dividing by zero.
+#[cfg(all(feature = "ndi", any(feature = "ndi-bindings", test)))]
+fn ndi_timecode_100ns(tick_index: u64, cadence: Rational) -> i64 {
+    if cadence.num <= 0 || cadence.den <= 0 {
+        return 0;
+    }
+    // 100 ns units per second = 10_000_000. `i128` keeps the product exact for
+    // any realistic tick count + cadence before the divide.
+    let units = i128::from(tick_index)
+        .saturating_mul(i128::from(cadence.den))
+        .saturating_mul(10_000_000)
+        / i128::from(cadence.num);
+    i64::try_from(units).unwrap_or(i64::MAX)
+}
+
+/// Drive the NDI output sink (OUT-4b / NDI-L2): publish the latest tapped program
+/// canvas to the live NDI sender as each end-of-program pulse arrives, converting
+/// NV12→UYVY at the host-copy boundary and stamping the tick-derived NDI 100 ns
+/// timecode (invariant #3). **Off the hot path** — the engine's projection only
+/// ever does a wait-free `publish` into the canvas mailbox; this runner reads the
+/// newest-wins slot, so a slow/wedged NDI send drops older canvases at the tap
+/// rather than back-pressuring the engine (invariants #1 + #10).
+///
+/// `eop` is the end-of-program signal: the per-sink fan-out [`Receiver`] the
+/// egress hands every sink. The NDI sink consumes **no packets** (it sends the
+/// raw canvas, not the encode-once AUs — a distinct canvas consumer, like the
+/// display head), so the receiver is used purely as the shared lifecycle pulse:
+/// one item per emitted tick, ending when the channel closes (end-of-program),
+/// which also paces the send at the output cadence. A send error from the SDK
+/// (e.g. the sender was torn down) is logged and the loop ends — it never panics
+/// and never fails the program (the file/HLS/push outputs keep producing).
+///
+/// **Infallible** by design (returns a [`SinkRunOutcome`], never an error): an NDI
+/// output that cannot send must not fail the run.
+#[cfg(all(feature = "ndi", any(feature = "ndi-bindings", test)))]
+fn run_ndi_output<A, T>(
+    out: &mut NdiOutput<A>,
+    reader: &multiview_output::display::FrameReader<NdiCanvasFrame>,
+    eop: Receiver<T>,
+    cadence: Rational,
+    label: &str,
+) -> SinkRunOutcome
+where
+    A: multiview_output::ndi::NdiApi,
+{
+    let frame_rate_n = u32::try_from(cadence.num.max(0)).unwrap_or(0);
+    let frame_rate_d = u32::try_from(cadence.den.max(1)).unwrap_or(1);
+    let mut sent = 0usize;
+    let mut last_seq = 0u64;
+    let mut send_errors = 0u64;
+    // Block on each end-of-program pulse (one per emitted tick): the iterator ends
+    // when the channel closes, consuming `eop` so it is dropped here. Each pulse,
+    // sample the newest-wins canvas slot and send it if it advanced — older
+    // canvases between pulses were already dropped at the single-slot tap.
+    for _pulse in eop {
+        let Some((frame, seq)) = reader.latest() else {
+            continue; // no canvas published yet (pre-roll); nothing to send.
+        };
+        if seq == last_seq {
+            continue; // no newer canvas since the last send (drop-oldest, idle).
+        }
+        last_seq = seq;
+        // Borrow the shared canvas planes for the conversion; a malformed canvas
+        // is a typed refusal from the seam, never a panic (invariant #1).
+        let image: &Nv12Image = &frame.canvas;
+        let canvas = match multiview_output::ndi::Nv12Canvas::new(
+            image.width(),
+            image.height(),
+            image.y_plane(),
+            image.uv_plane(),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                send_errors = send_errors.saturating_add(1);
+                tracing::warn!(output = label, error = %e, "ndi canvas rejected; skipping frame");
+                continue;
+            }
+        };
+        let timecode = ndi_timecode_100ns(frame.tick_index, cadence);
+        match out.send_canvas(&canvas, timecode, frame_rate_n, frame_rate_d) {
+            Ok(()) => sent = sent.saturating_add(1),
+            Err(e) => {
+                // A send failure (sender torn down, runtime error) ends the NDI
+                // sink, never the program: log + stop. The file/HLS/push outputs
+                // keep producing (invariants #1/#10).
+                tracing::warn!(output = label, error = %e, "ndi send failed; stopping NDI output");
+                send_errors = send_errors.saturating_add(1);
+                break;
+            }
+        }
+    }
+    // End-of-program (or send fault): close the sender so the SDK handle is freed
+    // off the hot path. Idempotent; `Drop` would also close it.
+    out.close();
+    if send_errors > 0 {
+        tracing::debug!(
+            output = label,
+            send_errors,
+            "ndi output finished with send faults"
+        );
+    }
+    SinkRunOutcome {
+        line: format!("{label}: {sent} canvas frame(s) sent to NDI"),
+        playlist: None,
+        frames: sent,
     }
 }
 
@@ -3867,6 +5939,11 @@ impl IngestSupervisor {
     /// #10). The audio thread is the peer of the video decode thread: it decodes
     /// the SAME source's audio (its own libav context) into the source's
     /// `AudioStore`, which the program bus samples.
+    // A sequence of near-identical per-role spawn loops (video / audio / tone /
+    // player-audio / captions), each registering a stop flag + ExitGuard and
+    // pushing a producer handle: clearer kept whole than split across five helpers
+    // that would each take the registry + the producers vec.
+    #[allow(clippy::too_many_lines)]
     fn start(
         plans: Vec<IngestPlan>,
         audio_plans: Vec<(
@@ -3877,6 +5954,13 @@ impl IngestSupervisor {
             crate::audio::ToneIngestPlan,
             Arc<multiview_audio::store::AudioStore>,
         )>,
+        // Media-player channels whose loaded asset has audio (ADR-T019): each
+        // loops its embedded audio on its own thread onto the program bus, on the
+        // same wrap instant as the video. Empty when no player carries audio.
+        player_audio_plans: Vec<(
+            crate::audio::PlayerAudioPlan,
+            Arc<multiview_audio::store::AudioStore>,
+        )>,
         caption_plans: Vec<crate::captions::CaptionPlan>,
         registry: &crate::live_sources::StopRegistry,
     ) -> Self {
@@ -3885,22 +5969,60 @@ impl IngestSupervisor {
                 .len()
                 .saturating_add(audio_plans.len())
                 .saturating_add(tone_plans.len())
+                .saturating_add(player_audio_plans.len())
                 .saturating_add(caption_plans.len()),
         );
         for plan in plans {
-            let stop = Arc::new(AtomicBool::new(false));
-            let id = plan.id.clone();
-            crate::live_sources::register_stop(registry, &id, &stop);
-            let thread_stop = Arc::clone(&stop);
-            let builder = std::thread::Builder::new().name(format!("multiview-ingest-{id}"));
-            match builder.spawn(move || ingest_loop(&plan, &thread_stop)) {
-                Ok(handle) => producers.push((stop, handle)),
-                Err(e) => {
-                    // A thread that cannot spawn is logged and skipped: its tile
-                    // simply rides NO_SIGNAL (slate) rather than failing the run
-                    // (invariant #1 — the output clock is independent of inputs).
-                    tracing::error!(error = %e, source = %id, "could not spawn ingest thread");
+            // IN-5b: spawn the PROACTIVE youtube re-resolution loop as a supervised
+            // SIBLING of this source's decode thread (before the decode thread takes
+            // ownership of `plan`). It shares the plan's lock-free swappable-URL slot
+            // and publishes a fresh `*.googlevideo.com` master into it AHEAD of the
+            // active URL's expiry (make-before-break), so the decode loop's reconnect
+            // picks up the next-up URL without a cold resolve at the boundary. It is
+            // registered under the derived `{id}/youtube-reresolve` key (ADR-W018) so
+            // a live remove/edit of the source raises every `{id}`-rooted flag and
+            // stops it too. Off the data plane — only ever WRITES the slot (inv
+            // #1/#10). Only under the off-by-default `youtube` feature.
+            #[cfg(feature = "youtube")]
+            if let SourceLocation::Youtube { watch_url } = &plan.location {
+                if let Some(slot) = plan.youtube_url_slot.clone() {
+                    let id = plan.id.clone();
+                    let watch_url = watch_url.clone();
+                    let rr_stop = Arc::new(AtomicBool::new(false));
+                    let rr_exited = crate::live_sources::register_stop(
+                        registry,
+                        &format!("{id}/youtube-reresolve"),
+                        &rr_stop,
+                    );
+                    // Build the ExitGuard BEFORE spawn: its Drop flips `exited` whether the
+                    // thread runs (drops on exit) OR Builder::spawn fails (the closure owning
+                    // it is dropped) — so a failed spawn never orphans an exited=false entry
+                    // that teardown would busy-wait to the grace deadline (ADR-W018 §5).
+                    let rr_exit_guard = crate::live_sources::ExitGuard::new(&rr_exited);
+                    let rr_thread_stop = Arc::clone(&rr_stop);
+                    let rr_builder =
+                        std::thread::Builder::new().name(format!("multiview-yt-reresolve-{id}"));
+                    match rr_builder.spawn(move || {
+                        let _exit = rr_exit_guard;
+                        youtube_reresolve_thread(&watch_url, &slot, &rr_thread_stop);
+                    }) {
+                        Ok(handle) => producers.push((rr_stop, handle)),
+                        Err(e) => {
+                            // The proactive loop is an optimisation: if its thread
+                            // cannot spawn, the decode thread's inline
+                            // resolve-on-reconnect (IN-5) still keeps the tile alive
+                            // across expiry (briefly degrading at the boundary). Log
+                            // + continue — never fail the run (invariant #1).
+                            tracing::error!(error = %e, source = %id, "could not spawn youtube re-resolution thread; falling back to resolve-on-reconnect");
+                        }
+                    }
                 }
+            }
+            // The decode thread itself — the SAME supervised producer the live
+            // hub spawns (ADR-W018 level 2): `spawn_ingest_producer` registers
+            // the per-source stop flag and runs `ingest_loop`.
+            if let Some((stop, handle)) = spawn_ingest_producer(plan, registry) {
+                producers.push((stop, handle));
             }
         }
         for (plan, store) in audio_plans {
@@ -3910,12 +6032,17 @@ impl IngestSupervisor {
             // remove/edit of the source raises every `{id}`-rooted flag, so its
             // audio decode thread stops too — never left mixing a stale source's
             // audio onto the program bus under the replacement.
-            crate::live_sources::register_stop(registry, &format!("{id}/audio"), &stop);
+            let exited =
+                crate::live_sources::register_stop(registry, &format!("{id}/audio"), &stop);
+            // ExitGuard built BEFORE spawn: its Drop flips `exited` even if Builder::spawn
+            // fails (the closure owning it is dropped) — no orphaned latch (ADR-W018 §5).
+            let exit_guard = crate::live_sources::ExitGuard::new(&exited);
             let thread_stop = Arc::clone(&stop);
             let builder = std::thread::Builder::new().name(format!("multiview-audio-{id}"));
-            match builder
-                .spawn(move || crate::audio::audio_ingest_loop(&plan, &store, &thread_stop))
-            {
+            match builder.spawn(move || {
+                let _exit = exit_guard;
+                crate::audio::audio_ingest_loop(&plan, &store, &thread_stop);
+            }) {
                 Ok(handle) => producers.push((stop, handle)),
                 Err(e) => {
                     // An audio thread that cannot spawn is logged and skipped: its
@@ -3933,12 +6060,15 @@ impl IngestSupervisor {
             // remove/edit of the source raises every `{id}`-rooted flag, so its
             // line-up tone thread stops too — never left feeding the program bus
             // a stale `bars` source's tone under the replacement.
-            crate::live_sources::register_stop(registry, &format!("{id}/tone"), &stop);
+            let exited = crate::live_sources::register_stop(registry, &format!("{id}/tone"), &stop);
+            // ExitGuard built BEFORE spawn (flips `exited` even if spawn fails) (ADR-W018 §5).
+            let exit_guard = crate::live_sources::ExitGuard::new(&exited);
             let thread_stop = Arc::clone(&stop);
             let builder = std::thread::Builder::new().name(format!("multiview-tone-{id}"));
-            match builder
-                .spawn(move || crate::audio::tone_publish_loop(&plan, &store, &thread_stop))
-            {
+            match builder.spawn(move || {
+                let _exit = exit_guard;
+                crate::audio::tone_publish_loop(&plan, &store, &thread_stop);
+            }) {
                 Ok(handle) => producers.push((stop, handle)),
                 Err(e) => {
                     // A tone thread that cannot spawn is logged and skipped: the
@@ -3949,6 +6079,45 @@ impl IngestSupervisor {
                 }
             }
         }
+        // Media-player channels with embedded audio (ADR-T019): each loops its
+        // asset's `[vamp_in, vamp_out)` audio onto the program bus on the same wrap
+        // instant as the video. Spawned exactly like the per-source audio decode
+        // threads, registered under the derived `{id}/player-audio` key (ADR-W018).
+        // The driver is `ffmpeg`-gated (it decodes the asset); without `ffmpeg` a
+        // player carries no audio and rides silence (consistent with every other
+        // decode path), so the plan is consumed (`stop`/store dropped) but no thread
+        // spawns.
+        for (plan, store) in player_audio_plans {
+            let stop = Arc::new(AtomicBool::new(false));
+            let id = plan.id.clone();
+            let exited =
+                crate::live_sources::register_stop(registry, &format!("{id}/player-audio"), &stop);
+            let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+            let thread_stop = Arc::clone(&stop);
+            #[cfg(feature = "ffmpeg")]
+            {
+                let builder =
+                    std::thread::Builder::new().name(format!("multiview-player-audio-{id}"));
+                match builder.spawn(move || {
+                    let _exit = exit_guard;
+                    crate::audio::player_audio_loop(&plan, &store, &thread_stop);
+                }) {
+                    Ok(handle) => producers.push((stop, handle)),
+                    Err(e) => {
+                        // A player-audio thread that cannot spawn is logged and
+                        // skipped: its channel loops video normally and rides audio
+                        // silence (best-effort — invariant #1; never gates output).
+                        tracing::error!(error = %e, player = %id, "could not spawn media-player audio loop thread");
+                    }
+                }
+            }
+            #[cfg(not(feature = "ffmpeg"))]
+            {
+                // No decode without `ffmpeg`: drop the guard (flips `exited`) and the
+                // store; the player rides audio silence.
+                let _ = (exit_guard, thread_stop, store);
+            }
+        }
         for plan in caption_plans {
             let stop = Arc::new(AtomicBool::new(false));
             let id = plan.id.clone();
@@ -3956,10 +6125,16 @@ impl IngestSupervisor {
             // live remove/edit of the source raises every `{id}`-rooted flag,
             // so its caption reader stops too — never left decoding a stale
             // URL's cues over the replacement picture.
-            crate::live_sources::register_stop(registry, &format!("{id}/captions"), &stop);
+            let exited =
+                crate::live_sources::register_stop(registry, &format!("{id}/captions"), &stop);
+            // ExitGuard built BEFORE spawn (flips `exited` even if spawn fails) (ADR-W018 §5).
+            let exit_guard = crate::live_sources::ExitGuard::new(&exited);
             let thread_stop = Arc::clone(&stop);
             let builder = std::thread::Builder::new().name(format!("multiview-captions-{id}"));
-            match builder.spawn(move || crate::captions::caption_loop(&plan, &thread_stop)) {
+            match builder.spawn(move || {
+                let _exit = exit_guard;
+                crate::captions::caption_loop(&plan, &thread_stop);
+            }) {
                 Ok(handle) => producers.push((stop, handle)),
                 Err(e) => {
                     // A caption reader that cannot spawn is logged and skipped:
@@ -4021,6 +6196,195 @@ impl Drop for IngestSupervisor {
         // thread blocks the caller. After `shutdown` the handle vec is already
         // drained, so this is a no-op on that path.
         self.join_all();
+    }
+}
+
+#[cfg(feature = "aes67")]
+impl IngestSupervisor {
+    /// Spawn one supervised AES67 / ST 2110-30 RX thread per plan (#103), pushing
+    /// each into the SAME `producers` vec every other ingest thread lives in — so
+    /// they share the identical bounded stop+join teardown ([`Self::join_all`]).
+    ///
+    /// Each registers its per-thread stop flag under the source id in the run's
+    /// shared registry (ADR-W018 — a live `RemoveSource` raises exactly this
+    /// flag), like [`spawn_ingest_producer`] does for a video source (an AES67
+    /// source has no video thread, so `{id}` is its primary producer). The RX
+    /// thread only ever WRITES its lock-free `AudioStore`, so it can neither pace
+    /// nor stall the output clock (inv #1/#10); a thread that cannot spawn is
+    /// logged and skipped (its source rides silence on the bus, never failing the
+    /// run — invariant #1).
+    fn spawn_aes67_receivers(
+        &mut self,
+        plans: Vec<Aes67RxPlan>,
+        registry: &crate::live_sources::StopRegistry,
+    ) {
+        for plan in plans {
+            let stop = Arc::new(AtomicBool::new(false));
+            let id = plan.id.clone();
+            let exited = crate::live_sources::register_stop(registry, &id, &stop);
+            // ExitGuard built BEFORE spawn (flips `exited` even if Builder::spawn
+            // fails — the dropped closure drops the guard) (ADR-W018 §5).
+            let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+            let thread_stop = Arc::clone(&stop);
+            let builder = std::thread::Builder::new().name(format!("multiview-aes67-rx-{id}"));
+            match builder.spawn(move || {
+                let _exit = exit_guard;
+                drive_aes67_rx(&plan, &thread_stop);
+            }) {
+                Ok(handle) => self.producers.push((stop, handle)),
+                Err(e) => {
+                    tracing::error!(error = %e, source = %id, "could not spawn aes67 rx thread");
+                }
+            }
+        }
+    }
+}
+
+/// Spawn ONE supervised ingest producer thread for `plan`: create its
+/// per-source stop flag, register it under the source id in the run's shared
+/// stop registry (ADR-W018 — a live remove/edit raises exactly this flag), and
+/// run [`ingest_loop`] on a named thread.
+///
+/// This is **the** per-source producer construction — the startup
+/// [`IngestSupervisor::start`] and the live-source hub's
+/// [`LiveIngestSpawner`] both call it, so a runtime-added source runs exactly
+/// the supervised ingest the startup path builds (same reconnect bracket,
+/// jitter, PTS normalization, rw-timeout) — never a second-quality copy.
+///
+/// A thread that cannot spawn is logged and yields `None`: its tile simply
+/// rides `NO_SIGNAL` (slate) rather than failing the run (invariant #1 — the
+/// output clock is independent of inputs).
+fn spawn_ingest_producer(
+    plan: IngestPlan,
+    registry: &crate::live_sources::StopRegistry,
+) -> Option<(Arc<AtomicBool>, JoinHandle<()>)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let id = plan.id.clone();
+    let exited = crate::live_sources::register_stop(registry, &id, &stop);
+    // ExitGuard built BEFORE spawn: its Drop flips `exited` on thread exit OR if
+    // Builder::spawn fails (the dropped closure drops the guard) — so a failed spawn
+    // never orphans an exited=false entry the hub would busy-wait on (ADR-W018 §5 /
+    // ADR-T002 — the hub cannot join a startup thread, so it waits on this latch).
+    let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+    let thread_stop = Arc::clone(&stop);
+    let builder = std::thread::Builder::new().name(format!("multiview-ingest-{id}"));
+    match builder.spawn(move || {
+        let _exit = exit_guard;
+        ingest_loop(&plan, &thread_stop);
+    }) {
+        Ok(handle) => Some((stop, handle)),
+        Err(e) => {
+            tracing::error!(error = %e, source = %id, "could not spawn ingest thread");
+            None
+        }
+    }
+}
+
+/// The run's decoded-ingest spawner (ADR-W018 level 2), handed to the
+/// live-source hub by the binary: it turns a runtime
+/// [`SourceSpawn`](crate::live_sources::SourceSpawn) into a running producer
+/// through **exactly** the startup construction — [`ingest_plan_for`] builds
+/// the plan, [`select_live_decode_placement`] consults the same admission scorer
+/// (pinned to the running island's device), and [`spawn_ingest_producer`]
+/// spawns the same supervised [`ingest_loop`]. Runs on the hub worker thread
+/// only — heavy/blocking work never touches the output clock (inv #1).
+struct LiveIngestSpawner {
+    /// The solved startup layout: tile geometry for a bound cell, the canvas
+    /// fallback for an unbound one — the same sizing rule the startup build
+    /// applies (a freshly added source is typically unbound until the
+    /// follow-up route, so it decodes at canvas size, exactly like an unbound
+    /// startup source).
+    layout: Arc<Layout>,
+    /// The canvas colour the source's frames are tagged in.
+    canvas_color: CanvasColor,
+    /// The output cadence (generator pacing / plan metadata).
+    cadence: Rational,
+    /// The pinned island slot `drive_streaming` publishes (ADR-W018 §7).
+    #[cfg(feature = "gpu")]
+    island: LiveIslandSlot,
+    /// The GPU load source the placement consult re-polls at decision time
+    /// (NVML in production; injectable for the placement-consult tests).
+    #[cfg(feature = "gpu")]
+    load_source: Box<dyn multiview_hal::LoadSource + Send + Sync>,
+}
+
+impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
+    fn spawn(
+        &self,
+        spawn: crate::live_sources::SourceSpawn,
+        registry: &crate::live_sources::StopRegistry,
+    ) -> Option<crate::live_sources::SpawnedProducer> {
+        let crate::live_sources::SourceSpawn { source, store } = spawn;
+        let (tile_w, tile_h) = cell_pixel_size(&self.layout, &source.id)
+            .unwrap_or((self.layout.canvas.width, self.layout.canvas.height));
+        #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+        // reason: without `gpu` there is no placement consult, so the plan is
+        // never re-stamped after construction; the binding must still be `mut`
+        // for the gpu arm below.
+        let mut plan = match ingest_plan_for(
+            &source,
+            tile_w,
+            tile_h,
+            store,
+            self.canvas_color,
+            self.cadence,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                tracing::warn!(
+                    source = %source.id,
+                    error = %e,
+                    "live ingest spawn refused: the source cannot be planned; \
+                     the tile rides the slate"
+                );
+                return None;
+            }
+        };
+        // Hardware re-assessment on every change (ADR-W018 §7), under `gpu`.
+        #[cfg(feature = "gpu")]
+        {
+            plan.decode_placement = self.decode_placement_for(&plan.id);
+        }
+        spawn_ingest_producer(plan, registry)
+            .map(|(stop, handle)| crate::live_sources::SpawnedProducer { stop, handle })
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl LiveIngestSpawner {
+    /// Decide a runtime-added source's [`DecodePlacement`] (ADR-W018 §7), under
+    /// `gpu` where an admission decision exists. An admit pins the island
+    /// ordinal; a reject (or an un-pinnable admit) forces `SoftwareOnly` so the
+    /// decode never lands on the over-headroom island.
+    ///
+    /// EMPTY ISLAND FAILS CLOSED: `gpu` admission ran at startup
+    /// (`drive_streaming`) and published a `LiveIsland` only when it named a
+    /// device; an EMPTY slot means admission was *attempted and named none*
+    /// (scorer rejection / no NVML / no admissible GPU). Defaulting to
+    /// `DecodePlacement::Default` there would open NVDEC on libav's default
+    /// device — exactly the over-subscribed/wrong GPU the admission declined —
+    /// so a runtime-added decode forces `SoftwareOnly` instead (fail closed).
+    /// The GPU-free build carries no `island` field at all and keeps the
+    /// constructor `Default` (no NVDEC compiled to mis-place).
+    fn decode_placement_for(&self, source_id: &str) -> DecodePlacement {
+        if let Some(island) = self.island.load_full() {
+            select_live_decode_placement(
+                self.load_source.as_ref(),
+                &island,
+                self.layout.canvas.width,
+                self.layout.canvas.height,
+                self.cadence,
+            )
+        } else {
+            tracing::warn!(
+                source = %source_id,
+                "live decode placement: GPU admission named no island device \
+                 (rejected / no NVML); FORCING software decode for this \
+                 runtime-added source (the default device would over-subscribe \
+                 or mis-place the decode — ADR-W018 §7)"
+            );
+            DecodePlacement::SoftwareOnly
+        }
     }
 }
 
@@ -4123,13 +6487,21 @@ fn duration_from_nanos(nanos: i64) -> Duration {
     Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
 }
 
-/// The pixel size of the cell that binds `source_id`, if any.
+/// The decode size for `source_id`: the **per-axis supremum** of the pixel sizes
+/// of every cell that binds it, or [`None`] if no cell binds it.
+///
+/// A source can tile into several cells of different sizes (e.g. a big PGM cell
+/// plus a small PIP). Decoding once at the per-axis max satisfies the largest
+/// consumer on each axis (ADR-0030 §3); each cell then scales down at composite.
+/// Taking the FIRST binding cell would under-decode every larger tile bound to
+/// the same source.
 fn cell_pixel_size(layout: &Layout, source_id: &str) -> Option<(u32, u32)> {
-    let cell = layout
+    layout
         .cells
         .iter()
-        .find(|c| c.source.as_deref() == Some(source_id))?;
-    Some(cell_dims(cell, layout.canvas.width, layout.canvas.height))
+        .filter(|c| c.source.as_deref() == Some(source_id))
+        .map(|c| cell_dims(c, layout.canvas.width, layout.canvas.height))
+        .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
 }
 
 /// Convert a cell's normalized `w`/`h` into even pixel dimensions (NV12 needs
@@ -4281,57 +6653,69 @@ fn u32_from_usize_audio(value: usize) -> u32 {
 }
 
 /// The codec token a config output names, if it carries one.
-/// Read an optional analog clock face from the config `[[overlays]]` list: the
-/// first entry whose `kind == "clock"` and whose `face` param is `"analog"`.
+/// Read the analog clock faces from the config `[[overlays]]` list: one face
+/// per entry whose `kind == "clock"` and whose `face` param is `"analog"`, in
+/// working-set order (ADR-W022 — EVERY analog entry renders; no first-wins).
 ///
-/// Placement comes from optional `x`/`y`/`radius` params (canvas pixels); a
-/// missing placement defaults the face to the bottom-right corner sized to the
-/// canvas. An optional `tz_minutes` param sets the timezone offset (default UTC).
-/// Returns `None` when no analog clock is requested (the digital label still
-/// renders). Without the `overlay` feature this is never called.
+/// Placement comes from each entry's optional `x`/`y`/`radius` params (canvas
+/// pixels); a missing placement defaults that face to the bottom-right corner
+/// sized to the canvas. An optional `tz_minutes` param sets the timezone
+/// offset (default UTC). Returns an empty set when no analog clock is
+/// requested (the digital label still renders). Without the `overlay` feature
+/// this is never called.
+// `pub` so a render-level integration test can drive the EXACT derivation the
+// bake consumer's `refresh_overlays` uses (slot overlay set → ordered analog
+// face specs → `OverlayBaker::draw_list`), proving an equal-z overlay reorder
+// changes the RENDERED draw order, not just the published slot (task #130).
 #[cfg(feature = "overlay")]
-fn analog_clock_from_config(
+#[must_use]
+pub fn analog_clocks_from_config(
     overlays: &[multiview_config::Overlay],
     canvas_w: u32,
     canvas_h: u32,
-) -> Option<crate::overlays::AnalogClockSpec> {
+) -> Vec<crate::overlays::AnalogClockSpec> {
     use multiview_overlay::clock::TimeZoneOffset;
-
-    let entry = overlays.iter().find(|o| {
-        o.kind == "clock"
-            && o.params
-                .get("face")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|f| f.eq_ignore_ascii_case("analog"))
-    })?;
 
     let cw = u32_to_f32(canvas_w);
     let ch = u32_to_f32(canvas_h);
     // A face sized to ~22% of the shorter canvas side by default.
     let default_radius = cw.min(ch) * 0.11;
-    // Config placement is whole-pixel / whole-minute; round each param to an i32
-    // and widen it losslessly to f32 (no `as` cast), or fall back to the default.
-    let param_f32 = |key: &str| -> Option<f32> {
-        entry
-            .params
-            .get(key)
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| i32_to_f32(round_f64_to_i32(v)))
-    };
-    let radius = param_f32("radius").unwrap_or(default_radius).max(8.0);
-    // Default placement: bottom-right corner, inset by the radius + a margin.
-    let margin = radius * 0.25;
-    let cx = param_f32("x").unwrap_or(cw - radius - margin);
-    let cy = param_f32("y").unwrap_or(ch - radius - margin);
-    let zone = entry
-        .params
-        .get("tz_minutes")
-        .and_then(serde_json::Value::as_f64)
-        .map_or(TimeZoneOffset::UTC, |m| {
-            TimeZoneOffset::from_minutes(round_f64_to_i32(m))
-        });
 
-    Some(crate::overlays::AnalogClockSpec::new(zone, cx, cy, radius))
+    overlays
+        .iter()
+        .filter(|o| {
+            o.kind == "clock"
+                && o.params
+                    .get("face")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|f| f.eq_ignore_ascii_case("analog"))
+        })
+        .map(|entry| {
+            // Config placement is whole-pixel / whole-minute; round each param
+            // to an i32 and widen it losslessly to f32 (no `as` cast), or fall
+            // back to the default.
+            let param_f32 = |key: &str| -> Option<f32> {
+                entry
+                    .params
+                    .get(key)
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|v| i32_to_f32(round_f64_to_i32(v)))
+            };
+            let radius = param_f32("radius").unwrap_or(default_radius).max(8.0);
+            // Default placement: bottom-right corner, inset by radius + margin.
+            let margin = radius * 0.25;
+            let cx = param_f32("x").unwrap_or(cw - radius - margin);
+            let cy = param_f32("y").unwrap_or(ch - radius - margin);
+            let zone = entry
+                .params
+                .get("tz_minutes")
+                .and_then(serde_json::Value::as_f64)
+                .map_or(TimeZoneOffset::UTC, |m| {
+                    TimeZoneOffset::from_minutes(round_f64_to_i32(m))
+                });
+            crate::overlays::AnalogClockSpec::new(zone, cx, cy, radius)
+        })
+        .collect()
 }
 
 /// Exact small-`u32` → `f32` widening (canvas sizes are well under `2^24`), no
@@ -4390,7 +6774,13 @@ fn output_codec(output: &Output) -> Option<&str> {
         | Output::LlHls { codec, .. }
         | Output::Hls { codec, .. }
         | Output::Rtmp { codec, .. }
-        | Output::Srt { codec, .. } => Some(codec.as_str()),
+        | Output::Srt { codec, .. }
+        // WebRTC outputs consume the encode-once program rendition (invariant #7,
+        // ADR-0049) — they spawn no encoder, so the program MUST be encoded as the
+        // codec they name (default h264). A webrtc-only config therefore selects
+        // h264, not the mpeg2video fallback the SRTP packetizer cannot carry.
+        | Output::Webrtc { codec, .. }
+        | Output::WhipPush { codec, .. } => Some(codec.as_str()),
         // NDI carries no codec token; a future output kind names none here until
         // explicitly wired (`Output` is `#[non_exhaustive]`).
         Output::Ndi { .. } | _ => None,
@@ -4402,11 +6792,30 @@ fn output_codec(output: &Output) -> Option<&str> {
 /// two disjoint paths by design (ADR-0044: a display sink consumes the
 /// pre-encode canvas and never joins the packet fan-out).
 struct BuiltOutputs {
-    /// File/HLS/push sinks fed the one encoded packet stream (invariant #7).
+    /// File/HLS/push sinks fed the one encoded packet stream (invariant #7). The
+    /// `ndi-bindings` NDI sink also lives here (as `RunnableOutput::Ndi`) so it
+    /// shares the existing per-sink thread + end-of-program lifecycle — but it
+    /// consumes the canvas tap below, never the packets.
     packet: Vec<RunnableOutput>,
     /// DRM/KMS display heads, started as raw-frame sinks at stream start.
     #[cfg(feature = "display-kms")]
     display: Vec<DisplayOutputPlan>,
+    /// The engine-side wait-free publishers of each NDI output's canvas tap
+    /// (paired with the `FrameReader` inside its `RunnableOutput::Ndi`). The hot
+    /// loop publishes the shared pre-encode canvas `Arc` into each, exactly like
+    /// the display head publishers — newest-wins, so the engine never blocks
+    /// (invariants #1 + #10). Built only under `ndi-bindings`.
+    #[cfg(feature = "ndi-bindings")]
+    ndi_publishers: Vec<multiview_output::display::FramePublisher<NdiCanvasFrame>>,
+    /// The bake-consumer-side **push handles** of each AES67 output's send FIFO
+    /// (#103), paired with the serve-side `Aes67Sender` inside its
+    /// `RunnableOutput::Aes67`. The bake consumer pushes each post-loudnorm program
+    /// block into every handle (drop-oldest, `&self`), exactly like it feeds the
+    /// display heads — a stalled network drops at the FIFO and can never
+    /// back-pressure the consumer or the engine (invariants #1 + #10). Built only
+    /// under `aes67`.
+    #[cfg(feature = "aes67")]
+    aes67_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
 }
 
 /// One configured display head (feature `display-kms`): everything
@@ -4422,6 +6831,10 @@ struct DisplayOutputPlan {
     mode: multiview_output::display::ModeRequest,
     /// The CVT-RB forced mode for an EDID-less chain, if configured.
     forced_mode: Option<multiview_output::display::ForcedMode>,
+    /// Whether HDMI/DP audio is enabled on this head (the config `audio` block
+    /// is present). The audio sink only runs when this is set AND the ELD is
+    /// valid (DEV-B4 / display-out §5); an EDID-less head has no audio path.
+    audio_enabled: bool,
 }
 
 /// Extract the display-head plan from one `Output::Display` (feature
@@ -4433,6 +6846,7 @@ fn display_plan_of(output: &Output) -> Option<DisplayOutputPlan> {
         connector,
         mode,
         forced_mode,
+        audio,
         ..
     } = output
     else {
@@ -4460,6 +6874,10 @@ fn display_plan_of(output: &Output) -> Option<DisplayOutputPlan> {
         connector: selector,
         mode: request,
         forced_mode: forced,
+        // The presence of the `audio` block enables HDMI/DP audio (ELD-gated at
+        // runtime); a display output never carries selectable discrete tracks
+        // (capability-validated upstream), so the mode is not inspected here.
+        audio_enabled: audio.is_some(),
     })
 }
 
@@ -4486,12 +6904,44 @@ impl multiview_output::display::DisplayCanvas for CanvasFrame {
     }
 }
 
+/// Everything [`start_display_sinks`] lit: the per-head video flip loops (and
+/// their mailbox publishers) plus the DEV-B4 audio sinks (and their bounded
+/// drop-oldest FIFO publishers) of the heads whose plan enabled audio. The handle vectors
+/// own the threads — keep them alive for the run; dropping them stops + joins.
+#[cfg(feature = "display-kms")]
+struct StartedDisplaySinks {
+    /// One running flip loop per head.
+    handles: Vec<multiview_output::display::DisplaySinkHandle>,
+    /// The matching wait-free frame mailboxes (same order as `handles`).
+    publishers: Vec<multiview_output::display::FramePublisher<CanvasFrame>>,
+    /// The running ELD-gated ALSA audio sinks (audio-enabled heads only).
+    audio_handles: Vec<multiview_output::display::audio::DisplayAudioSink>,
+    /// The matching bounded drop-oldest audio FIFO publishers.
+    audio_publishers: Vec<multiview_output::display::audio::DisplayAudioPublisher>,
+}
+
+/// The display-audio FIFO depth in frames (per channel): ~170 ms @ 48 kHz.
+/// Bounds the worst-case added audio latency AND the drop point under a
+/// wedged/slow device (drop-oldest — the engine-side push never blocks).
+#[cfg(feature = "display-kms")]
+const DISPLAY_AUDIO_FIFO_FRAMES: usize = 8_192;
+
 /// Open and light every configured display head (feature `display-kms`):
 /// scan `/dev/dri` for the connector-owning card, probe + select the mode
 /// (EDID preferred / exact-rational `cadence` match / CVT-RB forced), run the
 /// `TEST_ONLY` validation and the one startup modeset, and spawn the
 /// dedicated flip-loop thread per head (ADR-0044 §1). Startup-only; runs
 /// before the output clock starts.
+///
+/// An audio-enabled head (DEV-B4) additionally gets an ELD-gated ALSA audio
+/// sink: the connector's ALSA endpoints are discovered (vc4 card-per-port or
+/// the HDA `eld#D.P` scan), the sink is wired to this head's flip clock for
+/// the scanout-skew servo term, and fed `audio_format` program blocks. Audio
+/// is **best-effort by construction** (display-out §5): an EDID-less head
+/// (forced mode — no ELD exists) and a connector with no discoverable ALSA
+/// endpoint run video-only with a log line, never an error — and a present
+/// ELD is still re-checked live by the sink itself (hotplug), so audio only
+/// flows while the pipe is lit AND the ELD is valid.
 ///
 /// # Errors
 ///
@@ -4502,17 +6952,16 @@ impl multiview_output::display::DisplayCanvas for CanvasFrame {
 fn start_display_sinks(
     plans: Vec<DisplayOutputPlan>,
     cadence: Rational,
-) -> Result<
-    (
-        Vec<multiview_output::display::DisplaySinkHandle>,
-        Vec<multiview_output::display::FramePublisher<CanvasFrame>>,
-    ),
-    PipelineError,
-> {
+    audio_format: multiview_audio::AudioFormat,
+) -> Result<StartedDisplaySinks, PipelineError> {
     use multiview_output::display::kms::KmsDisplayDevice;
     use multiview_output::display::{DisplaySink, DisplaySinkConfig};
-    let mut handles = Vec::with_capacity(plans.len());
-    let mut publishers = Vec::with_capacity(plans.len());
+    let mut started = StartedDisplaySinks {
+        handles: Vec::with_capacity(plans.len()),
+        publishers: Vec::with_capacity(plans.len()),
+        audio_handles: Vec::new(),
+        audio_publishers: Vec::new(),
+    };
     for plan in plans {
         let device = KmsDisplayDevice::open_for_connector(&plan.connector).map_err(|e| {
             PipelineError::Output {
@@ -4538,10 +6987,298 @@ fn start_display_sinks(
             kind: "display",
             reason: format!("{}: {e}", plan.output_id),
         })?;
-        handles.push(handle);
-        publishers.push(publisher);
+        if plan.audio_enabled {
+            start_display_audio(&plan.output_id, &handle, audio_format, &mut started);
+        }
+        started.handles.push(handle);
+        started.publishers.push(publisher);
     }
-    Ok((handles, publishers))
+    Ok(started)
+}
+
+/// Start the DEV-B4 ALSA audio sink for one lit head, appending its handle +
+/// publisher to `started`. Best-effort: every miss (EDID-less head, no ALSA
+/// endpoint) logs and returns — the head runs video-only, never an error.
+#[cfg(feature = "display-kms")]
+fn start_display_audio(
+    output_id: &str,
+    handle: &multiview_output::display::DisplaySinkHandle,
+    audio_format: multiview_audio::AudioFormat,
+    started: &mut StartedDisplaySinks,
+) {
+    use multiview_output::display::audio::alsa::discover_for_connector;
+    use multiview_output::display::audio::{DisplayAudioConfig, DisplayAudioSink, FlipClock};
+
+    let head = handle.head();
+    if !head.from_edid {
+        // The documented field condition (display-out §5/§6): a forced-mode
+        // (EDID-less) head publishes no ELD, so it has NO audio path — video
+        // only, stated rather than a surprise.
+        tracing::info!(
+            output = %output_id,
+            connector = %head.connector,
+            "display head runs a forced (EDID-less) mode: no ELD, so no audio path; video only"
+        );
+        return;
+    }
+    let Some(found) = discover_for_connector(&head.connector) else {
+        tracing::warn!(
+            output = %output_id,
+            connector = %head.connector,
+            "display audio enabled but no ALSA endpoint was discovered for the connector; \
+             head runs video-only"
+        );
+        return;
+    };
+    tracing::info!(
+        output = %output_id,
+        connector = %head.connector,
+        card = %found.card_id,
+        "display audio: ALSA endpoints discovered (ELD-gated sink starting)"
+    );
+    // The head's flip telemetry is the scanout clock the audio servo's skew
+    // term anchors against (display-out §5: the three-clock problem).
+    let stats = handle.stats();
+    let flip: FlipClock = Box::new(move || stats.snapshot().last_flip_ns);
+    let (audio_handle, audio_publisher) = DisplayAudioSink::start_with_flip_clock(
+        DisplayAudioConfig {
+            output_id: output_id.to_owned(),
+            format: audio_format,
+            fifo_capacity_frames: DISPLAY_AUDIO_FIFO_FRAMES,
+            // Matches the video sink's poll: bounds stop latency and how fast
+            // an idle/ELD-waiting sink reacts, without busy-waiting (the
+            // blocking PCM write paces the steady state on hardware).
+            poll_interval: Duration::from_millis(4),
+        },
+        found.eld,
+        found.pcm,
+        Some(flip),
+    );
+    started.audio_handles.push(audio_handle);
+    started.audio_publishers.push(audio_publisher);
+}
+
+/// Resolve a RIST pre-shared-key `secret_ref` to its plaintext passphrase
+/// (RIST-3, ADR-0095 §3). The PSK is **never** stored in the config or logs; it
+/// is read at run time from the secret store the deployment configures.
+///
+/// This build resolves an `env:VAR` reference from the environment (no extra
+/// dependency, works in every deployment), exactly like the managed-device
+/// credential resolver. An `op://…` reference (or any other scheme) returns
+/// `None` here — the run then cannot inject the key and the `rist://` open
+/// surfaces a libav error the ingest loop rides as `NO_SIGNAL`/reconnect (never
+/// a crash), rather than silently sending an unencrypted feed.
+#[cfg(feature = "rist")]
+fn resolve_rist_secret(secret_ref: &str) -> Option<String> {
+    // `env:VAR` — read the passphrase from a single environment variable.
+    let var = secret_ref.strip_prefix("env:")?;
+    std::env::var(var).ok()
+}
+
+/// Lower a `rist://` base URL + typed [`RistOptions`] into the `AVIO` URL libav
+/// opens, resolving any PSK `secret_ref` (RIST-3, ADR-0095 §3). When `redact` is
+/// `true` the PSK is `***`-masked for logging — the plaintext never reaches a
+/// log line.
+///
+/// # Errors
+///
+/// [`multiview_config::RistUrlError`] when the typed options cannot be lowered
+/// (a non-empty bonding list on the Tier-0 build, or encryption configured with
+/// a `secret_ref` that did not resolve). Each call site maps it to the
+/// appropriate [`PipelineError`] (ingest vs output).
+#[cfg(feature = "rist")]
+fn rist_resolved_url(
+    base_url: &str,
+    rist: Option<&RistOptions>,
+    redact: bool,
+) -> Result<String, multiview_config::RistUrlError> {
+    let Some(opts) = rist else {
+        return Ok(base_url.to_owned());
+    };
+    // Resolve the PSK (if any) once; the lowering injects it into the URL.
+    let resolved = opts
+        .encryption
+        .as_ref()
+        .and_then(|enc| resolve_rist_secret(&enc.secret_ref));
+    lower_rist_url(base_url, opts, resolved.as_deref(), redact)
+}
+
+/// Build the `RunnableOutput::Push` for an `Output::Rist` (RIST-3): lower the
+/// typed options (resolving the PSK) to the `AVIO` URL the libav `mpegts` muxer
+/// opens over `rist://`, fed the SAME encoded packets as every other push
+/// (invariant #7). Only the redacted URL is ever logged / reported.
+///
+/// # Errors
+///
+/// [`PipelineError::Output`] when the options cannot be lowered (bonding on the
+/// Tier-0 build, or an unresolved encryption `secret_ref`).
+#[cfg(feature = "rist")]
+fn build_rist_push(
+    output: &Output,
+    url: &str,
+    rist: Option<&RistOptions>,
+) -> Result<RunnableOutput, PipelineError> {
+    let to_err = |e: multiview_config::RistUrlError| PipelineError::Output {
+        kind: "rist",
+        reason: e.to_string(),
+    };
+    let lowered = rist_resolved_url(url, rist, false).map_err(to_err)?;
+    let redacted = rist_resolved_url(url, rist, true).map_err(to_err)?;
+    tracing::info!(transport = "rist", url = %redacted, "wiring rist push output");
+    // OUTMETA: RIST carries MPEG-TS, so the SDT/PMT metadata applies (no
+    // rotation tag — pixels-only orientation is the compositor's concern).
+    let (meta, matrix) = output_mux_meta(output);
+    Ok(RunnableOutput::Push {
+        id: output.id(),
+        sink: PacketMuxSink::push(PushProtocol::Rist, lowered).with_output_metadata(meta, matrix),
+        label: "rist",
+        url: redacted,
+    })
+}
+
+/// Translate one config [`Output`]'s OUTMETA intent into the output-layer
+/// apply values (ADR-0088 / ADR-0089): the muxer dictionary entries
+/// ([`MuxMetadata`]) for the **`Applied`** metadata fields, and the tag-path
+/// display-rotation [`DisplayMatrix`] when the orientation resolves to the
+/// **tag** mechanism on this transport.
+///
+/// The config [`Output::metadata_plan`] already says which fields land on this
+/// transport (the rest are surfaced as `Dropped`); here we map each `Applied`
+/// field to the concrete libav dict key its carrier uses. A `Dropped` field is
+/// never pushed (it was already reported). Orientation: a `tag`/`auto`-on-a-tag-
+/// transport mechanism emits the display matrix; the **pixels** mechanism is a
+/// compositor concern (a rotated rendition), not a mux tag, so it yields `None`
+/// here. Returns an empty pair when the output carries neither.
+fn output_mux_meta(output: &Output) -> (multiview_output::MuxMetadata, Option<DisplayMatrix>) {
+    use multiview_config::{MetadataField, OrientationMechanism};
+
+    let mut mux = multiview_output::MuxMetadata::new();
+    if let Some(meta) = output.metadata() {
+        let plan = output.metadata_plan();
+        // The libav dict key for each config field is transport-family-specific.
+        // The MPEG-TS family (SRT/RIST) uses the SDT/PMT keys mpegtsenc reads;
+        // every other container uses the generic `title`/`comment`/`language`.
+        let is_mpegts = matches!(output, Output::Srt { .. } | Output::Rist { .. });
+        let title_key = if is_mpegts { "service_name" } else { "title" };
+        let provider_key = if is_mpegts {
+            "service_provider"
+        } else {
+            "author"
+        };
+        let desc_key = if is_mpegts { "service_name" } else { "comment" };
+
+        let applied = |f: &Option<MetadataField>| matches!(f, Some(MetadataField::Applied { .. }));
+        // Push only the fields the plan said landed; a malformed (interior-NUL)
+        // value is surfaced via the log and dropped, never failing the run
+        // (values are already validation-clean at config time). The
+        // `(applied, value, key)` table is collected first so the fallible
+        // pushes borrow `mux` one at a time (no closure capturing `mux`).
+        let format_pushes: [(bool, Option<&String>, &str); 3] = [
+            (applied(&plan.title), meta.title.as_ref(), title_key),
+            (
+                applied(&plan.provider),
+                meta.provider.as_ref(),
+                provider_key,
+            ),
+            (
+                applied(&plan.description),
+                meta.description.as_ref(),
+                desc_key,
+            ),
+        ];
+        for (is_applied, value, key) in format_pushes {
+            if is_applied {
+                if let Some(v) = value {
+                    if let Err(e) = mux.push_format(key, v) {
+                        tracing::warn!(key, error = %e, "skipping unencodable output metadata entry");
+                    }
+                }
+            }
+        }
+        // service_id maps to the mpegts SDT/PMT program number; mpegtsenc reads
+        // it from the format `service_id` key (carried by the TS family only).
+        if applied(&plan.service_id) {
+            if let Some(id) = meta.service_id {
+                if let Err(e) = mux.push_format("service_id", id.to_string()) {
+                    tracing::warn!(error = %e, "skipping unencodable service_id metadata");
+                }
+            }
+        }
+        // Language is a per-stream tag (the program video stream, index 0).
+        if applied(&plan.language) {
+            if let Some(v) = &meta.language {
+                if let Err(e) = mux.push_stream(0, "language", v) {
+                    tracing::warn!(error = %e, "skipping unencodable language metadata");
+                }
+            }
+        }
+        let _ = meta.timed; // timed-metadata side stream is the cue-injection path (ADR-0088 §4).
+    }
+
+    // Orientation tag path: emit the display matrix only when the resolved
+    // mechanism is `Tag` (auto-on-a-tag-transport or explicit tag). The pixels
+    // mechanism is handled in the compositor as a rotated rendition.
+    let matrix = output.orientation().and_then(|o| {
+        if o.is_identity() {
+            return None;
+        }
+        match o.mechanism(output.orientation_tag_capability()) {
+            OrientationMechanism::Tag => Some(display_matrix(o.turn)),
+            // The pixels mechanism (and any future one) rotates the rendition in
+            // the compositor, not via a mux tag — no display matrix here.
+            _ => None,
+        }
+    });
+    (mux, matrix)
+}
+
+/// Build the `RunnableOutput::Hls` for an HLS/LL-HLS output: create the segment
+/// dir, then a rolling-live segment sink (HLS-0/1, ADR-0032) carrying the
+/// OUTMETA per-output metadata + tag-path display matrix. The sink shares the
+/// pipeline epoch cell so each closed segment is PDT-stamped from the same
+/// outbound epoch the control WS publishes (DEV-C1 / ADR-M010).
+fn build_hls_output(
+    output: &Output,
+    path: &str,
+    epoch: &multiview_output::SharedEpoch,
+) -> Result<RunnableOutput, PipelineError> {
+    let (dir, prefix, playlist_path) = hls_paths(Path::new(path));
+    std::fs::create_dir_all(&dir).map_err(|e| PipelineError::Output {
+        kind: "hls",
+        reason: format!("creating {}: {e}", dir.display()),
+    })?;
+    let (meta, matrix) = output_mux_meta(output);
+    Ok(RunnableOutput::Hls {
+        id: output.id(),
+        sink: PacketMuxSink::segment_live(
+            dir,
+            prefix,
+            playlist_path.clone(),
+            HLS_LIVE_WINDOW,
+            epoch.clone(),
+        )
+        .with_output_metadata(meta, matrix),
+        playlist_path,
+    })
+}
+
+/// Build a live push sink ([`RunnableOutput::Push`]) for an RTMP/SRT output: the
+/// muxer targeting `url` over `protocol`, carrying the output's declarative
+/// metadata (ADR-0088), fed the SAME encode-once packets as every other transport
+/// (invariant #7).
+fn build_push_output(
+    output: &Output,
+    protocol: PushProtocol,
+    url: &str,
+    label: &'static str,
+) -> RunnableOutput {
+    let (meta, matrix) = output_mux_meta(output);
+    RunnableOutput::Push {
+        id: output.id(),
+        sink: PacketMuxSink::push(protocol, url.to_owned()).with_output_metadata(meta, matrix),
+        label,
+        url: url.to_owned(),
+    }
 }
 
 /// Build the runnable sinks from the config outputs.
@@ -4551,12 +7288,35 @@ fn start_display_sinks(
 /// invariant #7 — only the muxer targets a network URL). A **display** output
 /// (DEV-B1 / ADR-0044) is built as a raw-frame DRM/KMS plan in a `display-kms`
 /// build and is a hard error otherwise (never silently skipped — the gate in
-/// [`crate::outputs`]). The RTSP *server* and NDI out are genuinely not
-/// implemented (an RTSP server is its own RTP/RTSP protocol stack; NDI is the
-/// proprietary runtime-loaded SDK), so they are honestly skipped with a log
-/// line rather than pretended-runnable — a config mixing one with a supported
-/// output still produces that supported output.
-fn build_outputs(outputs: &[Output]) -> Result<BuiltOutputs, PipelineError> {
+/// [`crate::outputs`]). NDI out (OUT-4b) is a raw-canvas sink built under the
+/// live `ndi-bindings` binding (an accepted `[system.ndi]` license gates it by
+/// construction); a seam-only `ndi` build or an unaccepted/absent runtime is an
+/// honest skip. The RTSP *server* is genuinely not implemented (its own
+/// RTP/RTSP protocol stack) and is honestly skipped with a log line rather than
+/// pretended-runnable — a config mixing an unsupported output with a supported
+/// one still produces that supported output.
+#[allow(clippy::too_many_lines)]
+// reason: a flat build loop matching every configured output kind (display / HLS /
+// push / RIST / WebRTC / RTSP / NDI / AES67) to its runnable, each arm a short
+// build/skip; the value is reading the whole per-kind assembly in one place.
+fn build_outputs(
+    outputs: &[Output],
+    epoch: &multiview_output::SharedEpoch,
+    #[cfg(feature = "webrtc-native")] egress_sinks: &std::collections::HashMap<
+        String,
+        multiview_webrtc::egress::EgressSink,
+    >,
+    // The `[system.ndi]` license-acceptance settings (OUT-4b / NDI-L2): the live
+    // NDI sender is gated by an accepted license by construction. Unused without
+    // the `ndi-bindings` live binding.
+    #[cfg_attr(not(feature = "ndi-bindings"), allow(unused_variables))] ndi_system: Option<
+        &multiview_config::NdiSystemConfig,
+    >,
+    // The output cadence (exact rational): the NDI sink derives its tick-stamped
+    // 100 ns timecode + frame-rate descriptor from it (invariant #3). Unused
+    // without `ndi-bindings`.
+    #[cfg_attr(not(feature = "ndi-bindings"), allow(unused_variables))] cadence: Rational,
+) -> Result<BuiltOutputs, PipelineError> {
     // A display output in a non-display-kms build is a configuration the
     // binary cannot honour: fail the build clearly, never skip (DEV-B1).
     crate::outputs::ensure_display_outputs_supported(outputs).map_err(|reason| {
@@ -4565,9 +7325,29 @@ fn build_outputs(outputs: &[Output]) -> Result<BuiltOutputs, PipelineError> {
             reason,
         }
     })?;
+    // Same fail-closed contract for an AES67 raw-PCM output in a non-`aes67` build
+    // (#103): reject clearly rather than warn-skip it into a dead stream.
+    crate::outputs::ensure_aes67_outputs_supported(outputs).map_err(|reason| {
+        PipelineError::Output {
+            kind: "aes67",
+            reason,
+        }
+    })?;
+    // #103: distinct AES67 senders on ONE multicast group:port must advertise
+    // distinct RTP SSRCs (a receiver demuxes by SSRC within a group — RFC 3550 §8).
+    // The per-output SSRC is a 32-bit fold of id + group:port, so a same-group
+    // collision is astronomically unlikely but not impossible — reject it
+    // fail-closed here (config-time, off the hot path; inv #1/#10) rather than emit
+    // two ambiguous senders. Senders on DIFFERENT groups may share an SSRC.
+    #[cfg(feature = "aes67")]
+    ensure_no_aes67_ssrc_collision(outputs)?;
     let mut runnable = Vec::new();
     #[cfg(feature = "display-kms")]
     let mut display_plans = Vec::new();
+    #[cfg(feature = "ndi-bindings")]
+    let mut ndi_publishers = Vec::new();
+    #[cfg(feature = "aes67")]
+    let mut aes67_handles = Vec::new();
     for output in outputs {
         match output {
             Output::Display { .. } => {
@@ -4580,39 +7360,57 @@ fn build_outputs(outputs: &[Output]) -> Result<BuiltOutputs, PipelineError> {
                 }
             }
             Output::Hls { path, .. } | Output::LlHls { path, .. } => {
-                let (dir, prefix, playlist_path) = hls_paths(Path::new(path));
-                std::fs::create_dir_all(&dir).map_err(|e| PipelineError::Output {
-                    kind: "hls",
-                    reason: format!("creating {}: {e}", dir.display()),
-                })?;
-                // Live rolling playlist (HLS-0/1, ADR-0032): the sink publishes the
-                // windowed `.m3u8` on every closed segment and prunes the evicted
-                // `.ts` — so a live (infinite) run keeps `multiview.m3u8` current
-                // and disk bounded, instead of 404ing until a finalize that never
-                // comes. A 6-segment window is the rolling DVR depth.
-                runnable.push(RunnableOutput::Hls {
-                    sink: PacketMuxSink::segment_live(
-                        dir,
-                        prefix,
-                        playlist_path.clone(),
-                        HLS_LIVE_WINDOW,
-                    ),
-                    playlist_path,
-                });
+                runnable.push(build_hls_output(output, path, epoch)?);
             }
             Output::Rtmp { url, .. } => {
-                runnable.push(RunnableOutput::Push {
-                    sink: PacketMuxSink::push(PushProtocol::Rtmp, url.clone()),
-                    label: "rtmp",
-                    url: url.clone(),
-                });
+                runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
             }
             Output::Srt { url, .. } => {
-                runnable.push(RunnableOutput::Push {
-                    sink: PacketMuxSink::push(PushProtocol::Srt, url.clone()),
-                    label: "srt",
-                    url: url.clone(),
-                });
+                runnable.push(build_push_output(output, PushProtocol::Srt, url, "srt"));
+            }
+            // RIST push (ADR-0095): the open-standard sibling of the SRT push.
+            // The typed options lower to the `rist://…?…` AVIO URL (the PSK
+            // resolved from its secret_ref); `PushProtocol::Rist` fans the SAME
+            // encoded packets through the `mpegts` muxer (invariant #7). The
+            // unredacted URL goes to the sink; only the redacted form is logged.
+            #[cfg(feature = "rist")]
+            Output::Rist { url, rist, .. } => {
+                runnable.push(build_rist_push(output, url, rist.as_ref())?);
+            }
+            // Without the `rist` feature the librist obligation is not built in,
+            // so a rist output is an honest skip (never a silent pretend-run),
+            // exactly like the RTSP-server / NDI outputs below.
+            #[cfg(not(feature = "rist"))]
+            Output::Rist { .. } => {
+                tracing::warn!(
+                    "rist output requires the `rist` feature (off by default); skipping"
+                );
+            }
+            // WebRTC program outputs (ADR-0049): a mux-free fan-out sink that
+            // re-stamps the encode-once program packets into the output's bounded
+            // drop-oldest egress feed (invariant #7). The WHEP-serve driver /
+            // whip_push client (wired in the run path) drains the paired feed and
+            // packetizes per session. Under `webrtc-native` only; without the
+            // feature these are honestly skipped (no native transport linked).
+            #[cfg(feature = "webrtc-native")]
+            Output::Webrtc { .. } | Output::WhipPush { .. } => {
+                let id = output.id();
+                if let Some(sink) = egress_sinks.get(&id) {
+                    let label = match output {
+                        Output::WhipPush { .. } => format!("whip_push {id}"),
+                        _ => format!("webrtc {id}"),
+                    };
+                    runnable.push(RunnableOutput::WebRtc {
+                        id: id.clone(),
+                        sink: sink.clone(),
+                        label,
+                    });
+                } else {
+                    tracing::warn!(
+                        output = %id,
+                        "webrtc/whip_push output has no registered egress feed; skipping"
+                    );
+                }
             }
             Output::RtspServer { .. } => {
                 tracing::warn!(
@@ -4620,11 +7418,37 @@ fn build_outputs(outputs: &[Output]) -> Result<BuiltOutputs, PipelineError> {
                      RTP/RTSP protocol stack); skipping"
                 );
             }
+            // NDI output (OUT-4b / NDI-L2): a raw-canvas sink, license-gated by
+            // construction. Delegated to `handle_ndi_output`, which (under the live
+            // `ndi-bindings` binding) builds the real `SdkNdiApi` sender behind the
+            // `[system.ndi] accept_license` gate, or honestly skips with a logged
+            // reason (seam-only `ndi`, no live binding, or an unaccepted/absent
+            // runtime) — never a silent pretend-run, never a panic (inv #1/#10).
             Output::Ndi { .. } => {
-                tracing::warn!(
-                    "ndi output is not implemented (the NDI SDK is runtime-loaded and \
-                     not yet wired); skipping"
+                handle_ndi_output(
+                    output,
+                    #[cfg(feature = "ndi-bindings")]
+                    ndi_system,
+                    #[cfg(feature = "ndi-bindings")]
+                    cadence,
+                    #[cfg(feature = "ndi-bindings")]
+                    &mut runnable,
+                    #[cfg(feature = "ndi-bindings")]
+                    &mut ndi_publishers,
                 );
+            }
+            // AES67 / ST 2110-30 raw-PCM audio output (#103, ADR-0033/T013): a
+            // mux-free multicast sink of the mixed program audio. The serve-side
+            // `Aes67Sender` is built here (sync); its push handle is threaded to
+            // the bake consumer, and the async multicast socket is bound later in
+            // `run_aes67_output`. Under `aes67` only; a non-`aes67` build rejected
+            // any aes67 output up front (the gate above), so the fall-through below
+            // is defensive.
+            #[cfg(feature = "aes67")]
+            Output::Aes67 { .. } => {
+                let (runnable_out, handle) = build_aes67_output(output)?;
+                runnable.push(runnable_out);
+                aes67_handles.push(handle);
             }
             // `Output` is `#[non_exhaustive]`; an unrecognized future kind is
             // skipped rather than silently mishandled.
@@ -4642,7 +7466,377 @@ fn build_outputs(outputs: &[Output]) -> Result<BuiltOutputs, PipelineError> {
         packet: runnable,
         #[cfg(feature = "display-kms")]
         display: display_plans,
+        #[cfg(feature = "ndi-bindings")]
+        ndi_publishers,
+        #[cfg(feature = "aes67")]
+        aes67_handles,
     })
+}
+
+/// AES67 TX channel count (#103): FIXED at 2 — the program bus is stereo, and the
+/// bake consumer pushes that stereo block into the sender, whose channel count MUST
+/// match or the push is silently dropped. Multi-channel / discrete-track AES67 is a
+/// later slice.
+#[cfg(feature = "aes67")]
+const AES67_TX_CHANNELS: usize = 2;
+
+/// AES67 TX dynamic RTP payload type (#103): 97, a common dynamic PT for L24 audio
+/// (the receiver reads the format from the SDP, not the PT; any 96..=127 works).
+#[cfg(feature = "aes67")]
+const AES67_TX_PAYLOAD_TYPE: u8 = 97;
+
+/// AES67 TX send-FIFO depth in frames (#103): 4800 frames = 100 ms @ 48 kHz — a
+/// bounded drop-oldest buffer between the bake consumer (push) and the serve timer
+/// (drain), so a stalled network sheds oldest rather than growing memory (inv #5).
+#[cfg(feature = "aes67")]
+const AES67_TX_CAPACITY_FRAMES: usize = 4_800;
+
+/// AES67 TX default frames-per-packet (#103): 48 = 1 ms @ 48 kHz (Class-A ptime),
+/// the fallback when the `ptime_ms * rate / 1000` widening ever saturates (it never
+/// does for a validated ptime).
+#[cfg(feature = "aes67")]
+const AES67_DEFAULT_FRAMES_PER_PACKET: usize = 48;
+
+/// Build the [`RunnableOutput::Aes67`] for an `Output::Aes67` (#103,
+/// ADR-0033/T013): the serve-side [`Aes67Sender`](multiview_output::aes67::Aes67Sender)
+/// framed from the output's depth/ptime + the fixed 48 kHz **stereo** program bus,
+/// paired with the bake-consumer push
+/// [`Aes67SenderHandle`](multiview_output::aes67::Aes67SenderHandle) the program
+/// audio is fed into. Mux-free (no encode stage) — it multicasts the mixed program
+/// to a `group:port`.
+///
+/// The sender is created here (sync, always-compiled) so its handle can be threaded
+/// to the bake consumer; the async multicast socket is bound later, in
+/// [`run_aes67_output`] (a current-thread runtime on the sink thread). `channels` is
+/// FIXED at 2 to match the stereo program-bus block the consumer pushes —
+/// [`Aes67SenderHandle::push`](multiview_output::aes67::Aes67SenderHandle::push)
+/// silently drops a block whose channel count differs, so the two must agree.
+///
+/// # Errors
+/// [`PipelineError::Output`] when the `multicast` group:port is malformed, the PCM
+/// depth is unsupported, or the sender parameters are out of range
+/// (`Aes67ConfigError`).
+#[cfg(feature = "aes67")]
+fn build_aes67_output(
+    output: &Output,
+) -> Result<(RunnableOutput, multiview_output::aes67::Aes67SenderHandle), PipelineError> {
+    use multiview_output::aes67::{Aes67Sender, PcmDepth};
+
+    let Output::Aes67 {
+        multicast,
+        depth,
+        ptime_ms,
+        ..
+    } = output
+    else {
+        return Err(PipelineError::Output {
+            kind: "aes67",
+            reason: "build_aes67_output called on a non-aes67 output".to_owned(),
+        });
+    };
+    let id = output.id();
+    // The multicast destination `group:port` (a required schema field).
+    let dest = multicast
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| PipelineError::Output {
+            kind: "aes67",
+            reason: format!(
+                "aes67 output `{id}` multicast `{multicast}` is not a valid group:port: {e}"
+            ),
+        })?;
+    // Egress from an ephemeral port on the group's-family wildcard.
+    let local: std::net::SocketAddr = if dest.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    // L24 (Class-A interop default) unless the config says L16; a future/unknown
+    // depth is a typed refusal (never silently mishandled).
+    let pcm_depth = if depth.eq_ignore_ascii_case("l16") {
+        PcmDepth::L16
+    } else if depth.eq_ignore_ascii_case("l24") {
+        PcmDepth::L24
+    } else {
+        return Err(PipelineError::Output {
+            kind: "aes67",
+            reason: format!(
+                "aes67 output `{id}` has unsupported PCM depth `{depth}` (expected L16 or L24)"
+            ),
+        });
+    };
+    // A zero packet time is nonsensical (and the `.max(1)` below would silently
+    // coerce it to a 1-frame ~0.02 ms packet flood). Reject it fail-closed instead.
+    // (`ptime_ms * 48000 / 1000` is exactly `ptime_ms * 48` for any u32, so a
+    // NON-zero ptime never truncates; an oversized one is caught by
+    // `Aes67Sender::new`'s frames-per-packet bound below.)
+    if *ptime_ms == 0 {
+        return Err(PipelineError::Output {
+            kind: "aes67",
+            reason: format!("aes67 output `{id}` has a zero packet time (`ptime_ms` must be >= 1)"),
+        });
+    }
+    // frames_per_packet = ptime_ms * rate / 1000 (Class-A ptime = 1 ms → 48 frames
+    // @ 48 kHz). Computed in u64 to stay exact, clamped ≥ 1.
+    let frames_per_packet =
+        usize::try_from(u64::from(*ptime_ms).saturating_mul(u64::from(AES67_STORE_RATE_HZ)) / 1000)
+            .unwrap_or(AES67_DEFAULT_FRAMES_PER_PACKET)
+            .max(1);
+    let sender = Aes67Sender::new(
+        AES67_TX_CHANNELS,
+        pcm_depth,
+        AES67_TX_PAYLOAD_TYPE,
+        aes67_ssrc_for(&id, dest),
+        AES67_STORE_RATE_HZ,
+        frames_per_packet,
+        AES67_TX_CAPACITY_FRAMES,
+    )
+    .map_err(|e| PipelineError::Output {
+        kind: "aes67",
+        reason: format!("aes67 output `{id}` sender config invalid: {e}"),
+    })?;
+    let handle = sender.handle();
+    let runnable = RunnableOutput::Aes67 {
+        id: id.clone(),
+        sender,
+        local,
+        dest,
+        interface: multiview_output::aes67::transport::MulticastInterface::Unspecified,
+        label: format!("aes67 {id}"),
+    };
+    Ok((runnable, handle))
+}
+
+/// A stable, non-zero RTP SSRC for an AES67 output, folded from its id AND its
+/// multicast `group:port` (#103).
+///
+/// Uses **FNV-1a** (a small, fully-specified algorithm — mirroring the SAP
+/// [`stable_hash`](multiview_input::sap::stable_hash) approach, P2-F4) over a
+/// **stable byte encoding** of the address: the family tag + the raw IP octets +
+/// the big-endian port, NOT `SocketAddr`'s `Display` string (whose formatting —
+/// especially IPv6 zero-compression — is not a stable cross-version/-target byte
+/// form). So the mapping is stable across toolchain versions, targets, and
+/// restarts: a receiver keyed on the SSRC keeps seeing one sender as the same
+/// stream across a rebuild. `DefaultHasher` (`SipHash`) is explicitly **not** a
+/// stable cross-version contract, so it must never back a wire identifier. The
+/// multicast group+port is folded in (not just the id) so distinct outputs get
+/// distinct SSRCs **with overwhelming probability** (a 32-bit RTP SSRC space) — the
+/// deterministic fold does NOT by itself *guarantee* uniqueness. The one HARD
+/// guarantee is build-time and fail-closed ([`ensure_no_aes67_ssrc_collision`]): no
+/// two AES67 outputs **configured in this build** that share a multicast
+/// `group:port` may fold to the same SSRC. It does NOT detect or resolve a
+/// collision with an EXTERNAL / third-party sender on that group — there is no
+/// runtime RTCP SSRC collision detection or reselection here. Clamped away from `0`
+/// (an ambiguous-but-legal SSRC).
+#[cfg(feature = "aes67")]
+fn aes67_ssrc_for(id: &str, dest: std::net::SocketAddr) -> u32 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    // id, then a separator so ("ab", …) and ("a", "b…") cannot alias to one digest.
+    let mut hash = fnv1a_absorb(FNV_OFFSET, id.as_bytes());
+    hash = fnv1a_absorb(hash, b"@");
+    // Address family tag + raw IP octets (the stable wire bytes) + big-endian port.
+    hash = match dest.ip() {
+        std::net::IpAddr::V4(v4) => fnv1a_absorb(fnv1a_absorb(hash, &[4]), &v4.octets()),
+        std::net::IpAddr::V6(v6) => fnv1a_absorb(fnv1a_absorb(hash, &[6]), &v6.octets()),
+    };
+    hash = fnv1a_absorb(hash, &dest.port().to_be_bytes());
+    // Fold the 64-bit digest into 32 bits, then force non-zero.
+    let folded = (hash ^ (hash >> 32)) & u64::from(u32::MAX);
+    u32::try_from(folded).unwrap_or(1).max(1)
+}
+
+/// One FNV-1a absorb pass: XOR-then-multiply each byte into `hash` (the offset
+/// basis / running digest is supplied by the caller). Split out so the SSRC fold
+/// composes id + address-family + octets + port without repeating the loop.
+#[cfg(feature = "aes67")]
+fn fnv1a_absorb(mut hash: u64, bytes: &[u8]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Fail closed if two AES67 outputs on the **same multicast group:port** fold to
+/// the **same RTP SSRC** (#103).
+///
+/// [`aes67_ssrc_for`] folds to 32 bits, which is distinct with overwhelming
+/// probability but not *guaranteed* unique. An RTP receiver demuxes by SSRC
+/// **within one multicast group** (RFC 3550 §8), so only a same-`(group:port)`
+/// collision is ambiguous — two senders on **different** groups may share an SSRC
+/// harmlessly and are NOT rejected (no false positives). This runs once at config
+/// time (off the hot path; inv #1/#10). Outputs with a malformed `multicast` are
+/// skipped here — [`build_aes67_output`] reports that separately.
+///
+/// # Errors
+///
+/// [`PipelineError::Config`] naming BOTH colliding output ids and their shared
+/// group + SSRC.
+#[cfg(feature = "aes67")]
+fn ensure_no_aes67_ssrc_collision(outputs: &[Output]) -> Result<(), PipelineError> {
+    // Keyed on (multicast dest, SSRC): a duplicate key is two senders on ONE group
+    // that folded to ONE SSRC — the only ambiguous case.
+    let mut seen: std::collections::HashMap<(std::net::SocketAddr, u32), String> =
+        std::collections::HashMap::new();
+    for output in outputs {
+        let Output::Aes67 { multicast, .. } = output else {
+            continue;
+        };
+        // A malformed multicast is a typed refusal in `build_aes67_output`; this
+        // SSRC-uniqueness pass only considers parseable destinations.
+        let Ok(dest) = multicast.parse::<std::net::SocketAddr>() else {
+            continue;
+        };
+        let id = output.id();
+        let ssrc = aes67_ssrc_for(&id, dest);
+        if let Some(other) = seen.insert((dest, ssrc), id.clone()) {
+            return Err(PipelineError::Config(
+                multiview_config::ConfigError::Validation(format!(
+                    "aes67 outputs `{other}` and `{id}` collide on multicast group \
+                     `{dest}` with the same RTP SSRC {ssrc}: distinct senders on one \
+                     multicast group must have distinct SSRCs — rename one output"
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build one live NDI output sink (OUT-4b / NDI-L2): enforce the
+/// `[system.ndi] accept_license` gate, load the runtime, create the sender, and
+/// return the [`RunnableOutput::Ndi`] (carrying the sink + the canvas-tap reader)
+/// paired with the engine-side [`FramePublisher`] the hot loop publishes into.
+///
+/// The license gate is checked FIRST (ADR-0008 §7.5): an unaccepted/incomplete
+/// `accept_license` is refused BEFORE the runtime is touched, so an unaccepted
+/// operator never loads the proprietary SDK — mirroring the ingest gate
+/// ([`connect_ndi_receiver`]). The accepted [`NdiLicense`] then gates
+/// `NdiOutput::new` by construction: there is no way to build a sender without it.
+///
+/// # Errors
+/// A human-readable reason string when the license is not accepted, the runtime
+/// cannot be loaded, or the sender cannot be created — the caller logs it and
+/// **skips this output** (the run continues; invariants #1/#10). Never panics.
+#[cfg(feature = "ndi-bindings")]
+fn build_ndi_output(
+    output: &Output,
+    name: &str,
+    ndi_system: Option<&multiview_config::NdiSystemConfig>,
+    cadence: Rational,
+) -> Result<
+    (
+        RunnableOutput,
+        multiview_output::display::FramePublisher<NdiCanvasFrame>,
+    ),
+    String,
+> {
+    use multiview_output::ndi::license::LicenseAcceptance;
+    use multiview_output::ndi::{NdiCapability, NdiLicense, SdkNdiApi};
+
+    // License gate FIRST (ADR-0008 §7.5): refuse with the typed reason before any
+    // runtime load. Absent `[system.ndi]` ⇒ not accepted (empty audit fields).
+    let (accept_license, acceptance) = ndi_system.map_or_else(
+        || {
+            (
+                false,
+                LicenseAcceptance {
+                    accepted_by: String::new(),
+                    accepted_at: String::new(),
+                },
+            )
+        },
+        |s| {
+            (
+                s.accept_license,
+                LicenseAcceptance {
+                    accepted_by: s.accepted_by.clone().unwrap_or_default(),
+                    accepted_at: s.accepted_at.clone().unwrap_or_default(),
+                },
+            )
+        },
+    );
+    let license = NdiLicense::from_setting(accept_license, acceptance)
+        .map_err(|_| "ndi_unlicensed: [system.ndi] accept_license is not accepted".to_owned())?;
+
+    // Runtime load (only AFTER the gate passes). An absent/unusable runtime is a
+    // typed status, surfaced as the skip reason — never a panic, never a block.
+    let capability =
+        NdiCapability::load().map_err(|status| format!("NDI runtime unavailable ({status:?})"))?;
+
+    // The accepted license gates `NdiOutput::new` by construction.
+    let sink = NdiOutput::new(license, SdkNdiApi::new(capability), name.to_owned())
+        .map_err(|e| format!("NDI sender create failed: {e}"))?;
+
+    // The wait-free canvas tap: the engine publishes into `publisher`, the sink
+    // runner reads `reader` (newest-wins, drop-oldest) — the engine never blocks.
+    let (publisher, reader) = multiview_output::display::frame_mailbox::<NdiCanvasFrame>();
+    Ok((
+        RunnableOutput::Ndi {
+            id: output.id(),
+            sink,
+            reader,
+            cadence,
+            name: name.to_owned(),
+        },
+        publisher,
+    ))
+}
+
+/// Handle one `Output::Ndi` in [`build_outputs`], dispatching on the NDI feature
+/// set so the `build_outputs` match stays a single arm (OUT-4b / NDI-L2):
+///
+/// - With the live `ndi-bindings` binding: build the license-gated
+///   [`RunnableOutput::Ndi`] via [`build_ndi_output`] and push it (+ its
+///   canvas-tap publisher) into the accumulators, or log an honest skip reason
+///   (unaccepted license / absent runtime / create failure) and continue.
+/// - With seam-only `ndi` (no live binding): an honest skip — the `SdkNdiApi`
+///   cannot be constructed without the SDK function table.
+/// - Without `ndi`: an honest skip — the runtime-loaded SDK is not built in.
+///
+/// Never a panic, never a silent pretend-run, never a crash of the other outputs
+/// (invariants #1/#10).
+fn handle_ndi_output(
+    output: &Output,
+    #[cfg(feature = "ndi-bindings")] ndi_system: Option<&multiview_config::NdiSystemConfig>,
+    #[cfg(feature = "ndi-bindings")] cadence: Rational,
+    #[cfg(feature = "ndi-bindings")] runnable: &mut Vec<RunnableOutput>,
+    #[cfg(feature = "ndi-bindings")] ndi_publishers: &mut Vec<
+        multiview_output::display::FramePublisher<NdiCanvasFrame>,
+    >,
+) {
+    #[cfg(feature = "ndi-bindings")]
+    {
+        let Output::Ndi { name, .. } = output else {
+            return;
+        };
+        match build_ndi_output(output, name, ndi_system, cadence) {
+            Ok((sink, publisher)) => {
+                runnable.push(sink);
+                ndi_publishers.push(publisher);
+            }
+            Err(reason) => tracing::warn!(
+                output = %output.id(),
+                %reason,
+                "ndi output not started; the run continues without it"
+            ),
+        }
+    }
+    #[cfg(all(feature = "ndi", not(feature = "ndi-bindings")))]
+    {
+        let _ = output;
+        tracing::warn!(
+            "ndi output requires the `ndi-bindings` feature + a resolvable NDI runtime \
+             (the live SDK function table); the seam-only `ndi` build cannot send. Skipping"
+        );
+    }
+    #[cfg(not(feature = "ndi"))]
+    {
+        let _ = output;
+        tracing::warn!(
+            "ndi output requires the `ndi` feature (off by default; runtime-loaded SDK); \
+             skipping"
+        );
+    }
 }
 
 /// Optionally derive a single-file `program.ts` container sink from the first HLS
@@ -4661,14 +7855,28 @@ fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Ve
         RunnableOutput::Hls { playlist_path, .. } => {
             Some(playlist_path.with_file_name("program.ts"))
         }
-        // A push has no on-disk directory to derive a program file from; only an
-        // HLS output anchors the self-contained `program.ts`.
+        // A push / WebRTC output has no on-disk directory to derive a program
+        // file from; only an HLS output anchors the self-contained `program.ts`.
         RunnableOutput::File { .. } | RunnableOutput::Push { .. } => None,
+        #[cfg(feature = "webrtc-native")]
+        RunnableOutput::WebRtc { .. } => None,
+        // The NDI sink is a raw-canvas consumer, not a packet/disk muxer — it
+        // anchors no `program.ts`.
+        #[cfg(feature = "ndi-bindings")]
+        RunnableOutput::Ndi { .. } => None,
+        // The AES67 sink is a raw-PCM multicast consumer, not a packet/disk muxer —
+        // it anchors no `program.ts`.
+        #[cfg(feature = "aes67")]
+        RunnableOutput::Aes67 { .. } => None,
     });
     if let Some(path) = file_path {
         runnable.insert(
             0,
             RunnableOutput::File {
+                // The self-contained anchor is synthetic (derived from the first
+                // HLS output, not a config output), so it carries a synthetic
+                // resource id for the ADR-0060 output scope.
+                id: "program.ts".to_owned(),
                 sink: PacketMuxSink::file(path.clone()),
                 path,
             },
@@ -4881,6 +8089,23 @@ fn build_input_inventories(
     std::collections::BTreeMap::new()
 }
 
+/// Allocate the **swappable resolved-URL slot** for a `YouTube` source (IN-5b),
+/// or `None` for every other source kind.
+///
+/// The slot starts **empty**: the first (re)open resolves inline (cold start) and
+/// the proactive re-resolution loop (spawned in [`IngestSupervisor::start`])
+/// publishes the next-up `*.googlevideo.com` master into it `lead` seconds before
+/// the active URL's `expire` deadline — so the reconnect that follows expiry finds
+/// a fresh URL already in hand (make-before-break), no cold resolve at the boundary
+/// (ADR-0015 P2–P4). Lock-free, written only by the loop (invariants #1/#10).
+#[cfg(feature = "youtube")]
+fn youtube_url_slot_for(location: &SourceLocation) -> Option<Arc<arc_swap::ArcSwapOption<String>>> {
+    match location {
+        SourceLocation::Youtube { .. } => Some(Arc::new(arc_swap::ArcSwapOption::empty())),
+        _ => None,
+    }
+}
+
 /// Resolve a config [`Source`] into a streaming [`IngestPlan`] (it does **not**
 /// decode anything — the plan is consumed later by an ingest thread).
 ///
@@ -4897,6 +8122,10 @@ fn build_input_inventories(
 /// synthetic source with invalid parameters. (Opening/decoding errors surface on
 /// the ingest thread later — they must never fail the *build* of a never-ending
 /// live source.)
+// A flat, one-arm-per-`SourceKind` dispatch plus the single feature-gated
+// `IngestPlan` struct literal: inherently long and clearer kept whole than split
+// across helpers (adding the `player` field tipped it one line over the 100 bound).
+#[allow(clippy::too_many_lines)]
 fn ingest_plan_for(
     source: &Source,
     tile_w: u32,
@@ -4928,6 +8157,33 @@ fn ingest_plan_for(
         | SourceKind::Ts { url }
         | SourceKind::Srt { url }
         | SourceKind::Rtmp { url } => (SourceLocation::Url(url.clone()), true),
+        // RIST ingest (ADR-0095): the open-standard sibling of SRT. The typed
+        // options lower to the `rist://…?…` AVIO URL (PSK resolved from its
+        // secret_ref); it then rides the SAME libav demuxer + supervised
+        // reconnect + last-good store as every other network source — its ARQ
+        // recovery is an input jitter buffer, never the output clock
+        // (invariants #1/#2/#3; bad-inputs-are-the-purpose). `live` so the
+        // ingest loop reconnects forever.
+        #[cfg(feature = "rist")]
+        SourceKind::Rist { url, rist } => {
+            let lowered = rist_resolved_url(url, rist.as_ref(), false).map_err(|e| {
+                PipelineError::Ingest {
+                    id: source.id.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            (SourceLocation::Url(lowered), true)
+        }
+        // Without the `rist` feature the librist obligation is not built in, so a
+        // rist source is an honest typed refusal (never a silent skip), exactly
+        // like an NDI/webrtc source without its feature.
+        #[cfg(not(feature = "rist"))]
+        SourceKind::Rist { .. } => {
+            return Err(PipelineError::Ingest {
+                id: source.id.clone(),
+                reason: "RIST ingest requires the `rist` feature (off by default)".to_owned(),
+            })
+        }
         // A YouTube live source is a thin wrapper over HLS (ADR-0015): bound by its
         // watch URL, resolved to a fresh `*.googlevideo.com` HLS master on every
         // (re)connect by `yt-dlp`. It is `live` so the ingest loop reconnects (and
@@ -4944,9 +8200,10 @@ fn ingest_plan_for(
         // An NDI source (ADR-0008 / IN-3) is bound by its NDI source NAME and
         // received from host memory via `multiview-input`'s runtime-loaded NDI seam
         // — it bypasses libav. It is `live` so the ingest loop reconnects forever; a
-        // receive fault or an absent/unlicensed runtime degrades the tile on the
-        // ingest thread, never failing the build (invariants #1/#10). Only wired
-        // under the off-by-default `ndi` feature.
+        // receive fault, an absent runtime, or an unaccepted NDI license (the
+        // runtime gate, stamped onto the plan from `[system.ndi]` after build)
+        // degrades the tile on the ingest thread, never failing the build
+        // (invariants #1/#10). Only wired under the off-by-default `ndi` feature.
         #[cfg(feature = "ndi")]
         SourceKind::Ndi { name } => (SourceLocation::Ndi { name: name.clone() }, true),
         // With the `ndi` feature OFF the NDI runtime-load obligation is not built
@@ -4956,6 +8213,22 @@ fn ingest_plan_for(
             return Err(PipelineError::Ingest {
                 id: source.id.clone(),
                 reason: "NDI ingest requires the `ndi` feature (off by default)".to_owned(),
+            })
+        }
+        // A WHIP ingest (`kind = "webrtc"`) source: Multiview is the server, so
+        // there is nothing to dial — `live` so the drive loop runs forever
+        // (waiting for / ingesting publishers). The decode happens off the render
+        // thread in `drive_webrtc` (ADR-T014). Only under `webrtc-native`.
+        #[cfg(feature = "webrtc-native")]
+        SourceKind::Webrtc { audio, .. } => (SourceLocation::Webrtc { audio: *audio }, true),
+        // With `webrtc-native` OFF the str0m endpoint is not built, so a webrtc
+        // source is an honest typed refusal (never a silent skip).
+        #[cfg(not(feature = "webrtc-native"))]
+        SourceKind::Webrtc { .. } => {
+            return Err(PipelineError::Ingest {
+                id: source.id.clone(),
+                reason: "WHIP ingest requires the `webrtc-native` feature (off by default)"
+                    .to_owned(),
             })
         }
         // `SourceKind` is `#[non_exhaustive]`; a future kind is unsupported here
@@ -4968,9 +8241,16 @@ fn ingest_plan_for(
         }
     };
 
+    // A YouTube source gets an empty swappable-URL slot (IN-5b); every other kind
+    // has none. Computed before the struct literal moves `location`.
+    #[cfg(feature = "youtube")]
+    let youtube_url_slot = youtube_url_slot_for(&location);
+
     Ok(IngestPlan {
         id: source.id.clone(),
         location,
+        // Not a media-player channel (those are built from `config.media_players`).
+        player: None,
         tile_w,
         tile_h,
         store,
@@ -4981,12 +8261,234 @@ fn ingest_plan_for(
         embedded_cc: None,
         canvas_color,
         cadence,
-        // No GPU pinned yet: the load-aware admission pick (decide-once, in
-        // `drive_streaming`) stamps the chosen device's CUDA ordinal onto every
-        // plan before the ingest threads spawn. `None` is the default-device /
-        // GPU-free path, in lockstep with the compositor's `None`.
-        cuda_ordinal: None,
+        // No placement decision yet: the load-aware admission pick (decide-
+        // once, in `drive_streaming`) stamps `Pinned(ordinal)` onto every plan
+        // before the startup threads spawn; the live consult stamps a runtime
+        // add's outcome. `Default` is the default-device / GPU-free path, in
+        // lockstep with the compositor's default adapter.
+        decode_placement: DecodePlacement::Default,
+        // The WHIP publisher rendezvous + audio store are stamped after build
+        // (the registry/store are owned by the run wiring), like `cuda_ordinal`.
+        #[cfg(feature = "webrtc-native")]
+        webrtc_registry: None,
+        #[cfg(feature = "webrtc-native")]
+        webrtc_audio_store: None,
+        // Declined by default; the NDI license acceptance (ADR-0008 §7.5) is
+        // stamped from `config.system` after build (like `cuda_ordinal`), so an
+        // NDI source is refused (`ndi_unlicensed`) until the operator accepts.
+        #[cfg(feature = "ndi")]
+        ndi_accept_license: false,
+        #[cfg(feature = "ndi")]
+        ndi_acceptance: multiview_input::ndi::license::LicenseAcceptance {
+            accepted_by: String::new(),
+            accepted_at: String::new(),
+        },
+        #[cfg(feature = "youtube")]
+        youtube_url_slot,
     })
+}
+
+/// Map the config-schema [`EofPolicy`](multiview_config::media::EofPolicy) onto
+/// the player transport core's [`EofPolicy`](crate::player::EofPolicy).
+fn map_eof_policy(policy: multiview_config::media::EofPolicy) -> crate::player::EofPolicy {
+    use crate::player::EofPolicy as P;
+    use multiview_config::media::EofPolicy as C;
+    match policy {
+        C::Loop => P::Loop,
+        C::Black => P::Black,
+        C::AutoOff => P::AutoOff,
+        // `HoldLastFrame` (the default) and any future `#[non_exhaustive]` variant
+        // this build does not know about both hold the last-good frame.
+        _ => P::HoldLastFrame,
+    }
+}
+
+/// The result of boot-spawning the configured media-player channels: the player
+/// [`IngestPlan`]s (each with a `player` handle) and the per-player
+/// [`TransportMailbox`](crate::player::TransportMailbox) the control-plane
+/// command drain submits transport verbs to, keyed by player id.
+struct MediaPlayerBoot {
+    plans: Vec<IngestPlan>,
+    stores: Vec<(String, Arc<TileStore<Nv12Image>>)>,
+    mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    /// Per-player **audio** stores (ADR-T019): a player with a rolling asset gets
+    /// an `AudioStore` the program bus routes (so its looped audio joins the mix);
+    /// the `player_audio_loop` thread fills it. Empty for an idle player.
+    audio_stores: Vec<(String, Arc<multiview_audio::store::AudioStore>)>,
+    /// Per-player audio loop plans (ADR-T019): how to prime + loop each rolling
+    /// player's embedded audio, carrying the SAME vamp geometry + mailbox the video
+    /// uses so audio wraps on the same instant. One per rolling player.
+    audio_plans: Vec<crate::audio::PlayerAudioPlan>,
+}
+
+/// Build the boot-time media-player channels from `config.media_players`
+/// (ADR-0057 / ADR-0097).
+///
+/// Each player that has a `default` asset **with a declared `out_point_frames`**
+/// boot-spawns a player [`IngestPlan`] that plays (or vamps, per `loop_default`)
+/// the asset over its `[in_point, out_point)` window, looping the
+/// `[vamp_in, vamp_out)` sub-window (defaulting to the whole clip). A player with
+/// no default, or whose default asset has no declared out-point (the asset's
+/// frame count is not known without probing — probe-at-load is post-MVP), boots
+/// **idle**: its mailbox is still registered (so a later `load`/transport command
+/// is honoured once probe-at-load lands), but no plan rolls now — surfaced with a
+/// warning, never a silent skip.
+///
+/// All players' mailboxes are returned regardless, so the control-plane command
+/// drain can address every declared channel.
+// One per-player block that resolves the asset, validates the geometry, builds
+// the store + mailbox + handle, and constructs the (feature-gated) player
+// `IngestPlan` literal: inherently long and clearer kept whole than split across
+// helpers that would each take most of these locals.
+#[allow(clippy::too_many_lines)]
+fn build_media_player_boot(
+    config: &MultiviewConfig,
+    layout: &Layout,
+    cadence: Rational,
+    canvas_color: CanvasColor,
+) -> MediaPlayerBoot {
+    let mut boot = MediaPlayerBoot {
+        plans: Vec::new(),
+        stores: Vec::new(),
+        mailboxes: std::collections::HashMap::new(),
+        audio_stores: Vec::new(),
+        audio_plans: Vec::new(),
+    };
+    let library = config.media_library.as_ref();
+    let root = library.and_then(|l| l.root.as_deref());
+
+    for player in &config.media_players {
+        // Every declared channel gets a registered mailbox so the control plane
+        // can address it, even when it boots idle.
+        let mailbox = Arc::new(crate::player::TransportMailbox::new());
+        boot.mailboxes
+            .insert(player.id.clone(), Arc::clone(&mailbox));
+
+        // Resolve the default asset (if any) and require a declared out-point to
+        // boot a rolling channel.
+        let Some(asset_id) = player.default.as_deref() else {
+            tracing::info!(player = %player.id, "media player boots idle (no default asset)");
+            continue;
+        };
+        let asset = library.and_then(|l| l.assets.iter().find(|a| a.id == asset_id));
+        let Some(asset) = asset else {
+            tracing::warn!(
+                player = %player.id, asset = %asset_id,
+                "media player boots idle: default asset not found in the media library"
+            );
+            continue;
+        };
+        let Some(out_point) = asset.out_point_frames else {
+            tracing::warn!(
+                player = %player.id, asset = %asset_id,
+                "media player boots idle: default asset declares no out_point_frames \
+                 (probe-at-load is post-MVP)"
+            );
+            continue;
+        };
+        let in_point = asset.in_point_frames.unwrap_or(0);
+        // The vamp window defaults to the whole trimmed clip when unset.
+        let vamp_in = asset.vamp_in_frames.unwrap_or(in_point);
+        let vamp_out = asset.vamp_out_frames.unwrap_or(out_point);
+        let geometry = match crate::player::PlayoutGeometry::new(
+            in_point, out_point, vamp_in, vamp_out, cadence,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    player = %player.id, asset = %asset_id, error = %e,
+                    "media player boots idle: invalid playout geometry"
+                );
+                continue;
+            }
+        };
+
+        // Resolve the asset path against the library root.
+        let path = match root {
+            Some(r) => std::path::Path::new(r).join(&asset.path),
+            None => std::path::PathBuf::from(&asset.path),
+        };
+        // The libav-openable audio location (the SAME media as the video; the audio
+        // peer opens its own `!Send` libav context) for the player audio loop.
+        let audio_location = path.to_string_lossy().into_owned();
+
+        let (tile_w, tile_h) = cell_pixel_size(layout, &player.id)
+            .unwrap_or((config.canvas.width, config.canvas.height));
+        let store = Arc::new(TileStore::new(
+            player.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let eof_policy = map_eof_policy(player.eof_policy);
+        let handle = crate::player::PlayerHandle::new(
+            player.id.clone(),
+            geometry,
+            eof_policy,
+            player.loop_default,
+            mailbox,
+        );
+
+        // ADR-T019 §1: this rolling player gets an `AudioStore` (routed onto the
+        // bus like any source) + an audio loop plan carrying the SAME vamp geometry
+        // AND the SAME `PlayerControlBus` the video handle publishes to — so the
+        // audio rail samples the video's authoritative transport state and wraps/
+        // exits on the same instant by construction. A silent asset rides silence
+        // (the deck primes empty).
+        let audio_control_bus = Arc::clone(&handle.control_bus);
+        let audio_store = crate::audio::new_store();
+        boot.audio_stores
+            .push((player.id.clone(), Arc::clone(&audio_store)));
+        boot.audio_plans.push(crate::audio::PlayerAudioPlan {
+            id: player.id.clone(),
+            location: audio_location,
+            vamp_in_frames: geometry.vamp_in(),
+            vamp_out_frames: geometry.vamp_out(),
+            cadence: geometry.cadence(),
+            output_cadence: cadence,
+            control_bus: audio_control_bus,
+        });
+
+        boot.stores.push((player.id.clone(), Arc::clone(&store)));
+        boot.plans.push(IngestPlan {
+            id: player.id.clone(),
+            location: SourceLocation::Path(path),
+            player: Some(handle),
+            tile_w,
+            tile_h,
+            store,
+            // A media player is a finite asset played under transport control;
+            // it is not a live (reconnect-forever) source — the player loop owns
+            // its own loop/hold lifecycle.
+            live: false,
+            #[cfg(feature = "overlay")]
+            incontainer_sub: None,
+            #[cfg(feature = "overlay")]
+            embedded_cc: None,
+            canvas_color,
+            cadence,
+            decode_placement: DecodePlacement::Default,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_registry: None,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_audio_store: None,
+            #[cfg(feature = "ndi")]
+            ndi_accept_license: false,
+            #[cfg(feature = "ndi")]
+            ndi_acceptance: multiview_input::ndi::license::LicenseAcceptance {
+                accepted_by: String::new(),
+                accepted_at: String::new(),
+            },
+            #[cfg(feature = "youtube")]
+            youtube_url_slot: None,
+        });
+        tracing::info!(
+            player = %player.id, asset = %asset_id,
+            in_point, out_point, vamp_in, vamp_out,
+            looping = player.loop_default,
+            "media player boot-spawned"
+        );
+    }
+    boot
 }
 
 /// Resolve a source's **audio** decode plan (AUD-2): the libav-openable location
@@ -5015,6 +8517,15 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         | SourceKind::Ts { url }
         | SourceKind::Srt { url }
         | SourceKind::Rtmp { url } => (url.clone(), true),
+        // RIST audio is decoded from the SAME lowered `rist://` URL as its video
+        // (the audio peer opens its own libav context). A lowering error (bonding
+        // / unresolved PSK) means no audio path — the source rides silence on the
+        // bus rather than failing the build (the video plan surfaces the error).
+        #[cfg(feature = "rist")]
+        SourceKind::Rist { url, rist } => match rist_resolved_url(url, rist.as_ref(), false) {
+            Ok(lowered) => (lowered, true),
+            Err(_) => return None,
+        },
         // YouTube/NDI audio is not wired through the libav file decoder here:
         // YouTube needs the watch-URL resolve step (deferred to its own slice) and
         // NDI audio is a host-memory receive. Both ride silence on the bus for now.
@@ -5157,6 +8668,14 @@ fn resolve_incontainer_sub_route(
         // host-memory video receive); there is no container to open here.
         #[cfg(feature = "ndi")]
         SourceLocation::Ndi { .. } => return None,
+        // A WHIP/webrtc source is a depacketized RTP video receive (no libav
+        // container to open here), so it carries no in-container subtitle
+        // stream — mirroring the NDI arm. Pre-existing #181-era cross-feature
+        // gap (the overlay-gated match lacked the webrtc-native variant arm, so
+        // `--features overlay,webrtc-native` failed E0004); folded in here as the
+        // `pipeline.rs` owner (task #137), not a media-player change.
+        #[cfg(feature = "webrtc-native")]
+        SourceLocation::Webrtc { .. } => return None,
     };
     let demux = match Demuxer::open(path) {
         Ok(d) => d,
@@ -5233,6 +8752,19 @@ enum SourceLocation {
     Ndi {
         /// The NDI source name bound by the config.
         name: String,
+    },
+    /// A **WHIP ingest** (`kind = "webrtc"`) contribution source (ADR-T014):
+    /// Multiview is the server, so there is nothing to dial — a publisher
+    /// (browser / OBS) `POST`s to the derived endpoint and the negotiated RTP
+    /// ring is rendezvous'd to this source's drive loop via the shared
+    /// [`WhipRegistry`](crate::webrtc_ingest::WhipRegistry). The drive loop
+    /// ([`drive_webrtc`]) waits for a publisher, decodes its depacketized
+    /// H.264/Opus into the standard `TileStore`/`AudioStore`, and rides
+    /// `NO_SIGNAL` between publishers. Only wired under `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    Webrtc {
+        /// Whether the publisher's Opus audio is accepted (from the source kind).
+        audio: bool,
     },
 }
 
@@ -5371,6 +8903,10 @@ fn ingest_open_options(location: &SourceLocation) -> ffmpeg::Dictionary<'static>
         // libav input and gets no libav options.
         #[cfg(feature = "ndi")]
         SourceLocation::Ndi { .. } => false,
+        // WHIP ingest never opens a libav input (str0m surfaces RTP; the drive
+        // loop decodes per-packet), so it gets no libav open options.
+        #[cfg(feature = "webrtc-native")]
+        SourceLocation::Webrtc { .. } => false,
         SourceLocation::Path(_) | SourceLocation::Synthetic(_) => false,
     };
     if is_network {
@@ -5419,6 +8955,9 @@ fn is_hls_location(location: &SourceLocation) -> bool {
         SourceLocation::Path(p) => p.to_str().unwrap_or(""),
         #[cfg(feature = "ndi")]
         SourceLocation::Ndi { .. } => return false,
+        // WHIP ingest opens no libav input, so it is never an HLS master.
+        #[cfg(feature = "webrtc-native")]
+        SourceLocation::Webrtc { .. } => return false,
         SourceLocation::Synthetic(_) => return false,
     };
     // An `.m3u8` (with or without a query string) is an HLS playlist.
@@ -5530,7 +9069,36 @@ fn main_demuxer_open_url(url: &str, location: &SourceLocation, tile_h: u32) -> S
 /// its last-good frame meanwhile (invariant #2). The loop only ever *writes* the
 /// lock-free store, so it can neither pace nor stall the output clock
 /// (invariant #1) nor back-pressure the engine (invariant #10).
+/// Enter the per-source **resource scope** for the current decode thread
+/// (ADR-0060 §3.1, mechanism A): a thread-local [`ResourceContext`] tagged with
+/// the source's stable config id, set for the lifetime of the returned RAII
+/// [`ResourceGuard`] and cleared on its drop. Every libav line emitted
+/// synchronously on this thread while the guard is live (the HLS open, a decode
+/// error, an AVIO statistic) is attributed to this source by the libav→`tracing`
+/// bridge — so the operator sees *which* tile is flapping, not just the codec
+/// family. The guard is a cheap thread-local swap (no allocation on enter/drop),
+/// safe to hold across the whole decode/reconnect region; it never blocks and
+/// never back-pressures the engine (invariant #10).
+///
+/// The returned [`ResourceGuard`] is itself `#[must_use]` (dropping it early
+/// ends the attribution scope), so this fn carries no redundant `#[must_use]`.
+fn ingest_resource_scope(id: &str) -> multiview_ffmpeg::ResourceGuard {
+    multiview_ffmpeg::ResourceGuard::enter(multiview_ffmpeg::ResourceContext::source(id))
+}
+
 fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
+    // ADR-0060: run this source's whole decode/reconnect region inside a resource
+    // scope so our own logs (via the `source` span) AND libav's synchronous lines
+    // (via the thread-local ResourceContext the bridge resolves) name this source
+    // by its stable config id. The span is entered for the thread's lifetime; the
+    // guard sets the thread-local the libav bridge reads. Both clear on return.
+    let _span = tracing::info_span!(
+        "source",
+        resource_kind = "source",
+        resource_id = %plan.id,
+    )
+    .entered();
+    let _resource = ingest_resource_scope(&plan.id);
     // Synthetic sources (bars/solid/clock) render in-process — no decode, no
     // reconnect; the generator publishes into the store at cadence until `stop`.
     if let SourceLocation::Synthetic(kind) = &plan.location {
@@ -5543,6 +9111,18 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
             plan.cadence,
             stop,
         );
+        return;
+    }
+    // WHIP ingest (ADR-T014): Multiview is the server, so there is nothing to
+    // dial. Route it to its own supervised drive loop, which waits for a
+    // publisher (rendezvous'd via the WhipRegistry), decodes its depacketized
+    // H.264/Opus into the last-good store, and rides NO_SIGNAL between
+    // publishers. It only writes the lock-free store — it never paces or stalls
+    // the output clock nor back-pressures the engine (inv #1/#2/#10). Only under
+    // `webrtc-native`.
+    #[cfg(feature = "webrtc-native")]
+    if let SourceLocation::Webrtc { audio } = &plan.location {
+        drive_webrtc(plan, *audio, stop);
         return;
     }
     // NDI ingest is a host-memory receive that bypasses libav: route it to its own
@@ -5622,19 +9202,26 @@ fn drive_ndi(plan: &IngestPlan, name: &str, stop: &AtomicBool) {
             return;
         }
         let started = Instant::now();
-        match connect_ndi_receiver(name) {
-            Ok(receiver) => {
-                let mut producer = multiview_input::ndi::NdiProducer::new(receiver);
+        match connect_ndi_receiver(name, plan.ndi_accept_license, plan.ndi_acceptance.clone()) {
+            Ok((license, receiver)) => {
+                let mut producer = multiview_input::ndi::NdiProducer::new(license, receiver);
                 drive_ndi_producer(plan, &mut producer, stop);
             }
             Err(status) => {
-                // Runtime absent / unusable / no live receiver yet: log once and let
-                // the tile degrade. We do NOT spin — the reconnect backoff below
-                // bounds retry frequency, and `stop`/prime-wait are never blocked.
+                // Runtime absent / unusable / unlicensed / no live receiver yet: log
+                // the honest status token and let the tile degrade. We do NOT spin —
+                // the reconnect backoff below bounds retry frequency (so this warn
+                // repeats at most once per backoff cycle, settling to ~1/30s), and
+                // `stop`/prime-wait are never blocked. An unaccepted license is
+                // terminal for this run: the acceptance is stamped onto the plan at
+                // build time, so re-evaluating it each retry yields the same refusal
+                // until a config reload restarts the process (`system` is a
+                // restart-class diff section; live acceptance/revocation propagation
+                // is a deferred follow-up).
                 tracing::warn!(
                     source = %plan.id,
                     ndi_source = name,
-                    ?status,
+                    status = status.status_label(),
                     "ndi receive unavailable; tile will degrade (LIVE->...->NO_SIGNAL)"
                 );
             }
@@ -5724,28 +9311,676 @@ fn ndi_host_to_image(
     Nv12Image::new(w, h, y_plane.to_vec(), uv_plane.to_vec(), frame.meta.color).ok()
 }
 
-/// Attempt to connect a live NDI receiver for source `name`.
+/// Attempt to connect a live NDI receiver for source `name`, gated by the NDI
+/// license acceptance.
+///
+/// The license gate is checked FIRST (ADR-0008 §7.5): an unaccepted or incomplete
+/// `[system.ndi] accept_license` is refused with the
+/// [`NdiLoadStatus::Unlicensed`](multiview_input::ndi::NdiLoadStatus) status
+/// (`ndi_unlicensed`) BEFORE the runtime is probed, so an unaccepted source never
+/// touches the SDK.
 ///
 /// HONEST SCOPE (live-only deferred half): binding a real
 /// [`NdiReceiver`](multiview_input::ndi::NdiReceiver) onto the resolved
 /// `multiview-ndi-sys` function table needs the proprietary SDK ABI + a running NDI
-/// network — neither exists in CI — so this currently probes the runtime and
-/// returns the typed status without a live receiver. With the runtime absent (the
-/// default case) it reports the unavailable status so the tile degrades; even with
-/// the runtime present, the live receiver binding is not yet wired (the converter +
-/// `NdiProducer` drive shape that *consume* a receiver are complete and tested in
-/// `multiview-input`). It never panics or blocks.
+/// network — neither exists in CI — so once the gate passes this probes the runtime
+/// and returns the typed status without a live receiver yet. With the runtime
+/// absent (the default case) it reports the unavailable status so the tile degrades;
+/// the converter + `NdiProducer` drive shape that *consume* a receiver are complete
+/// and tested in `multiview-input`. It never panics or blocks.
 #[cfg(feature = "ndi")]
 fn connect_ndi_receiver(
     _name: &str,
-) -> Result<Box<dyn multiview_input::ndi::NdiReceiver + Send>, multiview_input::ndi::NdiLoadStatus>
-{
+    accept_license: bool,
+    acceptance: multiview_input::ndi::license::LicenseAcceptance,
+) -> Result<
+    (
+        multiview_input::ndi::NdiLicense,
+        Box<dyn multiview_input::ndi::NdiReceiver + Send>,
+    ),
+    multiview_input::ndi::NdiLoadStatus,
+> {
+    // License gate FIRST (ADR-0008 §7.5): an unaccepted/incomplete acceptance is
+    // refused with the `ndi_unlicensed` status BEFORE the runtime is probed, so an
+    // unaccepted source never touches the SDK. When the live receiver binding (the
+    // deferred half) lands, re-evaluate the gate and return Ok((license, receiver))
+    // so the accepted guard gates `NdiProducer::new` by construction.
+    multiview_input::ndi::NdiLicense::from_setting(accept_license, acceptance)
+        .map_err(|_| multiview_input::ndi::NdiLoadStatus::Unlicensed)?;
+    // Runtime probe; the live SDK-backed receiver binding is the deferred half, so
+    // there is no receiver to pair with the (accepted) license yet — surface the
+    // probe status (RuntimeNotFound when absent, Available when present) so the drive
+    // loop logs the honest reason and the tile degrades.
     let status = multiview_input::ndi::NdiCapability::probe();
-    // Whether available or not, the live SDK-backed receiver binding is the
-    // deferred half. Surface the probe status (RuntimeNotFound when absent, or
-    // Available when present) so the drive loop logs the honest reason and the tile
-    // degrades rather than streaming a non-existent receiver.
     Err(status)
+}
+
+#[cfg(all(test, feature = "ndi"))]
+mod ndi_license_gate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use multiview_input::ndi::license::LicenseAcceptance;
+    use multiview_input::ndi::NdiLoadStatus;
+
+    fn complete_audit() -> LicenseAcceptance {
+        LicenseAcceptance {
+            accepted_by: "ops".to_owned(),
+            accepted_at: "2026-06-06T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn connect_refuses_unlicensed_before_probing_the_runtime() {
+        // accept_license = false: the gate refuses with the distinct `ndi_unlicensed`
+        // status BEFORE the runtime is probed — never RuntimeNotFound, never a panic.
+        // (ADR-0008 §7.5: the license axis is checked first and is its own status.)
+        // `match` (not `expect_err`): the Ok arm carries a `Box<dyn NdiReceiver>`,
+        // which is not `Debug`.
+        match connect_ndi_receiver("STUDIO (CAM 1)", false, complete_audit()) {
+            Ok(_) => panic!("an unaccepted NDI source must be refused"),
+            Err(status) => assert_eq!(
+                status,
+                NdiLoadStatus::Unlicensed,
+                "unaccepted must surface ndi_unlicensed, distinct from the runtime axis"
+            ),
+        }
+    }
+
+    #[test]
+    fn connect_passes_the_license_gate_when_accepted() {
+        // accept_license = true + complete audit: the license gate passes, so the
+        // result is NEVER the Unlicensed refusal. The live receiver binding is the
+        // deferred half, so this still reports the runtime probe status on a host
+        // with no runtime — but never the license refusal.
+        match connect_ndi_receiver("STUDIO (CAM 1)", true, complete_audit()) {
+            Ok(_) => { /* a live receiver bound (SDK box): the gate passed */ }
+            Err(status) => assert_ne!(
+                status,
+                NdiLoadStatus::Unlicensed,
+                "an accepted + audited source must pass the license gate"
+            ),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "ndi"))]
+mod ndi_egress_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use std::sync::Arc;
+
+    use multiview_compositor::pipeline::Nv12Image;
+    use multiview_core::time::Rational;
+    use multiview_output::display::frame_mailbox;
+    use multiview_output::ndi::license::LicenseAcceptance;
+    use multiview_output::ndi::{FakeNdiApi, NdiLicense, NdiOutput};
+
+    use super::{ndi_timecode_100ns, run_ndi_output, NdiCanvasFrame};
+
+    fn accepted() -> NdiLicense {
+        NdiLicense::accept(LicenseAcceptance {
+            accepted_by: "ops".to_owned(),
+            accepted_at: "2026-06-06T00:00:00Z".to_owned(),
+        })
+        .expect("a complete acceptance yields a license")
+    }
+
+    /// A 4x2 NV12 canvas whose Y plane carries a per-pixel ramp keyed by `seed`,
+    /// so a content-aware reader could prove this exact frame survived the
+    /// NV12→UYVY conversion (the live roundtrip asserts that; the offline drive
+    /// asserts the send shape).
+    fn ramp_canvas(seed: u8) -> Nv12Image {
+        let (w, h) = (4u32, 2u32);
+        let y: Vec<u8> = (0..(w * h))
+            .map(|i| seed.wrapping_add(u8::try_from(i % 256).unwrap_or(0)))
+            .collect();
+        let uv = vec![128u8; usize::try_from(w * h / 2).unwrap()];
+        Nv12Image::new(w, h, y, uv, multiview_core::color::ColorInfo::default()).unwrap()
+    }
+
+    /// The NDI 100 ns timecode is derived from the TICK index + the exact-rational
+    /// cadence (invariant #3) — never from wall clock or a raw input PTS.
+    #[test]
+    fn timecode_is_tick_derived_exact_rational() {
+        // 30000/1001 (NTSC): one frame is 1001/30000 s = 333_666.6… (100 ns units).
+        let cadence = Rational {
+            num: 30_000,
+            den: 1_001,
+        };
+        assert_eq!(ndi_timecode_100ns(0, cadence), 0);
+        // tick 3 → 3 * 1001 * 10_000_000 / 30000 = 1_001_000 (integer truncation).
+        assert_eq!(ndi_timecode_100ns(3, cadence), 1_001_000);
+        // A 25 fps cadence: one frame = 400_000 (100 ns units), exact.
+        let p25 = Rational { num: 25, den: 1 };
+        assert_eq!(ndi_timecode_100ns(1, p25), 400_000);
+        assert_eq!(ndi_timecode_100ns(5, p25), 2_000_000);
+    }
+
+    /// The drive loop converts each published canvas (NV12→UYVY) and sends it to
+    /// the NDI sender with the tick-derived timecode, ending when the
+    /// end-of-program signal (the packet receiver) disconnects. No panic, no
+    /// block.
+    #[test]
+    fn drive_loop_converts_and_sends_each_published_canvas() {
+        let cadence = Rational { num: 25, den: 1 };
+        let (publisher, reader) = frame_mailbox::<NdiCanvasFrame>();
+        // The end-of-program signal: a closed packet channel.
+        let (eop_tx, eop_rx) = std::sync::mpsc::sync_channel(4);
+
+        // Publish three distinct canvases BEFORE the loop drains — the loop must
+        // send the latest at each end-signal pulse, never block.
+        let handle = std::thread::spawn(move || {
+            let mut out = NdiOutput::new(accepted(), FakeNdiApi::new(), "Multiview Test").unwrap();
+            let outcome = run_ndi_output(&mut out, &reader, eop_rx, cadence, "ndi-test");
+            (outcome, out.api().sent.clone())
+        });
+
+        for (tick, seed) in [(0u64, 10u8), (1, 20), (2, 30)] {
+            publisher.publish(NdiCanvasFrame {
+                canvas: Arc::new(ramp_canvas(seed)),
+                tick_index: tick,
+            });
+            // One end-signal pulse per published frame.
+            eop_tx.send(()).unwrap();
+            // Give the drain a beat to observe the new sequence + pulse.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(eop_tx); // end-of-program
+
+        let (outcome, sent) = handle.join().unwrap();
+        // At least one frame was sent; every send is the canvas geometry (4x2)
+        // converted to UYVY (the seam validated it) with a tick-derived timecode.
+        assert!(!sent.is_empty(), "the drive loop must send the canvas");
+        assert!(sent.iter().all(|s| s.0 == 4 && s.1 == 2));
+        // Timecodes are tick-derived (multiples of one 25 fps frame = 400_000),
+        // never raw input PTS.
+        assert!(sent.iter().all(|s| s.3 % 400_000 == 0));
+        assert!(outcome.frames >= 1);
+    }
+
+    /// A canvas tap is bounded drop-oldest (the mailbox is single-slot,
+    /// newest-wins): publishing many frames before a single drain pulse sends
+    /// only the LATEST — older frames are dropped, never queued (invariant #10).
+    #[test]
+    fn canvas_tap_is_bounded_drop_oldest() {
+        let cadence = Rational { num: 25, den: 1 };
+        let (publisher, reader) = frame_mailbox::<NdiCanvasFrame>();
+        let (eop_tx, eop_rx) = std::sync::mpsc::sync_channel(1);
+
+        // Publish FIVE canvases with no drain in between, then a SINGLE pulse:
+        // the latest (tick 4) is the only one the loop can observe.
+        for (tick, seed) in [(0u64, 1u8), (1, 2), (2, 3), (3, 4), (4, 5)] {
+            publisher.publish(NdiCanvasFrame {
+                canvas: Arc::new(ramp_canvas(seed)),
+                tick_index: tick,
+            });
+        }
+        let handle = std::thread::spawn(move || {
+            let mut out = NdiOutput::new(accepted(), FakeNdiApi::new(), "Multiview Test").unwrap();
+            run_ndi_output(&mut out, &reader, eop_rx, cadence, "ndi-test");
+            out.api().sent.clone()
+        });
+        eop_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(eop_tx);
+
+        let sent = handle.join().unwrap();
+        // Exactly the latest canvas was sent (tick 4 → timecode 4*400_000), the
+        // four older ones were dropped at the single-slot tap (drop-oldest).
+        assert_eq!(sent.len(), 1, "only the latest canvas survives the tap");
+        assert_eq!(sent[0].3, 4 * 400_000);
+    }
+}
+
+/// Drive a WHIP ingest source (ADR-T014): wait for a publisher, decode its
+/// depacketized H.264/Opus into the last-good store, ride `NO_SIGNAL` between
+/// publishers.
+///
+/// Multiview is the WHIP **server**, so there is nothing to dial. The supervised
+/// loop samples the [`WhipRegistry`](crate::webrtc_ingest::WhipRegistry) for this
+/// source's connected publisher (rendezvous'd by the `WhipProvider` on a `POST`);
+/// when one appears it builds the pure `WebRtcProducer` over the publisher's
+/// drop-oldest RTP ring and pumps it until the publisher goes (the ring ends) —
+/// then loops back to waiting (the tile rides STALE → `NO_SIGNAL` via the store
+/// policy; a `webrtc` source is never RECONNECTING — there is nothing to dial).
+/// It only ever *writes* the lock-free store, so it can neither pace nor stall
+/// the output clock (invariant #1) nor back-pressure the engine (invariant #10);
+/// the publisher's RTP ring is bounded drop-oldest (invariant #2/#5).
+#[cfg(feature = "webrtc-native")]
+fn drive_webrtc(plan: &IngestPlan, _audio: bool, stop: &AtomicBool) {
+    use multiview_input::webrtc::transport::WebRtcProducer;
+    use multiview_webrtc::transport::RtpRingEngine;
+
+    let Some(registry) = plan.webrtc_registry.clone() else {
+        // No registry wired (should not happen for a webrtc plan) — degrade the
+        // tile honestly rather than spin.
+        tracing::warn!(source = %plan.id, "webrtc source has no publisher registry; tile degrades");
+        return;
+    };
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // Sample for a connected publisher. A quiet wait (no publisher) naps and
+        // re-checks — it never extends the startup prime-wait nor spins.
+        let Some(publisher) = registry.take(&plan.id) else {
+            sleep_interruptible(Duration::from_millis(50), stop);
+            continue;
+        };
+        tracing::info!(source = %plan.id, "webrtc publisher connected; ingesting");
+        let negotiated = publisher.negotiated_session();
+        let engine: Box<dyn multiview_input::webrtc::transport::MediaEngine + Send> =
+            Box::new(RtpRingEngine::new(publisher.ring.clone()));
+        let mut producer = WebRtcProducer::new(engine, &negotiated);
+        drive_webrtc_producer(plan, &mut producer, &publisher.ring, stop);
+        tracing::info!(source = %plan.id, "webrtc publisher disconnected; tile holds last-good → NO_SIGNAL");
+    }
+}
+
+/// Pump a [`WebRtcProducer`] into the source's `TileStore` (video) and
+/// `AudioStore` (Opus), until the publisher's ring ends or `stop` is raised.
+///
+/// Video access units feed a `multiview-ffmpeg` [`H264PacketDecoder`] →
+/// NV12 (SPS geometry, VUI colour) → scaled to the tile → normalized PTS
+/// (`PtsNormalizer`, `WrapBits::Rtp32`) → published into the last-good store.
+/// Opus frames feed an `OpusDecoder` → 48 kHz stereo PCM → the ADR-T013
+/// [`RtpAudioRebaser`] → `AudioStore::publish_at`. Every hand-off is sampled,
+/// never pacing (inv #1/#10); a decode error on one unit is logged and the unit
+/// dropped (the tile holds last-good — bad inputs are the product, inv #2).
+#[cfg(feature = "webrtc-native")]
+#[allow(clippy::too_many_lines)]
+// reason: a straight-line per-event pump (lazy-build the H.264/Opus decoders,
+// route each MediaEvent to its decode→publish helper) whose value is reading it
+// top-to-bottom in one place, matching `ingest_loop`/`consumer_main`. Splitting
+// it would scatter the session lifecycle across helpers without improving clarity.
+fn drive_webrtc_producer(
+    plan: &IngestPlan,
+    producer: &mut multiview_input::webrtc::transport::WebRtcProducer,
+    ring: &multiview_webrtc::transport::RtpRing,
+    stop: &AtomicBool,
+) {
+    use multiview_input::webrtc::route::MediaEvent;
+    use multiview_input::webrtc::transport::VIDEO_CLOCK_RATE;
+
+    let tag = CanvasColor::default().output_tag();
+    // The packet-fed H.264 decoder: geometry/colour come from the bitstream
+    // (SPS/VUI), never declared — the ADR-T014 fix. Built lazily on the first
+    // video unit so a video-less (audio-only) publisher allocates none.
+    let video_tb = Rational::new(1, i64::from(VIDEO_CLOCK_RATE));
+    let mut decoder: Option<multiview_ffmpeg::H264PacketDecoder> = None;
+    let mut to_tile = TileScaler::new(plan.tile_w, plan.tile_h);
+    // The video PTS normalizer (invariant #3): the 32-bit RTP wrap is unwrapped,
+    // re-anchored on the depacketizer's discontinuity flag, monotonic-guarded.
+    let mut normalizer = multiview_input::normalize::PtsNormalizer::new(
+        multiview_input::normalize::WrapBits::Rtp32,
+        video_tb,
+        plan.cadence,
+    );
+    let start = Instant::now();
+
+    // Audio: the Opus decoder + the shared ADR-T013 rebaser onto the store's
+    // absolute frame index. Built lazily on the first audio unit; only when the
+    // source carries an AudioStore (audio = true).
+    let mut opus: Option<multiview_ffmpeg::OpusDecoder> = None;
+    let mut rebaser = multiview_input::rtp_audio::RtpAudioRebaser::new(
+        multiview_ffmpeg::OPUS_SAMPLE_RATE,
+        multiview_ffmpeg::OPUS_SAMPLE_RATE,
+    );
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // Publisher gone (ring closed + drained): end this session.
+        if ring.is_ended() {
+            return;
+        }
+        let event = match producer.next_event() {
+            Ok(Some(event)) => event,
+            // Nothing ready this poll: nap briefly and re-check (never spin).
+            Ok(None) => {
+                sleep_interruptible(Duration::from_millis(5), stop);
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(source = %plan.id, error = %err, "webrtc producer faulted");
+                return;
+            }
+        };
+        match event {
+            MediaEvent::VideoAccessUnit(unit) => {
+                let dec = match decoder.as_mut() {
+                    Some(d) => d,
+                    None => match multiview_ffmpeg::H264PacketDecoder::new(video_tb) {
+                        Ok(d) => decoder.insert(d),
+                        Err(err) => {
+                            tracing::warn!(source = %plan.id, error = %err, "h264 decoder open failed");
+                            return;
+                        }
+                    },
+                };
+                if unit.discontinuity {
+                    normalizer.mark_discontinuity();
+                }
+                // Feed the access unit; a structurally-corrupt AU is a recoverable
+                // condition — log (rate-limited by the libav bridge) and ride
+                // last-good (inv #2).
+                if let Err(err) = dec.push(&unit.data, unit.raw_pts) {
+                    tracing::debug!(source = %plan.id, error = %err, "h264 push dropped an access unit");
+                    continue;
+                }
+                publish_webrtc_video(plan, dec, &mut to_tile, &mut normalizer, tag, start, stop);
+            }
+            MediaEvent::AudioFrame(unit) => {
+                let Some(store) = plan.webrtc_audio_store.as_ref() else {
+                    continue; // audio = false / no store: drop (answered inactive).
+                };
+                let dec = match opus.as_mut() {
+                    Some(d) => d,
+                    None => {
+                        match multiview_ffmpeg::OpusDecoder::new(Rational::new(
+                            1,
+                            i64::from(multiview_ffmpeg::OPUS_SAMPLE_RATE),
+                        )) {
+                            Ok(d) => opus.insert(d),
+                            Err(err) => {
+                                tracing::warn!(source = %plan.id, error = %err, "opus decoder open failed");
+                                continue;
+                            }
+                        }
+                    }
+                };
+                publish_webrtc_audio(plan, &unit, dec, &mut rebaser, store);
+            }
+            // `MediaEvent` is `#[non_exhaustive]`: a future media kind we do not
+            // decode is sampled away (never an error, never a stall — inv #1/#2).
+            _ => {}
+        }
+    }
+}
+
+/// Drain the H.264 decoder, scaling + normalizing each decoded NV12 frame and
+/// publishing it into the last-good store. Never paces the engine.
+#[cfg(feature = "webrtc-native")]
+fn publish_webrtc_video(
+    plan: &IngestPlan,
+    decoder: &mut multiview_ffmpeg::H264PacketDecoder,
+    to_tile: &mut TileScaler,
+    normalizer: &mut multiview_input::normalize::PtsNormalizer,
+    tag: multiview_core::color::ColorInfo,
+    start: Instant,
+    stop: &AtomicBool,
+) {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        match decoder.receive_frame() {
+            Ok(Some(picture)) => {
+                let Ok(image) = to_tile.convert(&picture.frame, tag) else {
+                    tracing::debug!(source = %plan.id, "webrtc tile scale dropped a frame");
+                    continue;
+                };
+                // Normalize the verbatim 32-bit RTP PTS onto the unified ns
+                // timeline (anchored to the source's ingest start). A frame with
+                // no usable PTS falls back to the decoder's own rescaled time.
+                let pts = timeline_pts(normalizer, picture.raw_pts, picture.meta.pts);
+                // Stamp publish with the source-relative instant; the OUTPUT clock
+                // paces emission, never this stamp (inputs are sampled, inv #1).
+                let _ = start;
+                plan.store.publish(image, pts);
+            }
+            Ok(None) => return, // decoder needs more input.
+            Err(err) => {
+                tracing::debug!(source = %plan.id, error = %err, "webrtc video decode error");
+                return;
+            }
+        }
+    }
+}
+
+/// Decode one Opus frame and publish the 48 kHz PCM into the source's
+/// `AudioStore` at the rebased absolute frame index (ADR-T013). Never paces.
+#[cfg(feature = "webrtc-native")]
+fn publish_webrtc_audio(
+    plan: &IngestPlan,
+    unit: &multiview_input::webrtc::route::MediaUnit,
+    decoder: &mut multiview_ffmpeg::OpusDecoder,
+    rebaser: &mut multiview_input::rtp_audio::RtpAudioRebaser,
+    store: &multiview_audio::store::AudioStore,
+) {
+    // The rebaser maps the packet's RTP timestamp to the store's absolute frame.
+    // The Opus RTP clock has no SSRC surfaced at this seam, so a single logical
+    // stream is assumed (a real SSRC change re-anchors via the discontinuity
+    // flag the depacketizer raises).
+    let raw_ts = u32::try_from(unit.raw_pts.unwrap_or(0) & i64::from(u32::MAX)).unwrap_or(0);
+    let anchor = rebaser.rebase(raw_ts, 0, unit.discontinuity);
+    if let Err(err) = decoder.push(&unit.data, unit.raw_pts) {
+        tracing::debug!(source = %plan.id, error = %err, "opus push dropped a frame");
+        return;
+    }
+    let mut frame = anchor.store_frame;
+    loop {
+        match decoder.receive_block() {
+            Ok(Some(samples)) => {
+                let Some(block) = webrtc_audio_block(&samples) else {
+                    continue;
+                };
+                let frames = i64::try_from(block.frame_count()).unwrap_or(0);
+                if let Err(err) = store.publish_at(frame, &block) {
+                    tracing::debug!(source = %plan.id, error = %err, "webrtc audio publish rejected");
+                    return;
+                }
+                frame = frame.saturating_add(frames);
+            }
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(source = %plan.id, error = %err, "webrtc audio decode error");
+                return;
+            }
+        }
+    }
+}
+
+/// Bridge a decoded 48 kHz stereo interleaved-`f32` Opus block into the
+/// canonical [`AudioBlock`] the `AudioStore` consumes. Returns `None`
+/// (panic-free) on a degenerate shape.
+#[cfg(feature = "webrtc-native")]
+fn webrtc_audio_block(
+    samples: &multiview_ffmpeg::AudioSamplesF32,
+) -> Option<multiview_audio::format::AudioBlock> {
+    use multiview_audio::format::{AudioBlock, AudioFormat, ChannelLayout};
+    let format = AudioFormat::new(samples.rate, ChannelLayout::Stereo);
+    AudioBlock::from_interleaved(format, samples.interleaved.clone()).ok()
+}
+
+/// The canonical AES67 audio store / program-bus sample rate (Hz): 48 kHz — the
+/// rate [`crate::audio::new_store`] mints and the program bus mixes, so a rebased
+/// AES67 block is published at exactly this rate (the store's format contract).
+#[cfg(feature = "aes67")]
+const AES67_STORE_RATE_HZ: u32 = 48_000;
+
+/// The AES67 RX socket→packet channel-bridge depth (#103): a bounded drop-oldest
+/// buffer of depacketized RTP units between the async receive loop (writer) and
+/// the [`Aes67AudioProducer`] drain (reader). Bounded so a burst can never grow
+/// memory (inv #5); AES67 Class-A packets are 1 ms, so 512 units is ~0.5 s of
+/// slack — far more than the 2 ms drain cadence needs, and it drops-oldest under
+/// any stall rather than back-pressuring the socket.
+#[cfg(feature = "aes67")]
+const AES67_RX_BRIDGE_CAP: usize = 512;
+
+/// Receive one AES67 / ST 2110-30 multicast PCM source into its `AudioStore`
+/// (#103, ADR-0033/T013), until `stop` is raised or the socket faults.
+///
+/// Binds a UDP receiver to the multicast port, joins the group, and pumps
+/// depacketized audio units through the shared ADR-T013
+/// [`RtpAudioRebaser`](multiview_input::rtp_audio::RtpAudioRebaser) — the SAME
+/// seam the WebRTC-Opus path uses ([`publish_webrtc_audio`]), except AES67 passes
+/// the **real packet SSRC** (not the hardcoded `0`), so an SSRC change re-anchors
+/// the store's absolute-frame timeline. Each rebased block is published into the
+/// source's last-good [`AudioStore`](multiview_audio::store::AudioStore), which the
+/// program bus samples. Every hand-off is sampled, never pacing (inv #1/#10); a
+/// malformed packet is skipped by the producer (bad inputs are the product, inv
+/// #2), and a socket fault ends the session (the tile-less store then silence-fills
+/// on the bus).
+///
+/// The receiver socket + its receive loop are async, but this runs on the ingest
+/// thread (a `std::thread`, the control/IO plane), so it drives them on a small
+/// **current-thread** Tokio runtime (like [`resolve_youtube_master`]) — the output
+/// data plane is never involved. A `select!` drives the receive loop concurrently
+/// with a 2 ms drain poll on the one thread, so the socket makes progress without a
+/// dedicated runtime worker.
+#[cfg(feature = "aes67")]
+fn drive_aes67_rx(plan: &Aes67RxPlan, stop: &AtomicBool) {
+    use multiview_input::st2110::transport::{MulticastInterface, RtpReceiver};
+    use multiview_input::st2110::Aes67AudioProducer;
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(source = %plan.id, error = %e, "aes67 rx runtime build failed; source silent");
+            return;
+        }
+    };
+
+    // Receiving multicast binds the port on the WILDCARD of the group's address
+    // family (IPv6 `[::]` / IPv4 `0.0.0.0`) and then joins the group — never the
+    // group literal (a portable multicast receive).
+    let port = plan.group.port();
+    let local: std::net::SocketAddr = if plan.group.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, port).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, port).into()
+    };
+
+    runtime.block_on(async {
+        let receiver = match RtpReceiver::bind(local).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(source = %plan.id, error = %e, local = %local, "aes67 rx bind failed; source silent");
+                return;
+            }
+        };
+        if let Err(e) = receiver.join_multicast(plan.group.ip(), MulticastInterface::Unspecified) {
+            tracing::warn!(source = %plan.id, error = %e, group = %plan.group, "aes67 rx multicast join failed; source silent");
+            return;
+        }
+        tracing::info!(source = %plan.id, group = %plan.group, "aes67 rx receiving");
+        let (packet_source, receive_loop) = receiver.channel_bridge(AES67_RX_BRIDGE_CAP);
+        let mut receive_loop = receive_loop;
+        let mut producer = Aes67AudioProducer::new(
+            Box::new(packet_source),
+            plan.session.format,
+            plan.session.payload_type,
+        );
+        // The ADR-T013 rebaser maps each packet's 32-bit RTP media timestamp onto
+        // the store's absolute 48 kHz frame index. Wire rate is the SDP clock; the
+        // store is canonical 48 kHz.
+        let mut rebaser = multiview_input::rtp_audio::RtpAudioRebaser::new(
+            plan.session.clock_rate,
+            AES67_STORE_RATE_HZ,
+        );
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::select! {
+                // The receive loop drives the socket → packet channel. It resolves
+                // only on a socket fault or when the packet source is dropped —
+                // end the session (the store then silence-fills on the bus).
+                () = &mut receive_loop => {
+                    tracing::info!(source = %plan.id, "aes67 rx socket ended; source holds silence");
+                    return;
+                }
+                // Drain every unit ready this poll and publish it. A 2 ms nap
+                // yields to the runtime so `receive_loop` makes progress (never
+                // spins); AES67 Class-A packets are 1 ms, so this keeps pace.
+                () = tokio::time::sleep(Duration::from_millis(2)) => {
+                    if !drain_aes67_producer(plan, &mut producer, &mut rebaser) {
+                        return; // producer fault: end the session.
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Drain every AES67 audio unit ready this poll, rebasing + publishing each into
+/// the source's store. Returns `false` on a producer fault (end the session),
+/// `true` to keep receiving. Never paces the engine (inv #1/#10); a rejected
+/// publish or degenerate block is logged/skipped, never fatal (inv #2).
+#[cfg(feature = "aes67")]
+fn drain_aes67_producer(
+    plan: &Aes67RxPlan,
+    producer: &mut multiview_input::st2110::Aes67AudioProducer,
+    rebaser: &mut multiview_input::rtp_audio::RtpAudioRebaser,
+) -> bool {
+    loop {
+        match producer.next_audio() {
+            Ok(Some(frame)) => {
+                // AES67 passes the REAL SSRC (not the WebRTC path's hardcoded 0),
+                // so a mid-stream SSRC change re-anchors the store timeline.
+                let anchor = rebaser.rebase(frame.raw_timestamp, frame.ssrc, frame.discontinuity);
+                let Some(block) = aes67_audio_block(&frame) else {
+                    continue; // degenerate shape: skip (bad inputs are the product).
+                };
+                if let Err(e) = plan.store.publish_at(anchor.store_frame, &block) {
+                    tracing::debug!(source = %plan.id, error = %e, "aes67 audio publish rejected");
+                }
+            }
+            Ok(None) => return true, // nothing ready this poll.
+            Err(e) => {
+                tracing::warn!(source = %plan.id, error = %e, "aes67 producer faulted");
+                return false;
+            }
+        }
+    }
+}
+
+/// Bridge a depacketized [`Aes67AudioFrame`](multiview_input::st2110::Aes67AudioFrame)
+/// (interleaved canonical f32, frame-major) into the [`AudioBlock`] the
+/// `AudioStore` consumes, at the store's canonical 48 kHz **stereo**. The per-source
+/// store + program bus are stereo, so the block must be stereo whatever the source
+/// channel count: mono is duplicated L=R, a >2-channel stream keeps its first two
+/// channels (a full downmix is a later slice). Returns `None` (panic-free) on a
+/// degenerate shape.
+#[cfg(feature = "aes67")]
+fn aes67_audio_block(
+    frame: &multiview_input::st2110::Aes67AudioFrame,
+) -> Option<multiview_audio::format::AudioBlock> {
+    use multiview_audio::format::{AudioBlock, AudioFormat, ChannelLayout};
+    let channels = usize::from(frame.format.channels).max(1);
+    let stereo = interleave_to_stereo(&frame.samples, channels);
+    let format = AudioFormat::new(AES67_STORE_RATE_HZ, ChannelLayout::Stereo);
+    AudioBlock::from_interleaved(format, stereo).ok()
+}
+
+/// Convert an interleaved, frame-major f32 buffer at `channels` into interleaved
+/// STEREO (`L,R,…`): stereo passes through, mono duplicates each sample to both
+/// channels, and >2 channels keep the first two. `channels` is clamped to ≥1 so
+/// the frame stride is never zero.
+#[cfg(feature = "aes67")]
+fn interleave_to_stereo(samples: &[f32], channels: usize) -> Vec<f32> {
+    let channels = channels.max(1);
+    if channels == 2 {
+        return samples.to_vec();
+    }
+    let frames = samples.len() / channels;
+    let mut out = Vec::with_capacity(frames.saturating_mul(2));
+    for f in 0..frames {
+        let base = f.saturating_mul(channels);
+        let left = samples.get(base).copied().unwrap_or(0.0);
+        let right = if channels == 1 {
+            left
+        } else {
+            samples.get(base.saturating_add(1)).copied().unwrap_or(left)
+        };
+        out.push(left);
+        out.push(right);
+    }
+    out
 }
 
 /// Map one decoded frame onto the timeline the store is stamped with.
@@ -5800,6 +10035,111 @@ fn resolve_youtube_master(watch_url: &str) -> Result<String, String> {
     Ok(ingest_url(&master).to_owned())
 }
 
+/// Pick the `*.googlevideo.com` HLS master URL to open for a `YouTube` source on a
+/// (re)connect, **preferring the proactive re-resolution slot** (IN-5b) over an
+/// inline `yt-dlp` resolve.
+///
+/// The proactive [`run_reresolve_loop`](multiview_input::youtube::reresolve::run_reresolve_loop)
+/// bridge thread publishes a freshly resolved master into `slot` `lead` seconds
+/// before the active URL's `expire` deadline. So when the active manifest ages out
+/// and 403s, the reconnect bracket re-enters and finds the **next-up** URL already
+/// in hand — the tile reopens onto it without waiting on a cold synchronous resolve
+/// at the boundary (make-before-break: the new URL was resolved ahead of need).
+///
+/// `slot` is `None` only when the `youtube` plan carries no slot (it always does);
+/// an **empty** slot (cold start before the loop's first publish, or no loop) falls
+/// back to a synchronous inline resolve via `resolve_inline`, so the very first
+/// open never waits on the loop and a source with no running loop still works.
+///
+/// This is a pure selection over an injected `resolve_inline` closure so it is
+/// unit-testable with no network/subprocess (the live resolve is gated separately).
+#[cfg(feature = "youtube")]
+fn youtube_open_url<F>(
+    slot: Option<&arc_swap::ArcSwapOption<String>>,
+    resolve_inline: F,
+) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    if let Some(fresh) = slot.and_then(arc_swap::ArcSwapOption::load_full) {
+        // The proactive loop has a fresh, make-before-break-resolved URL in hand.
+        return Ok((*fresh).clone());
+    }
+    // Cold start (slot empty) or no loop: resolve inline this once.
+    resolve_inline()
+}
+
+/// Run the supervised **proactive** `YouTube` re-resolution loop on this thread
+/// (IN-5b): the async↔sync bridge that keeps a long-running tile's
+/// `*.googlevideo.com` HLS URL fresh ahead of its `expire` deadline.
+///
+/// This is the CLI seam onto
+/// [`run_reresolve_loop`](multiview_input::youtube::reresolve::run_reresolve_loop):
+/// it builds a small current-thread Tokio runtime (the loop's only `await`s are its
+/// own hard-timeout-bounded resolves + an interruptible sleep) and drives the loop,
+/// publishing each freshly resolved master into the lock-free `slot` via a swap
+/// closure. [`open_and_stream`] reads that slot on every (re)open
+/// ([`youtube_open_url`]), so the active manifest is replaced make-before-break.
+///
+/// It runs on its **own supervised `std::thread`** (a sibling of the decode thread,
+/// off the data plane), carries its own `stop` flag, and only ever *writes* the
+/// lock-free slot — so it can neither pace nor stall the output clock (invariant
+/// #1) nor back-pressure the engine (invariant #10). A hung `yt-dlp` is killed by
+/// the resolver's hard timeout, never awaited (invariant #10); an extraction
+/// failure degrades the tile and backs off inside the loop, never panicking. The
+/// thread returns when `stop` is observed.
+#[cfg(feature = "youtube")]
+fn youtube_reresolve_thread(
+    watch_url: &str,
+    slot: &Arc<arc_swap::ArcSwapOption<String>>,
+    stop: &AtomicBool,
+) {
+    use multiview_input::youtube::reresolve::{
+        run_reresolve_loop, ProcessResolver, ReresolveConfig, SystemUnixClock,
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            // No runtime ⇒ no proactive refresh, but the source still works: the
+            // decode thread's inline resolve-on-reconnect (the IN-5 fallback) keeps
+            // the tile alive across expiry (it briefly degrades at the boundary).
+            // Never panics, never fails the run (invariant #1).
+            tracing::warn!(
+                %watch_url,
+                error = %e,
+                "youtube re-resolution runtime unavailable; falling back to resolve-on-reconnect"
+            );
+            return;
+        }
+    };
+
+    let resolver = ProcessResolver::default();
+    let clock = SystemUnixClock;
+    let swap_slot = Arc::clone(slot);
+    let outcome = runtime.block_on(run_reresolve_loop(
+        watch_url,
+        ReresolveConfig::default(),
+        &resolver,
+        &clock,
+        stop,
+        move |url: String| {
+            // Lock-free publish of the next-up master; the decode thread reads it on
+            // its next (re)open. Cheap + non-blocking — the loop holds no lock.
+            swap_slot.store(Some(Arc::new(url)));
+        },
+    ));
+    if let Err(e) = outcome {
+        // The loop never returns `Err` for an extraction failure (those degrade the
+        // tile + back off inside it); a returned error is a fatal-config fault.
+        // Log it — the tile rides the decode thread's inline resolve fallback.
+        tracing::warn!(%watch_url, error = %e, "youtube re-resolution loop ended with error");
+    }
+}
+
 /// Open `plan.location`, decode its best video stream to NV12 scaled to the tile
 /// size, and publish each frame into `plan.store` paced to wall-clock by PTS.
 ///
@@ -5809,6 +10149,11 @@ fn resolve_youtube_master(watch_url: &str) -> Result<String, String> {
 /// Uses `ffmpeg-next`'s safe `Input`/`Parameters` value types only to bridge the
 /// container's stream parameters into `multiview-ffmpeg`'s safe `StreamVideoDecoder`
 /// (which `multiview-ffmpeg`'s `Demuxer` does not yet surface). No `unsafe`, no FFI.
+#[allow(clippy::too_many_lines)]
+// reason: the cohesive run-path open-and-stream routine (open + variant-pin +
+// decoder build + caption-route build + the packet/frame pump) read top-to-bottom
+// in one place; the feature-gated guarded-unreachable arms (synthetic/ndi/webrtc
+// never reach here) tip the count without changing the linear flow.
 fn open_and_stream(
     plan: &IngestPlan,
     tag: multiview_core::color::ColorInfo,
@@ -5816,18 +10161,26 @@ fn open_and_stream(
 ) -> Result<(), String> {
     multiview_ffmpeg::ensure_initialized().map_err(|e| e.to_string())?;
 
-    // A YouTube source resolves its watch URL to a FRESH `*.googlevideo.com` HLS
-    // master here, on every (re)connect (ADR-0015): the resolved master is
-    // time-limited and 403s at its `expire` deadline, so re-resolving on each open
-    // — driven by the existing reconnect bracket in `ingest_loop` — is what keeps
-    // the tile alive across the ~6 h expiry. Resolution runs on THIS ingest thread
-    // (the control/IO plane) under a hard timeout (a hung `yt-dlp` is killed, never
+    // A YouTube source picks its `*.googlevideo.com` HLS master here, on every
+    // (re)connect (ADR-0015), PREFERRING the proactive re-resolution slot (IN-5b):
+    // the supervised `youtube_reresolve_thread` publishes a freshly resolved master
+    // into `plan.youtube_url_slot` `lead` seconds AHEAD of the active URL's `expire`
+    // deadline (make-before-break), so when the active manifest 403s and the
+    // reconnect bracket in `ingest_loop` re-enters, the next-up URL is already in
+    // hand — the tile reopens onto it without waiting on a cold synchronous resolve.
+    // When the slot is empty (cold start before the loop's first publish, or no
+    // loop) it falls back to an inline `yt-dlp` resolve, on THIS ingest thread (the
+    // control/IO plane) under a hard timeout (a hung `yt-dlp` is killed, never
     // awaited); it never touches the output data plane (invariants #1/#10). A
     // resolve failure returns `Err`, which the reconnect bracket backs off and
     // retries while the tile rides last-good → NO_SIGNAL.
     #[cfg(feature = "youtube")]
     let resolved_youtube_url = match &plan.location {
-        SourceLocation::Youtube { watch_url } => Some(resolve_youtube_master(watch_url)?),
+        SourceLocation::Youtube { watch_url } => {
+            Some(youtube_open_url(plan.youtube_url_slot.as_deref(), || {
+                resolve_youtube_master(watch_url)
+            })?)
+        }
         _ => None,
     };
 
@@ -5878,6 +10231,13 @@ fn open_and_stream(
         SourceLocation::Ndi { .. } => {
             return Err("ndi source has no libav media to open".to_owned())
         }
+        // Unreachable: `ingest_loop` routes WHIP sources to `drive_webrtc` (str0m
+        // surfaces RTP; the drive loop decodes per-packet) before reaching
+        // `open_and_stream`. Guarded so the match stays exhaustive.
+        #[cfg(feature = "webrtc-native")]
+        SourceLocation::Webrtc { .. } => {
+            return Err("webrtc source has no libav media to open".to_owned())
+        }
     };
 
     let (stream_index, params, time_base, declared_fps) = best_video_stream_params(&input)?;
@@ -5890,17 +10250,17 @@ fn open_and_stream(
     // the tile keeps running (invariants #1/#2). Decoded CUDA surfaces are
     // downloaded to host NV12 inside the decoder (the budgeted CPU↔GPU copy), so
     // the rest of the pipeline is unchanged (invariant #5).
-    let want_hw = multiview_ffmpeg::want_hw_decode(
-        std::env::var(multiview_ffmpeg::NVDEC_DISABLE_ENV)
-            .ok()
-            .as_deref(),
-    );
-    // Pin NVDEC to the load-aware admission pick's CUDA ordinal so decode opens on
-    // the SAME physical GPU the compositor was pinned to — the whole pipeline
-    // follows one chosen device (affinity; ADR-0035 Tier-1 / the GPU-placement
-    // principle). `None` (no admission pick / GPU-free) selects libav's default
-    // CUDA device, in lockstep with the compositor's `None`.
-    let cuda_ordinal = plan.cuda_ordinal.as_deref();
+    // The placement-aware decode-open gate (ADR-W018 §7): a `Pinned` plan
+    // opens NVDEC on the admission-chosen island device (affinity; ADR-0035
+    // Tier-1); a `Default` plan keeps the env-gated hardware preference on
+    // libav's default device (the GPU-free / no-admission path); a
+    // `SoftwareOnly` plan (a live placement REJECT) never attempts hardware —
+    // NVDEC on the default device would overcommit a single-GPU island or
+    // fragment onto a different GPU (ADR-0018 never-fragment). On a GPU-free box
+    // or any hardware-open failure the open degrades to software gracefully —
+    // the tile keeps running (invariants #1/#2).
+    let nvdec_env = std::env::var(multiview_ffmpeg::NVDEC_DISABLE_ENV).ok();
+    let (want_hw, cuda_ordinal) = decoder_open_args(&plan.decode_placement, nvdec_env.as_deref());
     let (decoder, used_hw) =
         StreamVideoDecoder::new_preferring_hw(params, time_base, want_hw, cuda_ordinal)
             .map_err(|e| e.to_string())?;
@@ -5960,6 +10320,24 @@ fn open_and_stream(
     // each subsequent frame when wall-clock catches up to its PTS (invariant #4).
     let mut pacer = PtsWallClock::new();
 
+    // MEDIA-PLAYER CHANNEL (ADR-0057 / ADR-0097): when this source is a player,
+    // run the transport-driven decode loop instead of the plain pump. It owns
+    // its OWN monotone output-anchored timeline (so it bypasses `normalizer`
+    // entirely — see `stream_player`), performs the in-place loop seek +
+    // decoder flush at a wrap, and drains the transport mailbox between frames.
+    if plan.player.is_some() {
+        return stream_player(
+            plan,
+            tag,
+            &mut input,
+            &mut decoder,
+            &mut to_tile,
+            stream_index,
+            &mut pacer,
+            stop,
+        );
+    }
+
     // Pump packets, publishing each decoded+scaled frame into the store.
     let mut drained = false;
     loop {
@@ -6016,6 +10394,676 @@ fn open_and_stream(
             }
             Err(other) => return Err(other.to_string()),
         }
+    }
+}
+
+/// Convert a source frame index to a libav `AV_TIME_BASE` (microsecond) seek
+/// target at the given `cadence`, using exact integer rationals — never float
+/// fps (invariant #3). `target_us = frame * 1_000_000 * cadence.den /
+/// cadence.num`, computed in `i128` to avoid overflow, saturated into `i64`.
+fn frame_to_seek_us(frame: u64, cadence: Rational) -> i64 {
+    let num = i128::from(cadence.num);
+    let den = i128::from(cadence.den);
+    if num <= 0 {
+        return 0;
+    }
+    let us = i128::from(frame)
+        .saturating_mul(1_000_000)
+        .saturating_mul(den)
+        / num;
+    i64::try_from(us).unwrap_or(i64::MAX)
+}
+
+/// The media-player fail-safe: after this many consecutive open→decode→EOF laps
+/// that publish ZERO frames, the asset cannot be played at its declared geometry
+/// (truncated / zero-frame / corrupt, or an in-point/target past the real clip
+/// end) — `stream_player` gives up re-seeking and holds last-good, so the ingest
+/// thread can never spin seek→EOF→seek (rule 26 / inv #1).
+const MAX_UNPRODUCTIVE_LAPS: u32 = 3;
+
+/// The **media-player** decode loop (ADR-0057 / ADR-0097): drives a
+/// pre-declared player channel's transport over the open container.
+///
+/// Unlike the plain pump in [`open_and_stream`], this loop consults the
+/// thread-local [`MediaPlayer`](crate::player::MediaPlayer) for every decoded
+/// frame and performs the [`PlayerAction`](crate::player::PlayerAction) it
+/// returns:
+///
+/// - [`Publish`](crate::player::PlayerAction::Publish): pace to the player's
+///   **output-anchored** stamp (`anchor + emitted × frame_period`, monotone
+///   across loop laps) and publish — the stamp comes straight from the player's
+///   own synthesized timeline, so **no source PTS is routed through
+///   `PtsNormalizer`** and the wrapped-PTS monotonic-clamp hazard cannot arise
+///   (ADR-0097 §5 refinement). Invariant #4 pacing is preserved (the stamp is
+///   monotone media time the `PtsWallClock` paces on directly).
+/// - [`SeekFlushTo`](crate::player::PlayerAction::SeekFlushTo): the in-place
+///   loop/vamp wrap — seek the container to the in-point, **flush the decoder**
+///   (the non-negotiable ADR-0097 rule 2: drop stale reordered B-frames), reset
+///   the source-frame cursor, and keep decoding. The boundary frame is
+///   discarded, never published.
+/// - [`Hold`](crate::player::PlayerAction::Hold): republish the held last-good
+///   frame at an advancing stamp (paused / EOF-held) so the tile reads LIVE.
+/// - [`Ended`](crate::player::PlayerAction::Ended): the channel ended under a
+///   non-looping policy — heartbeat-republish the terminal frame so the tile
+///   holds LIVE on the freshness ladder.
+///
+/// The transport [`mailbox`](crate::player::TransportMailbox) is drained once
+/// per outer iteration (between frames) and applied to the player. The loop
+/// never blocks on a client and never paces the output clock (invariants
+/// #1/#10): it only ever writes the lock-free store, exactly like every other
+/// ingest path.
+#[allow(clippy::too_many_arguments)]
+// mirrors open_and_stream's decode-context threading
+// One cohesive decode loop: drain the mailbox, then per decoded frame run the
+// frame-accurate-seek alignment + the PlayerAction (publish/wrap/hold/end), then
+// feed the next packet. Splitting the per-action arms into helpers would thread
+// most of these locals (input/decoder/pacer/store/pending_target/last_image)
+// through each and obscure the single-pass control flow; kept whole.
+#[allow(clippy::too_many_lines)]
+fn stream_player(
+    plan: &IngestPlan,
+    tag: multiview_core::color::ColorInfo,
+    input: &mut ffmpeg::format::context::Input,
+    decoder: &mut StreamVideoDecoder,
+    to_tile: &mut TileScaler,
+    stream_index: usize,
+    pacer: &mut PtsWallClock,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    use crate::player::{PlayerAction, TransportVerb};
+
+    // The handle is present (the caller only enters here when `plan.player` is
+    // `Some`); a `let-else` keeps it panic-free.
+    let Some(handle) = plan.player.as_ref() else {
+        return Ok(());
+    };
+    let cadence = handle.geometry.cadence();
+    let mut player = handle.build_player();
+    // Begin playout: vamp (loop the vamp segment) when the channel loops on
+    // start, else a single forward play-through. Anchored at the zero output
+    // media time; the pacer maps that to wall-clock on the first publish. A
+    // vamping channel starts at the vamp-in (it loops the [vamp_in, vamp_out)
+    // window); a plain play starts at the clip in-point.
+    let start_frame = if handle.loop_on_start {
+        player.vamp(multiview_core::time::MediaTime::ZERO);
+        handle.geometry.vamp_in()
+    } else {
+        player.play(multiview_core::time::MediaTime::ZERO);
+        handle.geometry.in_point()
+    };
+
+    // The source frame index of the NEXT frame the decoder will yield. Starts at
+    // the start frame and is reset by a wrap seek; advances 1:1 with decoded
+    // frames otherwise.
+    let mut source_frame = start_frame;
+    // ADR-T019 §1/§2 (single-authority transport coupling): the video rail is the
+    // SOLE mailbox consumer and PUBLISHES its applied transport state to the
+    // wait-free `control_bus` the audio rail samples. `last_published_at` tracks the
+    // video's most recent output media-time; `armed_anchor` LATCHES that time at the
+    // edge the exit is armed (stable while armed — the audio arms at the SAME
+    // boundary, with no per-frame churn — MAJOR-5); `last_audio_control` is the last
+    // `(AudioTransport, exit_armed, anchor)` published, so the bus is bumped only on
+    // a real change (including a CHANGED anchor — a re-arm).
+    let mut last_published_at = multiview_core::time::MediaTime::ZERO;
+    let mut armed_anchor: Option<multiview_core::time::MediaTime> = None;
+    let mut last_audio_control: Option<(
+        crate::player::AudioTransport,
+        bool,
+        Option<multiview_core::time::MediaTime>,
+    )> = None;
+    // A pending **frame-accurate seek target**: when `Some(t)`, the decoder has
+    // just been seeked to a keyframe at-or-before `t` (libav seeks land on a
+    // keyframe ≤ target), so the loop **decodes-and-discards** every frame whose
+    // index is `< t` and only publishes once the decoded frame's index reaches
+    // `t` — so the first published frame after a seek/loop-wrap is EXACTLY the
+    // in-point, even for a non-keyframe in-point (frame-accurate vamp/exit, no
+    // pre-target frame at the seam). `None` ⇒ frames advance 1:1.
+    let mut pending_target: Option<u64> = Some(start_frame);
+    let frame_period_ns = handle.geometry.frame_period_ns();
+    // The asset's PTS origin: the canonical-ns PTS of the FIRST decoded frame
+    // (frame 0). A container (e.g. MPEG-TS) commonly starts PTS at a non-zero
+    // offset, so a source frame index is `(pts − first_pts) / frame_period`, not
+    // the absolute PTS — captured once, then frame indices are 0-based and the
+    // frame-accurate seek-to-target math is offset-independent.
+    let mut first_pts_ns: Option<i64> = None;
+    // The last-good frame **handle** (an `Arc`, shared with the store) for the
+    // held/ended heartbeat republish: republishing is an `Arc::clone` (a refcount
+    // bump), never a pixel-plane copy — no per-frame heap allocation on the hold
+    // path (bounded-memory data plane, inv #5 / rule 22).
+    let mut last_image: Option<Arc<Nv12Image>> = None;
+    // Whether the decoder has been fully drained (EOF reached with no loop, or a
+    // fail-safe gave up): the loop falls through to `heartbeat_player_hold`, which
+    // holds last-good forever — the tile rides the framestore state machine and
+    // the output clock keeps ticking undisturbed (inv #1).
+    let mut drained = false;
+    // FAIL-SAFE bounds against a bad/truncated/corrupt asset spinning the ingest
+    // thread (rule 26 — bad inputs are the purpose; inv #1 — never stall output):
+    // `discarded` counts frames dropped since the last seek while aligning to a
+    // frame-accurate target; `unproductive_laps` counts consecutive open→decode→
+    // EOF cycles that published ZERO frames. Either exceeding its bound is a clear
+    // "this asset cannot satisfy this geometry" signal → stop seeking and HOLD
+    // last-good, never busy-re-arm seek→EOF→seek.
+    let mut discarded: u64 = 0;
+    let mut produced_this_lap: u64 = 0;
+    let mut unproductive_laps: u32 = 0;
+    // `true` once demux EOF has flushed the decoder this lap: the next decode
+    // pass drains the decoder's DELAYED (reordered / B-frame) frames — which
+    // libav only emits after the EOF flush — before the lap is judged
+    // productive/unproductive. (A good B-frame clip's publishable frames can be
+    // buffered until this flush; judging at demux EOF alone would wrongly call
+    // such a lap empty.)
+    let mut eof_flushing = false;
+    // The discard budget: a generous multiple of the declared clip length plus a
+    // floor, so a legitimate keyframe-bracketed seek (discarding back to the prior
+    // keyframe) always succeeds, but an unreachable target (past clip end) or a
+    // PTS/index mismatch cannot discard forever.
+    let max_discard = handle
+        .geometry
+        .out_point()
+        .saturating_mul(2)
+        .saturating_add(256);
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        // Drain the transport mailbox and apply each verb to the player. This is
+        // the only control-plane seam; O(pending), it takes the mailbox's short
+        // uncontended mutex for a `mem::take`, and never awaits or back-pressures
+        // the output clock (inv #1/#10).
+        for verb in handle.mailbox.drain() {
+            match verb {
+                TransportVerb::Play => player.play(multiview_core::time::MediaTime::ZERO),
+                TransportVerb::Vamp => player.vamp(multiview_core::time::MediaTime::ZERO),
+                TransportVerb::Pause => player.pause(),
+                TransportVerb::Stop => player.stop(),
+                TransportVerb::ArmExit => player.arm_exit(),
+                TransportVerb::TakeExit => player.take_exit(),
+                TransportVerb::CancelExit => player.cancel_exit(),
+                // load/cue/seek carry a target the executor honours by seeking;
+                // the MVP player plays one bound asset, so a Seek re-targets the
+                // cursor and a Cue/Load re-cues to the in-point. A failed seek is
+                // logged and skipped (the tile holds last-good — inv #1/#2).
+                TransportVerb::Seek { frame } => {
+                    apply_player_seek(input, decoder, frame, cadence, &mut pending_target);
+                }
+                TransportVerb::Cue { frame } => {
+                    let target = frame.unwrap_or_else(|| handle.geometry.in_point());
+                    apply_player_seek(input, decoder, target, cadence, &mut pending_target);
+                }
+                TransportVerb::Load { .. } => {
+                    let in_point = handle.geometry.in_point();
+                    apply_player_seek(input, decoder, in_point, cadence, &mut pending_target);
+                }
+            }
+        }
+
+        // ADR-T019 §1/§2: after applying the drained verbs, publish the player's
+        // authoritative transport state to the audio rail's control bus — but only
+        // when it actually changed (the bus is wait-free and cheap, but bumping the
+        // generation needlessly would make the audio re-apply each block). LATCH the
+        // exit anchor at the edge the exit is armed (the video's then-current output
+        // media-time), so it is stable while armed (no per-frame churn) yet a re-arm
+        // at a different boundary updates it and re-reaches the deck (MAJOR-5).
+        armed_anchor = if player.exit_armed() {
+            // Latch on the false→true edge; hold the latched value while it stays armed.
+            Some(armed_anchor.unwrap_or(last_published_at))
+        } else {
+            None
+        };
+        publish_audio_control(
+            handle,
+            player.state(),
+            armed_anchor.unwrap_or(last_published_at),
+            &mut last_audio_control,
+        );
+
+        // Pull every frame the decoder currently has, deciding per frame.
+        while let Some(decoded) = decoder.receive_frame().map_err(|e| e.to_string())? {
+            // Establish the asset's PTS origin from the very first decoded frame
+            // (a container may start PTS at a non-zero offset).
+            let origin = *first_pts_ns.get_or_insert_with(|| decoded.meta.pts.as_nanos());
+            // Frame-accurate seek: after a seek/loop-wrap, libav landed on a
+            // keyframe at-or-before the requested in-point, so decode-and-discard
+            // every frame whose index is before the target; only once a decoded
+            // frame reaches the target do we align and start publishing — so no
+            // pre-target frame is ever shown at the seam.
+            if let Some(target) = pending_target {
+                let idx = frame_index_of(&decoded, origin, frame_period_ns);
+                if idx < target {
+                    // FAIL-SAFE: bound the decode-discard so an unreachable target
+                    // (past clip end) or a PTS/index mismatch cannot discard
+                    // forever. Give up → drain + hold last-good (inv #1/#2).
+                    discarded = discarded.saturating_add(1);
+                    if discarded > max_discard {
+                        tracing::warn!(
+                            player = %plan.id, target, discarded,
+                            "media player: seek target unreachable (discard budget exhausted) — \
+                             holding last-good"
+                        );
+                        drained = true;
+                        break;
+                    }
+                    continue;
+                }
+                // Target reached: aligned. Reset the discard budget for the next
+                // seek.
+                pending_target = None;
+                source_frame = idx;
+                discarded = 0;
+            }
+            match player.on_decoded(source_frame) {
+                PlayerAction::Publish { at } => {
+                    let image = to_tile.convert(&decoded.frame, tag)?;
+                    // Pace to the player's own monotone stamp (invariant #4),
+                    // then publish it (latch-on-tick, invariant #1). Re-check
+                    // `stop` after the (possibly long) pace wait. Wrap the frame
+                    // in an `Arc` ONCE and publish that handle; the held last-good
+                    // is the same `Arc` (a refcount bump, not a pixel copy).
+                    pacer.wait_for(at, stop);
+                    if stop.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let image = Arc::new(image);
+                    last_image = Some(Arc::clone(&image));
+                    plan.store.publish_arc(image, at);
+                    // Track the video's output media-time for the audio exit anchor
+                    // (ADR-T019 §1): the audio arms its exit at the next vamp
+                    // boundary at-or-after this same media-time.
+                    last_published_at = at;
+                    source_frame = source_frame.saturating_add(1);
+                    produced_this_lap = produced_this_lap.saturating_add(1);
+                }
+                PlayerAction::SeekFlushTo { frame } => {
+                    // The in-place loop/vamp wrap: discard this boundary frame,
+                    // seek to the in-point, flush the decoder (ADR-0097 rule 2),
+                    // and keep decoding (the decode-discard above lands the first
+                    // published frame exactly on the in-point). A wrap that
+                    // published frames is a healthy lap → reset the unproductive
+                    // counter; break to re-read packets from the new position.
+                    apply_player_seek(input, decoder, frame, cadence, &mut pending_target);
+                    discarded = 0;
+                    unproductive_laps = 0;
+                    produced_this_lap = 0;
+                    break;
+                }
+                PlayerAction::Hold { at } => {
+                    // The decoded frame is not shown (paused / EOF-held): hold
+                    // the last-good handle, republished at the advancing stamp so
+                    // the tile reads LIVE. Republish is an `Arc::clone` (refcount
+                    // bump) — no pixel-plane copy. With no prior frame, drop it.
+                    if let Some(image) = &last_image {
+                        pacer.wait_for(at, stop);
+                        if stop.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        plan.store.publish_arc(Arc::clone(image), at);
+                    }
+                }
+                PlayerAction::Ended => {
+                    // `auto_off`: the channel reports Ended and releases — the
+                    // switcher applies the bus/keyer consequence (ADR-0057 §4).
+                    // The tile holds its last-good frame forever (HoldForever).
+                    return Ok(());
+                }
+            }
+        }
+
+        // The decoder has been flushed at demux EOF and its DELAYED frames have
+        // now been drained by the `while` above — so the lap can be judged
+        // productive/unproductive on the COMPLETE frame set (B-frame / reordered
+        // frames buffered until the flush are counted). Decide the loop here.
+        if eof_flushing {
+            eof_flushing = false;
+            if player.is_playing_state() {
+                // FAIL-SAFE: a full open→decode→EOF-flush lap that published ZERO
+                // frames is an unplayable asset for this geometry (truncated /
+                // zero-frame / corrupt, or an in-point/target past the real clip
+                // end). Re-seeking forever would spin the ingest thread (rule 26 /
+                // inv #1). After `MAX_UNPRODUCTIVE_LAPS` such laps, give up → hold
+                // last-good, never busy-re-arm seek→EOF→seek. A lap that published
+                // ANY frame (during decode OR the flush) is productive.
+                if produced_this_lap == 0 {
+                    unproductive_laps = unproductive_laps.saturating_add(1);
+                    if unproductive_laps >= MAX_UNPRODUCTIVE_LAPS {
+                        tracing::warn!(
+                            player = %plan.id, laps = unproductive_laps,
+                            "media player: asset produced no frames for this geometry — \
+                             holding last-good (no further re-seek)"
+                        );
+                        drained = true;
+                    }
+                } else {
+                    unproductive_laps = 0;
+                }
+                if !drained {
+                    // Re-arm the next loop from the in-point (this re-seek flushes
+                    // the decoder again, clearing the EOF state).
+                    produced_this_lap = 0;
+                    let in_point = handle.geometry.in_point();
+                    apply_player_seek(input, decoder, in_point, cadence, &mut pending_target);
+                }
+            } else {
+                // Not looping: the play-through ended — drain and hold.
+                drained = true;
+            }
+        }
+
+        if drained {
+            // The decoder is fully drained and the player is not looping (a wrap
+            // would have re-seeded packets). Hold the tile LIVE: a finite,
+            // non-looping play-through keeps republishing its terminal frame at
+            // cadence via the heartbeat below until `stop`.
+            heartbeat_player_hold(plan, &mut player, last_image.as_ref(), pacer, stop);
+            return Ok(());
+        }
+
+        // While flushing the decoder's delayed frames after demux EOF, do not
+        // read more packets — loop back to drain the decoder first.
+        if eof_flushing {
+            continue;
+        }
+
+        // Feed the decoder the next packet(s).
+        let mut packet = ffmpeg::codec::packet::Packet::empty();
+        match packet.read(input) {
+            Ok(()) => {
+                if packet.stream() == stream_index {
+                    decoder.send_packet(&packet).map_err(|e| e.to_string())?;
+                }
+                // Non-video packets are ignored on the player path (a player
+                // channel renders video; its audio rides the per-source audio
+                // thread, ADR-0057 Decision 6).
+            }
+            Err(ffmpeg::Error::Eof) => {
+                // Demux EOF: flush the decoder so its DELAYED (reordered /
+                // B-frame) frames emit, then loop back to DRAIN + publish them
+                // before judging this lap (the productivity decision happens above
+                // once `eof_flushing` frames are drained). This is the same
+                // EOF-flush behaviour the decoder-flush tests document.
+                decoder.send_eof().map_err(|e| e.to_string())?;
+                eof_flushing = true;
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+    }
+}
+
+/// Publish the video player's authoritative transport state to the audio rail's
+/// wait-free control bus (ADR-T019 §1), but only when it changed since the last
+/// publish (so the audio re-applies on a real transition, not every frame). Maps
+/// the video [`MediaPlayerState`] onto the audio-rail subset
+/// ([`AudioTransport`](crate::player::AudioTransport)): publishing/vamping →
+/// `Vamping` (carrying the exit anchor when an exit is armed); paused/held/cued/
+/// loading → `Paused`; stopped (re-cued) → `Stopped`; the EOF terminals settle to
+/// `Paused` (the audio bus contributes silence while the video tile holds its
+/// terminal frame). The exit anchor is the video's most recent output media-time,
+/// so the audio arms at the SAME next-vamp boundary the video reaches.
+fn publish_audio_control(
+    handle: &crate::player::PlayerHandle,
+    state: crate::player::MediaPlayerState,
+    armed_anchor: multiview_core::time::MediaTime,
+    last: &mut Option<(
+        crate::player::AudioTransport,
+        bool,
+        Option<multiview_core::time::MediaTime>,
+    )>,
+) {
+    use crate::player::{AudioTransport, EofPolicy, MediaPlayerState};
+    use multiview_core::time::MediaTime;
+    // (audio_state, exit_armed, exit_anchor). For a forever-loop the audio vamps
+    // with no exit; for an armed vamp exit the audio arms at the video's LATCHED
+    // arm anchor (`armed_anchor`, stable while armed — the SAME next boundary); for a
+    // one-shot `Playing` (non-`Loop` policy) the audio arms at ZERO so it settles to
+    // silence after the first lap (mirroring the video playing `[in,out)` once then
+    // holding its terminal frame). The video's re-cue state (`Cued`, where
+    // `MediaPlayer::stop()` lands) maps to `Stopped` (an audio RE-CUE), distinct from
+    // a genuine `Paused` (hold-in-place) — MAJOR-4.
+    let loops_forever = matches!(handle.eof_policy, EofPolicy::Loop);
+    let (audio_state, exit_armed, anchor) = match state {
+        MediaPlayerState::Playing if loops_forever => (AudioTransport::Vamping, false, None),
+        MediaPlayerState::Playing => (AudioTransport::Vamping, true, Some(MediaTime::ZERO)),
+        MediaPlayerState::Vamping { exit_armed: true } => {
+            (AudioTransport::Vamping, true, Some(armed_anchor))
+        }
+        MediaPlayerState::Vamping { exit_armed: false } => (AudioTransport::Vamping, false, None),
+        // The video re-cue (Cued) → an audio re-cue (Stopped), not pause.
+        MediaPlayerState::Cued => (AudioTransport::Stopped, false, None),
+        MediaPlayerState::Paused
+        | MediaPlayerState::Holding
+        | MediaPlayerState::Black
+        | MediaPlayerState::Idle
+        | MediaPlayerState::Loading
+        | MediaPlayerState::Ended => (AudioTransport::Paused, false, None),
+    };
+    // Suppress on the FULL (state, exit_armed, anchor) triple so a CHANGED arm anchor
+    // (a re-arm / move-exit at a different boundary) always reaches the deck even
+    // when (state, exit_armed) is unchanged (MAJOR-5) — while an unchanged control is
+    // still suppressed (no per-frame generation churn, because `armed_anchor` is
+    // latched at the arm edge by the caller, not re-sampled every frame).
+    let key = (audio_state, exit_armed, anchor);
+    if *last == Some(key) {
+        return;
+    }
+    *last = Some(key);
+    handle.control_bus.publish(audio_state, anchor);
+}
+
+#[cfg(test)]
+mod publish_audio_control_tests {
+    //! MAJOR-5 (ADR-T019 §2): a CHANGED exit-arm anchor must always reach the audio
+    //! rail even when `(audio_state, exit_armed)` is unchanged — the round-2
+    //! suppression keyed only on `(audio_state, exit_armed)` and dropped a re-arm at
+    //! a different boundary. The fix suppresses only on the FULL `(state,
+    //! exit_armed, anchor)` triple. Also pins MAJOR-4: a re-cue (`Cued`) maps to
+    //! `AudioTransport::Stopped` (re-cue), not `Paused`.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use std::sync::Arc;
+
+    use multiview_core::time::{MediaTime, Rational};
+
+    use super::publish_audio_control;
+    use crate::player::{
+        AudioTransport, EofPolicy, MediaPlayerState, PlayerHandle, PlayoutGeometry,
+        TransportMailbox,
+    };
+
+    fn handle(eof: EofPolicy) -> PlayerHandle {
+        // A 1 s vamp window at 48 fps (in=0,out=48,vamp 0..48) — geometry irrelevant
+        // to the suppression logic, only valid construction matters.
+        let geometry = PlayoutGeometry::new(0, 48, 0, 48, Rational::new(48, 1)).unwrap();
+        PlayerHandle::new(
+            "p".to_owned(),
+            geometry,
+            eof,
+            true,
+            Arc::new(TransportMailbox::new()),
+        )
+    }
+
+    /// A re-published armed-vamp-exit with a CHANGED anchor (a re-arm / move-exit at
+    /// a different boundary) must bump the bus generation — it is NOT suppressed by
+    /// the `(Vamping, exit_armed=true)` tuple repeating.
+    #[test]
+    fn a_changed_arm_anchor_propagates_even_when_state_is_unchanged() {
+        let handle = handle(EofPolicy::Loop);
+        let mut last = None;
+
+        // First arm at anchor A1.
+        let a1 = MediaTime::from_nanos(1_000_000_000);
+        publish_audio_control(
+            &handle,
+            MediaPlayerState::Vamping { exit_armed: true },
+            a1,
+            &mut last,
+        );
+        let after_first = handle.control_bus.load();
+        assert_eq!(after_first.state, AudioTransport::Vamping);
+        assert_eq!(
+            after_first.exit_arm_anchor,
+            Some(a1),
+            "the first arm publishes anchor A1"
+        );
+        let gen1 = after_first.generation;
+
+        // Re-arm at a DIFFERENT anchor A2, SAME (state, exit_armed). Must publish.
+        let a2 = MediaTime::from_nanos(3_000_000_000);
+        publish_audio_control(
+            &handle,
+            MediaPlayerState::Vamping { exit_armed: true },
+            a2,
+            &mut last,
+        );
+        let after_second = handle.control_bus.load();
+        assert!(
+            after_second.generation > gen1,
+            "a changed arm anchor must bump the generation (not be suppressed) — MAJOR-5"
+        );
+        assert_eq!(
+            after_second.exit_arm_anchor,
+            Some(a2),
+            "the changed anchor A2 must reach the bus"
+        );
+    }
+
+    /// An UNCHANGED control (same state, same anchor) is suppressed — no needless
+    /// per-frame generation churn (the other half of the MAJOR-5 contract).
+    #[test]
+    fn an_unchanged_control_is_suppressed() {
+        let handle = handle(EofPolicy::Loop);
+        let mut last = None;
+        let a = MediaTime::from_nanos(1_000_000_000);
+        publish_audio_control(
+            &handle,
+            MediaPlayerState::Vamping { exit_armed: true },
+            a,
+            &mut last,
+        );
+        let gen1 = handle.control_bus.load().generation;
+        // Same state + same anchor again: suppressed.
+        publish_audio_control(
+            &handle,
+            MediaPlayerState::Vamping { exit_armed: true },
+            a,
+            &mut last,
+        );
+        assert_eq!(
+            handle.control_bus.load().generation,
+            gen1,
+            "an unchanged control must be suppressed (no per-frame churn)"
+        );
+    }
+
+    /// MAJOR-4: the video's re-cue state (`Cued`, where `MediaPlayer::stop()` lands)
+    /// maps to `AudioTransport::Stopped` (re-cue), NOT `Paused` (hold-in-place).
+    #[test]
+    fn cued_maps_to_stopped_not_paused() {
+        let handle = handle(EofPolicy::Loop);
+        let mut last = None;
+        publish_audio_control(&handle, MediaPlayerState::Cued, MediaTime::ZERO, &mut last);
+        assert_eq!(
+            handle.control_bus.load().state,
+            AudioTransport::Stopped,
+            "the video re-cue (Cued) must route to an audio re-cue (Stopped), not pause (MAJOR-4)"
+        );
+        // Paused/Holding still map to Paused (hold).
+        let mut last2 = None;
+        publish_audio_control(
+            &handle,
+            MediaPlayerState::Paused,
+            MediaTime::ZERO,
+            &mut last2,
+        );
+        assert_eq!(
+            handle.control_bus.load().state,
+            AudioTransport::Paused,
+            "an actual pause still maps to Paused (hold position)"
+        );
+    }
+}
+
+/// Seek the open container to `frame` (in-point of a loop/vamp, a cue, or a user
+/// seek) and **flush the decoder** so no stale reordered frame from before the
+/// seek leaks past it (ADR-0097 rule 2, non-negotiable). Arms the **pending
+/// frame-accurate target** at `frame`: libav lands on a keyframe at-or-before
+/// `frame`, so the decode loop discards forward to `frame` before publishing,
+/// making the first published frame exactly the requested in-point even for a
+/// non-keyframe in-point. A failed seek is logged and skipped — the tile holds
+/// last-good rather than crashing (invariants #1/#2); the supervised reconnect
+/// bracket in [`ingest_loop`] is the deeper recovery.
+fn apply_player_seek(
+    input: &mut ffmpeg::format::context::Input,
+    decoder: &mut StreamVideoDecoder,
+    frame: u64,
+    cadence: Rational,
+    pending_target: &mut Option<u64>,
+) {
+    let target_us = frame_to_seek_us(frame, cadence);
+    if let Err(reason) = input.seek(target_us, ..) {
+        tracing::warn!(%reason, frame, "media-player seek failed; holding last-good");
+        return;
+    }
+    if let Err(reason) = decoder.flush() {
+        tracing::warn!(%reason, "media-player decoder flush failed after seek");
+    }
+    *pending_target = Some(frame);
+}
+
+/// The 0-based source frame index of a decoded frame: `(meta.pts − origin) /
+/// frame_period`, rounded to nearest, where `origin` is the asset's first-frame
+/// PTS (a container may start PTS at a non-zero offset). Used to align a
+/// frame-accurate seek to its target.
+fn frame_index_of(
+    decoded: &multiview_ffmpeg::DecodedVideoFrame,
+    origin_ns: i64,
+    frame_period_ns: i64,
+) -> u64 {
+    if frame_period_ns <= 0 {
+        return 0;
+    }
+    let rel_ns = decoded.meta.pts.as_nanos().saturating_sub(origin_ns).max(0);
+    // Round to nearest: (rel + period/2) / period.
+    let idx = rel_ns.saturating_add(frame_period_ns / 2) / frame_period_ns;
+    u64::try_from(idx).unwrap_or(0)
+}
+
+/// Keep a drained, non-looping player's tile LIVE: heartbeat-republish its
+/// terminal frame at cadence with advancing stamps (media-playout §7.3) until
+/// `stop`, so it never ages to STALE on the freshness ladder. An `auto_off`
+/// player (whose `on_heartbeat` returns [`PlayerAction::Ended`]) instead returns
+/// immediately — it has released, and the store holds its last frame forever
+/// (`HoldForever`). With no frame ever decoded (a zero-length asset), returns
+/// immediately too.
+fn heartbeat_player_hold(
+    plan: &IngestPlan,
+    player: &mut crate::player::MediaPlayer,
+    last_image: Option<&Arc<Nv12Image>>,
+    pacer: &mut PtsWallClock,
+    stop: &AtomicBool,
+) {
+    use crate::player::PlayerAction;
+    let Some(image) = last_image else {
+        return;
+    };
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // A held player heartbeats `Hold { at }` with an advancing stamp; an
+        // `auto_off` player heartbeats `Ended` (released — stop the heartbeat,
+        // the tile holds last-good via HoldForever). Any other action is not
+        // expected on a drained player; stop rather than busy-loop.
+        let PlayerAction::Hold { at } = player.on_heartbeat() else {
+            return;
+        };
+        pacer.wait_for(at, stop);
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // Republish the held handle — an `Arc::clone` (refcount bump), never a
+        // pixel-plane copy.
+        plan.store.publish_arc(Arc::clone(image), at);
     }
 }
 
@@ -6358,18 +11406,21 @@ mod overlay_clock_tests {
     }
 
     #[test]
-    fn no_clock_overlay_yields_none() {
-        assert!(analog_clock_from_config(&[], 1280, 720).is_none());
-        // A digital clock overlay does NOT request the analog face.
+    fn no_clock_overlay_yields_an_empty_set() {
+        assert!(analog_clocks_from_config(&[], 1280, 720).is_empty());
+        // A digital clock overlay does NOT request an analog face.
         let digital = clock_overlay(serde_json::json!({ "face": "digital" }));
-        assert!(analog_clock_from_config(&[digital], 1280, 720).is_none());
+        assert!(analog_clocks_from_config(&[digital], 1280, 720).is_empty());
     }
 
     #[test]
     fn analog_face_param_requests_the_face() {
         let analog = clock_overlay(serde_json::json!({ "face": "analog" }));
-        let spec = analog_clock_from_config(&[analog], 1280, 720)
+        let specs = analog_clocks_from_config(&[analog], 1280, 720);
+        let spec = *specs
+            .first()
             .expect("an analog clock overlay yields a spec");
+        assert_eq!(specs.len(), 1);
         // Default placement is the bottom-right quadrant of the canvas.
         assert!(
             spec.cx() > 640.0 && spec.cy() > 360.0,
@@ -6383,13 +11434,39 @@ mod overlay_clock_tests {
         let analog = clock_overlay(
             serde_json::json!({ "face": "analog", "x": 200, "y": 150, "radius": 64 }),
         );
-        let spec = analog_clock_from_config(&[analog], 1280, 720).unwrap();
+        let specs = analog_clocks_from_config(&[analog], 1280, 720);
+        let spec = *specs.first().expect("spec");
         assert!((spec.cx() - 200.0).abs() < 0.5, "explicit x honoured");
         assert!((spec.cy() - 150.0).abs() < 0.5, "explicit y honoured");
         assert!(
             (spec.radius() - 64.0).abs() < 0.5,
             "explicit radius honoured"
         );
+    }
+
+    #[test]
+    fn every_analog_entry_yields_a_face_in_set_order() {
+        // MAJOR-1: ALL analog-face entries render — no first-wins. The specs
+        // come back in working-set order, each honouring its own placement,
+        // with the interleaved digital entry contributing nothing.
+        let a = clock_overlay(
+            serde_json::json!({ "face": "analog", "x": 100, "y": 100, "radius": 32 }),
+        );
+        let digital = clock_overlay(serde_json::json!({ "face": "digital" }));
+        let b = clock_overlay(
+            serde_json::json!({ "face": "analog", "x": 900, "y": 500, "radius": 48 }),
+        );
+        let specs = analog_clocks_from_config(&[a, digital, b], 1280, 720);
+        assert_eq!(specs.len(), 2, "both analog entries yield faces");
+        assert!(
+            (specs[0].cx() - 100.0).abs() < 0.5,
+            "first face keeps its x"
+        );
+        assert!(
+            (specs[1].cx() - 900.0).abs() < 0.5,
+            "second face keeps its x"
+        );
+        assert!((specs[1].radius() - 48.0).abs() < 0.5);
     }
 }
 
@@ -7291,7 +12368,7 @@ mod youtube_tests {
     use multiview_core::time::Rational;
     use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 
-    use super::{ingest_open_options, ingest_plan_for, SourceLocation};
+    use super::{ingest_open_options, ingest_plan_for, youtube_open_url, SourceLocation};
 
     /// Build a `youtube` `Source` via serde (the type is `#[non_exhaustive]`, so a
     /// struct literal is not available cross-crate — config is produced by
@@ -7344,6 +12421,233 @@ mod youtube_tests {
         assert_eq!(
             opts.get("rw_timeout"),
             Some(super::INGEST_RW_TIMEOUT.as_micros().to_string().as_str()),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IN-5b: the proactive re-resolution wiring — the swappable-URL slot on the
+    // plan, the open-URL selection that prefers it (make-before-break), and the
+    // bridge that runs `run_reresolve_loop` over the slot off the data plane.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn youtube_plan_carries_a_swappable_url_slot() {
+        // IN-5b: the proactive re-resolution loop needs a lock-free slot on the
+        // plan to publish each fresh master into; a youtube plan must allocate one
+        // (empty at build — filled by the loop ahead of expiry).
+        let source = youtube_source("yt-live", "https://www.youtube.com/watch?v=abcdEFGH123");
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let plan = ingest_plan_for(
+            &source,
+            320,
+            180,
+            Arc::clone(&store),
+            CanvasColor::default(),
+            Rational::new(30, 1),
+        )
+        .expect("youtube source plans without failing the build");
+
+        let slot = plan
+            .youtube_url_slot
+            .as_ref()
+            .expect("a youtube plan must carry a swappable-url slot");
+        // Empty at build: the first open resolves inline; the loop fills it ahead
+        // of expiry (make-before-break).
+        assert!(
+            slot.load().is_none(),
+            "the slot starts empty (cold start resolves inline)"
+        );
+    }
+
+    #[test]
+    fn open_url_prefers_the_proactive_slot_over_inline_resolve() {
+        // IN-5b make-before-break: when the proactive loop has published a fresh
+        // master into the slot, the (re)open uses IT and NEVER calls the inline
+        // resolver — the tile reopens onto the next-up URL without a cold resolve.
+        let slot = arc_swap::ArcSwapOption::empty();
+        slot.store(Some(Arc::new(
+            "https://r1.googlevideo.com/fresh.m3u8?expire=9999".to_owned(),
+        )));
+
+        let inline_called = std::cell::Cell::new(false);
+        let chosen = youtube_open_url(Some(&slot), || {
+            inline_called.set(true);
+            Ok("https://INLINE.example/should-not-be-used.m3u8".to_owned())
+        })
+        .expect("a populated slot yields its url");
+
+        assert_eq!(chosen, "https://r1.googlevideo.com/fresh.m3u8?expire=9999");
+        assert!(
+            !inline_called.get(),
+            "a populated slot must NOT trigger an inline resolve (make-before-break)"
+        );
+    }
+
+    #[test]
+    fn open_url_falls_back_to_inline_resolve_when_slot_is_empty() {
+        // Cold start (slot empty, before the loop's first publish) OR no loop: the
+        // (re)open resolves inline this once, so the very first open never waits on
+        // the loop and a source with no running loop still works (IN-5 fallback).
+        let slot = arc_swap::ArcSwapOption::<String>::empty();
+        let inline_called = std::cell::Cell::new(false);
+        let chosen = youtube_open_url(Some(&slot), || {
+            inline_called.set(true);
+            Ok("https://r2.googlevideo.com/cold.m3u8?expire=8888".to_owned())
+        })
+        .expect("an empty slot falls back to the inline resolve");
+
+        assert_eq!(chosen, "https://r2.googlevideo.com/cold.m3u8?expire=8888");
+        assert!(
+            inline_called.get(),
+            "an empty slot must fall back to the inline resolve"
+        );
+    }
+
+    #[test]
+    fn open_url_propagates_an_inline_resolve_failure() {
+        // When the slot is empty AND the inline resolve fails (binary absent /
+        // extraction broke), the error propagates so the reconnect bracket backs
+        // off and the tile degrades — never a panic, never a silent success.
+        let slot = arc_swap::ArcSwapOption::<String>::empty();
+        let err = youtube_open_url(Some(&slot), || Err("yt-dlp unavailable".to_owned()))
+            .expect_err("an empty slot with a failing inline resolve must error");
+        assert_eq!(err, "yt-dlp unavailable");
+    }
+
+    /// A scripted fake resolver for driving the bridge over the slot with no
+    /// network/subprocess — returns canned results in order, recording call count.
+    struct FakeResolver {
+        results: std::sync::Mutex<std::collections::VecDeque<Result<ResolvedHls, YoutubeError>>>,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl multiview_input::youtube::reresolve::Resolver for FakeResolver {
+        async fn resolve(&self, _url: &str) -> Result<ResolvedHls, YoutubeError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.results
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned())))
+        }
+    }
+
+    use multiview_input::youtube::reresolve::{run_reresolve_loop, ManualClock, ReresolveConfig};
+    use multiview_input::youtube::{LiveStatus, ResolvedHls, YoutubeError};
+
+    fn resolved(tag: &str, expire_unix: i64) -> ResolvedHls {
+        ResolvedHls::new(
+            format!("https://{tag}.googlevideo.com/index.m3u8?expire={expire_unix}"),
+            LiveStatus::Live,
+            Some(expire_unix),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reresolve_loop_publishes_fresh_urls_into_the_plan_slot() {
+        // IN-5b end-to-end (offline): the bridge's swap closure — the SAME closure
+        // shape `youtube_reresolve_thread` installs — writes each freshly resolved
+        // master into the plan's lock-free slot, make-before-break. With `expire`
+        // below the injected clock the deadline is already past, so the second
+        // resolve fires WITHOUT a timed wait, exercising the slot-publish wiring
+        // (the lead-time math is covered by the pure schedule tests in
+        // multiview-input). The slot ends holding the LATEST master.
+        let first = resolved("r1", 0);
+        let second = resolved("r2", 0);
+        let resolver = FakeResolver {
+            results: std::sync::Mutex::new(
+                vec![Ok(first.clone()), Ok(second.clone())]
+                    .into_iter()
+                    .collect(),
+            ),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        };
+
+        // The plan slot the decode thread reads via `youtube_open_url`.
+        let slot: Arc<arc_swap::ArcSwapOption<String>> = Arc::new(arc_swap::ArcSwapOption::empty());
+        let swap_slot = Arc::clone(&slot);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let clock = ManualClock::new(1000);
+        let cfg = ReresolveConfig {
+            lead: std::time::Duration::from_secs(1),
+            ttl_guard: std::time::Duration::from_secs(10),
+            error_burst_threshold: 100,
+        };
+
+        let handle = tokio::spawn(async move {
+            run_reresolve_loop(
+                "https://youtube.com/watch?v=v",
+                cfg,
+                &resolver,
+                &clock,
+                &stop_loop,
+                move |url: String| {
+                    // The exact swap-into-slot closure the CLI bridge installs.
+                    swap_slot.store(Some(Arc::new(url)));
+                },
+            )
+            .await
+        });
+
+        // Let both resolves land (deadline already past → no wait), then stop.
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        handle.await.expect("loop joins").expect("loop ok");
+
+        // The slot holds the LATEST master — the decode thread's next (re)open uses
+        // it (make-before-break); the loop only ever wrote the lock-free slot
+        // (bounded, non-blocking — inv #10).
+        let held = slot.load_full().expect("slot holds the latest master");
+        assert_eq!(*held, second.manifest_url);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reresolve_loop_leaves_slot_empty_when_resolution_fails() {
+        // A first-resolve failure must publish NOTHING into the slot (the decode
+        // thread then falls back to its inline resolve / the tile degrades) and
+        // must never panic — the loop backs off and stops cleanly (inv #1/#10).
+        let resolver = FakeResolver {
+            results: std::sync::Mutex::new(
+                vec![Err(YoutubeError::Resolve("n-sig rotated".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        };
+        let slot: Arc<arc_swap::ArcSwapOption<String>> = Arc::new(arc_swap::ArcSwapOption::empty());
+        let swap_slot = Arc::clone(&slot);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let clock = ManualClock::new(1000);
+
+        let handle = tokio::spawn(async move {
+            run_reresolve_loop(
+                "https://youtube.com/watch?v=dead",
+                ReresolveConfig::default(),
+                &resolver,
+                &clock,
+                &stop_loop,
+                move |url: String| {
+                    swap_slot.store(Some(Arc::new(url)));
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        handle.await.expect("loop joins").expect("loop ok");
+
+        assert!(
+            slot.load().is_none(),
+            "a failed resolve publishes no url; the slot stays empty"
         );
     }
 }
@@ -7410,6 +12714,154 @@ mod ndi_tests {
         };
         assert_eq!(name, "STUDIO (CAM 1)");
         assert!(plan.live, "an ndi source must be live (reconnects)");
+    }
+}
+
+/// Tests for the RIST ingest+egress wiring (RIST-3, ADR-0095 Tier-0): under the
+/// `rist` feature a `rist` source plans as a live network ingest location whose
+/// URL carries the lowered `librist` options, and a `rist` push output builds a
+/// `PushProtocol::Rist` runnable fed the same encoded packets (invariant #7).
+/// The PSK is resolved from a `secret_ref` (`env:VAR`) and never logged. No
+/// network/peer is touched here (offline like the SRT tests).
+#[cfg(test)]
+#[cfg(feature = "rist")]
+mod rist_tests {
+    #![allow(
+        // reason: a unit test module; the strict workspace lints are relaxed for
+        // test code per CLAUDE.md (these mirror the surrounding `tests` modules).
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic
+    )]
+    use std::sync::Arc;
+
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::{MultiviewConfig, RistOptions, Source};
+    use multiview_core::time::Rational;
+    use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+
+    use super::{
+        build_outputs, ingest_plan_for, rist_resolved_url, RunnableOutput, SourceLocation,
+    };
+
+    fn rist_source(json: serde_json::Value) -> Source {
+        serde_json::from_value(json).expect("rist source deserializes")
+    }
+
+    #[test]
+    fn rist_source_plans_as_a_live_network_url_with_lowered_options() {
+        let source = rist_source(serde_json::json!({
+            "id": "rist-in",
+            "kind": "rist",
+            "url": "rist://[::1]:5000",
+            "rist": { "profile": "main", "buffer_ms": 1000 },
+        }));
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let plan = ingest_plan_for(
+            &source,
+            320,
+            180,
+            Arc::clone(&store),
+            CanvasColor::default(),
+            Rational::new(30, 1),
+        )
+        .expect("rist source plans without failing the build");
+
+        let SourceLocation::Url(url) = &plan.location else {
+            panic!("expected a Url location for a rist source");
+        };
+        assert!(
+            url.starts_with("rist://[::1]:5000?"),
+            "base preserved: {url}"
+        );
+        assert!(url.contains("rist_profile=1"), "main ⇒ 1: {url}");
+        assert!(url.contains("buffer_size=1000"), "{url}");
+        assert!(plan.live, "a rist source must be live (reconnects)");
+    }
+
+    #[test]
+    fn rist_psk_is_resolved_from_env_and_redacted_in_logs() {
+        // Set a unique env var so the resolution is deterministic in CI.
+        let var = "RIST_TEST_PSK_RESOLVE";
+        std::env::set_var(var, "the-pre-shared-key");
+        let opts: RistOptions = serde_json::from_value(serde_json::json!({
+            "profile": "main",
+            "encryption": { "aes_bits": "aes256", "secret_ref": format!("env:{var}") },
+        }))
+        .expect("opts");
+
+        let live = rist_resolved_url("rist://[::1]:5000", Some(&opts), false)
+            .expect("the resolved secret lowers into the url");
+        assert!(live.contains("secret=the-pre-shared-key"), "{live}");
+
+        // The redacted (loggable) form hides the plaintext PSK.
+        let logged =
+            rist_resolved_url("rist://[::1]:5000", Some(&opts), true).expect("redacted url");
+        assert!(logged.contains("secret=***"), "{logged}");
+        assert!(!logged.contains("the-pre-shared-key"), "{logged}");
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn a_rist_push_output_builds_as_a_runnable_push() {
+        // A push-only RIST config must BUILD (the keystone — `build_outputs`
+        // produces a Push runnable, not a skip). A live handshake is the
+        // `#[ignore]`d hardware test; here we only prove the wiring exists.
+        let toml = r##"
+schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "rist"
+url = "rist://[::1]:6000"
+codec = "mpeg2video"
+[outputs.rist]
+profile = "main"
+buffer_ms = 700
+"##;
+        let config = MultiviewConfig::load_from_toml(toml).expect("parse");
+        config.validate().expect("validates");
+        let epoch = multiview_output::SharedEpoch::default();
+        #[cfg(feature = "webrtc-native")]
+        let egress_sinks = std::collections::HashMap::new();
+        let built = build_outputs(
+            &config.outputs,
+            &epoch,
+            #[cfg(feature = "webrtc-native")]
+            &egress_sinks,
+            config.system.as_ref().and_then(|s| s.ndi.as_ref()),
+            Rational { num: 25, den: 1 },
+        )
+        .expect("rist push output builds");
+        let push_count = built
+            .packet
+            .iter()
+            .filter(|r| matches!(r, RunnableOutput::Push { label, .. } if *label == "rist"))
+            .count();
+        assert_eq!(push_count, 1, "exactly one rist push runnable is built");
     }
 }
 
@@ -7650,8 +13102,14 @@ segment_ms = 1000
         .expect("rtsp ingest plan");
 
         let registry = stop_registry();
-        let supervisor =
-            IngestSupervisor::start(vec![plan], Vec::new(), Vec::new(), Vec::new(), &registry);
+        let supervisor = IngestSupervisor::start(
+            vec![plan],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            &registry,
+        );
         let flag = registry
             .lock()
             .expect("registry")
@@ -7661,7 +13119,7 @@ segment_ms = 1000
         // A live remove raises exactly this flag (the hub does this); the
         // ingest loop observes it between (re)connect attempts and exits, so
         // the supervisor's shutdown join returns without the wedge-detach path.
-        flag.store(true, Ordering::Release);
+        flag.stop.store(true, Ordering::Release);
         supervisor.shutdown();
     }
 
@@ -7677,15 +13135,21 @@ segment_ms = 1000
             live: true,
         };
         let registry = stop_registry();
-        let supervisor =
-            IngestSupervisor::start(Vec::new(), Vec::new(), Vec::new(), vec![plan], &registry);
+        let supervisor = IngestSupervisor::start(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![plan],
+            &registry,
+        );
         let flag = registry
             .lock()
             .expect("registry")
             .get("net1/captions")
             .cloned()
             .expect("the caption reader registers under {id}/captions");
-        flag.store(true, Ordering::Release);
+        flag.stop.store(true, Ordering::Release);
         supervisor.shutdown();
     }
 }
@@ -7766,6 +13230,2071 @@ mod shed_emission_tests {
         assert!(
             shed_load_event(5, tick, &mut last_dropped, &mut last_tick).is_none(),
             "a quiesced overload (no new drops) stops emitting"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "overlay"))]
+mod live_overlay_bake_tests {
+    //! ADR-W022: the bake consumer re-derives its overlay render state from the
+    //! live [`OverlayApplySlot`](crate::live_overlays::OverlayApplySlot) on a
+    //! generation change — proven at the pixel level on the baked NV12 frame.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
+    use multiview_core::time::Rational;
+
+    use super::{BakeContext, StreamBaker, StreamItem};
+
+    /// A pixel region (x, y, w, h) the tests assert over — placed well clear
+    /// of the top-left digital-clock chrome (whose readout changes with the
+    /// wall clock and would otherwise alias the diff).
+    type Region = (u32, u32, u32, u32);
+
+    /// The single-face region: a box around a face at (200, 120) radius 40 on
+    /// a 320x180 canvas.
+    const FACE: Region = (150, 70, 100, 100);
+    /// Region around face A at (80, 120) radius 30 (the two-clock test).
+    const FACE_A: Region = (45, 85, 70, 70);
+    /// Region around face B at (240, 120) radius 30 (the two-clock test).
+    const FACE_B: Region = (205, 85, 70, 70);
+
+    /// Count samples inside `region` whose full (y, u, v) tuple differs
+    /// between frames — chroma included, so a restore is proven on every
+    /// plane, not luma alone.
+    fn region_diff(a: &Nv12Image, b: &Nv12Image, region: Region) -> usize {
+        let (x0, y0, w, h) = region;
+        let mut differ = 0_usize;
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let pa = a.sample(x, y).expect("in bounds");
+                let pb = b.sample(x, y).expect("in bounds");
+                if pa != pb {
+                    differ += 1;
+                }
+            }
+        }
+        differ
+    }
+
+    /// A bake context with no tiles and no boot analog clock, wired to `slot`.
+    fn bake_context(slot: &crate::live_overlays::OverlayApplySlot) -> BakeContext {
+        BakeContext {
+            tile_specs: Vec::new(),
+            meter_db_timelines: HashMap::new(),
+            subtitles: None,
+            sidecar_target: None,
+            analog_clocks: Vec::new(),
+            canvas_color: CanvasColor::default(),
+            cadence: Rational::new(25, 1),
+            // No Conspect watermark in these pixel tests: the asserted face
+            // regions must change ONLY with the live overlay slot (S3 has its
+            // own coverage), and the 320x180 test canvas matches `item`.
+            watermark_signal: None,
+            canvas_width: 320,
+            canvas_height: 180,
+            overlay_apply: Some(Arc::clone(slot)),
+        }
+    }
+
+    /// One streamed tick over a uniform dark canvas.
+    fn item(tick_index: u64) -> StreamItem {
+        let tag = CanvasColor::default().output_tag();
+        StreamItem {
+            canvas: Arc::new(Nv12Image::solid(320, 180, 16, 128, 128, tag).expect("solid")),
+            tick_index,
+            source_states: HashMap::new(),
+            captions: HashMap::new(),
+            caption_bitmaps: HashMap::new(),
+            faults: HashMap::new(),
+        }
+    }
+
+    /// An analog wall-clock overlay document at the given placement.
+    fn analog_clock_at(id: &str, x: i64, y: i64, radius: i64) -> multiview_config::Overlay {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "kind": "clock", "target": "canvas",
+            "face": "analog", "x": x, "y": y, "radius": radius
+        }))
+        .expect("valid overlay document")
+    }
+
+    /// An analog wall-clock overlay document centred in [`FACE`].
+    fn analog_clock_doc() -> multiview_config::Overlay {
+        analog_clock_at("clk", 200, 120, 40)
+    }
+
+    /// A frame baked from an EMPTY overlay set (the bare-canvas reference).
+    fn blank_frame() -> Arc<Nv12Image> {
+        let empty = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut bare = StreamBaker::new(bake_context(&empty)).expect("bare baker");
+        bare.bake(&item(0)).expect("bare bake")
+    }
+
+    #[test]
+    fn stream_baker_rederives_the_analog_clock_from_the_live_slot() {
+        // Generation 0: an empty boot set ⇒ no analog face anywhere.
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+
+        let before = baker.bake(&item(0)).expect("bake gen 0");
+
+        // LIVE APPLY: publish a set carrying the analog clock. The next baked
+        // frame must ink the face (the bezel ring + hands) into the region.
+        let _gen = crate::live_overlays::publish_set(&slot, vec![analog_clock_doc()]);
+        let with_face = baker.bake(&item(1)).expect("bake gen 1");
+        let inked = region_diff(&before, &with_face, FACE);
+        assert!(
+            inked > 50,
+            "the live-applied analog face must visibly ink the region \
+             (differing samples: {inked})"
+        );
+
+        // LIVE REMOVE: publish the empty set again — the face disappears and
+        // the region returns to the bare-canvas pixels (every plane).
+        let _gen = crate::live_overlays::publish_set(&slot, Vec::new());
+        let removed = baker.bake(&item(2)).expect("bake gen 2");
+        assert_eq!(
+            region_diff(&before, &removed, FACE),
+            0,
+            "removing the overlay must restore the bare-canvas face region"
+        );
+    }
+
+    #[test]
+    fn two_analog_clocks_both_ink_and_removing_one_keeps_the_other() {
+        // MAJOR-1: EVERY analog-face clock entry renders its own face — there
+        // is no first-wins. Two clocks at distinct placements both ink, and
+        // removing one keeps the other while restoring the removed region.
+        let blank = blank_frame();
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+
+        let _gen = crate::live_overlays::publish_set(
+            &slot,
+            vec![
+                analog_clock_at("clk_a", 80, 120, 30),
+                analog_clock_at("clk_b", 240, 120, 30),
+            ],
+        );
+        let both = baker.bake(&item(0)).expect("bake both");
+        let a_ink = region_diff(&blank, &both, FACE_A);
+        let b_ink = region_diff(&blank, &both, FACE_B);
+        assert!(
+            a_ink > 50,
+            "the FIRST analog face must ink its region (got {a_ink})"
+        );
+        assert!(
+            b_ink > 50,
+            "the SECOND analog face must ink its region too — no first-wins \
+             (got {b_ink})"
+        );
+
+        // Remove clk_b: clk_a keeps drawing, clk_b's region restores exactly.
+        let _gen =
+            crate::live_overlays::publish_set(&slot, vec![analog_clock_at("clk_a", 80, 120, 30)]);
+        let only_a = baker.bake(&item(1)).expect("bake only_a");
+        assert!(
+            region_diff(&blank, &only_a, FACE_A) > 50,
+            "removing the OTHER clock must not disturb the kept face"
+        );
+        assert_eq!(
+            region_diff(&blank, &only_a, FACE_B),
+            0,
+            "the removed clock's region must restore to the bare canvas"
+        );
+    }
+
+    #[test]
+    fn seeded_slot_drives_the_first_bake() {
+        // The context carries no boot analog clock, but the slot's
+        // generation-0 set does: the FIRST bake must already honour the slot
+        // (the seeded set is the boot truth — one source of truth).
+        let slot = crate::live_overlays::overlay_apply_slot(vec![analog_clock_doc()]);
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let first = baker.bake(&item(0)).expect("bake");
+        assert!(
+            region_diff(&blank_frame(), &first, FACE) > 50,
+            "the seeded slot set must drive the very first bake"
+        );
+    }
+
+    #[test]
+    fn same_generation_bake_skips_rederivation() {
+        // The generation gate genuinely skips: perturb the baker's derived
+        // face state BEHIND the gate and prove a same-generation bake does
+        // NOT restore it (no re-derive happened), while a new generation does.
+        let blank = blank_frame();
+        let slot = crate::live_overlays::overlay_apply_slot(vec![analog_clock_doc()]);
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+
+        let first = baker.bake(&item(0)).expect("bake gen 0");
+        assert!(region_diff(&blank, &first, FACE) > 50, "gen-0 face inks");
+
+        // PERTURB: clear the derived faces directly. If the gate works, the
+        // next bake (same generation) must NOT re-derive them from the slot.
+        baker.baker.set_analog_clocks(Vec::new());
+        let second = baker.bake(&item(1)).expect("bake same gen");
+        assert_eq!(
+            region_diff(&blank, &second, FACE),
+            0,
+            "a same-generation bake must skip re-derivation (gate holds)"
+        );
+
+        // A NEW generation re-derives from the slot: the face returns.
+        let _gen = crate::live_overlays::publish_set(&slot, vec![analog_clock_doc()]);
+        let third = baker.bake(&item(2)).expect("bake new gen");
+        assert!(
+            region_diff(&blank, &third, FACE) > 50,
+            "a new generation must re-derive (the face returns)"
+        );
+    }
+}
+
+/// ADR-0060: every per-source decode thread must run inside a resource scope so
+/// libav lines emitted synchronously on that thread (HLS opens, decode errors)
+/// are attributed to the source's stable config id via the thread-local
+/// [`ResourceContext`] (mechanism A) — not left context-free. The scope is the
+/// [`ResourceGuard`] [`ingest_resource_scope`] enters at the top of
+/// [`ingest_loop`]; this proves the guard sets the right id while live and
+/// clears it on drop (scoped, never stale — a line after the thread releases the
+/// source must not inherit it).
+#[cfg(test)]
+mod obs_resource_scope_tests {
+    use multiview_ffmpeg::current_resource;
+
+    use super::ingest_resource_scope;
+
+    /// While the guard is alive, the thread's current resource is the source's
+    /// config id with kind `source`; after it drops, the thread is unattributed
+    /// again (so an unrelated later line falls through to weaker attribution
+    /// rather than inheriting a stale id, ADR-0060 §3.1).
+    #[test]
+    fn ingest_scope_attributes_then_clears_the_source_id() {
+        assert!(
+            current_resource().is_none(),
+            "no resource is owned before entering the scope"
+        );
+        {
+            let _scope = ingest_resource_scope("cnn");
+            let ctx = current_resource().expect("the guard sets a resource while live");
+            assert_eq!(ctx.id(), "cnn", "scoped to the source's stable config id");
+            assert_eq!(ctx.kind(), "source", "attributed as a source resource");
+        }
+        assert!(
+            current_resource().is_none(),
+            "the guard clears the resource on drop (scoped, never stale)"
+        );
+    }
+}
+
+/// OUTMETA (ADR-0088/0089) cli-wiring tests: `output_mux_meta` translates a
+/// config `Output`'s metadata plan + orientation into the muxer apply values —
+/// per-transport key mapping (TS SDT vs generic container tags), Dropped fields
+/// never pushed, and the tag-path display matrix only on a tag-capable
+/// transport. Pure (no engine/ffmpeg); proves the minimal cli read is correct.
+#[cfg(test)]
+mod outmeta_wiring_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::output_mux_meta;
+    use multiview_output::{display_matrix_degrees, MetadataScope};
+
+    fn output_from(json: serde_json::Value) -> multiview_config::Output {
+        serde_json::from_value(json).expect("output deserializes")
+    }
+
+    #[test]
+    fn maps_hls_fields_to_generic_keys_and_tags_orientation() {
+        let out = output_from(serde_json::json!({
+            "kind": "hls",
+            "path": "/hls/mv",
+            "codec": "h264",
+            "metadata": {
+                "title": "Studio A",
+                "provider": "Aperim",
+                "description": "Conf feed",
+                "language": "eng",
+            },
+            "orientation": { "turn": "cw90", "mode": "auto" },
+        }));
+        let (meta, matrix) = output_mux_meta(&out);
+        let entries = meta.entries();
+        let has = |scope_is_format: bool, key: &str, value: &str| {
+            entries.iter().any(|e| {
+                let scope_ok = match e.scope {
+                    MetadataScope::Format => scope_is_format,
+                    MetadataScope::Stream { .. } => !scope_is_format,
+                    _ => false,
+                };
+                scope_ok && e.key == key && e.value == value
+            })
+        };
+        assert!(has(true, "title", "Studio A"), "title→title (format)");
+        assert!(has(true, "comment", "Conf feed"), "description→comment");
+        assert!(has(false, "language", "eng"), "language→stream language");
+        // provider is Dropped on HLS ⇒ never pushed.
+        assert!(
+            !entries.iter().any(|e| e.value == "Aperim"),
+            "HLS has no provider carrier — the dropped field is not pushed"
+        );
+        let m = matrix.expect("HLS auto cw90 ⇒ a display-matrix tag");
+        assert_eq!(display_matrix_degrees(m), 90);
+    }
+
+    #[test]
+    fn maps_mpegts_to_sdt_keys_and_never_tags_orientation() {
+        let out = output_from(serde_json::json!({
+            "kind": "srt",
+            "url": "srt://[::1]:9000",
+            "codec": "h264",
+            "metadata": { "title": "Studio A", "provider": "Aperim", "service_id": 7 },
+            "orientation": { "turn": "cw90", "mode": "pixels" },
+        }));
+        let (meta, matrix) = output_mux_meta(&out);
+        let entries = meta.entries();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "service_name" && e.value == "Studio A"),
+            "TS title → SDT service_name"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "service_provider" && e.value == "Aperim"),
+            "TS provider → SDT service_provider"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.key == "service_id" && e.value == "7"),
+            "TS service_id carried"
+        );
+        assert!(
+            matrix.is_none(),
+            "the pixels mechanism is a rendition, not a mux tag — no display matrix"
+        );
+    }
+
+    #[test]
+    fn empty_without_metadata_or_orientation() {
+        let out = output_from(serde_json::json!({
+            "kind": "hls",
+            "path": "/hls/mv",
+            "codec": "h264",
+        }));
+        let (meta, matrix) = output_mux_meta(&out);
+        assert!(meta.is_empty());
+        assert!(matrix.is_none());
+    }
+}
+
+/// End-to-end proof of the **media-player loop executor** ([`stream_player`])
+/// against a REAL libav decoder — the load-bearing wiring test for ADR-0097's
+/// in-place loop (seek + `avcodec_flush_buffers` + keep decoding).
+///
+/// The pure transport core already proves bit-exactly that the published stamp
+/// sequence is monotone and `prev + frame_period` across a loop seam
+/// (`media_player_transport::stamps_are_monotonic_across_a_loop_lap`). What this
+/// test adds is proof that the EXECUTOR genuinely loops a real decoder: a finite
+/// clip, played as a vamp, must publish **more frames than the clip is long** —
+/// which is only possible if, on reaching the out-point, the loop seeks back,
+/// flushes the decoder, and keeps decoding fresh frames past the seam (rather
+/// than hitting EOF and stopping). It also confirms the tile reads LIVE (real
+/// decoded frames), and that the published media-time advances past one
+/// clip-length (the seam did not freeze/clamp).
+#[cfg(all(test, feature = "ffmpeg"))]
+mod media_player_loop_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::as_conversions,
+        clippy::too_many_lines
+    )]
+
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use ffmpeg_next as ffmpeg;
+    use multiview_core::time::{MediaTime, Rational};
+    use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+
+    use crate::player::{EofPolicy, PlayoutGeometry, TransportMailbox};
+
+    /// A cheap content fingerprint of an NV12 image: FNV-1a over the Y plane's
+    /// in-stride bytes. Two frames with the same picture hash equal; different
+    /// `testsrc` frames (a moving pattern) hash differently — enough to identify
+    /// WHICH source frame a published tile is, without OCR.
+    fn nv12_fingerprint(img: &super::Nv12Image) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in img.y_plane() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Decode the first `count` frames of `clip` to scaled NV12 (the same tile
+    /// size the player uses) and return their fingerprints, indexed by source
+    /// frame number — the independent reference for "which frame is on the tile".
+    fn reference_fingerprints(clip: &Path, tile_w: u32, tile_h: u32, count: u64) -> Vec<u64> {
+        use multiview_ffmpeg::StreamVideoDecoder;
+        multiview_ffmpeg::ensure_initialized().unwrap();
+        let mut input = ffmpeg::format::input(&clip).unwrap();
+        let (stream_index, params, time_base, declared_fps) =
+            super::best_video_stream_params(&input).unwrap();
+        let (decoder, _hw) =
+            StreamVideoDecoder::new_preferring_hw(params, time_base, false, None).unwrap();
+        let mut decoder = decoder.with_declared_fps(Some(declared_fps));
+        let tag = super::CanvasColor::default().output_tag();
+        let mut to_tile = super::TileScaler::new(tile_w, tile_h);
+        let mut out = Vec::new();
+        let mut drained = false;
+        'outer: loop {
+            while let Some(decoded) = decoder.receive_frame().unwrap() {
+                let img = to_tile.convert(&decoded.frame, tag).unwrap();
+                out.push(nv12_fingerprint(&img));
+                if out.len() as u64 >= count {
+                    break 'outer;
+                }
+            }
+            if drained {
+                break;
+            }
+            let mut packet = ffmpeg::codec::packet::Packet::empty();
+            match packet.read(&mut input) {
+                Ok(()) => {
+                    if packet.stream() == stream_index {
+                        decoder.send_packet(&packet).unwrap();
+                    }
+                }
+                Err(ffmpeg::Error::Eof) => {
+                    decoder.send_eof().unwrap();
+                    drained = true;
+                }
+                Err(e) => panic!("reference decode read error: {e}"),
+            }
+        }
+        out
+    }
+
+    /// Generate a short, all-keyframe-free `mpeg2video` clip with B-frames at
+    /// 25 fps. `-bf 2` forces a reorder window so the post-seek decoder flush is
+    /// load-bearing (stale B-frames would otherwise leak past the loop seam).
+    fn generate_loop_clip(path: &Path, frames: u32) {
+        let dur = f64::from(frames) / 25.0;
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc=size=160x120:rate=25:duration={dur}"))
+            .args([
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "mpeg2video",
+                "-bf",
+                "2",
+                "-g",
+                "6",
+                "-f",
+                "mpegts",
+            ])
+            .arg(path)
+            .status()
+            .expect("spawn ffmpeg to generate the loop clip");
+        assert!(status.success(), "ffmpeg failed to generate the loop clip");
+        assert!(path.exists(), "loop clip was not written");
+    }
+
+    #[test]
+    fn a_vamping_player_loops_frame_accurately_over_a_non_keyframe_vamp_window() {
+        // A 12-frame clip at 25 fps, GOP = 6 → keyframes at source frames 0 and
+        // 6 ONLY. Vamp the window [3, 9): both vamp_in (3) and the post-wrap
+        // re-entry are NON-KEYFRAMES, so a correct loop MUST keyframe-seek (to 0
+        // for the 3..6 span) then DECODE-AND-DISCARD forward to frame 3 — never
+        // publishing a pre-target frame (0,1,2) at the seam. This is the exact
+        // case the naive `*source_frame = frame` after a keyframe seek got wrong.
+        const CLIP_FRAMES: u32 = 12;
+        const VAMP_IN: u64 = 3;
+        const VAMP_OUT: u64 = 9;
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("loop.ts");
+        generate_loop_clip(&clip, CLIP_FRAMES);
+
+        let tile_w = 160;
+        let tile_h = 120;
+        // Independent reference: the fingerprint of every source frame [0, 12),
+        // so we can identify WHICH source frame each published tile is.
+        let refs = reference_fingerprints(&clip, tile_w, tile_h, u64::from(CLIP_FRAMES));
+        assert!(
+            refs.len() >= usize::try_from(CLIP_FRAMES).unwrap(),
+            "reference decode produced too few frames: {}",
+            refs.len()
+        );
+        // Sanity: testsrc frames differ, so the reference fingerprints in the
+        // pre-target span and the vamp window must be distinguishable.
+        let in_window: std::collections::HashSet<u64> = (VAMP_IN..VAMP_OUT)
+            .map(|i| refs[usize::try_from(i).unwrap()])
+            .collect();
+        let pre_target: std::collections::HashSet<u64> = (0..VAMP_IN)
+            .map(|i| refs[usize::try_from(i).unwrap()])
+            .collect();
+        assert!(
+            pre_target.is_disjoint(&in_window),
+            "test fixture invalid: pre-target and vamp-window frames are not distinguishable"
+        );
+
+        let cadence = Rational::new(25, 1);
+        let geometry =
+            PlayoutGeometry::new(0, u64::from(CLIP_FRAMES), VAMP_IN, VAMP_OUT, cadence).unwrap();
+        let mailbox = Arc::new(TransportMailbox::new());
+        let handle = crate::player::PlayerHandle::new(
+            "player-test".to_owned(),
+            geometry,
+            EofPolicy::Loop,
+            true, // loop_on_start → vamp the [3,9) window
+            Arc::clone(&mailbox),
+        );
+
+        let store = Arc::new(TileStore::new(
+            "player-test",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+
+        let plan = super::IngestPlan {
+            id: "player-test".to_owned(),
+            location: super::SourceLocation::Path(clip.clone()),
+            player: Some(handle),
+            tile_w,
+            tile_h,
+            store: Arc::clone(&store),
+            live: false,
+            #[cfg(feature = "overlay")]
+            incontainer_sub: None,
+            #[cfg(feature = "overlay")]
+            embedded_cc: None,
+            canvas_color: super::CanvasColor::default(),
+            cadence,
+            decode_placement: super::DecodePlacement::Default,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_registry: None,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_audio_store: None,
+            #[cfg(feature = "ndi")]
+            ndi_accept_license: false,
+            #[cfg(feature = "ndi")]
+            ndi_acceptance: multiview_input::ndi::license::LicenseAcceptance {
+                accepted_by: String::new(),
+                accepted_at: String::new(),
+            },
+            #[cfg(feature = "youtube")]
+            youtube_url_slot: None,
+        };
+
+        // A recorder thread snapshots the published tile's (stamp, fingerprint)
+        // as fast as it can while the player runs — across several laps this
+        // captures the published CONTENT and the monotone published media-time.
+        let captured: Arc<Mutex<Vec<(i64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec_store = Arc::clone(&store);
+        let rec_captured = Arc::clone(&captured);
+        let rec_stop = Arc::new(AtomicBool::new(false));
+        let rec_stop_t = Arc::clone(&rec_stop);
+        let recorder = std::thread::Builder::new()
+            .name("media-player-recorder".to_owned())
+            .spawn(move || {
+                let far = MediaTime::from_nanos(600_000_000_000);
+                let mut last_seq = 0u64;
+                while !rec_stop_t.load(Ordering::Acquire) {
+                    let seq = rec_store.sequence();
+                    if seq != last_seq {
+                        last_seq = seq;
+                        if let Some(frame) = rec_store.read_at(far).frame() {
+                            // The stamp is the store's last published instant.
+                            let stamp = rec_store
+                                .elapsed_since_frame(far)
+                                .map_or(0, |e| far.as_nanos() - e.as_nanos());
+                            let fp = nv12_fingerprint(frame);
+                            rec_captured.lock().unwrap().push((stamp, fp));
+                        }
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+            .unwrap();
+
+        // Drive the player ~5 vamp-window-lengths of wall time (window = 6 × 40 ms
+        // = 240 ms) so it loops several times across the non-keyframe seam.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let player_thread = std::thread::Builder::new()
+            .name("media-player-loop-test".to_owned())
+            .spawn(move || super::ingest_loop(&plan, &stop_thread))
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(1_500));
+        stop.store(true, Ordering::Release);
+        player_thread.join().unwrap();
+        rec_stop.store(true, Ordering::Release);
+        recorder.join().unwrap();
+
+        let captured = captured.lock().unwrap().clone();
+
+        // PROOF 1 — it LOOPED across the non-keyframe seam: more frames published
+        // than one vamp window holds (only possible via keyframe-seek + flush +
+        // decode-discard + re-decode, not EOF-stop).
+        let published = store.sequence();
+        let window_len = VAMP_OUT - VAMP_IN;
+        assert!(
+            published > window_len,
+            "a vamping player must loop past one vamp window: published {published} \
+             for a {window_len}-frame window (the seek+flush+discard loop did not run)"
+        );
+
+        // PROOF 2 — FRAME-ACCURATE: every captured published tile is a frame in
+        // the vamp window [3, 9); NONE is a pre-target keyframe-span frame (0,1,2).
+        // A naive seek (`*source_frame = frame` after a keyframe seek) would
+        // publish frame 0/1/2 at the seam — this asserts it never does.
+        assert!(
+            !captured.is_empty(),
+            "the recorder captured no published frames"
+        );
+        for &(_, fp) in &captured {
+            assert!(
+                !pre_target.contains(&fp),
+                "a PRE-TARGET frame (source < vamp_in={VAMP_IN}) was published — \
+                 the seek is not frame-accurate (published a keyframe-span frame at the seam)"
+            );
+            assert!(
+                in_window.contains(&fp),
+                "a published tile is not a frame in the vamp window [{VAMP_IN}, {VAMP_OUT})"
+            );
+        }
+
+        // PROOF 3 — the published media-time is MONOTONE across the seam (never
+        // froze/clamped): captured stamps are non-decreasing and the timeline
+        // advanced well past one window (no nanosecond-clamp at the wrap).
+        for w in captured.windows(2) {
+            assert!(
+                w[1].0 >= w[0].0,
+                "published media-time must be monotone across the loop seam: {:?} then {:?}",
+                w[0].0,
+                w[1].0
+            );
+        }
+        let max_stamp = captured.iter().map(|&(s, _)| s).max().unwrap();
+        let one_window_ns = i64::try_from(window_len).unwrap() * 40_000_000;
+        assert!(
+            max_stamp > one_window_ns,
+            "the published timeline must advance past one window (got {max_stamp} ns ≤ \
+             {one_window_ns} ns — the seam froze/clamped)"
+        );
+    }
+
+    #[test]
+    fn an_unplayable_asset_holds_last_good_without_spinning_the_ingest_thread() {
+        // FAIL-SAFE (rule 26 / inv #1): a vamp window whose frames DO NOT EXIST in
+        // the asset (here a 4-frame clip but a declared out-point of 12 + vamp
+        // [8, 12)) must NOT cycle seek→EOF→seek forever on the ingest thread — the
+        // decode-discard can never reach frame 8, and every open→decode→EOF lap
+        // publishes zero frames. The player must bound the discard / unproductive
+        // laps, give up, and HOLD last-good — the ingest thread TERMINATES ON ITS
+        // OWN (no `stop` set), leaving the output clock undisturbed. Against the
+        // pre-fix code this loops forever and the assertion below times out.
+        const REAL_FRAMES: u32 = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("short.ts");
+        generate_loop_clip(&clip, REAL_FRAMES);
+
+        let cadence = Rational::new(25, 1);
+        // Declared geometry far exceeds the real 4-frame clip: BOTH the in-point
+        // (8) and the vamp window [8, 12) are entirely past the real end, so every
+        // open→decode→EOF lap (which re-seeks to the in-point) decodes only frames
+        // 0..3, discards them all (idx < 8), and publishes NOTHING — a genuine
+        // unproductive spin the fail-safe must break.
+        let geometry = PlayoutGeometry::new(8, 12, 8, 12, cadence).unwrap();
+        let mailbox = Arc::new(TransportMailbox::new());
+        let handle = crate::player::PlayerHandle::new(
+            "vt-bad".to_owned(),
+            geometry,
+            EofPolicy::Loop,
+            true,
+            Arc::clone(&mailbox),
+        );
+        let store = Arc::new(TileStore::new(
+            "vt-bad",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let plan = super::IngestPlan {
+            id: "vt-bad".to_owned(),
+            location: super::SourceLocation::Path(clip.clone()),
+            player: Some(handle),
+            tile_w: 160,
+            tile_h: 120,
+            store: Arc::clone(&store),
+            live: false,
+            #[cfg(feature = "overlay")]
+            incontainer_sub: None,
+            #[cfg(feature = "overlay")]
+            embedded_cc: None,
+            canvas_color: super::CanvasColor::default(),
+            cadence,
+            decode_placement: super::DecodePlacement::Default,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_registry: None,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_audio_store: None,
+            #[cfg(feature = "ndi")]
+            ndi_accept_license: false,
+            #[cfg(feature = "ndi")]
+            ndi_acceptance: multiview_input::ndi::license::LicenseAcceptance {
+                accepted_by: String::new(),
+                accepted_at: String::new(),
+            },
+            #[cfg(feature = "youtube")]
+            youtube_url_slot: None,
+        };
+
+        // Drive the player WITHOUT ever setting `stop`: the fail-safe must end the
+        // thread on its own when the asset cannot satisfy the geometry.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let player_thread = std::thread::Builder::new()
+            .name("media-player-failsafe-test".to_owned())
+            .spawn(move || super::ingest_loop(&plan, &stop_thread))
+            .unwrap();
+
+        // Poll for self-termination for up to ~5 s. A correct fail-safe bounds the
+        // discard + unproductive laps and returns well within this; a spin never
+        // finishes (the pre-fix RED).
+        let mut finished = false;
+        for _ in 0..500 {
+            if player_thread.is_finished() {
+                finished = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            finished,
+            "the player ingest thread did NOT terminate on an unplayable asset — \
+             it is spinning seek→EOF→seek (the fail-safe is missing)"
+        );
+        // Stop is a no-op (already finished); join to reap.
+        stop.store(true, Ordering::Release);
+        player_thread.join().unwrap();
+
+        // The output path is undisturbed: the tile rides the framestore state
+        // machine (last-good / NO_SIGNAL). A reader never blocks — confirm the
+        // store responds (here: no real frame was ever decodable, so it holds
+        // NO_SIGNAL under the Slate-vs-HoldForever read, never a hang).
+        let _ = store.read_at(MediaTime::from_nanos(1_000_000_000));
+    }
+
+    #[test]
+    fn a_b_frame_clip_publishes_its_eof_flush_delayed_frames_each_lap() {
+        // A `-bf 2` clip holds its trailing reorder-window frames in the decoder
+        // until the EOF FLUSH (decoder_flush.rs proves `sent − emitted ≥ 1` frames
+        // are buffered awaiting EOF). The player MUST drain + publish those
+        // flush-delayed frames before re-seeking the next lap — otherwise the last
+        // frame(s) of the window are LOST every lap (and, in the extreme, a lap
+        // that publishes nothing until the flush is wrongly judged unproductive
+        // and given up). Vamp the WHOLE 6-frame clip and assert that, across
+        // several laps, EVERY source frame's content is published — including the
+        // reorder-buffered ones. Against the pre-flush judgment the buffered
+        // frames are flushed away (lost) and the captured set is incomplete.
+        const REAL_FRAMES: u64 = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("bframe.ts");
+        generate_loop_clip(&clip, u32::try_from(REAL_FRAMES).unwrap());
+
+        let tile_w = 160;
+        let tile_h = 120;
+        let refs = reference_fingerprints(&clip, tile_w, tile_h, REAL_FRAMES);
+        assert!(
+            refs.len() >= usize::try_from(REAL_FRAMES).unwrap(),
+            "reference decode produced too few frames: {}",
+            refs.len()
+        );
+        let want: std::collections::HashSet<u64> = refs.iter().copied().collect();
+
+        let cadence = Rational::new(25, 1);
+        let geometry = PlayoutGeometry::new(0, REAL_FRAMES, 0, REAL_FRAMES, cadence).unwrap();
+        let mailbox = Arc::new(TransportMailbox::new());
+        let handle = crate::player::PlayerHandle::new(
+            "vt-bframe".to_owned(),
+            geometry,
+            EofPolicy::Loop,
+            true,
+            Arc::clone(&mailbox),
+        );
+        let store = Arc::new(TileStore::new(
+            "vt-bframe",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let plan = super::IngestPlan {
+            id: "vt-bframe".to_owned(),
+            location: super::SourceLocation::Path(clip.clone()),
+            player: Some(handle),
+            tile_w,
+            tile_h,
+            store: Arc::clone(&store),
+            live: false,
+            #[cfg(feature = "overlay")]
+            incontainer_sub: None,
+            #[cfg(feature = "overlay")]
+            embedded_cc: None,
+            canvas_color: super::CanvasColor::default(),
+            cadence,
+            decode_placement: super::DecodePlacement::Default,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_registry: None,
+            #[cfg(feature = "webrtc-native")]
+            webrtc_audio_store: None,
+            #[cfg(feature = "ndi")]
+            ndi_accept_license: false,
+            #[cfg(feature = "ndi")]
+            ndi_acceptance: multiview_input::ndi::license::LicenseAcceptance {
+                accepted_by: String::new(),
+                accepted_at: String::new(),
+            },
+            #[cfg(feature = "youtube")]
+            youtube_url_slot: None,
+        };
+
+        // Capture every distinct published frame fingerprint across the run.
+        let captured: Arc<Mutex<std::collections::HashSet<u64>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let rec_store = Arc::clone(&store);
+        let rec_captured = Arc::clone(&captured);
+        let rec_stop = Arc::new(AtomicBool::new(false));
+        let rec_stop_t = Arc::clone(&rec_stop);
+        let recorder = std::thread::Builder::new()
+            .name("media-player-bframe-recorder".to_owned())
+            .spawn(move || {
+                let far = MediaTime::from_nanos(600_000_000_000);
+                let mut last_seq = 0u64;
+                while !rec_stop_t.load(Ordering::Acquire) {
+                    let seq = rec_store.sequence();
+                    if seq != last_seq {
+                        last_seq = seq;
+                        if let Some(frame) = rec_store.read_at(far).frame() {
+                            rec_captured.lock().unwrap().insert(nv12_fingerprint(frame));
+                        }
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            })
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let player_thread = std::thread::Builder::new()
+            .name("media-player-bframe-test".to_owned())
+            .spawn(move || super::ingest_loop(&plan, &stop_thread))
+            .unwrap();
+
+        // ~10 laps (clip = 6 × 40 ms = 240 ms): plenty for the poller to catch
+        // every per-lap frame including the flush-delayed ones.
+        std::thread::sleep(Duration::from_millis(2_500));
+        let still_running = !player_thread.is_finished();
+        stop.store(true, Ordering::Release);
+        player_thread.join().unwrap();
+        rec_stop.store(true, Ordering::Release);
+        recorder.join().unwrap();
+
+        // It kept looping a GOOD clip (never wrongly given up).
+        assert!(
+            still_running,
+            "a good B-frame clip was WRONGLY given up / held — the fail-safe judged \
+             the lap before the EOF flush drained the delayed frames"
+        );
+        // COMPLETENESS: every source frame's content was published across laps —
+        // including the reorder-buffered frames that emit only on the EOF flush.
+        // Against the pre-fix code those frames are flushed away and never appear.
+        let got = captured.lock().unwrap().clone();
+        let missing: Vec<u64> = want.difference(&got).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "the player dropped {} of {} source frames — flush-delayed (reorder) \
+             frames were lost instead of published before the re-seek",
+            missing.len(),
+            want.len()
+        );
+    }
+}
+
+/// Boot-spawn of media-player channels from `config.media_players` (ADR-0057 /
+/// ADR-0097): [`build_media_player_boot`] turns a configured player + its
+/// default library asset into a player [`IngestPlan`] (carrying a `player`
+/// handle) + a registered transport mailbox. Feature-independent (no libav).
+#[cfg(test)]
+mod media_player_boot_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::MultiviewConfig;
+
+    /// A canvas + one cell + a media library (one clip with a declared
+    /// out-point + vamp window) + a media player defaulting to it.
+    fn config_with_player() -> MultiviewConfig {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "vt-1"
+[media_library]
+root = "/srv/media"
+[[media_library.assets]]
+id = "opener"
+kind = "clip"
+path = "opener.ts"
+in_point_frames = 0
+out_point_frames = 100
+vamp_in_frames = 10
+vamp_out_frames = 90
+[[media_players]]
+id = "vt-1"
+default = "opener"
+loop_default = true
+"##;
+        MultiviewConfig::load_from_toml(doc).expect("parse media-player config")
+    }
+
+    #[test]
+    fn build_media_player_boot_spawns_a_rolling_player_with_geometry_and_mailbox() {
+        let config = config_with_player();
+        let layout = config.solve_layout().expect("layout solves");
+        let cadence = config.canvas.fps.rational();
+        let boot =
+            super::build_media_player_boot(&config, &layout, cadence, CanvasColor::default());
+
+        // One rolling player plan + one store + one mailbox.
+        assert_eq!(
+            boot.plans.len(),
+            1,
+            "the player with a declared-geometry asset rolls"
+        );
+        assert_eq!(boot.stores.len(), 1);
+        assert!(
+            boot.mailboxes.contains_key("vt-1"),
+            "the player's transport mailbox is registered for the control plane"
+        );
+
+        let plan = &boot.plans[0];
+        assert_eq!(plan.id, "vt-1");
+        assert!(
+            !plan.live,
+            "a media player is not a reconnect-forever live source"
+        );
+        let handle = plan
+            .player
+            .as_ref()
+            .expect("the plan carries a player handle");
+        // The geometry is the asset's declared window (the vamp sub-window loops).
+        assert_eq!(handle.geometry.in_point(), 0);
+        assert_eq!(handle.geometry.out_point(), 100);
+        assert_eq!(handle.geometry.vamp_in(), 10);
+        assert_eq!(handle.geometry.vamp_out(), 90);
+        assert_eq!(handle.geometry.cadence(), cadence);
+        assert!(
+            handle.loop_on_start,
+            "loop_default = true ⇒ the channel vamps on start"
+        );
+        // The asset path resolves against the library root.
+        let super::SourceLocation::Path(p) = &plan.location else {
+            panic!("expected a Path location for the player's asset");
+        };
+        assert_eq!(p.to_str().unwrap(), "/srv/media/opener.ts");
+
+        // ADR-T019: the rolling player ALSO gets an audio store + audio loop plan
+        // (so its embedded audio joins the program bus on the same wrap instant),
+        // carrying the SAME vamp geometry as the video and the SAME asset path.
+        assert_eq!(
+            boot.audio_stores.len(),
+            1,
+            "the rolling player gets an audio store"
+        );
+        assert_eq!(boot.audio_stores[0].0, "vt-1");
+        assert_eq!(
+            boot.audio_plans.len(),
+            1,
+            "the rolling player gets an audio loop plan"
+        );
+        let ap = &boot.audio_plans[0];
+        assert_eq!(ap.id, "vt-1");
+        assert_eq!(
+            ap.location, "/srv/media/opener.ts",
+            "audio decodes the SAME asset as the video"
+        );
+        assert_eq!(
+            ap.vamp_in_frames, 10,
+            "audio loops the SAME vamp window as the video"
+        );
+        assert_eq!(ap.vamp_out_frames, 90);
+        assert_eq!(
+            ap.cadence, cadence,
+            "audio uses the asset cadence for the frame→sample map"
+        );
+        // ADR-T019 §1: the audio plan shares the SAME `PlayerControlBus` Arc as the
+        // video handle — the single authority that makes the rails wrap/exit on the
+        // same instant by construction (not a second destructive mailbox drain).
+        assert!(
+            std::sync::Arc::ptr_eq(&ap.control_bus, &handle.control_bus),
+            "the audio rail follows the video handle's control bus (same Arc)"
+        );
+    }
+
+    #[test]
+    fn a_player_without_a_default_asset_boots_idle_but_keeps_its_mailbox() {
+        let mut config = config_with_player();
+        // Drop the default asset binding: the channel boots idle (no plan) but
+        // its mailbox stays registered so a later load command is honoured.
+        config.media_players[0].default = None;
+        let layout = config.solve_layout().expect("layout solves");
+        let cadence = config.canvas.fps.rational();
+        let boot =
+            super::build_media_player_boot(&config, &layout, cadence, CanvasColor::default());
+        assert!(boot.plans.is_empty(), "no default asset ⇒ no rolling plan");
+        assert!(
+            boot.mailboxes.contains_key("vt-1"),
+            "an idle player still registers its mailbox"
+        );
+        // An idle player contributes no audio store/plan either (ADR-T019): nothing
+        // to loop until a load command binds an asset (probe-at-load is post-MVP).
+        assert!(
+            boot.audio_stores.is_empty(),
+            "an idle player has no audio store"
+        );
+        assert!(
+            boot.audio_plans.is_empty(),
+            "an idle player has no audio loop plan"
+        );
+    }
+}
+
+/// Data-plane handle-sharing (ADR-0097 / inv #5 / rule 22): the media-player
+/// publish + hold path must share the decoded frame by `Arc` handle, never copy
+/// the NV12 pixel planes per frame. Pure store + image logic (no libav).
+#[cfg(test)]
+mod media_player_handle_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::sync::Arc;
+
+    use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
+    use multiview_core::time::MediaTime;
+    use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+
+    fn test_image(width: u32, height: u32) -> Nv12Image {
+        let y_len = usize::try_from(width * height).unwrap();
+        let y = vec![0x80u8; y_len];
+        let uv = vec![0x80u8; y_len / 2];
+        Nv12Image::new(width, height, y, uv, CanvasColor::default().output_tag()).unwrap()
+    }
+
+    #[test]
+    fn publish_arc_holds_the_same_buffer_handle_no_pixel_copy() {
+        // The executor wraps each decoded frame in an `Arc` ONCE and publishes
+        // that handle; the held last-good + every heartbeat republish are
+        // `Arc::clone`s of the SAME handle (a refcount bump, not a pixel-plane
+        // copy). Prove the store holds the exact buffer that was published —
+        // reading it back yields a pointer-equal `Arc`, so the hold/republish
+        // path allocates ZERO new NV12 buffers per frame.
+        let store: TileStore<Nv12Image> =
+            TileStore::new("h", TileThresholds::default(), NoSignalPolicy::HoldForever);
+        let frame = Arc::new(test_image(64, 48));
+
+        // Publish the handle (what `stream_player` does: `publish_arc`).
+        store.publish_arc(Arc::clone(&frame), MediaTime::from_nanos(0));
+
+        // Read it back; the store must hold the SAME underlying buffer.
+        let read = store.read_at(MediaTime::from_nanos(0));
+        let held = read.frame().expect("a frame is held");
+        assert!(
+            Arc::ptr_eq(held, &frame),
+            "the store must hold the published Arc itself (no pixel-plane copy)"
+        );
+
+        // A heartbeat republish (hold path) is `Arc::clone` of the same handle —
+        // republishing it leaves the store pointing at the same buffer still.
+        store.publish_arc(Arc::clone(&frame), MediaTime::from_nanos(40_000_000));
+        let read2 = store.read_at(MediaTime::from_nanos(40_000_000));
+        let held2 = read2.frame().expect("a frame is held");
+        assert!(
+            Arc::ptr_eq(held2, &frame),
+            "the heartbeat republish must reuse the same buffer handle (refcount bump only)"
+        );
+
+        // The only owners are `frame` (this test) + the store's slot/ring — the
+        // strong count reflects shared handles, never duplicated pixel buffers.
+        assert!(
+            Arc::strong_count(&frame) >= 2,
+            "the buffer is shared by handle (strong_count = {})",
+            Arc::strong_count(&frame)
+        );
+    }
+}
+
+#[cfg(test)]
+mod mp2_slice2_registry_adoption {
+    //! MP-2 SLICE 2 (ADR-0030 §3): the CLI `Pipeline` adopts the engine
+    //! `SourceRegistry` as the owner of per-source `TileStore` creation + sizing.
+    //!  * `cell_pixel_size` sizes a source's decode to the **per-axis supremum**
+    //!    across ALL cells that bind it — never just the first-found cell.
+    //!  * `Pipeline::build` mints ONE registry that OWNS the shared store (the
+    //!    `stores` map + the ingest plan just hold `Arc` clones of it), sized to
+    //!    that supremum — the single-program output path is otherwise unchanged.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// A 2x2 grid where source `cam1` is bound by two cells of DIFFERENT sizes:
+    /// area `a` = 400x480 and area `d` = 800x240 on a 1200x720 canvas. The
+    /// per-axis supremum is 800x480 — a size NEITHER binding cell has, so a
+    /// first-found (`.find`) result can never equal it: the test discriminates
+    /// the bug regardless of which binding cell iterates first.
+    fn two_cells_one_source_config() -> multiview_config::MultiviewConfig {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 1200
+height = 720
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "2fr"]
+rows = ["2fr", "1fr"]
+areas = ["a b", "c d"]
+[[sources]]
+id = "cam1"
+kind = "bars"
+[[cells]]
+id = "small"
+area = "a"
+[cells.source]
+input_id = "cam1"
+[[cells]]
+id = "wide"
+area = "d"
+[cells.source]
+input_id = "cam1"
+[[outputs]]
+kind = "hls"
+path = "/tmp/mp2-slice2-two-cells.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        multiview_config::MultiviewConfig::load_from_toml(doc).expect("test config parses")
+    }
+
+    #[test]
+    fn cell_pixel_size_is_the_per_axis_supremum_across_all_binding_cells() {
+        let config = two_cells_one_source_config();
+        let layout = config.solve_layout().expect("layout solves");
+
+        // Every cell that binds `cam1`, in layout order — the order `.find` walks.
+        let bound: Vec<(u32, u32)> = layout
+            .cells
+            .iter()
+            .filter(|c| c.source.as_deref() == Some("cam1"))
+            .map(|c| cell_dims(c, layout.canvas.width, layout.canvas.height))
+            .collect();
+        assert!(bound.len() >= 2, "config must bind cam1 from >= 2 cells");
+
+        let supremum = bound
+            .iter()
+            .copied()
+            .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
+            .unwrap();
+        let first = *bound.first().unwrap();
+        assert_ne!(
+            first, supremum,
+            "test precondition: the first-found cell must differ from the supremum \
+             so the assertion discriminates the .find() bug"
+        );
+
+        let got = cell_pixel_size(&layout, "cam1").expect("cam1 is bound");
+        assert_eq!(
+            got, supremum,
+            "cell_pixel_size must decode at the per-axis supremum across ALL binding \
+             cells (ADR-0030 §3), not the first-found cell {first:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_build_registry_owns_the_shared_store_sized_to_the_supremum() {
+        // The single-program build mints ONE SourceRegistry that OWNS each source's
+        // shared TileStore: the `stores` map (sampled by the compositor drive) and
+        // the ingest plan hold Arc CLONES of the registry's store, and the registry
+        // records the decode target = the per-axis supremum across the source's
+        // cells. Two cells binding `cam1` therefore share ONE registry entry / ONE
+        // store, sized to the supremum — the decode-once seam at the pipeline level.
+        let config = two_cells_one_source_config();
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let key = multiview_engine::SourceKey::from_canonical("cam1");
+
+        // Exactly one registry entry for the one source, regardless of how many
+        // cells bind it.
+        assert_eq!(
+            pipeline.source_registry.active_len(),
+            1,
+            "one source => one registry entry, even when two cells bind it"
+        );
+
+        // The decode target the registry records is the per-axis supremum — the
+        // same value `cell_pixel_size` derives for the ingest plan's tile geometry.
+        let expect = cell_pixel_size(&pipeline.layout, "cam1").expect("cam1 is bound");
+        assert_eq!(
+            pipeline.source_registry.requested_supremum(&key),
+            Some(multiview_engine::RequestedSize {
+                width: expect.0,
+                height: expect.1,
+            }),
+            "the registry decodes at the per-axis supremum across cam1's cells"
+        );
+
+        // The `stores` map holds the registry's OWN store Arc (not an independent
+        // TileStore) — the registry is the single owner, the map a lock-free reader.
+        let mapped = pipeline.stores.get("cam1").expect("cam1 has a store");
+        let owned = pipeline
+            .source_registry
+            .store(&key)
+            .expect("the registry owns cam1's store");
+        assert!(
+            std::sync::Arc::ptr_eq(mapped, &owned),
+            "the stores map must hold the registry's store Arc (decode-once ownership)"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "aes67"))]
+mod aes67_wiring_guardrails {
+    //! #103: an AES67 audio source is AUDIO-ONLY. It must contribute an
+    //! [`AudioStore`](multiview_audio::store::AudioStore) (routed onto the program
+    //! bus like any source's audio) but NEVER a video [`TileStore`], never a
+    //! [`SourceRegistry`] entry, and never a layout tile. These guardrails protect
+    //! the just-merged MP-2 decode-once / tile / per-axis-supremum seam (ADR-0030
+    //! §3): the video path must stay byte-identical for the non-AES67 sources of a
+    //! mixed config — the aes67 branch is a pure skip-the-video-path addition.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// A minimal valid AES67 Class-A L24 stereo SDP (RFC 4566/8866), IPv6-first
+    /// (`c=IN IP6`) — the same fixture shape `multiview-input`'s SDP parser
+    /// round-trips. CR/LF line endings are real bytes (the parser accepts them).
+    const AES67_SDP: &str = "v=0\r\n\
+o=- 1 1 IN IP6 2001:db8::1\r\n\
+s=Multiview AES67\r\n\
+c=IN IP6 ff3e::1\r\n\
+t=0 0\r\n\
+m=audio 5004 RTP/AVP 98\r\n\
+a=rtpmap:98 L24/48000/2\r\n\
+a=ptime:1\r\n\
+a=ts-refclk:ptp=IEEE1588-2008:AA-BB-CC-DD-EE-FF-00-11:0\r\n\
+a=mediaclk:direct=0\r\n";
+
+    /// A config with ONE video source (`cam1`, bars) bound to the single cell and
+    /// ONE audio-only AES67 source (`aes67-in`) bound to no cell. The SDP is
+    /// injected as a TOML literal (`'''…'''`) string so its newlines survive.
+    fn video_plus_aes67_config() -> multiview_config::MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 640
+height = 480
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "cam1"
+kind = "bars"
+[[sources]]
+id = "aes67-in"
+kind = "aes67"
+multicast = "[ff3e::1]:5004"
+sdp = '''
+{AES67_SDP}'''
+[[cells]]
+id = "only"
+area = "a"
+[cells.source]
+input_id = "cam1"
+[[outputs]]
+kind = "hls"
+path = "/tmp/aes67-guardrail.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##
+        );
+        multiview_config::MultiviewConfig::load_from_toml(&doc).expect("test config parses")
+    }
+
+    #[test]
+    fn aes67_source_makes_an_audio_store_but_no_video_tile_or_registry_entry() {
+        let config = video_plus_aes67_config();
+        let pipeline = Pipeline::build(&config).expect("pipeline builds with an aes67 source");
+
+        // AUDIO-ONLY: the aes67 source joins the program-audio path (an AudioStore
+        // keyed by its id, which the bus routes when this run carries audio) ...
+        assert!(
+            pipeline.audio_stores.contains_key("aes67-in"),
+            "an aes67 source must contribute an AudioStore (program-bus routed)"
+        );
+        // ... but contributes NO video TileStore (it decodes no pixels).
+        assert!(
+            !pipeline.stores.contains_key("aes67-in"),
+            "an aes67 source must NOT create a video TileStore (audio-only)"
+        );
+
+        // ... and NO SourceRegistry entry — the MP-2 decode-once video seam never
+        // sees it, so the registry still holds exactly the ONE video source.
+        let aes67_key = multiview_engine::SourceKey::from_canonical("aes67-in");
+        assert!(
+            pipeline.source_registry.store(&aes67_key).is_none(),
+            "an aes67 source must never take a video decode registry entry"
+        );
+        assert_eq!(
+            pipeline.source_registry.active_len(),
+            1,
+            "only the one video source takes a registry entry (aes67 excluded)"
+        );
+
+        // ... and NO layout tile (it is bound to no cell — audio has no geometry).
+        assert!(
+            cell_pixel_size(&pipeline.layout, "aes67-in").is_none(),
+            "an aes67 source is bound to no cell → no layout tile"
+        );
+
+        // The video source is UNAFFECTED: it keeps its TileStore + registry entry
+        // (the video path is byte-identical to a config without the aes67 source).
+        assert!(
+            pipeline.stores.contains_key("cam1"),
+            "the video source keeps its TileStore (video path byte-identical)"
+        );
+        let cam_key = multiview_engine::SourceKey::from_canonical("cam1");
+        assert!(
+            pipeline.source_registry.store(&cam_key).is_some(),
+            "the video source keeps its registry entry"
+        );
+    }
+
+    /// A 2x2 grid where `cam1` is bound by two DIFFERENT-sized cells (area `a` =
+    /// 400x480, area `d` = 800x240 on 1200x720 → per-axis supremum 800x480), PLUS
+    /// an audio-only aes67 source — proving the aes67 branch never disturbs the
+    /// MP-2 decode-once/supremum video seam.
+    fn two_cells_plus_aes67_config() -> multiview_config::MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 1200
+height = 720
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "2fr"]
+rows = ["2fr", "1fr"]
+areas = ["a b", "c d"]
+[[sources]]
+id = "cam1"
+kind = "bars"
+[[sources]]
+id = "aes67-in"
+kind = "aes67"
+multicast = "[ff3e::1]:5004"
+sdp = '''
+{AES67_SDP}'''
+[[cells]]
+id = "small"
+area = "a"
+[cells.source]
+input_id = "cam1"
+[[cells]]
+id = "wide"
+area = "d"
+[cells.source]
+input_id = "cam1"
+[[outputs]]
+kind = "hls"
+path = "/tmp/aes67-mixed.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##
+        );
+        multiview_config::MultiviewConfig::load_from_toml(&doc).expect("test config parses")
+    }
+
+    #[test]
+    fn mixed_config_still_decode_once_shares_the_video() {
+        let config = two_cells_plus_aes67_config();
+        let pipeline = Pipeline::build(&config).expect("pipeline builds (mixed aes67 + video)");
+        let cam_key = multiview_engine::SourceKey::from_canonical("cam1");
+
+        // ONE registry entry for the ONE video source, regardless of how many
+        // cells bind it — and the audio-only aes67 source adds none.
+        assert_eq!(
+            pipeline.source_registry.active_len(),
+            1,
+            "two cells binding one video source (+ an aes67 source) => ONE entry"
+        );
+
+        // The decode target the registry records is the per-axis supremum across
+        // cam1's two binding cells — unchanged by the aes67 source's presence.
+        let expect = cell_pixel_size(&pipeline.layout, "cam1").expect("cam1 is bound");
+        assert_eq!(
+            pipeline.source_registry.requested_supremum(&cam_key),
+            Some(multiview_engine::RequestedSize {
+                width: expect.0,
+                height: expect.1,
+            }),
+            "the registry still decodes cam1 at the per-axis supremum (MP-2 intact)"
+        );
+
+        // The `stores` map still holds the registry's OWN store Arc (decode-once
+        // ownership) — the aes67 branch did not fork it.
+        let mapped = pipeline.stores.get("cam1").expect("cam1 has a store");
+        let owned = pipeline
+            .source_registry
+            .store(&cam_key)
+            .expect("the registry owns cam1's store");
+        assert!(
+            std::sync::Arc::ptr_eq(mapped, &owned),
+            "the stores map still holds the registry's store Arc (MP-2 decode-once)"
+        );
+
+        // The aes67 source remains audio-only: an AudioStore, no video store.
+        assert!(pipeline.audio_stores.contains_key("aes67-in"));
+        assert!(!pipeline.stores.contains_key("aes67-in"));
+    }
+
+    /// A config that (wrongly) binds a layout CELL to the audio-only aes67 source.
+    /// An AES67 source decodes no pixels, so a cell referencing it would carry tile
+    /// geometry with NO backing `TileStore` (the source loop skips the video path
+    /// for it). The build must reject this fail-closed rather than leave a dangling
+    /// tile. `cam1` occupies area `a`; `aes67-in` is wrongly bound to area `b`.
+    fn aes67_source_bound_to_a_cell_config() -> multiview_config::MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 1200
+height = 720
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr"]
+areas = ["a b"]
+[[sources]]
+id = "cam1"
+kind = "bars"
+[[sources]]
+id = "aes67-in"
+kind = "aes67"
+multicast = "[ff3e::1]:5004"
+sdp = '''
+{AES67_SDP}'''
+[[cells]]
+id = "video"
+area = "a"
+[cells.source]
+input_id = "cam1"
+[[cells]]
+id = "oops-audio"
+area = "b"
+[cells.source]
+input_id = "aes67-in"
+[[outputs]]
+kind = "hls"
+path = "/tmp/aes67-cell-reject.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##
+        );
+        multiview_config::MultiviewConfig::load_from_toml(&doc).expect("test config parses")
+    }
+
+    #[test]
+    fn a_layout_cell_bound_to_an_aes67_source_is_rejected() {
+        let config = aes67_source_bound_to_a_cell_config();
+        let err = Pipeline::build(&config)
+            .err()
+            .expect("a layout cell bound to an audio-only aes67 source must fail the build");
+        // Fail-closed and honest: the error names the offending audio-only source.
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("aes67-in"),
+            "the rejection names the audio-only source wrongly bound to a cell: {rendered}"
+        );
+    }
+
+    /// Like [`aes67_source_bound_to_a_cell_config`] but the aes67-bound cell
+    /// references an UNKNOWN grid area, so its geometry does not resolve. The
+    /// audio-binding rejection must still fire (and name the source) rather than be
+    /// masked by a generic geometry-resolution error — the guard must key on the
+    /// source binding, not on tile geometry (`solve_layout` errors on the bad area
+    /// first, so a geometry-coupled guard never sees the cell).
+    fn aes67_cell_with_unresolved_geometry_config() -> multiview_config::MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 640
+height = 480
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "cam1"
+kind = "bars"
+[[sources]]
+id = "aes67-in"
+kind = "aes67"
+multicast = "[ff3e::1]:5004"
+sdp = '''
+{AES67_SDP}'''
+[[cells]]
+id = "video"
+area = "a"
+[cells.source]
+input_id = "cam1"
+[[cells]]
+id = "oops-audio"
+area = "does-not-exist"
+[cells.source]
+input_id = "aes67-in"
+[[outputs]]
+kind = "hls"
+path = "/tmp/aes67-unresolved-cell.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##
+        );
+        multiview_config::MultiviewConfig::load_from_toml(&doc).expect("test config parses")
+    }
+
+    #[test]
+    fn a_geometry_unresolved_cell_bound_to_an_aes67_source_is_rejected_by_name() {
+        let config = aes67_cell_with_unresolved_geometry_config();
+        let err = Pipeline::build(&config)
+            .err()
+            .expect("a cell bound to an audio-only aes67 source must fail the build");
+        // The rejection must name the AUDIO-BINDING root cause — not be masked by a
+        // generic "unknown grid area" geometry error — so the guard is effective
+        // even when the bound cell's geometry does not resolve (decoupled from
+        // tile-sizing, which `solve_layout` errors on first).
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("aes67-in"),
+            "the rejection names the audio-only source, not just a geometry error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_aes67_source_without_program_audio_is_rejected_before_going_on_air() {
+        let config = video_plus_aes67_config();
+        let pipeline = Pipeline::build(&config).expect("pipeline builds with an aes67 source");
+        // No program audio: the ST 2110-30 RX has no `ProgramBus` to publish into,
+        // so the run must fail closed rather than silently receive/emit silence.
+        assert!(
+            pipeline.ensure_aes67_has_program_audio().is_err(),
+            "an aes67 source with no program audio is a fail-closed run error"
+        );
+
+        let mut with_audio = Pipeline::build(&config).expect("pipeline builds");
+        with_audio.enable_program_audio();
+        assert!(
+            with_audio.ensure_aes67_has_program_audio().is_ok(),
+            "with program audio enabled, the aes67 source is accepted"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "aes67"))]
+mod aes67_tx_and_helpers {
+    //! #103 TX + pure-helper coverage (no socket): `build_aes67_output` maps an
+    //! `Output::Aes67` to a mux-free `RunnableOutput::Aes67` + a bake-consumer push
+    //! handle (rejecting a bad depth / malformed multicast); `Pipeline::build`
+    //! threads that handle onto the pipeline; and the RX bridging helpers
+    //! (`resolve_aes67_source`, `interleave_to_stereo`, `aes67_audio_block`) behave
+    //! correctly. The socket-bound RX/TX loops are hardware/network-gated.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    const AES67_SDP: &str = "v=0\r\n\
+o=- 1 1 IN IP6 2001:db8::1\r\n\
+s=Multiview AES67\r\n\
+c=IN IP6 ff3e::1\r\n\
+t=0 0\r\n\
+m=audio 5004 RTP/AVP 98\r\n\
+a=rtpmap:98 L24/48000/2\r\n\
+a=ptime:1\r\n\
+a=ts-refclk:ptp=IEEE1588-2008:AA-BB-CC-DD-EE-FF-00-11:0\r\n\
+a=mediaclk:direct=0\r\n";
+
+    /// An `Output::Aes67` value (via serde, bypassing config validation so the
+    /// malformed cases reach `build_aes67_output`).
+    fn aes67_output_value(multicast: &str, depth: &str) -> Output {
+        serde_json::from_value(serde_json::json!({
+            "kind": "aes67",
+            "label": "aes-out",
+            "multicast": multicast,
+            "depth": depth,
+        }))
+        .expect("aes67 output parses")
+    }
+
+    /// A `SourceKind::Aes67` source value, optionally carrying the multicast override.
+    fn aes67_source_value(multicast: Option<&str>) -> Source {
+        let mut map = serde_json::Map::new();
+        map.insert("id".to_owned(), serde_json::json!("aes-in"));
+        map.insert("kind".to_owned(), serde_json::json!("aes67"));
+        map.insert("sdp".to_owned(), serde_json::json!(AES67_SDP));
+        if let Some(m) = multicast {
+            map.insert("multicast".to_owned(), serde_json::json!(m));
+        }
+        serde_json::from_value(serde_json::Value::Object(map)).expect("aes67 source parses")
+    }
+
+    #[test]
+    fn build_aes67_output_makes_a_mux_free_runnable_and_a_push_handle() {
+        let output = aes67_output_value("[ff3e::1]:5004", "L24");
+        let (runnable, _handle) = build_aes67_output(&output).expect("valid aes67 output builds");
+        let RunnableOutput::Aes67 {
+            dest, local, id, ..
+        } = runnable
+        else {
+            panic!("expected a RunnableOutput::Aes67");
+        };
+        assert_eq!(
+            dest,
+            "[ff3e::1]:5004".parse().unwrap(),
+            "dest is the configured multicast group:port"
+        );
+        assert!(
+            local.is_ipv6(),
+            "an ipv6 group egresses from an ipv6 wildcard"
+        );
+        assert!(
+            local.ip().is_unspecified(),
+            "egress binds the family wildcard"
+        );
+        assert_eq!(local.port(), 0, "egress uses an ephemeral local port");
+        assert_eq!(id, "aes-out", "the id derives from the label when unset");
+    }
+
+    #[test]
+    fn build_aes67_output_rejects_an_unknown_pcm_depth() {
+        let output = aes67_output_value("[ff3e::1]:5004", "L99");
+        assert!(
+            build_aes67_output(&output).is_err(),
+            "an unknown PCM depth is a typed refusal (not a silent default)"
+        );
+    }
+
+    #[test]
+    fn build_aes67_output_rejects_a_malformed_multicast() {
+        let output = aes67_output_value("not-a-socket-addr", "L24");
+        assert!(
+            build_aes67_output(&output).is_err(),
+            "a malformed multicast group:port is a typed refusal"
+        );
+    }
+
+    /// Build an `Output::Aes67` with an explicit id + multicast (via serde).
+    fn aes67_output_named(id: &str, multicast: &str) -> Output {
+        serde_json::from_value(serde_json::json!({
+            "kind": "aes67",
+            "id": id,
+            "label": id,
+            "multicast": multicast,
+        }))
+        .expect("aes67 output parses")
+    }
+
+    #[test]
+    fn aes67_outputs_that_collide_on_ssrc_within_one_group_are_rejected() {
+        // A PINNED brute-forced collision: at [ff3e::1]:5004 the ids "bzhq" and
+        // "fnmw" fold to the SAME 32-bit RTP SSRC (17_309_552). Two senders on ONE
+        // multicast group with one SSRC are ambiguous to an RTP receiver (RFC 3550
+        // §8), so the build must reject them, naming both. (Found offline by a
+        // birthday search over short ascii ids; the search loop is NOT committed.)
+        let g: std::net::SocketAddr = "[ff3e::1]:5004".parse().unwrap();
+        assert_eq!(
+            aes67_ssrc_for("bzhq", g),
+            aes67_ssrc_for("fnmw", g),
+            "the pinned collision holds under the real fold"
+        );
+
+        let err = ensure_no_aes67_ssrc_collision(&[
+            aes67_output_named("bzhq", "[ff3e::1]:5004"),
+            aes67_output_named("fnmw", "[ff3e::1]:5004"),
+        ])
+        .expect_err("a same-group ssrc collision is rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("bzhq") && msg.contains("fnmw"),
+            "the rejection names BOTH colliding outputs: {msg}"
+        );
+
+        // Distinct, non-colliding ids on the same group pass.
+        assert!(
+            ensure_no_aes67_ssrc_collision(&[
+                aes67_output_named("bzhq", "[ff3e::1]:5004"),
+                aes67_output_named("cam-audio", "[ff3e::1]:5004"),
+            ])
+            .is_ok(),
+            "distinct non-colliding same-group ids pass"
+        );
+
+        // The SAME colliding pair on DIFFERENT multicast groups is harmless — an RTP
+        // receiver demuxes per group, so those SSRCs never coexist. Not a conflict.
+        assert!(
+            ensure_no_aes67_ssrc_collision(&[
+                aes67_output_named("bzhq", "[ff3e::1]:5004"),
+                aes67_output_named("fnmw", "[ff3e::2]:5004"),
+            ])
+            .is_ok(),
+            "the same collision on different groups is not a conflict"
+        );
+    }
+
+    #[test]
+    fn pipeline_build_rejects_two_aes67_outputs_that_collide_on_ssrc() {
+        // The SSRC-collision guard is wired into `build_outputs`, not merely
+        // callable: a FULL `Pipeline::build` of a config with the pinned colliding
+        // pair on one multicast group fails closed. (Kills the mutant that drops the
+        // `ensure_no_aes67_ssrc_collision` call from `build_outputs`.)
+        let doc = r##"schema_version = 1
+[canvas]
+width = 640
+height = 480
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "cam1"
+kind = "bars"
+[[cells]]
+id = "only"
+area = "a"
+[cells.source]
+input_id = "cam1"
+[[outputs]]
+kind = "aes67"
+id = "bzhq"
+label = "bzhq"
+multicast = "[ff3e::1]:5004"
+[[outputs]]
+kind = "aes67"
+id = "fnmw"
+label = "fnmw"
+multicast = "[ff3e::1]:5004"
+"##;
+        let config = multiview_config::MultiviewConfig::load_from_toml(doc).expect("config parses");
+        // `Pipeline` is not `Debug`, so `.err().expect(...)` (not `expect_err`).
+        let err = Pipeline::build(&config)
+            .err()
+            .expect("colliding aes67 outputs fail the build");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("bzhq") && msg.contains("fnmw"),
+            "the build rejection names both colliding outputs: {msg}"
+        );
+    }
+
+    #[test]
+    fn aes67_ssrc_is_stable_nonzero_and_folds_in_the_multicast_binding() {
+        let g1: std::net::SocketAddr = "[ff3e::1]:5004".parse().unwrap();
+        let g1_alt_port: std::net::SocketAddr = "[ff3e::1]:5006".parse().unwrap();
+        let g2: std::net::SocketAddr = "[ff3e::2]:5004".parse().unwrap();
+        // Never the ambiguous 0.
+        assert_ne!(
+            aes67_ssrc_for("out-a", g1),
+            0,
+            "ssrc is never the ambiguous 0"
+        );
+        // Deterministic for the same (id, group:port).
+        assert_eq!(
+            aes67_ssrc_for("out-a", g1),
+            aes67_ssrc_for("out-a", g1),
+            "the same id + binding always advertises the same ssrc"
+        );
+        // The fold mixes id AND group:port, so different inputs map to different
+        // SSRCs with overwhelming probability (a 32-bit space) — NOT a guarantee.
+        // These particular inputs differ (a hard same-group guarantee is enforced
+        // separately by `ensure_no_aes67_ssrc_collision`, tested above).
+        // Distinct output ids on one group differ (here).
+        assert_ne!(
+            aes67_ssrc_for("out-a", g1),
+            aes67_ssrc_for("out-b", g1),
+            "these distinct output ids fold to distinct ssrcs"
+        );
+        // A different port folds in, so these differ.
+        assert_ne!(
+            aes67_ssrc_for("out-a", g1),
+            aes67_ssrc_for("out-a", g1_alt_port),
+            "this different port folds to a different ssrc"
+        );
+        // A different group folds in, so these differ.
+        assert_ne!(
+            aes67_ssrc_for("out-a", g1),
+            aes67_ssrc_for("out-a", g2),
+            "this different group folds to a different ssrc"
+        );
+        // Pinned FNV-1a value over STABLE address bytes (family + raw IP octets +
+        // big-endian port), NOT the `SocketAddr` Display string (whose formatting
+        // is not a stable cross-version/-target byte encoding). The mapping is a
+        // fixed contract — a `DefaultHasher`/SipHash fold, or a Display-string fold,
+        // is not stable across releases, so a rebuild could change every sender's
+        // advertised SSRC. Changing this constant is a deliberate, reviewed change.
+        assert_eq!(
+            aes67_ssrc_for("out", g1),
+            3_149_784_790,
+            "the ssrc is a pinned FNV-1a fold of id + address family/octets/port"
+        );
+    }
+
+    #[test]
+    fn pipeline_build_threads_the_aes67_send_handle_onto_the_pipeline() {
+        // A video source + cell (so the layout solves) plus an AES67 audio output:
+        // the output's serve-side sender rides `outputs`, its push handle is threaded
+        // onto the pipeline for the bake consumer to feed.
+        let doc = r##"schema_version = 1
+[canvas]
+width = 640
+height = 480
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "cam1"
+kind = "bars"
+[[cells]]
+id = "only"
+area = "a"
+[cells.source]
+input_id = "cam1"
+[[outputs]]
+kind = "aes67"
+label = "aes-out"
+multicast = "[ff3e::1]:5004"
+"##;
+        let config = multiview_config::MultiviewConfig::load_from_toml(doc).expect("config parses");
+        let pipeline = Pipeline::build(&config).expect("pipeline builds with an aes67 output");
+        assert_eq!(
+            pipeline.aes67_send_handles.len(),
+            1,
+            "the aes67 output's bake-consumer push handle is threaded onto the pipeline"
+        );
+        assert!(
+            pipeline
+                .outputs
+                .iter()
+                .any(|o| matches!(o, RunnableOutput::Aes67 { .. })),
+            "the aes67 output is a mux-free runnable sink"
+        );
+    }
+
+    #[test]
+    fn resolve_aes67_source_reads_the_sdp_and_requires_a_multicast_override() {
+        // Valid: the SDP parses (format/clock/payload) and the multicast override
+        // gives the transport binding (the SDP c= line is deliberately not used).
+        let src = aes67_source_value(Some("[ff3e::1]:5004"));
+        let (session, group) = resolve_aes67_source(&src).expect("valid aes67 source resolves");
+        assert_eq!(session.clock_rate, 48_000);
+        assert_eq!(session.payload_type, 98);
+        assert_eq!(session.format.channels, 2);
+        assert_eq!(group, "[ff3e::1]:5004".parse().unwrap());
+
+        // A missing multicast override is a typed refusal (not derived from the SDP).
+        assert!(
+            resolve_aes67_source(&aes67_source_value(None)).is_err(),
+            "a missing multicast override is rejected (the SDP c= line is not used)"
+        );
+        // A malformed override is rejected.
+        assert!(
+            resolve_aes67_source(&aes67_source_value(Some("nope"))).is_err(),
+            "a malformed multicast override is rejected"
+        );
+    }
+
+    #[test]
+    fn interleave_to_stereo_maps_mono_stereo_and_multichannel() {
+        // Stereo passes through unchanged.
+        assert_eq!(
+            interleave_to_stereo(&[0.1, 0.2, 0.3, 0.4], 2),
+            vec![0.1, 0.2, 0.3, 0.4]
+        );
+        // Mono duplicates each sample to both L and R.
+        assert_eq!(
+            interleave_to_stereo(&[0.5, 0.6], 1),
+            vec![0.5, 0.5, 0.6, 0.6]
+        );
+        // >2 channels keep the first two channels per frame (f0: 1,2 ; f1: 5,6).
+        assert_eq!(
+            interleave_to_stereo(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 4),
+            vec![1.0, 2.0, 5.0, 6.0]
+        );
+        // Zero channels clamps to mono — never divides by zero.
+        assert_eq!(interleave_to_stereo(&[0.9], 0), vec![0.9, 0.9]);
+    }
+
+    #[test]
+    fn aes67_audio_block_builds_a_48k_stereo_block() {
+        use multiview_input::st2110::v30::{Aes3Format, SampleDepth};
+        let frame = multiview_input::st2110::Aes67AudioFrame {
+            raw_timestamp: 0,
+            ssrc: 42,
+            discontinuity: false,
+            format: Aes3Format {
+                channels: 2,
+                depth: SampleDepth::L24,
+            },
+            samples: vec![0.1, -0.1, 0.2, -0.2], // 2 stereo frames
+        };
+        let block = aes67_audio_block(&frame).expect("builds a canonical block");
+        assert_eq!(block.frame_count(), 2, "two stereo frames");
+        assert_eq!(block.format().channel_count(), 2, "canonical stereo");
+        assert_eq!(block.format().sample_rate(), 48_000, "canonical 48 kHz");
+        assert_eq!(block.interleaved(), &[0.1, -0.1, 0.2, -0.2]);
+    }
+
+    /// A well-formed AES67 SDP at an arbitrary L24 clock rate (the parser accepts
+    /// 48 kHz and 96 kHz).
+    fn aes67_source_value_at_rate(clock_rate: u32) -> Source {
+        let sdp = format!(
+            "v=0\r\n\
+o=- 1 1 IN IP6 2001:db8::1\r\n\
+s=Multiview AES67\r\n\
+c=IN IP6 ff3e::1\r\n\
+t=0 0\r\n\
+m=audio 5004 RTP/AVP 98\r\n\
+a=rtpmap:98 L24/{clock_rate}/2\r\n\
+a=ptime:1\r\n\
+a=ts-refclk:ptp=IEEE1588-2008:AA-BB-CC-DD-EE-FF-00-11:0\r\n\
+a=mediaclk:direct=0\r\n"
+        );
+        let mut map = serde_json::Map::new();
+        map.insert("id".to_owned(), serde_json::json!("aes-in"));
+        map.insert("kind".to_owned(), serde_json::json!("aes67"));
+        map.insert("sdp".to_owned(), serde_json::json!(sdp));
+        map.insert("multicast".to_owned(), serde_json::json!("[ff3e::1]:5004"));
+        serde_json::from_value(serde_json::Value::Object(map)).expect("aes67 source parses")
+    }
+
+    #[test]
+    fn resolve_aes67_source_rejects_a_non_48khz_session() {
+        // A 48 kHz session resolves (the canonical store rate).
+        assert!(
+            resolve_aes67_source(&aes67_source_value_at_rate(48_000)).is_ok(),
+            "a 48 kHz aes67 session is supported"
+        );
+        // A 96 kHz session PARSES, but the RX rebaser only rescales the RTP
+        // timestamp onto the 48 kHz store index — it does NOT resample the PCM.
+        // Publishing 96 samples/ms against a +48/ms store anchor overlaps/gaps the
+        // store, so a non-48 kHz session must be rejected fail-closed, not accepted.
+        assert!(
+            resolve_aes67_source(&aes67_source_value_at_rate(96_000)).is_err(),
+            "a non-48 kHz aes67 session is rejected (the RX path does not resample)"
+        );
+    }
+
+    /// An `Output::Aes67` value with an explicit `ptime_ms` (via serde, bypassing
+    /// config validation so degenerate cases reach `build_aes67_output`).
+    fn aes67_output_value_with_ptime(ptime_ms: u32) -> Output {
+        serde_json::from_value(serde_json::json!({
+            "kind": "aes67",
+            "label": "aes-out",
+            "multicast": "[ff3e::1]:5004",
+            "depth": "L24",
+            "ptime_ms": ptime_ms,
+        }))
+        .expect("aes67 output parses")
+    }
+
+    #[test]
+    fn build_aes67_output_rejects_a_zero_ptime() {
+        // A 1 ms ptime builds (48 frames/packet @ 48 kHz).
+        assert!(
+            build_aes67_output(&aes67_output_value_with_ptime(1)).is_ok(),
+            "a 1 ms packet time builds"
+        );
+        // A zero packet time is nonsensical; the framing must reject it fail-closed
+        // rather than silently coerce it to a 1-frame (~0.02 ms) packet flood.
+        assert!(
+            build_aes67_output(&aes67_output_value_with_ptime(0)).is_err(),
+            "a zero packet time is a typed refusal, not a silent coercion to 1 frame"
         );
     }
 }

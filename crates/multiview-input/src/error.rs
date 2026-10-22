@@ -78,11 +78,6 @@ pub enum Error {
     #[error("srt: {0}")]
     Srt(#[from] crate::srt::SrtError),
 
-    /// A WebRTC SDP offer/answer could not be parsed or negotiated. Carries the
-    /// underlying [`crate::webrtc::WebRtcError`].
-    #[error("webrtc: {0}")]
-    WebRtc(#[from] crate::webrtc::WebRtcError),
-
     /// An NDI received frame could not be converted to NV12 (geometry, stride, or
     /// an unsupported `FourCC`). Carries the underlying
     /// [`crate::ndi::NdiConvertError`]. Only constructed under the `ndi` feature.

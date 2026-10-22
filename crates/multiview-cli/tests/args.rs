@@ -33,7 +33,7 @@ fn run_args(ticks: Option<u64>, duration: Option<u64>) -> RunArgs {
     }
     match Cli::parse_from(cmdline).command {
         Command::Run(parsed) => parsed,
-        Command::Validate(_) => panic!("expected Run"),
+        other => panic!("expected Run, got {other:?}"),
     }
 }
 
@@ -44,7 +44,7 @@ fn validate_subcommand_parses_path() {
         Command::Validate(args) => {
             assert_eq!(args.config, PathBuf::from("examples/2x2.toml"));
         }
-        other @ Command::Run(_) => panic!("expected Validate, got {other:?}"),
+        other => panic!("expected Validate, got {other:?}"),
     }
 }
 
@@ -57,7 +57,7 @@ fn run_subcommand_defaults() {
             assert!(!args.software, "software must default to false");
             assert_eq!(args.ticks, None, "ticks must default to None (run forever)");
         }
-        other @ Command::Validate(_) => panic!("expected Run, got {other:?}"),
+        other => panic!("expected Run, got {other:?}"),
     }
 }
 
@@ -76,7 +76,7 @@ fn run_subcommand_software_with_ticks() {
             assert!(args.software);
             assert_eq!(args.ticks, Some(120));
         }
-        other @ Command::Validate(_) => panic!("expected Run, got {other:?}"),
+        other => panic!("expected Run, got {other:?}"),
     }
 }
 
@@ -89,7 +89,7 @@ fn run_subcommand_headless_is_a_back_compat_alias_for_software() {
             args.software,
             "the --headless alias must set the software flag"
         ),
-        other @ Command::Validate(_) => panic!("expected Run, got {other:?}"),
+        other => panic!("expected Run, got {other:?}"),
     }
 }
 
@@ -102,7 +102,7 @@ fn run_subcommand_subtitles_flag_parses() {
             args.subtitles, None,
             "subtitles must default to None when --subtitles is absent"
         ),
-        other @ Command::Validate(_) => panic!("expected Run, got {other:?}"),
+        other => panic!("expected Run, got {other:?}"),
     }
 
     // Explicit --subtitles captures the file path.
@@ -119,7 +119,7 @@ fn run_subcommand_subtitles_flag_parses() {
             Some(PathBuf::from("captions.srt")),
             "--subtitles FILE must be captured as the cue-track path"
         ),
-        other @ Command::Validate(_) => panic!("expected Run, got {other:?}"),
+        other => panic!("expected Run, got {other:?}"),
     }
 }
 

@@ -23,6 +23,14 @@ multiview-telemetry = { workspace = true }
 # CI-green default build; enforcement is DATA the control plane renders, never a
 # control-flow decision that could touch the engine (invariant #1/#10).
 multiview-licence = { workspace = true }
+# The local-mesh discovery/relay plane (Conspect, ADR-0051): the untrusted
+# discovered-peer inventory, the relay opt-in, and the computed mesh role the
+# `/api/v1/mesh/*` routes render + toggle. Pure-Rust leaf crate (no engine, no
+# socket — the live mDNS announce lives behind the mesh crate's own off-by-default
+# `mdns` feature, which the control plane does NOT enable); it stays in the
+# CI-green default build, control-plane-only, never able to back-pressure the
+# engine (invariant #10).
+multiview-mesh = { workspace = true }
 # The `FocusGate` admission primitive (pure-Rust default build: counters only, no
 # native/codec dep) bounds concurrent WHEP focus sessions. The control plane wraps
 # its codec-free `WhepProvider` seam with the gate; both Tier-A control-plane
@@ -31,25 +39,54 @@ multiview-preview = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # `net` adds `tokio::net::TcpListener` for `serve` (the real-socket bind that lets
-# `multiview run` expose the API+WebUI); pure Rust, stays in the default build.
-tokio = { workspace = true, features = ["net"] }
+# `multiview run` expose the API+WebUI); `sync` adds `tokio::sync::Semaphore` for
+# the SEC-14 concurrent-request cap. Pure Rust, stays in the default build.
+tokio = { workspace = true, features = ["net", "sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 # HTTP stack (pure Rust; the default-feature build pulls no native libs).
 axum = { version = "0.8.9", features = ["ws", "macros"] }
 tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.6.11", features = ["trace", "cors"] }
+tower-http = { version = "0.7.0", features = ["trace", "cors"] }
+# The hand-rolled control-plane serve loop (SEC-14 #126 / ADR-W028 + ADR-W031):
+# `axum::serve` builds the hyper connection `Builder` internally and exposes no
+# header-read timeout, and its `auto` builder negotiates HTTP/2 (whose server has NO
+# header-read timeout at all). So the accept loop is driven directly on
+# `hyper::server::conn::http1::Builder` — HTTP/1-only, so every connection (incl. one
+# that opens with the HTTP/2 preface, parsed as a bad HTTP/1 request line) is bounded by
+# `header_read_timeout(..)` (+ a `TokioTimer`), keeping `serve_connection(..)
+# .with_upgrades()` (WS). Pure Rust, already in the lock via axum.
+hyper = { version = "1.10", default-features = false, features = [
+    "server",
+    "http1",
+] }
+# `hyper-util` supplies only the Tokio IO/timer adapters (`rt::TokioIo` / `rt::TokioTimer`)
+# the http1 serve loop wraps its streams and installs its header-read timer with. Pure
+# Rust, already in the lock.
+hyper-util = { version = "0.1.20", default-features = false, features = [
+    "tokio",
+] }
+# The `http_body::Body` trait, to wrap a response body so a SEC-14 concurrency
+# permit is held for the BODY's lifetime (a held-open SSE stream), not merely the
+# handler's return. Pure Rust; already in the lock via axum.
+http-body = "1.0.1"
 bytes = "1.10.1"
 async-stream = "0.3.6"
 uuid = { version = "1.23.2", features = ["v4"] }
+# RFC 3339 rendering of the telemetry-consent `changed_at` instant (Conspect,
+# ADR-0052). Pure Rust, no native deps, on the deny.toml allowlist, and already
+# in the CI-green default build (pulled by multiview-licence / multiview-overlay).
+# `alloc` is the only feature we need (no `clock` — the control plane is
+# clock-injected via the ack clock; chrono only formats the instant here).
+chrono = { workspace = true, features = ["alloc"] }
 
 # Auth: HMAC-SHA256 verification of API keys (high-entropy keys -> no slow KDF,
 # per the web-api-stack brief) and HS256 JWT signature verification. RustCrypto
 # crates, all MIT/Apache-2.0. `base64` (MIT/Apache-2.0, pure Rust) decodes the
 # base64url JWT segments — no native deps, stays in the CI-green default build.
-sha2 = "0.10.9"
-hmac = "0.12.1"
+sha2 = "0.11.0"
+hmac = "0.13.0"
 subtle = "2.6.1"
 base64 = "0.22.1"
 
@@ -72,7 +109,7 @@ mime_guess = { version = "2", optional = true }
 
 # SQLite persistence: OFF by default. SQLite's bundled license is NOT in the
 # cargo-deny allowlist, so sqlx/sqlite must never appear in the default build.
-sqlx = { version = "0.8.6", default-features = false, features = [
+sqlx = { version = "0.9.0", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
     "macros",
@@ -129,7 +166,70 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ], optional = true }
 
+# The WHATWG URL parser — the SAME one reqwest resolves hosts through — so the
+# `zowietek` transport's SSRF screen (SEC-02, CWE-918) canonicalizes a device
+# URL's host to the exact `IpAddr` reqwest will dial (incl. alt-encoded IPv4
+# like `2130706433` and IPv4-mapped IPv6). Already in the lock via reqwest;
+# off-by-default (behind `zowietek`) so it stays out of the scanned default
+# graph (`deny.toml [graph] all-features = false`).
+url = { version = "2", optional = true }
+
+# The live CASTV2 wire layer for the `cast` managed-device driver: OFF by
+# default (`cast` / `devices-net`). The typed protocol payloads, the media-URL
+# rules, the session actor, and the registry wiring are ALWAYS compiled and
+# tested socket-free over the scripted channel seam; only the real TLS +
+# length-prefixed-protobuf framing needs these. The DEV-D2 spike rejected
+# `rust_cast` 0.21 on API fit (blocking reader with no settable read timeout;
+# its `thread_safe` mode serializes send/receive behind ONE mutex held through
+# a blocking `read_exact`, making the mandated 10 s/20 s/5 s heartbeat
+# unimplementable; library-code `unwrap`/`expect` panics) — see
+# `src/devices/cast/net.rs` for the verdict. `prost` (Apache-2.0, prost-derive
+# only — no protoc, no build step) carries the BSD-3-Clause Open Screen
+# `CastMessage` schema; `tokio-rustls` (rustls 0.23, aws-lc-rs — both already
+# in the lock via reqwest's rustls backend) carries the TLS channel with the
+# permissive device-certificate verifier ADR-M011 mandates. Because
+# `deny.toml` has `[graph] all-features = false`, these off-by-default deps
+# stay out of the scanned default graph (the `reqwest`/`ring` posture).
+prost = { version = "0.14", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+# Atomic, secure boot-model state-file writes (ADR-W024 MAJOR-A / panel round 2):
+# `NamedTempFile::new_in` creates the temp with `O_EXCL` + an unpredictable name
+# + 0600 on Unix, defeating the pre-existing-inode and symlink-at-temp attacks a
+# deterministic temp name allows. Permissive (MIT/Apache-2.0), already on the
+# deny.toml allowlist; pure Rust, stays in the CI-green default build.
+tempfile = "3"
+# `rustix::process::geteuid` — a SAFE wrapper (this crate forbids `unsafe`) used
+# to fail-closed when the `.multiview` state dir is owned by another uid
+# (ADR-W024 MAJOR-A). Permissive (Apache-2.0/MIT/BSD), already in the lock.
+rustix = { version = "1", features = ["process"] }
+
+# Control-plane TLS termination (TLS-0, ADR-W029; HTTP/1-only serve loop SEC-14 #126 R2 /
+# ADR-W031): OFF by default (`tls`). The `[control.tls]` schema + the plain-HTTP serve path
+# are ALWAYS compiled; only the rustls termination (`serve_router_tls`) needs these. The
+# serve loop wraps the `tokio_rustls::TlsAcceptor` (declared above for `cast`) around the
+# shared listener and drives the handshake itself (with a handshake timeout, then HTTP/1
+# only), so no separate accept-loop crate is needed; `rustls` builds the `ServerConfig` with
+# an EXPLICIT `aws-lc-rs` provider (mirroring `devices/cast/net.rs` — never the
+# process-default, which panics when both `ring` and `aws-lc-rs` are linked, e.g. a `full`
+# build) and pins ALPN to `http/1.1`; `rustls-pki-types` (`pem`) loads the cert chain + key
+# from PEM files. All rustls 0.23 / aws-lc-rs, already in the lock via the `cast`
+# (`tokio-rustls`) and `reqwest` rustls backends; MIT/Apache-2.0, and `deny.toml [graph]
+# all-features = false` keeps these off-by-default deps out of the scanned default graph
+# (the `tokio-rustls`/`reqwest`/`ring` posture already documented above).
+rustls = { version = "0.23", optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+
 [dev-dependencies]
+# Self dev-dependency: the canonical way to enable a TEST-ONLY feature for this
+# crate's OWN tests without pulling it into the default build or a downstream
+# consumer's normal build. Dev-dependencies are inactive for a normal
+# `cargo build`/`check` and for `multiview-cli`'s build of this crate (resolver
+# v2 keeps dev-dep features out of the non-test graph), so `_test-seams` — which
+# exposes the config-watch post-probe interpose hook that WRITES the watched
+# file — is turned on by THIS line only when building this crate's own tests. It
+# is still an ordinary feature, so an explicit `--features _test-seams` or a
+# workspace `--all-features` build can enable it; the release presets do not.
+multiview-control = { path = ".", features = ["_test-seams"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
@@ -147,22 +247,39 @@ http-body-util = "0.1.3"
 # codec and the tally mirror/override registry).
 proptest = "1.11.0"
 rumqttd = { version = "0.20", default-features = false }
-toml = "0.8"
+toml = "1.1"
 # Build signed lease bindings in the licence-route tests (Conspect, ADR-0050):
 # generate a test keypair, sign a lease, and CBOR-encode the binding the
 # `POST /api/v1/licence/lease` route ingests, and drive the store clock across
 # day boundaries. Test-only; the non-test control build never mints keys nor
 # reads a clock (the licence crate is verification-only / clock-injected). All
-# `MIT`/`Apache-2.0`, already on the deny.toml allowlist.
+# `MIT`/`Apache-2.0`, already on the deny.toml allowlist. ed25519-dalek 3.x aligns
+# to rand_core 0.10 / getrandom 0.4 (ADR-I010): the test keygen draws OS entropy via
+# `getrandom::SysRng` wrapped in the ed25519-dalek-re-exported `rand_core::UnwrapErr`
+# (the `rand_core` feature re-exports the exact rand_core `SigningKey::generate` binds to).
 chrono = { workspace = true, features = ["alloc"] }
-ed25519-dalek = { version = "2", default-features = false, features = [
+ed25519-dalek = { version = "3", default-features = false, features = [
     "alloc",
     "rand_core",
 ] }
-rand_core = { version = "0.6", default-features = false, features = [
-    "getrandom",
-] }
+getrandom = { version = "0.4", default-features = false, features = ["sys_rng"] }
 ciborium = "0.2.2"
+# TLS-0 serve e2e (`tests/tls_serve.rs`, gated `required-features = ["tls"]`):
+# generate an ephemeral self-signed cert (`rcgen`, with IPv6/IPv4 loopback SANs)
+# and drive a REAL HTTPS client (`reqwest` rustls-tls, `danger_accept_invalid_certs`)
+# against the served TLS listener — proving the rustls handshake succeeds AND the
+# SEC-14 per-IP rate limiter still engages through `axum-server` + `ConnectInfo`.
+# Test-only (dev-deps never ship, never affect the public API); both already in
+# the lock (rcgen 0.14, reqwest via the zowietek backend).
+rcgen = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# TLS-slowloris e2e (`tests/tls_serve.rs`, SEC-14 #126): a RAW rustls client (not
+# `reqwest`, which only sends complete requests) that completes the TLS handshake
+# then dribbles a partial request head, proving the header-read timeout drops the
+# stalled connection under HTTPS. Re-exports `rustls` + `pki_types`, so this one
+# dev-dep covers the client config + danger verifier. Already in the lock (the
+# `cast` backend); `aws-lc-rs` provider to match the server's TLS material.
+tokio-rustls = "0.26"
 
 [features]
 "default" = ["openapi"]
@@ -203,12 +320,44 @@ ciborium = "0.2.2"
 # scripted transport seam; only the real reqwest-backed transport
 # (`ReqwestTransport`) needs this feature, so the default build stays
 # pure-Rust/socket-free and CI-green.
-"zowietek" = ["dep:reqwest"]
+"zowietek" = ["dep:reqwest", "dep:url"]
+# Off-by-default live CASTV2 wire layer for the `cast` managed-device driver
+# (DEV-D2, ADR-M011). The protocol payloads + media-URL rules + session actor
+# + registry wiring are ALWAYS compiled and tested socket-free over the
+# scripted channel seam; only the real TLS + length-prefixed-protobuf framing
+# (`TlsCastConnector`/`TlsCastChannel`) needs this feature, so the default
+# build pulls no protobuf/TLS dependency and stays CI-green.
+"cast" = ["dep:prost", "dep:tokio-rustls"]
 # The umbrella feature for managed-device network I/O (so a deployment can turn
 # on every device driver's live transport + the mDNS discovery browse with one
-# flag). Today: the `zowietek` live transport + `discovery`; future drivers
-# (cast, …) join here.
-"devices-net" = ["zowietek", "discovery"]
+# flag): the `zowietek` HTTP transport, the `cast` CASTV2 wire layer, and the
+# `discovery` mDNS browse.
+"devices-net" = ["zowietek", "cast", "discovery"]
+# TEST-ONLY seam — do NOT enable in a shipped build. Exposes the config-watch
+# post-probe interpose hook (`WatchOptions::with_post_probe_interpose`) the
+# probe→apply TOCTOU regression test uses to WRITE the watched file mid-poll.
+# Because the hook makes the watcher write the config file, it is off by default
+# and excluded from the `multiview-cli` release presets (nvidia/apple/linux-vaapi/
+# full — verified: none pull `multiview-control/_test-seams`); it is compiled in
+# for this crate's own tests via the self dev-dependency above. It is an ordinary
+# feature (an explicit `--features _test-seams` can still turn it on), so keep it
+# out of shipped builds. Underscore-prefixed to mark it internal.
+"_test-seams" = []
+# Control-plane TLS termination (TLS-0, ADR-W029; HTTP/1-only serve loop SEC-14 #126 R2
+# / ADR-W031): OFF by default. Adds the rustls `serve_router_tls` path — a
+# `tokio_rustls::TlsAcceptor` over an explicit `aws-lc-rs` `ServerConfig` (ALPN pinned to
+# `http/1.1`) — alongside the always-compiled plain-HTTP `serve_router`, plus the
+# `RustlsMaterial` PEM loader. `tokio-rustls` is already a normal (optional) dep via
+# `cast`, so enabling `tls` adds no new crate to the graph; no native lib beyond the
+# aws-lc-rs crypto blob already in the lock (via the `cast`/`reqwest` backends),
+# LGPL-clean; kept out of the CI-green default build and the deny default graph (`[graph]
+# all-features = false`). Wired into the `multiview-cli` umbrella presets.
+"tls" = ["dep:rustls", "dep:rustls-pki-types", "dep:tokio-rustls"]
+
+[[test]]
+# The TLS-0 serve e2e needs the rustls termination path compiled in.
+name = "tls_serve"
+required-features = ["tls"]
 
 [lints]
 workspace = true

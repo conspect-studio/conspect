@@ -89,7 +89,7 @@ support matrix — update a row's status as it is implemented.
 | Grid + absolute (free-form / overlap) layouts | 🔵 | M3 | [templates/layout-and-config.md](docs/templates/layout-and-config.md) |
 | Fit modes, borders, gaps, corner radius, z-order | 🔵 | M3 | [templates/layout-and-config.md](docs/templates/layout-and-config.md) |
 | Live hot-swap of a cell's source (no black flash) | 📐 | M3 | [templates/layout-and-config.md](docs/templates/layout-and-config.md) |
-| Transitions (cut / crossfade) | 📐 | M3 | [templates/layout-and-config.md](docs/templates/layout-and-config.md) |
+| Transitions (cut / crossfade) | 📐 | M3/M13 | [production-switcher §5](docs/research/production-switcher.md), [ADR-0055](docs/decisions/ADR-0055.md) — supersedes the cut/crossfade sketch in [templates/layout-and-config.md](docs/templates/layout-and-config.md) §7.1; generalized to the full transition family (mix/dip/wipe/DVE/stinger) with integer-frame rates |
 | Config-as-code (TOML/JSON, validate, import/export, rollback) | 🔵 | M6 | [ADR-M006](docs/decisions/ADR-M006.md) |
 
 ## Audio, subtitles & overlays
@@ -148,14 +148,14 @@ Standards-based broadcast-multiviewer capabilities mapped to Multiview — see [
 | Free-form absolute tile placement (any size/aspect/position, overlap) | ✅ have (enhance) | core | M3 | De-facto industry standard |
 | Per-tile source crop / zoom (region-of-interest) | 📋 | valuable | M3 | De-facto industry standard |
 | Round-robin / cycling tile mode | 📋 | valuable | M11 | De-facto industry standard |
-| Freeze / reference-image still tiles | 📋 | niche | M11 | De-facto (freeze-frame detection also a QC metric) |
+| Freeze / reference-image still tiles | 📋 | niche | M11 | De-facto (freeze-frame detection also a QC metric); reference stills ship via the media-library still store — decode-once + hold-forever ([ADR-0057](docs/decisions/ADR-0057.md)) |
 | Output orientation (portrait/landscape) + per-tile rotation/flip | 📋 | valuable | M11 | De-facto industry standard |
 
 ### Layouts & control
 
 | Capability | Status | Relevance | Target | Standard |
 |---|---|---|---|---|
-| Instant layout preset recall / salvo (multi-trigger) | 📋 | core | M11 | Router/automation salvo concept; SW-P-08 presets/salvos |
+| Instant layout preset recall / salvo (multi-trigger) | 📋 | core | M11 | Router/automation salvo concept; SW-P-08 presets/salvos; extended by switcher memories = salvo + recall-scope masks ([ADR-M012](docs/decisions/ADR-M012.md), [production-switcher §10](docs/research/production-switcher.md)) — supersedes [ADR-MV004](docs/decisions/ADR-MV004.md)'s salvo-only automation story |
 
 ### Layouts & monitoring
 
@@ -186,10 +186,10 @@ Standards-based broadcast-multiviewer capabilities mapped to Multiview — see [
 
 | Capability | Status | Relevance | Target | Standard |
 |---|---|---|---|---|
-| TSL UMD protocol ingest/egress (v3.1 / v4.0 / v5.0) | 📋 | core | M11 | TSL UMD v3.1 / v4.0 / v5.0 |
+| TSL UMD protocol ingest/egress (v3.1 / v4.0 / v5.0) | 📋 | core | M11 | TSL UMD v3.1 / v4.0 / v5.0 — on-wire codec spec-reconciliation (v5.0 DLE, CONTROL bit order, v4.0 rebuild, golden on-wire vectors) pinned in [ADR-MV006](docs/decisions/ADR-MV006.md) |
 | Dynamic UMD text + multi-field UMD/OMD | ✅ have (enhance) | core | M11 | TSL UMD; generic dynamic UMD |
-| Tally states + multi-region/multi-level tally | ✅ have (enhance) | core | M11 | TSL v4.0/v5.0 (0=off/1=red/2=green/3=amber); SW-P-08 multi-level |
-| External tally-bus integration (switcher/router) + arbiter | 📋 | core | M11 | TSL tally; NMOS IS-07; GPI; switcher-native buses |
+| Tally states + multi-region/multi-level tally | ✅ have (enhance) | core | M11 | TSL v4.0/v5.0 (0=off/1=red/2=green/3=amber); SW-P-08 multi-level; internally-derived switcher tally (PGM/PVW/ISO-amber from live bus state) per [ADR-MV006](docs/decisions/ADR-MV006.md) |
+| External tally-bus integration (switcher/router) + arbiter | 📋 | core | M11 | TSL tally; NMOS IS-07; GPI; switcher-native buses; internally-derived facts from the built-in switcher join the same arbiter under one conflict policy ([ADR-MV006](docs/decisions/ADR-MV006.md)) |
 | Router/switcher name-following UMD labels | 📋 | valuable | M12 | SW-P-08 labels; Ember+; NMOS IS-04 |
 
 ### Control & integration
@@ -260,7 +260,7 @@ Standards-based broadcast-multiviewer capabilities mapped to Multiview — see [
 
 | Capability | Status | Relevance | Target | Standard |
 |---|---|---|---|---|
-| Audio-follow-video monitor / PFL bus | 📋 | valuable | M4 | Generic operational feature |
+| Audio-follow-video monitor / PFL bus | 📋 | valuable | M4 | Generic operational feature; distinct from switcher audio-follow-video on transitions — that is [ADR-0059](docs/decisions/ADR-0059.md) (production switcher) |
 
 ### Audio metering & metadata
 
@@ -363,6 +363,52 @@ Standards-based broadcast-multiviewer capabilities mapped to Multiview — see [
 |---|---|---|---|---|
 | Soft/hardware control panels + browser/mobile remote | ✅ have (enhance) | valuable | M11 | Panels over Ember+/HTTP; HTML5/WebSocket/WebRTC monitor view |
 | RBAC multi-user + audit log + config versioning | ✅ have (enhance) | valuable | M6 | RBAC; OAuth 2.0/JWT; align AMWA NMOS IS-10 |
+
+## Production switcher (proposed — designed 2026-06-11)
+
+A live production-switcher layer on the multiviewer engine, in generic industry vocabulary
+(M/E stage, PGM/PVW, T-bar, dip, wipe, stinger, upstream/downstream keyer, clean feed, media
+library, macro, memory). Designed in [production-switcher](docs/research/production-switcher.md)
+and [media-playout](docs/research/media-playout.md); decided in
+[ADR-0054](docs/decisions/ADR-0054.md)–[ADR-0059](docs/decisions/ADR-0059.md),
+[ADR-M012](docs/decisions/ADR-M012.md), [ADR-RT008](docs/decisions/ADR-RT008.md),
+[ADR-W021](docs/decisions/ADR-W021.md), [ADR-P007](docs/decisions/ADR-P007.md),
+[ADR-T015](docs/decisions/ADR-T015.md), [ADR-C007](docs/decisions/ADR-C007.md),
+[ADR-MV006](docs/decisions/ADR-MV006.md), [ADR-R011](docs/decisions/ADR-R011.md); PR-sized
+slices in [production-switcher-backlog.md](docs/development/production-switcher-backlog.md)
+(`SW-`). **Invariant posture:** switcher state is *sampled* by the output clock once per tick at
+the frame-boundary control seam — transitions are pure `f(tick)`, never pacing (inv #1); the
+control surface, macros, and monitors are physically incapable of back-pressuring the engine
+(inv #10); every duration is an integer frame count at the exact rational output cadence, never
+float fps/seconds (inv #3, [ADR-T015](docs/decisions/ADR-T015.md)). All rows 📐 (docs-only design
+pass; no code), except the native-graphics row — explicitly deferred and **not** designed, so 📋.
+**Target** follows the MVP boundary in
+[production-switcher §18](docs/research/production-switcher.md): *M13* = the one-M/E MVP
+milestone, *M13+* = the post-MVP waves (wipes, DVE, stinger, chroma/pattern keys, aux via the
+output crosspoint, multi-M/E) — milestone definition lands in [ROADMAP.md](ROADMAP.md) with this
+design pass.
+
+| Capability | Status | Target | Design | Standard |
+|---|---|---|---|---|
+| M/E program/preview buses (PGM/PVW inside ONE program; same-tick second composite; frame-aligned take) | 📐 | M13 | [production-switcher §4](docs/research/production-switcher.md), [ADR-0054](docs/decisions/ADR-0054.md), [ADR-P007](docs/decisions/ADR-P007.md) | De-facto industry practice |
+| Cut / auto / T-bar (idempotent absolute progress setter, conflated latest-wins; integer-frame rates; flip-flop; abort semantics) | 📐 | M13 | [ADR-0055](docs/decisions/ADR-0055.md), [ADR-T015](docs/decisions/ADR-T015.md) | De-facto industry practice |
+| Mix / dip transitions (dip via any bus-selectable dip source; pinned linear-light dissolve law + optional perceptual progress curve) | 📐 | M13 | [ADR-0055](docs/decisions/ADR-0055.md), [ADR-C007](docs/decisions/ADR-C007.md) | De-facto industry practice (gamma-domain dissolve midpoint documented vs the linear-light law) |
+| Wipes (pattern / softness / border fill / position / reverse / flip-flop; SDF masks) | 📐 | M13+ | [ADR-0055](docs/decisions/ADR-0055.md) Wave 2 | De-facto industry practice |
+| DVE transitions (push/squeeze; per-tile transform + sub-pixel placement; wires the dormant fit/crop/rotation model) | 📐 | M13+ | [ADR-0055](docs/decisions/ADR-0055.md) Wave 2 | De-facto industry practice |
+| Stinger / media transitions (pre-roll, trigger point, mix window; validated `trigger+mix ≤ duration`) | 📐 | M13+ | [ADR-0055](docs/decisions/ADR-0055.md) Wave 3, [ADR-0058](docs/decisions/ADR-0058.md), [media-playout §9](docs/research/media-playout.md) | De-facto industry practice |
+| Fade to black (master stage after the DSKs; own rate; optional audio-follow master ramp) | 📐 | M13 | [ADR-0056](docs/decisions/ADR-0056.md), [ADR-0059](docs/decisions/ADR-0059.md) | De-facto industry practice |
+| Upstream keyers (luma / linear fill+key / chroma / pattern / DVE PiP; clip/gain/invert; garbage matte; explicit key priority) | 📐 | M13 (linear/luma) · M13+ (chroma/pattern) | [ADR-0056](docs/decisions/ADR-0056.md), [ADR-C007](docs/decisions/ADR-C007.md) | De-facto industry practice |
+| Downstream keyers (canvas-level, post-M/E pre-FTB; TIE / CUT / AUTO; on-clock render-plan stage, not the monitoring overlay bake) | 📐 | M13 | [ADR-0056](docs/decisions/ADR-0056.md), [ADR-0054](docs/decisions/ADR-0054.md) | De-facto industry practice |
+| Multi-box composition source (background + z-ordered boxes as a bus-selectable source; drive-internal same-tick pre-pass) | 📐 | M13+ | [ADR-0056](docs/decisions/ADR-0056.md) | De-facto industry practice |
+| Media library + media players (stills/clips/audio assets; cue/play/pause/seek; loop; play-on-take; EOF policy `hold_last_frame\|loop\|black\|auto_off`; frame-accurate start) | 📐 | M13 | [media-playout](docs/research/media-playout.md), [ADR-0057](docs/decisions/ADR-0057.md) | De-facto industry practice; transport semantics follow the open CasparCG AMCP model (cue/play/auto-chain) |
+| Alpha media (NV12+A frame payload, 2.5 B/px — straight alpha in the payload, premultiplied exactly once in-kernel in linear light; bounded stinger mezzanine; import probe + reject-or-transcode) | 📐 | M13 (stills with alpha) · M13+ (alpha clips) | [ADR-0058](docs/decisions/ADR-0058.md), [media-playout §6](docs/research/media-playout.md) | FFmpeg-documented alpha decode set (ProRes 4444, qtrle, PNG/TGA sequences, VP9-alpha); HEVC-alpha rejected/import-transcoded |
+| Native graphics renderer (templates, lower thirds, data-bound text, clock/score widgets, font management, preview-before-air, take-coupled graphics automation) | 📋 | M13+ | Explicitly deferred — **not designed in this pass** ([production-switcher §18](docs/research/production-switcher.md)); MVP production graphics are media-based alpha fills (NV12+A stills/clips, [ADR-0058](docs/decisions/ADR-0058.md)); the existing overlay text stack stays monitoring-only | De-facto industry practice |
+| Audio-follow-video + master gain (equal-power AFV crossfades from the same state-machine window; FTB audio fade; gain-preserving mute; live meters ~30 Hz) | 📐 | M13 | [ADR-0059](docs/decisions/ADR-0059.md) | EBU R128 / ITU-R BS.1770 (loudness-normaliser interaction); else de-facto industry practice |
+| Internally-derived tally (recursive contributes-to-program over the live composition graph; merged with external facts in one arbiter) | 📐 | M13 | [ADR-MV006](docs/decisions/ADR-MV006.md), [production-switcher §9](docs/research/production-switcher.md) | TSL UMD v3.1/v4.0/v5.0; AMWA NMOS IS-07 |
+| Aux buses + clean feeds (bus-tap taxonomy `{program, clean, preview, me[n], aux[j]}`; clean = pre-DSK tap; aux = independent encode via the output←program crosspoint) | 📐 | M13 (clean tap) · M13+ (aux buses) | [production-switcher §4.4/§4.6](docs/research/production-switcher.md), [ADR-0054](docs/decisions/ADR-0054.md) | De-facto industry practice |
+| Macros + memories (control-plane command sequencer with `wait_frames`/`wait_ms`; memories = salvo + recall-scope masks; multi-op frame-boundary batches) | 📐 | M13 | [production-switcher §10](docs/research/production-switcher.md), [ADR-M012](docs/decisions/ADR-M012.md), [ADR-W021](docs/decisions/ADR-W021.md) | Batch-at-one-frame semantic per the open obs-websocket protocol (`SERIAL_FRAME`); else de-facto industry practice |
+| Switcher REST/WS surface + operator panel + shortcuts (`/api/v1/switcher/*` bare verbs, plan/take classification, correlated events; SPA panel, keyboard CUT/AUTO/bus keys, no-color-alone bus state) | 📐 | M13 | [ADR-W021](docs/decisions/ADR-W021.md), [ADR-RT008](docs/decisions/ADR-RT008.md), [ADR-M012](docs/decisions/ADR-M012.md), [ADR-P007](docs/decisions/ADR-P007.md) | OpenAPI 3.1 + AsyncAPI; RFC 9457 errors (house API conventions) |
+| External-control-friendly contract (long-lived WS snapshot+deltas; stable string ids; idempotent single-shot commands; boolean state feedback) | 📐 | M13 (contract) · M13+ (official gateway module, OSC) | [ADR-W021](docs/decisions/ADR-W021.md) §13 | De-facto industry practice (control-surface gateways) |
 
 ## Accessibility & internationalization
 

@@ -51,15 +51,24 @@ pub enum VideoCodec {
     Ffv1,
     /// Motion-JPEG — LGPL software encoder (intra-only, preview-friendly).
     Mjpeg,
+    /// VP8, encoded with the BSD-licensed `libvpx` — the licence-clean software
+    /// rung for WHEP preview (ADR-P006): every browser must receive it
+    /// (RFC 7742) and the default build may link it (no `gpl-codecs` needed).
+    /// Whether the linked `FFmpeg` actually ships `libvpx` is a run-time fact;
+    /// `select_encoder` probes it and falls through gracefully when absent.
+    Vp8,
 }
 
 impl VideoCodec {
-    /// The libav short-name of this codec's LGPL software encoder, if it has one
-    /// in the default (`ffmpeg`-only) build.
+    /// The libav short-name of this codec's licence-clean (LGPL/BSD) software
+    /// encoder, if it has one in the default (`ffmpeg`-only) build.
     ///
-    /// H.264/H.265 have no LGPL software encoder, so they return [`None`] — the
-    /// default build genuinely cannot encode them, and selection reflects that
-    /// rather than silently substituting a different codec.
+    /// H.264/H.265 have no licence-clean software encoder, so they return
+    /// [`None`] — the default build genuinely cannot encode them, and selection
+    /// reflects that rather than silently substituting a different codec. VP8's
+    /// `libvpx` is BSD (licence-clean for the default build) but external: a
+    /// linked `FFmpeg` built without it simply fails the `select_encoder`
+    /// run-time probe.
     #[must_use]
     pub const fn lgpl_software_encoder(self) -> Option<&'static str> {
         match self {
@@ -67,6 +76,7 @@ impl VideoCodec {
             Self::Mpeg2Video => Some("mpeg2video"),
             Self::Ffv1 => Some("ffv1"),
             Self::Mjpeg => Some("mjpeg"),
+            Self::Vp8 => Some("libvpx"),
         }
     }
 
@@ -79,7 +89,7 @@ impl VideoCodec {
             match self {
                 Self::H264 => Some("libx264"),
                 Self::H265 => Some("libx265"),
-                Self::Mpeg2Video | Self::Ffv1 | Self::Mjpeg => None,
+                Self::Mpeg2Video | Self::Ffv1 | Self::Mjpeg | Self::Vp8 => None,
             }
         }
         #[cfg(not(feature = "gpl-codecs"))]
@@ -99,7 +109,7 @@ impl VideoCodec {
             match self {
                 Self::H264 => Some("h264_nvenc"),
                 Self::H265 => Some("hevc_nvenc"),
-                Self::Mpeg2Video | Self::Ffv1 | Self::Mjpeg => None,
+                Self::Mpeg2Video | Self::Ffv1 | Self::Mjpeg | Self::Vp8 => None,
             }
         }
         #[cfg(not(feature = "cuda"))]

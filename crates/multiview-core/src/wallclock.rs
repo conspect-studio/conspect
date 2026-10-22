@@ -233,6 +233,27 @@ impl WallClockRef {
         let delta_ns = rescale(delta_ticks, tick_timebase, Rational::new(1, 1_000_000_000));
         self.wall_at_anchor_ns.saturating_add(delta_ns)
     }
+
+    /// The **inverse** map (ADR-M010, the outbound presentation epoch): a
+    /// wall-clock instant (integer ns past the Unix epoch) back to the media PTS
+    /// (in `rate` units) the affine map associates with it:
+    /// `media(wall) = media_anchor + rescale(wall − wall_anchor, ns → rate)`.
+    ///
+    /// Exact integer arithmetic (`i128` intermediates via [`rescale`], rounding
+    /// half away from zero) — never float. For the canonical 1 GHz (nanosecond)
+    /// epoch rate the round trip `media_at(wall_at(pts)) == pts` is exact; for a
+    /// coarser rate (e.g. 90 kHz) it is exact to within one tick (the
+    /// quantisation of [`WallClockRef::wall_at`]). A degenerate `rate` yields a
+    /// zero delta (the anchor media position) rather than panicking.
+    #[must_use]
+    pub fn media_at(self, wall_ns: i64) -> i64 {
+        let delta_ns = wall_ns.saturating_sub(self.wall_at_anchor_ns);
+        // Rescale the ns delta into media ticks: from a 1 ns timebase into the
+        // rate.den/rate.num seconds-per-tick timebase.
+        let tick_timebase = Rational::new(self.rate.den, self.rate.num);
+        let delta_ticks = rescale(delta_ns, Rational::new(1, 1_000_000_000), tick_timebase);
+        self.media_at_anchor.saturating_add(delta_ticks)
+    }
 }
 
 /// The effective per-source sync mode (ADR-0038 §1), surfaced so the UI shows which

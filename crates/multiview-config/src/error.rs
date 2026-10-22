@@ -40,6 +40,17 @@ pub enum ConfigError {
         reason: String,
     },
 
+    /// A duration string was not an exact `"<integer><ms|s|m>"` form (e.g.
+    /// `"30s"`): the unit is always explicit, and fractional magnitudes are
+    /// rejected — express them in the next-finer unit (`"1500ms"`).
+    #[error("invalid duration {value:?}: {reason}")]
+    InvalidDuration {
+        /// The offending string as written in the document.
+        value: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+
     /// A CSS-grid track (`columns`/`rows` entry) could not be parsed.
     #[error("invalid grid track {value:?}: expected `<n>fr`, `<n>px`, or `<n>%`")]
     InvalidTrack {

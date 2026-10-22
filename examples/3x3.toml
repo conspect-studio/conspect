@@ -105,6 +105,4 @@ input_id = "in_i"
 kind = "ll_hls"
 path = "/hls/multiview"
 codec = "h264"
-part_target_ms = 250
 segment_ms = 2000
-gop_ms = 2000

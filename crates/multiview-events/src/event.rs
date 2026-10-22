@@ -123,6 +123,64 @@ pub struct AudioMeter {
     pub sampled_hz: u32,
 }
 
+/// A program-bus **EBU R128 loudness** sample (AUD-8): the slow-cadence
+/// compliance lane carrying momentary / short-term / integrated LUFS, loudness
+/// range, and true-peak (dBTP), plus the compliance reference the engine
+/// normalises toward.
+///
+/// Pushed on topic [`crate::topic::Topic::AudioLoudness`], **conflated +
+/// drop-oldest** (inv #10): the meter runs read-only on the off-hot-path audio
+/// bus (BS.1770-4 / EBU Tech 3341/3342, ADR-R006), the engine never blocks on a
+/// client, and a slow UI simply skips samples. Numeric only — never audio
+/// content. **Ballistics are applied client-side** (ADR-R006 wire-to-browser):
+/// the wire carries the raw measured values at ~10 Hz; the browser meter applies
+/// the display decay/peak-hold.
+///
+/// The integrating loudness fields (`momentary`/`short_term`/`integrated`/`lra`/
+/// `true_peak_dbtp`) are `Option` because the meter returns nothing below the
+/// `-70` LUFS absolute gate (e.g. a silenced/lost program) — a `None` is an
+/// honest "no measurement", never a fabricated `-inf` or `0`. The compliance
+/// reference (`target_lufs`/`ceiling_dbtp`/`tolerance_lu`) is always present so
+/// the meter colours against the same target/ceiling the loudnorm processor uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioLoudness {
+    /// The program/bus index this loudness sample is for.
+    pub program: u32,
+    /// Momentary loudness (400 ms window), LUFS. `None` below the absolute gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub momentary: Option<f32>,
+    /// Short-term loudness (3 s window), LUFS. `None` below the absolute gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_term: Option<f32>,
+    /// Integrated (gated) loudness over the program, LUFS. `None` until enough
+    /// gated audio has accumulated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrated: Option<f32>,
+    /// Loudness range (EBU Tech 3342), LU. `None` until enough gated audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lra: Option<f32>,
+    /// Maximum true-peak across channels (4x oversampled BS.1770), dBTP. `None`
+    /// when true-peak measurement is disabled for this program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub true_peak_dbtp: Option<f32>,
+    /// The normalisation target loudness, LUFS (the compliance reference — e.g.
+    /// `-23` EBU broadcast / `-16` streaming). Always present.
+    pub target_lufs: f32,
+    /// The true-peak ceiling, dBTP (the compliance reference — e.g. `-1.5`).
+    /// Always present.
+    pub ceiling_dbtp: f32,
+    /// The live convergence tolerance, LU (e.g. `±1` LU). The meter renders the
+    /// in-spec band as `target ± tolerance`. Always present.
+    pub tolerance_lu: f32,
+    /// The makeup gain the loudnorm processor is currently applying, dB (positive
+    /// boosts, negative attenuates). `None` when no normaliser is engaged (the
+    /// program bus is emitted unaltered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f32>,
+    /// The effective sampling cadence on the wire (Hz).
+    pub sampled_hz: u32,
+}
+
 /// The hardware vendor of a GPU/accelerator (for telemetry display + which
 /// per-engine signals to expect). `#[non_exhaustive]` so a future vendor does
 /// not break the wire enum.
@@ -323,6 +381,107 @@ pub enum WarningCode {
     /// loader/ICD. **Latched** (a build-time fact; raised once, cleared on
     /// reconfigure/restart — it cannot flap).
     GpuPresentNoVulkanAdapter,
+    /// The watched boot config file changed on disk but the new document does
+    /// not parse/validate, so NOTHING was applied — the run keeps the
+    /// last-good configuration (ADR-W020). Remediation: fix the file; the
+    /// next valid write applies and clears this warning.
+    ConfigFileInvalid,
+    /// The watched boot config file changed sections that cannot hot-apply
+    /// (e.g. canvas geometry — Class-2 — or outputs/control), so the running
+    /// process differs from the file until a restart (ADR-W020). **Latched**
+    /// until restart; the message names the pending sections.
+    ConfigFileRequiresRestart,
+    /// A valid config-file change was only PARTIALLY applied: one or more
+    /// engine commands were shed on a full command bus (ADR-W020 review M1).
+    /// The watcher retries the whole (idempotent) apply on its next poll and
+    /// clears this warning when the apply completes.
+    ConfigFileApplyIncomplete,
+    /// A RIST link is recovering far below clean-link quality — sustained packet
+    /// loss has pushed the link-quality metric under the health threshold for
+    /// long enough that the ARQ recovery window is at risk (ADR-0095 Tier-1 /
+    /// RIST-5). Carries the affected link in the warning `subsystem`/`message`.
+    /// Raised by the RIST stats surface and **cleared** automatically when the
+    /// link's quality recovers — a transient blip self-clears (never latched).
+    /// Remediation: investigate the network path (loss/RTT) or raise `buffer_ms`.
+    RistLinkLoss,
+}
+
+/// Which end of a RIST link a [`RistLinkStats`] sample describes.
+///
+/// librist reports **sender-peer** stats on the egress (send) side and
+/// **receiver-flow** stats on the ingress (receive) side; the two share most
+/// fields (rtt/bandwidth/retransmits/quality) but not all, so the role names the
+/// origin. Serialised **`snake_case`** (the stable wire label the UI keys on);
+/// `#[non_exhaustive]` is intentionally **omitted** — RIST has exactly two ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RistLinkRole {
+    /// Egress: `rist_stats_sender_peer` (we are pushing the flow to a peer).
+    Sender,
+    /// Ingress: `rist_stats_receiver_flow` (we are receiving the flow).
+    Receiver,
+}
+
+impl RistLinkRole {
+    /// The stable lower-case wire label for this role (matches `serde`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sender => "sender",
+            Self::Receiver => "receiver",
+        }
+    }
+}
+
+/// A RIST link-health telemetry sample (ADR-0095 Tier-1 / RIST-5).
+///
+/// The wire mirror of librist's periodic `rist_stats` callback — the link
+/// statistics `FFmpeg`'s `rist://` protocol structurally cannot expose (it
+/// registers no stats callback), which is why RIST-5 owns a direct-librist FFI
+/// leaf (`multiview-rist-sys`) to obtain them. Carried by [`Event::RistLinkStats`]
+/// on [`crate::topic::Topic::Outputs`] (a RIST egress link's health is an
+/// output-sink concern) and emitted through the same conflated, drop-oldest
+/// publisher as every other telemetry sample — the engine never blocks on it
+/// (inv #10). [`Event::is_conflated`] returns `true` for it: it is a latest-wins
+/// snapshot, excluded from the lossless replay ring (a re-snapshot heals it).
+///
+/// All counters are **cumulative since the link opened** (librist's model);
+/// rates are derived downstream by differencing successive samples. Fields the
+/// reporting role does not populate are `0` (e.g. `received` is sender-side `0`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RistLinkStats {
+    /// The configured RIST source/output id this link belongs to (the label the
+    /// metrics + UI scope on).
+    pub link_id: String,
+    /// Which end of the link reported these stats.
+    pub role: RistLinkRole,
+    /// The RIST flow id (set by the sender; identifies the flow on the wire).
+    pub flow_id: u32,
+    /// The peer canonical name(s) librist reported for this link.
+    pub cname: String,
+    /// The number of active peers on this link (`1` for a single-link Tier-0/1
+    /// session; `>1` only on a Tier-2 bonded session).
+    pub peer_count: u32,
+    /// Current round-trip time to the peer, milliseconds.
+    pub rtt_ms: u32,
+    /// librist link-quality metric (0–100; 100 = no loss needing recovery).
+    pub quality: f64,
+    /// Average measured throughput, bits per second.
+    pub bandwidth_bps: u64,
+    /// Throughput devoted to ARQ retransmissions, bits per second.
+    pub retry_bandwidth_bps: u64,
+    /// Cumulative packets sent on this link.
+    pub sent: u64,
+    /// Cumulative packets received on this link (receiver role; `0` for sender).
+    pub received: u64,
+    /// Cumulative packets retransmitted (the ARQ recovery traffic).
+    pub retransmitted: u64,
+    /// Cumulative packets lost (could not be recovered within the buffer window).
+    pub lost: u64,
+    /// Cumulative packets recovered by the ARQ retransmission machinery.
+    pub recovered: u64,
+    /// When this link first reported stats (engine monotonic nanoseconds).
+    pub since: i64,
 }
 
 /// An actionable health warning — a richer *sibling* of [`Alert`].
@@ -372,18 +531,52 @@ impl WarningCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::GpuPresentNoVulkanAdapter => "gpu-present-no-vulkan-adapter",
+            Self::ConfigFileInvalid => "config-file-invalid",
+            Self::ConfigFileRequiresRestart => "config-file-requires-restart",
+            Self::ConfigFileApplyIncomplete => "config-file-apply-incomplete",
+            Self::RistLinkLoss => "rist-link-loss",
         }
     }
 }
 
 /// An input source connection-state change.
+///
+/// `#[non_exhaustive]` (ADR-W026): construct via [`InputConnection::new`] plus
+/// the [`InputConnection::with_attempt`] builder so a future field never breaks
+/// a caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InputConnection {
+    /// The owning input's id (the configured source id) — the object axis this
+    /// lifecycle event is authorized under (ADR-W026). An input's connect/flap
+    /// is the same leak class as its `input.streams` inventory, so a
+    /// cam1-scoped principal must not receive cam2's connection deltas.
+    pub input_id: String,
     /// The new lifecycle state of the source.
     pub state: LifecycleState,
     /// The reconnect attempt counter, if reconnecting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
+}
+
+impl InputConnection {
+    /// Build an `input.connection` event body for `input_id` entering `state`,
+    /// with no reconnect attempt counter.
+    #[must_use]
+    pub fn new(input_id: impl Into<String>, state: LifecycleState) -> Self {
+        Self {
+            input_id: input_id.into(),
+            state,
+            attempt: None,
+        }
+    }
+
+    /// Builder: set the reconnect attempt counter (a reconnect in progress).
+    #[must_use]
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
 }
 
 /// The full elementary-stream inventory an input offers (RT-3, ADR-0034 §9).
@@ -532,6 +725,102 @@ impl SalvoEvent {
     #[must_use]
     pub fn with_head(mut self, head: impl Into<String>) -> Self {
         self.head = Some(head.into());
+        self
+    }
+}
+
+/// A media player's discrete transport state (ADR-RT008 / ADR-0097,
+/// media-playout.md): the lifecycle a clip/VT-roll/opener player rides, reported
+/// by the `media.player_state` event. This is the **discrete** state — the
+/// per-frame playhead is carried separately as
+/// [`MediaPlayerEvent::position_frames`], never as a per-frame event.
+///
+/// Serialised **tagged** (`#[serde(tag = "kind", rename_all = "snake_case")]`),
+/// never `untagged` (conventions §5) — the same shape as a tagged
+/// [`TallyTarget`]/[`SyncChange`] union, so the data-carrying [`Vamping`] variant
+/// rides the wire as `{ "kind": "vamping", "exit_armed": true }`. `#[non_exhaustive]`
+/// so a future state does not break the wire enum. ADR-RT008 enumerates
+/// `cued`/`playing`/`paused`/`stopped`/`eof`; [`Loading`] and the
+/// exit-armable [`Vamping`] are the additive vamp/exit states (the VT vamp/exit
+/// delta — the operator's fill-until-a-cue-then-exit-cleanly ask) layered on top.
+///
+/// [`Vamping`]: MediaPlayerState::Vamping
+/// [`Loading`]: MediaPlayerState::Loading
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MediaPlayerState {
+    /// The player is opening/decoding its asset toward the cue point; the cued
+    /// in-point frame is not yet primed. A transient pre-roll state.
+    Loading,
+    /// The asset is loaded and the in-point frame is primed in the tile store,
+    /// holding paused on that frame — ready to take to air (preview-before-trigger).
+    Cued,
+    /// The player is playing forward at the output cadence.
+    Playing,
+    /// The player is paused, holding the current frame.
+    Paused,
+    /// The player is stopped (idle); no asset is rolling.
+    Stopped,
+    /// The player is vamping — looping a fill segment to hold until a cue. When
+    /// `exit_armed` is set, the current lap finishes and the player transitions out
+    /// cleanly at the next loop/frame boundary (the VT vamp/exit feature). Distinct
+    /// from a forever loop precisely because of the armable exit latch.
+    Vamping {
+        /// Whether a clean exit has been armed: the current vamp lap completes,
+        /// then the player leaves the vamp at the boundary.
+        exit_armed: bool,
+    },
+    /// The player reached end-of-file (the asset played to its out-point and no
+    /// loop/vamp is engaged).
+    Eof,
+}
+
+/// A media-player transport-state lifecycle event (topic
+/// [`crate::topic::Topic::Switcher`], ADR-RT008 / ADR-0097).
+///
+/// Identifies the [`player`](MediaPlayerEvent::player) by its stable id (the same
+/// value the envelope `id` is scoped with), the discrete
+/// [`state`](MediaPlayerEvent::state) it transitioned into, the optional
+/// [`asset`](MediaPlayerEvent::asset) currently loaded, and the playhead
+/// [`position_frames`](MediaPlayerEvent::position_frames) at the transition.
+///
+/// **Lossless lifecycle event** (ADR-RT008): rare, operator-meaningful facts kept
+/// in the bounded replay ring — [`Event::is_conflated`] returns `false` for it and
+/// its topic is not high-rate, so a control surface or the SPA can reconstruct an
+/// authoritative player history. It must never be conflated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaPlayerEvent {
+    /// Stable media-player id (matches the envelope `id` scope).
+    pub player: String,
+    /// The asset currently loaded in the player, if any (omitted when none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// The discrete transport state the player transitioned into.
+    pub state: MediaPlayerState,
+    /// The playhead position at the transition, in integer frames at the output
+    /// cadence (exact frames, never a float; ADR-T015). Counts from the asset
+    /// in-point; clients interpolate between events at the output rate.
+    pub position_frames: u64,
+}
+
+impl MediaPlayerEvent {
+    /// Construct a media-player state event for `player` entering `state` at
+    /// `position_frames`, with no asset scope.
+    #[must_use]
+    pub fn new(player: impl Into<String>, state: MediaPlayerState, position_frames: u64) -> Self {
+        Self {
+            player: player.into(),
+            asset: None,
+            state,
+            position_frames,
+        }
+    }
+
+    /// Builder: record the asset currently loaded in the player.
+    #[must_use]
+    pub fn with_asset(mut self, asset: impl Into<String>) -> Self {
+        self.asset = Some(asset.into());
         self
     }
 }
@@ -889,7 +1178,12 @@ pub enum AddressFamily {
 /// `device.discovered`, correlated to the scan via the envelope `corr`
 /// (ADR-RT007). Discovery rows are an **untrusted inventory** requiring
 /// explicit confirm-adopt (ADR-0041 doctrine); they carry no registry id.
+///
+/// `#[non_exhaustive]` (ADR-W026): construct via [`DeviceDiscovered::new`] plus
+/// the [`DeviceDiscovered::with_name`] / [`DeviceDiscovered::with_domain`]
+/// builders so a future field never breaks a caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DeviceDiscovered {
     /// The candidate driver that recognised the device (e.g. `zowietek`).
     pub driver: String,
@@ -900,6 +1194,93 @@ pub struct DeviceDiscovered {
     /// The advertised device name, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The discovery **domain** the observing node stamped on this row
+    /// (ADR-W026), sourced solely from that node's operator-declared
+    /// `[discovery] domain` config — **never** from the responder payload, its
+    /// TXT records, or mesh peer identity (a discovered device is untrusted and
+    /// cannot assert its own scope). `None` = the observing node declared no
+    /// domain; a discovery-scoped principal is denied an unlabelled row
+    /// (fail-closed). Under mesh-forwarded discovery the controller stamps this
+    /// from its own registry record of the enrolled node, never from the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+impl DeviceDiscovered {
+    /// Construct a discovery row with no name and no domain (the two optional,
+    /// builder-set fields).
+    #[must_use]
+    pub fn new(driver: String, address: String, family: AddressFamily) -> Self {
+        Self {
+            driver,
+            address,
+            family,
+            name: None,
+            domain: None,
+        }
+    }
+
+    /// Set the advertised device name.
+    #[must_use]
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// Stamp the observing node's discovery domain (ADR-W026). The caller must
+    /// pass its own local config value, never a value read off the wire.
+    #[must_use]
+    pub fn with_domain(mut self, domain: String) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+}
+
+/// An ephemeral cast session was started — the `data` body of
+/// `cast.session.started` (lossless low-rate lifecycle lane on the `devices`
+/// topic, ADR-M011 over ADR-RT007).
+///
+/// Cast-session list **membership** changes ride this lane so a client
+/// refreshes its session list immediately instead of waiting for a REST
+/// re-poll; the session's live *state* stays on the conflated
+/// `device.status` lane keyed by the same session id. Published at the
+/// control-plane accept point (the session record exists and its supervised
+/// actor is spawned); whether the receiver later accepts the LOAD is the
+/// status lane's story.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastSessionStarted {
+    /// The runtime session id (`cast-session-…`, UUID-fresh per start).
+    pub session_id: String,
+    /// The operator-facing name, if given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The device authority dialled (`host[:port]`, IPv6 bracketed).
+    pub address: String,
+    /// The output id whose HLS rendition the session casts.
+    pub output: String,
+}
+
+/// An ephemeral cast session was removed — the `data` body of
+/// `cast.session.removed` (lossless low-rate lifecycle lane on the `devices`
+/// topic).
+///
+/// Removal covers both the operator stop (`DELETE`, the receiver `STOP` that
+/// clears the TV) and the save-as-device promotion (the ephemeral record is
+/// retired while playback continues under the promoted device id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastSessionRemoved {
+    /// The runtime session id that was removed.
+    pub session_id: String,
+}
+
+impl CastSessionRemoved {
+    /// Build a removal event body for `session_id`.
+    #[must_use]
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
 }
 
 /// What disciplines the wall-clock estimate behind a [`TimingStatus`] epoch
@@ -1077,6 +1458,55 @@ pub struct ShedLoad {
     pub dropped: u64,
 }
 
+/// The authorization classification of an [`Event`] for realtime delivery and
+/// REST parity (ADR-W026) — the single, total, wildcard-free scope axis every
+/// consumer routes through.
+///
+/// Deliberately **not** `#[non_exhaustive]`: it is a purely in-tree contract
+/// (never serialized), so adding an axis must break every `match` on it — in
+/// [`Event::authz_scope`] here and in the control-plane `scope_permits`
+/// predicate — until a human classifies the new axis. That compile-time ratchet
+/// is the whole point: it replaces the old fail-open `_ => deliver` wildcard
+/// that silently firehosed every unclassified event. The borrowed `&str`s point
+/// into the event, so classification allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthzScope<'a> {
+    /// Delivered to any authenticated reader (role still gates the topic). An
+    /// explicit, greppable, review-gated firehose declaration — never a
+    /// fallthrough.
+    Public,
+    /// Restricted to a principal whose `scoped_object_ids` allowlist admits this
+    /// object id (BOLA axis, ADR-W005/W025).
+    Object(&'a str),
+    /// Restricted to a principal whose `scoped_output_ids` allowlist admits this
+    /// output id — matched against **plain** entries only (`program:*` entries
+    /// are inert here).
+    Output(&'a str),
+    /// Restricted to a principal whose `scoped_output_ids` allowlist admits
+    /// `program:<id>` — the program-namespaced grant that carries `timing.status`
+    /// without punning the plain output-id namespace (ADR-W026).
+    Program(&'a str),
+    /// Restricted by discovery **domain** (ADR-W026). `Some(label)` is matched
+    /// against `scoped_discovery_domains`; `None` is an *unlabelled* row, which a
+    /// discovery-scoped principal is denied (fail-closed). The policy lives in
+    /// the control-plane predicate; this classifier only reports the label.
+    DiscoveryDomain(Option<&'a str>),
+    /// Restricted by **both** an object id and an output id — the two-axis
+    /// conjunction an event whose REST twin gates both surfaces requires
+    /// (ADR-W026). The predicate admits it iff `scoped_object_ids` admits
+    /// `object` **and** `scoped_output_ids` admits `output` (either axis unset =
+    /// unrestricted on that axis). Carries a head-scoped `salvo.*` — the REST
+    /// twin runs `authorize_object(salvo)` **and** `authorize_output(head)`; a
+    /// head-less recall stays a plain [`AuthzScope::Object`].
+    ObjectAndOutput {
+        /// The object-axis id (matched against `scoped_object_ids`).
+        object: &'a str,
+        /// The output-axis id (matched against `scoped_output_ids`, plain
+        /// entries only).
+        output: &'a str,
+    },
+}
+
 /// The discriminated payload of every frame: control frames and data events.
 ///
 /// Internally tagged on `t` with the body under `data` (ADR-RT002). The
@@ -1136,6 +1566,11 @@ pub enum Event {
     /// High-rate audio meter sample (topic `audio.meters`).
     #[serde(rename = "audio.meter")]
     AudioMeter(AudioMeter),
+    /// Program-bus EBU R128 loudness sample (topic `audio.loudness`): the
+    /// slow-cadence M/S/I/LRA/dBTP compliance lane. Conflated + drop-oldest;
+    /// pushed, never polled (inv #10).
+    #[serde(rename = "audio.loudness")]
+    AudioLoudness(AudioLoudness),
     /// High-rate whole-system metrics sample (topic `system`): cpu / gpu /
     /// encoder-decoder. Conflated + drop-oldest; pushed, never polled.
     #[serde(rename = "system.metrics")]
@@ -1143,6 +1578,13 @@ pub enum Event {
     /// Output sink status (topic `outputs`).
     #[serde(rename = "output.status")]
     OutputStatus(OutputStatus),
+    /// A RIST link-health telemetry sample (topic `outputs`): retransmits / RTT /
+    /// link-quality / bandwidth / lost / recovered for a RIST source or output
+    /// link, obtained via the direct-librist FFI stats callback `FFmpeg`'s
+    /// `rist://` protocol cannot expose (ADR-0095 Tier-1). Conflated latest-wins
+    /// + drop-oldest; pushed, never polled (inv #10).
+    #[serde(rename = "rist.link.stats")]
+    RistLinkStats(RistLinkStats),
     /// An operator alert raised (topic `alerts`).
     #[serde(rename = "alert.raised")]
     AlertRaised(Alert),
@@ -1204,6 +1646,16 @@ pub enum Event {
     #[serde(rename = "salvo.cancelled")]
     SalvoCancelled(SalvoEvent),
 
+    // ---- Switcher realtime surface (topic `switcher`, ADR-RT008) ----
+    /// A media player's discrete transport state changed (topic `switcher`,
+    /// envelope `id` = player id). A **lossless** lifecycle event kept in the
+    /// replay ring ([`Event::is_conflated`] is `false`): cued / playing / paused /
+    /// stopped / `vamping{exit_armed}` / eof / loading transitions, plus the playhead
+    /// `position_frames`. Discrete state changes only — never a per-frame position
+    /// stream.
+    #[serde(rename = "media.player_state")]
+    MediaPlayerState(MediaPlayerEvent),
+
     // ---- Devices realtime surface (topic `devices`, ADR-RT007) ----
     /// Conflated latest-wins per-device runtime snapshot (envelope `id` =
     /// device id). Excluded from the lossless replay ring per event type
@@ -1231,6 +1683,14 @@ pub enum Event {
     /// correlated via the envelope `corr` (lossless lifecycle lane).
     #[serde(rename = "device.discovered")]
     DeviceDiscovered(DeviceDiscovered),
+    /// An ephemeral cast session was started (lossless lifecycle lane;
+    /// membership of the cast-session list changed).
+    #[serde(rename = "cast.session.started")]
+    CastSessionStarted(CastSessionStarted),
+    /// An ephemeral cast session was removed — stopped or promoted to a saved
+    /// device (lossless lifecycle lane; membership changed).
+    #[serde(rename = "cast.session.removed")]
+    CastSessionRemoved(CastSessionRemoved),
     /// F3 sync telemetry: the outbound presentation epoch + per-group achieved
     /// skew (envelope `id` = program or sync-group id). Latest-wins and
     /// ring-excluded like `device.status` — the affine epoch stays valid when
@@ -1258,8 +1718,10 @@ impl Event {
             Self::TileState(_) => "tile.state",
             Self::TilesSnapshot(_) => "$snapshot",
             Self::AudioMeter(_) => "audio.meter",
+            Self::AudioLoudness(_) => "audio.loudness",
             Self::SystemMetrics(_) => "system.metrics",
             Self::OutputStatus(_) => "output.status",
+            Self::RistLinkStats(_) => "rist.link.stats",
             Self::AlertRaised(_) => "alert.raised",
             Self::AlertCleared(_) => "alert.cleared",
             Self::HealthWarningRaised(_) => "health.warning.raised",
@@ -1276,6 +1738,7 @@ impl Event {
             Self::SalvoArmed(_) => "salvo.armed",
             Self::SalvoTaken(_) => "salvo.taken",
             Self::SalvoCancelled(_) => "salvo.cancelled",
+            Self::MediaPlayerState(_) => "media.player_state",
             Self::DeviceStatus(_) => "device.status",
             Self::DeviceAdopted(_) => "device.adopted",
             Self::DeviceRemoved(_) => "device.removed",
@@ -1283,7 +1746,124 @@ impl Event {
             Self::DeviceError(_) => "device.error",
             Self::DeviceSync(_) => "device.sync",
             Self::DeviceDiscovered(_) => "device.discovered",
+            Self::CastSessionStarted(_) => "cast.session.started",
+            Self::CastSessionRemoved(_) => "cast.session.removed",
             Self::TimingStatus(_) => "timing.status",
+        }
+    }
+
+    /// The authorization scope this event is delivered under (ADR-W026).
+    ///
+    /// This is the single, total classification the realtime delta filter, the
+    /// connect snapshot, and REST parity all consult (via the control-plane
+    /// `scope_permits` predicate). The match is **exhaustive and wildcard-free**
+    /// by design: adding an [`Event`] variant fails compilation here until its
+    /// author classifies it, which kills the old fail-open `_ => deliver`
+    /// firehose at the root. Every [`AuthzScope::Public`] arm carries a one-line
+    /// justification so the firehose is an enumerated, reviewed decision.
+    #[must_use]
+    // The `Public` arms are deliberately split by resource family so each keeps
+    // its own review-gated justification comment (ADR-W026): the firehose must
+    // stay an enumerated, auditable decision, not a merged catch-all.
+    #[allow(clippy::match_same_arms)]
+    pub fn authz_scope(&self) -> AuthzScope<'_> {
+        match self {
+            // Control frames are protocol plumbing, not resource data — public.
+            Self::Hello(_)
+            | Self::Subscribe(_)
+            | Self::Subscribed(_)
+            | Self::Unsubscribe(_)
+            | Self::SetRate(_)
+            | Self::Resume(_)
+            | Self::Resync(_)
+            | Self::Lag(_)
+            | Self::Ping
+            | Self::Pong
+            | Self::Error(_) => AuthzScope::Public,
+
+            // ---- Object-scoped (a REST `authorize_object` read gates the id) ----
+            Self::DeviceStatus(e) => AuthzScope::Object(&e.device_id),
+            Self::DeviceAdopted(e) => AuthzScope::Object(&e.device_id),
+            Self::DeviceRemoved(e) => AuthzScope::Object(&e.device_id),
+            Self::DeviceMode(e) => AuthzScope::Object(&e.device_id),
+            Self::DeviceError(e) => AuthzScope::Object(&e.device_id),
+            Self::DeviceSync(e) => AuthzScope::Object(&e.device_id),
+            Self::CastSessionStarted(e) => AuthzScope::Object(&e.session_id),
+            Self::CastSessionRemoved(e) => AuthzScope::Object(&e.session_id),
+            Self::MediaPlayerState(e) => AuthzScope::Object(&e.player),
+            // A tile bound to an input is object-scoped by that input id; a
+            // placeholder/no-signal tile (`input: None`) has no authorizable
+            // object and stays public (structurally id-less).
+            Self::TileState(t) => t
+                .input
+                .as_deref()
+                .map_or(AuthzScope::Public, AuthzScope::Object),
+
+            // ---- Discovery-domain-scoped (ADR-W026) ----
+            // The observing node's stamped domain; `None` is unlabelled and
+            // denied to a discovery-scoped principal by the predicate.
+            Self::DeviceDiscovered(d) => AuthzScope::DiscoveryDomain(d.domain.as_deref()),
+
+            // ---- Program-scoped (ADR-W026) ----
+            // The outbound presentation epoch, keyed by its program stream id;
+            // delivered to output-scoped principals only via a `program:<id>`
+            // grant.
+            Self::TimingStatus(t) => AuthzScope::Program(&t.stream_id),
+
+            // ---- Output-scoped (ADR-W026) ----
+            // A RIST link's health is an output-sink concern keyed by its
+            // configured source/output id; `cname` leaks peer-hostname topology,
+            // so it must not firehose to an output-scoped principal (REST twin:
+            // rides `Topic::Outputs`).
+            Self::RistLinkStats(e) => AuthzScope::Output(&e.link_id),
+
+            // ---- Object-scoped input lanes (ADR-W026) ----
+            // An input's stream inventory and its connect/flap lifecycle share
+            // the input-id object namespace with `tile.state`; their REST twins
+            // are `authorize_object`-gated. "input cam2 flapping" is the same
+            // leak class to a cam1-scoped principal.
+            Self::InputStreams(e) => AuthzScope::Object(&e.input_id),
+            Self::InputConnection(e) => AuthzScope::Object(&e.input_id),
+
+            // ---- Object+output-scoped salvo lane (ADR-W026) ----
+            // The REST twin gates BOTH axes when a head is addressed
+            // (`authorize_object(salvo)` + `authorize_output(head)`), so a
+            // head-scoped recall is the two-axis conjunction; a head-less
+            // whole-wall recall gates the salvo object only (the REST path skips
+            // `authorize_output` when no head is given).
+            Self::SalvoArmed(e) | Self::SalvoTaken(e) | Self::SalvoCancelled(e) => {
+                e.head.as_deref().map_or_else(
+                    || AuthzScope::Object(&e.salvo),
+                    |head| AuthzScope::ObjectAndOutput {
+                        object: &e.salvo,
+                        output: head,
+                    },
+                )
+            }
+
+            // ---- Public data lanes (preserve the pre-W026 firehose, reviewed) ----
+            // The connect-time tile baseline rides its own `tiles` snapshot path,
+            // not the object axis — public like the rest of the tile lane.
+            Self::TilesSnapshot(_) => AuthzScope::Public,
+            // Whole-program telemetry with no per-tenant object dimension today.
+            Self::AudioMeter(_)
+            | Self::AudioLoudness(_)
+            | Self::SystemMetrics(_)
+            | Self::OutputStatus(_) => AuthzScope::Public,
+            // Operator alert / health / degradation lanes — node-wide signals.
+            Self::AlertRaised(_)
+            | Self::AlertCleared(_)
+            | Self::HealthWarningRaised(_)
+            | Self::HealthWarningCleared(_)
+            | Self::ShedLoad(_) => AuthzScope::Public,
+            // Job progress is correlated by `corr`, not a per-object resource.
+            Self::JobProgress(_) => AuthzScope::Public,
+            // Broadcast monitoring surface — node-wide operator lanes.
+            Self::AlarmRaised(_)
+            | Self::AlarmUpdated(_)
+            | Self::AlarmCleared(_)
+            | Self::AlarmAcked(_)
+            | Self::TallyState(_) => AuthzScope::Public,
         }
     }
 
@@ -1298,18 +1878,23 @@ impl Event {
     /// status is a snapshot by definition, and the timing epoch is an affine
     /// map that stays valid when stale), while the device lifecycle events on
     /// the same topic stay lossless in the ring. The existing conflated lanes
-    /// (`audio.meter`, `system.metrics`) answer `true` here too, so this
-    /// predicate is the single per-event source of truth for conflation. No
-    /// production consumer consults it yet: the pump's Devices handling lands
-    /// with the producers in DEV-A3.
+    /// (`audio.meter`, `audio.loudness`, `system.metrics`) answer `true` here
+    /// too, so this predicate is the single per-event source of truth for
+    /// conflation. The control session pump consults it in production
+    /// (`multiview-control/src/realtime.rs`: ring exclusion is
+    /// `topic.is_high_rate() || event.is_conflated()`), and the
+    /// `timing.status` producer (`multiview-cli/src/timing_status.rs`)
+    /// publishes through that rule at ~1 Hz.
     #[must_use]
     pub const fn is_conflated(&self) -> bool {
         matches!(
             self,
             Self::AudioMeter(_)
+                | Self::AudioLoudness(_)
                 | Self::SystemMetrics(_)
                 | Self::DeviceStatus(_)
                 | Self::TimingStatus(_)
+                | Self::RistLinkStats(_)
         )
     }
 

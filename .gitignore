@@ -45,6 +45,32 @@ dist/
 # Demo/multiview screenshots for manual inspection (not part of the product)
 /demo-output/
 
-# Coding-agent local working directory (sessions, scratch) — never part of the product
-/.claude/
+# Coding-agent working directory. Most of it is local scratch (sessions, locks,
+# worktree lanes, per-host settings) and is NOT part of the product — but the
+# committed governance machinery IS (ADR-G006/G007): settings.json, skills/,
+# hooks/, workflows/. Ignore the contents, then re-include the committed paths.
+# (You cannot negate a child if the parent dir itself is ignored, so we ignore
+# `/.claude/*`.)
+/.claude/*
+!/.claude/settings.json
+!/.claude/.gitignore
+!/.claude/skills/
+!/.claude/hooks/
+!/.claude/workflows/
+
+# Local persistent memory MCP store (embedded qdrant + embedding-model cache) —
+# never commit (ADR-G006). `.memory/` is the canonical relative path the memory
+# MCP resolves against the project root (see docs/runbooks/memory-mcp.md). The
+# `${CLAUDE_PROJECT_DIR}` form below guards the literal-named directory created
+# when an older client failed to expand that variable (ADR-G007 substrate fix).
+/.memory/
+/${CLAUDE_PROJECT_DIR}/
+
+# Manual worktree lanes (alt location to .claude/worktrees/) — disposable.
+/.worktrees/
+
 demo-output/
+
+# graphify knowledge-graph build scratch — gitignored, never committable
+# (estate remediation 2026-08-17; clone-portable unlike .git/info/exclude).
+graphify-out/

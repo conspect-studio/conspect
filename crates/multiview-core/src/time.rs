@@ -180,6 +180,43 @@ impl Rational {
         num / den
     }
 
+    /// The rounded per-tick **period in nanoseconds** for this cadence — i.e. the
+    /// nanosecond span of one tick, `round(NANOS_PER_SEC · den / num)`.
+    ///
+    /// This is exactly `MediaTime::from_tick(1, self).as_nanos()` — the same value
+    /// the output clock uses for `pts_at(1)`. Returns `0` for a degenerate cadence
+    /// (`num == 0`/`den == 0`), and rounds to `0` for a sub-nanosecond period.
+    /// Diagnostics/accessor only — for the validation bound use
+    /// [`Rational::has_subnanosecond_period`], which tests the *exact* period (the
+    /// rounded value can be `1` while the exact period is `< 1 ns`, e.g. 1.5 GHz).
+    #[must_use]
+    pub fn period_nanos(self) -> i64 {
+        MediaTime::from_tick(1, self).as_nanos()
+    }
+
+    /// Whether one tick's **exact** period is shorter than one nanosecond — i.e.
+    /// `den/num · NANOS_PER_SEC < 1`, equivalently `num > NANOS_PER_SEC · den`
+    /// (the cadence exceeds 1 GHz).
+    ///
+    /// Such a cadence is rejected by [`crate::layout::Canvas::validate`] and the
+    /// engine's `OutputClock::new`: with a sub-nanosecond exact period, consecutive
+    /// ticks can round to the **same** nanosecond, breaking strictly-increasing
+    /// output PTS (invariant #3) and the output clock's exact-floor wall-clock
+    /// resync (ADR-T018). The test uses the exact period (not the rounded
+    /// `period_nanos`), computed in i128 so `NANOS_PER_SEC · den` cannot overflow.
+    /// A degenerate non-positive cadence (`num <= 0`/`den <= 0`) is not classified
+    /// here — the positive-rational checks reject it first.
+    #[must_use]
+    pub fn has_subnanosecond_period(self) -> bool {
+        if self.num <= 0 || self.den <= 0 {
+            return false;
+        }
+        // period_exact = (NANOS_PER_SEC · den) / num seconds-as-ns; < 1 ns ⇔
+        // NANOS_PER_SEC · den < num.
+        i128::from(MediaTime::NANOS_PER_SEC).saturating_mul(i128::from(self.den))
+            < i128::from(self.num)
+    }
+
     /// Cross-multiplied numerator/denominator in `i128`, sign-normalized so the
     /// effective denominator is positive. Used for `Ord`/`PartialOrd`.
     fn cross_terms(self) -> (i128, i128) {
@@ -326,5 +363,55 @@ impl MediaTime {
     #[must_use]
     pub const fn saturating_sub(self, other: Self) -> Self {
         Self(self.0.saturating_sub(other.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_subnanosecond_period_is_exact_not_rounded() {
+        // Exact period >= 1 ns (fps <= 1 GHz): accepted (not sub-ns).
+        assert!(!Rational::new(60, 1).has_subnanosecond_period());
+        assert!(!Rational::new(30_000, 1_001).has_subnanosecond_period());
+        assert!(!Rational::new(24_000, 1_001).has_subnanosecond_period());
+        // Exactly 1 GHz — period is exactly 1 ns, the accepted boundary.
+        assert!(!Rational::new(1_000_000_000, 1).has_subnanosecond_period());
+        // A non-trivial denominator: 2e9/3 ≈ 0.667 GHz → period 1.5 ns, accepted.
+        assert!(!Rational::new(2_000_000_000, 3).has_subnanosecond_period());
+
+        // Just over 1 GHz: the ROUNDED period is still 1 ns, but the EXACT period is
+        // < 1 ns — this is the case `period_nanos() < 1` would WRONGLY accept and is
+        // exactly why the bound tests the exact period.
+        assert_eq!(Rational::new(1_500_000_000, 1).period_nanos(), 1);
+        assert!(Rational::new(1_500_000_000, 1).has_subnanosecond_period());
+        assert!(Rational::new(1_000_000_001, 1).has_subnanosecond_period());
+        assert!(Rational::new(2_000_000_000, 1).has_subnanosecond_period());
+        // Absurdly fast: period rounds to 0.
+        assert_eq!(Rational::new(10_000_000_000, 1).period_nanos(), 0);
+        assert!(Rational::new(10_000_000_000, 1).has_subnanosecond_period());
+
+        // Degenerate/non-positive cadences are not classified here (the
+        // positive-rational checks reject them first); never panics.
+        assert!(!Rational::new(0, 1).has_subnanosecond_period());
+        assert!(!Rational::new(60, 0).has_subnanosecond_period());
+        assert!(!Rational::new(-60, 1).has_subnanosecond_period());
+        // i64::MAX numerator must not overflow the i128 cross-multiply.
+        assert!(Rational::new(i64::MAX, 1).has_subnanosecond_period());
+    }
+
+    #[test]
+    fn period_nanos_matches_pts_at_one() {
+        for cadence in [
+            Rational::new(60, 1),
+            Rational::new(30_000, 1_001),
+            Rational::new(1_000_000_000, 1),
+        ] {
+            assert_eq!(
+                cadence.period_nanos(),
+                MediaTime::from_tick(1, cadence).as_nanos()
+            );
+        }
     }
 }

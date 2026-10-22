@@ -21,7 +21,7 @@
 #   * builder  — `cargo chef cook` pre-builds the dependency graph as a CACHED
 #                layer keyed on recipe.json, THEN copies the source + web/dist and
 #                builds the `multiview` binary with `--features
-#                ${CARGO_FEATURES}` (default ffmpeg,linux-vaapi,web — the `web`
+#                ${CARGO_FEATURES}` (default ffmpeg,linux-vaapi,web,ntp — the `web`
 #                feature pulls multiview-control/embed-web, embedding the SPA so
 #                the web UI + REST/WS API + OpenAPI/Scalar docs serve from the
 #                binary on the [control] listener). ffmpeg-sys-next's build.rs
@@ -39,7 +39,7 @@
 # DELIBERATELY do NOT enable `gpl-codecs` (x264/x265) here. A separate `-gpl`
 # image tag (built with `--build-arg
 # FFMPEG_IMAGE=ghcr.io/aperim/multiview-ffmpeg:8.1.1-gpl --build-arg
-# CARGO_FEATURES=ffmpeg,linux-vaapi,web,gpl-codecs`) is the opt-in GPL variant.
+# CARGO_FEATURES=ffmpeg,linux-vaapi,web,ntp,gpl-codecs`) is the opt-in GPL variant.
 #
 # 8.1.1 → libavcodec.so.62 / libavutil.so.60 / libavformat.so.62, matching
 # `ffmpeg-sys-next 8.1.0` (build.rs `ffmpeg_8_1` → libavcodec 62), the version
@@ -141,14 +141,17 @@ RUN cargo chef prepare --recipe-path recipe.json
 # -----------------------------------------------------------------------------
 FROM chef AS builder
 
-# Build-time feature set. Default is the LGPL-clean `ffmpeg,linux-vaapi,web`
-# (`web` embeds the SPA + serves the control API; no GPL deps). Pass
-# `--build-arg CARGO_FEATURES=ffmpeg,linux-vaapi,web,gpl-codecs` (with
+# Build-time feature set. Default is the LGPL-clean `ffmpeg,linux-vaapi,web,ntp`
+# (`web` embeds the SPA + serves the control API; `ntp` measures the kernel
+# NTP/chrony discipline for the outbound presentation epoch instead of assuming
+# it — the linux-vaapi preset already implies it, named here so an override list
+# keeps it deliberately; no GPL deps). Pass
+# `--build-arg CARGO_FEATURES=ffmpeg,linux-vaapi,web,ntp,gpl-codecs` (with
 # `--build-arg FFMPEG_IMAGE=…:8.1.1-gpl`) to produce the GPL `-gpl` image variant.
 # CARGO_FEATURES is threaded IDENTICALLY into `cook` and `build` — a mismatch
 # pre-builds the wrong dependency closure and silently triggers a near-full
 # rebuild while appearing to hit the cache.
-ARG CARGO_FEATURES=ffmpeg,linux-vaapi,web
+ARG CARGO_FEATURES=ffmpeg,linux-vaapi,web,ntp
 
 # Cook the dependency graph from recipe.json ONLY. This is the expensive,
 # cacheable layer: it busts only when Cargo.{toml,lock} (→ recipe.json) change,

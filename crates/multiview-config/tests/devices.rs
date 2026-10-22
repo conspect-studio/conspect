@@ -469,6 +469,116 @@ address = ""
     );
 }
 
+// SSRF (SEC-02/SEC-04, CWE-918): `Device::validate` is the config-load,
+// deployment-independent layer — it rejects the NEVER-legitimate literal dial
+// targets (loopback, link-local incl. the cloud-metadata IP, unspecified,
+// multicast/broadcast, IPv4-mapped forms) and enforces the http/https scheme
+// allowlist for device-management URLs. Private/ULA are the legitimate LAN
+// device range (the canonical `http://[fd00:db8::42]` example) so they are NOT
+// rejected here — the resolved-IP dial guard (default-deny + operator
+// allowlist) enforces them at runtime, which is also the only layer that can
+// defeat DNS-rebind.
+
+#[test]
+fn device_management_address_rejects_never_legitimate_literals_and_unsafe_schemes() {
+    let rejected = [
+        ("http://169.254.169.254/latest/meta-data", "link-local/IMDS"),
+        ("http://127.0.0.1/admin", "IPv4 loopback"),
+        ("http://169.254.42.1/admin", "IPv4 link-local"),
+        ("http://0.0.0.0/admin", "IPv4 unspecified"),
+        ("http://239.0.0.9/admin", "IPv4 multicast"),
+        ("http://255.255.255.255/admin", "IPv4 broadcast"),
+        ("http://[::1]/admin", "IPv6 loopback"),
+        ("http://[fe80::1]/admin", "IPv6 link-local"),
+        ("http://[::]/admin", "IPv6 unspecified"),
+        ("http://[ff02::1]/admin", "IPv6 multicast"),
+        (
+            "http://[::ffff:169.254.169.254]/admin",
+            "IPv4-mapped IMDS bypass",
+        ),
+        ("ftp://198.51.100.8/admin", "scheme outside HTTP allowlist"),
+        ("gopher://198.51.100.8/admin", "gopher SSRF gadget scheme"),
+    ];
+
+    for (address, reason) in rejected {
+        let fragment =
+            format!("[[devices]]\nid = \"dev-a\"\ndriver = \"zowietek\"\naddress = {address:?}\n");
+        let cfg = parse(&[&fragment]);
+        let err = cfg
+            .validate()
+            .expect_err("SSRF-capable device-management address must fail");
+        assert!(
+            err.to_string().contains("address"),
+            "{reason} rejection names the address field: {err}"
+        );
+    }
+}
+
+#[test]
+fn device_management_address_accepts_public_lan_and_dns_hosts() {
+    // Public literals, DNS names, AND private/ULA LAN literals validate: the
+    // LAN range is where real managed devices live (dial-gated at runtime, not
+    // rejected at config-load).
+    for address in [
+        "http://198.51.100.8:8080",
+        "https://[2001:db8::8]:8443",
+        "https://device.example.test",
+        "http://192.168.0.8",
+        "http://[fd00:db8::42]",
+    ] {
+        let fragment =
+            format!("[[devices]]\nid = \"dev-a\"\ndriver = \"zowietek\"\naddress = {address:?}\n");
+        parse(&[&fragment])
+            .validate()
+            .unwrap_or_else(|err| panic!("address {address:?} must validate: {err}"));
+    }
+}
+
+#[test]
+fn cast_device_address_rejects_never_legitimate_literals() {
+    let rejected = [
+        "169.254.169.254:8009",
+        "127.0.0.1:8009",
+        "169.254.42.1:8009",
+        "0.0.0.0:8009",
+        "239.0.0.9:8009",
+        "[::1]:8009",
+        "[fe80::1]:8009",
+        "[::]:8009",
+        "[ff02::1]:8009",
+        "[::ffff:127.0.0.1]:8009",
+    ];
+
+    for address in rejected {
+        let fragment =
+            format!("[[devices]]\nid = \"cast-a\"\ndriver = \"cast\"\naddress = {address:?}\n");
+        let err = parse(&[&fragment])
+            .validate()
+            .expect_err("SSRF-capable cast dial target must fail");
+        assert!(
+            err.to_string().contains("address"),
+            "rejection names the address field: {err}"
+        );
+    }
+}
+
+#[test]
+fn cast_device_address_accepts_public_lan_and_dns_hosts() {
+    for address in [
+        "198.51.100.8:8009",
+        "[2001:db8::8]:8009",
+        "cast.example.test:8009",
+        "192.168.0.8:8009",
+        "[fd00:db8::42]:8009",
+    ] {
+        let fragment =
+            format!("[[devices]]\nid = \"cast-a\"\ndriver = \"cast\"\naddress = {address:?}\n");
+        parse(&[&fragment])
+            .validate()
+            .unwrap_or_else(|err| panic!("cast target {address:?} must validate: {err}"));
+    }
+}
+
 #[test]
 fn empty_secret_ref_is_rejected() {
     let cfg = parse(&[r#"

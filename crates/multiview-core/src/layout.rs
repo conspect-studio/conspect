@@ -21,13 +21,19 @@ pub enum FitMode {
     Fill,
 }
 
-/// A quarter-turn (90°-step) rotation applied to a tile's source before fit.
+/// A quarter-turn (90°-step) rotation: the shared `none`/`cw90`/`cw180`/`cw270`
+/// vocabulary used by the per-output presentation orientation (ADR-0089).
 ///
-/// Broadcast walls routinely mount portrait monitors; per-tile rotation lets a
-/// landscape source fill a portrait tile (and vice versa). Only quarter turns
-/// are offered so the rotation is lossless and GPU-cheap (a sampling transform,
-/// no resampling artefacts). `#[non_exhaustive]` for forward compatibility.
+/// Only quarter turns are offered so a pixel rotation stays lossless and
+/// GPU-cheap (a sampling transform, no resampling artefacts) and a
+/// display-rotation tag can carry it exactly. `#[non_exhaustive]` for forward
+/// compatibility.
+///
+/// Serializes in **`snake_case`** (`none`/`cw90`/`cw180`/`cw270`) — the
+/// project-wide serde convention and the authoring spelling the config schema
+/// documents for the per-output `orientation.turn` (ADR-0089 §2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QuarterTurn {
     /// No rotation (0°).
@@ -84,24 +90,6 @@ impl Orientation {
     }
 }
 
-/// A normalized source-rectangle (region of interest) cropped from a tile's
-/// source before it is fitted into the cell.
-///
-/// All four fields are fractions of the **source** frame in `0.0..=1.0`; a full
-/// frame is `{ x: 0, y: 0, w: 1, h: 1 }`. Validated by [`Layout::validate`]
-/// (within the unit square, positive extent, finite).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct CropRect {
-    /// Left edge (fraction of source width).
-    pub x: f32,
-    /// Top edge (fraction of source height).
-    pub y: f32,
-    /// Width (fraction of source width).
-    pub w: f32,
-    /// Height (fraction of source height).
-    pub h: f32,
-}
-
 /// The fully-opaque default opacity (`1.0`) for a [`Cell`].
 ///
 /// Used as the serde default and by [`Cell`]'s [`Default`] impl so a cell built
@@ -113,11 +101,10 @@ const fn default_opacity() -> f32 {
 
 /// One multiview cell/tile: a normalized rectangle (`0.0..=1.0`) on the canvas.
 ///
-/// The broadcast extras — [`crop`](Cell::crop), [`rotation`](Cell::rotation),
-/// and [`opacity`](Cell::opacity) — are **additive and defaulted**: a `Cell`
-/// constructed without them (or deserialized from a document predating them)
-/// behaves exactly as before. Use `..Cell::default()` in struct literals to opt
-/// out of the new fields.
+/// The per-tile [`opacity`](Cell::opacity) is **additive and defaulted**: a
+/// `Cell` constructed without it (or deserialized from a document predating it)
+/// composites as a hard-cover, exactly as before. Use `..Cell::default()` in
+/// struct literals to opt out of the new field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
     /// Left edge (fraction of canvas width).
@@ -134,14 +121,6 @@ pub struct Cell {
     pub fit: FitMode,
     /// Bound source id, if any.
     pub source: Option<String>,
-    /// Optional per-tile source crop / region-of-interest. [`None`] (the
-    /// default) uses the full source frame.
-    #[serde(default)]
-    pub crop: Option<CropRect>,
-    /// Per-tile quarter-turn rotation applied to the source before fit.
-    /// Defaults to [`QuarterTurn::None`].
-    #[serde(default)]
-    pub rotation: QuarterTurn,
     /// Per-tile uniform opacity (straight alpha) in the closed interval
     /// `[0.0, 1.0]`, applied in the compositor's premultiplied linear-light
     /// `over` blend. Defaults to `1.0` (fully opaque / hard-cover); a lower
@@ -162,8 +141,6 @@ impl Default for Cell {
             z: 0,
             fit: FitMode::default(),
             source: None,
-            crop: None,
-            rotation: QuarterTurn::default(),
             opacity: default_opacity(),
         }
     }
@@ -248,6 +225,18 @@ impl Canvas {
                 self.fps_num, self.fps_den
             )));
         }
+        // The per-tick period must be at least 1 ns (i.e. fps <= 1 GHz, far above
+        // any real video rate). A sub-nanosecond period collapses consecutive ticks
+        // onto the same nanosecond, which breaks strictly-increasing output PTS
+        // (invariant #3) and defeats the output clock's exact-floor wall-clock resync
+        // (ADR-T018). Reject it here rather than silently degrade.
+        if self.cadence().has_subnanosecond_period() {
+            return Err(Error::Config(format!(
+                "canvas cadence {}/{} is too fast: the per-tick period is under 1 ns \
+                 (fps must be <= 1 GHz)",
+                self.fps_num, self.fps_den
+            )));
+        }
         Ok(())
     }
 }
@@ -273,8 +262,6 @@ impl Layout {
     /// - every cell rectangle is finite, lies within `0.0..=1.0` on both axes
     ///   (`x + w <= 1.0`, `y + h <= 1.0`), and has positive extent (`w > 0`,
     ///   `h > 0`);
-    /// - any per-cell [`crop`](Cell::crop) region-of-interest is finite, lies
-    ///   within the source unit square `0.0..=1.0`, and has positive extent;
     /// - every cell's [`opacity`](Cell::opacity) is finite and within the
     ///   closed straight-alpha interval `0.0..=1.0`.
     ///
@@ -345,57 +332,6 @@ fn validate_cell(index: usize, cell: &Cell) -> Result<()> {
         return Err(Error::Config(format!(
             "cell {index}: opacity must be within 0.0..=1.0 (got {})",
             cell.opacity
-        )));
-    }
-    if let Some(crop) = cell.crop {
-        validate_crop(index, &crop)?;
-    }
-    Ok(())
-}
-
-/// Validate a per-cell source crop rectangle, attributing failures to `index`.
-fn validate_crop(index: usize, crop: &CropRect) -> Result<()> {
-    let fields = [
-        ("crop.x", crop.x),
-        ("crop.y", crop.y),
-        ("crop.w", crop.w),
-        ("crop.h", crop.h),
-    ];
-    for (name, value) in fields {
-        if !value.is_finite() {
-            return Err(Error::Config(format!(
-                "cell {index}: {name} must be finite (got {value})"
-            )));
-        }
-    }
-    if crop.w <= 0.0 {
-        return Err(Error::Config(format!(
-            "cell {index}: crop.w must be > 0 (got {})",
-            crop.w
-        )));
-    }
-    if crop.h <= 0.0 {
-        return Err(Error::Config(format!(
-            "cell {index}: crop.h must be > 0 (got {})",
-            crop.h
-        )));
-    }
-    if crop.x < 0.0 || crop.y < 0.0 {
-        return Err(Error::Config(format!(
-            "cell {index}: crop origin ({}, {}) must be within 0.0..=1.0",
-            crop.x, crop.y
-        )));
-    }
-    if crop.x + crop.w > 1.0 {
-        return Err(Error::Config(format!(
-            "cell {index}: crop.x + crop.w = {} exceeds 1.0",
-            crop.x + crop.w
-        )));
-    }
-    if crop.y + crop.h > 1.0 {
-        return Err(Error::Config(format!(
-            "cell {index}: crop.y + crop.h = {} exceeds 1.0",
-            crop.y + crop.h
         )));
     }
     Ok(())
@@ -543,5 +479,56 @@ impl VideoWall {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn canvas(fps_num: i64, fps_den: i64) -> Canvas {
+        Canvas {
+            width: 1920,
+            height: 1080,
+            fps_num,
+            fps_den,
+        }
+    }
+
+    #[test]
+    fn canvas_validate_rejects_subnanosecond_cadence() {
+        // fps > 1 GHz → sub-nanosecond per-tick period → rejected (inv #3 / ADR-T018).
+        for (num, den) in [
+            (10_000_000_000_i64, 1_i64), // period rounds to 0 ns
+            (1_500_000_000, 1),          // rounded 1 ns but exact < 1 ns
+            (1_000_000_001, 1),          // just over 1 GHz
+            (2_000_000_000, 1),
+        ] {
+            let err = canvas(num, den)
+                .validate()
+                .expect_err("a sub-nanosecond cadence must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("per-tick period is under 1 ns") || msg.contains("1 GHz"),
+                "error should name the sub-ns/1 GHz cause, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_validate_accepts_the_1ghz_boundary_and_real_cadences() {
+        // Exactly 1 GHz (period == 1 ns) is the accepted boundary.
+        canvas(1_000_000_000, 1)
+            .validate()
+            .expect("1 GHz (period == 1 ns) is accepted");
+        // Real broadcast cadences are unaffected.
+        for (num, den) in [(60, 1), (30_000, 1_001), (24_000, 1_001), (25, 1)] {
+            canvas(num, den)
+                .validate()
+                .expect("a real cadence must validate");
+        }
+        // The pre-existing positive-rational checks still fire.
+        assert!(canvas(0, 1).validate().is_err());
+        assert!(canvas(60, 0).validate().is_err());
     }
 }

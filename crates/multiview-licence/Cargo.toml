@@ -36,7 +36,10 @@ chrono = { workspace = true, features = ["serde", "alloc"] }
 # mints keys, it checks signatures handed to it). Default features are disabled
 # and only `alloc` (for the `Signature`/key parsing surface) is enabled; the
 # `rand_core` keygen feature is pulled in dev-dependencies for test keypairs only.
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+# ed25519-dalek 3.x aligns the closure to curve25519-dalek 5 / signature 3 /
+# sha2 0.11; verification (`VerifyingKey::from_bytes` fallible, `Signature::from_bytes`
+# infallible over `&[u8;64]`, `verify_strict`) is byte-identical to 2.x (ADR-I010).
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 # CBOR encode/decode for the local lease lifecycle: the dropped lease/binding
 # file (the directory-watcher reads it) and the `<host>.challenge` export (salted
 # digests + counters only — data minimisation, brief §3/§8). `ciborium` and its
@@ -46,14 +49,83 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] 
 # the portal and the machine agree byte-for-byte on the challenge format.
 ciborium = "0.2.2"
 
+# --- The `heartbeat` device-licensing client (CONSPECT-3, ADR-0096) ---
+# All OFF by default: the default `cargo check --workspace` + `cargo deny check`
+# stay a pure, LGPL-clean, network-free shell (mirrors `multiview-mesh`'s `mdns`
+# gate). The feature adds the Conspect key-trust verifier + the heartbeat loop;
+# the live HTTP transport stays at the cli/app boundary (it owns `reqwest`), so
+# this leaf crate never links an HTTP client — under `heartbeat` it gains ONLY
+# pure-Rust crypto + `tokio` (the loop's sleep), never a socket of its own.
+#
+# `p256` (RustCrypto): ECDSA-P256/SHA-256 verification of the well-known
+# intermediate-key attestations against the pinned root (D1). Its closure
+# (`ecdsa`, `elliptic-curve`, `sec1`, `primeorder`, `rfc6979`, `sha2`, `hmac`,
+# `der`, `spki`, `crypto-bigint`, `ff`, `group`, `base16ct`, `generic-array`,
+# `typenum`, `zeroize`, `subtle`, `const-oid`) is entirely `MIT`/`Apache-2.0`/
+# `BSD-3-Clause`/`BSD-1-Clause`, all on the deny.toml allowlist (verified with
+# `cargo metadata`). Verification-only — no key generation, no RNG in non-test
+# code. Default features disabled; only `ecdsa` (verify) is enabled.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
+# STANDARD-base64 (RFC 4648 §4) decode of `leaseBytes` + base64url decode of the
+# well-known key material/signatures (D3). `MIT OR Apache-2.0`, deny-clean, pure
+# Rust, no native deps.
+base64 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
+# Lower-case hex decode of the bare-Ed25519 lease `signature` (64 bytes) + the
+# device-PoP challenge nonce (32 raw bytes from 64-hex). `MIT OR Apache-2.0`,
+# deny-clean, pure Rust.
+hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
+# COSE_Sign1 construction for the device-PoP proof (CONSPECT-3 D2, ADR-I007): the
+# `Conspect-Device-PoP` header is a base64 COSE_Sign1 over the canonical PoP
+# pre-image, signed EdDSA with the device key. `coset` is `Apache-2.0` (deny-clean,
+# already on the allowlist); its ONLY runtime deps are `ciborium` + `ciborium-io`,
+# BOTH already in this crate's graph (the lease/challenge CBOR), so it adds ZERO new
+# transitive crates. We build the structure (set protected `alg = EdDSA`, payload =
+# pre-image) and sign via the closure seam; the Ed25519 SIGNING is deterministic
+# (RFC 8032 — no RNG), so the leaf crate stays no-RNG in non-test code.
+coset = { version = "0.4", optional = true }
+# SHA-256 of the request body for the PoP pre-image (`sha256(body)`). `sha2` (and
+# its `digest` trait) is `MIT OR Apache-2.0`, deny-clean, and ALREADY in this
+# crate's graph (the `p256` ECDSA closure pulls it), so it adds no new crate.
+sha2 = { version = "0.11", default-features = false, optional = true }
+# Serialise the heartbeat request body to the EXACT bytes the PoP `sha256(body)`
+# covers and the transport sends verbatim (ADR-I007 — no re-serialisation drift).
+# `MIT OR Apache-2.0`, deny-clean, ALREADY in the workspace graph (and this crate's
+# dev-deps); pure Rust, no native deps.
+serde_json = { workspace = true, optional = true }
+# The heartbeat loop sleeps to `nextDue` and is `tokio::spawn`'d by the cli. Only
+# the `rt`/`time` slices are needed (no socket — the leaf crate never opens one).
+# `MIT`, deny-clean, already in the workspace graph.
+tokio = { workspace = true, optional = true }
+
 [dev-dependencies]
 proptest = "1.11.0"
 serde_json = { workspace = true }
 # Test-only deterministic keypair generation for the Ed25519 verify tests
-# (valid / tampered / wrong-key). `rand_core` enables `SigningKey::generate`;
-# the non-test library never depends on an RNG.
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+# (valid / tampered / wrong-key). The ed25519-dalek `rand_core` feature enables
+# `SigningKey::generate` + re-exports the exact rand_core (0.10) it binds to; the
+# OS entropy source is `getrandom::SysRng` wrapped in `rand_core::UnwrapErr`
+# (ADR-I010). The non-test library never depends on an RNG.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core"] }
+getrandom = { version = "0.4", default-features = false, features = ["sys_rng"] }
+# Test-only signing of golden leases/attestations for the `heartbeat` tests:
+# `p256`'s `arithmetic` + RustCrypto `signature` give an ECDSA-P256 signer for
+# fabricating a fake root-attested keyset, and `ed25519-dalek/rand_core` signs the
+# fake server lease. `tokio` macros/rt drive the async loop test deterministically.
+# Dev-only: the non-test library has no signer.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
+
+[features]
+default = []
+# The Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096): the
+# key-trust verifier (pinned-root ECDSA-P256 → attested Ed25519 intermediates,
+# dual-pin + revocation, RFC 8949 §4.2.1 deterministic-CBOR pre-image) + the
+# bare-Ed25519 signed-lease verifier + the `LicenceServer` trait + the
+# `HeartbeatClient` loop + an in-process `FakeLicenceServer` for tests. OFF by
+# default so the baseline build is network-free and `cargo deny`-clean; the cli
+# `heartbeat` feature (the shipped deploy presets) turns it on and supplies the
+# live HTTP transport. The pure data/verify model stays compiled either way.
+heartbeat = ["dep:p256", "dep:base64", "dep:hex", "dep:tokio", "dep:coset", "dep:sha2", "dep:serde_json"]
 
 [lints]
 workspace = true

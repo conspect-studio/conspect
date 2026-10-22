@@ -217,6 +217,21 @@ pub enum PollerControl {
     /// The operator updated the stored credential (`secret_ref`): re-arm a probe
     /// out of `AUTH_FAILED` (drives the lifecycle breaker closed).
     SecretUpdated,
+    /// Set the device's audio volume to `percent` (0–100) — the Cast driver's
+    /// receiver-namespace `SET_VOLUME` (DEV-D2, ADR-M011). Carried as an
+    /// integer percent so the command stays `Eq`-comparable (no float here);
+    /// the cast actor maps it to the protocol's unit level. Ignored by drivers
+    /// without a volume verb (`zowietek` logs and drops it).
+    SetVolume {
+        /// The desired volume as an integer percent (values above 100 clamp).
+        percent: u8,
+    },
+    /// Tear the cast session down **voluntarily** (DEV-D2): the cast actor
+    /// best-effort `STOP`s the receiver app (what actually clears the TV),
+    /// sends a courtesy `CLOSE`, and exits its run loop — the graceful-stop
+    /// path [`DevicePollerRegistry::stop_graceful`](crate::devices::DevicePollerRegistry::stop_graceful)
+    /// joins. Ignored by drivers without a session to stop.
+    StopCast,
 }
 
 /// The outcome of one poller step — what the lifecycle resolved to (or that the
@@ -251,6 +266,17 @@ pub struct PollerHandle {
 }
 
 impl PollerHandle {
+    /// Build a handle from a spawned actor's control sender and its task — the
+    /// constructor every driver's `spawn` uses (`zowietek`'s poller, the cast
+    /// session actor, and tests assembling scripted actors).
+    #[must_use]
+    pub fn new(control: mpsc::Sender<PollerControl>, task: JoinHandle<()>) -> Self {
+        Self {
+            control,
+            task: Some(task),
+        }
+    }
+
     /// Try to dispatch a control command without blocking (drop-newest if the
     /// channel is full or the actor is gone). Returns `true` if enqueued.
     ///
@@ -484,6 +510,25 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
                 }
             }
             PollerControl::SecretUpdated => self.secret_updated(),
+            PollerControl::SetVolume { percent } => {
+                // A receiver-volume verb (the cast driver's, DEV-D2): the
+                // zowietek management API has no volume control, so the
+                // command is logged and dropped — never an error.
+                tracing::debug!(
+                    device = %self.device_id,
+                    percent,
+                    "set-volume is not a zowietek verb; ignored"
+                );
+            }
+            PollerControl::StopCast => {
+                // A cast-session teardown verb (DEV-D2): a zowietek poller has
+                // no cast session to stop — logged and dropped, the poller
+                // keeps running (its lifecycle is the device registry's).
+                tracing::debug!(
+                    device = %self.device_id,
+                    "stop-cast is not a zowietek verb; ignored"
+                );
+            }
         }
     }
 
@@ -579,10 +624,7 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
     {
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_DEPTH);
         let task = tokio::spawn(self.run(control_rx));
-        PollerHandle {
-            control: control_tx,
-            task: Some(task),
-        }
+        PollerHandle::new(control_tx, task)
     }
 
     /// The supervised run loop: adopt, then drive the lifecycle from polls and

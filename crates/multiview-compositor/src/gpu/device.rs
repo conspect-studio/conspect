@@ -87,6 +87,13 @@ impl GpuContext {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                // wgpu 30 adds limit *bucketing*: quantising the adapter's real
+                // limits into coarse buckets to blunt fingerprinting when wgpu is
+                // exposed to UNTRUSTED web content. Multiview is trusted native code
+                // that deliberately requests the adapter's true `limits()` below (a
+                // 4K canvas needs the real `max_texture_dimension_2d`, not a bucketed
+                // floor), so bucketing stays OFF — matching the wgpu-types default.
+                apply_limit_buckets: false,
             }))
             .map_err(|e| Error::NoAdapter(e.to_string()))?,
         };

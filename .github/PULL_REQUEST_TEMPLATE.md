@@ -1,21 +1,26 @@
-# Summary
+## Class
 
-<!-- What does this change do, and why? Link issues / ADRs. -->
+<!-- Run `scripts/classify.sh` and paste its output here. The class is a floor you may
+     raise, never lower; the gates it owes are in docs/standards/engineering.md Part A.
+     CI's "change class" job prints the same thing, advisory. -->
 
-## Changes
+## What and why
 
--
+<!-- What this changes and why. Link the issue, ADR or brief it comes from. -->
+
+## Evidence
+
+<!-- Command + output + exit code for the gates this class owes beyond CI. Don't restate
+     fmt/clippy/test/deny/link checks — CI proves those mechanically. Do report anything
+     that skipped or failed; a green summary over a skipped suite is a defect. -->
+
+## Risk notes
+
+<!-- Trade-offs, what could break, follow-ups, and what a reviewer should attack first.
+     At least one substantive risk statement — "no risk" is a yellow flag. -->
 
 ## Checklist
 
-- [ ] `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` pass
-- [ ] `cargo test --workspace` passes
-- [ ] `cargo deny check` passes (license/advisory)
-- [ ] Docs updated (and any new decision recorded under `docs/decisions/`)
-- [ ] Inclusive language throughout (code, comments, docs, commits) — see `CODE_OF_CONDUCT.md`
 - [ ] Respects the canonical invariants (output-clock, isolation, NV12-throughout, color order) — see `docs/architecture/conventions.md`
+- [ ] Inclusive language throughout (code, comments, docs, commits) — see `CODE_OF_CONDUCT.md`
 - [ ] Commit messages signed off (`git commit -s`, DCO)
-
-## Notes for reviewers
-
-<!-- Anything to call out: trade-offs, follow-ups, things to test. -->

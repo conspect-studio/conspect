@@ -21,7 +21,7 @@
 //!
 //! The clock is **injected** (the caller passes `now_nanos`), so issue/verify
 //! are pure functions of their inputs and the tests are exact and flake-free.
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::time::Duration;
 use thiserror::Error;

@@ -25,7 +25,7 @@
 //!
 //! 1. **Low-pass + detect sustained overload.** Each device's dominant-resource
 //!    share is smoothed by an EWMA; the controlled pipeline's *current* device
-//!    feeds the existing [`Hysteresis`](multiview_hal::degradation::Hysteresis)
+//!    feeds the existing [`Hysteresis`]
 //!    controller (reused verbatim — no new anti-flap math). A **transient** spike
 //!    never trips it; only a smoothed value that crosses the hysteresis-high
 //!    threshold and stays there for `>= dwell` ticks raises an overload.
@@ -38,7 +38,7 @@
 //!    composite off it would force the per-frame GPU→host→GPU copy ADR-0018
 //!    forbids. Both may still *shed* locally.
 //! 3. **SHED vs MIGRATE.** On a sustained overload the controller re-runs
-//!    [`select_device`](multiview_hal::select_device) over the *other* candidate
+//!    [`select_device`] over the *other* candidate
 //!    GPUs. If a materially-better home exists (its score beats the current
 //!    device's by `>= min_gain`) **and** the anti-storm gate allows, it proposes
 //!    a make-before-break [`PlacementProposal::Migrate`]; otherwise the imbalance
@@ -107,6 +107,26 @@ pub struct MigrationPlan {
     pub idr_aligned: bool,
 }
 
+impl MigrationPlan {
+    /// Build a migration plan from `from` → `to` with the modelled `gain`.
+    ///
+    /// `idr_aligned` is always `true` by construction (Multiview pins the output
+    /// GOP + drives `forceIDR`, so the cutover boundary is an IDR boundary). The
+    /// controller builds plans internally; this constructor lets the
+    /// make-before-break executor ([`crate::migration`]) and tests build one
+    /// without the controller (the struct is `#[non_exhaustive]`, so an
+    /// out-of-module struct literal is impossible).
+    #[must_use]
+    pub const fn new(from: DeviceId, to: DeviceId, gain: f32) -> Self {
+        Self {
+            from,
+            to,
+            gain,
+            idr_aligned: true,
+        }
+    }
+}
+
 /// The action the placement controller proposes for one control tick.
 ///
 /// The controller never executes anything — it returns one of these for the
@@ -146,7 +166,7 @@ pub enum PlacementProposal {
 /// `min_gain` is the minimum score improvement a migration must buy.
 ///
 /// (`PartialEq` is intentionally not derived: the embedded
-/// [`PlacementPolicy`](multiview_hal::select::PlacementPolicy) does not
+/// [`PlacementPolicy`] does not
 /// implement it, and a controller config is never compared for equality.)
 #[derive(Debug, Clone, Copy)]
 pub struct PlacementControllerConfig {

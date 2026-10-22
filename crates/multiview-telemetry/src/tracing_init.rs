@@ -13,7 +13,10 @@
 //! Filtering follows the standard `RUST_LOG`-style directive grammar via
 //! [`tracing_subscriber::EnvFilter`]; a malformed directive is reported as a
 //! [`TelemetryError::Filter`] rather than panicking.
+use std::sync::Arc;
+
 use crate::error::{Result, TelemetryError};
+use crate::log_capture::{LogCaptureLayer, LogRing};
 use tracing::Subscriber;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -177,6 +180,47 @@ impl SubscriberBuilder {
     pub fn try_init(&self) -> Result<()> {
         let filter = self.resolve_filter()?;
         let registry = tracing_subscriber::registry().with(filter);
+        let result = match self.output {
+            Output::Stderr => {
+                let layer = fmt::layer()
+                    .with_ansi(self.ansi)
+                    .with_writer(std::io::stderr);
+                registry.with(layer).try_init()
+            }
+            Output::Stdout => {
+                let layer = fmt::layer()
+                    .with_ansi(self.ansi)
+                    .with_writer(std::io::stdout);
+                registry.with(layer).try_init()
+            }
+        };
+        result.map_err(|e| TelemetryError::Filter(e.to_string()))
+    }
+
+    /// Build the subscriber with an additional resource-scoped [`LogCaptureLayer`]
+    /// feeding a fresh bounded [`LogRing`], and install it as the process-global
+    /// default — returning the shared ring so the control plane can serve it over
+    /// `GET /api/v1/logs` (ADR-0060).
+    ///
+    /// The capture layer mirrors every emitted event (ours and the libav
+    /// bridge's) into the ring with its resource attribution; it sits *outside*
+    /// the `EnvFilter` so the ring captures records at the same verbosity the
+    /// fmt sink writes. `run_id` stamps every captured record. The ring is bounded
+    /// drop-oldest and read-only — it can never back-pressure the engine
+    /// (invariant #10).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::Filter`] if the directive is invalid, or if a
+    /// global subscriber has already been installed.
+    pub fn try_init_with_capture(
+        &self,
+        ring: Arc<LogRing>,
+        run_id: impl Into<String>,
+    ) -> Result<()> {
+        let filter = self.resolve_filter()?;
+        let capture = LogCaptureLayer::new(ring).with_run_id(run_id);
+        let registry = tracing_subscriber::registry().with(filter).with(capture);
         let result = match self.output {
             Output::Stderr => {
                 let layer = fmt::layer()

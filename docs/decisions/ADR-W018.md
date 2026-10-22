@@ -48,14 +48,17 @@ The mutation response's `X-Multiview-Apply` header is computed per request:
 
 | Mutation | Condition | Header |
 |---|---|---|
-| POST/PUT | new kind is **synthetic** (`bars`/`solid`/`clock`) and the `UpsertSource` was enqueued | `live` |
-| PUT | previous stored kind synthetic, new kind not → `RemoveSource` enqueued (the running generator stops; the new doc applies on restart) | `restart` |
-| POST/PUT | network kind (`rtsp`/`hls`/`ts`/`srt`/`rtmp`/`file`/`ndi`/`youtube`) | `restart` (level 2, designed below, not in this slice) |
+| POST/PUT | the run declares the kind **live-appliable** and the `UpsertSource` was enqueued — **synthetic** (`bars`/`solid`/`clock`) on every run; **network/file** (`rtsp`/`hls`/`ts`/`srt`/`rtmp`/`rist`/`file`) on a full-pipeline run with a real ingest spawner (level 2) | `live` |
+| PUT | previous stored kind live-appliable, new kind not (e.g. `rtsp`→`ndi`) → `RemoveSource` enqueued (the running producer stops; the new doc applies on restart) | `restart` |
+| POST/PUT | a kind the run **cannot** apply live: `ndi`/`youtube`/`aes67` (runtime machinery the live path does not provide), or any network kind on a run with no decoder (the software engine) | `restart` |
 | DELETE | `RemoveSource` enqueued (any kind — teardown is a stop-flag raise + store unregister) | `live` |
 | any | bus full/closed, or no engine drains (no `[control]` run) | `restart` |
 
-`SourceKind::is_synthetic()` (new, on `multiview-config`) is the single classification point —
-the same predicate `SyntheticKind::from_source_kind` implements in the CLI.
+`SourceKind::is_synthetic()` and `SourceKind::is_network_media()` (both on `multiview-config`)
+are the classification points; the run-path capability `LiveSourceCapability { synthetic, network }`
+(on the control `AppState`, derived by the binary from `ingest.is_some()`) decides whether each set
+is live on THIS run — the same predicate `SyntheticKind::from_source_kind` implements in the CLI.
+The header never over-claims `live` for a kind the running engine cannot ingest.
 
 Two honesty bounds on the header: **(a)** a submit that succeeds but is never drained (the engine
 stops before the next frame boundary) converges on restart semantics — the stored document remains
@@ -149,10 +152,20 @@ operator re-routes that cell — held, never a panic, never a falter.
   principle: candidates/pins are **pinned to the running island's device**
   (`Pins::pin_pipeline(island_device)`) — a runtime add may never fragment or migrate the island —
   and the demand is the island's current tile set **plus** the new decode (`TileLoad::new(Decode,
-  …)`), re-polling NVML at decision time. An admit stamps the island's `cuda_ordinal` on the new
-  `IngestPlan` (NVDEC co-located, ADR-0035 Tier-1/Tier-2 affinity + perf-class budget); a reject
-  (budget/headroom) degrades **that source only** to software decode (`cuda_ordinal: None`) with a
-  loud warning — the island is never overcommitted and the output never falters.
+  …)`), re-polling NVML at decision time. The outcome is the explicit tri-state
+  `DecodePlacement::{Default, Pinned(ordinal), SoftwareOnly}` on the new `IngestPlan` (NOT
+  `Option<ordinal>`): an admit stamps `Pinned(island ordinal)` (NVDEC co-located, ADR-0035
+  Tier-1 affinity); an admit where the island resolved **no** ordinal — like a reject
+  (budget/headroom) **or** the island-vanished case — stamps `SoftwareOnly` on the LIVE path (the
+  compositor island is already pinned, so an un-pinnable/rejected/vanished decode forces software,
+  never `Default`, which only the startup path uses where nothing is pinned yet), and the
+  `decoder_open_args` gate FORCES that one source's decoder open to software — `(want_hw=false,
+  None)` — with a loud warning. This is the load-bearing distinction: encoding a reject as "no
+  ordinal" would let `new_preferring_hw(.., want_hw=true, None)` open NVDEC on libav's **default**
+  device, which on a single-GPU host IS the over-headroom island (overcommit) and on a multi-GPU
+  host may be a **different** GPU (silent fragmentation, forbidden by ADR-0018). The island is
+  never overcommitted, never fragmented, and the output never falters. The operator
+  `MULTIVIEW_DISABLE_NVDEC` opt-out still wins over a pin.
 - **Removal returns its budget implicitly:** the startup path books nothing — placement decisions
   read *measured* NVML load per decision, so a removed source's NVDEC/VRAM consumption disappears
   from the next decision's inputs when its decoder closes. There is **no allocation ledger** to
@@ -172,16 +185,27 @@ operator re-routes that cell — held, never a panic, never a falter.
 
 ## Scope shipped vs designed
 
-Shipped in this slice (vertical, end-to-end, soak-gated): **level 1** (live add, synthetic kinds),
-**level 3** (live remove, any kind whose producer is registry-known; composition-plane removal for
-all kinds), **level 4** (live edit synthetic→synthetic via store-reuse upsert). The UI copy and
-OpenAPI descriptions state exactly this per-kind split.
+Shipped in the first slice (vertical, end-to-end, soak-gated): **level 1** (live add, synthetic
+kinds), **level 3** (live remove, any kind whose producer is registry-known; composition-plane
+removal for all kinds), **level 4** (live edit synthetic→synthetic via store-reuse upsert).
 
-Designed but **not** shipped here (header stays `restart` — truthful): **level 2** network-kind
-live add (rtsp/hls/ts/srt/rtmp/file via hub-spawned `ingest_loop` + the pinned placement consult
-above), `ndi`/`youtube` kinds, and the placement booking ledger. Caption-reader teardown on
-remove/edit **is** shipped: readers register under `{id}/captions` and the hub raises every
-`{id}`-rooted flag.
+**Amendment (2026-06-17) — level 2 now shipped.** Network/file kinds
+(`rtsp`/`hls`/`ts`/`srt`/`rtmp`/`rist`/`file`) live-add/edit on the running full-pipeline engine
+through **one uniform ingest path**: `Pipeline::live_ingest_spawner()` hands the live-source hub an
+`IngestSpawner` that builds the plan with the **same** `ingest_plan_for` construction, consults the
+**same** admission scorer pinned to the running island's device (`select_live_decode_placement`
+→ the explicit `DecodePlacement` tri-state, §7 below), and runs the **same** supervised
+`ingest_loop` the startup path runs — never a second-quality copy. The run-path capability `LiveSourceCapability` (derived from
+`ingest.is_some()`) flips the header to `live` for network kinds exactly when a real spawner backs
+it; `rist` is live-applicable **only** when the `rist` feature is compiled (`with_rist(cfg!(feature =
+"rist"))`) — it then lowers to a `rist://` AVIO URL and rides the identical ingest path; an
+`ffmpeg`-without-`rist` build keeps `rist` as `restart`, never over-claiming `live`. The
+software engine (no decoder) and the `ndi`/`youtube`/`aes67` kinds (runtime machinery the live path
+does not provide) stay `restart`, truthfully. Caption-reader teardown on remove/edit is shipped:
+readers register under `{id}/captions` and the hub raises every `{id}`-rooted flag.
+
+Still designed but not shipped: the placement **booking ledger** (the measured-load re-poll covers
+budget recovery without one — §7), and `ndi`/`youtube`/`aes67` live add.
 
 ## Alternatives considered
 
@@ -211,5 +235,8 @@ remove/edit **is** shipped: readers register under `{id}/captions` and the hub r
   live adds/removes.
 - Startup supervisors carry one stop flag per producer (same join semantics; `shutdown` raises
   all), enabling targeted teardown forever after.
-- When level 2 lands, the header flips to `live` for network kinds with **no path change** —
-  exactly the per-class flip ADR-W015 anticipated.
+- Level 2 (2026-06-17) flipped the header to `live` for network kinds with **no path change** —
+  exactly the per-class flip ADR-W015 anticipated — and extracted `spawn_ingest_producer` so the
+  startup supervisor and the live hub share one producer construction. The pinned-island slot
+  (`LiveIngestSpawner` reads what `drive_streaming` publishes) keeps every runtime decode on the
+  startup island device — a live add never fragments or migrates the GPU pipeline (ADR-0018 / §7).

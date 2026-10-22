@@ -15,7 +15,7 @@ use multiview_core::time::MediaTime;
 use serde_json::json;
 use support::{
     body_json, delete_if_match, etag, get, harness, post_json, put_json, send, ADMIN_TOKEN,
-    OPERATOR_TOKEN, VIEWER_TOKEN,
+    OPERATOR_TOKEN, SCOPED_TOKEN, VIEWER_TOKEN,
 };
 
 #[test]
@@ -105,6 +105,149 @@ async fn mutation_through_the_router_is_audited() {
         arr.len()
     );
     assert_eq!(arr[0]["action"], "update");
+}
+
+/// BOLA re-disclosure through the audit log (OWASP API1, ADR-W005/ADR-W025): the
+/// audit history carries every mutation's `object_id` AND a `detail` body with
+/// full resource contents (device ids, `device_ref`, sync-group members). A
+/// scoped principal reading `GET /audit` unfiltered re-enumerates every
+/// out-of-scope object id and the device refs redacted elsewhere. So a scoped
+/// principal must see ONLY entries for objects in its allowlist, and those
+/// entries' detail bodies must still redact out-of-scope device refs.
+///
+/// `SCOPED_TOKEN` (allowlist `["scoped-layout"]`). Admin creates an out-of-scope
+/// device `dev-other` (audited under `object_id` `dev-other`) and an in-scope
+/// source `scoped-layout` whose `device_ref` is `dev-other` (audited under
+/// `object_id` `scoped-layout`, detail body carrying the `device_ref`). The
+/// scoped `/audit` must show only the `scoped-layout` entry, with its detail
+/// `device_ref` redacted; never an entry whose `object_id` is `dev-other`.
+#[tokio::test]
+async fn audit_list_filters_entries_and_redacts_detail_for_a_scoped_principal() {
+    let h = harness();
+
+    // An out-of-scope device mutation (object_id = dev-other).
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/devices/dev-other",
+            ADMIN_TOKEN,
+            &json!({
+                "name": "Theirs",
+                "body": { "id": "dev-other", "driver": "zowietek", "address": "http://[fd00:db8::9]" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // An in-scope source mutation whose body embeds the out-of-scope device_ref.
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/scoped-layout",
+            ADMIN_TOKEN,
+            &json!({
+                "name": "Mine",
+                "body": {
+                    "id": "scoped-layout",
+                    "kind": "rtsp",
+                    "url": "rtsp://[fd00:db8::1]/mine",
+                    "device_ref": "dev-other"
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The scoped principal's audit listing: ONLY in-scope object ids appear.
+    let resp = send(&h.router, get("/api/v1/audit", SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let entries = body_json(resp).await;
+    let object_ids: Vec<&str> = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["object_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        object_ids.iter().all(|id| *id == "scoped-layout"),
+        "a scoped principal must not see audit entries for out-of-scope objects (BOLA): {object_ids:?}"
+    );
+    assert!(
+        object_ids.contains(&"scoped-layout"),
+        "the scoped principal's own in-scope entry must still be visible: {object_ids:?}"
+    );
+    // The surviving in-scope entry's detail body must redact the out-of-scope
+    // device_ref it carries.
+    for entry in entries.as_array().unwrap() {
+        if let Some(detail) = entry.get("detail") {
+            assert!(
+                detail.get("device_ref").is_none(),
+                "an audit detail must not disclose an out-of-scope device_ref: {entry}"
+            );
+        }
+    }
+
+    // An admin sees every entry (both object ids) — no over-restriction.
+    let resp = send(&h.router, get("/api/v1/audit", ADMIN_TOKEN)).await;
+    let admin_ids: Vec<String> = body_json(resp)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["object_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(admin_ids.iter().any(|id| id == "dev-other"));
+    assert!(admin_ids.iter().any(|id| id == "scoped-layout"));
+}
+
+/// A scoped principal that explicitly queries an out-of-scope `?object_id=` is
+/// denied `403` — the per-object BOLA gate, exactly as a single-object `GET` of
+/// that id would `403` (ADR-W005/ADR-W025). An in-scope `?object_id=` is allowed.
+#[tokio::test]
+async fn audit_object_id_query_is_object_scoped() {
+    let h = harness();
+    // Seed an out-of-scope device so its audit history exists.
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/devices/dev-other",
+            ADMIN_TOKEN,
+            &json!({
+                "name": "Theirs",
+                "body": { "id": "dev-other", "driver": "zowietek", "address": "http://[fd00:db8::9]" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The scoped principal explicitly probing the out-of-scope object id: 403.
+    let resp = send(
+        &h.router,
+        get("/api/v1/audit?object_id=dev-other", SCOPED_TOKEN),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "querying an out-of-scope object_id must be denied (BOLA probe)"
+    );
+    let problem = body_json(resp).await;
+    assert_eq!(problem["type"], "/problems/forbidden");
+
+    // The scoped principal querying its OWN in-scope object id is allowed.
+    let resp = send(
+        &h.router,
+        get("/api/v1/audit?object_id=scoped-layout", SCOPED_TOKEN),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "querying an in-scope object_id is allowed (the guard does not over-restrict)"
+    );
 }
 
 #[tokio::test]

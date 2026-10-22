@@ -40,6 +40,17 @@ pub const SCOPED_TOKEN: &str = "scoped-key.scoped-secret-jkl";
 /// An operator scoped to a single **output** id (`wall-1`) for per-output BOLA
 /// tests: it may address head `wall-1` but is denied any other head.
 pub const OUTPUT_SCOPED_TOKEN: &str = "out-scoped-key.out-scoped-secret-mno";
+/// An operator scoped to the object allowlist `["cast-session-savable",
+/// "dev-savable"]` for the cast-save positive path: it owns BOTH the fixture
+/// session id and the promoted device id, so a save-as-device promotion of that
+/// session into that device passes both per-object authorizations (proving the
+/// save guard does not over-restrict a properly-scoped principal).
+pub const CAST_SAVE_SCOPED_TOKEN: &str = "cast-save-key.cast-save-secret-pqr";
+/// An operator scoped to a single discovery **domain** (`site-a`) and nothing
+/// else (no object/output scope) for the discovery-domain BOLA axis (ADR-W026).
+/// Used by the whole-system guard tests: a principal restricted on the discovery
+/// axis alone must still be denied whole-system artifacts.
+pub const DISCOVERY_SCOPED_TOKEN: &str = "disco-scoped-key.disco-scoped-secret-stu";
 
 /// A fixed, deterministic acknowledgement timestamp used in tests.
 pub const ACK_NANOS: i64 = 1_700_000_000_000_000_000;
@@ -66,6 +77,9 @@ pub struct Harness {
     /// The shared NMOS registry the router serves, so a test can seed
     /// node/device/sender/receiver resources and exercise the NMOS Node API.
     pub nmos: Arc<NmosRegistry>,
+    /// The shared bounded log-tail ring the router reads (ADR-0060): a test can
+    /// push structured records and read them back over `GET /api/v1/logs`.
+    pub logs: Arc<multiview_telemetry::LogRing>,
 }
 
 /// Build an API-key store seeded with the four known test keys.
@@ -79,6 +93,7 @@ pub fn seeded_keys() -> ApiKeyStore {
             role: Role::Admin,
             scoped_object_ids: None,
             scoped_output_ids: None,
+            scoped_discovery_domains: None,
         },
     );
     keys.register(
@@ -89,6 +104,7 @@ pub fn seeded_keys() -> ApiKeyStore {
             role: Role::Operator,
             scoped_object_ids: None,
             scoped_output_ids: None,
+            scoped_discovery_domains: None,
         },
     );
     keys.register(
@@ -99,6 +115,7 @@ pub fn seeded_keys() -> ApiKeyStore {
             role: Role::Viewer,
             scoped_object_ids: None,
             scoped_output_ids: None,
+            scoped_discovery_domains: None,
         },
     );
     keys.register(
@@ -109,6 +126,7 @@ pub fn seeded_keys() -> ApiKeyStore {
             role: Role::Operator,
             scoped_object_ids: Some(vec!["scoped-layout".to_owned()]),
             scoped_output_ids: None,
+            scoped_discovery_domains: None,
         },
     );
     keys.register(
@@ -119,6 +137,32 @@ pub fn seeded_keys() -> ApiKeyStore {
             role: Role::Operator,
             scoped_object_ids: None,
             scoped_output_ids: Some(vec!["wall-1".to_owned()]),
+            scoped_discovery_domains: None,
+        },
+    );
+    keys.register(
+        "cast-save-key",
+        "cast-save-secret-pqr",
+        Principal {
+            key_id: "cast-save-key".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(vec![
+                "cast-session-savable".to_owned(),
+                "dev-savable".to_owned(),
+            ]),
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        },
+    );
+    keys.register(
+        "disco-scoped-key",
+        "disco-scoped-secret-stu",
+        Principal {
+            key_id: "disco-scoped-key".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: None,
+            scoped_discovery_domains: Some(vec!["site-a".to_owned()]),
         },
     );
     keys
@@ -154,6 +198,7 @@ pub fn harness_customized(
     let salvos: Arc<dyn SalvoRepository> = Arc::new(InMemorySalvoStore::new());
     let tally = Arc::new(TallyMirror::new());
     let nmos = Arc::new(NmosRegistry::new());
+    let logs = Arc::new(multiview_telemetry::LogRing::new(2000));
     let state = AppState::new(
         Arc::clone(&engine),
         tx,
@@ -165,6 +210,7 @@ pub fn harness_customized(
     .with_salvo_store(Arc::clone(&salvos))
     .with_tally_mirror(Arc::clone(&tally))
     .with_nmos(Arc::clone(&nmos))
+    .with_log_ring(Arc::clone(&logs))
     .with_ack_clock(Arc::new(|| MediaTime::from_nanos(ACK_NANOS)));
     let state = customize(state);
     Harness {
@@ -176,6 +222,7 @@ pub fn harness_customized(
         salvos,
         tally,
         nmos,
+        logs,
     }
 }
 

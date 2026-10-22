@@ -10,9 +10,9 @@
 // grows past the number of distinct catalog codes.
 import { useEffect, useState } from "react";
 
-import { getStoredToken } from "../api/token";
 import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
+import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
 
 /** The severity classes a health warning carries (mirrors `WarningSeverity`). */
 export type WarningSeverity = "info" | "warning" | "critical";
@@ -144,19 +144,6 @@ export class HealthWarningMap {
 /** The realtime topic health warnings ride (the operator-alert lane). */
 export const ALERTS_TOPIC = "alerts";
 
-function resolveWsUrl(): string {
-  // Same-origin: the dev proxy and the embedded build both serve `/api/v1/ws`.
-  const { protocol, host } = window.location;
-  const wsProtocol = protocol === "https:" ? "wss:" : "ws:";
-  const base = `${wsProtocol}//${host}/api/v1/ws`;
-  // A browser WebSocket cannot send an Authorization header; the control plane
-  // also accepts the bearer token as an `access_token` query parameter.
-  const token = getStoredToken();
-  return token === undefined
-    ? base
-    : `${base}?access_token=${encodeURIComponent(token)}`;
-}
-
 /** What {@link useHealth} returns. */
 export interface HealthState {
   /** The active warnings (empty on a clean host → the banner renders nothing). */
@@ -177,16 +164,20 @@ export function useHealth(): HealthState {
 
   useEffect(() => {
     const map = new HealthWarningMap();
-    const connection = new RealtimeConnection(resolveWsUrl(), {
-      onStatus: (next): void => {
-        setStatus(next);
+    const connection = new RealtimeConnection(
+      realtimeWsBaseUrl(),
+      {
+        onStatus: (next): void => {
+          setStatus(next);
+        },
+        onEnvelope: (envelope): void => {
+          if (map.applyEnvelope(envelope.t, envelope.data)) {
+            setWarnings(map.active());
+          }
+        },
       },
-      onEnvelope: (envelope): void => {
-        if (map.applyEnvelope(envelope.t, envelope.data)) {
-          setWarnings(map.active());
-        }
-      },
-    });
+      mintWsTicket,
+    );
     connection.start();
     return (): void => {
       connection.stop();

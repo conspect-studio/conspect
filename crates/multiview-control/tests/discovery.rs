@@ -98,7 +98,7 @@ fn zowietek_control_service_type_is_only_recognised_when_configured() {
 
 #[test]
 fn endpoints_are_aaaa_first_with_ipv4_labelled_legacy() {
-    let svc = DiscoveredService::from_raw(&raw_ndi(), None, far_future());
+    let svc = DiscoveredService::from_raw(&raw_ndi(), None, far_future(), None);
     // IPv6 leads even though IPv4 was listed first in the raw record.
     assert_eq!(svc.endpoints[0].family, AddressFamily::Ipv6);
     assert!(svc.endpoints[0].address.contains("fd00:db8::42"));
@@ -109,7 +109,7 @@ fn endpoints_are_aaaa_first_with_ipv4_labelled_legacy() {
 
 #[test]
 fn primary_address_prefers_ipv6() {
-    let svc = DiscoveredService::from_raw(&raw_ndi(), None, far_future());
+    let svc = DiscoveredService::from_raw(&raw_ndi(), None, far_future(), None);
     assert_eq!(svc.primary().family, AddressFamily::Ipv6);
 }
 
@@ -118,9 +118,19 @@ fn primary_address_prefers_ipv6() {
 #[test]
 fn inventory_dedups_by_key_latest_wins() {
     let inv = DiscoveryInventory::new(8);
-    inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, far_future()));
+    inv.upsert(DiscoveredService::from_raw(
+        &raw_ndi(),
+        None,
+        far_future(),
+        None,
+    ));
     // A second sighting of the SAME service (same key) replaces, not duplicates.
-    inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, far_future()));
+    inv.upsert(DiscoveredService::from_raw(
+        &raw_ndi(),
+        None,
+        far_future(),
+        None,
+    ));
     assert_eq!(inv.snapshot().len(), 1);
 }
 
@@ -132,6 +142,7 @@ fn inventory_expires_stale_rows_on_snapshot() {
         &raw_ndi(),
         None,
         already_expired(),
+        None,
     ));
     assert!(inv.snapshot().is_empty());
 }
@@ -142,7 +153,7 @@ fn inventory_is_bounded_drop_oldest() {
     for n in 0..5 {
         let mut raw = raw_cast();
         raw.instance_name = format!("Cast-{n}");
-        inv.upsert(DiscoveredService::from_raw(&raw, None, far_future()));
+        inv.upsert(DiscoveredService::from_raw(&raw, None, far_future(), None));
     }
     // Never grows past the cap (bounded, invariant #10).
     assert!(inv.snapshot().len() <= 2);

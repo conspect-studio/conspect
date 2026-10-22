@@ -105,6 +105,12 @@ struct MockBackend {
     pending_flips: u64,
     /// When set, `wait_events` never delivers flips (a wedged display pipe).
     wedged: Arc<AtomicBool>,
+    /// `wait_events` entry counter. One sink-loop iteration is
+    /// `wait_events → read mailbox → decide`, so a test that locks this after
+    /// publishing (a mutex sync point) and then sees it advance twice has
+    /// PROOF the sink completed a full iteration that observed the latest
+    /// published frame.
+    wait_calls: Arc<Mutex<u64>>,
     frame_counter: u64,
 }
 
@@ -116,6 +122,7 @@ impl MockBackend {
             calls,
             pending_flips: 0,
             wedged: Arc::new(AtomicBool::new(false)),
+            wait_calls: Arc::new(Mutex::new(0)),
             frame_counter: 0,
         }
     }
@@ -165,6 +172,7 @@ impl KmsBackend for MockBackend {
     }
 
     fn wait_events(&mut self, _timeout: Duration) -> Result<Vec<FlipEvent>, DisplayError> {
+        *self.wait_calls.lock().unwrap() += 1;
         if self.wedged.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
@@ -309,20 +317,79 @@ fn startup_fails_when_the_named_connector_is_absent() {
 // The frame path: conflation, repeat, EBUSY
 // ---------------------------------------------------------------------------
 
+/// Frames flow end-to-end AND the mailbox conflates to the latest — made
+/// DETERMINISTIC (this was a CI flake): instead of racing the publisher
+/// against the sink thread's pace, the mock is scripted so the sink is
+/// provably in-flight for the whole burst:
+///
+/// 1. the event channel is wedged shut BEFORE the first frame, so the flip
+///    the kernel owes is withheld until the test releases it;
+/// 2. frame 1's commit is scripted `EBUSY` (the kernel has the modeset's
+///    flip outstanding) — per the DEV-B1 contract the driver becomes
+///    in-flight WITHOUT advancing, i.e. EBUSY-as-conflation;
+/// 3. 199 newer frames are published while in-flight: none can be
+///    committed, so conflation is structural, not load-dependent;
+/// 4. the `wait_calls` handshake proves the sink completed full iterations
+///    that OBSERVED the newest frame while in-flight and declined to commit;
+/// 5. releasing the wedge drains the owed flip and exactly the LATEST frame
+///    is committed.
+///
+/// 200 publishes ⇒ exactly 2 device submits ⇒ 198 conflations BY
+/// CONSTRUCTION (the original assertion was ≥1).
 #[test]
 fn frames_flow_and_conflate_to_the_latest() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let backend = MockBackend::new(vec![connected_dp1()], Arc::clone(&calls));
+    let wedged = Arc::clone(&backend.wedged);
+    let wait_calls = Arc::clone(&backend.wait_calls);
+    // The first commit hits EBUSY (an outstanding flip), every later one
+    // succeeds.
+    backend.script_submit(vec![Some(SubmitError::Busy)]);
+    // Wedge BEFORE anything is published: no flip event can drain until the
+    // test releases the pipe.
+    wedged.store(true, Ordering::Release);
+
     let (handle, publisher) =
         DisplaySink::start::<TestCanvas, _>(backend, sink_config(ConnectorSelector::Auto))
             .expect("startup succeeds");
+    let stats = handle.stats();
 
-    // Publish a burst of frames much faster than flips can drain: the sink
-    // must conflate (newest wins), never queue.
-    for tag in 1..=200u8 {
+    // Frame 1 reaches the device; the EBUSY answer pins the driver in-flight
+    // and the wedge withholds the flip that would release it.
+    publisher.publish(TestCanvas::tagged(1));
+    wait_until(|| calls.lock().unwrap().contains(&Call::Submit(1)));
+
+    // The burst: 199 newer frames land in the mailbox while the sink is
+    // in-flight. Structurally none of them may be committed.
+    for tag in 2..=200u8 {
         publisher.publish(TestCanvas::tagged(tag));
     }
+
+    // Prove the sink SAW the newest frame and conflated rather than
+    // committed: locking `wait_calls` after the publishes is a mutex sync
+    // point (the sink's next lock observes the publishes), and two further
+    // increments mean one full wait→read→decide iteration completed against
+    // the final mailbox state.
+    let c0 = *wait_calls.lock().unwrap();
+    wait_until(|| *wait_calls.lock().unwrap() >= c0 + 2);
+    {
+        let calls = calls.lock().unwrap();
+        let submits = calls
+            .iter()
+            .filter(|c| matches!(c, Call::Submit(_)))
+            .count();
+        assert_eq!(
+            submits, 1,
+            "while a flip is in flight every newer frame must conflate: {calls:?}"
+        );
+    }
+
+    // Release the pipe: the owed flip drains and the sink commits exactly
+    // the LATEST frame — the intermediates were conflated away, never queued.
+    wedged.store(false, Ordering::Release);
     wait_until(|| calls.lock().unwrap().contains(&Call::Submit(200)));
+    // Let the flip for frame 200 drain too, so the counters are settled.
+    wait_until(|| stats.snapshot().flips == 2);
     drop(handle);
 
     let calls = calls.lock().unwrap();
@@ -333,26 +400,16 @@ fn frames_flow_and_conflate_to_the_latest() {
             _ => None,
         })
         .collect();
-    // The LAST frame always lands; far fewer submits than publishes happened
-    // (conflation), and the submitted tags are strictly increasing (newest
-    // wins; nothing is queued or replayed out of order).
-    assert_eq!(submits.last(), Some(&200));
-    assert!(
-        submits.len() < 200,
-        "conflation must drop intermediate frames (got {} submits)",
-        submits.len()
-    );
-    assert!(
-        submits.windows(2).all(|w| w[0] < w[1]),
-        "submitted frames must be strictly newest-wins: {submits:?}"
-    );
-    // The stats agree: at least one frame was conflated away.
-    assert!(handle_stats_conflated(&submits));
-}
-
-/// 200 publishes with fewer submits means the mailbox conflated.
-fn handle_stats_conflated(submits: &[u64]) -> bool {
-    submits.len() < 200
+    // End-to-end flow + newest-wins conflation, exactly: frame 1 flowed to
+    // the device, frames 2..=199 were conflated (never submitted, never
+    // queued, never replayed), and the latest frame won.
+    assert_eq!(submits, vec![1, 200], "exactly first-then-latest submits");
+    // The telemetry counters agree with the call log.
+    let snap = stats.snapshot();
+    assert_eq!(snap.commits, 1, "one successful commit (frame 200)");
+    assert_eq!(snap.busy_conflations, 1, "frame 1's EBUSY was a conflation");
+    assert_eq!(snap.flips, 2, "one flip per device-accepted commit");
+    assert_eq!(snap.submit_errors, 0, "no device errors in this scenario");
 }
 
 #[test]

@@ -100,6 +100,44 @@ impl Lease {
         Self::new(serial, granted_at, source, activation_window_days)
     }
 
+    /// Build an **online/relay** lease whose `expires_at` is anchored to the
+    /// cryptographically-signed `not_after` (epoch ms) rather than to a local
+    /// clock read — the lease the heartbeat installs MUST expire exactly when the
+    /// signed lease says, so a short-lived or replayed-old signed lease can never
+    /// become a fresh 35-day term (CONSPECT-3 / ADR-0096, ADR-I006).
+    ///
+    /// `granted_at` is back-derived as `expires_at − term`, so the whole ladder
+    /// (grace, hard bound, next-contact) is consistent with the signed window.
+    /// Returns `None` when `not_after_ms` is at or before `now_ms` — a
+    /// signed-but-expired (or replayed) lease is rejected, never installed.
+    #[must_use]
+    pub fn new_online_expiring_at(
+        serial: String,
+        not_after_ms: i64,
+        now_ms: i64,
+        activation_window_days: i64,
+    ) -> Option<Self> {
+        if not_after_ms <= now_ms {
+            return None;
+        }
+        let expires_at = DateTime::<Utc>::from_timestamp_millis(not_after_ms)?;
+        let source = LeaseSource::Online;
+        let granted_at = expires_at - Duration::days(source.term_days());
+        let grace_until = expires_at + Duration::days(LEASE_GRACE_DAYS);
+        let hard_at = granted_at + Duration::days(LEASE_HARD_DAYS);
+        let next_contact_due = granted_at + Duration::days(activation_window_days);
+        Some(Self {
+            serial,
+            source,
+            granted_at,
+            expires_at,
+            grace_days: LEASE_GRACE_DAYS,
+            grace_until,
+            hard_at,
+            next_contact_due,
+        })
+    }
+
     /// Build an **offline** (file) lease with the 90-day hard term.
     #[must_use]
     pub fn new_offline(

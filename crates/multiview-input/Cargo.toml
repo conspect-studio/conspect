@@ -17,9 +17,25 @@ multiview-framestore = { workspace = true }
 # Lock-free read-copy-update for the per-source caption cue store (same
 # primitive the frame stores use); no native deps, keeps the crate `unsafe`-free.
 arc-swap = "1.9.1"
+# Bounded zlib inflate for the RFC 2974 SAP `C=1` (compressed) packet path
+# (ADR-0041 Decision 8). `decompress_to_vec_zlib_with_limit` enforces a hard
+# decompressed-size cap DURING inflate, so an unauthenticated compressed
+# announcement can never become a decompression bomb. Pure Rust (miniz backend),
+# no native deps, LGPL-clean (MIT/Zlib/Apache-2.0) — the crate stays
+# `unsafe_code = forbid`. Always compiled: the SAP packet codec is
+# feature-independent (only the socket transport sits behind `st2110`).
+miniz_oxide = "0.8.9"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+
+# IPv6 multicast egress interface + hop-limit selection (IPV6_MULTICAST_IF /
+# IPV6_MULTICAST_HOPS) for the SAP announcer — tokio's UdpSocket does not expose
+# these setsockopts, so we reach them through a `SockRef` over the bound socket
+# (panel F9). Pulled in ONLY by the `st2110` feature (the socket transport);
+# `MIT OR Apache-2.0`, already in the workspace lock (a tokio transitive), no FFI
+# here — the crate stays `unsafe_code = forbid`.
+socket2 = { version = "0.6", optional = true }
 
 # multiview-ffmpeg is pulled in UNCONDITIONALLY but with NO features: its DEFAULT
 # build is pure-Rust / native-dep-free (the libav* `ffmpeg-next` link is opt-in
@@ -51,6 +67,14 @@ multiview-ndi-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = "1.11.0"
+# Generate adversarial `C=1` (zlib) bombs at test time to *verify* — not merely
+# assert — the SAP inflate cap (ADR-0041 Decision 8): the deflate side of the
+# SAME crate the codec inflates with. `compress_to_vec_zlib` lets a test build a
+# valid zlib stream whose decompressed size dwarfs `MAX_SDP_PAYLOAD` (e.g. 8 MiB
+# vs the 64 KiB cap) without a multi-KiB magic const; the parser must reject it
+# AT the cap. Already a normal dependency at this exact version (deny-neutral),
+# and it is safe code — the crate stays `unsafe_code = forbid`.
+miniz_oxide = "0.8.9"
 # Self-contained ffmpeg-feature tests generate their own tiny clip at runtime
 # (via the `ffmpeg` CLI) into a tempdir — no checked-in media.
 tempfile = "3"
@@ -94,12 +118,16 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # always compiled and fully tested; this feature only adds the thin tokio
 # `UdpSocket` binding in `st2110::transport`. No native deps, no FFI — the crate
 # stays `unsafe_code = forbid`.
-"st2110" = ["tokio/net"]
-# WebRTC ingest transport. OFF by default: a real session needs an ICE/DTLS/SRTP
-# media engine and a network stack, none of which exist in CI here, so the
-# transport shell is compile-verified only. The PURE SDP offer/answer model
-# (parse + negotiate) is always compiled and fully tested; this feature only adds
-# the thin `webrtc::transport` shell. No native deps, no FFI — the crate stays
+"st2110" = ["tokio/net", "dep:socket2"]
+# WebRTC ingest seam. OFF by default: a real session needs an application-layer
+# ICE/DTLS/SRTP media engine and a network stack (str0m, in `multiview-webrtc`),
+# neither of which lives in this crate: str0m owns the live transport, so there
+# is no transport path here to compile-verify. This crate never parses SDP: SDP
+# offer/answer negotiation is str0m's, in `multiview-webrtc` (ADR-0048). The PURE
+# negotiated-session value model (`NegotiatedSession` and friends in
+# `webrtc::sdp`) is always compiled; this feature only adds the thin
+# `webrtc::transport`/`route` depacketizer/router seam (pure over injected RTP,
+# fully tested). No native deps, no FFI — the crate stays
 # `unsafe_code = forbid`. (The concrete media-engine binding is supplied by the
 # application layer; this crate never links a WebRTC native library, keeping the
 # default build pure-Rust and LGPL-clean.)

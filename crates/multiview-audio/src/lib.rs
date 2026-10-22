@@ -39,6 +39,11 @@
 //!   store** (the audio peer of the video tile store) plus the per-source audio
 //!   decode loop: a decode thread publishes blocks, the output clock samples
 //!   exactly the frames it needs per tick (never pacing, never blocking — #1/#10).
+//! - [`adaptive`] — a ratio-driven (varying ±ppm) linear-interpolating
+//!   resampler the HDMI display-audio servo drives to track the scanout clock
+//!   (the mpv/Kodi "display-resample" technique); pure Rust, the runtime half of
+//!   the resample machinery whose fixed-ratio decode-time half lives in
+//!   [`decode`].
 //! - [`filter`] / [`truepeak`] — the supporting DSP primitives.
 //!
 //! Decode and resample (turning coded packets into the in-memory
@@ -53,6 +58,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod adaptive;
 pub mod ballistics;
 pub mod cadence;
 pub mod capability;
@@ -63,6 +69,7 @@ pub mod decode;
 pub mod error;
 pub mod filter;
 pub mod format;
+pub mod loopdeck;
 pub mod loudness;
 pub mod loudnorm;
 pub mod meterdata;
@@ -73,6 +80,7 @@ pub mod store;
 pub mod tone;
 pub mod truepeak;
 
+pub use adaptive::{AdaptiveResampler, RatioPpm};
 pub use ballistics::{Ballistics, MeterScale, PeakMode, PpmKind, SampleScale};
 pub use capability::{DiscreteTracks, OutputCapability, OutputTransport, TrackSupport};
 pub use chanmap::{ChannelMatrix, Route};
@@ -81,8 +89,11 @@ pub use correlation::{CorrelationMeter, GonioPoint, SurroundDownmix};
 pub use decode::{meter_file, AudioFileDecoder, DecodedBlock};
 pub use error::{AudioError, Result};
 pub use format::{AudioBlock, AudioFormat, ChannelLayout};
+pub use loopdeck::{LoopDeck, LoopDeckError, DEFAULT_CROSSFADE_FRAMES};
 pub use loudness::LoudnessMeter;
-pub use loudnorm::{LoudnessTarget, LoudnormProcessor, DEFAULT_TRUE_PEAK_CEILING_DBTP};
+pub use loudnorm::{
+    LoudnessTarget, LoudnormProcessor, DEFAULT_TRUE_PEAK_CEILING_DBTP, LIVE_TOLERANCE_LU,
+};
 pub use meterdata::{Conflator, MeterSample, StereoMeterSample, DISPLAY_HZ};
 pub use mixer::{GainRamp, Mixer, RoutePoint};
 pub use probe::{AudioProbeBank, AudioProbeConfig, ProbeSeverityProfile};

@@ -241,6 +241,7 @@ fn from_raw_truncates_hostile_oversized_fields() {
         &raw,
         None,
         std::time::Instant::now() + Duration::from_secs(60),
+        None,
     );
     assert!(svc.name.len() <= MAX_FIELD_LEN, "name is truncated");
     assert!(svc.host.len() <= MAX_FIELD_LEN, "host is truncated");
@@ -452,6 +453,7 @@ async fn corr_window_does_not_stamp_pre_window_events() {
         "[fd00:db8::1]:5961",
         AddressFamily::Ipv6,
         None,
+        None,
     );
     let fence = engine.events.sequence();
     let op = OperationId::new();
@@ -461,6 +463,7 @@ async fn corr_window_does_not_stamp_pre_window_events() {
         "ndi-source",
         "[fd00:db8::2]:5961",
         AddressFamily::Ipv6,
+        None,
         None,
     );
 

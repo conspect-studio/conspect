@@ -228,6 +228,17 @@ impl DemuxOptions {
 /// for shared access (CLAUDE.md §7). It is `Send`, so it may move to the decode
 /// thread that drives it.
 pub struct Demuxer {
+    /// The libav→resource attribution registration for this demuxer's
+    /// `AVFormatContext*` (ADR-0060 §3.2, mechanism B). Declared **before**
+    /// `input` so Rust's field-drop order removes the map entry **before** the
+    /// `AVFormatContext` memory is freed (no lookup ever observes a freed pointer
+    /// mapped to a stale id). `None` when no resource was owned at open time (the
+    /// thread held no [`ResourceGuard`]) — honest: no guessed id.
+    ///
+    /// Held purely for its `Drop` (which removes the map entry); never read after
+    /// construction, hence `dead_code`-allowed with this justification.
+    #[allow(dead_code)]
+    registration: Option<crate::log_bridge::AvContextRegistration>,
     input: ffmpeg::format::context::Input,
     /// The read-deadline state the injected `AVIOInterruptCB` reads. Boxed so its
     /// address is stable for the raw pointer libav holds; `None` for a bare
@@ -253,7 +264,9 @@ impl Demuxer {
             path: path.display().to_string(),
             source,
         })?;
+        let registration = register_format_context(&input);
         Ok(Self {
+            registration,
             input,
             deadline: None,
             rw_timeout: None,
@@ -293,12 +306,26 @@ impl Demuxer {
         let input = open_input_with_interrupt(path, deadline.as_ref(), rw_timeout)?;
         deadline.disarm();
 
+        let registration = register_format_context(&input);
         Ok(Self {
+            registration,
             input,
             deadline: Some(deadline),
             rw_timeout,
             source,
         })
+    }
+
+    /// The address of this demuxer's `AVFormatContext`, as a `usize`.
+    ///
+    /// This is the key under which the context is registered in the libav→
+    /// resource attribution map (ADR-0060 §3.2) and the address a libav line's
+    /// `parent_log_context_offset` walk resolves to. Returned as a `usize` so
+    /// callers (tests, telemetry) can match a logged context without holding a
+    /// raw pointer or touching libav memory.
+    #[must_use]
+    pub fn format_ctx_ptr(&self) -> usize {
+        format_context_addr(&self.input)
     }
 
     /// Snapshot every stream's parameters.
@@ -606,6 +633,52 @@ pub fn discard_unrouted_subtitles(
         discarded = discarded.saturating_add(1);
     }
     discarded
+}
+
+/// The address of an opened input's `AVFormatContext`, as a `usize` map key.
+///
+/// libav logs against the `AVFormatContext` (and child contexts whose
+/// `parent_log_context_offset` reaches it), so its address is the attribution
+/// key (ADR-0060 §3.2). Returned as a `usize`: it is only ever compared as a map
+/// key, never dereferenced through this value.
+#[allow(unsafe_code)]
+#[must_use]
+fn format_context_addr(input: &ffmpeg::format::context::Input) -> usize {
+    // SAFETY: `Input::as_ptr` returns the live `*const AVFormatContext` this
+    // `Input` owns; we only read its address (never dereference it here). The
+    // pointer is valid for the borrow of `input`.
+    let ptr = unsafe { input.as_ptr() };
+    // reason(allow): pointer→address cast for a map key only (never cast back /
+    // dereferenced); `<*const T>::addr()` is MSRV-1.84 and this crate is 1.82, so
+    // `as usize` is the only option until the MSRV moves.
+    #[allow(clippy::as_conversions)]
+    {
+        ptr as usize
+    }
+}
+
+/// Register an opened input's `AVFormatContext*` in the libav→resource map for
+/// the resource the current thread owns, if any (ADR-0060 §3.2, mechanism B).
+///
+/// The ingest/output thread enters its [`ResourceGuard`](crate::log_bridge::ResourceGuard)
+/// **before** opening the demuxer (verified in `multiview-cli`'s `pipeline.rs`:
+/// `ingest_resource_scope` / the output `ResourceGuard::enter` precede
+/// `Demuxer::open`), so [`current_resource`](crate::log_bridge::current_resource)
+/// is set here and the format context is tagged with that resource id. A libav
+/// line emitted later on a libav-owned decoder / HLS sub-demuxer thread (where
+/// the thread-local is **not** set) is then attributed by walking
+/// `parent_log_context_offset` up to this registered format context.
+///
+/// Returns [`None`] when no resource is owned at open time — honest: no guessed
+/// id (mechanism C). The returned guard is held in the [`Demuxer`] and removes
+/// the entry on drop, ordered before the `AVFormatContext` is freed.
+#[must_use]
+fn register_format_context(
+    input: &ffmpeg::format::context::Input,
+) -> Option<crate::log_bridge::AvContextRegistration> {
+    let context = crate::log_bridge::current_resource()?;
+    let addr = format_context_addr(input);
+    Some(crate::log_bridge::register_av_context(addr, context))
 }
 
 /// Human-readable codec id name (e.g. `"h264"`), or `"unknown"`.

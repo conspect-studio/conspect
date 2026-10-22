@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::rand_core::UnwrapErr;
 use ed25519_dalek::{Signer, SigningKey};
+use getrandom::SysRng;
 use multiview_control::LicenceState;
 use multiview_licence::entitlement::{
     Entitlement, EntitlementFlags, GpuLimit, HardwareClass, Tier,
@@ -32,7 +34,6 @@ use multiview_licence::lease::{Lease, LeaseSource};
 use multiview_licence::store::{LeaseBinding, LeaseStore};
 use multiview_licence::verify::{PinnedKey, SignedLease};
 use multiview_licence::ACTIVATION_WINDOW_DAYS;
-use rand_core::OsRng;
 use support::{body_json, harness_with, send, ADMIN_TOKEN, VIEWER_TOKEN};
 
 fn epoch() -> DateTime<Utc> {
@@ -40,7 +41,7 @@ fn epoch() -> DateTime<Utc> {
 }
 
 fn keypair() -> (SigningKey, PinnedKey) {
-    let mut rng = OsRng;
+    let mut rng = UnwrapErr(SysRng);
     let key = SigningKey::generate(&mut rng);
     let pinned = PinnedKey::from_verifying_key(&key.verifying_key());
     (key, pinned)
@@ -57,7 +58,7 @@ fn binding(
         LeaseSource::File => Lease::new_offline(serial.to_owned(), granted, ACTIVATION_WINDOW_DAYS),
         other => Lease::new_full(serial.to_owned(), granted, other, ACTIVATION_WINDOW_DAYS),
     };
-    let sig = key.sign(&SignedLease::signing_bytes(&lease));
+    let sig = key.sign(&SignedLease::signing_bytes(&lease, None));
     LeaseBinding::new(
         SignedLease::new(lease.clone(), sig.to_bytes()),
         Entitlement::new(
@@ -69,6 +70,7 @@ fn binding(
             EntitlementFlags::default(),
         ),
         100,
+        None,
     )
 }
 

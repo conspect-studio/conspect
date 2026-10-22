@@ -247,9 +247,9 @@ mod tests {
             "kind": "ll_hls",
             "path": "/var/lib/multiview/hls",
             "codec": "h264",
-            "part_target_ms": 333
+            "segment_ms": 2000
         });
         let stored = validated_body(TypedCollection::Outputs, "web1", &body).unwrap();
-        assert_eq!(stored["part_target_ms"], 333);
+        assert_eq!(stored["segment_ms"], 2000);
     }
 }

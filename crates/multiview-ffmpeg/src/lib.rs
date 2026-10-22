@@ -33,7 +33,12 @@
 //! * `audio_file` — `AudioFileDecoder`: file → interleaved-`f32` blocks
 //!   (`AudioSamplesF32`) with no libav type in its public API.
 //! * `scale` / `resample` — libswscale / libswresample wrappers.
-//! * `encode` — `VideoEncoder`/`AudioEncoder` configured from a target.
+//! * `encode` — `VideoEncoder`/`AudioEncoder` configured from a target (plus
+//!   the ADR-0049 `force_next_keyframe` seam and `new_with_options`).
+//! * `packet_decode` — `H264PacketDecoder`: avcodec-only WHIP/WebRTC
+//!   access-unit decode (geometry from SPS, colour from VUI; ADR-T014).
+//! * `opus` — `OpusDecoder`/`OpusEncoder`: RTP-shaped Opus packet decode and
+//!   the single program Opus rendition (ADR-T014 §5 / ADR-0049 / ADR-P006).
 //! * `mux` — `Muxer`: write a container, re-stamping packet timestamps.
 //! * `hwframe` — `AVHWFramesContext`/`AVHWDeviceContext` RAII scaffold.
 //!
@@ -54,6 +59,13 @@
 //!
 //! See [`docs/research/core-engine.md`](../docs/research/core-engine.md) §7,
 //! §8.1, §12 for the FFI / hardware-frame design this crate builds toward.
+
+/// Pure Annex-B framing normalization (ADR-T014): turn whatever the RTP
+/// depacketizer emits — bare NALs, raw STAP-A payloads, AVCC length-prefixed
+/// or already start-code-framed access units — into the Annex-B bytes libav's
+/// H.264 decoder consumes. Always compiled, libav-free, unit-tested in the
+/// default build; the feature-gated [`packet_decode`] decoder applies it.
+pub mod annexb;
 
 /// The unified **caption cue** model (`CaptionCue` text/bitmap shapes, regions,
 /// rects) plus the pure ASS-event markup stripper. Always compiled and
@@ -106,6 +118,15 @@ pub mod hwdecode;
 /// `ffmpeg` feature.
 pub mod jpegxs;
 
+/// Typed, libav-free encoder-`AVOption` surface + the fixed ADR-P006 preview
+/// option sets. The pure [`encode_options::CodecOptions`] model (NUL-validated
+/// pairs, the [`mux_options`] pattern on the encoder side) and the
+/// `preview_h264_options` / `preview_vp8_options` / `preview_gop_frames`
+/// family mappings are always compiled and unit-tested; the feature-gated
+/// `VideoEncoder::new_with_options` / `AudioEncoder::new_with_options` consume
+/// them at `avcodec_open2`.
+pub mod encode_options;
+
 /// Typed, libav-free muxer-`AVOption` surface (GP-6 Piece B, ADR-0030 §4). The
 /// pure [`mux_options::MuxOptions`] model — the `avoid_negative_ts` /
 /// `max_interleave_delta` knobs a guarded passthrough sets before
@@ -113,8 +134,14 @@ pub mod jpegxs;
 /// and unit-tested; the feature-gated [`Muxer::create_with_options`] consumes it.
 pub mod mux_options;
 
+pub use annexb::{is_annexb, to_annexb};
+
 pub use caption::{
     strip_ass_event, CaptionCue, CueAnchor, CueBitmap, CueError, CueRect, CueRegion, CueText,
+};
+
+pub use encode_options::{
+    preview_gop_frames, preview_h264_options, preview_vp8_options, CodecOptionError, CodecOptions,
 };
 
 pub use codec::{
@@ -137,9 +164,9 @@ pub use bsf_select::{
 pub use error::{FfmpegError, Result};
 
 pub use log_bridge::{
-    map_av_level, sanitize_line, BridgeLevel, SuppressOutcome, Suppressor, AV_LOG_DEBUG,
-    AV_LOG_ERROR, AV_LOG_FATAL, AV_LOG_INFO, AV_LOG_PANIC, AV_LOG_TRACE, AV_LOG_VERBOSE,
-    AV_LOG_WARNING, MAX_LINE_LEN,
+    current_resource, map_av_level, sanitize_line, BridgeLevel, ResourceContext, ResourceGuard,
+    ResourceKind, SuppressOutcome, Suppressor, AV_LOG_DEBUG, AV_LOG_ERROR, AV_LOG_FATAL,
+    AV_LOG_INFO, AV_LOG_PANIC, AV_LOG_TRACE, AV_LOG_VERBOSE, AV_LOG_WARNING, MAX_LINE_LEN,
 };
 
 #[cfg(feature = "ffmpeg")]
@@ -214,6 +241,21 @@ pub mod hwframe;
 #[cfg(feature = "ffmpeg")]
 pub mod mux;
 
+/// Opus packet decode + the single program Opus rendition encode (ADR-T014 §5,
+/// ADR-0049, ADR-P006): raw RTP-shaped Opus packets → 48 kHz stereo
+/// interleaved-`f32` blocks, and the `libopus`-preferred (native-`opus`
+/// fallback) 20 ms / ~96 kbps program audio encoder emitting audio-tagged
+/// encoded packets. Behind the `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod opus;
+
+/// Packet-fed H.264 access-unit decoder for WHIP/WebRTC ingest (ADR-T014): an
+/// avcodec-only decoder (no `AVFormatContext`) fed depacketizer output, with
+/// geometry from the in-band SPS and `ColorInfo` from the VUI. Behind the
+/// `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod packet_decode;
+
 /// Thread-movable encoded packet ([`packet::EncodedPacket`]) + `Send`
 /// codec-parameter snapshot ([`packet::StreamCodecParameters`]) for the
 /// encode-once-mux-many fan-out (invariant #7, ADR-0026). Behind the `ffmpeg`
@@ -273,6 +315,15 @@ pub use hwframe::{
 
 #[cfg(feature = "ffmpeg")]
 pub use mux::Muxer;
+
+#[cfg(feature = "ffmpeg")]
+pub use opus::{
+    OpusDecoder, OpusEncoder, OPUS_CHANNELS, OPUS_FRAME_SAMPLES, OPUS_SAMPLE_RATE,
+    PROGRAM_OPUS_BIT_RATE,
+};
+
+#[cfg(feature = "ffmpeg")]
+pub use packet_decode::H264PacketDecoder;
 
 #[cfg(feature = "ffmpeg")]
 pub use packet::{EncodedPacket, StreamCodecParameters, StreamKind};

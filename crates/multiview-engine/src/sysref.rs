@@ -8,7 +8,7 @@
 //! * **System NTP/chrony** (`SYS`): the kernel's own clock-discipline state,
 //!   read on Linux with `adjtimex`/`ntp_adjtime` (the `STA_*` status bits, the
 //!   `TIME_*` clock state, and the estimated error). That syscall read lives
-//!   behind the off-by-default [`live`] module / `ntp` feature (it needs a real,
+//!   behind the off-by-default `live` module / `ntp` feature (it needs a real,
 //!   NTP-synchronised host to mean anything); the **classification** of a reading
 //!   is pure and lives here, tested over injected snapshots.
 //! * **PTP / ST 2059-2** (`PTP`): the disciplined-reference lock state produced
@@ -42,7 +42,7 @@ use crate::ptp::{LockState, ReferenceStatus};
 /// Only the bits the badge classification needs are interpreted; the raw value is
 /// retained for diagnostics. The bit values are the stable Linux kernel ABI
 /// (`<linux/timex.h>`); they are re-declared here so the pure classifier carries
-/// no syscall dependency (the live `adjtimex` read in [`live`] cross-checks them
+/// no syscall dependency (the live `adjtimex` read in `live` cross-checks them
 /// against `libc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct NtpStatusFlags {
@@ -142,7 +142,7 @@ impl NtpClockState {
 
 /// A single `adjtimex`/`ntp_adjtime` snapshot, normalised for classification.
 ///
-/// Produced by the live syscall reader ([`live::SystemNtpQuery`], behind the
+/// Produced by the live syscall reader (`live::SystemNtpQuery`, behind the
 /// `ntp` feature) in production and injected directly in tests. All error / offset
 /// fields are normalised to **nanoseconds** by the reader (`STA_NANO` decides
 /// whether the kernel's raw fields were us or ns).
@@ -188,6 +188,21 @@ impl SystemRefConfig {
             assumed_when_unavailable: LockState::Locked,
         }
     }
+
+    /// The conservative variant: the same lock tolerance, but an unavailable
+    /// read is assumed [`LockState::Freerun`] — "no measurement" is reported
+    /// as undisciplined, never as an assumed lock. This is the default for
+    /// the **machine-readable epoch path** (`timing.status`, consumed by
+    /// downstream presenters), where over-claiming discipline on a possibly
+    /// undisciplined host would mislead consumers; the on-screen badge keeps
+    /// [`Self::new_default`]'s documented deployment assumption.
+    #[must_use]
+    pub const fn new_conservative() -> Self {
+        Self {
+            est_error_tolerance_ns: 100_000,
+            assumed_when_unavailable: LockState::Freerun,
+        }
+    }
 }
 
 impl Default for SystemRefConfig {
@@ -231,7 +246,7 @@ pub fn classify_system(reading: &NtpReading, config: &SystemRefConfig) -> LockSt
 
 /// The injectable source of kernel `adjtimex` readings.
 ///
-/// Production wires the live Linux reader ([`live::SystemNtpQuery`], behind the
+/// Production wires the live Linux reader (`live::SystemNtpQuery`, behind the
 /// `ntp` feature); tests wire a fake whose readings they control. [`read`](Self::read)
 /// returns `None` when no reading is available (non-Linux, missing capability,
 /// syscall error, or the `ntp` feature off) — the tracker then falls back to the

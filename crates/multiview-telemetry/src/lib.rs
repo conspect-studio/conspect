@@ -22,7 +22,25 @@
 //! * [`availability`] — [`availability::AvailabilityCounters`]: pure G.826-style
 //!   uptime / alarm-second / error-second / severely-errored-second accounting
 //!   with a derived availability ratio.
+//! * [`clock`] — clock-layer servo telemetry (DEV-C4; ADR-R012, implementing the
+//!   ADR-M010 sync-acceptance gate): the disciplined-reference servo offset (ns)
+//!   / frequency (ppb) gauges ([`clock::ClockServoGauges`]) labelled by `source`,
+//!   the display-audio buffer servo gauges ([`clock::AudioServoGauges`]) labelled
+//!   by `sink`, and the documented soak pass thresholds
+//!   ([`clock::PTP_OFFSET_P99_MAX_NS`] / [`clock::CHRONY_OFFSET_P99_MAX_NS`]) as
+//!   exact integer nanoseconds (invariant #3).
+//! * [`soak`] — the pure, dependency-free acceptance-soak verdict analyzer
+//!   (DEV-C4; ADR-R012): nearest-rank p99 `|offset|`
+//!   ([`soak::p99_abs_offset_ns`]), the per-leg [`soak::evaluate_offset`], the
+//!   invariant-#1 [`soak::cadence_uninterrupted`] chaos assertion, and the
+//!   aggregate [`soak::SoakReport`] PASS/FAIL. The same code CI exercises is what
+//!   a hardware soak is judged by (`cargo xtask soak-report`).
 //! * [`health`] — [`health::HealthState`] with readiness gates for the probes.
+//! * [`log_capture`] — the resource-scoped structured log producer (ADR-0060):
+//!   the bounded drop-oldest [`log_capture::LogRing`] and the
+//!   [`log_capture::LogCaptureLayer`] `tracing` layer that mirrors every event
+//!   (ours and the libav bridge's) into it with its `resource_id` attribution,
+//!   feeding the control-plane `GET /api/v1/logs` tail and `Topic::Logs`.
 //! * [`metrics`] — [`metrics::MetricsRegistry`] with counters, gauges,
 //!   histograms, and bounded-cardinality [`metrics::Labels`].
 //! * [`gpu`] — per-GPU load gauges ([`gpu::GpuGauges`]) keyed by a bounded
@@ -51,21 +69,30 @@
 #![warn(missing_docs)]
 
 pub mod availability;
+pub mod clock;
 pub mod error;
 pub mod gpu;
 pub mod health;
+pub mod log_capture;
 pub mod metrics;
 pub mod placement;
 pub mod retention;
+pub mod rist;
 #[cfg(feature = "snmp")]
 pub mod snmp;
+pub mod soak;
 pub mod syslog;
 pub mod tracing_init;
 
 pub use availability::{AvailabilityCounters, AvailabilitySnapshot};
+pub use clock::{
+    AudioServoGauges, ClockServoGauges, ClockSourceLabel, CHRONY_OFFSET_P99_MAX_NS,
+    PTP_OFFSET_P99_MAX_NS, SOAK_WINDOW_SECS,
+};
 pub use error::{Result, TelemetryError};
 pub use gpu::{CpuGauge, CpuSampler, GpuGauges, GpuLabels, VendorExposes};
 pub use health::{GateId, HealthState, Liveness, Readiness};
+pub use log_capture::{LogCaptureLayer, LogFilter, LogLevel, LogRecord, LogResourceKind, LogRing};
 pub use metrics::{
     Counter, Gauge, Histogram, HistogramSnapshot, Labels, MetricKind, MetricsRegistry,
     SeriesDescriptor,
@@ -76,5 +103,6 @@ pub use retention::{
     ShedReason, UtilisationBucket, UtilisationSample, UtilisationSummary, BUCKET_SECONDS,
     MAX_EVENTS_PER_BUCKET, RETENTION_BUCKETS,
 };
+pub use rist::{RistLinkAssessment, RistLinkGauges, RistLinkRole, RistLinkSample};
 pub use syslog::{Facility, SdElement, Severity, SyslogMessage};
 pub use tracing_init::{Output, SubscriberBuilder};

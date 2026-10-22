@@ -240,6 +240,66 @@ describe('sourceFormToBody', () => {
   });
 });
 
+describe('webrtc source (WHIP ingest, ADR-T014 / ADR-W023)', () => {
+  it('builds a bare webrtc body (kind only) — token absent, audio default on', () => {
+    // ADR-T014: there is no `url` to author (the publish endpoint is derived
+    // from the id); an absent token means publishing requires a Write API key;
+    // `audio` defaults to true (serde skip_serializing_if = is_true), so a body
+    // accepting publisher Opus carries no `audio` key.
+    const body = sourceFormToBody(sourceForm({ kind: 'webrtc' }));
+    expect(body).toEqual({ id: 'cam1', display_name: 'Cam 1', kind: 'webrtc' });
+    expect(body).not.toHaveProperty('url');
+    expect(body).not.toHaveProperty('token');
+    expect(body).not.toHaveProperty('audio');
+  });
+
+  it('writes a non-empty token and an explicit audio=false', () => {
+    const body = sourceFormToBody(
+      sourceForm({ kind: 'webrtc', webrtcToken: 'pub-secret', webrtcAudio: false }),
+    );
+    expect(body).toMatchObject({ kind: 'webrtc', token: 'pub-secret', audio: false });
+  });
+
+  it('omits a blank/whitespace token (never writes an empty token)', () => {
+    const body = sourceFormToBody(sourceForm({ kind: 'webrtc', webrtcToken: '   ' }));
+    expect(body).not.toHaveProperty('token');
+  });
+
+  it('round-trips a stored webrtc body (token + audio=false)', () => {
+    const form = defined(
+      sourceFormFromRecord({
+        id: 'cam-field-1',
+        name: 'Field cam',
+        body: { id: 'cam-field-1', kind: 'webrtc', token: 'pub-secret', audio: false },
+      }),
+    );
+    expect(form.kind).toBe('webrtc');
+    expect(form.webrtcToken).toBe('pub-secret');
+    expect(form.webrtcAudio).toBe(false);
+    expect(sourceFormToBody(form)).toMatchObject({
+      kind: 'webrtc',
+      token: 'pub-secret',
+      audio: false,
+    });
+  });
+
+  it('treats an absent audio key as the schema default (accept = true)', () => {
+    const form = defined(
+      sourceFormFromRecord({
+        id: 'c',
+        name: 'C',
+        body: { id: 'c', kind: 'webrtc' },
+      }),
+    );
+    expect(form.webrtcAudio).toBe(true);
+    expect(form.webrtcToken).toBe('');
+  });
+
+  it('validates nothing extra for a bare webrtc form (no url to require)', () => {
+    expect(validateSourceForm(sourceForm({ kind: 'webrtc' }), true)).toEqual({});
+  });
+});
+
 describe('sourceFormFromRecord', () => {
   it('refuses an unknown kind with the undefined sentinel (never folds)', () => {
     expect(
@@ -996,6 +1056,10 @@ describe('OUTPUT_RUNNABLE', () => {
     expect(OUTPUT_RUNNABLE.rtsp).toBe('unbuilt');
     expect(OUTPUT_RUNNABLE.ndi).toBe('unbuilt');
     expect(OUTPUT_RUNNABLE.display).toBe('requires-feature');
+    // The WebRTC outputs run only in a webrtc-native build (ADR-0049): a
+    // default build accepts the config but cannot serve/push WebRTC.
+    expect(OUTPUT_RUNNABLE.webrtc).toBe('requires-feature');
+    expect(OUTPUT_RUNNABLE['whip-push']).toBe('requires-feature');
   });
 });
 
@@ -1128,6 +1192,156 @@ describe('display output form (DEV-B1 / ADR-0044)', () => {
           displayModeHeight: '1080',
           displayModeRefresh: '60000/1001',
         }),
+        true,
+      ),
+    ).toEqual({});
+  });
+});
+
+describe('webrtc output (WHEP serve, ADR-0049 / ADR-W023)', () => {
+  it('builds a webrtc body with label, default max_viewers omitted, codec h264', () => {
+    // ADR-0049: the WHEP serve output carries an explicit `label` (no
+    // mount/path/url to derive one from); `max_viewers` default is 8 and is
+    // omitted when unchanged; `codec` defaults to h264 (the only v1 value).
+    const body = outputFormToBody(
+      outputForm({ kind: 'webrtc', name: 'Program WHEP', codec: 'h264' }),
+    );
+    expect(body).toMatchObject({ kind: 'webrtc', label: 'Program WHEP', codec: 'h264' });
+    // 8 is the schema default; omit it so the body only carries what changed.
+    expect(body).not.toHaveProperty('max_viewers');
+    expect(body).not.toHaveProperty('token');
+  });
+
+  it('writes a non-default max_viewers and a non-empty token', () => {
+    const body = outputFormToBody(
+      outputForm({
+        kind: 'webrtc',
+        name: 'Program WHEP',
+        codec: 'h264',
+        webrtcMaxViewers: '32',
+        webrtcToken: 'viewer-secret',
+      }),
+    );
+    expect(body).toMatchObject({ kind: 'webrtc', max_viewers: 32, token: 'viewer-secret' });
+  });
+
+  it('never writes a routable id from the store id (label-derived)', () => {
+    const body = outputFormToBody(
+      outputForm({ id: 'output-9', kind: 'webrtc', name: 'WHEP', codec: 'h264' }),
+    );
+    expect(body).not.toHaveProperty('id');
+  });
+
+  it('round-trips a stored webrtc body (label + max_viewers + token)', () => {
+    const form = defined(
+      outputFormFromRecord({
+        id: 'output-9',
+        name: 'Program WHEP',
+        body: {
+          kind: 'webrtc',
+          label: 'Program WHEP',
+          max_viewers: 16,
+          token: 'viewer-secret',
+          codec: 'h264',
+        },
+      }),
+    );
+    expect(form.kind).toBe('webrtc');
+    expect(form.name).toBe('Program WHEP');
+    expect(form.webrtcMaxViewers).toBe('16');
+    expect(form.webrtcToken).toBe('viewer-secret');
+    expect(form.codec).toBe('h264');
+    expect(outputFormToBody(form)).toMatchObject({
+      kind: 'webrtc',
+      label: 'Program WHEP',
+      max_viewers: 16,
+      token: 'viewer-secret',
+    });
+  });
+
+  it('validates a positive max_viewers and an empty token allowed', () => {
+    expect(
+      validateOutputForm(
+        outputForm({ kind: 'webrtc', name: 'W', codec: 'h264', webrtcMaxViewers: '0' }),
+        true,
+      ).webrtcMaxViewers,
+    ).toBe('positive-int');
+    expect(
+      validateOutputForm(
+        outputForm({ kind: 'webrtc', name: 'W', codec: 'h264', webrtcMaxViewers: '8' }),
+        true,
+      ),
+    ).toEqual({});
+  });
+});
+
+describe('whip-push output (WHIP push client, ADR-0049 / ADR-W023)', () => {
+  it('builds a whip_push body (display kind ↔ wire tag) with url + codec', () => {
+    const body = outputFormToBody(
+      outputForm({
+        kind: 'whip-push',
+        url: 'https://[2001:db8::15]:8443/whip/pgm1',
+        codec: 'h264',
+      }),
+    );
+    expect(body).toMatchObject({
+      kind: 'whip_push',
+      url: 'https://[2001:db8::15]:8443/whip/pgm1',
+      codec: 'h264',
+    });
+  });
+
+  it('writes a non-empty token but omits a blank one', () => {
+    expect(
+      outputFormToBody(
+        outputForm({
+          kind: 'whip-push',
+          url: 'https://o.example/whip',
+          codec: 'h264',
+          whipPushToken: 'origin-secret',
+        }),
+      ).token,
+    ).toBe('origin-secret');
+    expect(
+      outputFormToBody(
+        outputForm({ kind: 'whip-push', url: 'https://o.example/whip', codec: 'h264' }),
+      ),
+    ).not.toHaveProperty('token');
+  });
+
+  it('round-trips a stored whip_push body', () => {
+    const form = defined(
+      outputFormFromRecord({
+        id: 'output-7',
+        name: 'Origin push',
+        body: {
+          kind: 'whip_push',
+          url: 'https://o.example/whip/pgm',
+          token: 'origin-secret',
+          codec: 'h264',
+        },
+      }),
+    );
+    expect(form.kind).toBe('whip-push');
+    expect(form.url).toBe('https://o.example/whip/pgm');
+    expect(form.whipPushToken).toBe('origin-secret');
+    expect(outputFormToBody(form)).toMatchObject({
+      kind: 'whip_push',
+      url: 'https://o.example/whip/pgm',
+      token: 'origin-secret',
+    });
+  });
+
+  it('requires an http(s) url', () => {
+    expect(
+      validateOutputForm(
+        outputForm({ kind: 'whip-push', url: 'rtsp://h/x', codec: 'h264' }),
+        true,
+      ).url,
+    ).toBe('scheme-http');
+    expect(
+      validateOutputForm(
+        outputForm({ kind: 'whip-push', url: 'https://o.example/whip', codec: 'h264' }),
         true,
       ),
     ).toEqual({});

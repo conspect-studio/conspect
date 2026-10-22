@@ -62,19 +62,68 @@ use tokio::task::JoinHandle;
 /// Cache-Control tiers, Range/206, and Origin-reflecting CORS, so Cast
 /// receivers and browser players fetch cross-origin without a fronting proxy.
 ///
+/// Also returns a clone of the served [`AppState`] so a sibling control-plane
+/// tenant — the ADR-W020 config-file watcher — reaches the SAME stores,
+/// command bus, audit log, and watch-status slot the router serves (one set
+/// of stores, never a parallel copy).
+///
+/// `live_apply` declares what the **running** engine can take live (ADR-W022):
+/// the caller — the binary, the only place that knows both the compiled
+/// features and the chosen run path — injects it so every mutation route's
+/// `X-Multiview-Apply` header tells the truth per build. Pass
+/// [`multiview_control::LiveApplyCaps::default()`] for a run path with no live
+/// seams (everything honestly declares `restart`).
+///
 /// # Errors
 /// Returns an I/O error from binding the `listen` address, or — wrapped as
 /// [`std::io::ErrorKind::InvalidData`] — a failure to seed the resource stores
 /// from `config` (not expected for a validated config).
+// reason: this is the control-plane bind seam; each parameter (listen, config,
+// publisher, commands, preview, the Conspect LicenceState + MeshState, and the
+// shutdown future) is a distinct, independently-owned input the bind threads into
+// the `AppState`. Bundling them into a struct would only move the arity behind a
+// one-use builder without improving clarity.
+#[allow(clippy::too_many_arguments)]
+// reason: `whep` (WHEP preview egress, ADR-P006) and `whip` (WHIP ingest,
+// ADR-T014) are the canonical, externally-named WebRTC protocol terms — distinct
+// transports, not a typo-similar pair; renaming either to satisfy the lint would
+// obscure the spec mapping.
+#[allow(clippy::similar_names)]
+// reason: this is a flat, linear control-plane wiring sequence — one documented
+// `if let Some(provider)` / `match` block per optional surface (WHEP preview, WHIP
+// ingest, WHEP-serve output, discovery, device pollers, licence, mesh). It crossed
+// the 100-line ceiling by 2 when the WebRTC ingest/preview/output providers were
+// each wired (#141/#143/#147). Extracting the blocks would only scatter the wiring
+// behind one-use helpers around the `#[cfg(feature = "discovery")]` rebind without
+// improving clarity; the length is inherent to the surface count, not complexity.
+#[allow(clippy::too_many_lines)]
 pub async fn bind_and_serve<F>(
     listen: &str,
     config: &MultiviewConfig,
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     commands: CommandSender,
     preview: SharedPreview,
+    // The WHEP focus transport (ADR-P006), already cap-decorated. `None` keeps
+    // the default `NoWhep` (a pure build sheds every focus to the JPEG ladder).
+    whep: Option<multiview_control::SharedWhep>,
+    // The WHIP ingest provider (ADR-T014). `None` keeps the default `NoWhip`
+    // (every publish answers `503`; routes stay present + authz-enforced).
+    whip: Option<multiview_control::SharedWhip>,
+    whep_output: Option<multiview_control::SharedWhepOutput>,
     licence: Option<multiview_control::LicenceState>,
+    mesh: Option<Arc<multiview_mesh::MeshState>>,
+    live_apply: multiview_control::LiveApplyCaps,
+    // The run-path live-apply capability (ADR-W018): which source kinds the
+    // RUNNING engine can take live. The binary derives it from the seams it
+    // actually wired (network kinds iff the hub has an ingest spawner), so
+    // the X-Multiview-Apply header never over-claims.
+    live_sources: multiview_control::LiveSourceCapability,
+    // The Boot/Loaded/Running model (ADR-W024): `Some` for a config-file run
+    // (backs `GET /config/boot-model` + the revert/promote actions); `None`
+    // for store-only/`--ticks` runs (those routes report `modeled: false`).
+    boot_model: Option<Arc<multiview_control::boot_model::BootModel>>,
     shutdown: F,
-) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>)>
+) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -92,7 +141,7 @@ where
     let admin_secret = std::env::var("MULTIVIEW_CONTROL_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
-    let (api_keys, bootstrap_token) = provision_admin_keys(admin_secret);
+    let (mut api_keys, bootstrap_token) = provision_admin_keys(admin_secret);
     if let Some(token) = bootstrap_token {
         tracing::warn!(
             token = %token,
@@ -102,6 +151,25 @@ where
         );
     } else {
         tracing::info!("control admin key provisioned from MULTIVIEW_CONTROL_TOKEN");
+    }
+
+    // Config-declared scoped API keys (ADR-W026): register every `[[api.keys]]`
+    // beside the bootstrap admin so the object/output/discovery authorization
+    // axes have live principals. Each secret is read from the env var named by
+    // `secret_env` (never inlined — rule 34); a key whose secret env is unset is
+    // a hard startup error (an un-authenticatable scoped key is a latent
+    // misconfiguration). The bootstrap admin above is unchanged and unscoped.
+    if let Some(api) = &config.api {
+        multiview_control::auth::register_config_api_keys(&mut api_keys, &api.keys, |name| {
+            std::env::var(name).ok()
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if !api.keys.is_empty() {
+            tracing::info!(
+                count = api.keys.len(),
+                "registered config-declared scoped API keys ([[api.keys]], ADR-W026)"
+            );
+        }
     }
 
     // Optional, explicit, opt-in auth-disable for trusted/local deployments.
@@ -133,7 +201,26 @@ where
     let warning_sub = publisher.subscribe();
     tokio::spawn(run_warning_ingest(warning_sub, Arc::clone(&warnings)));
 
-    let state = AppState::new(
+    // The Cast delivery map (DEV-D2, ADR-M011): `control.cast_media_base` ×
+    // the served HLS mounts. `None` (no base configured / base rejected) means
+    // the cast-session routes refuse with an honest 409 and the poller
+    // registry carries no cast member.
+    let delivery = cast_delivery(config);
+
+    // The outbound-dial SSRF policy (SEC-02/SEC-04, CWE-918): the non-breaking
+    // LAN default, tightened by the operator's `control.device_dial_allow`
+    // allowlist (or the legacy env var).
+    let dial_policy = device_dial_policy(config.control.as_ref());
+
+    // Resolve the compositor adapter for the system-capabilities snapshot
+    // (ADR-W030): only a `gpu` build can read a wgpu adapter; other builds report
+    // the CPU-composite tier (compositor class `none`). A one-shot startup read.
+    #[cfg(feature = "gpu")]
+    let compositor_adapter = crate::capability_warn::read_compositor_adapter();
+    #[cfg(not(feature = "gpu"))]
+    let compositor_adapter: Option<multiview_hal::AdapterReport> = None;
+
+    let mut state = AppState::new(
         publisher,
         commands,
         Arc::new(InMemoryRepository::new()),
@@ -145,13 +232,86 @@ where
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
     )
     .with_preview(preview)
-    .with_warning_store(warnings)
-    .with_device_pollers(device_poller_registry())
+    .with_warning_store(warnings);
+    if let Some(whep) = whep {
+        state = state.with_whep(whep);
+    }
+    let mut state = state
+    .with_device_pollers(device_poller_registry(delivery.as_ref(), &dial_policy))
+    .with_dial_policy(Arc::clone(&dial_policy))
     .with_auth_disabled(auth_disabled)
+    // The management-plane request-concurrency + rate caps (SEC-14 control-plane DoS
+    // floor): map `control.limits` (secure defaults when the section is absent)
+    // onto the served API. Config-driven; the guards shed `429`/`503` and never
+    // touch the engine (invariant #10).
+    .with_limits(
+        &config
+            .control
+            .as_ref()
+            .map(|control| control.limits.clone())
+            .unwrap_or_default(),
+    )
+    // The realtime `Origin` allow-list (SEC-13 / CSWSH, ADR-RT011): map
+    // `control.allowed_origins` (empty ⇒ same-origin only) onto the WS + SSE upgrade
+    // gate. Enforced even when auth is disabled — a cross-origin handshake bypasses
+    // SOP/CORS, so this is the CSWSH defense for the realtime firehose.
+    .with_allowed_origins(
+        config
+            .control
+            .as_ref()
+            .map(|control| control.allowed_origins.clone())
+            .unwrap_or_default(),
+    )
+    // The CORS allow-list for the WebRTC media-signalling routes (ADR-0048 §9):
+    // map `[webrtc].cors_allow_origins` (default `["*"]`) onto the control plane
+    // so a browser served from a web origin can WHIP-publish / WHEP-play.
+    .with_cors_allow_origins(config.webrtc.cors_allow_origins.clone())
+    .with_live_apply(live_apply)
+    // The run-path live-apply capability (ADR-W018): which source kinds the
+    // running engine can take live — synthetic always, network/file only when
+    // a real ingest spawner backs them. The header consults this before
+    // promising `live` (never over-claims).
+    .with_live_sources(live_sources)
+    // The static system capability + licence snapshot (ADR-W030): the HAL probe
+    // + compiled features + resolved compositor adapter that
+    // `GET /api/v1/system/capabilities` serves. A one-shot snapshot, never an
+    // engine channel (invariant #10).
+    .with_capabilities(crate::system_capabilities::resolve_system_capabilities(
+        compositor_adapter.as_ref(),
+    ))
     // The `[discovery]` browse configuration: the operator-configured
     // zowietek-control service type (the vendor's type is unverified — only a
     // configured string is ever recognised) plus any extra DNS-SD types.
     .with_discovery_config(config.discovery.clone().unwrap_or_default());
+    // The Boot/Loaded/Running model (ADR-W024): installed for a config-file
+    // run so the boot-model/revert/promote routes are live; absent ⇒ those
+    // routes honestly report `modeled: false`.
+    if let Some(boot_model) = boot_model {
+        state = state.with_boot_model(boot_model);
+    }
+    // Serve the process log-tail ring the capture layer feeds (ADR-0060): the
+    // same `Arc` `init_tracing` installed, so `GET /api/v1/logs` returns live
+    // captured, resource-attributed records. If logging was not initialized
+    // (never, in the binary), the AppState keeps its empty default ring.
+    if let Some(logs) = crate::log_ring() {
+        state = state.with_log_ring(logs);
+    }
+    if let Some(delivery) = delivery {
+        state = state.with_cast_delivery(delivery);
+    }
+    // The WHIP ingest provider (ADR-T014): when the binary wired the native
+    // endpoint, install it so a publish negotiates a real session; otherwise the
+    // default `NoWhip` answers `503` (routes stay present + authz-enforced).
+    if let Some(whip) = whip {
+        state = state.with_whip(whip);
+    }
+    // The WHEP-serve output provider (ADR-0049): when the binary wired the native
+    // endpoint, install it so a `POST /api/v1/whep/{output}` serves the real
+    // encoded program to a browser viewer; otherwise the default `NoWhepOutput`
+    // answers `503` (routes stay present + authz-enforced).
+    if let Some(whep_output) = whep_output {
+        state = state.with_whep_output(whep_output);
+    }
 
     // Install the real mDNS browser when the `discovery` feature is built, so
     // `POST /api/v1/discovery/devices/scan` browses the LAN for Cast / NDI /
@@ -196,6 +356,16 @@ where
         None => state,
     };
 
+    // The Conspect local-mesh plane (ADR-0051): share the SAME `MeshState` the cli
+    // owns + (under `mesh-mdns`) the always-on announce/browse loop maintains, so
+    // `/api/v1/mesh/*` renders + toggles the live discovery state. `None` keeps the
+    // empty always-on default (a store-only run / test). Control-plane only; the
+    // store holds no engine handle and can never back-pressure the engine (inv #10).
+    let state = match mesh {
+        Some(mesh) => state.with_mesh(mesh),
+        None => state,
+    };
+
     // Mount each configured HLS/LL-HLS output's delivery surface under
     // `/hls/{output-id}/` (DEV-D1): the ADR-0032 §6 router serving that
     // output's playlist/segment/init files with the Cache-Control tiers,
@@ -205,46 +375,245 @@ where
     // unauthenticated like `/docs` (media devices cannot send Bearer tokens).
     // Isolation-safe (inv #10): the handlers only read files the segmenter
     // already published to disk — never an engine channel or lock.
-    let mut app = multiview_control::router(state);
+    // ADR-W024 MAJOR-C1 (startup TOCTOU): for a config-file run (a boot model
+    // is wired) the config-file watcher's suppression handle MUST be installed
+    // into the shared state BEFORE the router serves a single request — else a
+    // `POST /config/promote` in the window between serving and the watcher
+    // spawning would find no handle, skip suppression, write the boot file, and
+    // the watcher would later re-apply the promoted file as an external edit.
+    // The handle is created and installed here; the caller reads it back via
+    // `state.watch_handle()` and drives the SAME handle from the spawned watcher
+    // (`WatchOptions::with_handle`). Store-only runs (no boot model) install no
+    // handle — promote there correctly skips suppression (nothing to suppress).
+    if state.boot_model.is_some() {
+        state.install_watch_handle(multiview_control::config_watch::ConfigWatchHandle::new());
+    }
+    let mut app = multiview_control::router(state.clone());
     for mount in hls_mounts(config) {
         app = app.nest(
             &mount.route,
             multiview_output::hls::http::hls_router(mount.dir),
         );
     }
-    let handle = tokio::spawn(multiview_control::serve_router(listener, app, shutdown));
-    Ok((addr, handle))
+    // TLS-0 (ADR-W029): serve over rustls when `[control.tls]` is configured, else
+    // plain HTTP. The TLS material is loaded HERE (startup), so a missing/garbage
+    // certificate aborts `multiview run` loudly rather than failing inside the
+    // spawned server task; a `[control.tls]` config in a build WITHOUT the `tls`
+    // feature is a hard startup error — never a silent plain-HTTP downgrade.
+    // SEC-14 #126 (ADR-W028 F-A): the header-read timeout (slowloris guard) is a
+    // serve-loop property, not a router layer, so it is threaded into the serve
+    // helper. It applies to every served connection regardless of the rate/concurrency
+    // `enabled` flag. Absent `[control.limits]` ⇒ the secure default (20 s).
+    let serve_options = match config.control.as_ref() {
+        Some(control) => {
+            let limits = &control.limits;
+            // The header-read timeout applies to every connection regardless of the
+            // shed-layer `enabled` flag (a generous timeout has no downside for a
+            // legitimate client). Reuse the same budget for the TLS handshake timeout —
+            // both bound "time to get your request in", pre- and post-handshake — so a
+            // client stalled mid-handshake recycles its accept-level cap slot too.
+            let header_read = std::time::Duration::from_secs(limits.header_read_timeout_secs);
+            // The accept-level population caps ARE shed-layer controls (like the
+            // request-concurrency + rate caps): enforced only while `enabled`.
+            let (max_connections, max_connections_per_ip) = if limits.enabled {
+                (
+                    Some(limits.max_connections),
+                    Some(limits.max_connections_per_ip),
+                )
+            } else {
+                (None, None)
+            };
+            multiview_control::ServeOptions::default()
+                .with_header_read_timeout(Some(header_read))
+                .with_tls_handshake_timeout(Some(header_read))
+                .with_max_connections(max_connections)
+                .with_max_connections_per_ip(max_connections_per_ip)
+        }
+        None => multiview_control::ServeOptions::default(),
+    };
+    let handle = match config
+        .control
+        .as_ref()
+        .and_then(|control| control.tls.as_ref())
+    {
+        None => tokio::spawn(multiview_control::serve_router_with(
+            listener,
+            app,
+            serve_options,
+            shutdown,
+        )),
+        #[cfg(feature = "tls")]
+        Some(tls) => {
+            let material = multiview_control::load_tls_material(tls)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            tokio::spawn(multiview_control::serve_router_tls_with(
+                listener,
+                app,
+                material,
+                serve_options,
+                shutdown,
+            ))
+        }
+        #[cfg(not(feature = "tls"))]
+        Some(_tls) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "control.tls is configured but this `multiview` build lacks the `tls` feature; \
+                 rebuild with --features tls (or a preset), or remove [control.tls]",
+            ));
+        }
+    };
+    Ok((addr, handle, state))
 }
 
-/// Build the runtime device-poller registry for the control plane (DEV-A4).
+/// Build the runtime device-poller registry for the control plane (DEV-A4/D2).
 ///
-/// With the `devices-net` feature on (which forwards `multiview-control/zowietek`),
-/// the registry carries the reqwest-backed
-/// [`ReqwestPollerFactory`](multiview_control::devices::ReqwestPollerFactory) so
-/// boot-seed/adopt spawn a **live** supervised poller per `zowietek` device,
-/// resolving each device's credentials from its `auth.secret_ref` via
-/// [`resolve_device_credentials`]. Without the feature it is the default no-op
-/// registry (no live transport → no poller spawned; the projection routes stay
-/// honestly empty), so the default build pulls no socket.
+/// With the `devices-net` feature on (which forwards
+/// `multiview-control/devices-net` = `zowietek` + `cast`), the registry carries
+/// a [`CompositePollerFactory`](multiview_control::devices::CompositePollerFactory)
+/// over both live drivers:
+///
+/// * the reqwest-backed
+///   [`ReqwestPollerFactory`](multiview_control::devices::ReqwestPollerFactory),
+///   so boot-seed/adopt spawn a **live** supervised poller per `zowietek`
+///   device, resolving credentials from its `auth.secret_ref` via
+///   [`resolve_device_credentials`];
+/// * the [`CastSessionFactory`](multiview_control::devices::cast::runtime::CastSessionFactory)
+///   over the live [`TlsCastConnector`](multiview_control::devices::cast::net::TlsCastConnector)
+///   and the [`cast_delivery`] map, so a `driver = cast` device (config-declared
+///   or an ad-hoc `/api/v1/cast/sessions` start) gets a supervised CASTV2
+///   session actor (DEV-D2, ADR-M011). Installed only when a delivery map
+///   exists (`control.cast_media_base` set) — without one no device-reachable
+///   media URL can be derived, so the cast member is honestly absent and the
+///   session routes refuse with `409`. A rustls-config build failure (a broken
+///   crypto provider — never expected) is logged and likewise leaves the cast
+///   member out rather than panicking.
+///
+/// Without the feature it is the default no-op registry (no live transport →
+/// no actor spawned; the projection routes stay honestly empty), so the
+/// default build pulls no socket.
 #[cfg(feature = "devices-net")]
-fn device_poller_registry() -> Arc<multiview_control::devices::DevicePollerRegistry> {
-    use multiview_control::devices::{DevicePollerRegistry, ReqwestPollerFactory};
+fn device_poller_registry(
+    cast_delivery: Option<&std::sync::Arc<multiview_control::devices::cast::media::CastDelivery>>,
+    dial_policy: &std::sync::Arc<multiview_config::device::net_guard::DialPolicy>,
+) -> Arc<multiview_control::devices::DevicePollerRegistry> {
+    use multiview_control::devices::cast::net::TlsCastConnector;
+    use multiview_control::devices::cast::runtime::CastSessionFactory;
+    use multiview_control::devices::cast::session::CastSessionConfig;
+    use multiview_control::devices::{
+        CompositePollerFactory, DevicePollerFactory, DevicePollerRegistry, ReqwestPollerFactory,
+    };
     // A 5s per-request timeout: generous for a LAN appliance, bounded so a hung
     // device times out into the supervised-reconnect path rather than wedging
-    // the poller task.
-    let factory = ReqwestPollerFactory::new(
+    // the poller task. Both live transports screen every resolved dial IP
+    // against the SSRF `dial_policy` (SEC-02/SEC-04).
+    let zowietek = ReqwestPollerFactory::new(
         std::time::Duration::from_secs(5),
         resolve_device_credentials,
+        Arc::clone(dial_policy),
     );
-    Arc::new(DevicePollerRegistry::with_factory(Arc::new(factory)))
+    let mut members: Vec<Arc<dyn DevicePollerFactory>> = vec![Arc::new(zowietek)];
+    if let Some(delivery) = cast_delivery {
+        match TlsCastConnector::new(Arc::clone(dial_policy)) {
+            Ok(connector) => members.push(Arc::new(CastSessionFactory::new(
+                Arc::new(connector),
+                Arc::clone(delivery),
+                CastSessionConfig::default(),
+            ))),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "cast TLS connector did not build; running without the cast driver"
+            ),
+        }
+    }
+    Arc::new(DevicePollerRegistry::with_factory(Arc::new(
+        CompositePollerFactory::new(members),
+    )))
 }
 
-/// The default no-op poller registry (no `zowietek` feature): no live device
+/// The default no-op poller registry (no `devices-net` feature): no live device
 /// transport, so no poller is spawned and the projection routes stay honestly
-/// empty — exactly the pre-DEV-A4 behaviour.
+/// empty — exactly the pre-DEV-A4 behaviour. The unused delivery map keeps the
+/// call site feature-free.
 #[cfg(not(feature = "devices-net"))]
-fn device_poller_registry() -> Arc<multiview_control::devices::DevicePollerRegistry> {
+fn device_poller_registry(
+    _cast_delivery: Option<&std::sync::Arc<multiview_control::devices::cast::media::CastDelivery>>,
+    _dial_policy: &std::sync::Arc<multiview_config::device::net_guard::DialPolicy>,
+) -> Arc<multiview_control::devices::DevicePollerRegistry> {
     Arc::new(multiview_control::devices::DevicePollerRegistry::new())
+}
+
+/// Build the outbound-dial SSRF policy (SEC-02/SEC-04, CWE-918) an operator sets
+/// to **tighten** the dial to their own device subnet(s) — a list of CIDRs (e.g.
+/// `["192.168.0.0/16", "fd00:db8::/32"]`).
+///
+/// Precedence: the validated [`control.device_dial_allow`](multiview_config::ControlConfig::device_dial_allow)
+/// config field is the config-as-code home for the allowlist; the
+/// `MULTIVIEW_DEVICE_DIAL_ALLOW` env var (comma/whitespace-separated) is the
+/// legacy source, kept as a fallback during the migration off it. Absent from
+/// both ⇒ the non-breaking default: LAN devices (private/ULA/carrier) stay
+/// dialable while the never-legitimate ranges (loopback, link-local incl. the
+/// cloud-metadata IP, unspecified, multicast/broadcast) stay blocked. An
+/// unparseable entry logs a warning and falls back — fail-closed — to denying
+/// every allowlistable range (globally-routable hosts only), never silently
+/// widening back to the LAN default the operator was tightening away from.
+fn device_dial_policy(
+    control: Option<&multiview_config::ControlConfig>,
+) -> Arc<multiview_config::device::net_guard::DialPolicy> {
+    use multiview_config::device::net_guard::DialPolicy;
+
+    // The config field wins when present (it is validated at config load).
+    if let Some(cidrs) = control.and_then(|c| c.device_dial_allow.as_deref()) {
+        let policy = match DialPolicy::from_cidrs(cidrs.iter().map(String::as_str)) {
+            Ok(policy) => {
+                tracing::info!(
+                    entries = cidrs.len(),
+                    "device-dial allowlist loaded from control.device_dial_allow"
+                );
+                policy
+            }
+            // Rejected already at config load; fail closed here too rather than
+            // dialling wide, in case an unvalidated config ever reaches this.
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "control.device_dial_allow has an invalid CIDR; denying all internal \
+                     dial targets (only globally-routable hosts are dialled)"
+                );
+                DialPolicy::deny_all_allowlistable()
+            }
+        };
+        return Arc::new(policy);
+    }
+
+    let policy = match std::env::var("MULTIVIEW_DEVICE_DIAL_ALLOW") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let cidrs: Vec<&str> = raw
+                .split([',', ' ', '\t', '\n'])
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .collect();
+            match DialPolicy::from_cidrs(cidrs.iter().copied()) {
+                Ok(policy) => {
+                    tracing::info!(
+                        entries = cidrs.len(),
+                        "device-dial allowlist loaded from MULTIVIEW_DEVICE_DIAL_ALLOW"
+                    );
+                    policy
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "MULTIVIEW_DEVICE_DIAL_ALLOW has an invalid CIDR; denying all internal \
+                         dial targets (only globally-routable hosts are dialled)"
+                    );
+                    DialPolicy::deny_all_allowlistable()
+                }
+            }
+        }
+        _ => DialPolicy::allow_lan(),
+    };
+    Arc::new(policy)
 }
 
 /// Resolve a managed device's `(username, password)` from its
@@ -270,13 +639,22 @@ fn resolve_device_credentials(device: &multiview_config::Device) -> Option<(Stri
 
 /// One HLS delivery mount derived from a configured HLS/LL-HLS output: the
 /// route prefix on the control listener and the on-disk directory it serves
-/// (the configured playlist's parent — where the segmenter writes).
+/// (the configured playlist's parent — where the segmenter writes), plus the
+/// identity the Cast delivery map ([`cast_delivery`], DEV-D2) joins on — the
+/// output id this mount serves and the playlist file name under the mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HlsMount {
     /// Route prefix, e.g. `/hls/program`.
     pub route: String,
     /// The served directory (the output playlist's parent directory).
     pub dir: std::path::PathBuf,
+    /// The configured output's stable id this mount serves.
+    pub output_id: String,
+    /// The playlist file name under [`route`](Self::route) (the configured
+    /// path's final component), e.g. `multiview.m3u8`. [`None`] when the
+    /// configured path has no usable file name (a directory-shaped path) —
+    /// the mount still serves, but no Cast media URL can be derived from it.
+    pub playlist: Option<String>,
 }
 
 /// Derive the `/hls/{output-id}` delivery mounts for every HLS/LL-HLS output
@@ -315,12 +693,69 @@ pub fn hls_mounts(config: &MultiviewConfig) -> Vec<HlsMount> {
                 n = n.saturating_add(1);
             };
         }
+        let playlist = std::path::Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
         mounts.push(HlsMount {
             route: format!("/hls/{segment}"),
             dir,
+            output_id: output.id(),
+            playlist,
         });
     }
     mounts
+}
+
+/// Build the Cast **delivery map** (DEV-D2, ADR-M011): the validated
+/// `control.cast_media_base` × the [`hls_mounts`] this listener serves, giving
+/// output id → the device-reachable playlist URL a Cast session `LOAD`s.
+///
+/// [`None`] when no `cast_media_base` is configured (the cast-session routes
+/// then refuse with an honest `409`) or when the configured base fails the
+/// driver's host rules (loopback / `.local` / bare LAN name — warned loudly,
+/// Cast delivery disabled rather than handing devices an unreachable URL).
+/// The segment format is MPEG-TS for every mount: the DEV-D1 run-path
+/// segmenter writes `.ts` segments only (see
+/// `multiview_output::hls::live::LivePlaylist`); signal `fmp4` here once a
+/// rendition actually serves CMAF.
+#[must_use]
+pub fn cast_delivery(
+    config: &MultiviewConfig,
+) -> Option<std::sync::Arc<multiview_control::devices::cast::media::CastDelivery>> {
+    use multiview_control::devices::cast::media::{
+        CastDelivery, CastMediaBase, CastMediaTarget, HlsSegmentFormat,
+    };
+    let base = config.control.as_ref()?.cast_media_base.as_deref()?;
+    let base = match CastMediaBase::parse(base) {
+        Ok(base) => base,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "control.cast_media_base rejected; Cast delivery is disabled \
+                 (cast sessions will refuse with 409)"
+            );
+            return None;
+        }
+    };
+    let mut delivery = CastDelivery::new();
+    for mount in hls_mounts(config) {
+        let Some(playlist) = mount.playlist else {
+            tracing::warn!(
+                output = %mount.output_id,
+                route = %mount.route,
+                "HLS output path has no playlist file name; not castable"
+            );
+            continue;
+        };
+        delivery.insert(
+            &mount.output_id,
+            CastMediaTarget {
+                url: base.join(&mount.route, &playlist),
+                format: HlsSegmentFormat::MpegTs,
+            },
+        );
+    }
+    Some(std::sync::Arc::new(delivery))
 }
 
 /// Map an output id to a URL-segment-safe mount name (see [`hls_mounts`]).
@@ -635,7 +1070,56 @@ pub fn command_drain_with_live_sources(
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     live: crate::live_sources::LiveSourceHandle,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
-    let mut drain = CommandDrain::new(commands, config, publisher).with_live_sources(live);
+    command_drain_with_live_sources_and_players(
+        commands,
+        config,
+        publisher,
+        live,
+        std::collections::HashMap::new(),
+    )
+}
+
+/// As [`command_drain_with_live_sources`], plus the media-player transport seam
+/// (ADR-0057 / ADR-0097): the per-player [`TransportMailbox`](crate::player::TransportMailbox)
+/// map the command drain submits a `MediaTransport`/exit verb to. The production
+/// **non-overlay** full-engine path wires this so player channels are drivable
+/// even without subtitle/overlay rendering; the existing 4-arg form (no players)
+/// is unchanged for callers that have none.
+// The map always originates from `Pipeline::player_mailboxes()` (the default
+// hasher); generalizing over the hasher buys no caller anything here.
+#[allow(clippy::implicit_hasher)]
+pub fn command_drain_with_live_sources_and_players(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::player::TransportMailbox>,
+    >,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
+/// Build the per-tick control hook **with the live overlay seam** (ADR-W022)
+/// threaded in, so `UpsertOverlay`/`RemoveOverlay` apply to the running
+/// engine: the drain mirrors the document into the working overlay set and
+/// publishes the set (generation-bumped) through the lock-free
+/// [`OverlayApplySlot`](crate::live_overlays::OverlayApplySlot) the bake
+/// consumer re-derives from at its next frame — pure data mutation at the
+/// frame boundary, no rasterization, no I/O (invariants #1 + #10).
+pub fn command_drain_with_live_overlays(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    overlays: crate::live_overlays::OverlayApplySlot,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher).with_live_overlays(overlays);
     move |drive: &mut CompositorDrive<Nv12Image>| {
         let _applied = drain.apply(drive);
     }
@@ -657,20 +1141,34 @@ pub fn command_drain_with_live_sources(
 /// bounded drop-oldest, so neither can pace or stall the output clock
 /// (invariants #1/#10).
 ///
+/// It also threads in the pipeline's **live overlay slot**
+/// ([`Pipeline::overlay_apply_slot`](crate::pipeline::Pipeline::overlay_apply_slot),
+/// ADR-W022) so `UpsertOverlay`/`RemoveOverlay` re-derive the running bake.
+///
 /// The binary wires this on the full libav\* path (`run_pipeline_until_ctrl_c`),
 /// where the pipeline has a subtitle router; the software-engine path (no subtitle
 /// rendering) wires the plain [`command_drain`].
+// The player-mailbox map always originates from `Pipeline::player_mailboxes()`
+// (the default hasher); generalizing over the hasher buys no caller anything.
+#[allow(clippy::implicit_hasher)]
 #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
 pub fn command_drain_with_seams(
     commands: CommandReceiver,
     config: MultiviewConfig,
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     subtitle_route: Arc<arc_swap::ArcSwapOption<crate::captions::SubtitleRouteHandle>>,
+    overlays: crate::live_overlays::OverlayApplySlot,
     live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::player::TransportMailbox>,
+    >,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
         .with_subtitle_route(subtitle_route)
-        .with_live_sources(live);
+        .with_live_overlays(overlays)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes);
     move |drive: &mut CompositorDrive<Nv12Image>| {
         let _applied = drain.apply(drive);
     }
@@ -692,6 +1190,32 @@ pub const MAX_REPOINTS_PER_TICK: usize = 32;
 /// an old superseded one being shed is harmless). Bounded data-plane-adjacent
 /// memory (safety rule §5: queues drop, never grow).
 const MAX_REPOINT_BACKLOG: usize = 256;
+
+/// Map a control-plane [`MediaTransportVerb`](multiview_control::MediaTransportVerb)
+/// onto the CLI player's [`TransportVerb`](crate::player::TransportVerb) (the two
+/// are structurally identical but live in different crates — the control crate
+/// owns the wire/REST shape, the cli owns the ingest-thread transport core).
+fn map_transport_verb(
+    verb: &multiview_control::MediaTransportVerb,
+) -> crate::player::TransportVerb {
+    use crate::player::TransportVerb as V;
+    use multiview_control::MediaTransportVerb as W;
+    match verb {
+        W::Load { asset } => V::Load {
+            asset: asset.clone(),
+        },
+        W::Cue { frame } => V::Cue { frame: *frame },
+        W::Play => V::Play,
+        W::Pause => V::Pause,
+        W::Stop => V::Stop,
+        // A `Seek` with an explicit frame seeks there.
+        W::Seek { frame: Some(f) } => V::Seek { frame: *f },
+        // A `Seek { None }` (seek to the declared in-point) maps to the executor's
+        // in-point cue; likewise any future `#[non_exhaustive]` verb this build
+        // does not know about maps to a harmless re-cue rather than panicking.
+        _ => V::Cue { frame: None },
+    }
+}
 
 /// The per-tick command-drain machine: it owns the non-blocking command bus, the
 /// working config, the outbound publisher, and the across-tick state, and applies
@@ -738,6 +1262,23 @@ pub struct CommandDrain {
     /// spawn/teardown + the preview registry. `None` ⇒ `UpsertSource`/
     /// `RemoveSource` are surfaced held actions (never a silent drop).
     live_sources: Option<crate::live_sources::LiveSourceHandle>,
+    /// The live overlay working-set seam (ADR-W022), when wired
+    /// ([`command_drain_with_live_overlays`] / [`command_drain_with_seams`]):
+    /// the lock-free slot the bake consumer re-derives its overlay render
+    /// state from. `None` ⇒ `UpsertOverlay`/`RemoveOverlay` are surfaced held
+    /// actions (never a silent drop).
+    live_overlays: Option<crate::live_overlays::OverlayApplySlot>,
+    /// The media-player transport seam (ADR-0057 / ADR-0097): the per-player
+    /// bounded [`TransportMailbox`](crate::player::TransportMailbox) the running
+    /// player ingest thread drains between frames, keyed by player id. A
+    /// `MediaTransport`/`ArmMediaExit`/`TakeMediaExit`/`CancelMediaExit` command
+    /// submits its verb to the addressed player's mailbox (a short mutex-guarded
+    /// push into a bounded two-class queue — state verbs conflated latest-wins,
+    /// targeted verbs a bounded drop-oldest FIFO; the engine never awaits the
+    /// player — inv #1/#10). An empty map (no players configured) ⇒ those
+    /// commands are surfaced held (warned), never a silent drop.
+    player_mailboxes:
+        std::collections::HashMap<String, std::sync::Arc<crate::player::TransportMailbox>>,
     /// One-shot: the drive's cell-id → index map is established the first tick.
     cell_ids_set: bool,
     /// Test-only spy counting how many times this drain calls `solve_layout`.
@@ -764,10 +1305,29 @@ impl CommandDrain {
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             subtitle_route: None,
             live_sources: None,
+            live_overlays: None,
+            player_mailboxes: std::collections::HashMap::new(),
             cell_ids_set: false,
             #[cfg(test)]
             resolve_spy: None,
         }
+    }
+
+    /// Thread in the media-player transport seam (ADR-0057 / ADR-0097): the map
+    /// of player-id → [`TransportMailbox`](crate::player::TransportMailbox) the
+    /// boot-spawned player ingest threads drain, so a `MediaTransport` / exit
+    /// command reaches the addressed running player. See
+    /// [`command_drain_with_seams`].
+    #[must_use]
+    fn with_player_mailboxes(
+        mut self,
+        mailboxes: std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::player::TransportMailbox>,
+        >,
+    ) -> Self {
+        self.player_mailboxes = mailboxes;
+        self
     }
 
     /// Thread in the live-source producer seam (ADR-W018) so
@@ -776,6 +1336,15 @@ impl CommandDrain {
     #[must_use]
     fn with_live_sources(mut self, live: crate::live_sources::LiveSourceHandle) -> Self {
         self.live_sources = Some(live);
+        self
+    }
+
+    /// Thread in the live overlay working-set seam (ADR-W022) so
+    /// `UpsertOverlay`/`RemoveOverlay` reach the running bake. See
+    /// [`command_drain_with_live_overlays`].
+    #[must_use]
+    fn with_live_overlays(mut self, overlays: crate::live_overlays::OverlayApplySlot) -> Self {
+        self.live_overlays = Some(overlays);
         self
     }
 
@@ -805,9 +1374,13 @@ impl CommandDrain {
     /// running `drive`. Returns the number of re-points applied **this tick**
     /// (bounded by [`MAX_REPOINTS_PER_TICK`]).
     ///
-    /// Never blocks, never awaits — it drains a non-blocking queue (O(pending)),
-    /// applies O(1) re-points, and publishes drop-oldest events, so the output
-    /// clock is never stalled by control (invariants #1 + #10).
+    /// Never awaits, and is never back-pressured by a slow consumer — it drains a
+    /// non-blocking queue (O(pending)), applies O(1) re-points, publishes
+    /// drop-oldest events, and (for a media-transport command) takes a short
+    /// uncontended `std::sync::Mutex` to push into a player's bounded mailbox (the
+    /// player's drain holds that lock only for a `mem::take`, never across a
+    /// decode/publish). So the output clock is never stalled by control
+    /// (invariants #1 + #10).
     pub fn apply(&mut self, drive: &mut CompositorDrive<Nv12Image>) -> usize {
         // First tick: hand the drive the cell ids (in config-cell order, which is
         // exactly `solve_layout`'s core-cell order) so `rebind_cell` can address
@@ -1007,6 +1580,10 @@ struct DrainState {
 /// outcome event. Panic-free (no `unwrap`/`expect`/indexing); an unknown
 /// layout/salvo logs `tracing::warn!` and emits nothing (or a tally echo).
 impl CommandDrain {
+    // A flat one-arm-per-`Command`-variant dispatch (the canonical single apply
+    // path): inherently long and clearer kept whole than split — each arm is a
+    // thin delegate to a focused handler. The media-player arms tipped it over.
+    #[allow(clippy::too_many_lines)]
     fn route_command(&mut self, command: Command, drive: &mut CompositorDrive<Nv12Image>) {
         match command {
             Command::Start { .. } => {
@@ -1112,23 +1689,36 @@ impl CommandDrain {
             Command::RemoveSource { ref id, .. } => {
                 self.remove_source(id, drive);
             }
+            Command::UpsertOverlay { ref overlay, .. } => {
+                self.upsert_overlay(overlay);
+            }
+            Command::RemoveOverlay { ref id, .. } => {
+                self.remove_overlay(id);
+            }
+            Command::ReorderOverlays { ref order, .. } => {
+                self.reorder_overlays(order);
+            }
             Command::SetTallyOverride { target, color, .. } => {
-                // No tally arbiter is wired into the software engine yet, so this
-                // emits a TallyState echo rather than silently no-op'ing: a forced
-                // colour maps to a program-bus lamp of that colour at the default
-                // brightness; a cleared override (`None`) maps to the unlit default.
-                // FOLLOW-UP: route through the real arbiter once it exists.
-                let tally_state = match color {
-                    Some(color) => multiview_core::tally::TallyState {
-                        color,
-                        ..multiview_core::tally::TallyState::default()
-                    },
-                    None => multiview_core::tally::TallyState::default(),
-                };
-                self.publisher.publish_event(Event::TallyState(TallyEvent {
-                    target,
-                    state: tally_state,
-                }));
+                self.set_tally_override(target, color);
+            }
+            // Media-player transport (ADR-0057 / ADR-0097): submit the verb to the
+            // addressed player's bounded mailbox (a short mutex-guarded push; the
+            // player thread drains it between frames — the engine never awaits it).
+            Command::MediaTransport {
+                ref player,
+                ref verb,
+                ..
+            } => {
+                self.submit_player_verb(player, map_transport_verb(verb));
+            }
+            Command::ArmMediaExit { ref player, .. } => {
+                self.submit_player_verb(player, crate::player::TransportVerb::ArmExit);
+            }
+            Command::TakeMediaExit { ref player, .. } => {
+                self.submit_player_verb(player, crate::player::TransportVerb::TakeExit);
+            }
+            Command::CancelMediaExit { ref player, .. } => {
+                self.submit_player_verb(player, crate::player::TransportVerb::CancelExit);
             }
             // `Command` is `#[non_exhaustive]`: a future variant this build does not
             // know about is logged and skipped, never panicked on.
@@ -1136,6 +1726,46 @@ impl CommandDrain {
                 tracing::warn!(kind = other.kind(), "unhandled control command; skipped");
             }
         }
+    }
+
+    /// Submit a transport verb to the addressed player's bounded mailbox (a short
+    /// mutex-guarded push into the two-class queue) the player ingest thread
+    /// drains between frames — the engine never awaits the player (inv #1/#10).
+    /// An unknown player id (none configured / a typo) is surfaced held (warned),
+    /// never a silent drop.
+    fn submit_player_verb(&self, player: &str, verb: crate::player::TransportVerb) {
+        let Some(mailbox) = self.player_mailboxes.get(player) else {
+            tracing::warn!(
+                player,
+                ?verb,
+                "media transport held: no such player channel (none configured / unknown id)"
+            );
+            return;
+        };
+        mailbox.submit(verb);
+    }
+
+    /// Apply a `SetTallyOverride`. No tally arbiter is wired into the software
+    /// engine yet, so this emits a `TallyState` echo rather than silently
+    /// no-op'ing: a forced colour maps to a program-bus lamp of that colour at
+    /// the default brightness; a cleared override (`None`) maps to the unlit
+    /// default. FOLLOW-UP: route through the real arbiter once it exists.
+    fn set_tally_override(
+        &self,
+        target: multiview_events::TallyTarget,
+        color: Option<multiview_core::tally::TallyColor>,
+    ) {
+        let tally_state = match color {
+            Some(color) => multiview_core::tally::TallyState {
+                color,
+                ..multiview_core::tally::TallyState::default()
+            },
+            None => multiview_core::tally::TallyState::default(),
+        };
+        self.publisher.publish_event(Event::TallyState(TallyEvent {
+            target,
+            state: tally_state,
+        }));
     }
 }
 
@@ -1232,14 +1862,15 @@ impl CommandDrain {
             );
             return;
         };
-        let Some(kind) = crate::synth::SyntheticKind::from_source_kind(&source.kind) else {
+        let synthetic = crate::synth::SyntheticKind::from_source_kind(&source.kind);
+        if synthetic.is_none() && !source.kind.is_network_media() {
             tracing::warn!(
                 source = %source.id,
-                "upsert_source held: this kind is not live-appliable yet \
-                 (network live-add is the next ADR-W018 slice); it applies on restart"
+                "upsert_source held: this kind is not live-appliable \
+                 (ndi/youtube/aes67 apply on restart)"
             );
             return;
-        };
+        }
         let id = source.id.clone();
         // Reuse the registered store on an edit-by-id so the tile holds
         // last-good while the hub swaps the producer behind it.
@@ -1255,20 +1886,28 @@ impl CommandDrain {
         );
         // Heavy half off-thread FIRST: the hub tears down any previous
         // producer under this id (and its `{id}/` companions) before spawning
-        // the SAME generator_loop the startup path runs, and RCUs the preview
-        // map. Requesting this BEFORE the binding mutations below gives the
-        // hub a head start on stopping a replaced producer, shrinking the
-        // bounded window in which old and new frames can interleave in the
-        // reused store on an edit (ADR-W018 §5).
-        match seam.request_spawn_synth(crate::live_sources::SynthSpawn {
-            id: id.clone(),
-            kind,
-            store: Arc::clone(&store),
-            width: self.config.canvas.width,
-            height: self.config.canvas.height,
-            canvas: multiview_compositor::pipeline::CanvasColor::default(),
-            cadence: self.config.canvas.fps.rational(),
-        }) {
+        // the replacement — the SAME generator_loop (synthetic) or the SAME
+        // supervised ingest_loop (network/file) the startup path runs — and
+        // RCUs the preview map. Requesting this BEFORE the binding mutations
+        // below gives the hub a head start on stopping a replaced producer,
+        // shrinking the bounded window in which old and new frames can
+        // interleave in the reused store on an edit (ADR-W018 §5).
+        let submitted = match synthetic {
+            Some(kind) => seam.request_spawn_synth(crate::live_sources::SynthSpawn {
+                id: id.clone(),
+                kind,
+                store: Arc::clone(&store),
+                width: self.config.canvas.width,
+                height: self.config.canvas.height,
+                canvas: multiview_compositor::pipeline::CanvasColor::default(),
+                cadence: self.config.canvas.fps.rational(),
+            }),
+            None => seam.request_spawn_source(crate::live_sources::SourceSpawn {
+                source: source.clone(),
+                store: Arc::clone(&store),
+            }),
+        };
+        match submitted {
             crate::live_sources::HubSubmit::Accepted => {}
             crate::live_sources::HubSubmit::Full => {
                 tracing::warn!(
@@ -1342,6 +1981,186 @@ impl CommandDrain {
             tracing::info!(source = %id, "remove_source: no registered store under that id");
         }
         self.config.sources.retain(|s| s.id != id);
+    }
+
+    /// Apply an `UpsertOverlay` (ADR-W022) at the frame boundary: upsert the
+    /// document by id into the working overlay set (the config mirror — the
+    /// same discipline as live sources) and publish the set, generation-
+    /// bumped, through the lock-free slot the bake consumer re-derives from
+    /// at its next frame. Pure data mutation — no rasterization, no I/O, no
+    /// `.await` (invariants #1/#10).
+    ///
+    /// A document the running build does not visibly render
+    /// ([`renders_live`](crate::live_overlays::renders_live) is `false`) is
+    /// still mirrored + published (the working set stays coherent) but warned
+    /// loudly: the route already declared `restart` for it (ADR-W022 §4) and
+    /// the operator should know why nothing changed on screen. Without a
+    /// wired seam the command is a surfaced held action — warned and made
+    /// observable as a `job.progress` `apply_overlay_held` outcome.
+    fn upsert_overlay(&mut self, overlay: &multiview_config::Overlay) {
+        let Some(slot) = self.live_overlays.as_ref() else {
+            tracing::warn!(
+                overlay = %overlay.id,
+                "upsert_overlay held: no live overlay seam on this run path \
+                 (the stored document applies on restart)"
+            );
+            self.publish_overlay_held(&overlay.id, "no live overlay seam on this run path");
+            return;
+        };
+        // Mirror: replace-or-append by id (a live edit replaces, never
+        // duplicates), then publish the WHOLE set — the consumer derives from
+        // the set, so one publish per applied change keeps one truth.
+        match self.config.overlays.iter_mut().find(|o| o.id == overlay.id) {
+            Some(existing) => *existing = overlay.clone(),
+            None => self.config.overlays.push(overlay.clone()),
+        }
+        let generation = crate::live_overlays::publish_set(slot, self.config.overlays.clone());
+        let renders = crate::live_overlays::renders_live(overlay);
+        if renders {
+            tracing::info!(
+                overlay = %overlay.id,
+                generation,
+                "apply_overlay: overlay applied live at the frame boundary"
+            );
+        } else {
+            tracing::warn!(
+                overlay = %overlay.id,
+                kind = %overlay.kind,
+                generation,
+                "apply_overlay: stored + mirrored into the working set, but this \
+                 kind has no live renderer in this build — no visual change (ADR-W022)"
+            );
+        }
+        let message = if renders {
+            format!("overlay {} applied live at the frame boundary", overlay.id)
+        } else {
+            format!(
+                "overlay {} mirrored (kind {} has no live renderer in this build)",
+                overlay.id, overlay.kind
+            )
+        };
+        self.publisher
+            .publish_event(Event::JobProgress(JobProgress {
+                phase: "apply_overlay".to_owned(),
+                pct: 100,
+                message: Some(message),
+            }));
+    }
+
+    /// Apply a `RemoveOverlay` (ADR-W022) at the frame boundary: drop the
+    /// document from the working overlay set and republish — a rendered face
+    /// disappears on the next baked frame. Removing an unknown id publishes
+    /// no new set (the consumer never re-derives spuriously) but is still
+    /// surfaced — warned and observable as a `job.progress`
+    /// `apply_overlay_held` outcome, symmetric with a held upsert, never a
+    /// silent drop. Without a wired seam it is likewise a surfaced held
+    /// action.
+    fn remove_overlay(&mut self, id: &str) {
+        let Some(slot) = self.live_overlays.as_ref() else {
+            tracing::warn!(
+                overlay = %id,
+                "remove_overlay held: no live overlay seam on this run path \
+                 (the stored removal applies on restart)"
+            );
+            self.publish_overlay_held(id, "no live overlay seam on this run path");
+            return;
+        };
+        let before = self.config.overlays.len();
+        self.config.overlays.retain(|o| o.id != id);
+        if self.config.overlays.len() == before {
+            tracing::warn!(
+                overlay = %id,
+                "remove_overlay held: unknown overlay id (nothing to remove); \
+                 no set published"
+            );
+            self.publish_overlay_held(id, "unknown overlay id (nothing to remove)");
+            return;
+        }
+        let generation = crate::live_overlays::publish_set(slot, self.config.overlays.clone());
+        tracing::info!(
+            overlay = %id,
+            generation,
+            "remove_overlay: overlay removed live at the frame boundary"
+        );
+        self.publisher
+            .publish_event(Event::JobProgress(JobProgress {
+                phase: "apply_overlay".to_owned(),
+                pct: 100,
+                message: Some(format!("overlay {id} removed at the frame boundary")),
+            }));
+    }
+
+    /// Apply a `ReorderOverlays` (task #130) at the frame boundary: re-sequence
+    /// the working-overlay mirror to the requested draw order and republish the
+    /// set, so the bake consumer re-derives the new equal-`z` draw order on its
+    /// next frame. A pure permutation — no document is added, removed, or edited
+    /// — and a generation bump only when the order actually changes (idempotent:
+    /// a shed retry re-submitting the same order is a no-op that cannot thrash
+    /// the consumer). Pure data mutation, no rasterization, no I/O (inv #1/#10).
+    ///
+    /// `order` is the full desired id sequence. The mirror is sorted by each
+    /// entry's index in `order`; an entry whose id is absent from `order` (which
+    /// a well-formed reorder never produces — the watcher derives `order` from
+    /// the same document the set mirrors) is kept, after the listed ones, in its
+    /// prior relative order — never dropped. A reorder with no live seam is a
+    /// held action, symmetric with a held upsert/remove.
+    fn reorder_overlays(&mut self, order: &[String]) {
+        let Some(slot) = self.live_overlays.as_ref() else {
+            tracing::warn!(
+                "reorder_overlays held: no live overlay seam on this run path \
+                 (the stored order applies on restart)"
+            );
+            self.publish_overlay_held("(set)", "no live overlay seam on this run path");
+            return;
+        };
+        // Stable key: an id listed in `order` sorts by its position there; an
+        // unlisted id sorts after all listed ones (usize::MAX) and — because the
+        // sort is STABLE — keeps its prior relative order. A pure permutation of
+        // the existing entries: nothing is added or removed.
+        let rank = |overlay: &multiview_config::Overlay| -> usize {
+            order
+                .iter()
+                .position(|id| *id == overlay.id)
+                .unwrap_or(usize::MAX)
+        };
+        let before: Vec<String> = self.config.overlays.iter().map(|o| o.id.clone()).collect();
+        self.config.overlays.sort_by_key(rank);
+        let after: Vec<String> = self.config.overlays.iter().map(|o| o.id.clone()).collect();
+        if before == after {
+            // Already in the requested order — publish nothing (no spurious
+            // generation bump / re-derivation), but surface the no-op so a
+            // submitted command is never silently swallowed.
+            tracing::debug!("reorder_overlays: working set already in the requested order; no-op");
+            return;
+        }
+        let generation = crate::live_overlays::publish_set(slot, self.config.overlays.clone());
+        tracing::info!(
+            generation,
+            order = ?after,
+            "reorder_overlays: overlay draw order re-sequenced live at the frame boundary"
+        );
+        self.publisher
+            .publish_event(Event::JobProgress(JobProgress {
+                phase: "apply_overlay".to_owned(),
+                pct: 100,
+                message: Some(format!(
+                    "overlay draw order re-sequenced at the frame boundary: {}",
+                    after.join(", ")
+                )),
+            }));
+    }
+
+    /// Make a HELD overlay apply observable on the realtime stream (the
+    /// ADR-W019 pattern): a `job.progress` outcome with the held phase and
+    /// the reason — drop-oldest, never awaits a client (inv #10) — alongside
+    /// the `tracing::warn!`.
+    fn publish_overlay_held(&self, id: &str, reason: &str) {
+        self.publisher
+            .publish_event(Event::JobProgress(JobProgress {
+                phase: "apply_overlay_held".to_owned(),
+                pct: 0,
+                message: Some(format!("overlay {id} not applied: {reason}")),
+            }));
     }
 
     /// Apply a `RouteSubtitle` by driving the run's live subtitle re-point seam
@@ -2254,12 +3073,21 @@ input_id = "in_b"
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // IPv6-first: the CLI serve path must bind the IPv6 loopback `[::1]`.
-        let (addr, handle) = bind_and_serve(
+        let (addr, handle, _state) = bind_and_serve(
             "[::1]:0",
             &test_config(),
             publisher,
             commands,
             multiview_control::no_preview(),
+            // whep: the default (no native transport) — a pure build path.
+            None,
+            None,
+            None,
+            None,
+            None,
+            multiview_control::LiveApplyCaps::default(),
+            multiview_control::LiveSourceCapability::synthetic_only(),
+            // boot_model: none for this store-only bind test (ADR-W024).
             None,
             async move {
                 let _ = shutdown_rx.await;
@@ -2300,6 +3128,60 @@ input_id = "in_b"
         joined
             .expect("serve task panicked")
             .expect("serve returned an I/O error");
+    }
+
+    /// ADR-W024 MAJOR-C1 (startup TOCTOU): for a config-file run (a boot model
+    /// is wired) `bind_and_serve` must install the config-file watch handle into
+    /// the served `AppState` BEFORE it starts serving — so a
+    /// `POST /config/promote` arriving with the very first request already finds
+    /// the suppression seam, and the promoted file is never later re-applied as
+    /// an external edit. The returned state (the one the router serves) must
+    /// therefore already carry a watch handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_and_serve_installs_the_watch_handle_before_serving() {
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+        let (commands, _rx) = multiview_control::command_bus(8);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let config = test_config();
+        let boot_model = Arc::new(multiview_control::boot_model::BootModel::new(
+            std::path::PathBuf::from("/nonexistent/multiview.toml"),
+            config.clone(),
+            config.clone(),
+            multiview_config::StartMode::Boot,
+            false,
+            None,
+        ));
+
+        let (_addr, handle, state) = bind_and_serve(
+            "[::1]:0",
+            &config,
+            publisher,
+            commands,
+            multiview_control::no_preview(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            multiview_control::LiveApplyCaps::default(),
+            multiview_control::LiveSourceCapability::synthetic_only(),
+            // A config-file run: the watch handle MUST be installed before serving.
+            Some(boot_model),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .expect("bind + serve should start");
+
+        assert!(
+            state.watch_handle().is_some(),
+            "a config-file run must have the watch handle installed before the \
+             router serves a single request (no startup TOCTOU for promote)"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
     /// Build a config carrying one HLS output per `(id, path)` pair (the rest of

@@ -163,6 +163,23 @@ export interface CrudPageProps<View, Form, Field extends string> {
     creating: boolean,
     errors: FieldErrors<Field>,
   ) => ReactNode;
+  /**
+   * An externally-requested dialog open with a prefilled form (e.g. adopting
+   * from a discovery row). Each distinct `key` opens the dialog once with
+   * `form`; the operator still confirms with the dialog's own submit — seeding
+   * never saves anything by itself.
+   */
+  readonly seed?: CrudSeed<Form> | undefined;
+}
+
+/** An externally-seeded dialog request (see {@link CrudPageProps.seed}). */
+export interface CrudSeed<Form> {
+  /** A new value opens the dialog once (monotonic counter or timestamp). */
+  readonly key: number;
+  /** Open in create (`true`) or edit (`false`) mode. */
+  readonly creating: boolean;
+  /** The prefilled form. */
+  readonly form: Form;
 }
 
 const RESOURCE_CONTEXT: ResourceContext = {};
@@ -181,6 +198,17 @@ export function CrudPage<View, Form, Field extends string>(
   const [creating, setCreating] = useState(true);
   const [pendingDelete, setPendingDelete] = useState<View | null>(null);
   const [errors, setErrors] = useState<FieldErrors<Field>>(NO_ERRORS);
+  const [seenSeedKey, setSeenSeedKey] = useState<number | undefined>(undefined);
+
+  // Consume an externally-seeded dialog request exactly once per key. This is
+  // the React "adjust state during render" pattern: cheaper and glitch-free
+  // versus an effect (no extra commit with stale UI).
+  if (props.seed !== undefined && props.seed.key !== seenSeedKey) {
+    setSeenSeedKey(props.seed.key);
+    setCreating(props.seed.creating);
+    setErrors(NO_ERRORS);
+    setForm(props.seed.form);
+  }
 
   const openCreate = (): void => {
     setCreating(true);

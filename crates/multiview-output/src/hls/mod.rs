@@ -21,11 +21,18 @@
 //! The CMAF segmenter and the blocking-reload LL-HLS origin (held GETs) live
 //! behind the off-by-default transport features; they feed segment/part
 //! metadata into these builders and will mount behind [`http`]'s CORS layer.
+//!
+//! `EXT-X-PROGRAM-DATE-TIME` (ADR-M010, DEV-C1) is stamped from the shared
+//! outbound presentation epoch ([`crate::epoch::SharedEpoch`]): segment first-
+//! sample wall time = `epoch.wall_at(first PTS)`, rendered by the pure integer
+//! [`format_program_date_time`] — the same anchor the control WS publishes.
 pub mod http;
 mod live;
 mod master;
 mod media;
+mod pdt;
 
 pub use live::LivePlaylist;
 pub use master::{MasterPlaylist, VariantStream};
 pub use media::{MediaPlaylist, Part, Segment, SegmentType, ServerControl};
+pub use pdt::format_program_date_time;

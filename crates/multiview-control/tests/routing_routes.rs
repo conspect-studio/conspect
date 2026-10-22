@@ -19,7 +19,7 @@ mod support;
 
 use axum::http::StatusCode;
 use serde_json::json;
-use support::{body_json, harness, post_json, send, OPERATOR_TOKEN, VIEWER_TOKEN};
+use support::{body_json, harness, post_json, send, OPERATOR_TOKEN, SCOPED_TOKEN, VIEWER_TOKEN};
 
 fn video_route_body() -> serde_json::Value {
     json!({
@@ -188,5 +188,87 @@ async fn unknown_route_kind_is_404() {
         resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::BAD_REQUEST,
         "an unknown route kind is rejected, got {}",
         resp.status()
+    );
+}
+
+// ---- SEC-09 (BOLA, ADR-W005): a take/plan authorizes the SOURCE too ----
+//
+// plan_route / take_route authorized only the destination, so a scoped operator
+// could route an out-of-scope source's stream onto an in-scope destination (and
+// probe the source's classification via plan). Pin per-object authz on
+// `source.input_id`, with zero command side effect on a denied take. scoped-key
+// is object-scoped to "scoped-layout".
+
+fn scoped_dest_out_of_scope_source() -> serde_json::Value {
+    json!({
+        "target": { "kind": "video_cell", "cell": "scoped-layout" },
+        "source": { "input_id": "cam-b", "kind": { "kind": "video" }, "selector": { "by": "best" } }
+    })
+}
+
+fn scoped_dest_and_source() -> serde_json::Value {
+    json!({
+        "target": { "kind": "video_cell", "cell": "scoped-layout" },
+        "source": { "input_id": "scoped-layout", "kind": { "kind": "video" }, "selector": { "by": "best" } }
+    })
+}
+
+#[tokio::test]
+async fn take_denied_when_source_is_out_of_object_scope() {
+    let mut h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/routing/video/take",
+            SCOPED_TOKEN,
+            &scoped_dest_out_of_scope_source(),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["type"], "/problems/forbidden");
+    assert!(
+        h.commands.try_drain().is_empty(),
+        "a denied take must not enqueue a route command"
+    );
+}
+
+#[tokio::test]
+async fn plan_denied_when_source_is_out_of_object_scope() {
+    let h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/routing/plan",
+            SCOPED_TOKEN,
+            &scoped_dest_out_of_scope_source(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "plan must not classify (probe) an out-of-scope source"
+    );
+    assert_eq!(body_json(resp).await["type"], "/problems/forbidden");
+}
+
+#[tokio::test]
+async fn take_allowed_when_destination_and_source_are_both_in_scope() {
+    let mut h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/routing/video/take",
+            SCOPED_TOKEN,
+            &scoped_dest_and_source(),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        h.commands.try_drain().len(),
+        1,
+        "an in-scope take reaches the engine"
     );
 }

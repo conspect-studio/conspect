@@ -233,6 +233,16 @@ input_id = "in_live"`}
               alongside the common fields and round-trip losslessly.
             </Trans>
           </Prose>
+          <Prose>
+            <Trans>
+              Saving an overlay through the API or this UI applies it to the
+              running engine at the next frame where the build renders that
+              kind — today an analog-face <Code>clock</Code> appears, moves, or
+              disappears live. Kinds without a renderer are stored losslessly
+              and take effect via config export + restart; every save response
+              declares which happened in its X-Multiview-Apply header.
+            </Trans>
+          </Prose>
           <CodeBlock label="Example overlay">
             {`[[overlays]]
 id = "ov_clock"
@@ -314,6 +324,88 @@ segment_ms = 2000`}
             to="/help/concepts/transports#choosing"
             label={t`About output transports`}
           />
+        </DocSection>
+
+        <DocSection id="devices" title={<Trans>Devices</Trans>}>
+          <Prose>
+            <Trans>
+              Each <Code>[[devices]]</Code> entry adopts one managed device as
+              desired state: a <Code>driver</Code> (<Code>zowietek</Code>,{" "}
+              <Code>displaynode</Code>, or <Code>cast</Code>), an IPv6-first
+              management <Code>address</Code> (required for zowietek/cast;
+              optional for an enrolled display node), an optional{" "}
+              <Code>desired_mode</Code> the driver re-converges on every
+              reconnect, an optional <Code>alarm_on_offline</Code> severity,
+              and write-only credentials via <Code>auth.secret_ref</Code>.
+              Applying a config adopts and converges idempotently.
+            </Trans>
+          </Prose>
+          <CodeBlock label={t`Example device`}>{`[[devices]]
+id = "dev-foyer"
+display_name = "Foyer decoder"
+driver = "zowietek"
+address = "http://[fd00:db8::42]"
+desired_mode = "decoder"
+alarm_on_offline = "major"
+
+[devices.auth]
+secret_ref = "op://Site/foyer-decoder/credentials"`}</CodeBlock>
+        </DocSection>
+
+        <DocSection id="sync-groups" title={<Trans>Sync groups</Trans>}>
+          <Prose>
+            <Trans>
+              Each <Code>[[sync_groups]]</Code> entry aligns member devices'
+              presentation: <Code>target_skew_ms</Code> (1–10000) is the
+              drift-alarm threshold and every member carries a per-device{" "}
+              <Code>offset_ms</Code> trim (0–10000). Cast devices can never be
+              members; the group reports its weakest member's tier.
+            </Trans>
+          </Prose>
+          <CodeBlock label={t`Example sync group`}>{`[[sync_groups]]
+id = "lobby-wall"
+target_skew_ms = 80
+members = [
+  { device = "dev-node-left", offset_ms = 0 },
+  { device = "dev-foyer", offset_ms = 120 },
+]`}</CodeBlock>
+        </DocSection>
+
+        <DocSection id="webrtc-ice" title={<Trans>WebRTC and TURN (ICE servers)</Trans>}>
+          <Prose>
+            <Trans>
+              The optional <Code>[webrtc]</Code> section tunes the built-in
+              WebRTC endpoint that serves WHEP playback and the live preview and
+              accepts WHIP publishing. Most deployments need none of it: browsers
+              on the same network reach the server directly. When viewers or
+              publishers sit behind strict NATs or firewalls, add one or more{" "}
+              <Code>[[webrtc.ice_servers]]</Code> entries pointing at a STUN
+              and/or TURN server so the connection can be relayed.
+            </Trans>
+          </Prose>
+          <Prose>
+            <Trans>
+              TURN credentials are server-side configuration: they live in the
+              config file (or a <Code>secret_ref</Code> indirection) and are used
+              by the server when it gathers connection candidates. They are{" "}
+              <strong>never sent to the browser</strong> — the client offers a
+              plain connection and the server returns the negotiated path — so no
+              relay password is exposed to a viewer. URLs are IPv6-first and
+              bracket literal IPv6 addresses.
+            </Trans>
+          </Prose>
+          <CodeBlock label={t`Example ICE / TURN configuration`}>{`[webrtc]
+# Optional NAT-traversal helpers; omit entirely on a flat network.
+[[webrtc.ice_servers]]
+kind = "stun"
+url = "stun:[2001:db8::53]:3478"
+
+[[webrtc.ice_servers]]
+kind = "turn"
+url = "turn:[2001:db8::55]:3478"
+username = "multiview"
+# Secret — redacted in support bundles, never echoed to the browser.
+password = "op://Site/turn/credential"`}</CodeBlock>
         </DocSection>
 
         <DocSection id="validation" title={<Trans>Validation and import / export</Trans>}>

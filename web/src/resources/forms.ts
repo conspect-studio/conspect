@@ -46,6 +46,7 @@ export type FormErrorCode =
   | 'url-invalid'
   | 'scheme-rtsp'
   | 'scheme-srt'
+  | 'scheme-rist'
   | 'scheme-rtmp'
   | 'scheme-http'
   | 'hex-color'
@@ -64,13 +65,15 @@ export type FormErrorCode =
   | 'rational-fps'
   | 'timezone'
   | 'time-of-day'
-  | 'date-time';
+  | 'date-time'
+  | 'members-required'
+  | 'duplicate-member';
 
 /** Per-field validation errors keyed by form-state field name. */
 export type FieldErrors<Field extends string> = Partial<Record<Field, FormErrorCode>>;
 
 /** Parse a strict integer string, or `undefined` when not a whole number. */
-function parseIntStrict(value: string): number | undefined {
+export function parseIntStrict(value: string): number | undefined {
   const trimmed = value.trim();
   if (!INT_RE.test(trimmed)) {
     return undefined;
@@ -107,7 +110,7 @@ export function isValidUrl(value: string, schemes?: readonly string[]): boolean 
  * Validate a URL field: `required` when blank, `url-invalid` when unparseable
  * or host-less, `schemeCode` when parseable but on the wrong scheme.
  */
-function urlErrorCode(
+export function urlErrorCode(
   value: string,
   schemes: readonly string[] | undefined,
   schemeCode: FormErrorCode,
@@ -258,7 +261,7 @@ function asPinVendor(value: unknown): PinVendor {
  * body spreads (`{ ...form.extra }`) copy it back as an own data property too
  * (spread uses CreateDataProperty, never the inherited setter).
  */
-function extraOf(
+export function extraOf(
   body: Record<string, unknown>,
   managedKeys: readonly string[],
 ): Readonly<Record<string, unknown>> {
@@ -437,6 +440,16 @@ export interface SourceFormState {
   readonly wallclock: WallClockChoice;
   /** `auth.secret_ref` ('' = no `auth` block; never a plaintext secret). */
   readonly authSecretRef: string;
+  /**
+   * WHIP publisher bearer token (`webrtc` source; '' = omit ⇒ publishing needs
+   * a Write API key, ADR-T014). A config-secret: masked in the UI, never echoed.
+   */
+  readonly webrtcToken: string;
+  /**
+   * Whether the `webrtc` source's SDP answer accepts the publisher's Opus audio
+   * (schema default true). `false` answers the audio m-line `inactive`.
+   */
+  readonly webrtcAudio: boolean;
   /** Unmanaged body fields preserved verbatim across an edit. */
   readonly extra: Readonly<Record<string, unknown>>;
 }
@@ -508,6 +521,8 @@ export function emptySourceForm(): SourceFormState {
     gpuPinStableId: '',
     wallclock: 'default',
     authSecretRef: '',
+    webrtcToken: '',
+    webrtcAudio: true,
     extra: {},
   };
 }
@@ -545,6 +560,9 @@ const SOURCE_MANAGED_KEYS: readonly string[] = [
   'captions',
   'gpu_pin',
   'wallclock',
+  // `webrtc` (WHIP ingest) source keys.
+  'token',
+  'audio',
 ];
 
 /** Whether a source kind's locator is its `url`. */
@@ -555,6 +573,7 @@ export function sourceKindHasUrl(kind: SourceFormKind): boolean {
     kind === 'youtube' ||
     kind === 'ts' ||
     kind === 'srt' ||
+    kind === 'rist' ||
     kind === 'rtmp'
   );
 }
@@ -669,10 +688,14 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
         body.rtsp = { transport: form.rtspTransport };
       }
       break;
+    // The plain URL kinds. RIST is a URL kind like SRT; its optional typed
+    // `rist` options block (when present in the stored body) round-trips through
+    // `form.extra` until a dedicated options sub-form lands (ADR-0095).
     case 'hls':
     case 'youtube':
     case 'ts':
     case 'srt':
+    case 'rist':
     case 'rtmp':
       body.url = form.url.trim();
       break;
@@ -682,6 +705,21 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
     case 'file':
       body.path = form.path.trim();
       break;
+    case 'webrtc': {
+      // WHIP ingest (ADR-T014): no `url` to author — the publish endpoint is
+      // derived from the id. A non-empty token gates publishing; an empty one
+      // is omitted (publishing then needs a Write API key). `audio` defaults to
+      // true (accept the publisher's Opus), so only an explicit `false` is
+      // written — matching the schema's `skip_serializing_if = is_true`.
+      const token = form.webrtcToken.trim();
+      if (token !== '') {
+        body.token = token;
+      }
+      if (!form.webrtcAudio) {
+        body.audio = false;
+      }
+      break;
+    }
   }
   if (form.authSecretRef.trim() !== '') {
     body.auth = { secret_ref: form.authSecretRef.trim() };
@@ -747,9 +785,11 @@ export function parseSourceFormKind(tag: string | undefined): SourceFormKind | u
       'youtube',
       'ts',
       'srt',
+      'rist',
       'rtmp',
       'ndi',
       'file',
+      'webrtc',
     ] as const
   ).find((k) => k === tag);
 }
@@ -832,6 +872,10 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
     gpuPinStableId: asString(gpuPin?.stable_id) ?? '',
     wallclock: wallclockUse === 'use' || wallclockUse === 'discard' ? wallclockUse : 'default',
     authSecretRef: asString(auth?.secret_ref) ?? '',
+    webrtcToken: kind === 'webrtc' ? (asString(body.token) ?? '') : '',
+    // The schema default accepts publisher audio (`audio: true`); an absent key
+    // means "accept", so only an explicit `false` clears the toggle.
+    webrtcAudio: kind === 'webrtc' ? body.audio !== false : true,
     extra: extraOf(body, SOURCE_MANAGED_KEYS),
   };
 }
@@ -858,6 +902,13 @@ export function validateSourceForm(
     }
     case 'srt': {
       const code = urlErrorCode(form.url, ['srt'], 'scheme-srt');
+      if (code !== undefined) {
+        errors.url = code;
+      }
+      break;
+    }
+    case 'rist': {
+      const code = urlErrorCode(form.url, ['rist'], 'scheme-rist');
       if (code !== undefined) {
         errors.url = code;
       }
@@ -939,6 +990,10 @@ export function validateSourceForm(
       }
       break;
     }
+    case 'webrtc':
+      // WHIP ingest authors no locator (the publish endpoint is derived from
+      // the id) and the token is optional — nothing kind-specific to validate.
+      break;
     case 'bars':
       break;
   }
@@ -978,6 +1033,13 @@ export function validateSourceForm(
 
 /** Per-output audio selection ('default' = no `audio` block). */
 export type OutputAudioChoice = 'default' | 'program' | 'tracks';
+
+/**
+ * The schema default for a `webrtc` (WHEP serve) output's `max_viewers`
+ * (ADR-0049). An unchanged value is omitted from the body (absent ≠
+ * default-valued).
+ */
+export const DEFAULT_WEBRTC_MAX_VIEWERS = 8;
 
 /**
  * How a display output's mode is chosen: automatic (EDID preferred +
@@ -1028,6 +1090,21 @@ export interface OutputFormState {
   readonly audioMode: OutputAudioChoice;
   /** Comma-separated selectable track names (mode `tracks`). */
   readonly audioTracks: string;
+  /**
+   * WHEP viewer cap (`webrtc` output; '' = the schema default 8). A non-default
+   * positive integer is written as `max_viewers` (ADR-0049).
+   */
+  readonly webrtcMaxViewers: string;
+  /**
+   * WHEP viewer bearer token (`webrtc` output; '' = omit ⇒ viewing needs a View
+   * API key, ADR-0049). A config-secret: masked in the UI, never echoed.
+   */
+  readonly webrtcToken: string;
+  /**
+   * WHIP-push origin bearer token (`whip-push` output; '' = omit). A
+   * config-secret: masked in the UI, never echoed.
+   */
+  readonly whipPushToken: string;
   /** Whether a `gpu_pin` block is written. */
   readonly gpuPinEnabled: boolean;
   readonly gpuPinVendor: PinVendor;
@@ -1053,6 +1130,7 @@ export type OutputField =
   | 'segmentMs'
   | 'gopMs'
   | 'audioTracks'
+  | 'webrtcMaxViewers'
   | 'gpuPinStableId';
 
 /**
@@ -1077,7 +1155,14 @@ export const OUTPUT_RUNNABLE: Readonly<Record<OutputKind, OutputRunnability>> = 
   ndi: 'unbuilt',
   rtmp: 'runnable',
   srt: 'runnable',
+  // RIST runs only in a binary built with the off-by-default `rist` feature
+  // (a default build fails the run with a clear error, never a silent skip).
+  rist: 'requires-feature',
   display: 'requires-feature',
+  // WHEP serve + WHIP push run only in a `webrtc-native` build (ADR-0049): a
+  // default build accepts the config but cannot serve/push WebRTC.
+  webrtc: 'requires-feature',
+  'whip-push': 'requires-feature',
 };
 
 /** Map a display kind onto the config wire tag. */
@@ -1087,6 +1172,8 @@ export function outputWireKind(kind: OutputKind): string {
       return 'rtsp_server';
     case 'll-hls':
       return 'll_hls';
+    case 'whip-push':
+      return 'whip_push';
     default:
       return kind;
   }
@@ -1114,6 +1201,9 @@ export function emptyOutputForm(): OutputFormState {
     gopMs: '',
     audioMode: 'default',
     audioTracks: '',
+    webrtcMaxViewers: '',
+    webrtcToken: '',
+    whipPushToken: '',
     gpuPinEnabled: false,
     gpuPinVendor: 'nvidia',
     gpuPinStableId: '',
@@ -1146,6 +1236,11 @@ const OUTPUT_MANAGED_KEYS: readonly string[] = [
   'gop_ms',
   'gpu_pin',
   'audio',
+  // `webrtc` (WHEP serve) + `whip_push` keys. `label` is the display name for
+  // the label-bearing kinds (webrtc), written from the form's Name.
+  'label',
+  'max_viewers',
+  'token',
 ];
 
 /**
@@ -1212,11 +1307,41 @@ export function outputFormToBody(form: OutputFormState): Record<string, unknown>
       }
       break;
     }
+    // The push URL kinds. RIST push is a URL kind like SRT; its optional typed
+    // `rist` options block round-trips through `form.extra` until a dedicated
+    // options sub-form lands (ADR-0095).
     case 'rtmp':
     case 'srt':
+    case 'rist':
       body.url = form.url.trim();
       body.codec = form.codec.trim();
       break;
+    case 'webrtc': {
+      // WHEP serve (ADR-0049): label-named, never encodes (consumes the H.264
+      // program rendition). `max_viewers` default 8 is omitted; a non-empty
+      // token gates viewing.
+      body.label = form.name.trim();
+      body.codec = form.codec.trim();
+      const viewers = parseIntStrict(form.webrtcMaxViewers);
+      if (viewers !== undefined && viewers !== DEFAULT_WEBRTC_MAX_VIEWERS) {
+        body.max_viewers = viewers;
+      }
+      const token = form.webrtcToken.trim();
+      if (token !== '') {
+        body.token = token;
+      }
+      break;
+    }
+    case 'whip-push': {
+      // WHIP push client (ADR-0049): publishes the program to a remote origin.
+      body.url = form.url.trim();
+      body.codec = form.codec.trim();
+      const token = form.whipPushToken.trim();
+      if (token !== '') {
+        body.token = token;
+      }
+      break;
+    }
   }
   if (form.audioMode !== 'default') {
     body.audio = {
@@ -1275,7 +1400,12 @@ export function parseOutputFormKind(tag: string | undefined): OutputKind | undef
   if (tag === 'll_hls') {
     return 'll-hls';
   }
-  return (['hls', 'ndi', 'rtmp', 'srt', 'display'] as const).find((k) => k === tag);
+  if (tag === 'whip_push') {
+    return 'whip-push';
+  }
+  return (['hls', 'ndi', 'rtmp', 'srt', 'rist', 'display', 'webrtc'] as const).find(
+    (k) => k === tag,
+  );
 }
 
 /**
@@ -1311,7 +1441,10 @@ export function outputFormFromRecord(record: ResourceRecord): OutputFormState | 
   return {
     ...empty,
     id: record.id,
-    name: record.name,
+    // The label-bearing kinds (webrtc) author their display name as `label`;
+    // prefer it over the store name so the round-trip is stable (the writer
+    // emits `label` from the form's Name).
+    name: asString(body.label) ?? record.name,
     kind,
     mount: asString(body.mount) ?? '',
     path: asString(body.path) ?? '',
@@ -1330,6 +1463,9 @@ export function outputFormFromRecord(record: ResourceRecord): OutputFormState | 
     audioMode:
       audioMode === 'program' || audioMode === 'tracks' ? audioMode : 'default',
     audioTracks: tracks.join(', '),
+    webrtcMaxViewers: kind === 'webrtc' ? numberToField(asFiniteNumber(body.max_viewers)) : '',
+    webrtcToken: kind === 'webrtc' ? (asString(body.token) ?? '') : '',
+    whipPushToken: kind === 'whip-push' ? (asString(body.token) ?? '') : '',
     gpuPinEnabled: gpuPin !== undefined,
     gpuPinVendor: asPinVendor(gpuPin?.vendor),
     gpuPinStableId: asString(gpuPin?.stable_id) ?? '',
@@ -1407,6 +1543,33 @@ export function validateOutputForm(
       const code = urlErrorCode(form.url, ['srt'], 'scheme-srt');
       if (code !== undefined) {
         errors.url = code;
+      }
+      break;
+    }
+    case 'rist': {
+      const code = urlErrorCode(form.url, ['rist'], 'scheme-rist');
+      if (code !== undefined) {
+        errors.url = code;
+      }
+      break;
+    }
+    case 'whip-push': {
+      // The remote WHIP origin is an http(s) URL (https recommended, ADR-0049).
+      const code = urlErrorCode(form.url, ['http', 'https'], 'scheme-http');
+      if (code !== undefined) {
+        errors.url = code;
+      }
+      break;
+    }
+    case 'webrtc': {
+      // WHEP serve authors no URL (derived from the id). `max_viewers` is
+      // optional; when present it must be a positive integer (ADR-0049: >= 1).
+      const viewers = form.webrtcMaxViewers.trim();
+      if (viewers !== '') {
+        const parsed = parseIntStrict(viewers);
+        if (parsed === undefined || parsed <= 0) {
+          errors.webrtcMaxViewers = 'positive-int';
+        }
       }
       break;
     }

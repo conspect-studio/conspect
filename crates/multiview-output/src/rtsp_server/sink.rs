@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use crate::fanout::{EncodedPacket, PacketSink};
+use crate::rtcp::{SenderReport, SrStamper};
 
 use super::queue::BoundedPacketQueue;
 
@@ -25,10 +26,18 @@ use super::queue::BoundedPacketQueue;
 ///
 /// Holds a bounded drop-oldest queue (shared via [`Arc`] with the serving side).
 /// `deliver` is the producer end; the serving thread is the consumer end.
+///
+/// The sink optionally carries the program's epoch-fed RTCP
+/// [`SrStamper`] (ADR-M010, DEV-C1) so the serving layer obtains Sender
+/// Reports stamped from the **same** outbound presentation epoch as the
+/// control-WS publication and the HLS `EXT-X-PROGRAM-DATE-TIME` tags — see
+/// [`RtspServerSink::sender_report`] and the module docs for the precise
+/// wired-vs-seam boundary.
 #[derive(Debug)]
 pub struct RtspServerSink {
     id: String,
     queue: Arc<BoundedPacketQueue>,
+    sr_stamper: Option<SrStamper>,
 }
 
 impl RtspServerSink {
@@ -40,6 +49,7 @@ impl RtspServerSink {
         Self {
             id: id.into(),
             queue: Arc::new(BoundedPacketQueue::new(capacity)),
+            sr_stamper: None,
         }
     }
 
@@ -50,7 +60,36 @@ impl RtspServerSink {
         Self {
             id: id.into(),
             queue,
+            sr_stamper: None,
         }
+    }
+
+    /// Attach the program's epoch-fed RTCP SR stamper (ADR-M010): the serving
+    /// layer then stamps Sender-Report NTP↔RTP pairs from the same outbound
+    /// presentation epoch every other surface uses.
+    #[must_use]
+    pub fn with_sr_stamper(mut self, stamper: SrStamper) -> Self {
+        self.sr_stamper = Some(stamper);
+        self
+    }
+
+    /// Build the epoch-stamped RTCP Sender Report for the wall instant
+    /// `wall_ns` with the transport's RTP totals.
+    ///
+    /// Returns `None` when no stamper is attached **or** no epoch has been
+    /// published yet — an honest absence, never a fabricated NTP↔RTP pair.
+    /// Read-only over the shared epoch cell: calling this can never influence
+    /// the engine or the producer side (invariants #1/#10).
+    #[must_use]
+    pub fn sender_report(
+        &self,
+        wall_ns: i64,
+        packet_count: u32,
+        octet_count: u32,
+    ) -> Option<SenderReport> {
+        self.sr_stamper
+            .as_ref()
+            .and_then(|s| s.report(wall_ns, packet_count, octet_count))
     }
 
     /// A clone of the shared queue handle for the serving side to drain.

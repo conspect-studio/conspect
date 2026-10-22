@@ -1,0 +1,60 @@
+{
+  "model": "sonnet",
+  "effortLevel": "medium",
+  "enableAllProjectMcpServers": true,
+  "env": {
+    "OTEL_RESOURCE_ATTRIBUTES": "estate.repo=aperim/multiview"
+  },
+  "permissions": {
+    "deny": [
+      "Read(/.env)",
+      "Read(/.env.*)",
+      "Read(/**/.env)",
+      "Read(/**/.env.*)",
+      "Read(/**/*.pem)",
+      "Read(/**/*.key)",
+      "Read(/**/*.p12)",
+      "Read(/**/*.pfx)",
+      "Read(/**/id_rsa*)",
+      "Read(/**/id_ed25519*)",
+      "Read(/**/.npmrc)",
+      "Read(/**/.netrc)",
+      "Read(/.memory/**)",
+      "Read(/**/target/**)",
+      "Read(/**/node_modules/**)",
+      "Read(/**/dist/**)",
+      "Read(/.multiview-build/**)",
+      "Read(/.ndi-sdk/**)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Gates scale with blast radius: run scripts/classify.sh, meet that class R0-R3 owes (docs/standards/engineering.md), ship. Project memory is live - qdrant-find before non-trivial work, qdrant-store what a future session needs. R1+ file changes go in a worktree lane.'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/enforce-worktree.mjs\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/test-budget.sh" },
+          { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/big-dump-guard.sh" }
+        ]
+      }
+    ]
+  }
+}

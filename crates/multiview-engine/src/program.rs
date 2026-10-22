@@ -1,7 +1,7 @@
 //! The **`Program`** abstraction (ADR-0030, MP-0).
 //!
 //! Today the engine runs exactly **one** program: one fixed-cadence
-//! [`OutputClock`](crate::OutputClock) drives one composited canvas per tick,
+//! [`OutputClock`] drives one composited canvas per tick,
 //! encoded once and fanned to N transports (invariant #7). ADR-0030 makes that
 //! single program the first instance of a general `Program` so the engine can
 //! eventually run N concurrent, independently start/stoppable output pipelines
@@ -12,8 +12,8 @@
 //!
 //! [`MultiviewProgram`] is **today's per-program run core, relocated and owned by
 //! one struct** — a *move*, not a rewrite. It owns the program's own
-//! [`OutputClock`] + [`CompositorDrive`](crate::CompositorDrive) (via an
-//! [`EngineRuntime`](crate::EngineRuntime)) and its own [`StopSignal`], and it
+//! [`OutputClock`] + [`CompositorDrive`] (via an
+//! [`EngineRuntime`]) and its own [`StopSignal`], and it
 //! drives the protected per-tick loop. The CLI's run path
 //! (`Pipeline::drive_streaming`) now constructs **one** [`MultiviewProgram`] from
 //! a [`ProgramSpec`] derived from the existing single-program config and drives
@@ -35,7 +35,7 @@
 //!   consumer, never another program (the structural basis for "one program
 //!   stalling never stalls another", MP-1).
 //! * **#10 (isolation).** The run methods take the caller's wait-free
-//!   [`EnginePublisher`](crate::EnginePublisher) + the non-blocking per-tick
+//!   [`EnginePublisher`] + the non-blocking per-tick
 //!   `control` hook verbatim; the program adds no new engine→outside channel.
 
 use std::sync::Arc;
@@ -58,7 +58,7 @@ use crate::runtime::{EngineRuntime, Pacer, RunOutcome, StopSignal};
 /// inline in `Pipeline::drive_streaming`: the clock build, the runtime, and the
 /// per-tick drive loop. The CLI assembles the clock + drive (it knows the layout,
 /// stores, and canvas color), hands them here, and drives the loop through
-/// [`MultiviewProgram::run_with_control`] / [`run_for_with_control`].
+/// [`MultiviewProgram::run_with_control`] / [`MultiviewProgram::run_for_with_control`].
 ///
 /// `P` is the [`Pacer`] (real-time in production; a cooperative test pacer in
 /// deterministic tests), matching [`EngineRuntime`].
@@ -135,6 +135,17 @@ impl<P: Pacer> MultiviewProgram<P> {
     #[must_use]
     pub fn cadence(&self) -> multiview_core::time::Rational {
         self.runtime.cadence()
+    }
+
+    /// The seed instant (time-source nanoseconds) this program's tick 0 is
+    /// anchored to (see [`EngineRuntime::seed_nanos`](crate::EngineRuntime::seed_nanos)).
+    ///
+    /// DEV-C1 (ADR-M010): the outbound presentation epoch binds this anchor to
+    /// disciplined wall time — reading it is a pure value access and can never
+    /// influence the clock.
+    #[must_use]
+    pub const fn seed_nanos(&self) -> i64 {
+        self.runtime.seed_nanos()
     }
 
     /// A clone of this program's [`StopSignal`] — the "stop handle" the program

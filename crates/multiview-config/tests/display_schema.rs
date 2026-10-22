@@ -32,6 +32,7 @@ kind = "display"
             forced_mode,
             gpu_pin,
             audio,
+            ..
         } => {
             assert_eq!(*id, None);
             assert_eq!(connector, "auto");
@@ -67,6 +68,7 @@ refresh = "60000/1001"
             forced_mode,
             gpu_pin,
             audio,
+            ..
         } => {
             assert_eq!(id.as_deref(), Some("out-monitor-left"));
             assert_eq!(connector, "DP-1");

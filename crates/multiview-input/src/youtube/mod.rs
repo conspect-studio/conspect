@@ -24,11 +24,12 @@
 //!
 //! ## Isolation (invariants #1 / #2 / #10)
 //!
-//! Resolution and the (later) re-resolution loop run **off the data plane**. A
+//! Resolution and the re-resolution loop run **off the data plane**. A
 //! resolution failure degrades the *tile* (LIVE → STALE → `NO_SIGNAL`) and raises
 //! an operator alarm; it never stalls the output clock. Re-resolution before the
-//! `expire` deadline and the make-before-break URL swap are a later item; this
-//! module supplies the resolver core they build on.
+//! `expire` deadline and the make-before-break URL swap are wired: the CLI ingest
+//! path spawns the [`reresolve`] loop off the data plane and swaps the refreshed
+//! URL into ingest ahead of expiry.
 //!
 //! ## Licensing and terms of service
 //!

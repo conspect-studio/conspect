@@ -92,15 +92,18 @@ pub mod clock;
 pub mod cycle;
 pub mod degrade;
 pub mod drive;
+pub mod epoch;
 pub mod error;
 pub mod ha;
 pub mod heads;
 pub mod isolation;
+pub mod migration;
 pub mod placement;
 pub mod probe;
 pub mod program;
 pub mod programset;
 pub mod ptp;
+pub mod registry;
 pub mod route;
 pub mod runtime;
 pub mod salvo;
@@ -119,6 +122,11 @@ pub use clock::{ManualTimeSource, MonotonicTimeSource, OutputClock, Tick, TimeSo
 pub use cycle::{FreezeTile, RoundRobin};
 pub use degrade::{ControlLoop, ControlStep};
 pub use drive::{CompositedFrame, CompositorDrive};
+pub use epoch::{
+    clock_quality_of, clock_source_of, EpochAnchor, EpochPolicy, EpochSampler, EpochSamplerConfig,
+    EpochStatus, EpochTracker, EpochUpdate, SystemWallSampler, WallClockSampler, WallSample,
+    EPOCH_RATE,
+};
 pub use error::{Error, Result};
 pub use ha::{
     Cluster, Epoch, FailoverDecision, FailoverPolicy, HaNode, HaStateMachine, Heartbeat,
@@ -128,6 +136,10 @@ pub use heads::{HeadBinding, HeadPlacement, WallComposition};
 pub use isolation::{
     event_stream, EnginePublisher, EventStream, EventSubscription, LatestState, RecvError,
     SeqEvent, TryRecvError,
+};
+pub use migration::{
+    drain_stop, validate_migration, KeepaliveSink, LoadSnapshot, MigrationOutcome,
+    OutputCrosspoint, PlacementCoordinator, RollbackReason,
 };
 pub use placement::{
     MigrationPlan, PlacementController, PlacementControllerConfig, PlacementProposal, ShedReason,
@@ -139,9 +151,13 @@ pub use probe::{
 pub use program::{MultiviewProgram, ProgramId, ProgramKind};
 pub use programset::{Program, ProgramSet};
 pub use ptp::{PtpSample, PtpServo, ServoConfig};
+pub use registry::{
+    RequestedSize, SourceActor, SourceHandle, SourceInit, SourceKey, SourceRegistry,
+};
 pub use route::{resolve_selector, RouteApplier, RouteIntent, RouteResolution};
 pub use runtime::{
     CooperativePacer, EngineRuntime, Pacer, RealtimePacer, RunOutcome, RunStop, StopSignal,
+    MAX_REPEATS_PER_TICK,
 };
 pub use salvo::{Salvo, SalvoBatch, SalvoChange, SalvoPhase};
 pub use scheduler::{EventKind, ScheduledAction, Scheduler, TriggerEvent};

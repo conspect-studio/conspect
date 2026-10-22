@@ -5,7 +5,13 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# MSRV raised 1.82 → 1.85 by the ed25519-dalek 2→3 migration (ADR-I010): the
+# Conspect signature crates ed25519-dalek 3.0 + curve25519-dalek 5.0 are
+# edition-2024 (rust-version 1.85), and both are default deps of multiview-licence
+# / multiview-mesh, so the whole default build now needs rustc ≥ 1.85. Multiview's
+# own crates stay edition 2021; only the toolchain minimum rises. CI pins
+# `channel = "stable"` (floating), so this is a declaration/reality alignment.
+rust-version = "1.85"
 license-file = "LICENSE"
 repository = "https://github.com/aperim/multiview"
 authors = ["The Multiview Authors"]
@@ -13,9 +19,9 @@ authors = ["The Multiview Authors"]
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # `ReaderStream` for streaming HLS segment bodies straight off disk (no whole-
 # segment RAM buffering on the unauthenticated delivery surface). MIT-licensed,
@@ -26,7 +32,7 @@ tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 # build time; ADR-0008). Dual ISC-licensed (LGPL-clean) and already transitively
 # in the workspace graph. Only `multiview-ndi-sys` (pulled solely by the `ndi`
 # feature) depends on it; the default build never links it.
-libloading = "0.8"
+libloading = "0.9"
 # Off-by-default `rtsp-server` path ONLY (OUT-2 / ADR-0006): the in-process RTSP
 # server fans the already-encoded canvas to RTSP clients via `gst-rtsp-server`,
 # with no re-encode. These are the SAFE Rust bindings (MIT/Apache-2.0) over the
@@ -35,10 +41,10 @@ libloading = "0.8"
 # LGPL-clean. Pulled in ONLY by `multiview-output`'s `rtsp-server` feature, so the
 # default build links nothing and `cargo deny` (`all-features = false`) never
 # scans them. Pinned to the 0.23.x series (MSRV 1.82-compatible).
-gstreamer = "0.23"
-gstreamer-app = "0.23"
-gstreamer-rtsp-server = "0.23"
-glib = "0.20"
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-rtsp-server = "0.25"
+glib = "0.22"
 # Date/time + IANA timezone database for the clock synthetic source (ADR-0047):
 # resolve an IANA zone id (e.g. `Australia/Sydney`) to a DST-correct concrete UTC
 # offset for the displayed instant. Both `MIT OR Apache-2.0` (deny-clean), pure
@@ -61,7 +67,18 @@ chrono-tz = { version = "0.10.4", default-features = false }
 drm = "0.15"
 drm-ffi = "0.9"
 gbm = { version = "0.18", default-features = false }
-rustix = { version = "0.38", features = ["event"] }
+rustix = { version = "1.1", features = ["event"] }
+# Off-by-default `display-kms` path ONLY (DEV-B4 / ADR-0044 §5): the real ALSA
+# HDMI audio sink (`display::audio::alsa`). `alsa` is the project's SAFE Rust
+# wrapper over libasound (MIT/Apache-2.0 bindings; the libasound2 C library is
+# LGPL-2.1, resolved by DYNAMIC LINK at run time — never vendored), so enabling
+# it does NOT make the build GPL and `multiview-output` stays
+# `forbid(unsafe_code)`. The pure servo/ELD-parse/xrun/FIFO/sink-seam is ALWAYS
+# compiled and CI-tested over the mock; this feature only adds the
+# libasound-speaking PCM + `/proc/asound` ELD reader, exercised on hardware.
+# Pulled in ONLY by `multiview-output`'s `display-kms` feature, so the default
+# build links nothing and `cargo deny` (`all-features = false`) never scans it.
+alsa = "0.12"
 # Internal crates
 multiview-core = { path = "crates/multiview-core" }
 multiview-hal = { path = "crates/multiview-hal" }
@@ -76,12 +93,15 @@ multiview-engine = { path = "crates/multiview-engine" }
 multiview-config = { path = "crates/multiview-config" }
 multiview-events = { path = "crates/multiview-events" }
 multiview-licence = { path = "crates/multiview-licence" }
+multiview-mesh = { path = "crates/multiview-mesh" }
 multiview-control = { path = "crates/multiview-control" }
 multiview-preview = { path = "crates/multiview-preview" }
+multiview-webrtc = { path = "crates/multiview-webrtc" }
 multiview-telemetry = { path = "crates/multiview-telemetry" }
 multiview-ntpsys = { path = "crates/multiview-ntpsys" }
 multiview-i915pmu = { path = "crates/multiview-i915pmu" }
 multiview-ndi-sys = { path = "crates/multiview-ndi-sys" }
+multiview-rist-sys = { path = "crates/multiview-rist-sys" }
 multiview-cli = { path = "crates/multiview-cli" }
 
 [profile.release]

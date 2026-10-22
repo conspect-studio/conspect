@@ -17,11 +17,15 @@ import {
   Container,
   FileCog,
   Film,
+  HardDrive,
   HeartPulse,
+  MonitorCheck,
   Palette,
   Plug,
+  Radar,
   Sparkles,
   Timer,
+  Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -47,6 +51,10 @@ const PAGE_ICONS: Readonly<Record<string, LucideIcon>> = {
   "/help/config": FileCog,
   "/help/api": Plug,
   "/help/features": Sparkles,
+  "/help/devices": HardDrive,
+  "/help/devices/adopt": Radar,
+  "/help/display-nodes": MonitorCheck,
+  "/help/sync": Workflow,
   "/help/concepts/transports": ArrowLeftRight,
   "/help/concepts/timing-sync": Clock,
   "/help/concepts/codecs": Film,

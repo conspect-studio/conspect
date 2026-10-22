@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use ed25519_dalek::rand_core::UnwrapErr;
 use ed25519_dalek::{Signer, SigningKey};
+use getrandom::SysRng;
 use multiview_licence::entitlement::{
     Entitlement, EntitlementFlags, GpuLimit, HardwareClass, Tier,
 };
@@ -25,14 +27,13 @@ use multiview_licence::store::{LeaseBinding, LeaseStore};
 use multiview_licence::verify::{PinnedKey, SignedLease};
 use multiview_licence::watcher::{LeaseDirectoryWatcher, PollOutcome};
 use multiview_licence::ACTIVATION_WINDOW_DAYS;
-use rand_core::OsRng;
 
 fn epoch() -> DateTime<Utc> {
     DateTime::from_timestamp(1_700_000_000, 0).unwrap()
 }
 
 fn keypair() -> (SigningKey, PinnedKey) {
-    let mut rng = OsRng;
+    let mut rng = UnwrapErr(SysRng);
     let key = SigningKey::generate(&mut rng);
     let pinned = PinnedKey::from_verifying_key(&key.verifying_key());
     (key, pinned)
@@ -45,7 +46,7 @@ fn binding(key: &SigningKey, serial: &str, granted: DateTime<Utc>) -> LeaseBindi
         LeaseSource::File,
         ACTIVATION_WINDOW_DAYS,
     );
-    let msg = SignedLease::signing_bytes(&lease);
+    let msg = SignedLease::signing_bytes(&lease, None);
     let sig = key.sign(&msg);
     LeaseBinding::new(
         SignedLease::new(lease.clone(), sig.to_bytes()),
@@ -58,6 +59,7 @@ fn binding(key: &SigningKey, serial: &str, granted: DateTime<Utc>) -> LeaseBindi
             EntitlementFlags::default(),
         ),
         100,
+        None,
     )
 }
 

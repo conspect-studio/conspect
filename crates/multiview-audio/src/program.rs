@@ -105,8 +105,9 @@ pub struct ProgramBus {
     routes: Vec<(RoutePoint, Arc<AudioStore>)>,
     /// Outgoing strips that are fading out during a cross-fade (RT-9). Each is a
     /// temporary route reading the *old* store at a declining (`cos`) ramp; once
-    /// its ramp completes it is unrouted and removed from `routes`. Tracked here
-    /// so [`mix`](ProgramBus::mix) can retire it on the tick the ramp finishes.
+    /// its ramp completes it is reclaimed from the mixer and dropped from
+    /// `routes`. Tracked here so [`mix`](ProgramBus::mix) can retire it on the
+    /// tick the ramp finishes.
     fading_out: Vec<RoutePoint>,
     format: AudioFormat,
 }
@@ -196,9 +197,10 @@ impl ProgramBus {
     ///   fade (no audible dip), and the per-sample envelope (applied inside
     ///   [`Mixer::mix_program`]) means **no sample discontinuity** at the seam (no
     ///   click) even when the fade spans a tick block;
-    /// * when the down-ramp completes the outgoing strip is **unrouted**
-    ///   ([`Mixer::unroute_from_program`]) so the old source no longer
-    ///   contributes (no lingering double-count).
+    /// * when the down-ramp completes the outgoing strip is **reclaimed**
+    ///   ([`Mixer::remove_input`]) so the old source no longer contributes (no
+    ///   lingering double-count) and its mixer slot is returned for reuse (the
+    ///   strip storage stays bounded across cross-fades — invariant #9).
     ///
     /// Returns the [`SwitchTier`] applied: [`SwitchTier::ClickFree`] for a real
     /// cross-fade (`ramp_frames > 0`), or [`SwitchTier::SoftStep`] when
@@ -274,6 +276,27 @@ impl ProgramBus {
         self.format
     }
 
+    /// The number of physical mixer input-strip slots backing this bus
+    /// (occupied strips + any reclaimed-free slots).
+    ///
+    /// The bounded-memory observable for the cross-fade path (invariant #9):
+    /// repeated completed cross-fades must **reuse** their retired strip slots,
+    /// so this stays bounded and never grows one leaked strip per fade. See
+    /// [`Mixer::slot_count`](crate::mixer::Mixer::slot_count).
+    #[must_use]
+    pub fn mixer_slot_count(&self) -> usize {
+        self.mixer.slot_count()
+    }
+
+    /// The number of currently-occupied mixer strips on this bus: the routed
+    /// channel(s) plus any in-flight cross-fade's outgoing strip. A completed
+    /// fade's outgoing strip is reclaimed and is **not** counted. See
+    /// [`Mixer::live_input_count`](crate::mixer::Mixer::live_input_count).
+    #[must_use]
+    pub fn live_strip_count(&self) -> usize {
+        self.mixer.live_input_count()
+    }
+
     /// Mix one output tick of program audio.
     ///
     /// Advances the [`SampleClock`] by one tick to
@@ -344,18 +367,26 @@ impl ProgramBus {
         };
 
         // Advance every in-flight ramp by this tick's budget, then retire any
-        // outgoing cross-fade strip whose `cos` taper has run out: unroute it so
-        // the old source contributes nothing more (no lingering double-count) and
-        // drop it from the route table (its cursor freezes; never read again).
+        // outgoing cross-fade strip whose `cos` taper has run out: reclaim its
+        // mixer slot so the old source contributes nothing more (no lingering
+        // double-count) and the slot is reused rather than leaked (invariant #9),
+        // and drop it from the route table (its cursor freezes; never read again).
         self.mixer.advance_ramps(frames);
         self.retire_completed_fades();
 
         block
     }
 
-    /// Unroute and forget any outgoing cross-fade strip whose ramp has completed.
-    /// A retired ramp is gone from the mixer (`advance_ramps` cleared it), so a
-    /// `fading_out` strip with no ramp left has finished its fade-out.
+    /// Reclaim any outgoing cross-fade strip whose ramp has completed. A retired
+    /// ramp is gone from the mixer (`advance_ramps` cleared it), so a `fading_out`
+    /// strip with no ramp left has finished its fade-out.
+    ///
+    /// A finished strip is **removed** from the mixer
+    /// ([`Mixer::remove_input`](crate::mixer::Mixer::remove_input)) — not merely
+    /// unrouted — so its slot is returned to the mixer's free-list for reuse and
+    /// the strip storage stays bounded across arbitrarily many cross-fades
+    /// (invariant #9), and it is dropped from the bus read loop (its cursor
+    /// freezes; the old source is never read again).
     fn retire_completed_fades(&mut self) {
         let Self {
             mixer,
@@ -367,8 +398,9 @@ impl ProgramBus {
             if mixer.gain_ramp(out_point).is_some() {
                 return true; // still fading
             }
-            // Fade done: take it off the bus and out of the read loop.
-            mixer.unroute_from_program(out_point);
+            // Fade done: reclaim the strip's mixer slot (returned to the free-list
+            // for reuse) and take it out of the bus read loop.
+            mixer.remove_input(out_point);
             routes.retain(|(p, _)| *p != out_point);
             false
         });

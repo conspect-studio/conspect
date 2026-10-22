@@ -57,15 +57,14 @@
 //!   stays pure Rust; the real GPU downscale blit + low-latency H.264 encode still
 //!   land behind a *further* gate (they need a GPU). The default build is the
 //!   MJPEG/snapshot model plus signed tokens, with no native or GPU dependency.
-//! * `webrtc-native` (off by default; implies `webrtc`) — the **native str0m**
-//!   ICE/DTLS/SRTP implementation of the [`whep::transport::WhepTransport`] seam,
-//!   in [`whep::native`]. It pulls the `str0m` sans-IO WebRTC stack (and a small
-//!   `aws-lc-rs` C/assembly crypto blob), so it is NOT part of the pure-Rust CI
-//!   default. Because str0m is sans-IO, the SDP offer→answer negotiation (real
-//!   ICE credentials + a real self-signed DTLS-certificate fingerprint) is still
-//!   socket-free and unit-tested in CI; only the live DTLS-SRTP handshake + RTP
-//!   egress need a real socket/peer and run under an env-gated `#[ignore]`d
-//!   loopback test.
+//!
+//! The **native** str0m ICE/DTLS/SRTP implementation of the
+//! [`whep::transport::WhepTransport`] seam no longer lives here: it relocated to
+//! the `multiview-webrtc` crate (`multiview_webrtc::whep_egress::WhepEgress`,
+//! behind that crate's `native` feature — ADR-0048 / ADR-P006 move 1), so there is
+//! exactly one str0m owner per process, shared with WHIP ingest and the WebRTC
+//! outputs. `multiview-preview` therefore keeps only the pure, socket-free
+//! `webrtc` seam and carries no `str0m` dependency.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

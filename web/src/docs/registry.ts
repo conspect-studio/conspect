@@ -154,6 +154,32 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         keywords: ["hls", "ll-hls", "rtsp", "rtmp", "srt", "ndi", "display", "connector", "codec", "sink"],
       },
       {
+        id: "devices",
+        title: msg`Devices`,
+        keywords: ["devices", "driver", "address", "desired_mode", "alarm_on_offline", "secret_ref", "reconnect"],
+      },
+      {
+        id: "sync-groups",
+        title: msg`Sync groups`,
+        keywords: ["sync_groups", "members", "offset_ms", "target_skew_ms"],
+      },
+      {
+        id: "webrtc-ice",
+        title: msg`WebRTC and TURN (ICE servers)`,
+        keywords: [
+          "webrtc",
+          "turn",
+          "stun",
+          "ice_servers",
+          "ice",
+          "nat",
+          "relay",
+          "credentials",
+          "whep",
+          "whip",
+        ],
+      },
+      {
         id: "validation",
         title: msg`Validation and import / export`,
         keywords: ["validate", "import", "export", "unique ids"],
@@ -193,7 +219,7 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
   {
     path: "/help/features",
     title: msg`Feature guide`,
-    summary: msg`Layouts, sources, outputs, overlays, tally, salvos, and alarms — what each one is.`,
+    summary: msg`Layouts, sources, outputs, overlays, tally, salvos, media players, and alarms — what each one is.`,
     keywords: ["features", "multiviewer", "guide"],
     sections: [
       {
@@ -227,6 +253,11 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         keywords: ["recall", "preset", "atomic", "switch"],
       },
       {
+        id: "media-players",
+        title: msg`Media players`,
+        keywords: ["vt", "clip", "playout", "cue", "vamp", "loop", "opener"],
+      },
+      {
         id: "alarms",
         title: msg`Alarms`,
         keywords: ["probe", "black", "freeze", "silence", "loudness", "severity"],
@@ -237,6 +268,112 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
       "/help/concepts/transports",
       "/help/concepts/resilience",
     ],
+  },
+  {
+    path: "/help/devices",
+    title: msg`Managed devices`,
+    summary: msg`Adopt decoders, display nodes, and cast targets; lifecycle states, drivers, and stream binding.`,
+    keywords: ["devices", "device", "adopt", "decoder", "zowietek", "cast", "driver", "device_ref"],
+    sections: [
+      {
+        id: "what-devices-are",
+        title: msg`What a managed device is`,
+        keywords: ["managed device", "desired state", "driver", "converge"],
+      },
+      {
+        id: "device-states",
+        title: msg`Lifecycle states`,
+        keywords: ["online", "degraded", "auth failed", "unreachable", "adopting", "discovered"],
+      },
+      {
+        id: "drivers",
+        title: msg`Drivers and what they support`,
+        keywords: ["zowietek", "displaynode", "cast", "capabilities", "supports"],
+      },
+      {
+        id: "binding-streams",
+        title: msg`Binding device streams`,
+        keywords: ["device_ref", "bind", "source candidate", "decode slot", "unverified"],
+      },
+    ],
+    related: ["/help/devices/adopt", "/help/sync", "/help/display-nodes"],
+  },
+  {
+    path: "/help/devices/adopt",
+    title: msg`Adopting devices`,
+    summary: msg`Discovery scans are untrusted hints; adoption is always an explicit operator confirmation.`,
+    keywords: ["adopt", "discovery", "scan", "mdns", "confirm", "untrusted"],
+    sections: [
+      {
+        id: "untrusted-discovery",
+        title: msg`Discovery is untrusted`,
+        keywords: ["untrusted", "inventory", "hints", "never auto", "ipv6"],
+      },
+      {
+        id: "adopt-steps",
+        title: msg`Adopting step by step`,
+        keywords: ["scan", "adopt", "identifier", "driver", "address"],
+      },
+      {
+        id: "adopt-credentials",
+        title: msg`Credentials`,
+        keywords: ["secret", "reference", "auth", "password", "auth failed"],
+      },
+      {
+        id: "adopt-after",
+        title: msg`After adoption`,
+        keywords: ["probe", "online", "converge", "export", "restart"],
+      },
+    ],
+    related: ["/help/devices", "/help/display-nodes"],
+  },
+  {
+    path: "/help/display-nodes",
+    title: msg`Display nodes`,
+    summary: msg`Multiview's own playout endpoints: enrolled, frame-accurate wall heads on small computers.`,
+    keywords: ["display node", "wall", "head", "enrollment", "playout", "sbc"],
+    sections: [
+      {
+        id: "display-node-model",
+        title: msg`What a display node is`,
+        keywords: ["display node", "wall head", "program", "frame-accurate"],
+      },
+      {
+        id: "display-node-enrollment",
+        title: msg`Enrollment`,
+        keywords: ["enrol", "enrollment", "keypair", "identity", "address"],
+      },
+      {
+        id: "display-node-resilience",
+        title: msg`Resilience`,
+        keywords: ["last good frame", "slate", "reconnect", "never blank"],
+      },
+    ],
+    related: ["/help/devices", "/help/sync"],
+  },
+  {
+    path: "/help/sync",
+    title: msg`Synchronized output`,
+    summary: msg`The honest sync tier ladder, sync groups, offsets, and measured (never assumed) skew.`,
+    keywords: ["sync", "synchronized", "skew", "tier", "wall", "offset", "drift"],
+    sections: [
+      {
+        id: "sync-tiers",
+        title: msg`The tier ladder`,
+        keywords: ["frame-accurate", "bounded skew", "drift", "cast", "tier"],
+      },
+      {
+        id: "sync-groups",
+        title: msg`Sync groups`,
+        keywords: ["sync group", "offset_ms", "target_skew_ms", "weakest member", "alarm"],
+      },
+      {
+        id: "sync-honesty",
+        title: msg`Measured, never assumed`,
+        keywords: ["measured", "achieved", "honest", "presentation edge"],
+      },
+    ],
+    related: ["/help/devices", "/help/display-nodes", "/help/concepts/timing-sync"],
   },
   {
     path: "/help/concepts/transports",
@@ -288,6 +425,21 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         id: "mpeg-ts",
         title: msg`MPEG-TS over UDP and multicast`,
         keywords: ["mpeg-ts", "transport stream", "udp", "multicast", "broadcast", "rtp"],
+      },
+      {
+        id: "webrtc",
+        title: msg`WebRTC (WHIP and WHEP)`,
+        keywords: [
+          "webrtc",
+          "whip",
+          "whep",
+          "browser",
+          "sub-second",
+          "turn",
+          "ice",
+          "sdp",
+          "low latency",
+        ],
       },
       {
         id: "file-and-synthetic",
@@ -487,6 +639,11 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         keywords: ["limited", "full", "tv range", "pc range"],
       },
       {
+        id: "display-node",
+        title: msg`Display node`,
+        keywords: ["display node", "wall head", "playout", "enrollment"],
+      },
+      {
         id: "genlock",
         title: msg`Genlock`,
         keywords: ["genlock", "sync", "reference", "phase"],
@@ -502,6 +659,11 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         keywords: ["hdr", "pq", "hlg", "brightness"],
       },
       {
+        id: "ice",
+        title: msg`ICE (Interactive Connectivity Establishment)`,
+        keywords: ["ice", "stun", "turn", "nat", "webrtc", "candidate", "relay"],
+      },
+      {
         id: "jitter-buffer",
         title: msg`Jitter buffer`,
         keywords: ["jitter", "buffer", "network", "smoothing"],
@@ -515,6 +677,11 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         id: "ll-hls",
         title: msg`LL-HLS (Low-Latency HLS)`,
         keywords: ["ll-hls", "low latency", "parts", "apple"],
+      },
+      {
+        id: "managed-device",
+        title: msg`Managed device`,
+        keywords: ["managed device", "adopt", "driver", "device_ref", "desired state"],
       },
       {
         id: "mldv2",
@@ -567,9 +734,19 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         keywords: ["salvo", "recall", "preset", "router"],
       },
       {
+        id: "sdp",
+        title: msg`SDP (Session Description Protocol)`,
+        keywords: ["sdp", "offer", "answer", "webrtc", "whip", "whep", "negotiation"],
+      },
+      {
         id: "srt",
         title: msg`SRT`,
         keywords: ["srt", "secure reliable transport", "contribution"],
+      },
+      {
+        id: "sync-group",
+        title: msg`Sync group`,
+        keywords: ["sync group", "skew", "offset", "tier", "wall"],
       },
       {
         id: "tally",
@@ -585,6 +762,16 @@ export const DOCS_REGISTRY: readonly DocsPageEntry[] = [
         id: "umd",
         title: msg`UMD (Under-Monitor Display)`,
         keywords: ["umd", "under monitor display", "label", "source name"],
+      },
+      {
+        id: "whep",
+        title: msg`WHEP (WebRTC-HTTP Egress Protocol)`,
+        keywords: ["whep", "webrtc", "egress", "play", "browser", "preview", "sdp"],
+      },
+      {
+        id: "whip",
+        title: msg`WHIP (WebRTC-HTTP Ingestion Protocol)`,
+        keywords: ["whip", "webrtc", "ingest", "publish", "browser", "encoder", "sdp"],
       },
     ],
     related: ["/help/concepts/transports", "/help/concepts/timing-sync"],

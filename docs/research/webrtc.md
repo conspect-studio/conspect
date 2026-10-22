@@ -4,7 +4,7 @@
 > [docs/decisions](../decisions/): [ADR-0048](../decisions/ADR-0048.md) (endpoint),
 > [ADR-T014](../decisions/ADR-T014.md) (WHIP ingest), [ADR-0049](../decisions/ADR-0049.md)
 > (WebRTC outputs), [ADR-P006](../decisions/ADR-P006.md) (WHEP preview completion),
-> [ADR-W020](../decisions/ADR-W020.md) (SPA player & management).
+> [ADR-W023](../decisions/ADR-W023.md) (SPA player & management).
 
 ---
 
@@ -41,7 +41,7 @@ Five pillars, shipped together (no "core now, wiring later"):
    honest fidelity labels.
 4. **SPA**: a `<WhepPlayer>` component for program/input/output/layout-editor previews with
    automatic fallback to the existing JPEG-poll path; forms for the new source/output kinds;
-   in-app docs; a capabilities probe ([ADR-W020](../decisions/ADR-W020.md)).
+   in-app docs; a capabilities probe ([ADR-W023](../decisions/ADR-W023.md)).
 5. **Docs/process**: this brief; the five ADRs above; conventions §3/§4 updates (crate row +
    canonical features); capability-matrix and work-schedule updates.
 
@@ -204,13 +204,16 @@ Dotted edges are drop-oldest rings — nothing on the engine side ever blocks on
 ## 3. Port & firewall model
 
 The entire subsystem needs exactly **one new UDP port**. Signaling rides the existing control-plane
-HTTP listener; there are no per-session port ranges and no STUN/TURN servers.
+HTTP listener; there are no per-session port ranges and Multiview does not *run* a STUN/TURN server.
+It **is** an in-crate TURN *client* (Amendment 2026-06-13, [ADR-0048 §5.1](../decisions/ADR-0048.md)):
+where host + advertised candidates cannot establish, configured TURN servers (`webrtc.ice_servers`)
+provide relayed candidates over the same single UDP port.
 
 | Port | Proto | Direction | Purpose |
 |---|---|---|---|
 | control port (existing) | TCP | inbound | ALL WHIP/WHEP signaling (`OPTIONS`/`POST`/`DELETE` under `/api/v1/whip/…`, `/api/v1/whep/…`, `/api/v1/preview/…`) + SPA + REST |
 | `webrtc.udp_port` (default **8189**) | UDP | inbound + outbound | ALL ICE/DTLS/SRTP media, every role, single-port mux (§2.2) |
-| remote WHIP endpoint | TCP (HTTPS) + UDP | outbound only | `whip_push` signaling + media — we initiate, so plain NAT works with host candidates, no TURN |
+| remote WHIP endpoint | TCP (HTTPS) + UDP | outbound only | `whip_push` signaling + media — we initiate, so plain NAT works with host candidates; a configured TURN server can supply relayed candidates where it does not |
 
 Deployment rules:
 
@@ -218,9 +221,10 @@ Deployment rules:
   addresses (IPv6 first) — bridge-mode containers otherwise advertise unreachable container
   addresses. Host networking needs neither.
 - **Inbound behind NAT** (WHIP publishers / WHEP viewers reaching a Multiview behind NAT): forward
-  `webrtc.udp_port` and advertise the external address. This is the self-hosted posture every
-  TURN-less open-source WHIP/WHEP server documents; a TURN **client** is explicitly out of scope
-  (§11).
+  `webrtc.udp_port` and advertise the external address — the self-hosted posture every open-source
+  WHIP/WHEP server documents. Where forwarding/advertising is not possible (symmetric NAT /
+  restrictive firewall), configure a TURN server (`webrtc.ice_servers`) and the in-crate TURN client
+  relays via it (§11.0).
 - **Outbound `whip_push`** traverses NAT with host candidates alone, because Multiview initiates
   the connectivity checks.
 - IPv6-first throughout: candidates are gathered and listed IPv6 before IPv4; SDP uses
@@ -450,7 +454,7 @@ build** can encode (H.264 preferred, else VP8) — never a hard-coded assumption
   (`crates/multiview-preview/src/focus.rs`) with tracing — preview WebRTC rides the existing
   topmost (cheapest-to-shed) preview rungs, shed before any program lever moves (invariant #9).
 
-### 7.4 Control surface & SPA (summary — [ADR-W020](../decisions/ADR-W020.md))
+### 7.4 Control surface & SPA (summary — [ADR-W023](../decisions/ADR-W023.md))
 
 `GET /api/v1/preview/capabilities` reports
 `{ webrtc, scopes: { program: { whep, fidelity }, inputs: { whep }, outputs: { whep } },
@@ -549,8 +553,20 @@ tool.
 
 ## 11. Explicit boundaries (stated non-goals, not deferred work)
 
-- **No TURN/STUN client.** The server is self-hosted; host candidates + `advertised_addresses`
-  cover the deployment shapes (§3) — the same posture as the TURN-less open-source servers.
+### 11.0 In scope: TURN client (Amendment 2026-06-13)
+
+**TURN is in scope** — an operator hard requirement, recorded in
+[ADR-0048 §5.1](../decisions/ADR-0048.md). The subsystem ships an **in-crate, sans-IO TURN client**
+(RFC 5389 / RFC 5766 / RFC 8656: `Allocate` / `Refresh` / `CreatePermission` / `ChannelBind`,
+`Send`/`Data`, `MESSAGE-INTEGRITY`, `FINGERPRINT`, `XOR-…-ADDRESS` for IPv4 **and** IPv6) because
+str0m 0.16.2 is full-ICE but has **no TURN client** (it consumes a relay candidate but cannot allocate
+one). Credentials are long-term and coturn-style ephemeral REST/HMAC
+(`draft-uberti-behave-turn-rest-00`), secret-named for the redactor; TURN runs IPv6-first; and the
+client is pure and CI-tested offline against an in-process fake TURN server. Multiview still does not
+*run* a STUN/TURN **server** — it is a relay **client** only.
+
+### 11.1 Genuine non-goals
+
 - **No VP8 ingest depacketization.** We *answer* H.264+Opus only for WHIP — every browser and OBS
   can send that (RFC 7742/7874 floors, §1.3). VP8 remains an **egress** preview codec only.
 - **No simulcast.**
@@ -586,4 +602,4 @@ tool.
 | [ADR-T014](../decisions/ADR-T014.md) | WHIP ingest: endpoint semantics, auth, source-kind schema, media path, PLI policy + OBS profile, lifecycle, apply classification (§4, §6.2) |
 | [ADR-0049](../decisions/ADR-0049.md) | WebRTC program outputs: `Output::Webrtc` + `Output::WhipPush`, encode-once fan, B-frame validation, force-IDR seam, the Opus program rendition, viewer caps, push redirect/reconnect, never-shed status (§5, §6.1) |
 | [ADR-P006](../decisions/ADR-P006.md) | WHEP preview completion: native-transport relocation, encoder ladder, audio in the seam, scopes, fidelity labels, capabilities endpoint, PRV-4b glue, answer-SDP policy (§7) |
-| [ADR-W020](../decisions/ADR-W020.md) | SPA: `<WhepPlayer>`, fallback ladder + badge, capabilities probe, forms for the new kinds, docs/i18n/test strategy, JPEG endpoints entering OpenAPI (§7.4) |
+| [ADR-W023](../decisions/ADR-W023.md) | SPA: `<WhepPlayer>`, fallback ladder + badge, capabilities probe, forms for the new kinds, docs/i18n/test strategy, JPEG endpoints entering OpenAPI (§7.4) |

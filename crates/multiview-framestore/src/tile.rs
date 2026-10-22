@@ -14,7 +14,7 @@
 //! Time is **injected**: every method that needs "now" takes a [`MediaTime`],
 //! so the whole state ladder is deterministically testable with no real clock
 //! and no sleeps.
-use core::sync::atomic::{AtomicI64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -63,12 +63,23 @@ fn latch_and_classify<T>(
 }
 
 /// One retained frame in the media-time ring: the source-relative media instant
-/// it represents, paired with the frame. Ordered by `at` (publishes are
-/// monotonic in media time on the normal path; an out-of-order or backwards
-/// stamp re-anchors the ring, see [`TileStore::publish_arc`]).
+/// it represents and the globally-monotonic publish `seq` it was stamped with,
+/// paired with the frame. Ordered by `at` for selection (publishes are monotonic
+/// in media time on the normal path; an out-of-order or backwards stamp
+/// re-anchors the ring, see [`TileStore::publish_arc`]); `seq` gives a total,
+/// never-reset order across source generations that the prune watermark keys on.
 #[derive(Debug)]
 struct RingEntry<T> {
+    /// The source-relative media instant this frame represents — the selection
+    /// key for [`select_nearest_not_after`].
     at: MediaTime,
+    /// The tile-global publish sequence (from [`LatestSlot`]): strictly
+    /// increasing across every publish and never reset, so a newer source
+    /// generation always outranks an older one. The prune watermark is keyed on
+    /// `seq`, not `at`, precisely so a reader holding a superseded
+    /// (old-generation) snapshot can never advance it past a newer generation's
+    /// frames.
+    seq: u64,
     frame: Arc<T>,
 }
 
@@ -76,6 +87,7 @@ impl<T> Clone for RingEntry<T> {
     fn clone(&self) -> Self {
         Self {
             at: self.at,
+            seq: self.seq,
             frame: Arc::clone(&self.frame),
         }
     }
@@ -87,6 +99,13 @@ impl<T> Clone for RingEntry<T> {
 /// so it unambiguously encodes the not-yet-published state without a separate
 /// flag or an `Option` allocation.
 const NEVER_PUBLISHED: i64 = i64::MIN;
+
+/// Watermark value meaning "no reader has latched a ring frame yet". `0` is below
+/// every real publish sequence (the first publish is `seq` `1`; see
+/// [`LatestSlot::publish_arc`]), so `retain(|e| e.seq >= NO_LATCH_SEQ)` keeps the
+/// whole ring until a reader has actually selected a frame — nothing is pruned
+/// before it has been consumed.
+const NO_LATCH_SEQ: u64 = 0;
 
 /// The outcome of reading a tile on an output tick.
 ///
@@ -174,6 +193,30 @@ pub struct TileStore<T> {
     /// (not an `Arc` cell) so a reader observes it lock-free with no allocation
     /// and no extra reclamation machinery alongside the frame slot.
     last_frame_at_ns: AtomicI64,
+    /// The **publish sequence** of the frame the output clock last **latched**
+    /// onto (via [`read_at`](TileStore::read_at) / [`state_at`](TileStore::state_at)),
+    /// or [`NO_LATCH_SEQ`] until the first latch. [`publish_arc`] prunes every
+    /// ring entry whose `seq` is *strictly below* this watermark: those frames
+    /// sit before the frame the compositor is showing and — output `now` being
+    /// monotonic (invariant #1/#3) — can never be selected again, so dropping
+    /// them collapses the ring to the latched frame plus any decode-ahead future
+    /// instead of a full [`RING_CAPACITY`] backlog of dead frames (invariant #9).
+    ///
+    /// **Keyed on `seq`, not media time, for cross-generation safety.** The
+    /// sequence is tile-global and never reset, so a newer source generation
+    /// (after a reconnect re-anchors the ring to a lower media time) always
+    /// carries strictly higher `seq`s than any frame an older snapshot holds. A
+    /// reader still holding a superseded snapshot can therefore only ever
+    /// `fetch_max` this watermark to an *old, lower* sequence — one already below
+    /// the new generation's frames — so it can never make the next publish prune
+    /// the reconnected generation (the cross-generation race a media-time
+    /// watermark admitted). Advanced with a monotonic `fetch_max`: it never
+    /// regresses, and `read_at`/`state_at` running on the single output-clock
+    /// thread only push it forward.
+    ///
+    /// [`RING_CAPACITY`]: TileStore::RING_CAPACITY
+    /// [`publish_arc`]: TileStore::publish_arc
+    latch_watermark_seq: AtomicU64,
     /// A bounded, media-time-ordered ring of recently-published frames, used by
     /// [`read_at`](TileStore::read_at) to latch the frame nearest-but-not-after
     /// the output clock's instant (streaming-gotchas §1). Stored as a snapshot
@@ -213,6 +256,7 @@ impl<T> TileStore<T> {
             thresholds,
             policy,
             last_frame_at_ns: AtomicI64::new(NEVER_PUBLISHED),
+            latch_watermark_seq: AtomicU64::new(NO_LATCH_SEQ),
             ring: ArcSwap::from_pointee(Vec::new()),
         }
     }
@@ -258,16 +302,45 @@ impl<T> TileStore<T> {
         // after reconnect) re-anchors the ring on itself rather than leaving a
         // stale future-stamped frame ahead of it, so sampling cannot get stuck
         // pointing past the new content.
-        let entry = RingEntry { at, frame };
+        //
+        // Publishes are single-writer per tile (one actor per source), so the
+        // tail observed here is stable against other writers; only the lock-free
+        // readers touch the ring concurrently, and they never mutate it.
+        //
+        // Frames the output clock has already advanced past are dead weight
+        // (invariant #9): output `now` is monotone, so nothing whose publish `seq`
+        // is strictly below the latch watermark is ever selected again. Pruning
+        // them holds the ring at the latched frame + any decode-ahead future
+        // rather than a full RING_CAPACITY backlog. This runs inside the existing
+        // O(capacity) copy-on-write on the sampled input thread — never on the
+        // output clock.
+        //
+        // The watermark is a publish `seq`, not a media time, so a reconnect
+        // needs no special-casing here: the re-anchored generation's frames carry
+        // strictly higher `seq`s than anything an old snapshot holds, so a stale
+        // cross-generation `fetch_max` can only leave the watermark *below* them
+        // and the `retain` keeps them (see the `latch_watermark_seq` field).
+        let watermark_seq = self.latch_watermark_seq.load(Ordering::Relaxed);
+        let entry = RingEntry { at, seq, frame };
         self.ring.rcu(|current| {
             let mut next: Vec<RingEntry<T>> = if current.last().is_some_and(|tail| at < tail.at) {
-                // Backwards stamp: discard the now-superseded future and restart.
+                // Backwards stamp: discard the now-superseded future and restart
+                // the ring on the re-anchored frame, so selection cannot stay
+                // stuck pointing past the fresh content.
                 Vec::with_capacity(1)
             } else {
-                Vec::clone(current)
+                let mut kept = Vec::clone(current);
+                // Keep every entry whose `seq` is at-or-after the watermark; drop
+                // ONLY those strictly before it. The latched frame sits exactly at
+                // the watermark (a reader `fetch_max`'d it to its own `seq`), so
+                // `>=` retains it — the boundary frame the compositor is still
+                // showing is never pruned, only strictly-consumed past frames.
+                kept.retain(|e| e.seq >= watermark_seq);
+                kept
             };
             next.push(entry.clone());
-            // Drop the oldest entries beyond the bounded capacity.
+            // Hard ceiling (drop-oldest) bounds the worst case: a stalled output
+            // clock that stops advancing the watermark while the producer runs on.
             let overflow = next.len().saturating_sub(Self::RING_CAPACITY);
             if overflow > 0 {
                 next.drain(0..overflow);
@@ -335,6 +408,37 @@ impl<T> TileStore<T> {
         }
     }
 
+    /// Latch onto the ring frame nearest-but-not-after `now` and advance the
+    /// prune watermark to that frame's publish `seq`. **The single point at which
+    /// any reader selects a frame from the ring** — [`read_at`](TileStore::read_at)
+    /// and [`state_at`](TileStore::state_at) both route through it, and any future
+    /// reader (e.g. a wired-up degradation sampler) MUST too.
+    ///
+    /// Fusing selection with the watermark advance is what makes
+    /// [`publish_arc`](TileStore::publish_arc)'s prune correct *by construction*:
+    /// the producer drops only entries whose `seq` is **strictly below** the
+    /// watermark, so the frame this method selects — whose `seq` is written into
+    /// the watermark by the `fetch_max` before it is returned — can never be
+    /// pruned out from under the caller. A reader physically cannot obtain a ring
+    /// frame without first protecting it.
+    ///
+    /// Keying on `seq` (a tile-global, never-reset order) rather than media time
+    /// is what makes this safe across a reconnect: a reader holding a superseded
+    /// snapshot advances the watermark only to an *old* `seq`, always below the
+    /// re-anchored generation's frames, so it can never prune the new generation
+    /// (see the `latch_watermark_seq` field). `fetch_max` is monotone: the
+    /// watermark only ever moves forward and never regresses.
+    fn latch_and_advance<'r>(
+        &self,
+        ring: &'r [RingEntry<T>],
+        now: MediaTime,
+    ) -> Option<(&'r RingEntry<T>, SourceState)> {
+        let (selected, state) = latch_and_classify(ring, now, self.thresholds)?;
+        self.latch_watermark_seq
+            .fetch_max(selected.seq, Ordering::Relaxed);
+        Some((selected, state))
+    }
+
     /// The tile's [`SourceState`] for the frame the output clock is **latched
     /// onto** at output media time `now` (streaming-gotchas §1).
     ///
@@ -354,8 +458,13 @@ impl<T> TileStore<T> {
     #[must_use]
     pub fn state_at(&self, now: MediaTime) -> SourceState {
         let ring = self.ring.load();
-        latch_and_classify(&ring, now, self.thresholds)
-            .map_or(SourceState::NoSignal, |(_, state)| state)
+        // Route through `latch_and_advance` so a monitored-but-not-composited
+        // tile (state sampled, never `read_at`) still advances the watermark and
+        // bounds its ring — and so selection can never skip the watermark.
+        match self.latch_and_advance(&ring, now) {
+            Some((_selected, state)) => state,
+            None => SourceState::NoSignal,
+        }
     }
 
     /// Read the tile on an output tick at instant `now`.
@@ -420,7 +529,12 @@ impl<T> TileStore<T> {
     #[must_use]
     pub fn read_at(&self, now: MediaTime) -> TileRead<T> {
         let ring = self.ring.load();
-        let Some((selected, state)) = latch_and_classify(&ring, now, self.thresholds) else {
+        // Selecting the latched frame also advances the prune watermark (see
+        // `latch_and_advance`), so the producer's next publish can drop consumed
+        // past frames (invariant #9) without ever dropping this one. The only new
+        // per-tick cost on the read path is that one relaxed-atomic `fetch_max` —
+        // no lock, no allocation.
+        let Some((selected, state)) = self.latch_and_advance(&ring, now) else {
             return TileRead::NoSignal;
         };
         let frame = Arc::clone(&selected.frame);
@@ -453,5 +567,110 @@ impl<T> TileStore<T> {
     #[must_use]
     pub fn slot(&self) -> &LatestSlot<T> {
         &self.slot
+    }
+
+    /// The number of frames currently retained in the media-time ring.
+    ///
+    /// Introspection for bounded-memory tests and soak gates (invariant #9): the
+    /// ring must not accumulate frames the output clock has already advanced
+    /// past. Hidden from the public docs — it exposes an internal buffer's
+    /// occupancy, not a stable API contract.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_frames(&self) -> usize {
+        self.ring.load().len()
+    }
+}
+
+#[cfg(test)]
+mod cross_generation_watermark_race {
+    //! Regression: a reader holding a *superseded* ring snapshot must not be able
+    //! to corrupt the prune watermark of the generation that replaced it.
+    //!
+    //! The race (found by the ADR-T009 data-plane review): a reader
+    //! ([`read_at`](TileStore::read_at) / [`state_at`](TileStore::state_at))
+    //! *loads* the ring snapshot and *then* advances the prune watermark from the
+    //! frame it selected. If a reconnect (a backwards re-anchor to a fresh, LOW
+    //! media-time generation) lands in between, a reader still holding the OLD,
+    //! HIGH media-time snapshot advances the watermark to an old high value —
+    //! **after** the re-anchor. A watermark keyed on media time then lets the
+    //! next forward publish on the new generation prune that generation's own
+    //! frames as "older than the (stale) watermark", dropping the boundary frame
+    //! the compositor is showing (invariant #2 / #9).
+    //!
+    //! The two barriers force exactly that interleaving deterministically —
+    //! `publish(reconnect)` → stale `latch_and_advance` → `publish(forward)` —
+    //! rather than relying on a flaky stress loop to hit the narrow window.
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use multiview_core::time::MediaTime;
+
+    use super::{NoSignalPolicy, TileStore, TileThresholds};
+
+    const SEC: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+
+    #[test]
+    fn stale_reader_cannot_prune_the_reconnected_generation() {
+        // Holds frames forever, so pruning — not the failure ladder — is what
+        // this probes.
+        let s: Arc<TileStore<u32>> = Arc::new(TileStore::new(
+            "t",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+
+        // Generation G0, stamped HIGH on the media timeline (10s, 11s).
+        s.publish(1_u32, MediaTime::from_nanos(10 * SEC));
+        s.publish(2_u32, MediaTime::from_nanos(11 * SEC));
+
+        let captured = Arc::new(Barrier::new(2)); // reader has loaded the G0 snapshot
+        let reconnected = Arc::new(Barrier::new(2)); // producer has re-anchored to G1
+
+        let reader = {
+            let s = Arc::clone(&s);
+            let captured = Arc::clone(&captured);
+            let reconnected = Arc::clone(&reconnected);
+            thread::spawn(move || {
+                // Load the G0 (high-time) snapshot BEFORE the reconnect — exactly
+                // what a reader does at the top of `read_at`.
+                let g0 = s.ring.load_full();
+                captured.wait();
+                // Wait until the producer has re-anchored to the new LOW
+                // generation, then advance the watermark from the STALE snapshot
+                // (the second half of `read_at`, now a generation behind).
+                reconnected.wait();
+                let _ = s.latch_and_advance(g0.as_slice(), MediaTime::from_nanos(11 * SEC));
+            })
+        };
+
+        // Producer: wait for the reader to capture G0, then re-anchor to a fresh
+        // LOW generation with a backwards stamp at t=0.
+        captured.wait();
+        s.publish(100_u32, MediaTime::from_nanos(0));
+        reconnected.wait();
+        // The stale cross-generation watermark advance must be visible before the
+        // forward publish that would act on it (thread join = happens-before).
+        reader.join().expect("reader thread panicked");
+
+        // The next forward publish on the NEW generation. A media-time watermark
+        // polluted with the stale 11s latch prunes this generation's boundary
+        // frame (frame 100 @ t=0) as "older than 11s".
+        s.publish(101_u32, MediaTime::from_nanos(40 * MS));
+
+        // The reconnected generation's boundary frame MUST survive: a read at its
+        // instant returns frame 100, not the later 101 (nor a slate).
+        assert_eq!(
+            s.read_at(MediaTime::from_nanos(0)).frame().map(|f| **f),
+            Some(100),
+            "a stale cross-generation watermark advance must not prune the reconnected boundary frame"
+        );
+        assert_eq!(
+            s.read_at(MediaTime::from_nanos(40 * MS))
+                .frame()
+                .map(|f| **f),
+            Some(101),
+        );
     }
 }

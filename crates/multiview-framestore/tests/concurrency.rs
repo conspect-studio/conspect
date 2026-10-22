@@ -94,6 +94,14 @@ fn reader_never_observes_a_regression_in_sequence() {
     // A single reader observing one writer must see a non-decreasing sequence
     // of counter values (newest-wins; the slot never hands back an older
     // value than one it already returned to this same reader).
+    //
+    // This is guaranteed by read-read coherence over the single atomic pointer
+    // backing the slot (C++/Rust [intro.races]/4 + /12): a thread's sequenced
+    // loads of one atomic location can never move backwards in that location's
+    // single total modification order — on x86 *or* ARM/AArch64, at any atomic
+    // ordering. So `*v >= prev` below must hold on every iteration on every
+    // platform; a failure here would be a real arc-swap/std bug, never a flake.
+    // See the "Ordering guarantee" docs on `LatestSlot`.
     const PUBLISHES: u64 = 300_000;
 
     let slot: Arc<LatestSlot<u64>> = Arc::new(LatestSlot::new());
@@ -134,7 +142,15 @@ fn reader_never_observes_a_regression_in_sequence() {
 
     writer.join().expect("writer thread panicked");
     let samples = reader.join().expect("reader thread panicked");
-    assert!(samples > 0);
+    // The reader actually ran (it observed at least one value and so executed
+    // the per-iteration `*v >= prev` non-regression check), and it terminated
+    // only by observing the final published value — not by any weaker path.
+    assert!(samples > 0, "reader observed no values");
+    assert_eq!(
+        slot.load().map(|v| *v),
+        Some(PUBLISHES),
+        "final published value must remain observable after the writer finishes"
+    );
 }
 
 #[test]

@@ -38,6 +38,16 @@ pub struct DiscoveryConfig {
     /// (usually `unknown`) — extra browse scope, never extra trust.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_service_types: Vec<String>,
+    /// The **discovery domain** this node stamps onto every discovery-inventory
+    /// row it observes (ADR-W026): `[discovery] domain = "site-a"`. A
+    /// DNS-label-like id (non-empty, ≤64 chars, `[a-z0-9-]`). This is the SOLE
+    /// source of the authz domain label — the observing node stamps its own
+    /// configured value; a discovered device's payload/TXT records never
+    /// contribute. Absent ⇒ this node's discovery rows are unlabelled, and a
+    /// discovery-scoped principal is denied them (fail-closed). One node = one
+    /// domain; per-NIC/per-VLAN split is out of scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 impl DiscoveryConfig {
@@ -49,7 +59,15 @@ impl DiscoveryConfig {
         Self {
             zowietek_service_type,
             extra_service_types,
+            domain: None,
         }
+    }
+
+    /// Stamp this node's discovery domain (ADR-W026).
+    #[must_use]
+    pub fn with_domain(mut self, domain: String) -> Self {
+        self.domain = Some(domain);
+        self
     }
 
     /// Validate every configured service type: each must be a well-formed
@@ -65,8 +83,44 @@ impl DiscoveryConfig {
         for ty in &self.extra_service_types {
             validate_service_type(ty, "discovery.extra_service_types")?;
         }
+        if let Some(domain) = &self.domain {
+            validate_discovery_domain(domain, "discovery.domain")?;
+        }
         Ok(())
     }
+}
+
+/// Check that `domain` is a DNS-label-like discovery domain (ADR-W026):
+/// non-empty, ≤64 chars, and only lowercase ASCII letters, digits, and `-`.
+/// Rejecting anything else keeps the label operator-legible and unambiguous as
+/// an authz key. Shared by the `[discovery] domain` field and the `[[api.keys]]`
+/// `scoped_discovery_domains` allowlist so the label rules cannot fork; `field`
+/// names the offending config path in the error.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Validation`] describing the violation.
+pub(crate) fn validate_discovery_domain(domain: &str, field: &str) -> Result<(), ConfigError> {
+    if domain.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{field}: must not be empty (omit the field instead)"
+        )));
+    }
+    if domain.len() > 64 {
+        return Err(ConfigError::Validation(format!(
+            "{field}: {domain:?} exceeds 64 characters"
+        )));
+    }
+    if !domain
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(ConfigError::Validation(format!(
+            "{field}: {domain:?} must contain only lowercase letters, \
+             digits, and '-' (DNS-label-like)"
+        )));
+    }
+    Ok(())
 }
 
 /// Check that `ty` is a plausible DNS-SD service type: it must start with `_`
@@ -122,6 +176,40 @@ mod tests {
             assert!(
                 cfg.validate().is_err(),
                 "{bad:?} must be rejected as a service type"
+            );
+        }
+    }
+
+    // --- ADR-W026: the discovery domain label ---
+
+    #[test]
+    fn domain_defaults_absent_and_old_toml_parses() {
+        // A config written before ADR-W026 has no `domain` key — it must parse
+        // to `None` (serde default), preserving the compat see-all posture.
+        let cfg: DiscoveryConfig = toml::from_str("zowietek_service_type = \"_z._tcp\"\n")
+            .expect("pre-W026 discovery TOML parses");
+        assert!(cfg.domain.is_none());
+        cfg.validate().expect("no domain validates");
+    }
+
+    #[test]
+    fn valid_domain_round_trips_and_validates() {
+        let cfg = DiscoveryConfig::default().with_domain("site-a".to_owned());
+        cfg.validate().expect("a DNS-label-like domain validates");
+        let wire = toml::to_string(&cfg).expect("serializes");
+        let back: DiscoveryConfig = toml::from_str(&wire).expect("round-trips");
+        assert_eq!(back.domain.as_deref(), Some("site-a"));
+    }
+
+    #[test]
+    fn malformed_domains_are_rejected() {
+        // Uppercase / space / empty / >64 chars / illegal punctuation.
+        let too_long = "a".repeat(65);
+        for bad in ["Site A", "site_a", "", "site.a", too_long.as_str()] {
+            let cfg = DiscoveryConfig::default().with_domain(bad.to_owned());
+            assert!(
+                cfg.validate().is_err(),
+                "{bad:?} must be rejected as a discovery domain"
             );
         }
     }

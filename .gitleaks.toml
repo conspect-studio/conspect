@@ -1,0 +1,21 @@
+# gitleaks configuration for Multiview (AGENTS.md rule 34; ADR-G006).
+# Extends the upstream default ruleset and adds a CURATED allowlist of verified
+# false positives. Each entry is justified (rule 20: no silent suppression).
+# Real secrets never live in the repo — they come from 1Password at runtime
+# (rule 34); these allowlisted paths hold only synthetic test fixtures and public
+# content-pins. Verified non-secret on 2026-06-16 against full git history.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Curated false positives — verified non-secret 2026-06-16 (ADR-G006)."
+paths = [
+  # Test fixtures: synthetic signing/API keys for the auth/licence/OpenAPI tests.
+  # Real secrets are forbidden in code (rule 34) — test fixtures are not secrets.
+  '''crates/.*/tests/.*\.rs''',
+  # Container build args that LOOK like keys but are PUBLIC pins, not secrets:
+  # FFMPEG_GPG_KEY (a public GPG signing key/fingerprint), FFMPEG_SHA256 (a
+  # source checksum), and ghcr image references / digests.
+  '''deploy/Dockerfile.*''',
+]

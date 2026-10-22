@@ -90,10 +90,17 @@ pub(crate) async fn list_devices(
     principal: Principal,
 ) -> ControlResult<Json<Vec<Resource>>> {
     principal.role.require(Action::Read)?;
+    // Per-object visibility (BOLA, ADR-W005/ADR-W025): a scoped principal sees
+    // ONLY its allowlisted devices — by parity with `GET /devices/{id}` 403'ing
+    // an out-of-scope id, an unfiltered collection would let it enumerate (and
+    // read the address/config of) devices it cannot fetch. The same
+    // `authorize_object` predicate the per-object handlers use; an unscoped
+    // principal (admin/unrestricted operator) keeps every row.
     let devices = state
         .devices
         .list()?
         .into_iter()
+        .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
         .map(|v| v.resource)
         .collect();
     Ok(Json(devices))
@@ -691,12 +698,13 @@ fn fire_and_forget(
 /// Mint (or replay, by `Idempotency-Key`) an operation id for a long-running
 /// device action.
 ///
-/// Device actions run on the control-plane driver poller (DEV-A4), not the
-/// engine command bus, so this only mints the operation id the `202` returns;
-/// the driver publishes the matching `device.mode`/outcome event on the realtime
-/// stream as the convergence runs. A retried `Idempotency-Key` returns the
-/// original id.
-fn reserve_operation(state: &AppState, idem: &IdempotencyKey) -> OperationId {
+/// Device actions run on the control-plane driver poller (DEV-A4) or session
+/// actor (DEV-D2), not the engine command bus, so this only mints the
+/// operation id the `202` returns; the driver publishes the matching
+/// `device.mode`/outcome event on the realtime stream as the action runs. A
+/// retried `Idempotency-Key` returns the original id. Shared with the
+/// cast-session volume route.
+pub(crate) fn reserve_operation(state: &AppState, idem: &IdempotencyKey) -> OperationId {
     match state.idempotency.reserve(idem.0.as_deref()) {
         Reservation::Fresh(op) | Reservation::Replay(op) => op,
     }

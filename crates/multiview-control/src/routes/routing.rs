@@ -111,6 +111,10 @@ pub(crate) async fn plan_route(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, destination_id(&req.target))?;
+    // Per-object authz on the SOURCE too (BOLA, SEC-09): classifying a take reads
+    // the source's stream inventory, so a scoped principal may plan only sources
+    // within its object allowlist (a missing/out-of-scope id fails closed).
+    crate::auth::authorize_object(&principal, &req.source.input_id)?;
     let plan = classify_request(&state, &req);
     Ok((StatusCode::OK, Json(plan)).into_response())
 }
@@ -158,6 +162,11 @@ pub(crate) async fn take_route(
     }
     let destination = destination_id(&req.target).to_owned();
     crate::auth::authorize_object(&principal, &destination)?;
+    // Per-object authz on the SOURCE too (BOLA, SEC-09): a take routes the source
+    // input onto the destination, so a scoped principal may route only sources
+    // within its object allowlist — checked before any classify/submit side effect
+    // (a missing/out-of-scope id fails closed).
+    crate::auth::authorize_object(&principal, &req.source.input_id)?;
 
     // Classify against the destination's pinned params (inv #11: surfaced first).
     let plan = classify_request(&state, &req);

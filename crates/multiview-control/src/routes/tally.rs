@@ -28,6 +28,7 @@ use multiview_core::tally::TallyColor;
 use multiview_events::TallyTarget;
 use serde::{Deserialize, Serialize};
 
+use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
 use crate::command::Command;
 use crate::concurrency::{IdempotencyKey, IfMatch};
@@ -167,10 +168,28 @@ pub(crate) async fn put_profile(
         Ok(current) => {
             if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
             let versioned = state.tally_profiles.put(profile)?;
+            // ADR-W024 round 6: a tally profile is runtime-mutable running state
+            // composed into active.toml; audit (the ONE persist choke point) so
+            // the persister captures the edit. A pure store edit (no engine
+            // command), so the store IS the adopted state.
+            state.audit(
+                &principal.key_id,
+                AuditAction::Update,
+                TALLY_PROFILE_KIND,
+                &id,
+                Some(serde_json::to_value(&versioned.profile).unwrap_or(serde_json::Value::Null)),
+            );
             Ok(profile_response(StatusCode::OK, &versioned))
         }
         Err(ControlError::NotFound { .. }) => {
             let versioned = state.tally_profiles.put(profile)?;
+            state.audit(
+                &principal.key_id,
+                AuditAction::Create,
+                TALLY_PROFILE_KIND,
+                &id,
+                Some(serde_json::to_value(&versioned.profile).unwrap_or(serde_json::Value::Null)),
+            );
             Ok(profile_response(StatusCode::CREATED, &versioned))
         }
         Err(other) => Err(other),
@@ -188,6 +207,15 @@ pub(crate) async fn delete_profile(
     let current = state.tally_profiles.get(&id)?;
     if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
     state.tally_profiles.delete(&id)?;
+    // ADR-W024 round 6: removing a runtime-mutable tally profile changes the
+    // composed running state — audit so the persister rewrites active.toml.
+    state.audit(
+        &principal.key_id,
+        AuditAction::Delete,
+        TALLY_PROFILE_KIND,
+        &id,
+        None,
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 

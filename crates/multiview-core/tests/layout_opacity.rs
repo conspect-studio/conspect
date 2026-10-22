@@ -25,8 +25,7 @@ fn canvas() -> Canvas {
     }
 }
 
-/// A full-canvas opaque cell with an explicit opacity, spreading defaults for
-/// the broadcast extras.
+/// A full-canvas opaque cell with an explicit opacity.
 fn cell_with_opacity(opacity: f32) -> Cell {
     Cell {
         x: 0.0,
@@ -37,7 +36,6 @@ fn cell_with_opacity(opacity: f32) -> Cell {
         fit: FitMode::Contain,
         source: None,
         opacity,
-        ..Cell::default()
     }
 }
 

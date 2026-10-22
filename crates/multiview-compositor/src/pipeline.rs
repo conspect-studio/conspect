@@ -13,6 +13,9 @@
 //! default. The canvas is fixed SDR BT.709 limited (ADR-C001); the working
 //! blend space is linear BT.709-primaries RGB.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use multiview_core::color::{
     ColorInfo, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristic,
 };
@@ -165,7 +168,7 @@ fn rgb_to_canvas_yuv(r: u8, g: u8, b: u8, canvas: CanvasColor) -> Result<[u8; 3]
 /// This is the CPU-reference pixel container — the GPU path uses native
 /// surfaces and never materializes one of these. Width and height are required
 /// to be even (4:2:0 chroma subsampling).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Nv12Image {
     width: u32,
     height: u32,
@@ -173,6 +176,80 @@ pub struct Nv12Image {
     uv_plane: Vec<u8>,
     /// The resolved color of these samples.
     color: ColorInfo,
+    /// Optional return path for CPU-compositor output planes. Images built by
+    /// public constructors leave this `None`; only the persistent CPU backend
+    /// leases planes from its pool and installs a return path.
+    plane_return: Option<Arc<PlaneReturn>>,
+}
+
+impl Clone for Nv12Image {
+    fn clone(&self) -> Self {
+        // A clone owns independent bytes and therefore must not return them into
+        // the source image's lease. This preserves the old deep-clone semantics.
+        Self {
+            width: self.width,
+            height: self.height,
+            y_plane: self.y_plane.clone(),
+            uv_plane: self.uv_plane.clone(),
+            color: self.color,
+            plane_return: None,
+        }
+    }
+}
+
+impl PartialEq for Nv12Image {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.y_plane == other.y_plane
+            && self.uv_plane == other.uv_plane
+            && self.color == other.color
+    }
+}
+
+impl Eq for Nv12Image {}
+
+impl Drop for Nv12Image {
+    fn drop(&mut self) {
+        let Some(return_to) = self.plane_return.take() else {
+            return;
+        };
+        let y = core::mem::take(&mut self.y_plane);
+        let uv = core::mem::take(&mut self.uv_plane);
+        return_to.give_back(y, uv);
+    }
+}
+
+/// Shared return path for CPU-compositor output-plane leases. `Nv12Image::drop`
+/// pushes its two vectors back into these bounded one-slot caches; if a later
+/// frame is still outstanding, the returned smaller slot is dropped rather than
+/// growing memory without bound.
+#[derive(Debug, Default)]
+struct PlaneReturn {
+    y: std::sync::Mutex<Option<Vec<u8>>>,
+    uv: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl PlaneReturn {
+    /// Return a completed frame's planes into the one-slot caches. Poison is
+    /// recovered (hot-path safety); only one spare per plane is retained.
+    fn give_back(&self, y: Vec<u8>, uv: Vec<u8>) {
+        let mut y_slot = match self.y.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if y_slot.is_none() {
+            *y_slot = Some(y);
+        }
+        drop(y_slot);
+        let mut uv_slot = match self.uv.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if uv_slot.is_none() {
+            *uv_slot = Some(uv);
+        }
+    }
 }
 
 impl Nv12Image {
@@ -219,7 +296,24 @@ impl Nv12Image {
             y_plane,
             uv_plane,
             color,
+            plane_return: None,
         })
+    }
+
+    /// Build an NV12 image whose output planes return to `plane_return` on drop.
+    /// Geometry validation is identical to [`Nv12Image::new`]; this private
+    /// constructor is used only by the persistent CPU compositor's plane lease.
+    fn new_pooled(
+        width: u32,
+        height: u32,
+        y_plane: Vec<u8>,
+        uv_plane: Vec<u8>,
+        color: ColorInfo,
+        plane_return: Arc<PlaneReturn>,
+    ) -> Result<Self> {
+        let mut image = Self::new(width, height, y_plane, uv_plane, color)?;
+        image.plane_return = Some(plane_return);
+        Ok(image)
     }
 
     /// A solid-color NV12 image filled with the given 8-bit `(y, cb, cr)` code
@@ -253,6 +347,7 @@ impl Nv12Image {
             y_plane,
             uv_plane,
             color,
+            plane_return: None,
         })
     }
 
@@ -528,6 +623,258 @@ fn map_axis(d: u32, src: u32, dst: u32) -> u32 {
     u32::try_from(clamped).unwrap_or(src.saturating_sub(1))
 }
 
+// ============================================================================
+// Reusable per-run composite scratch (efficiency findings #5 + #6)
+//
+// The CPU compositor runs one composite per output tick, forever (invariant #1).
+// Two costs were paid every tick and are now paid once and reused, owned by the
+// persistent backend ([`crate::backend::CpuScratch`]):
+//   * #5 — the transfer LUTs ([`LutCache`]): thousands of pow/exp evaluations,
+//     rebuilt only when the set of transfer characteristics in play changes.
+//   * #6 — the per-band accumulator + coverage ([`ScratchPool`]/[`BandScratch`]):
+//     the frame's largest transient, pooled instead of `vec!`-allocated per tick.
+// The kernel is byte-for-byte unchanged — only where the memory comes from and
+// how coverage is tracked (a generation stamp, not a cleared bool vec) changed;
+// the oracle-equivalence proptest (`tests/composite_tile_driven.rs`) pins it.
+// ============================================================================
+
+/// A generation-stamped coverage map for the tile-driven kernel: `stamp[i]`
+/// equal to the current generation means pixel `i` was touched by a tile this
+/// composite. Advancing the generation each composite empties the whole map in
+/// O(1) — no per-tick clear (the classic version-stamp trick) — which is what
+/// lets the buffer be reused every tick instead of a fresh `vec![false; n]`
+/// (finding #6). Grows monotonically; never shrinks.
+#[derive(Debug, Default)]
+pub(crate) struct Coverage {
+    /// Per-pixel generation stamp. `0` is the permanent "never touched" sentinel
+    /// (the generation starts at 1), so a freshly grown slot reads as uncovered
+    /// with no explicit clear.
+    stamp: Vec<u64>,
+    /// The current composite's generation (advanced by [`Coverage::begin`]).
+    gen: u64,
+}
+
+impl Coverage {
+    /// Begin a new composite pass over `len` pixels, advancing the generation so
+    /// every prior stamp reads as uncovered. Grows the stamp buffer when it is
+    /// shorter than `len`; returns `true` iff a (re)allocation happened (for the
+    /// pool's allocation counter). Never clears existing stamps.
+    fn begin(&mut self, len: usize) -> bool {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            // Generation wrapped (only after 2^64 composites): reset to 1 and
+            // clear so the `0`-means-never sentinel stays sound. O(n), and
+            // astronomically rare (≈ 9.7e9 years at 60 fps).
+            self.gen = 1;
+            for s in &mut self.stamp {
+                *s = 0;
+            }
+        }
+        if self.stamp.len() < len {
+            self.stamp.resize(len, 0);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether pixel `i` was marked this composite. Out-of-range reads as
+    /// uncovered (bounds-checked; never panics).
+    fn is_covered(&self, i: usize) -> bool {
+        self.stamp.get(i).copied() == Some(self.gen)
+    }
+
+    /// Mark pixel `i` covered this composite (a no-op if out of range).
+    fn mark(&mut self, i: usize) {
+        if let Some(slot) = self.stamp.get_mut(i) {
+            *slot = self.gen;
+        }
+    }
+}
+
+/// One band's reusable composite scratch: the premultiplied-linear accumulator
+/// and its coverage map, sized to the band's covered-row span and reused across
+/// ticks (finding #6). Owned by the [`ScratchPool`]; one per worker band, index-
+/// stable across ticks.
+#[derive(Debug, Default)]
+pub(crate) struct BandScratch {
+    /// Premultiplied-linear accumulator over the band's covered span. Only the
+    /// entries the coverage map marks are read back ([`encode_covered_pixels`]),
+    /// so stale contents outside this tick's covered pixels are never observed —
+    /// no per-tick reinitialisation of the accumulator is required either.
+    acc: Vec<PremulRgba>,
+    /// Coverage sentinel parallel to `acc`.
+    cover: Coverage,
+}
+
+impl BandScratch {
+    /// Prepare this scratch for a composite over `span_pixels` pixels and return
+    /// the `(accumulator, coverage)` split. Grows `acc`/`cover` only when shorter
+    /// than the span (bumping `counter` once per growth); the coverage generation
+    /// is advanced so neither buffer needs a per-tick clear. The returned
+    /// accumulator slice is exactly `span_pixels` long.
+    fn begin(
+        &mut self,
+        span_pixels: usize,
+        counter: &AtomicU64,
+    ) -> (&mut [PremulRgba], &mut Coverage) {
+        if self.acc.len() < span_pixels {
+            self.acc.resize(span_pixels, PremulRgba::TRANSPARENT);
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.cover.begin(span_pixels) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        let acc = match self.acc.get_mut(..span_pixels) {
+            Some(slice) => slice,
+            None => &mut [], // unreachable after the resize above; total, no panic
+        };
+        (acc, &mut self.cover)
+    }
+}
+
+/// The per-run pool of band scratch buffers the CPU compositor reuses every tick
+/// instead of allocating per composite (finding #6; the CPU twin of the GPU
+/// [`crate::gpu::pool::SurfacePool`]). Allocated lazily at warmup and grown
+/// monotonically; steady-state ticks perform no allocation.
+#[derive(Debug, Default)]
+pub(crate) struct ScratchPool {
+    /// One [`BandScratch`] per parallel worker band (index-stable across ticks).
+    bands: Vec<BandScratch>,
+    /// Shared return path for completed output-plane leases. Kept in an `Arc`
+    /// because a returned [`Nv12Image`] may outlive the synchronous composite
+    /// call; its `Drop` returns the vectors without borrowing the backend.
+    planes: Arc<PlaneReturn>,
+    /// Count of buffer (re)allocations since construction — the authoritative
+    /// counter the reuse test asserts is bounded (warmup only, not per tick).
+    /// Atomic because the parallel bands bump it from their worker threads,
+    /// exactly as `SurfacePool::alloc_count` does.
+    alloc_count: AtomicU64,
+}
+
+impl ScratchPool {
+    /// The number of scratch (re)allocations made since construction. Steady-
+    /// state ticks must not increase this.
+    #[must_use]
+    pub(crate) fn alloc_count(&self) -> u64 {
+        self.alloc_count.load(Ordering::Relaxed)
+    }
+
+    /// The number of per-band scratch slots the pool holds (grow-only high-water,
+    /// [`ScratchPool::ensure_bands`]). The serial branch uses one band; the
+    /// parallel branch grows this to the (clamped) worker count, so `>= 2` proves
+    /// a composite actually fanned across the multi-band parallel path rather than
+    /// the serial fallback. An observability/test seam, not part of the composite.
+    #[must_use]
+    pub(crate) fn band_count(&self) -> usize {
+        self.bands.len()
+    }
+
+    /// Ensure at least `n_bands` band-scratch slots exist (grow-only), bumping the
+    /// allocation counter for each new slot.
+    fn ensure_bands(&mut self, n_bands: usize) {
+        while self.bands.len() < n_bands {
+            self.bands.push(BandScratch::default());
+            self.alloc_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Lease output planes of exactly `y_len`/`uv_len` bytes. A returned vector
+    /// with enough capacity is resized+zeroed in place; otherwise one new vector
+    /// is allocated and counted. The image's `Drop` returns the vectors through
+    /// the shared one-slot cache.
+    fn lease_planes(&self, y_len: usize, uv_len: usize) -> (Vec<u8>, Vec<u8>, Arc<PlaneReturn>) {
+        let y = Self::take_plane(&self.planes.y, y_len, &self.alloc_count);
+        let uv = Self::take_plane(&self.planes.uv, uv_len, &self.alloc_count);
+        (y, uv, Arc::clone(&self.planes))
+    }
+
+    /// Take one cached plane, growing/allocating only if its capacity cannot
+    /// serve `len`. Poison is recovered to protect the output clock.
+    fn take_plane(
+        slot: &std::sync::Mutex<Option<Vec<u8>>>,
+        len: usize,
+        counter: &AtomicU64,
+    ) -> Vec<u8> {
+        let mut guard = match slot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut plane = guard.take().unwrap_or_default();
+        if plane.capacity() < len {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        plane.resize(len, 0);
+        plane.fill(0);
+        plane
+    }
+}
+
+/// A memoized [`LutSet`] keyed on the SET of transfer characteristics currently
+/// in play (canvas + tiles). The CPU compositor rebuilds the tables only when
+/// that set changes (finding #5) instead of every tick; a stable run builds them
+/// once. Owned by the persistent backend.
+#[derive(Debug, Default)]
+pub(crate) struct LutCache {
+    /// The cached table set, valid iff `have`.
+    luts: LutSet,
+    /// The deduped transfer set `luts` was built for (compared order-independently).
+    key: Vec<TransferCharacteristic>,
+    /// Whether `luts`/`key` hold a built set yet.
+    have: bool,
+    /// Number of times the tables were (re)built — the counter the memoization
+    /// test asserts stays at 1 for a stable transfer set.
+    build_count: u64,
+}
+
+impl LutCache {
+    /// The number of LUT (re)builds since construction.
+    #[must_use]
+    pub(crate) fn build_count(&self) -> u64 {
+        self.build_count
+    }
+
+    /// Return the memoized [`LutSet`] for the transfer characteristics of the
+    /// `canvas` and `tiles`, rebuilding only when that set differs from the cached
+    /// one. The returned set is bit-identical to [`LutSet::for_transfers`] over the
+    /// same transfers — dedup is first-seen and lookups are by transfer value, so
+    /// the input order never matters — hence the composite output is unchanged.
+    pub(crate) fn ensure(&mut self, canvas: CanvasColor, tiles: &[Tile<'_>]) -> &LutSet {
+        let want = present_transfers(canvas, tiles);
+        if !self.have || !same_transfer_set(&self.key, &want) {
+            self.luts = LutSet::for_transfers(want.iter().copied());
+            self.key = want;
+            self.have = true;
+            self.build_count = self.build_count.saturating_add(1);
+        }
+        &self.luts
+    }
+}
+
+/// The deduped set (first-seen order) of transfer characteristics present across
+/// the canvas and every tile — exactly the transfers [`LutSet::for_transfers`]
+/// would table for one composite.
+fn present_transfers(canvas: CanvasColor, tiles: &[Tile<'_>]) -> Vec<TransferCharacteristic> {
+    let mut set: Vec<TransferCharacteristic> = Vec::with_capacity(tiles.len().saturating_add(1));
+    push_unique(&mut set, canvas.transfer);
+    for tile in tiles {
+        push_unique(&mut set, tile.image.color().transfer);
+    }
+    set
+}
+
+/// Append `t` to `set` only if it is not already present (dedup, first-seen order).
+fn push_unique(set: &mut Vec<TransferCharacteristic>, t: TransferCharacteristic) {
+    if !set.contains(&t) {
+        set.push(t);
+    }
+}
+
+/// Order-independent set equality of two deduped transfer lists.
+fn same_transfer_set(a: &[TransferCharacteristic], b: &[TransferCharacteristic]) -> bool {
+    a.len() == b.len() && a.iter().all(|t| b.contains(t))
+}
+
 /// Composite a back-to-front stack of [`Tile`]s onto a `canvas_w x canvas_h`
 /// output, running the full fixed-order pipeline per pixel, and return the
 /// tagged output NV12 image.
@@ -583,7 +930,7 @@ pub fn composite_with(
 /// The number of worker threads to fan the composite across: the machine's
 /// available parallelism, clamped to `[1, 64]`. Falls back to 1 when the count
 /// is unavailable (the serial path).
-fn auto_thread_count() -> usize {
+pub(crate) fn auto_thread_count() -> usize {
     std::thread::available_parallelism()
         .map_or(1, std::num::NonZero::get)
         .min(64)
@@ -618,6 +965,61 @@ pub fn composite_with_threads(
     use_lut: bool,
     n_threads: usize,
 ) -> Result<Nv12Image> {
+    // Build the transfer LUTs once per composite for exactly the transfers
+    // present (tiles + canvas); empty when `use_lut` is false. Unsupported
+    // transfers are absent and fall back to the oracle (same Err). This
+    // free-function path builds them fresh each call (it has no persistent home);
+    // the persistent backend memoizes them across ticks (finding #5,
+    // [`crate::backend::CpuScratch`]).
+    let luts = if use_lut {
+        Some(LutSet::for_transfers(present_transfers(canvas, tiles)))
+    } else {
+        None
+    };
+    // A transient, single-use scratch pool for this call. The persistent backend
+    // passes its own reused pool instead (finding #6).
+    let mut pool = ScratchPool::default();
+    composite_core(
+        canvas_w,
+        canvas_h,
+        canvas,
+        background,
+        tiles,
+        luts.as_ref(),
+        &mut pool,
+        n_threads,
+    )
+}
+
+/// The shared composite kernel behind both the free [`composite_with_threads`]
+/// (which passes freshly-built LUTs + a transient [`ScratchPool`]) and the
+/// persistent [`crate::backend::CpuScratch`] (which passes its memoized LUTs +
+/// its reused pool). Routing both through one body guarantees the pooled backend
+/// is byte-for-byte the free-function oracle (pinned by
+/// `tests/backend_select.rs::cpu_backend_matches_free_function_byte_for_byte`).
+///
+/// `luts` is `Some` for the LUT path (ADR-0022) and `None` for the transcendental
+/// oracle; `pool` supplies the reusable per-band accumulator + coverage scratch
+/// (finding #6); `n_threads` is the worker count (clamped, and irrelevant to the
+/// output — the band split is byte-identical for any count).
+///
+/// # Errors
+///
+/// Same as [`composite_with_threads`].
+#[allow(clippy::too_many_arguments)]
+// reason: the public composite parameters plus the two injected resources (LUTs +
+// scratch pool). A struct would only relocate the same fields and obscure that
+// the pool is a `&mut` reused across calls.
+pub(crate) fn composite_core(
+    canvas_w: u32,
+    canvas_h: u32,
+    canvas: CanvasColor,
+    background: LinearRgba,
+    tiles: &[Tile<'_>],
+    luts: Option<&LutSet>,
+    pool: &mut ScratchPool,
+    n_threads: usize,
+) -> Result<Nv12Image> {
     if canvas_w == 0 || canvas_h == 0 || canvas_w % 2 != 0 || canvas_h % 2 != 0 {
         return Err(Error::Geometry(format!(
             "canvas dimensions must be positive and even (got {canvas_w}x{canvas_h})"
@@ -628,21 +1030,11 @@ pub fn composite_with_threads(
     let h = usize::try_from(canvas_h)
         .map_err(|_| Error::Geometry("canvas height overflow".to_owned()))?;
 
-    // Build the transfer LUTs once per composite for exactly the transfers
-    // present (tiles + canvas); empty when `use_lut` is false. Unsupported
-    // transfers are absent and fall back to the oracle (same Err).
-    let luts = if use_lut {
-        let mut transfers: Vec<TransferCharacteristic> = vec![canvas.transfer];
-        for tile in tiles {
-            transfers.push(tile.image.color().transfer);
-        }
-        Some(LutSet::for_transfers(transfers))
-    } else {
-        None
-    };
-
-    let mut y_plane = vec![0_u8; w * h];
-    let mut uv_plane = vec![0_u8; w * h / 2];
+    // Lease the output NV12 planes from the per-run CPU pool. The returned image
+    // owns the vectors for its lifetime and gives them back on `Drop`; no bytes
+    // alias across frames, and a warm steady run avoids per-tick plane allocation.
+    let (mut y_plane, mut uv_plane, plane_return) =
+        pool.lease_planes(w.saturating_mul(h), w.saturating_mul(h) / 2);
 
     // Total chroma row-pairs; clamp the worker count so no band is empty.
     let total_pairs = h / 2;
@@ -650,17 +1042,25 @@ pub fn composite_with_threads(
 
     if workers <= 1 || w.saturating_mul(h) < PARALLEL_PIXEL_THRESHOLD {
         // Serial path: one band covering the whole canvas.
-        composite_band(
-            &mut y_plane,
-            &mut uv_plane,
-            w,
-            0,
-            canvas_h,
-            canvas,
-            background,
-            tiles,
-            luts.as_ref(),
-        )?;
+        pool.ensure_bands(1);
+        let ScratchPool {
+            bands, alloc_count, ..
+        } = pool;
+        if let Some(band) = bands.get_mut(0) {
+            composite_band(
+                &mut y_plane,
+                &mut uv_plane,
+                w,
+                0,
+                canvas_h,
+                canvas,
+                background,
+                tiles,
+                luts,
+                band,
+                alloc_count,
+            )?;
+        }
     } else {
         composite_parallel(
             &mut y_plane,
@@ -671,11 +1071,19 @@ pub fn composite_with_threads(
             canvas,
             background,
             tiles,
-            luts.as_ref(),
+            luts,
+            pool,
         )?;
     }
 
-    Nv12Image::new(canvas_w, canvas_h, y_plane, uv_plane, canvas.output_tag())
+    Nv12Image::new_pooled(
+        canvas_w,
+        canvas_h,
+        y_plane,
+        uv_plane,
+        canvas.output_tag(),
+        plane_return,
+    )
 }
 
 /// Render the whole canvas with the **reference** (pixel-driven) kernel
@@ -758,6 +1166,7 @@ fn composite_parallel(
     background: LinearRgba,
     tiles: &[Tile<'_>],
     luts: Option<&LutSet>,
+    pool: &mut ScratchPool,
 ) -> Result<()> {
     // Even split of chroma row-pairs across workers (ceil), so every band is the
     // same size except possibly the last — which is exactly what `chunks_mut`
@@ -769,9 +1178,22 @@ fn composite_parallel(
     let y_bands = y_plane.chunks_mut(y_band_len);
     let uv_bands = uv_plane.chunks_mut(uv_band_len);
 
+    // One reusable scratch slot per possible worker band. Split `bands` and the
+    // atomic counter into disjoint borrows before entering the scope: each worker
+    // gets a distinct `&mut BandScratch`; only the lock-free counter is shared.
+    pool.ensure_bands(workers);
+    let ScratchPool {
+        bands, alloc_count, ..
+    } = pool;
+    // Reborrow the counter immutably so the shared reference is `Copy` into every
+    // worker closure; only atomic increments occur concurrently.
+    let alloc_count: &AtomicU64 = alloc_count;
+
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
-        for (band_index, (band_y, band_uv)) in y_bands.zip(uv_bands).enumerate() {
+        for (band_index, ((band_y, band_uv), scratch)) in
+            y_bands.zip(uv_bands).zip(bands.iter_mut()).enumerate()
+        {
             // Global top row of this band (luma rows): band_index * band height.
             // `pairs_per_band * 2` luma rows per band; the band's own height is
             // derived from its (possibly shorter, final) slice length.
@@ -779,7 +1201,17 @@ fn composite_parallel(
             let band_h = u32::try_from(band_y.len() / w.max(1)).unwrap_or(0);
             let handle = scope.spawn(move || {
                 composite_band(
-                    band_y, band_uv, w, py_start, band_h, canvas, background, tiles, luts,
+                    band_y,
+                    band_uv,
+                    w,
+                    py_start,
+                    band_h,
+                    canvas,
+                    background,
+                    tiles,
+                    luts,
+                    scratch,
+                    alloc_count,
                 )
             });
             handles.push(handle);
@@ -902,25 +1334,30 @@ fn composite_band_reference(
 /// 1. Encode the background straight color through the back half **once**
 ///    (killing the per-uncovered-pixel colour round-trip) and fill the entire
 ///    band with that constant.
-/// 2. Maintain a band-sized accumulator of premultiplied linear `bg`, then for
-///    each tile in slice order (back-to-front) fold `over` into **only** the
-///    pixels in its `rect ∩ band` — so each covered pixel sees the identical
-///    per-pixel fold sequence as the reference, in the identical order.
+/// 2. Fold each tile in slice order (back-to-front) into **only** the pixels in
+///    its `rect ∩ band`, using the reused [`BandScratch`] accumulator: a pixel's
+///    first touch this tick folds `over` the background constant, later touches
+///    fold `over` the resident value. Each covered pixel therefore sees the
+///    identical per-pixel fold sequence as the reference, in the identical order.
 /// 3. Re-encode through the back half **only** the pixels at least one tile
 ///    touched, leaving the precomputed background constant for the rest.
 ///
 /// Invariant #5 (NV12-throughout): the output stays NV12 and no per-*tile* RGBA
-/// is materialised. The tile-driven fold does hold a per-pixel
-/// premultiplied-linear accumulator, but it is sized to the band's **covered row
-/// range** ([`covered_row_span`]) — the even-row-aligned union of the rows any
-/// tile touches — not the full band. So even on the single-threaded path (one
-/// full-canvas band) the scratch is `O(covered_rows × width)`: a canvas with a
-/// few small tiles never allocates a full-frame buffer, and an all-background band
-/// allocates none at all. Rows outside the span keep the precomputed background
-/// constant the fill already wrote. The covered span is even-row-aligned so a
-/// 2×2 chroma block never straddles its boundary (NV12 chroma is 2×2
-/// subsampled). Invariant #8 (fixed colour order) is unchanged: the same
-/// front-half/`over`/back-half order runs; only the *iteration* changed.
+/// is materialised. The tile-driven fold holds a per-pixel premultiplied-linear
+/// accumulator, but it is sized to the band's **covered row range**
+/// ([`covered_row_span`]) — the even-row-aligned union of the rows any tile
+/// touches — not the full band, and it is **reused from the pool** across ticks
+/// rather than allocated per composite (finding #6). So even on the single-
+/// threaded path (one full-canvas band) the scratch is `O(covered_rows × width)`,
+/// grown only when a larger span is seen; a canvas with a few small tiles never
+/// grows a full-frame buffer, and an all-background band touches the scratch not
+/// at all. Coverage is a generation-stamped [`Coverage`] sentinel, so neither the
+/// accumulator nor the coverage map is cleared per tick. Rows outside the span
+/// keep the precomputed background constant the fill already wrote. The covered
+/// span is even-row-aligned so a 2×2 chroma block never straddles its boundary
+/// (NV12 chroma is 2×2 subsampled). Invariant #8 (fixed colour order) is
+/// unchanged: the same front-half/`over`/back-half order runs; only the
+/// *iteration* and the memory provenance changed.
 #[allow(clippy::too_many_arguments)]
 // reason: this is the internal band kernel; the arguments are the band slices
 // plus the shared composite parameters. Grouping them into a struct would not
@@ -936,6 +1373,8 @@ fn composite_band(
     background: LinearRgba,
     tiles: &[Tile<'_>],
     luts: Option<&LutSet>,
+    scratch: &mut BandScratch,
+    alloc_count: &AtomicU64,
 ) -> Result<()> {
     let band_rows = usize::try_from(band_h).unwrap_or(0);
     if band_rows == 0 || w == 0 {
@@ -970,30 +1409,24 @@ fn composite_band(
     let span_rows = span_end.saturating_sub(span_start);
     let span_pixels = span_rows.saturating_mul(w);
 
-    // 3. Per-pixel premultiplied accumulator over the covered span (all
-    //    background), plus a coverage bitmap of which pixels at least one tile
-    //    touched. Fold each tile's rect ∩ span in slice order (back-to-front);
-    //    `span_start` rebases band-local rows into accumulator rows.
-    let mut acc = vec![bg_premul; span_pixels];
-    let mut covered = vec![false; span_pixels];
+    // 3. Borrow the per-run scratch for this band. `Coverage::begin` advances a
+    //    generation sentinel (O(1), no clear); `acc` grows only at warmup. On a
+    //    pixel's first touch this tick, `fold_tile_into_band` uses `bg_premul` as
+    //    the destination before writing the fold result. On later touches it uses
+    //    the resident accumulator. That is byte-for-byte the old
+    //    `vec![bg_premul; span_pixels]` + `vec![false; span_pixels]` algorithm,
+    //    without either per-tick allocation or full-span initialisation.
+    let (acc, covered) = scratch.begin(span_pixels, alloc_count);
     for tile in tiles {
         fold_tile_into_band(
-            &mut acc,
-            &mut covered,
-            w,
-            span_start,
-            span_rows,
-            py_start,
-            tile,
-            canvas,
-            luts,
+            acc, covered, bg_premul, w, span_start, span_rows, py_start, tile, canvas, luts,
         )?;
     }
 
     // 4. Re-encode through the back half ONLY the pixels a tile touched; the
     //    rest already hold the precomputed background constant.
     encode_covered_pixels(
-        band_y, band_uv, w, span_start, span_rows, &acc, &covered, canvas, luts,
+        band_y, band_uv, w, span_start, span_rows, acc, covered, canvas, luts,
     )
 }
 
@@ -1074,7 +1507,8 @@ pub fn covered_row_span(
 // shared composite parameters; a struct would not shrink the surface.
 fn fold_tile_into_band(
     acc: &mut [PremulRgba],
-    covered: &mut [bool],
+    covered: &mut Coverage,
+    bg_premul: PremulRgba,
     w: usize,
     span_start: usize,
     span_rows: usize,
@@ -1143,12 +1577,21 @@ fn fold_tile_into_band(
                     a: opacity,
                 }
                 .premultiplied();
-                if let Some(slot) = acc.get_mut(row_base + col) {
-                    *slot = over(src, *slot);
+                // The accumulator destination: the resident value if this pixel
+                // was already folded this tick, else the background constant (its
+                // first touch). Reproduces the old `vec![bg_premul; ..]` prefill
+                // exactly (back-to-front `over` from `bg_premul`) without a fill.
+                let idx = row_base + col;
+                let base = if covered.is_covered(idx) {
+                    acc.get(idx).copied().unwrap_or(bg_premul)
+                } else {
+                    bg_premul
+                };
+                let blended = over(src, base);
+                if let Some(slot) = acc.get_mut(idx) {
+                    *slot = blended;
                 }
-                if let Some(flag) = covered.get_mut(row_base + col) {
-                    *flag = true;
-                }
+                covered.mark(idx);
             }
             gx += 1;
         }
@@ -1183,7 +1626,7 @@ fn encode_covered_pixels(
     span_start: usize,
     span_rows: usize,
     acc: &[PremulRgba],
-    covered: &[bool],
+    covered: &Coverage,
     canvas: CanvasColor,
     luts: Option<&LutSet>,
 ) -> Result<()> {
@@ -1196,9 +1639,9 @@ fn encode_covered_pixels(
         let row_is_block_bottom = (span_start.saturating_add(acc_row)) % 2 == 1;
         for col in 0..w {
             let idx = row_base + col;
-            let Some(true) = covered.get(idx).copied() else {
+            if !covered.is_covered(idx) {
                 continue;
-            };
+            }
             let Some(&p) = acc.get(idx) else {
                 continue;
             };

@@ -1,6 +1,7 @@
 import type { LinguiConfig } from "@lingui/conf";
+import { formatter } from "@lingui/format-po";
 
-// Lingui v5 catalog config. Compile-time ICU: `lingui extract` scans `t`/`<Trans>`
+// Lingui catalog config. Compile-time ICU: `lingui extract` scans `t`/`<Trans>`
 // macros into per-locale PO catalogs; `lingui compile` emits JS catalogs that the
 // app lazy-loads. `ar` is a stub locale that also exercises the RTL path.
 // See docs/web/internationalization.md.
@@ -17,7 +18,11 @@ const config: LinguiConfig = {
       include: ["src"],
     },
   ],
-  format: "po",
+  // Lingui 6 removed the `format: "po"` string shorthand — the PO formatter is
+  // now a separate package (`@lingui/format-po`) supplied via `formatter()`.
+  // `lineNumbers: true` keeps the `#: src/...:NN` origin comments the committed
+  // catalogs already carry, so `lingui extract` stays byte-stable.
+  format: formatter({ lineNumbers: true }),
   // Emit compiled catalogs as TypeScript (`messages.ts`) keyed by the
   // content-hash message IDs the macro generates at runtime. The app imports
   // these compiled `.ts` catalogs directly (see src/i18n/I18nProvider.tsx);

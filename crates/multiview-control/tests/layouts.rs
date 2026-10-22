@@ -11,10 +11,51 @@ mod support;
 
 use axum::http::{header, StatusCode};
 use serde_json::json;
-use support::{body_json, get, harness, post_json, put_json, send, ADMIN_TOKEN, OPERATOR_TOKEN};
+use support::{
+    body_json, get, harness, post_json, put_json, send, ADMIN_TOKEN, OPERATOR_TOKEN, SCOPED_TOKEN,
+};
 
 fn layout_body(name: &str) -> serde_json::Value {
     json!({ "name": name, "body": { "canvas": { "w": 1920, "h": 1080 }, "cells": [] } })
+}
+
+/// BOLA ROW enumeration (OWASP API1, ADR-W005/ADR-W025): a layout is
+/// object-scoped by its OWN id (`get_layout` 403s an out-of-scope id), so
+/// `list_layouts` MUST filter ROWS to the principal's allowlist — by the same
+/// parity as `list_devices`. `SCOPED_TOKEN` is scoped to `["scoped-layout"]`.
+#[tokio::test]
+async fn list_filters_layout_rows_to_the_scoped_allowlist() {
+    let h = harness();
+    for id in ["scoped-layout", "other-layout"] {
+        let resp = send(
+            &h.router,
+            post_json(
+                &format!("/api/v1/layouts/{id}"),
+                ADMIN_TOKEN,
+                &layout_body(id),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = send(&h.router, get("/api/v1/layouts", SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids: Vec<String> = body_json(resp)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["scoped-layout".to_owned()],
+        "a scoped principal must see ONLY its allowlisted layout rows (BOLA)"
+    );
+
+    let resp = send(&h.router, get("/api/v1/layouts", ADMIN_TOKEN)).await;
+    assert_eq!(body_json(resp).await.as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]

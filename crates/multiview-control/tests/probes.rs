@@ -15,10 +15,61 @@ mod support;
 use axum::http::{header, StatusCode};
 use serde_json::json;
 use support::{
-    body_json, get, harness, post_json, put_json, send, ADMIN_TOKEN, OPERATOR_TOKEN, VIEWER_TOKEN,
+    body_json, get, harness, post_json, put_json, send, ADMIN_TOKEN, OPERATOR_TOKEN, SCOPED_TOKEN,
+    VIEWER_TOKEN,
 };
 
 const APPLY_HEADER: &str = "x-multiview-apply";
+
+/// BOLA ROW enumeration (OWASP API1, ADR-W005/ADR-W025): a probe is object-scoped
+/// by its OWN id (`get_probe` 403s an out-of-scope id), so `list_probes` MUST
+/// filter ROWS to the principal's allowlist — by the same parity as
+/// `list_devices`. `SCOPED_TOKEN` is scoped to `["scoped-layout"]`.
+#[tokio::test]
+async fn list_filters_probe_rows_to_the_scoped_allowlist() {
+    let h = harness();
+    for id in ["scoped-layout", "other-probe"] {
+        let resp = send(
+            &h.router,
+            post_json(
+                &format!("/api/v1/probes/{id}"),
+                ADMIN_TOKEN,
+                &json!({
+                    "name": id,
+                    "body": {
+                        "id": id,
+                        "cell": "cell-a",
+                        "kind": "black",
+                        "luma_threshold": 16,
+                        "dwell": { "up_ms": 2000, "down_ms": 1000 },
+                        "severity": "Major",
+                        "latched": false
+                    }
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = send(&h.router, get("/api/v1/probes", SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids: Vec<String> = body_json(resp)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["scoped-layout".to_owned()],
+        "a scoped principal must see ONLY its allowlisted probe rows (BOLA)"
+    );
+
+    let resp = send(&h.router, get("/api/v1/probes", ADMIN_TOKEN)).await;
+    assert_eq!(body_json(resp).await.as_array().unwrap().len(), 2);
+}
 
 /// A valid black-detection probe body (the canonical `multiview_config::Probe`
 /// wire shape: `kind` flattened to top level).

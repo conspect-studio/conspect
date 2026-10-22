@@ -57,6 +57,13 @@ export function LatencyPage(): JSX.Element {
             </li>
             <li>
               <Trans>
+                <strong>WebRTC (WHIP/WHEP):</strong> well under a second to a
+                browser, end to end — the lowest-latency way to reach a web page,
+                at the cost of a per-viewer peer connection.
+              </Trans>
+            </li>
+            <li>
+              <Trans>
                 <strong>MPEG-TS / UDP multicast:</strong> well under a second
                 on a managed network (no recovery buffering at all).
               </Trans>

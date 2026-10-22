@@ -29,6 +29,7 @@ const EXAMPLES: &[&str] = &[
     "public-streams-2x2.toml",
     "broadcast-monitor.toml",
     "world-clock.toml",
+    "webrtc.toml",
     "countdown-timer.toml",
 ];
 

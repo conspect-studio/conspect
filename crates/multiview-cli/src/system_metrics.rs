@@ -383,11 +383,14 @@ fn u64_to_f64(value: u64) -> f64 {
 /// Select the per-GPU [`LoadSource`] for this build + host.
 ///
 /// With the `cuda` feature on, this tries the runtime-loaded NVML poller and
-/// uses it when an NVIDIA driver/device is present; on a host with no NVIDIA
-/// device (CI, this container) NVML init fails gracefully and it falls back to
-/// the always-compiled [`NullLoadPoller`](multiview_hal::NullLoadPoller). Without
-/// the feature it is always the null source. Either way the returned source is a
-/// working `Box<dyn LoadSource>` that polls without blocking the engine.
+/// uses it when an NVIDIA driver/device is present. With the `vaapi`/`qsv`
+/// feature on, it then tries the AMD/Intel DRM sysfs + `/proc` fdinfo poller
+/// (base gpu-busy / VRAM plus the merged media-engine term). On a host with no
+/// matching GPU (CI, this container) each probe reports absence gracefully and
+/// it falls back to the always-compiled
+/// [`NullLoadPoller`](multiview_hal::NullLoadPoller). Either way the returned
+/// source is a working `Box<dyn LoadSource>` that polls without blocking the
+/// engine.
 #[must_use]
 pub fn default_load_source() -> Box<dyn LoadSource + Send + Sync> {
     #[cfg(feature = "cuda")]
@@ -399,7 +402,17 @@ pub fn default_load_source() -> Box<dyn LoadSource + Send + Sync> {
             tracing::info!("system-metrics: NVML per-GPU load source active");
             return Box::new(poller);
         }
-        tracing::debug!("system-metrics: NVML unavailable; using the no-GPU load source");
+        tracing::debug!("system-metrics: NVML unavailable; trying the next per-GPU source");
+    }
+    #[cfg(any(feature = "vaapi", feature = "qsv"))]
+    {
+        // AMD/Intel: the DRM sysfs + /proc fdinfo per-GPU load source. Returns
+        // None on a no-DRM host, so the null fallback below stays reachable.
+        if let Some(poller) = multiview_hal::SysfsLoadPoller::try_init() {
+            tracing::info!("system-metrics: DRM sysfs per-GPU load source active");
+            return Box::new(poller);
+        }
+        tracing::debug!("system-metrics: no DRM GPU; using the no-GPU load source");
     }
     Box::new(multiview_hal::NullLoadPoller::new())
 }

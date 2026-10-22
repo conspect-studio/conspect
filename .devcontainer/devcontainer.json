@@ -55,12 +55,20 @@
   // not just VS Code terminals. NVIDIA caps MUST include `video` or NVENC/NVDEC
   // silently fail even though CUDA works. These vars are inert on hosts without
   // a GPU, so they are safe everywhere (macOS included).
+  //
+  // CARGO_TARGET_DIR is DELIBERATELY NOT set here. A global override is visible
+  // to every process, so it funnels EVERY git-worktree lane under
+  // .claude/worktrees/** into the ONE root target dir — flock contention + a
+  // disk-I/O storm (loadavg spiked to 675 with ~627 D-state procs) when several
+  // lanes build at once, and it links siblings' stale artifacts (fakes a green).
+  // Leaving it unset restores per-worktree target/ isolation (AGENTS.md rule
+  // 10/11). The root checkout still builds into ./target — the `multiview-target`
+  // named volume below keeps THAT fast. See docs/runbooks/devcontainer-cargo-target.md.
   // -------------------------------------------------------------------------
   "containerEnv": {
     "NVIDIA_VISIBLE_DEVICES": "all",
     "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,video",
     "CARGO_HOME": "/usr/local/cargo",
-    "CARGO_TARGET_DIR": "${containerWorkspaceFolder}/target",
     "RUST_BACKTRACE": "1"
   },
 
@@ -72,7 +80,7 @@
   },
 
   "features": {
-    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/node:2": { "version": "22" },
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
 

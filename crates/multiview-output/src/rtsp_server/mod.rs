@@ -44,6 +44,25 @@
 //!   (invariant #3). Construction is feature-checked here; the live serve is
 //!   exercised by an ignored-by-default `tests/rtsp_server_playout.rs` against a
 //!   `GStreamer`-equipped runner.
+//!
+//! # RTCP Sender Reports + RFC 7273 (ADR-M010, DEV-C1) — the honest boundary
+//!
+//! The outbound presentation epoch stamps RTCP SR NTP↔RTP pairs through the
+//! always-compiled, fully-tested [`SrStamper`](crate::rtcp::SrStamper) carried
+//! by [`RtspServerSink`] ([`RtspServerSink::sender_report`]). **What is wired
+//! today:** the stamper seam end-to-end (epoch cell → exact SR bytes), CI-
+//! tested against known vectors. **What is not:** the `rtsp-server` feature's
+//! `gst-rtsp-server` path emits its own RTCP SRs from its internal `rtpbin`
+//! pipeline clock — adopting the epoch-stamped SRs there requires hooking the
+//! rtpbin's RTCP emission (`on-sending-rtcp`) on a `GStreamer`-equipped
+//! runner, which this environment cannot build or validate (no `GStreamer`
+//! dev libraries; the whole serving path is feature-gated for the same
+//! reason). Likewise **RFC 7273 `a=ts-refclk`/`a=mediaclk` SDP attributes are
+//! not emitted**: the only RTSP SDP generator lives inside `gst-rtsp-server`
+//! itself — no Multiview-owned SDP-building surface exists yet — and the ADR
+//! classifies the attributes as optional, non-load-bearing interop (the WS
+//! epoch is the primary carrier). Both adoptions are `rtsp-server`-feature
+//! work on a `GStreamer`-equipped runner, consuming this seam unchanged.
 
 mod caps;
 mod mount;

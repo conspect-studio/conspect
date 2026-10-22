@@ -13,6 +13,7 @@ layout → cells → overlays → outputs, config-as-code). `fps` is **always** 
 | [`pip.toml`](pip.toml) | Picture-in-picture | 2 × built-in `test` | Absolute normalized rect overlap. |
 | [`synthetic-sources.toml`](synthetic-sources.toml) | 2×2 grid | `bars` + `solid` + 2 × `clock` | The first-class in-process synthetic sources (ADR-0027); no network, no GPL. |
 | [`public-streams-2x2.toml`](public-streams-2x2.toml) | 2×2 grid | Mixed source kinds | Synthetic + a sample clip + an example RTSP camera; fps/codec/**color** heterogeneity test — see below. |
+| [`webrtc.toml`](webrtc.toml) | 2×2 grid | 2 × `webrtc` (WHIP ingest) + `bars` + `clock` | WebRTC end-to-end: WHIP contribution sources (ADR-T014), a WHEP-serve `webrtc` output + a `whip_push` output (ADR-0049), and the shared `[webrtc]` endpoint section (ADR-0048 §9). IPv6-first examples. |
 
 The synthetic source kinds — `bars` (75% colour bars; `test` is a back-compat alias), `solid`
 (a `#RRGGBB` slate), and `clock` (a full-frame analog/digital clock) — render in-process in pure

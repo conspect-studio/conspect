@@ -18,8 +18,37 @@ use multiview_config::Salvo;
 use serde_json::json;
 use support::{
     body_json, delete_if_match, get, harness, harness_with_capacity, post_if_match, put_json, send,
-    ADMIN_TOKEN, OPERATOR_TOKEN, OUTPUT_SCOPED_TOKEN, VIEWER_TOKEN,
+    ADMIN_TOKEN, OPERATOR_TOKEN, OUTPUT_SCOPED_TOKEN, SCOPED_TOKEN, VIEWER_TOKEN,
 };
+
+/// BOLA ROW enumeration (OWASP API1, ADR-W005/ADR-W025): a salvo is object-scoped
+/// by its OWN id (`get_salvo` 403s an out-of-scope id), so `list_salvos` MUST
+/// filter ROWS to the principal's allowlist — by the same parity as
+/// `list_devices`. `SCOPED_TOKEN` is scoped to `["scoped-layout"]`.
+#[tokio::test]
+async fn list_filters_salvo_rows_to_the_scoped_allowlist() {
+    let h = harness();
+    seed_salvo(&h, "scoped-layout");
+    seed_salvo(&h, "other-salvo");
+
+    let resp = send(&h.router, get("/api/v1/salvos", SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ids: Vec<String> = body_json(resp)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["scoped-layout".to_owned()],
+        "a scoped principal must see ONLY its allowlisted salvo rows (BOLA)"
+    );
+
+    let resp = send(&h.router, get("/api/v1/salvos", ADMIN_TOKEN)).await;
+    assert_eq!(body_json(resp).await.as_array().unwrap().len(), 2);
+}
 
 fn salvo_body() -> serde_json::Value {
     json!({

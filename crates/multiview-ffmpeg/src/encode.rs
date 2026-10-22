@@ -20,14 +20,27 @@
 use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::format::{Pixel, Sample};
 use ffmpeg::util::frame::{Audio, Video};
-use ffmpeg::{codec, encoder, ChannelLayout};
+use ffmpeg::{codec, encoder, ChannelLayout, Dictionary};
 use ffmpeg_next as ffmpeg;
 
 use multiview_core::time::Rational;
 
 use crate::convert::to_ff_rational;
 use crate::decode::ensure_initialized;
+use crate::encode_options::CodecOptions;
 use crate::error::{FfmpegError, Result};
+
+/// Build a libav option dictionary from a validated [`CodecOptions`] set.
+///
+/// The pairs were NUL-validated at construction, so `Dictionary::set` (which
+/// builds C strings) is safe for every entry.
+fn to_dictionary(options: &CodecOptions) -> Dictionary<'static> {
+    let mut dict = Dictionary::new();
+    for (key, value) in options.as_pairs() {
+        dict.set(key, value);
+    }
+    dict
+}
 
 /// Target description for a [`VideoEncoder`].
 #[derive(Debug, Clone)]
@@ -62,6 +75,10 @@ pub struct VideoEncodeTarget {
 pub struct VideoEncoder {
     encoder: encoder::video::Encoder,
     time_base: Rational,
+    /// Armed by [`Self::force_next_keyframe`] (the ADR-0049 force-keyframe
+    /// seam): the next frame sent is encoded as an intra/IDR picture. One-shot —
+    /// cleared by the send that consumes it.
+    force_keyframe: bool,
     /// The CUDA device context a `*_nvenc` encoder is bound to, when the
     /// device-affinity pin (Tier-2 P1a) is live. Held for the encoder's lifetime
     /// so the device outlives every `send_frame` — exactly as
@@ -74,13 +91,32 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    /// Configure and open a video encoder for `target`.
+    /// Configure and open a video encoder for `target` (no extra `AVOption`s).
     ///
     /// # Errors
     /// * [`FfmpegError::CodecNotFound`] — the named codec is not in this build.
     /// * [`FfmpegError::Rational`] — the time-base does not fit an `AVRational`.
     /// * [`FfmpegError::OpenEncoder`] — libav rejected the configuration.
     pub fn new(target: &VideoEncodeTarget) -> Result<Self> {
+        Self::new_with_options(target, &CodecOptions::new())
+    }
+
+    /// Configure and open a video encoder for `target`, applying a validated
+    /// [`CodecOptions`] set at `avcodec_open2` — the seam the fixed preview
+    /// profiles ([`preview_h264_options`](crate::encode_options::preview_h264_options)
+    /// / [`preview_vp8_options`](crate::encode_options::preview_vp8_options),
+    /// ADR-P006) open through.
+    ///
+    /// Per libav semantics, an option key the chosen encoder does not declare
+    /// is left unconsumed and ignored (never an open failure) — which is why
+    /// the preview helpers only emit family-specific keys for recognized
+    /// encoder families.
+    ///
+    /// # Errors
+    /// * [`FfmpegError::CodecNotFound`] — the named codec is not in this build.
+    /// * [`FfmpegError::Rational`] — the time-base does not fit an `AVRational`.
+    /// * [`FfmpegError::OpenEncoder`] — libav rejected the configuration.
+    pub fn new_with_options(target: &VideoEncodeTarget, options: &CodecOptions) -> Result<Self> {
         ensure_initialized()?;
         // Leak-safe: `codec_name` is matched against a static set of LGPL codecs
         // for the typed `CodecNotFound` message without allocating per-call.
@@ -131,12 +167,30 @@ impl VideoEncoder {
             _ => None,
         };
 
-        let encoder = ctx.open_as(codec).map_err(FfmpegError::OpenEncoder)?;
+        let encoder = if options.is_empty() {
+            ctx.open_as(codec)
+        } else {
+            ctx.open_as_with(codec, to_dictionary(options))
+        }
+        .map_err(FfmpegError::OpenEncoder)?;
         Ok(Self {
             encoder,
             time_base: target.time_base,
+            force_keyframe: false,
             hw_device,
         })
+    }
+
+    /// Arm the force-keyframe seam (ADR-0049): the **next** frame sent through
+    /// [`Self::send_frame`] is encoded as an intra picture
+    /// (`AV_PICTURE_TYPE_I`; with `forced-idr=1` on NVENC/x264 that is a true
+    /// IDR). One-shot — the flag clears on the send that consumes it.
+    ///
+    /// This is the encoder end of the viewer-join / PLI demand path; the
+    /// caller (the cli gate) owns the ≥2 s rate-limit and coalescing, so
+    /// arming is deliberately unconditional here.
+    pub fn force_next_keyframe(&mut self) {
+        self.force_keyframe = true;
     }
 
     /// Create a CUDA device context for `ordinal` and attach it to the
@@ -199,9 +253,23 @@ impl VideoEncoder {
     /// Send one frame, whose PTS the caller has already set from the tick
     /// counter (encoder time-base). Drain packets with [`Self::receive_packet`].
     ///
+    /// If [`Self::force_next_keyframe`] armed the seam, this send consumes it:
+    /// the frame is deep-copied once (geometry-bounded, and rate-bounded by the
+    /// caller's ≥2 s force floor — never a steady-state cost), stamped
+    /// `AV_PICTURE_TYPE_I`, and encoded as a keyframe.
+    ///
     /// # Errors
     /// Returns [`FfmpegError::Encode`] on a libav send error.
     pub fn send_frame(&mut self, frame: &Video) -> Result<()> {
+        if self.force_keyframe {
+            self.force_keyframe = false;
+            // `Video::clone` copies the pixel planes AND the frame props (PTS
+            // included) via av_frame_copy + av_frame_copy_props, so the keyed
+            // copy is the same frame with only the picture type forced.
+            let mut keyed = frame.clone();
+            keyed.set_kind(ffmpeg::picture::Type::I);
+            return self.encoder.send_frame(&keyed).map_err(FfmpegError::Encode);
+        }
         self.encoder.send_frame(frame).map_err(FfmpegError::Encode)
     }
 
@@ -269,12 +337,25 @@ pub struct AudioEncoder {
 unsafe impl Send for AudioEncoder {}
 
 impl AudioEncoder {
-    /// Configure and open an audio encoder for `target`.
+    /// Configure and open an audio encoder for `target` (no extra `AVOption`s).
     ///
     /// # Errors
     /// * [`FfmpegError::CodecNotFound`] — the named codec is not in this build.
     /// * [`FfmpegError::OpenEncoder`] — libav rejected the configuration.
     pub fn new(target: &AudioEncodeTarget) -> Result<Self> {
+        Self::new_with_options(target, &CodecOptions::new())
+    }
+
+    /// Configure and open an audio encoder for `target`, applying a validated
+    /// [`CodecOptions`] set at `avcodec_open2` — how the program Opus
+    /// rendition ([`OpusEncoder`](crate::opus::OpusEncoder), ADR-0049) sets
+    /// `vbr=constrained`/`frame_duration` on `libopus`, and
+    /// `strict=experimental` when falling back to libav's native `opus`.
+    ///
+    /// # Errors
+    /// * [`FfmpegError::CodecNotFound`] — the named codec is not in this build.
+    /// * [`FfmpegError::OpenEncoder`] — libav rejected the configuration.
+    pub fn new_with_options(target: &AudioEncodeTarget, options: &CodecOptions) -> Result<Self> {
         ensure_initialized()?;
         let codec = encoder::find_by_name(&target.codec_name)
             .ok_or_else(|| FfmpegError::CodecNotFound(static_codec_name(&target.codec_name)))?;
@@ -295,7 +376,12 @@ impl AudioEncoder {
             ctx.set_bit_rate(target.bit_rate);
         }
 
-        let encoder = ctx.open_as(codec).map_err(FfmpegError::OpenEncoder)?;
+        let encoder = if options.is_empty() {
+            ctx.open_as(codec)
+        } else {
+            ctx.open_as_with(codec, to_dictionary(options))
+        }
+        .map_err(FfmpegError::OpenEncoder)?;
         let frame_size = encoder.frame_size();
         Ok(Self {
             encoder,
@@ -389,6 +475,58 @@ impl AudioEncoder {
         self.send_frame(&frame)
     }
 
+    /// Build and send one **packed** (interleaved) `f32` **stereo** audio frame
+    /// from `interleaved` (`[l0, r0, l1, r1, …]`, at least `samples * 2` long),
+    /// stamped at `pts` in the encoder time-base (`1/sample_rate`). The packed
+    /// sibling of [`Self::send_planar_f32`] for encoders whose only `f32` input
+    /// is interleaved `FLT` (`libopus`).
+    ///
+    /// `pts` must come from a sample counter (`audio_pts = Σ samples`), the
+    /// audio analogue of the output tick (invariant #3) — never a raw input PTS.
+    ///
+    /// # Errors
+    /// * [`FfmpegError::FrameMismatch`] — the encoder is not packed `f32`
+    ///   stereo, or `interleaved` is shorter than `samples * 2`.
+    /// * [`FfmpegError::Encode`] — a libav send error.
+    pub fn send_interleaved_f32(
+        &mut self,
+        interleaved: &[f32],
+        samples: usize,
+        pts: i64,
+    ) -> Result<()> {
+        if self.format != Sample::F32(SampleType::Packed) {
+            return Err(FfmpegError::FrameMismatch(
+                "send_interleaved_f32 requires a packed-f32 encoder",
+            ));
+        }
+        if self.channels() != 2 {
+            return Err(FfmpegError::FrameMismatch(
+                "send_interleaved_f32 supports stereo encoders only",
+            ));
+        }
+        let needed = samples.saturating_mul(2);
+        let src = interleaved.get(..needed).ok_or(FfmpegError::FrameMismatch(
+            "interleaved audio block shorter than the requested sample count",
+        ))?;
+
+        let mut frame = Audio::new(self.format, samples, self.channel_layout);
+        frame.set_rate(self.sample_rate);
+        // Packed stereo f32 exposes one plane of `(f32, f32)` pairs, exactly
+        // `samples` long — the format/channel checks above keep the typed plane
+        // access in-bounds (no panic on the encode path, CLAUDE.md §7).
+        for (dst, pair) in frame
+            .plane_mut::<(f32, f32)>(0)
+            .iter_mut()
+            .zip(src.chunks_exact(2))
+        {
+            if let &[left, right] = pair {
+                *dst = (left, right);
+            }
+        }
+        frame.set_pts(Some(pts));
+        self.send_frame(&frame)
+    }
+
     /// Flush the encoder (signal EOF).
     ///
     /// # Errors
@@ -459,10 +597,12 @@ fn static_codec_name(name: &str) -> &'static str {
         "ffv1" => "ffv1",
         "mjpeg" => "mjpeg",
         "rawvideo" => "rawvideo",
+        "libvpx" => "libvpx",
         "flac" => "flac",
         "pcm_s16le" => "pcm_s16le",
         "aac" => "aac",
         "libopus" => "libopus",
+        "opus" => "opus",
         "mp2" => "mp2",
         _ => "<encoder>",
     }

@@ -128,24 +128,53 @@ fn clamp_gain(v: f64) -> f32 {
     v.clamp(-1.0, 1.0) as f32
 }
 
-/// A handle to a routing endpoint. Currently an input slot; the type leaves
-/// room for future endpoints (e.g. named submixes) without changing call sites.
+/// A handle to a routing endpoint: a **generation-tagged** input-slot index.
+///
+/// The mixer stores strips in a slot-map ([`Mixer`]'s `slots` + a free-list); a
+/// reclaimed slot is reused by a later [`Mixer::add_input`]. The generation tag
+/// makes a *stale* handle (one that named a slot before it was reclaimed) compare
+/// unequal to the reused occupant, so the mixer treats it as unknown rather than
+/// silently binding the wrong source — the ABA defence the resilience brief calls
+/// out ("non-refcounted … silently reused on the next decode → corruption").
+/// Handles are valid only when obtained from [`Mixer::add_input`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RoutePoint {
     input: usize,
+    generation: u64,
 }
 
 impl RoutePoint {
-    /// A route point referring to mixer input `index`.
+    /// A route point naming mixer input slot `index` at **generation 0** — the
+    /// generation a never-reclaimed slot carries.
+    ///
+    /// A freshly-populated slot starts at generation 0, so a handle built this way
+    /// addresses input `index` exactly while that slot has never been reclaimed;
+    /// once the slot is reclaimed and reused its generation advances and this
+    /// (generation-0) handle no longer matches. Prefer the handle returned by
+    /// [`Mixer::add_input`]; this constructor is for addressing a slot by raw
+    /// index (e.g. tests, or an external map keyed by position).
     #[must_use]
     pub const fn input(index: usize) -> Self {
-        Self { input: index }
+        Self {
+            input: index,
+            generation: 0,
+        }
     }
 
-    /// The input index this route point refers to.
+    /// The input slot index this route point refers to.
     #[must_use]
     pub const fn index(self) -> usize {
         self.input
+    }
+
+    /// A route point naming slot `index` at `generation` (mixer-internal — the
+    /// generation comes from the slot the handle is issued for).
+    #[must_use]
+    const fn at(index: usize, generation: u64) -> Self {
+        Self {
+            input: index,
+            generation,
+        }
     }
 }
 
@@ -165,10 +194,30 @@ struct InputStrip {
 }
 
 /// A program-bus + discrete-track mixer over a fixed working [`AudioFormat`].
+///
+/// Input strips live in a **slot-map** (`slots` + parallel `generations` + a
+/// `free` list): [`add_input`] fills a free slot or appends one, and
+/// [`remove_input`] reclaims a slot (bumping its generation and parking its
+/// index on `free`) so a completed cross-fade's outgoing strip is returned for
+/// reuse rather than leaked. The physical strip storage is therefore bounded by
+/// the high-water mark of concurrently-live strips, never by the number of
+/// cross-fades ever run (invariant #9).
+///
+/// [`add_input`]: Mixer::add_input
+/// [`remove_input`]: Mixer::remove_input
 #[derive(Debug)]
 pub struct Mixer {
     format: AudioFormat,
-    inputs: Vec<InputStrip>,
+    /// The strip slot-map. An index is stable for the mixer's lifetime; `None`
+    /// means the slot is reclaimed and (unless its generation is exhausted)
+    /// available on `free` for reuse.
+    slots: Vec<Option<InputStrip>>,
+    /// The current generation of each parallel `slots` entry. A [`RoutePoint`]
+    /// must match both index and generation, so a stale handle cannot address a
+    /// reused slot.
+    generations: Vec<u64>,
+    /// Indices of reclaimed (`slots[index] == None`) slots available for reuse.
+    free: Vec<usize>,
 }
 
 impl Mixer {
@@ -177,7 +226,9 @@ impl Mixer {
     pub fn new(format: AudioFormat) -> Self {
         Self {
             format,
-            inputs: Vec::new(),
+            slots: Vec::new(),
+            generations: Vec::new(),
+            free: Vec::new(),
         }
     }
 
@@ -187,26 +238,117 @@ impl Mixer {
         self.format
     }
 
+    /// The number of physical input-strip slots the mixer currently holds —
+    /// occupied strips **plus** any reclaimed-and-free slots retained for reuse.
+    ///
+    /// This is the bounded-memory observable for the program-bus cross-fade path
+    /// (invariant #9): it is the high-water mark of concurrently-live strips and
+    /// must **not** grow unboundedly as completed cross-fades come and go — a
+    /// retired outgoing strip's slot is reclaimed and reused, never leaked.
+    #[must_use]
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The number of currently-occupied input strips (excludes any
+    /// reclaimed/free slots). At steady state this is the number of sources
+    /// actually routed on the bus; a completed cross-fade's outgoing strip is
+    /// **not** counted — it is reclaimed once its fade finishes.
+    #[must_use]
+    pub fn live_input_count(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
+
     /// Register a new input strip, returning its [`RoutePoint`]. The input is
     /// not routed to the program bus until [`Mixer::route_to_program`] is
     /// called.
+    ///
+    /// Reuses a reclaimed slot from the free-list when one is available (so
+    /// repeated add/remove churn — e.g. cross-fade outgoing strips — does not
+    /// grow the physical strip storage), otherwise appends a new slot. The
+    /// returned handle carries the slot's current generation, which for a reused
+    /// slot is distinct from any handle the previous occupant held.
     pub fn add_input(&mut self, id: impl Into<String>) -> RoutePoint {
-        let index = self.inputs.len();
-        self.inputs.push(InputStrip {
+        let strip = InputStrip {
             id: id.into(),
             program_gain: 1.0,
             routed_to_program: false,
             latest: None,
             gain_ramp: None,
-        });
-        RoutePoint::input(index)
+        };
+        // Reuse a reclaimed slot when one is free; its generation was already
+        // bumped on removal, so the new handle is distinct from the freed one.
+        if let Some(index) = self.free.pop() {
+            let generation = self.generations.get(index).copied();
+            if let (Some(slot), Some(generation)) = (self.slots.get_mut(index), generation) {
+                *slot = Some(strip);
+                return RoutePoint::at(index, generation);
+            }
+        }
+        let index = self.slots.len();
+        self.slots.push(Some(strip));
+        self.generations.push(0);
+        RoutePoint::at(index, 0)
+    }
+
+    /// Reclaim an input strip's slot (the inverse of [`add_input`](Self::add_input)):
+    /// drop the strip, bump the slot's generation so the handle just retired is
+    /// now stale, and park the slot on the free-list for reuse. Returns whether a
+    /// strip was actually removed.
+    ///
+    /// A no-op returning `false` for an unknown or already-reclaimed handle — an
+    /// out-of-range index, a **stale generation** (the slot was reclaimed, and
+    /// possibly reused, since the handle was issued), or an empty slot — so it is
+    /// never a panic, never a double-free, and never frees the wrong (reused)
+    /// slot. This is how a completed cross-fade returns its outgoing strip so the
+    /// mixer's strip storage stays bounded (invariant #9).
+    ///
+    /// The generation is 64-bit and is never allowed to wrap: if a slot reaches
+    /// `u64::MAX` after 2⁶⁴ occupancies it becomes a permanent empty tombstone
+    /// rather than re-entering the free-list, preserving the stale-handle
+    /// guarantee without ABA even at counter exhaustion.
+    pub fn remove_input(&mut self, point: RoutePoint) -> bool {
+        let Some(generation) = self.generations.get_mut(point.index()) else {
+            return false;
+        };
+        let Some(slot) = self.slots.get_mut(point.index()) else {
+            return false;
+        };
+        if *generation != point.generation || slot.is_none() {
+            return false;
+        }
+        *slot = None;
+        if let Some(next_generation) = generation.checked_add(1) {
+            *generation = next_generation;
+            self.free.push(point.index());
+        }
+        true
+    }
+
+    /// The occupied strip a live [`RoutePoint`] names, if any. Returns `None` for
+    /// an out-of-range index, a **stale generation** (the slot was reclaimed and
+    /// possibly reused since the handle was issued), or an empty slot — so a stale
+    /// handle can never read a reused slot's occupant.
+    fn strip(&self, point: RoutePoint) -> Option<&InputStrip> {
+        if self.generations.get(point.index()).copied()? != point.generation {
+            return None;
+        }
+        self.slots.get(point.index())?.as_ref()
+    }
+
+    /// Mutable peer of [`strip`](Self::strip); same generation guard.
+    fn strip_mut(&mut self, point: RoutePoint) -> Option<&mut InputStrip> {
+        if self.generations.get(point.index()).copied()? != point.generation {
+            return None;
+        }
+        self.slots.get_mut(point.index())?.as_mut()
     }
 
     /// Route an input to the program bus at linear `gain`. Calling again
     /// updates the gain. A no-op (but not an error) for an unknown input — use
     /// only handles returned by [`Mixer::add_input`].
     pub fn route_to_program(&mut self, point: RoutePoint, gain: f64) {
-        if let Some(strip) = self.inputs.get_mut(point.index()) {
+        if let Some(strip) = self.strip_mut(point) {
             strip.program_gain = gain;
             strip.routed_to_program = true;
         }
@@ -214,7 +356,7 @@ impl Mixer {
 
     /// Remove an input from the program bus (its discrete track remains).
     pub fn unroute_from_program(&mut self, point: RoutePoint) {
-        if let Some(strip) = self.inputs.get_mut(point.index()) {
+        if let Some(strip) = self.strip_mut(point) {
             strip.routed_to_program = false;
         }
     }
@@ -226,7 +368,7 @@ impl Mixer {
     /// input. Pass a fresh ramp (`frames_done == 0`); calling again replaces any
     /// in-flight ramp.
     pub fn set_gain_ramp(&mut self, point: RoutePoint, ramp: GainRamp) {
-        if let Some(strip) = self.inputs.get_mut(point.index()) {
+        if let Some(strip) = self.strip_mut(point) {
             strip.gain_ramp = Some(ramp);
         }
     }
@@ -234,16 +376,16 @@ impl Mixer {
     /// Drop any in-flight [`GainRamp`] on an input (the strip returns to its
     /// steady `program_gain`). A no-op for an unknown input.
     pub fn clear_gain_ramp(&mut self, point: RoutePoint) {
-        if let Some(strip) = self.inputs.get_mut(point.index()) {
+        if let Some(strip) = self.strip_mut(point) {
             strip.gain_ramp = None;
         }
     }
 
     /// The in-flight [`GainRamp`] on an input, if any (primarily for the program
-    /// bus to detect completion and unroute the faded-out strip).
+    /// bus to detect completion and reclaim the faded-out strip).
     #[must_use]
     pub fn gain_ramp(&self, point: RoutePoint) -> Option<GainRamp> {
-        self.inputs.get(point.index())?.gain_ramp
+        self.strip(point)?.gain_ramp
     }
 
     /// Advance every in-flight ramp by `frames` (one tick's sample budget),
@@ -252,7 +394,7 @@ impl Mixer {
     /// [`mix_program`](Self::mix_program) has consumed the pre-advance envelope
     /// position for this tick.
     pub fn advance_ramps(&mut self, frames: usize) {
-        for strip in &mut self.inputs {
+        for strip in self.slots.iter_mut().filter_map(|slot| slot.as_mut()) {
             if let Some(ramp) = strip.gain_ramp.as_mut() {
                 ramp.frames_done = ramp.frames_done.saturating_add(frames);
                 if ramp.is_complete() {
@@ -282,8 +424,7 @@ impl Mixer {
             });
         }
         let strip = self
-            .inputs
-            .get_mut(point.index())
+            .strip_mut(point)
             .ok_or(AudioError::UnknownInput(point.index()))?;
         strip.latest = Some(block);
         Ok(())
@@ -293,13 +434,13 @@ impl Mixer {
     /// if the input is unknown or has not submitted a block.
     #[must_use]
     pub fn discrete_track(&self, point: RoutePoint) -> Option<&AudioBlock> {
-        self.inputs.get(point.index())?.latest.as_ref()
+        self.strip(point)?.latest.as_ref()
     }
 
     /// The identifier of an input, if known.
     #[must_use]
     pub fn input_id(&self, point: RoutePoint) -> Option<&str> {
-        self.inputs.get(point.index()).map(|s| s.id.as_str())
+        self.strip(point).map(|s| s.id.as_str())
     }
 
     /// The current steady program-route gain of an input, if known (the base the
@@ -307,7 +448,7 @@ impl Mixer {
     /// unknown input.
     #[must_use]
     pub fn program_gain(&self, point: RoutePoint) -> Option<f64> {
-        self.inputs.get(point.index()).map(|s| s.program_gain)
+        self.strip(point).map(|s| s.program_gain)
     }
 
     /// Mix all program-routed inputs into the program bus for this tick.
@@ -334,8 +475,9 @@ impl Mixer {
         }
         // Longest routed-and-submitted block sets the bus length.
         let frames = self
-            .inputs
+            .slots
             .iter()
+            .filter_map(|slot| slot.as_ref())
             .filter(|s| s.routed_to_program)
             .filter_map(|s| s.latest.as_ref())
             .map(AudioBlock::frame_count)
@@ -343,7 +485,12 @@ impl Mixer {
             .unwrap_or(0);
 
         let mut acc = vec![0.0f64; frames.saturating_mul(channels)];
-        for strip in self.inputs.iter().filter(|s| s.routed_to_program) {
+        for strip in self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter(|s| s.routed_to_program)
+        {
             let Some(block) = strip.latest.as_ref() else {
                 continue; // dropout => contributes silence
             };

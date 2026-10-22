@@ -17,11 +17,13 @@ mod support;
 
 use std::sync::Arc;
 
+use multiview_control::command::MediaTransportVerb;
 use multiview_control::realtime::{CorrKey, CorrRegistry};
 use multiview_control::{AppState, Command, OperationId, SessionStream};
 use multiview_engine::EnginePublisher;
 use multiview_events::{
-    Alert, AlertSeverity, Event, OutputRunState, OutputStatus, SalvoEvent, SalvoPhase,
+    Alert, AlertSeverity, Event, MediaPlayerEvent, MediaPlayerState, OutputRunState, OutputStatus,
+    SalvoEvent, SalvoPhase,
 };
 use serde_json::json;
 use support::{body_json, post_json, seeded_keys, send, OPERATOR_TOKEN};
@@ -80,6 +82,84 @@ async fn salvo_take_outcome_carries_corr() {
         delta.envelope.corr.as_deref(),
         Some(op.as_str()),
         "the outcome envelope must echo the accepted op id as corr"
+    );
+}
+
+/// A media-exit arm's outcome envelope carries the same `corr` the arm was
+/// accepted with: `CorrKey::MediaPlayer` is recorded under the armed-vamp state
+/// at 202 time, and the `media.player_state` outcome event projects to the same
+/// key (ADR-0097 §6, ADR-RT008) — the salvo correlation discipline for players.
+#[tokio::test]
+async fn media_exit_arm_outcome_carries_corr() {
+    let engine: Arc<Publisher> = Arc::new(EnginePublisher::new(64));
+    let registry = Arc::new(CorrRegistry::new(64));
+
+    let op = OperationId::new();
+    let command = Command::ArmMediaExit {
+        op: op.clone(),
+        player: "vt-1".to_owned(),
+    };
+    let key = CorrKey::for_command(&command).expect("an arm-exit command has an outcome key");
+    registry.record(key, op.clone());
+
+    let sub = engine.subscribe();
+    let mut session = SessionStream::new(sub, "sess-corr-media", None).with_corr_registry(registry);
+
+    // The engine arms the exit and publishes the player's lifecycle transition.
+    engine.publish_event(Event::MediaPlayerState(MediaPlayerEvent::new(
+        "vt-1",
+        MediaPlayerState::Vamping { exit_armed: true },
+        240,
+    )));
+
+    let delta = session
+        .next_delta()
+        .await
+        .unwrap()
+        .expect("the media-player outcome is delivered");
+    assert!(
+        matches!(
+            &delta.envelope.payload,
+            Event::MediaPlayerState(e)
+                if e.player == "vt-1"
+                    && e.state == MediaPlayerState::Vamping { exit_armed: true }
+        ),
+        "expected the armed-vamp MediaPlayerState outcome, got {:?}",
+        delta.envelope.payload
+    );
+    assert_eq!(
+        delta.envelope.corr.as_deref(),
+        Some(op.as_str()),
+        "the outcome envelope must echo the accepted op id as corr"
+    );
+}
+
+/// A `play` transport command correlates its `Playing` outcome; a `seek`
+/// command is intentionally uncorrelated (no single unambiguous outcome).
+#[tokio::test]
+async fn transport_play_correlates_but_seek_does_not() {
+    let play = Command::MediaTransport {
+        op: OperationId::new(),
+        player: "vt-1".to_owned(),
+        verb: MediaTransportVerb::Play,
+    };
+    assert_eq!(
+        CorrKey::for_command(&play),
+        Some(CorrKey::MediaPlayer {
+            player: "vt-1".to_owned(),
+            state: MediaPlayerState::Playing,
+        })
+    );
+
+    let seek = Command::MediaTransport {
+        op: OperationId::new(),
+        player: "vt-1".to_owned(),
+        verb: MediaTransportVerb::Seek { frame: Some(48) },
+    };
+    assert_eq!(
+        CorrKey::for_command(&seek),
+        None,
+        "a seek has no single unambiguous outcome state to correlate"
     );
 }
 

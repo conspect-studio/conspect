@@ -41,14 +41,15 @@ pub mod topic;
 pub use envelope::{Envelope, FrameKind, SchemaVersion};
 pub use error::{Error, Result};
 pub use event::{
-    AchievedSync, AddressFamily, AlarmTransition, Alert, AlertSeverity, AudioMeter, ClockQuality,
-    ClockSource, DeviceAdopted, DeviceCapabilities, DeviceDiscovered, DeviceError, DeviceMode,
-    DeviceRemoved, DeviceState, DeviceStatus, DeviceStreamRole, DeviceStreamStatus, DeviceSync,
-    DeviceSyncSummary, Event, GpuMetrics, GpuVendor, HealthWarning, ImpactClass, InputConnection,
-    InputStreams, JobProgress, LifecycleState, ModePhase, OutputRunState, OutputStatus, SalvoEvent,
-    SalvoPhase, ShedLoad, ShedReason, ShedScope, SyncCapability, SyncChange, SyncGroupSkew,
-    SystemMetrics, TallyEvent, TallyTarget, TileSnapshotEntry, TileState, TilesSnapshot,
-    TimingStatus, WarningCode, WarningSeverity,
+    AchievedSync, AddressFamily, AlarmTransition, Alert, AlertSeverity, AudioLoudness, AudioMeter,
+    AuthzScope, CastSessionRemoved, CastSessionStarted, ClockQuality, ClockSource, DeviceAdopted,
+    DeviceCapabilities, DeviceDiscovered, DeviceError, DeviceMode, DeviceRemoved, DeviceState,
+    DeviceStatus, DeviceStreamRole, DeviceStreamStatus, DeviceSync, DeviceSyncSummary, Event,
+    GpuMetrics, GpuVendor, HealthWarning, ImpactClass, InputConnection, InputStreams, JobProgress,
+    LifecycleState, MediaPlayerEvent, MediaPlayerState, ModePhase, OutputRunState, OutputStatus,
+    RistLinkRole, RistLinkStats, SalvoEvent, SalvoPhase, ShedLoad, ShedReason, ShedScope,
+    SyncCapability, SyncChange, SyncGroupSkew, SystemMetrics, TallyEvent, TallyTarget,
+    TileSnapshotEntry, TileState, TilesSnapshot, TimingStatus, WarningCode, WarningSeverity,
 };
 pub use ordering::{Accepted, TopicCursor};
 pub use seq::{Seq, SeqCounter};

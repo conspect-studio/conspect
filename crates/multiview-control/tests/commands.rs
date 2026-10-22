@@ -14,7 +14,8 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use serde_json::json;
 use support::{
-    body_json, harness, harness_with_capacity, post_json, send, OPERATOR_TOKEN, VIEWER_TOKEN,
+    body_json, harness, harness_with_capacity, post_json, send, OPERATOR_TOKEN, SCOPED_TOKEN,
+    VIEWER_TOKEN,
 };
 
 #[tokio::test]
@@ -222,5 +223,54 @@ async fn viewer_may_not_issue_commands() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "a viewer is read-only and cannot start output"
+    );
+}
+
+// ---- SEC-09 (BOLA, ADR-W005): a swap authorizes the SOURCE, not just the tile --
+//
+// `cmd_swap` authorized only the destination tile, so a scoped operator could
+// pull an out-of-scope source's content onto an in-scope tile. Pin per-object
+// authz on the source input id too, with zero command side effect on denial.
+
+#[tokio::test]
+async fn swap_denied_when_source_is_out_of_object_scope() {
+    let mut h = harness();
+    // scoped-key is object-scoped to "scoped-layout": the tile is in scope, the
+    // source "studio-b" is not.
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/commands/swap",
+            SCOPED_TOKEN,
+            &json!({ "tile": "scoped-layout", "source": "studio-b" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["type"], "/problems/forbidden");
+    // ZERO side effect: no swap command reached the engine.
+    assert!(
+        h.commands.try_drain().is_empty(),
+        "a denied swap must not enqueue a command"
+    );
+}
+
+#[tokio::test]
+async fn swap_allowed_when_tile_and_source_are_both_in_scope() {
+    let mut h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/commands/swap",
+            SCOPED_TOKEN,
+            &json!({ "tile": "scoped-layout", "source": "scoped-layout" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        h.commands.try_drain().len(),
+        1,
+        "an in-scope swap reaches the engine"
     );
 }

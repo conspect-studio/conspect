@@ -445,3 +445,58 @@ Established, standards-based multiviewer capabilities layered on the core produc
 - **M5:** Safe-area / title-safe / action-safe / center-cross marker overlay (SMPTE ST 2046-1: 93%/90% of the Production Aperture; cite ST 2046-1 not RP 2046-2 for the percentages); Analog-face clocks + multiple styles + multi-timezone + NTP/PTP source selection with lock/ref-loss status; Extract embedded source timecode (ATC/RP-188/VITC/LTC) for per-tile display vs generated TC; Per-input HDR-format detect/override (PQ/HLG/S-Log3) + correct mixed HDR/SDR compositing (BT.2446)
 - **M6:** Finer RBAC scoping (admin/read-only/output-scoped roles) + change audit log + config versioning; OAuth2/JWT auth option (aligned to NMOS IS-10 where NMOS is adopted)
 - **M9:** Formalize HA model: active/standby + N+1 engine instances with heartbeat health-check + automatic output failover + state replication
+
+---
+
+## Production switcher milestone (M13)
+
+The live **production-switcher layer**, designed docs-first (2026-06-11) in the
+[production-switcher](research/production-switcher.md) and [media-playout](research/media-playout.md)
+briefs and decisions [ADR-0054](decisions/ADR-0054.md)…[ADR-0059](decisions/ADR-0059.md) +
+[ADR-M012](decisions/ADR-M012.md)/[ADR-RT008](decisions/ADR-RT008.md)/[ADR-W021](decisions/ADR-W021.md)/
+[ADR-P007](decisions/ADR-P007.md)/[ADR-T015](decisions/ADR-T015.md)/[ADR-C007](decisions/ADR-C007.md)/
+[ADR-MV006](decisions/ADR-MV006.md)/[ADR-R011](decisions/ADR-R011.md) *(all Proposed)*; `SW-*` backlog
+in [development/production-switcher-backlog.md](development/production-switcher-backlog.md). All
+vocabulary is generic industry terminology; external references are open/published documents only.
+
+**Honest sequencing.** M13 builds on the M1–M8 core (output clock + compositor drive, framestores,
+audio program bus, control plane + SPA) and **overlaps M10–M12 rather than following them**: its
+internally-derived tally feeds the same arbiter M11 wires for external TSL/IS-07 facts
+([ADR-MV006](decisions/ADR-MV006.md)), and nothing in it depends on M12. It is listed after M12 only
+to avoid renumbering existing milestones.
+
+### M13 — Production switcher
+
+**Focus:** M/E (mix/effects) stages **inside one program** — PGM and PVW are two scene states
+composed against the *same* output-clock tick (a transition needs both scenes in one composite;
+mix math is impossible across encoded streams), with a pure switcher state machine at the
+frame-boundary control seam and a per-tick render-plan resolver
+([ADR-0054](decisions/ADR-0054.md)); transitions (cut/mix/dip/FTB first; wipes/DVE/stinger later)
+whose progress is an exact-rational pure function of the tick index with **integer-frame
+durations** ([ADR-0055](decisions/ADR-0055.md), [ADR-T015](decisions/ADR-T015.md)); upstream/
+downstream keyers + fade-to-black as on-clock render-plan stages with pinned color law
+([ADR-0056](decisions/ADR-0056.md), [ADR-C007](decisions/ADR-C007.md)); a media library + media
+players extending the production file-ingest path, with an NV12+A alpha payload for keyed media
+([ADR-0057](decisions/ADR-0057.md), [ADR-0058](decisions/ADR-0058.md)); switcher audio —
+audio-follow-video, master gain/FTB fade, gain-preserving mute, live meters
+([ADR-0059](decisions/ADR-0059.md)); internally-derived tally merged with external facts in the
+one arbiter ([ADR-MV006](decisions/ADR-MV006.md)); preview bus + cue/pre-warm as one mechanism
+([ADR-P007](decisions/ADR-P007.md)); config/resource model, realtime topic and REST/SPA operator
+surface ([ADR-M012](decisions/ADR-M012.md), [ADR-RT008](decisions/ADR-RT008.md),
+[ADR-W021](decisions/ADR-W021.md)); resilience policies + chaos gates for every new seam
+([ADR-R011](decisions/ADR-R011.md)).
+
+**Exit criteria (MVP = one M/E, designed for N):**
+- [ ] PGM/PVW switching with cut, auto (mix + dip + FTB) and T-bar; takes are frame-aligned; flip-flop works; transition progress is reproducible under a deterministic time source.
+- [ ] The output-validity probe stays green through every switcher operation and through source death **mid-transition** (each side holds last-good + slate; completion lands on schedule — invariants #1/#2/#10, chaos-gated).
+- [ ] Audio follows video pop-free (equal-power crossfade spanning exactly the transition window), FTB fades audio with the master gain stage, and live meters stream conflated at ~30 Hz.
+- [ ] 2 downstream keyers key alpha stills (linear/luma) via the NV12+A path; FTB composites after the DSKs; the clean (pre-DSK) program tap exists.
+- [ ] Media library imports validate-or-transcode (HEVC-with-alpha never silently accepted); 2 players cue (prime-gated), loop, hold-on-EOF and roll-on-take.
+- [ ] Derived red/green tally flows from bus state through the tally arbiter (merged with external facts) to multiview borders and the API.
+- [ ] The switcher REST surface ships plan/take classification, idempotency and correlatable operation outcomes; lifecycle events are lossless on the `switcher` topic with conflated progress/meter lanes (tally stays on the existing lossless `tally.state` lane — edge-triggered, never conflated); the SPA panel is fully keyboard-operable with no-color-alone bus state.
+- [ ] Macros (command sequences with frame/ms waits, control-plane-side) and memories (salvo recall-scope extension) replay onto the same engine intents as live commands.
+
+**Post-MVP:** wipes (SDF masks), DVE push/squeeze, stinger transitions (alpha media), chroma/
+pattern keyers, aux buses via the output←program crosspoint, preview-transition, multi-M/E,
+WHEP bus monitors, external control-surface module + OSC namespace + MIDI surface adapter,
+TSL egress, GPI/GPO (NMOS IS-07 first), ISO-recording tie-in.

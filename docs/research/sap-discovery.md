@@ -60,8 +60,8 @@ MC-4) — SAP **depends** on them, it does not re-solve them.
 
 Two narrow SDP parsers exist **to generalize**: `nmos/is05.rs:340` `parse_sdp_transport` (`c=` +
 `m=video <port> RTP/AVP <fmt>` + `a=source-filter` only — no `m=audio`, no `rtpmap`, no generator;
-its doc-comment says "not a full RFC 8866 SDP implementation"); and `webrtc/sdp.rs:138` `RtpMap`
-(PT/name/clock/channels) + `MediaDescription` (WebRTC/SAVPF-shaped). The **NMOS IS-04/IS-05** node
+its doc-comment says "not a full RFC 8866 SDP implementation"); and `st2110/sdp.rs`'s `parse_rtpmap`
+(the AES67 `a=rtpmap` parser — PT/name/clock/channels). The **NMOS IS-04/IS-05** node
 (`nmos/mod.rs` `NmosRegistry`) is the richer, trustworthy **parallel** discovery already built. The
 wait-free publish primitive `LatestState`/`ArcSwapOption` (`isolation.rs`) and the drop-oldest
 `Event::HealthWarningRaised` path are reusable.
@@ -165,8 +165,8 @@ MP2T/90000 is static** (RFC 3551), so the `rtpmap` is redundant — a robust rec
 **even when `a=rtpmap` is absent**.
 
 This model **generalizes** the two narrow parsers: `nmos/is05.rs:340` (video-only; IS-05
-`transport_file` delegates here) and the `webrtc/sdp.rs:138` `RtpMap` pattern (promoted into the
-shared model). It carries the AES67 audio-profile extras (`ts-refclk`/`mediaclk`/`ptime`) as
+`transport_file` delegates here) and `st2110/sdp.rs`'s `parse_rtpmap` `a=rtpmap` pattern (promoted
+into the shared model). It carries the AES67 audio-profile extras (`ts-refclk`/`mediaclk`/`ptime`) as
 **typed-but-optional** attributes the audio profile validates.
 
 ---
@@ -325,6 +325,6 @@ All tests are NIC-free or use loopback multicast on `lo` — no AES67/Dante hard
 - **In-repo:** [multicast-transport](multicast-transport.md) + [ADR-0040](../decisions/ADR-0040.md)
   (the media path + MC-3/MC-4 deps), [aes67-delivery](aes67-delivery.md) §6/§6.1/§7 +
   [aes67-backlog](../development/aes67-backlog.md) AES67-4/-5/-6/-13 + [ADR-0033](../decisions/ADR-0033.md)
-  (the AES67 plan this unifies), `conventions.md` §5 (invariants); `is05.rs:340`, `webrtc/sdp.rs:138`,
+  (the AES67 plan this unifies), `conventions.md` §5 (invariants); `is05.rs:340`, `st2110/sdp.rs` `parse_rtpmap`,
   `transport.rs:149/171/297/410`, `isolation.rs`, `schema.rs:213/531`, `sink.rs:1028`,
   `pipeline.rs:3203/3544/4275`, `event.rs:284/307`.

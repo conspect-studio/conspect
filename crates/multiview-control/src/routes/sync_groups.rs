@@ -63,11 +63,20 @@ pub(crate) async fn list_sync_groups(
     principal: Principal,
 ) -> ControlResult<Json<Vec<Resource>>> {
     principal.role.require(Action::Read)?;
+    // Per-object ROW visibility (BOLA, ADR-W005/ADR-W025): a sync group is gated
+    // by its OWN id (`get_sync_group` 403s an out-of-scope id), so the list must
+    // drop rows outside the allowlist. THEN redact an out-of-scope member device
+    // id on a surviving in-scope row. Both are no-ops for an unscoped principal.
     let groups = state
         .sync_groups
         .list()?
         .into_iter()
-        .map(|v| v.resource)
+        .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
+        .map(|v| {
+            let mut resource = v.resource;
+            crate::routes::redact_out_of_scope_device_refs(&principal, &mut resource);
+            resource
+        })
         .collect();
     Ok(Json(groups))
 }
@@ -95,7 +104,11 @@ pub(crate) async fn get_sync_group(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.sync_groups.get(&id)?;
+    let mut versioned = state.sync_groups.get(&id)?;
+    // Redact out-of-scope member device ids (BOLA visibility, ADR-W005/ADR-W025):
+    // the group itself is in scope (authorized above), but its members must not
+    // leak device ids the principal could not `GET`. No-op when unscoped.
+    crate::routes::redact_out_of_scope_device_refs(&principal, &mut versioned.resource);
     Ok(group_response(StatusCode::OK, &versioned))
 }
 

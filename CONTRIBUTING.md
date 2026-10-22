@@ -306,17 +306,22 @@ We use [Conventional Commits](https://www.conventionalcommits.org):
 
 ### Pull requests
 
-A PR is ready to review when:
+**Gates scale with blast radius.** Run `scripts/classify.sh` — it prints the change's class
+(R0–R3) and exactly which gates that class owes. The full contract, including the evidence rules
+and the review model, is [`docs/standards/engineering.md`](docs/standards/engineering.md); this
+section does not restate it, so the two can never drift apart.
 
-- [ ] `cargo fmt --all -- --check` is clean.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
-- [ ] `cargo test --workspace` passes (default features at minimum).
-- [ ] `cargo deny check` passes.
+Whatever the class, a PR is ready when:
+
+- [ ] Every gate the classifier printed for this change is met, with evidence (command + output).
 - [ ] New public items are documented; new behaviour has tests.
 - [ ] The default (GPU-free) build still compiles and runs the software pipeline.
 - [ ] Relevant invariants ([conventions §5](docs/architecture/conventions.md)) are
  respected, or you've opened an ADR to change one.
-- [ ] All commits are DCO-signed.
+- [ ] All commits are DCO-signed (see [DCO](#developer-certificate-of-origin-dco) below).
+
+`cargo fmt`, `clippy`, `cargo test` and `cargo deny` are proven mechanically by CI on every code
+PR — you do not need to attest to them, but CI must be green before merge.
 
 Keep PRs scoped and reviewable. If a change alters a load-bearing decision, link (or add)
 the relevant ADR.
@@ -438,8 +443,11 @@ The easy way is `-s`:
 git commit -s -m "feat(compositor): add cover/crop fit modes"
 ```
 
-Unsigned commits will be flagged in CI and must be amended (`git commit --amend -s`) or
-rebased with sign-offs before merge.
+Unsigned commits must be amended (`git commit --amend -s`) or rebased with sign-offs before
+merge. **Note:** there is currently **no automated DCO check** in `.github/workflows/` — the
+sign-off requirement is real and binding, but it is enforced by review, not by a gate. Wiring a
+DCO check is tracked as a gap in
+[`docs/standards/engineering.md`](docs/standards/engineering.md) Part C.
 
 ---
 

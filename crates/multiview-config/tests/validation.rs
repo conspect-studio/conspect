@@ -197,6 +197,39 @@ fn control_listener_unparseable_addr_is_rejected() {
 }
 
 #[test]
+fn control_device_dial_allow_valid_cidrs_are_accepted() {
+    // The SSRF dial allowlist (ADR-M013): a list of CIDRs (IPv6-first) an
+    // operator locks the outbound device dial to. Valid entries validate.
+    let doc = format!(
+        "{BASE}\n[control]\nlisten = \"[::]:8080\"\n\
+         device_dial_allow = [\"192.168.0.0/16\", \"fd00:db8::/32\", \"10.5.0.7\"]\n"
+    );
+    let cfg = MultiviewConfig::load_from_toml(&doc).unwrap();
+    cfg.validate()
+        .expect("a control.device_dial_allow of valid CIDRs must validate");
+}
+
+#[test]
+fn control_device_dial_allow_malformed_cidr_is_rejected() {
+    // A typo in the allowlist must fail at config-validation time (fail-closed),
+    // not be silently ignored (which would leave the dial screen wider than the
+    // operator intended). Proves the field is deserialized AND validated: an
+    // ignored/unwired field would never see the bad CIDR.
+    let doc = format!(
+        "{BASE}\n[control]\nlisten = \"[::]:8080\"\n\
+         device_dial_allow = [\"192.168.0.0/16\", \"not-a-cidr\"]\n"
+    );
+    let cfg = MultiviewConfig::load_from_toml(&doc).unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("a malformed control.device_dial_allow entry must fail validation");
+    assert!(
+        err.to_string().contains("device_dial_allow"),
+        "error should name device_dial_allow, got: {err}"
+    );
+}
+
+#[test]
 fn malformed_fps_string_is_rejected() {
     let bad = BASE.replace(r#"fps = "30000/1001""#, r#"fps = "not-a-ratio""#);
     assert!(

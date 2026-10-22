@@ -277,10 +277,13 @@ fn normalize_layout(layout: ChannelLayout, channels: u16) -> ChannelLayout {
 /// channel count first, so the underlying plane access cannot trip libav's
 /// out-of-bounds / wrong-type guards (no panic on the decode path, CLAUDE.md §7).
 ///
+/// Crate-internal: shared with the packet-fed [`OpusDecoder`](crate::opus::OpusDecoder)
+/// (ADR-T014 §5), which emits the same [`AudioSamplesF32`] block shape.
+///
 /// # Errors
 /// Returns [`FfmpegError::FrameMismatch`] if the frame is not planar `f32` or
 /// its plane count disagrees with `channels`.
-fn interleave_fltp(frame: &Audio, channels: u16) -> Result<Vec<f32>> {
+pub(crate) fn interleave_fltp(frame: &Audio, channels: u16) -> Result<Vec<f32>> {
     if frame.format() != Sample::F32(SampleType::Planar) {
         return Err(FfmpegError::FrameMismatch(
             "resampled frame is not planar f32 (FLTP)",

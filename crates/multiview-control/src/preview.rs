@@ -116,7 +116,7 @@ pub enum WhepReject {
     /// The concurrent-focus cap is hit or no preview-encode budget is available,
     /// so the focus is shed with a `fallback` transport hint (`503`).
     CapacityExceeded {
-        /// The transport the client should fall back to (e.g. `"ws-jpeg"`,
+        /// The transport the client should fall back to (e.g. `"jpeg"`,
         /// `"llhls"`), surfaced in the problem body so the UI degrades honestly.
         fallback: String,
     },
@@ -162,6 +162,110 @@ pub trait WhepProvider: Send + Sync {
     ///
     /// Best-effort and preview-only; never reflects engine state.
     fn active_sessions(&self) -> usize;
+
+    /// Whether this build can actually serve WHEP (a native ICE/DTLS/SRTP
+    /// transport is wired). The `GET /api/v1/preview/capabilities` endpoint
+    /// surfaces this so the SPA picks its transport (WHEP → JPEG ladder, ADR-W020)
+    /// **before** issuing an offer (ADR-P006 move 6). The default is `false`: a
+    /// negotiation-only / pure build advertises no WebRTC and the SPA stays on the
+    /// always-available JPEG ladder.
+    fn webrtc_available(&self) -> bool {
+        false
+    }
+
+    /// The fidelity label the **program** WHEP scope would carry (ADR-P005/P006).
+    ///
+    /// `RealEncodedOutput` when the program rendition itself is WebRTC-compatible
+    /// (H.264, B-frame-free) and the focus is fed the real encoded bitstream via
+    /// the fan-out tap; otherwise the canvas-approx path
+    /// ([`ProgramFidelity::PreEncodeCanvasApprox`]). The default is the
+    /// canvas-approx path — the always-available program focus shape.
+    fn program_fidelity(&self) -> ProgramFidelity {
+        ProgramFidelity::PreEncodeCanvasApprox
+    }
+}
+
+/// The fidelity a **program** WHEP focus would carry (ADR-P005/P006). Serialized
+/// in the capabilities response so the SPA can label the program preview before
+/// it opens one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ProgramFidelity {
+    /// The program focus is fed the real encoded program bitstream (a fan-out tap
+    /// of a WebRTC-compatible rendition).
+    RealEncodedOutput,
+    /// The program focus is the pre-encode canvas downscale (the default,
+    /// always-available program focus shape).
+    PreEncodeCanvasApprox,
+}
+
+/// Per-scope WHEP availability (plus the program scope's fidelity label).
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ScopeCapability {
+    /// Whether a WHEP focus can be opened on this scope.
+    pub whep: bool,
+    /// The program scope's fidelity label (only present for the program scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<ProgramFidelity>,
+}
+
+/// The per-scope capability map.
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ScopeCapabilities {
+    /// The composited program canvas scope.
+    pub program: ScopeCapability,
+    /// The per-input scope.
+    pub inputs: ScopeCapability,
+    /// The per-output rendition scope.
+    pub outputs: ScopeCapability,
+}
+
+/// The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
+/// transports this build can serve, so the SPA picks WHEP vs the JPEG ladder
+/// (ADR-W020) **before** issuing an offer.
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PreviewCapabilities {
+    /// Whether this build can serve WHEP/WebRTC at all (a native transport is
+    /// wired). `false` on a pure / negotiation-only build.
+    pub webrtc: bool,
+    /// Per-scope WHEP availability + the program fidelity label.
+    pub scopes: ScopeCapabilities,
+    /// The always-available fallback transport literal: `"jpeg"` (the one
+    /// fallback literal everywhere — ADR-P006 move 6).
+    pub fallback: String,
+}
+
+impl PreviewCapabilities {
+    /// Build the capabilities view from a [`WhepProvider`]. When WebRTC is
+    /// unavailable every scope advertises `whep: false`, so the SPA stays on the
+    /// JPEG ladder; `fallback` is always `"jpeg"`.
+    #[must_use]
+    pub fn from_provider(provider: &dyn WhepProvider) -> Self {
+        let webrtc = provider.webrtc_available();
+        Self {
+            webrtc,
+            scopes: ScopeCapabilities {
+                program: ScopeCapability {
+                    whep: webrtc,
+                    fidelity: Some(provider.program_fidelity()),
+                },
+                inputs: ScopeCapability {
+                    whep: webrtc,
+                    fidelity: None,
+                },
+                outputs: ScopeCapability {
+                    whep: webrtc,
+                    fidelity: None,
+                },
+            },
+            fallback: "jpeg".to_owned(),
+        }
+    }
 }
 
 /// The default WHEP provider used when the binary wires no focus transport (the
@@ -170,7 +274,7 @@ pub trait WhepProvider: Send + Sync {
 ///
 /// This keeps the routes present and authz-enforced even on a build without a
 /// WebRTC transport — a `View` token still gets `403` and a valid `Focus` offer
-/// gets an honest `503 fallback: ws-jpeg`, never a `404`/panic.
+/// gets an honest `503 fallback: jpeg`, never a `404`/panic.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoWhep;
 
@@ -179,7 +283,7 @@ impl WhepProvider for NoWhep {
         // No transport is wired: the focus cannot be served, so shed honestly to
         // the always-available JPEG transport rather than pretending success.
         Err(WhepReject::CapacityExceeded {
-            fallback: "ws-jpeg".to_owned(),
+            fallback: "jpeg".to_owned(),
         })
     }
 
@@ -219,7 +323,7 @@ use multiview_preview::focus::{FocusGate, FocusLease};
 /// * **Admission on `POST`.** [`Self::negotiate`] acquires a [`FocusLease`]
 ///   *before* delegating to the inner transport. When a cap is full the focus is
 ///   **rejected** with [`WhepReject::CapacityExceeded`] carrying the configured
-///   `fallback` transport hint (the existing `503 fallback: ws-jpeg` shape) — it
+///   `fallback` transport hint (the existing `503 fallback: jpeg` shape) — it
 ///   is never queued and never able to starve or stall the engine (invariant
 ///   #10). If the inner transport then refuses the (admitted) offer, the lease is
 ///   dropped so the slot is freed immediately.
@@ -236,7 +340,7 @@ pub struct GatedWhep {
     inner: SharedWhep,
     gate: FocusGate<String>,
     /// The transport the client should fall back to when a cap is full (the
-    /// honest `503` hint; e.g. `"ws-jpeg"`).
+    /// honest `503` hint; e.g. `"jpeg"`).
     fallback: String,
     /// Live focus leases keyed by the inner transport's `session_id`, so a
     /// `DELETE`/expiry frees exactly the right slot. The decorator's own state.
@@ -269,10 +373,10 @@ impl GatedWhep {
     }
 
     /// Wrap `inner` with conservative default caps ([`FocusCaps::default`] — one
-    /// focus server-wide and per scope) and the `ws-jpeg` fallback hint.
+    /// focus server-wide and per scope) and the `jpeg` fallback hint.
     #[must_use]
     pub fn with_defaults(inner: SharedWhep) -> Self {
-        Self::new(inner, FocusCaps::default(), "ws-jpeg")
+        Self::new(inner, FocusCaps::default(), "jpeg")
     }
 }
 
@@ -317,5 +421,11 @@ impl WhepProvider for GatedWhep {
 
     fn active_sessions(&self) -> usize {
         self.gate.active()
+    }
+
+    fn webrtc_available(&self) -> bool {
+        // The gate is a thin cap decorator; whether WebRTC can be served is the
+        // inner transport's truth.
+        self.inner.webrtc_available()
     }
 }

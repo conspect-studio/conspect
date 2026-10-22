@@ -86,6 +86,16 @@
         "summary": "An alert was raised (alert.raised) or cleared (alert.cleared) on topic `alerts`.",
         "title": "Operator alert raised or cleared"
       },
+      "AudioLoudness": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `audio.loudness` (AUD-8). A high-rate CONFLATED compliance lane (BS.1770-4 / EBU Tech 3341/3342, ADR-R006): the slow-cadence M/S/I/LRA/dBTP sample the loudness meter measures read-only off the audio bus, pushed at ~10 Hz and excluded from the lossless replay ring. A slow consumer can only lose its own samples — the engine never back-pressures (inv #10). BALLISTICS are applied client-side: the wire carries raw measured values; the browser meter applies the display decay/peak-hold. The compliance reference (`target_lufs`/`ceiling_dbtp`/`tolerance_lu`) rides every sample so the meter colours against the same target the program bus is normalised toward.",
+        "name": "AudioLoudness",
+        "payload": {
+          "$ref": "#/components/schemas/AudioLoudness"
+        },
+        "summary": "Momentary/short-term/integrated LUFS + LRA + true-peak (dBTP) + compliance reference (numeric only).",
+        "title": "Program-bus EBU R128 loudness sample"
+      },
       "AudioMeter": {
         "contentType": "application/json",
         "description": "Emitted on topic `audio.meters`. This is the sole high-rate conflated topic; frames are conflated/sampled at 10–30 Hz on the wire. A slow consumer can only lose its own meter frames — the engine never back-pressures. The binary fast-path (subprotocol `multiview.bin.v1`) carries the same fields in compact form; this schema describes the decoded (JSON) shape.",
@@ -95,6 +105,26 @@
         },
         "summary": "Per-input/track peak/RMS/clip meter sample (numeric only, never audio data).",
         "title": "High-rate audio meter sample"
+      },
+      "CastSessionRemoved": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `devices` with envelope `id` = session id when a session is stopped (`DELETE /api/v1/cast/sessions/{id}` — the receiver STOP that clears the TV) or promoted to a saved device (`POST /{id}/save` retires the ephemeral record while playback continues under the promoted device id).",
+        "name": "CastSessionRemoved",
+        "payload": {
+          "$ref": "#/components/schemas/CastSessionRemoved"
+        },
+        "summary": "An ad-hoc cast session was removed (cast.session.removed on topic `devices`; lossless lifecycle lane).",
+        "title": "Ephemeral cast session removed"
+      },
+      "CastSessionStarted": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `devices` with envelope `id` = session id when `POST /api/v1/cast/sessions` accepts a start (the runtime record exists and its supervised actor is spawned): the session-list MEMBERSHIP changed, so clients refresh the list immediately instead of waiting for a REST re-poll. The session's live state rides the conflated `device.status` lane keyed by the same session id.",
+        "name": "CastSessionStarted",
+        "payload": {
+          "$ref": "#/components/schemas/CastSessionStarted"
+        },
+        "summary": "An ad-hoc cast session was started (cast.session.started on topic `devices`; lossless lifecycle lane).",
+        "title": "Ephemeral cast session started"
       },
       "DeviceAdopted": {
         "contentType": "application/json",
@@ -185,6 +215,9 @@
                   "$ref": "#/components/schemas/AudioMeter"
                 },
                 {
+                  "$ref": "#/components/schemas/AudioLoudness"
+                },
+                {
                   "$ref": "#/components/schemas/OutputStatus"
                 },
                 {
@@ -212,6 +245,9 @@
                   "$ref": "#/components/schemas/SalvoEvent"
                 },
                 {
+                  "$ref": "#/components/schemas/MediaPlayerEvent"
+                },
+                {
                   "$ref": "#/components/schemas/DeviceStatus"
                 },
                 {
@@ -231,6 +267,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/DeviceDiscovered"
+                },
+                {
+                  "$ref": "#/components/schemas/CastSessionStarted"
+                },
+                {
+                  "$ref": "#/components/schemas/CastSessionRemoved"
                 },
                 {
                   "$ref": "#/components/schemas/TimingStatus"
@@ -297,7 +339,8 @@
                 "logs",
                 "jobs",
                 "preview",
-                "devices"
+                "devices",
+                "switcher"
               ],
               "type": "string"
             },
@@ -372,6 +415,16 @@
         },
         "summary": "Progress of a REST command job correlated by `corr` (topic `jobs`).",
         "title": "Long-running job progress"
+      },
+      "MediaPlayerEvent": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `switcher` with envelope `id` = player id. A LOSSLESS lifecycle event kept in the bounded replay ring (ADR-RT008): discrete transport-state changes (cued / playing / paused / stopped / vamping{exit_armed} / eof / loading) plus the playhead `position_frames`. It must never be conflated — a control surface reconstructs authoritative player history from it. Per-frame position is NOT streamed; clients interpolate `position_frames` between events at the output cadence.",
+        "name": "MediaPlayerEvent",
+        "payload": {
+          "$ref": "#/components/schemas/MediaPlayerEvent"
+        },
+        "summary": "A media player transitioned transport state (media.player_state on topic `switcher`).",
+        "title": "Media-player transport-state lifecycle"
       },
       "OutputStatus": {
         "contentType": "application/json",
@@ -525,6 +578,74 @@
         ],
         "type": "string"
       },
+      "AudioLoudness": {
+        "description": "Data body of the `audio.loudness` event: a program-bus EBU R128 loudness sample (M/S/I LUFS, LRA, true-peak dBTP) plus the compliance reference. Numeric metadata only — never audio content. Conflated/sampled at ~10 Hz on the wire (high-rate lane); ballistics are applied client-side. The integrating fields are absent below the -70 LUFS absolute gate (no fabricated value).",
+        "properties": {
+          "ceiling_dbtp": {
+            "description": "True-peak ceiling, dBTP (compliance reference, e.g. -1.5).",
+            "format": "float",
+            "type": "number"
+          },
+          "gain_db": {
+            "description": "Makeup gain the loudnorm processor is applying, dB. Absent when no normaliser is engaged.",
+            "format": "float",
+            "type": "number"
+          },
+          "integrated": {
+            "description": "Integrated (gated) loudness, LUFS. Absent until enough gated audio.",
+            "format": "float",
+            "type": "number"
+          },
+          "lra": {
+            "description": "Loudness range (EBU Tech 3342), LU. Absent until enough gated audio.",
+            "format": "float",
+            "type": "number"
+          },
+          "momentary": {
+            "description": "Momentary loudness (400 ms window), LUFS. Absent below the absolute gate.",
+            "format": "float",
+            "type": "number"
+          },
+          "program": {
+            "description": "Program/bus index this loudness sample is for.",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "sampled_hz": {
+            "description": "Effective wire cadence (Hz).",
+            "format": "uint32",
+            "type": "integer"
+          },
+          "short_term": {
+            "description": "Short-term loudness (3 s window), LUFS. Absent below the absolute gate.",
+            "format": "float",
+            "type": "number"
+          },
+          "target_lufs": {
+            "description": "Normalisation target loudness, LUFS (compliance reference, e.g. -23 / -16).",
+            "format": "float",
+            "type": "number"
+          },
+          "tolerance_lu": {
+            "description": "Live convergence tolerance, LU (the in-spec band is target ± tolerance).",
+            "format": "float",
+            "type": "number"
+          },
+          "true_peak_dbtp": {
+            "description": "Maximum true-peak across channels (4x oversampled), dBTP. Absent when disabled.",
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "program",
+          "target_lufs",
+          "ceiling_dbtp",
+          "tolerance_lu",
+          "sampled_hz"
+        ],
+        "type": "object"
+      },
       "AudioMeter": {
         "description": "Data body of the `audio.meter` event: a high-rate per-input/track peak/RMS/clip sample. This is numeric metadata only — never audio content. Conflated/sampled at 10–30 Hz on the wire (high-rate lane).",
         "properties": {
@@ -570,6 +691,46 @@
           "clip",
           "overflow",
           "sampled_hz"
+        ],
+        "type": "object"
+      },
+      "CastSessionRemoved": {
+        "description": "Data body of `cast.session.removed`: an ephemeral cast session was removed — stopped (the receiver STOP that clears the TV) or promoted to a saved device (playback continues under the promoted device id).",
+        "properties": {
+          "session_id": {
+            "description": "The runtime session id that was removed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "CastSessionStarted": {
+        "description": "Data body of `cast.session.started`: an ephemeral cast session was started (session-list membership changed). The session's live state rides the conflated `device.status` lane keyed by the same session id.",
+        "properties": {
+          "address": {
+            "description": "The device authority dialled (`host[:port]`, IPv6 bracketed).",
+            "type": "string"
+          },
+          "name": {
+            "description": "The operator-facing name, if given.",
+            "type": "string"
+          },
+          "output": {
+            "description": "The output id whose HLS rendition the session casts.",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The runtime session id (`cast-session-…`, UUID-fresh per start).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "address",
+          "output"
         ],
         "type": "object"
       },
@@ -642,6 +803,10 @@
         "properties": {
           "address": {
             "description": "The management endpoint (URL/host; IPv6 literals bracketed).",
+            "type": "string"
+          },
+          "domain": {
+            "description": "The discovery domain the observing node stamped on this row (ADR-W026), sourced solely from that node's operator-declared `[discovery] domain` config — never from the responder payload or TXT records. Absent when the observing node declared no domain; a discovery-scoped principal is then denied the row (fail-closed).",
             "type": "string"
           },
           "driver": {
@@ -1083,11 +1248,16 @@
             "format": "uint32",
             "type": "integer"
           },
+          "input_id": {
+            "description": "The owning input's id (the configured source id) — the object axis this lifecycle event is authorized under (ADR-W026).",
+            "type": "string"
+          },
           "state": {
             "$ref": "#/components/schemas/LifecycleState"
           }
         },
         "required": [
+          "input_id",
           "state"
         ],
         "type": "object"
@@ -1194,6 +1364,139 @@
         ],
         "type": "string"
       },
+      "MediaPlayerEvent": {
+        "description": "Data body of `media.player_state` (ADR-RT008): a media player's discrete transport-state transition, envelope `id` = player id. LOSSLESS — kept in the replay ring, never conflated. `position_frames` is the playhead in integer frames at the output cadence (never a float; clients interpolate between events).",
+        "properties": {
+          "asset": {
+            "description": "The asset currently loaded in the player, if any.",
+            "type": "string"
+          },
+          "player": {
+            "description": "Stable media-player id (matches the envelope `id`).",
+            "type": "string"
+          },
+          "position_frames": {
+            "description": "Playhead position at the transition, in integer frames at the output cadence.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MediaPlayerState"
+          }
+        },
+        "required": [
+          "player",
+          "state",
+          "position_frames"
+        ],
+        "type": "object"
+      },
+      "MediaPlayerState": {
+        "description": "A media player's discrete transport state (tagged by `kind`, never untagged). The `vamping` variant carries `exit_armed`: when set, the current vamp lap finishes then the player exits cleanly at the boundary. `#[non_exhaustive]`: a client must treat an unknown kind as forward-compatible, not an error.",
+        "discriminator": "kind",
+        "oneOf": [
+          {
+            "description": "Opening/decoding the asset toward the cue point; not yet primed.",
+            "properties": {
+              "kind": {
+                "const": "loading",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Asset loaded, in-point frame primed, holding paused — ready to take.",
+            "properties": {
+              "kind": {
+                "const": "cued",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Playing forward at the output cadence.",
+            "properties": {
+              "kind": {
+                "const": "playing",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Paused, holding the current frame.",
+            "properties": {
+              "kind": {
+                "const": "paused",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Stopped/idle; no asset rolling.",
+            "properties": {
+              "kind": {
+                "const": "stopped",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Looping a fill segment to hold until a cue (the VT vamp/exit feature).",
+            "properties": {
+              "exit_armed": {
+                "description": "Whether a clean exit is armed: finish the current lap, then leave the vamp at the boundary.",
+                "type": "boolean"
+              },
+              "kind": {
+                "const": "vamping",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "exit_armed"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Reached end-of-file with no loop/vamp engaged.",
+            "properties": {
+              "kind": {
+                "const": "eof",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ],
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
       "OutputRunState": {
         "description": "Running state of an output sink.",
         "enum": [
@@ -1284,11 +1587,12 @@
         "type": "object"
       },
       "ResyncReason": {
-        "description": "Why a $resync was issued.",
+        "description": "Why a $resync was issued (the client must rebuild, not merge). The first three are unrecoverable resume gaps; `authz_changed` is a mid-session authorization change (object scope narrowed/widened) on an intact connection (ADR-RT010).",
         "enum": [
           "seq_evicted",
           "unknown_session",
-          "session_expired"
+          "session_expired",
+          "authz_changed"
         ],
         "type": "string"
       },
@@ -1888,7 +2192,10 @@
       "WarningCode": {
         "description": "Stable catalog code of a health warning (kebab-case). `#[non_exhaustive]`: the catalog grows over time, so a client must treat an unknown code as a forward-compatible warning, not an error.",
         "enum": [
-          "gpu-present-no-vulkan-adapter"
+          "gpu-present-no-vulkan-adapter",
+          "config-file-invalid",
+          "config-file-requires-restart",
+          "config-file-apply-incomplete"
         ],
         "type": "string"
       },
@@ -1908,7 +2215,7 @@
       "name": "The Multiview Authors",
       "url": "https://github.com/aperim/multiview"
     },
-    "description": "WebSocket and SSE realtime event stream for the Multiview engine. Every message uses a single versioned envelope (ADR-RT002). Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, layout, config, logs, jobs, preview, system, capabilities, devices. The WebSocket endpoint (/api/v1/ws) is bidirectional (events + subscription control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
+    "description": "WebSocket and SSE realtime event stream for the Multiview engine. Every message uses a single versioned envelope (ADR-RT002). Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, layout, config, logs, jobs, preview, system, capabilities, devices, switcher. The WebSocket endpoint (/api/v1/ws) is bidirectional (events + subscription control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
     "externalDocs": {
       "description": "Realtime API reference",
       "url": "https://github.com/aperim/multiview/blob/main/docs/api/realtime.md"

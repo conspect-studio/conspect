@@ -21,6 +21,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::{MediaPlaylist, Segment, SegmentType};
+use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 
 /// The rolling live-playlist driver: a windowed [`MediaPlaylist`] plus the
@@ -49,6 +50,19 @@ pub struct LivePlaylist {
     /// the front. When the count exceeds `window` the front path is popped and
     /// the corresponding `.ts` file unlinked (best-effort) so disk stays bounded.
     seg_paths: VecDeque<PathBuf>,
+    /// The shared outbound presentation epoch (ADR-M010, DEV-C1). When set
+    /// **and** the cell carries an epoch, each closed segment is stamped with
+    /// `EXT-X-PROGRAM-DATE-TIME: epoch.wall_at(segment first PTS)` — the same
+    /// map the control WS publishes and RTCP SR stamps. `None` (or an empty
+    /// cell) ⇒ no PDT tags (behaviour identical to before this field).
+    epoch: Option<SharedEpoch>,
+    /// The epoch generation of the last segment close that saw an epoch
+    /// (`None` before the first). A **changed** generation means the sampler
+    /// stepped the map (a Class-2-like re-anchor, wall-clock-sync §3): the
+    /// first segment closed under the new map is marked
+    /// `EXT-X-DISCONTINUITY`. Hold/slew updates keep the generation, so they
+    /// mark nothing.
+    epoch_generation: Option<u64>,
 }
 
 impl LivePlaylist {
@@ -64,6 +78,8 @@ impl LivePlaylist {
             window,
             playlist,
             seg_paths: VecDeque::new(),
+            epoch: None,
+            epoch_generation: None,
         }
     }
 
@@ -73,14 +89,39 @@ impl LivePlaylist {
         &self.playlist_path
     }
 
+    /// Attach the shared outbound presentation epoch (ADR-M010): every
+    /// subsequently-closed segment is stamped with an
+    /// `EXT-X-PROGRAM-DATE-TIME` derived from `epoch.wall_at(start_pts)`.
+    /// Until the cell carries an epoch (the ~1 Hz sampler has not anchored
+    /// yet), segments are published without a PDT — never a fabricated wall
+    /// time.
+    pub fn set_epoch_source(&mut self, epoch: SharedEpoch) {
+        self.epoch = Some(epoch);
+    }
+
     /// Record one **closed** GOP-aligned segment: append it to the windowed
     /// playlist (`uri` referenced relative to the manifest, `duration` its
-    /// `EXTINF` seconds), recompute `EXT-X-TARGETDURATION`, and atomically
-    /// re-publish the manifest to disk. The segment's on-disk `path` is tracked so
-    /// that, once it ages out of the window, its `.ts` file is pruned.
+    /// `EXTINF` seconds, `start_pts_ns` the output PTS of its first sample on
+    /// the tick-derived internal timeline), recompute `EXT-X-TARGETDURATION`,
+    /// and atomically re-publish the manifest to disk. The segment's on-disk
+    /// `path` is tracked so that, once it ages out of the window, its `.ts`
+    /// file is pruned.
+    ///
+    /// When an epoch source is attached ([`set_epoch_source`]) and carries an
+    /// epoch, the segment is stamped `EXT-X-PROGRAM-DATE-TIME:
+    /// epoch.wall_at(start_pts_ns)` — exact integer affine math, the same
+    /// anchor every other ADR-M010 surface uses. When the epoch **generation**
+    /// changed since the previous close (the sampler published a *stepped*
+    /// re-anchor via [`SharedEpoch::set_stepped`]), this first segment under
+    /// the new map is additionally marked `EXT-X-DISCONTINUITY`
+    /// (wall-clock-sync §3: a step follows the same Class-2 discontinuity
+    /// rules as a `D` change); hold/slew updates keep the generation and mark
+    /// nothing.
     ///
     /// The published manifest carries **no** `#EXT-X-ENDLIST` (the run is live);
     /// [`finalize`](Self::finalize) adds it once at end-of-run.
+    ///
+    /// [`set_epoch_source`]: Self::set_epoch_source
     ///
     /// # Errors
     /// Returns [`Error::Output`] if the manifest could not be atomically written
@@ -92,11 +133,34 @@ impl LivePlaylist {
         uri: impl Into<String>,
         path: PathBuf,
         duration: f64,
+        start_pts_ns: i64,
     ) -> Result<()> {
+        let mut segment = Segment::new(uri, duration);
+        // PDT from the shared epoch (ADR-M010): segment first-sample wall time
+        // = wall_at(first PTS). An unset source or a still-empty cell stamps
+        // nothing — never a fabricated wall time.
+        if let Some((epoch, generation)) = self
+            .epoch
+            .as_ref()
+            .and_then(SharedEpoch::get_with_generation)
+        {
+            segment = segment.with_program_date_time_ns(epoch.wall_at(start_pts_ns));
+            // The step seam (wall-clock-sync §3): a generation bump since the
+            // last close means the sampler STEPPED the map — mark exactly this
+            // first segment closed under the new map discontinuous. The first
+            // epoch ever seen (anchor) is not a step.
+            if self
+                .epoch_generation
+                .is_some_and(|previous| previous != generation)
+            {
+                segment.discontinuity = true;
+            }
+            self.epoch_generation = Some(generation);
+        }
         // Append to the windowed playlist; `push_segment` auto-evicts the oldest
         // beyond the window and advances EXT-X-MEDIA-SEQUENCE / -DISCONTINUITY-
         // SEQUENCE (RFC 8216bis §6.2.2) — we never touch those counters by hand.
-        self.playlist.push_segment(Segment::new(uri, duration));
+        self.playlist.push_segment(segment);
         // TARGETDURATION must be >= every EXTINF still listed, as an integer.
         self.playlist.recompute_target_duration();
 

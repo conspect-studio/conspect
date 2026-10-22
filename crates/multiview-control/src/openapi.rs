@@ -14,10 +14,42 @@ use axum::http::header;
 use axum::response::IntoResponse;
 use axum::Json;
 use axum::Router;
-use utoipa::OpenApi;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 use utoipa_scalar::{Scalar, Servable};
 
 use crate::state::AppState;
+
+/// Registers the reusable `bearer_auth` security scheme (HTTP Bearer) in the
+/// document components so authenticated operations can reference it with
+/// `security(("bearer_auth" = []))`. The scheme covers both machine bearers the
+/// control plane accepts — a hashed API key and a JWT — carried as
+/// `Authorization: Bearer <token>` (ADR-W004). Applied via `modifiers(...)` below.
+///
+/// No *global* `security` requirement is set: only the operations that annotate
+/// their own `security` advertise it, so unauthenticated routes (health,
+/// `/auth/status`) are not falsely marked as requiring a credential.
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        // `components` is always present once schemas are registered above, but
+        // create it defensively rather than unwrap (no panics in library code).
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "bearer_auth",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "Machine bearer token: a hashed API key or a JWT, sent as \
+                         `Authorization: Bearer <token>`.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
 
 /// The `AsyncAPI` 3.0 document, embedded at compile time from the generated
 /// file produced by `cargo xtask gen-asyncapi`. Served as-is; the `xtask` is
@@ -43,6 +75,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
             url = "https://github.com/aperim/multiview/blob/main/LICENSE",
         ),
     ),
+    modifiers(&SecurityAddon),
     paths(
         crate::routes::list_layouts,
         crate::routes::get_layout,
@@ -83,6 +116,12 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::devices::test_pattern,
         crate::routes::devices::source_candidates,
         crate::routes::devices::output_targets,
+        crate::routes::cast_sessions::start_cast_session,
+        crate::routes::cast_sessions::list_cast_sessions,
+        crate::routes::cast_sessions::get_cast_session,
+        crate::routes::cast_sessions::stop_cast_session,
+        crate::routes::cast_sessions::save_cast_session,
+        crate::routes::cast_sessions::set_cast_volume,
         crate::routes::discovery::scan_devices,
         crate::routes::discovery::list_discovered,
         crate::routes::sync_groups::list_sync_groups,
@@ -96,20 +135,50 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::cmd_apply_layout,
         crate::routes::alarms::list_alarms,
         crate::routes::alarms::ack_alarm,
+        crate::routes::logs::list_logs,
         crate::routes::health::list_health,
         crate::routes::licence::get_licence,
         crate::routes::licence::install_lease,
         crate::routes::licence::get_challenge,
         crate::routes::licence::get_heartbeat_status,
+        crate::routes::mesh::get_status,
+        crate::routes::mesh::set_relay,
+        crate::routes::mesh::list_peers,
+        crate::routes::telemetry::get_consent,
+        crate::routes::telemetry::set_consent,
+        crate::routes::telemetry::get_schema,
+        crate::routes::telemetry::request_snapshot,
+        crate::routes::telemetry::get_snapshot,
         crate::routes::salvos::list_salvos,
         crate::routes::salvos::put_salvo,
         crate::routes::salvos::arm_salvo,
         crate::routes::salvos::take_salvo,
         crate::routes::salvos::cancel_salvo,
+        crate::routes::media_players::list_players,
+        crate::routes::media_players::get_player,
+        crate::routes::media_players::load_player,
+        crate::routes::media_players::cue_player,
+        crate::routes::media_players::play_player,
+        crate::routes::media_players::pause_player,
+        crate::routes::media_players::stop_player,
+        crate::routes::media_players::seek_player,
+        crate::routes::media_players::arm_exit,
+        crate::routes::media_players::take_exit,
+        crate::routes::media_players::cancel_exit,
         crate::routes::account::fire_salvo,
         crate::routes::account::list_account_audit,
         crate::routes::account::list_pending_actions,
         crate::routes::account::cancel_action,
+        crate::routes::support::get_entitlement,
+        crate::routes::support::list_tickets,
+        crate::routes::support::raise_ticket,
+        crate::routes::support::get_ticket,
+        crate::routes::support::reply_ticket,
+        crate::routes::support::close_ticket,
+        crate::routes::support::compose,
+        crate::routes::support::get_bundle,
+        crate::routes::support::approve_data_request,
+        crate::routes::support::deny_data_request,
         crate::routes::routing::plan_route,
         crate::routes::routing::take_route,
         crate::routes::tally::list_tally,
@@ -119,25 +188,59 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::tally::clear_override,
         crate::routes::audit::list_audit,
         crate::routes::config::export_config,
+        crate::routes::config::watch_status,
+        crate::routes::config::boot_model_status,
+        crate::routes::config::revert_to_start,
+        crate::routes::config::promote_to_boot,
+        crate::routes::preview::capabilities,
+        crate::routes::system::system_capabilities,
         crate::routes::preview::program_whep_open,
         crate::routes::preview::program_whep_close,
         crate::routes::preview::input_whep_open,
         crate::routes::preview::input_whep_close,
         crate::routes::preview::output_whep_open,
         crate::routes::preview::output_whep_close,
+        crate::routes::whip::whip_publish,
+        crate::routes::whip::whip_delete,
+        crate::routes::whip::whip_patch,
+        crate::routes::whip::whip_options,
+        crate::routes::whep_output::whep_view,
+        crate::routes::whep_output::whep_delete,
+        crate::routes::whep_output::whep_patch,
+        crate::routes::whep_output::whep_options,
         crate::nmos::get_self,
         crate::nmos::list_devices,
         crate::nmos::list_senders,
         crate::nmos::list_receivers,
         crate::nmos::patch_staged,
+        // Realtime browser auth: mint a single-use WS/SSE ticket (ADR-RT011).
+        crate::realtime::ws_ticket_handler,
     ),
     components(schemas(
         crate::problem::Problem,
+        crate::realtime::WsTicketResponse,
+        crate::preview::PreviewCapabilities,
+        crate::preview::ScopeCapabilities,
+        crate::preview::ScopeCapability,
+        crate::preview::ProgramFidelity,
+        // System capability + licence surface (ADR-W030).
+        crate::system::SystemCapabilities,
+        crate::system::BackendCapability,
+        crate::system::BackendResolution,
+        crate::system::BackendKind,
+        crate::system::PipelineStage,
+        crate::system::CompositorCapability,
+        crate::system::CompositorClass,
+        crate::system::CompositorDeviceType,
+        crate::system::BuildInfo,
+        crate::system::EffectiveLicense,
+        crate::system::NdiAttribution,
         crate::repository::Layout,
         crate::repository::LayoutInput,
         crate::resource_store::Resource,
         crate::resource_store::ResourceInput,
         crate::routes::AcceptedBody,
+        crate::routes::media_players::TransportBody,
         crate::routes::SwapRequest,
         crate::routes::ApplyLayoutRequest,
         crate::auth::Role,
@@ -153,12 +256,49 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::pending_actions::PendingActionState,
         crate::routes::account::CancelledBody,
         crate::routes::account::FiredBody,
+        // Local support surface (Conspect, ADR-0053 §3 / brief §10/§11): the
+        // entitlement-routing answer, the local ticket + thread + machine context
+        // (§7.1), the redacted media-free context-pack composer, and the local
+        // data-request approve/deny shapes.
+        crate::support_store::SupportEntitlement,
+        crate::support_store::SupportRoute,
+        crate::support_store::FirstLine,
+        crate::support_store::Ticket,
+        crate::support_store::TicketSummary,
+        crate::support_store::TicketUpdate,
+        crate::support_store::TicketContext,
+        crate::support_store::TicketEntitlement,
+        crate::support_store::TicketEnforcement,
+        crate::support_store::TicketSeverity,
+        crate::support_store::TicketState,
+        crate::support_store::DataRequest,
+        crate::support_store::DataRequestState,
+        crate::routes::support::RaiseTicketRequest,
+        crate::routes::support::ReplyRequest,
+        crate::routes::support::DataRequestActioned,
+        crate::support_bundle::BundleRequest,
+        crate::support_bundle::BundleInclude,
+        crate::support_bundle::BundleWindow,
+        crate::support_bundle::BundleAccepted,
+        crate::support_bundle::Bundle,
+        crate::support_bundle::Diagnostics,
+        crate::support_bundle::Incident,
+        crate::support_bundle::Redaction,
+        crate::support_bundle::RedactionReason,
         crate::versioning::ConfigRevision,
         crate::versioning::RevisionId,
         crate::versioning::DocumentDiff,
         crate::routes::config::CommitRequest,
         crate::routes::config::RollbackRequest,
+        crate::routes::config::BootModelBody,
+        crate::routes::config::RevertToStartBody,
+        crate::routes::config::PromoteBody,
+        crate::watch_status::WatchStatusBody,
+        crate::watch_status::WatchStamp,
         crate::openapi_schemas::AlarmRecordDoc,
+        crate::openapi_schemas::LogRecordDoc,
+        crate::openapi_schemas::LogLevelDoc,
+        crate::openapi_schemas::LogResourceKindDoc,
         crate::openapi_schemas::SourceBodyDoc,
         crate::openapi_schemas::SourceKindDoc,
         crate::openapi_schemas::SourceAuthDoc,
@@ -166,7 +306,11 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::openapi_schemas::CaptionSelectorDoc,
         crate::openapi_schemas::DevicePinDoc,
         crate::openapi_schemas::PinVendorDoc,
-        crate::openapi_schemas::RtspOptionsDoc,
+        crate::openapi_schemas::RistOptionsDoc,
+        crate::openapi_schemas::RistEncryptionDoc,
+        crate::openapi_schemas::RistProfileDoc,
+        crate::openapi_schemas::RistAesBitsDoc,
+        crate::openapi_schemas::RistPeerDoc,
         crate::openapi_schemas::ClockFaceDoc,
         crate::openapi_schemas::TimerTargetDoc,
         crate::openapi_schemas::TimerDirectionDoc,
@@ -177,6 +321,12 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::openapi_schemas::OutputAudioModeDoc,
         crate::openapi_schemas::OutputBodyDoc,
         crate::openapi_schemas::OutputAudioDoc,
+        crate::openapi_schemas::OutputMetadataDoc,
+        crate::openapi_schemas::OutputTimedMetadataDoc,
+        crate::openapi_schemas::OutputOrientationDoc,
+        crate::openapi_schemas::OrientationModeDoc,
+        crate::openapi_schemas::OutputFlipDoc,
+        crate::openapi_schemas::QuarterTurnDoc,
         crate::openapi_schemas::AudioChannelsDoc,
         crate::openapi_schemas::AudioRouteDoc,
         crate::openapi_schemas::AudioRoutingDoc,
@@ -202,6 +352,10 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::openapi_schemas::DeviceStatusDoc,
         crate::routes::devices::SetModeRequest,
         crate::routes::devices::SetModeAccepted,
+        crate::routes::cast_sessions::StartCastSessionRequest,
+        crate::routes::cast_sessions::CastSessionDoc,
+        crate::routes::cast_sessions::SaveCastSessionRequest,
+        crate::routes::cast_sessions::CastVolumeRequest,
         crate::devices::projection::SourceCandidate,
         crate::devices::projection::OutputTarget,
         crate::devices::discovery::DiscoveredService,
@@ -227,6 +381,28 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::openapi_schemas::EnforcementLevelDoc,
         crate::openapi_schemas::LeaseDoc,
         crate::openapi_schemas::LeaseInstalledDoc,
+        // Local mesh (Conspect, CONSPECT-3a / ADR-0051): the always-on
+        // discovery + relay status, the relay opt-in request body, and the
+        // untrusted discovered-peer inventory. The Doc mirrors match the
+        // multiview-mesh serde shapes (pinned byte-for-byte by tests/mesh.rs).
+        crate::routes::mesh::RelaySetRequest,
+        // Telemetry pipe (Conspect, ADR-0052): the opt-in daily-pipe consent
+        // document + request body, the published schema (sent + never-sent), and
+        // the diagnostics-snapshot bundle (logs + engine state, never media). The
+        // telemetry consent is separate from the licensing heartbeat (two-pipe).
+        crate::routes::telemetry::ConsentResource,
+        crate::routes::telemetry::ConsentSetRequest,
+        crate::routes::telemetry::TelemetrySchema,
+        crate::routes::telemetry::SnapshotAccepted,
+        // The diagnostics snapshot wraps the shared #111 `Bundle` (registered
+        // above), so no diagnostics mirror types are duplicated here.
+        crate::routes::telemetry::DiagnosticsSnapshot,
+        crate::telemetry_consent::ConsentActor,
+        crate::telemetry_consent::SnapshotStatus,
+        crate::openapi_schemas::DiscoveryModeDoc,
+        crate::openapi_schemas::MeshRoleDoc,
+        crate::openapi_schemas::MeshStatusDoc,
+        crate::openapi_schemas::MeshPeerDoc,
         crate::openapi_schemas::AlarmKindDoc,
         crate::openapi_schemas::AlarmScopeDoc,
         crate::openapi_schemas::AckStateDoc,
@@ -288,19 +464,27 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         (name = "overlays", description = "Overlay (managed overlay layer) resource CRUD"),
         (name = "probes", description = "Probe (per-cell fail-state detection: black/freeze/silence/loudness) resource CRUD"),
         (name = "devices", description = "Managed-device registry CRUD + status + bare-verb actions + stream-binding projections (ADR-M008/M009/W017)"),
+        (name = "cast", description = "Ephemeral Google Cast sessions of a served HLS rendition + save-as-device promotion (ADR-M011). Google Cast and Chromecast are trademarks of Google LLC."),
         (name = "discovery", description = "mDNS device discovery: scan + the untrusted inventory requiring explicit confirm-adopt (ADR-M008 §6 / ADR-0041)"),
         (name = "sync-groups", description = "Presentation-sync-group CRUD + skew measurement (ADR-M008/M010)"),
         (name = "audio", description = "Audio routing: the document-level program-bus membership + discrete-track wiring per-output selections resolve against"),
         (name = "commands", description = "Operational commands (start/stop/swap)"),
         (name = "alarms", description = "Monitoring alarms: list + acknowledge"),
+        (name = "logs", description = "Structured log tail (ADR-0060): recent buffered, resource-attributed records from a bounded drop-oldest ring, filterable by resource_id/kind/level/since/limit (read-only). Control-plane only; never back-pressures the engine."),
         (name = "health", description = "Health warnings: active capability mismatches + remediation (read-only)"),
         (name = "licence", description = "Local licence (Conspect): the computed licence resource + ladder (enforcement is data), lease install, and the salted challenge export. All-local; never off air."),
+        (name = "mesh", description = "Local mesh (Conspect): always-on mDNS discovery status (no off switch), the relay opt-in toggle, and the untrusted discovered-peer inventory. Control-plane only; never back-pressures the engine."),
+        (name = "telemetry", description = "Telemetry pipe (Conspect): the opt-in daily-pipe consent (off by default, last-writer-wins), the published schema (sent + never-sent), and the §4.2 diagnostics snapshot (logs + engine state, never media). DISTINCT from the licensing heartbeat (under /licensing) — the two pipes are never co-mingled. Consent gates no local route; control-plane only."),
         (name = "salvos", description = "Salvo definitions + arm/take/cancel"),
+        (name = "media-players", description = "Media-player transport (ADR-0057/ADR-0097): load/cue/play/pause/stop/seek + the vamp-exit arm/take/cancel triad"),
         (name = "routing", description = "Per-stream crosspoint routing: classify (plan) + apply (take)"),
         (name = "tally", description = "Tally state, profiles, and manual override"),
         (name = "audit", description = "Read-only change audit log (who/what/when)"),
         (name = "account", description = "Account-side (Conspect): append-only audit (cursor-paginated), pending remote-actions strip + local-wins cancel, and named-salvo fire. Locally drivable now; portal-fed over the heartbeat/relay transport later."),
+        (name = "support", description = "Local support (Conspect): tier-derived entitlement routing (free → community), the local CS-xxxx ticket store with auto-attached machine context (§7.1), the previewable redacted media-free context-pack composer (consent-independent, §7.2), and local approve/deny of inbound egress data requests (nothing leaves without a local yes). Local lifecycle fully functional; portal sync rides the later transport."),
         (name = "preview", description = "Live preview: WHEP focus sessions per scope (program/input/output)"),
+        (name = "whip", description = "WHIP ingest (RFC 9725): WebRTC contribution publishers POST to a source-derived endpoint (ADR-T014)"),
+        (name = "whep", description = "WHEP-serve output viewers (ADR-0049): browsers POST to an output-derived endpoint to play the real encoded program over WebRTC"),
         (name = "config", description = "Config/layout versioning: revisions, diff, rollback"),
         (name = "nmos", description = "AMWA NMOS Node API: IS-04 resources + IS-05 connection"),
         (name = "realtime", description = "WebSocket + SSE event stream"),
@@ -337,14 +521,12 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v1/sources/{id}"),
     ("PUT", "/api/v1/sources/{id}"),
     ("DELETE", "/api/v1/sources/{id}"),
-    // Read-only input elementary-stream inventory (RT-3).
     ("GET", "/api/v1/inputs/{id}/streams"),
     ("GET", "/api/v1/outputs"),
     ("GET", "/api/v1/outputs/{id}"),
     ("POST", "/api/v1/outputs/{id}"),
     ("PUT", "/api/v1/outputs/{id}"),
     ("DELETE", "/api/v1/outputs/{id}"),
-    // The audio-routing singleton document (GET is 404-free).
     ("GET", "/api/v1/audio-routing"),
     ("PUT", "/api/v1/audio-routing"),
     ("GET", "/api/v1/overlays"),
@@ -357,7 +539,6 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v1/probes/{id}"),
     ("PUT", "/api/v1/probes/{id}"),
     ("DELETE", "/api/v1/probes/{id}"),
-    // Managed-devices registry CRUD + status + actions + projections.
     ("GET", "/api/v1/devices"),
     ("GET", "/api/v1/devices/{id}"),
     ("POST", "/api/v1/devices/{id}"),
@@ -371,10 +552,12 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v1/devices/{id}/test-pattern"),
     ("GET", "/api/v1/devices/{id}/source-candidates"),
     ("GET", "/api/v1/devices/{id}/output-targets"),
-    // mDNS device discovery (ADR-M008 §6 / ADR-0041 untrusted inventory).
-    ("POST", "/api/v1/discovery/devices/scan"),
-    ("GET", "/api/v1/discovery/devices"),
-    // Presentation-sync-groups CRUD + measure.
+    ("POST", "/api/v1/cast/sessions"),
+    ("GET", "/api/v1/cast/sessions"),
+    ("GET", "/api/v1/cast/sessions/{id}"),
+    ("DELETE", "/api/v1/cast/sessions/{id}"),
+    ("POST", "/api/v1/cast/sessions/{id}/save"),
+    ("POST", "/api/v1/cast/sessions/{id}/volume"),
     ("GET", "/api/v1/sync-groups"),
     ("GET", "/api/v1/sync-groups/{id}"),
     ("POST", "/api/v1/sync-groups/{id}"),
@@ -387,12 +570,29 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v1/commands/apply-layout"),
     ("GET", "/api/v1/alarms"),
     ("POST", "/api/v1/alarms/{id}/ack"),
-    // Read-only health warnings (SA-0 / ADR-0035).
+    ("GET", "/api/v1/logs"),
     ("GET", "/api/v1/health"),
     ("GET", "/api/v1/licence"),
     ("POST", "/api/v1/licence/lease"),
     ("GET", "/api/v1/licence/challenge"),
     ("GET", "/api/v1/licensing/heartbeat-status"),
+    // Local mesh (Conspect, CONSPECT-3a / ADR-0051): always-on discovery
+    // status (GET-only — no off switch, the spec's locked row), the relay
+    // opt-in toggle, and the untrusted discovered-peer inventory.
+    ("GET", "/api/v1/mesh/status"),
+    ("PUT", "/api/v1/mesh/relay"),
+    ("GET", "/api/v1/mesh/peers"),
+    // Telemetry pipe (Conspect, ADR-0052): opt-in daily-pipe consent (off by
+    // default, LWW) + the published schema (sent + never-sent). Under
+    // `/telemetry/`, NEVER `/licensing/` (the two-pipe separation). Consent gates
+    // no local route.
+    ("GET", "/api/v1/telemetry/consent"),
+    ("PUT", "/api/v1/telemetry/consent"),
+    ("GET", "/api/v1/telemetry/schema"),
+    // Diagnostics snapshot (Conspect, spec §4.2 / ADR-0053): the one-button
+    // support bundle (logs + engine state, never media) — POST → 202, GET by id.
+    ("POST", "/api/v1/diagnostics/snapshot"),
+    ("GET", "/api/v1/diagnostics/{id}"),
     ("GET", "/api/v1/salvos"),
     ("GET", "/api/v1/salvos/{id}"),
     ("PUT", "/api/v1/salvos/{id}"),
@@ -402,6 +602,19 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v1/salvos/{id}/cancel"),
     // Salvo parity (Conspect §11): fire a named salvo → 202.
     ("POST", "/api/v1/salvos/{id}/fire"),
+    // Media-player transport (ADR-0057/ADR-0097): read + transport verbs +
+    // the vamp-exit arm/take/cancel triad.
+    ("GET", "/api/v1/media/players"),
+    ("GET", "/api/v1/media/players/{id}"),
+    ("POST", "/api/v1/media/players/{id}/load"),
+    ("POST", "/api/v1/media/players/{id}/cue"),
+    ("POST", "/api/v1/media/players/{id}/play"),
+    ("POST", "/api/v1/media/players/{id}/pause"),
+    ("POST", "/api/v1/media/players/{id}/stop"),
+    ("POST", "/api/v1/media/players/{id}/seek"),
+    ("POST", "/api/v1/media/players/{id}/exit/arm"),
+    ("POST", "/api/v1/media/players/{id}/exit/take"),
+    ("POST", "/api/v1/media/players/{id}/exit/cancel"),
     // Per-stream crosspoint routing (RT-11): plan (classify) + take (apply).
     ("POST", "/api/v1/routing/plan"),
     ("POST", "/api/v1/routing/{kind}/take"),
@@ -412,29 +625,49 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/v1/tally/profiles/{id}"),
     ("PUT", "/api/v1/tally/profiles/{id}"),
     ("DELETE", "/api/v1/tally/profiles/{id}"),
-    // WHEP focus sessions (sub-second WebRTC preview) per scope.
+    ("GET", "/api/v1/preview/capabilities"),
     ("POST", "/api/v1/preview/program/whep"),
     ("DELETE", "/api/v1/preview/program/whep/{session_id}"),
     ("POST", "/api/v1/preview/inputs/{id}/whep"),
     ("DELETE", "/api/v1/preview/inputs/{id}/whep/{session_id}"),
     ("POST", "/api/v1/preview/outputs/{id}/whep"),
     ("DELETE", "/api/v1/preview/outputs/{id}/whep/{session_id}"),
-    // Read-only change audit log.
+    // WHIP ingest (RFC 9725 / ADR-T014): publish to a source-derived endpoint;
+    // DELETE the session resource to tear it down (PATCH is 405, OPTIONS is the
+    // CORS preflight — documented via utoipa, not enumerated as primary verbs).
+    ("POST", "/api/v1/whip/{source_id}"),
+    ("DELETE", "/api/v1/whip/{source_id}/sessions/{session_id}"),
+    // WHEP-serve output viewers (ADR-0049 §5.1): view an output-derived endpoint;
+    // DELETE the session resource to release the slot (PATCH 405 / OPTIONS CORS
+    // preflight documented via utoipa, not enumerated as primary verbs).
+    ("POST", "/api/v1/whep/{output_id}"),
+    ("DELETE", "/api/v1/whep/{output_id}/sessions/{session_id}"),
     ("GET", "/api/v1/audit"),
     // Account-side append-only audit (Conspect §10/§11): cursor-paginated.
     ("GET", "/api/v1/account/audit"),
     // Pending remote-actions strip + local cancel (local always wins).
     ("GET", "/api/v1/actions/pending"),
     ("POST", "/api/v1/actions/{id}/cancel"),
+    // Local support surface (Conspect §10/§11): entitlement routing, the local
+    // ticket store + thread + close, the redacted media-free context-pack
+    // composer, and local approve/deny of inbound egress data requests.
+    ("GET", "/api/v1/support/entitlement"),
+    ("GET", "/api/v1/support/tickets"),
+    ("POST", "/api/v1/support/tickets"),
+    ("GET", "/api/v1/support/tickets/{id}"),
+    ("POST", "/api/v1/support/tickets/{id}/reply"),
+    ("POST", "/api/v1/support/tickets/{id}/close"),
+    ("POST", "/api/v1/support/bundle"),
+    ("GET", "/api/v1/support/bundle/{id}"),
+    ("POST", "/api/v1/support/data-request/{id}/approve"),
+    ("POST", "/api/v1/support/data-request/{id}/deny"),
     // Config versioning: history + commit, single revision, diff, rollback.
     ("GET", "/api/v1/config/{target}"),
     ("PUT", "/api/v1/config/{target}"),
     ("GET", "/api/v1/config/{target}/rev/{revision}"),
     ("GET", "/api/v1/config/{target}/diff"),
     ("POST", "/api/v1/config/{target}/rollback"),
-    // AsyncAPI 3.0 document (realtime/WebSocket spec, generated by xtask).
     ("GET", "/asyncapi.json"),
-    // AMWA NMOS Node API (under the standardised /x-nmos base).
     ("GET", "/x-nmos/node/v1.3/self"),
     ("GET", "/x-nmos/node/v1.3/devices"),
     ("GET", "/x-nmos/node/v1.3/senders"),
@@ -449,6 +682,8 @@ const REST_ROUTES: &[(&str, &str)] = &[
     ),
     ("GET", "/api/v1/ws"),
     ("GET", "/api/v1/events"),
+    ("POST", "/api/v1/discovery/devices/scan"),
+    ("GET", "/api/v1/discovery/devices"),
 ];
 
 /// Serve the raw `OpenAPI` document as JSON.

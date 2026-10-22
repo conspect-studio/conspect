@@ -51,7 +51,8 @@ mod live_ingest {
     use std::time::{Duration, Instant};
 
     use multiview_core::pixel::PixelFormat;
-    use multiview_input::ndi::{NdiCapability, NdiProducer, SdkNdiReceiver};
+    use multiview_input::ndi::license::LicenseAcceptance;
+    use multiview_input::ndi::{NdiCapability, NdiLicense, NdiProducer, SdkNdiReceiver};
     use multiview_input::source::FrameProducer;
     use multiview_ndi_sys::{NdiFinder, NdiRuntime, NdiSender, NdiVideoFourCc};
 
@@ -73,6 +74,16 @@ mod live_ingest {
             }
         }
         buf
+    }
+
+    /// An accepted NDI license guard for the gated `NdiProducer::new` (ADR-0008
+    /// §7.5); this live round-trip exercises the receiver, not the gate.
+    fn accepted() -> NdiLicense {
+        NdiLicense::accept(LicenseAcceptance {
+            accepted_by: "live-test".to_owned(),
+            accepted_at: "2026-06-06T00:00:00Z".to_owned(),
+        })
+        .expect("a complete acceptance is accepted")
     }
 
     #[test]
@@ -128,7 +139,7 @@ mod live_ingest {
                 NdiCapability::load().map_err(|s| format!("capability load: {s:?}"))?;
             let receiver =
                 SdkNdiReceiver::connect(capability, &source.as_str()).map_err(|e| e.to_string())?;
-            let mut producer = NdiProducer::new(Box::new(receiver));
+            let mut producer = NdiProducer::new(accepted(), Box::new(receiver));
 
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {

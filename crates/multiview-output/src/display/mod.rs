@@ -76,6 +76,7 @@
 //!
 //! [ADR-0044]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0044.md
 
+pub mod audio;
 pub mod canvas;
 pub mod device;
 pub mod flip;

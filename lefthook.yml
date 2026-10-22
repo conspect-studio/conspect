@@ -1,0 +1,104 @@
+# Local git gate (AGENTS.md rule 15: CI must never be the first run of the gates).
+# Mirrors the CI gate so failures surface before push. OPTIONAL but recommended —
+# install once with a pinned binary:
+#
+#   cargo install lefthook   # or download the pinned release binary
+#   lefthook install         # writes the shared .git/hooks shims
+#
+# Heavy checks (clippy, test) run on pre-push, not pre-commit, to keep commits
+# fast; fast checks (fmt, secret scan) run on pre-commit. CI is authoritative.
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      run: cargo fmt --all -- --check
+    secrets:
+      # Run gitleaks only if installed locally (CI is the authoritative scan).
+      # gitleaks' non-zero exit on a real detection propagates through the branch.
+      run: |
+        if command -v gitleaks >/dev/null 2>&1; then
+          gitleaks git --config .gitleaks.toml --pre-commit --staged --redact --verbose
+        else
+          echo "gitleaks not installed; skipping local scan (CI gitleaks.yml is authoritative)"
+        fi
+
+pre-push:
+  parallel: true
+  commands:
+    clippy:
+      # --locked mirrors CI (rule 33): enforce the committed Cargo.lock.
+      run: cargo clippy --locked --workspace --all-targets -- -D warnings
+    test:
+      # --locked mirrors CI (rule 33). --skip tile_driven_meets_budget mirrors the
+      # CI `test` job: the compositor per-tick perf BUDGET test asserts a wall-clock
+      # ceiling only meaningful on consistent hardware (ADR-E009/ADR-0022), so it is
+      # flaky off dedicated runners. Scaling correctness stays covered by the
+      # tile-driven scaling test.
+      run: cargo test --locked --workspace -- --skip tile_driven_meets_budget
+    # ── feature-gated clippy mirrors (match the CI feature matrix) ──────────────
+    # The default workspace clippy above builds default features only, so an
+    # off-by-default feature can break silently (e.g. the cosmic-text 0.19 overlay
+    # break, or the overlay×webrtc-native non-exhaustive match). These mirror the
+    # CI `feature-clippy` legs so the local gate catches them first (rule 15).
+    # All are pure Rust (no ffmpeg) and run on any dev host.
+    clippy-overlay-compositor:
+      # The cosmic-text text rasterizer + GPU overlay sub-pass.
+      run: cargo clippy --locked -p multiview-compositor --features overlay --all-targets -- -D warnings
+    clippy-overlay-cli:
+      # The cli umbrella `overlay` feature (GPU-free; no ffmpeg) + its wiring/tests.
+      run: cargo clippy --locked -p multiview-cli --features overlay --all-targets -- -D warnings
+    clippy-overlay-libass:
+      # The off-by-default libass subtitle marker feature on multiview-overlay.
+      # clippy + test, mirroring the CI feature-clippy-overlay-libass job: the
+      # `subtitle` capability test is cfg-gated by feature (#141), so the suite is
+      # green under --features libass and gives real run-time coverage.
+      run: |
+        cargo clippy --locked -p multiview-overlay --features libass --all-targets -- -D warnings
+        cargo test --locked -p multiview-overlay --features libass
+    # The overlay×webrtc-native pair (#137) + the webrtc-native cli/preview surface
+    # both link ffmpeg (webrtc-native implies the cli `ffmpeg` feature), so these
+    # only run when libav is discoverable locally — CI's `feature-clippy-ffmpeg-
+    # webrtc` job runs them against the pinned FFmpeg base unconditionally.
+    clippy-webrtc-native-ffmpeg:
+      run: |
+        if pkg-config --exists libavcodec 2>/dev/null; then
+          cargo clippy --locked -p multiview-cli --features webrtc-native --all-targets -- -D warnings
+          cargo clippy --locked -p multiview-cli --features overlay,webrtc-native --all-targets -- -D warnings
+          cargo clippy --locked -p multiview-preview --features webrtc --all-targets -- -D warnings
+        else
+          echo "libav (libavcodec) not found via pkg-config; skipping webrtc-native/overlay+webrtc-native clippy (CI feature-clippy-ffmpeg-webrtc is authoritative)"
+        fi
+    # ── i18n catalog freshness (match the CI i18n-catalogs job) ─────────────────
+    # A stale lingui catalog ships content-hash IDs in production with a green CI
+    # (the prod macro strips the source fallback; vitest/build never extract). This
+    # mirrors the CI freshness check: extract --clean + compile, then fail on any
+    # uncommitted drift under web/src/locales/**. Runs only when web/node_modules
+    # is present (i.e. `npm --prefix web ci` has been run); CI is authoritative.
+    i18n-catalogs:
+      run: |
+        if [ -d web/node_modules ]; then
+          npm --prefix web run i18n:extract -- --clean
+          npm --prefix web run i18n:compile
+          if ! git diff --exit-code -- web/src/locales/; then
+            echo "i18n catalogs are stale. Run 'npm --prefix web run i18n:extract -- --clean && npm --prefix web run i18n:compile' and commit web/src/locales/**." >&2
+            exit 1
+          fi
+        else
+          echo "web/node_modules absent (run 'npm --prefix web ci'); skipping i18n catalog freshness check (CI i18n-catalogs is authoritative)"
+        fi
+    # ── API spec freshness (match the CI spec-freshness job, ADR-RT006) ─────────
+    # The committed docs/api/{openapi,asyncapi}.json are generated from the Rust
+    # source of truth (multiview-control utoipa + multiview-events asyncapi) via
+    # `cargo xtask gen-{openapi,asyncapi}`. Nothing else forces a regen when those
+    # annotations change, so the specs can drift behind the served document. This
+    # mirrors the CI drift gate: regenerate both specs, then fail on any
+    # uncommitted diff under docs/api/. --locked mirrors CI (rule 33). Pure-Rust
+    # (no ffmpeg), so it runs on any dev host.
+    spec-freshness:
+      run: |
+        cargo run --locked -p xtask -- gen-openapi
+        cargo run --locked -p xtask -- gen-asyncapi
+        if ! git diff --exit-code -- docs/api/; then
+          echo "API specs are stale. Run 'cargo run -p xtask -- gen-openapi && cargo run -p xtask -- gen-asyncapi' and commit docs/api/{openapi,asyncapi}.json." >&2
+          exit 1
+        fi

@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
 
+pub mod net_guard;
+
 /// The reconnect backoff ceiling (one hour) — a larger `max_ms` is a typo,
 /// not a policy.
 const MAX_RECONNECT_MS: u32 = 3_600_000;
@@ -255,6 +257,7 @@ impl Device {
                         self.id
                     )));
                 }
+                self.screen_dial_address(address)?;
             }
             None => {
                 if self.driver.requires_address() {
@@ -326,6 +329,35 @@ impl Device {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Screen a device's dial `address` at config-load time (SSRF guard,
+    /// SEC-02/SEC-04): parse the driver's address form and reject a
+    /// never-legitimate literal dial target (loopback, link-local incl. the
+    /// cloud-metadata IP, unspecified, multicast/broadcast, IPv4-mapped forms).
+    /// A `zowietek` address is a URL held to the `http`/`https` scheme
+    /// allowlist; a `cast` address is a `host[:port]` authority.
+    ///
+    /// This is the offline, deployment-independent layer: private/ULA LAN
+    /// literals are accepted here and gated at runtime by the resolved-IP dial
+    /// guard ([`net_guard::screen_ip`]), which is also the only layer that can
+    /// defeat DNS-rebind. `displaynode` binds by enrolled identity and is not
+    /// dialled from this address, so it is not screened.
+    fn screen_dial_address(&self, address: &str) -> Result<(), ConfigError> {
+        let wrap = |e: net_guard::AddressError| {
+            ConfigError::Validation(format!("device {:?} address {address:?}: {e}", self.id))
+        };
+        let host = match self.driver {
+            DeviceDriver::Zowietek => net_guard::parse_device_address(address).map_err(wrap)?,
+            DeviceDriver::Cast => net_guard::parse_cast_authority(address)
+                .map(|(host, _port)| host)
+                .map_err(wrap)?,
+            DeviceDriver::Displaynode => return Ok(()),
+        };
+        if let net_guard::HostSpec::Ip(ip) = host {
+            net_guard::screen_config_literal(ip).map_err(wrap)?;
         }
         Ok(())
     }

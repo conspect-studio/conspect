@@ -289,6 +289,15 @@ pub struct DiscoveredService {
     pub txt: Vec<TxtRecord>,
     /// When this row was last seen (Unix nanoseconds), informational for the UI.
     pub last_seen_unix_ns: i64,
+    /// The discovery **domain** the observing node stamped on this row
+    /// (ADR-W026) — sourced solely from the node's operator-declared
+    /// `[discovery] domain` config, **never** from the responder payload, TXT
+    /// records, or mesh peer identity. `None` = the observing node declared no
+    /// domain; a discovery-scoped principal is denied an unlabelled row
+    /// (fail-closed). Event (`device.discovered`) and this REST row are stamped
+    /// from the one config value so they can never disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     /// The TTL deadline after which the row is purged as stale. Not serialized —
     /// it is internal bookkeeping (a monotonic [`Instant`]).
     #[serde(skip)]
@@ -319,11 +328,17 @@ impl DiscoveredService {
     /// [`MAX_TXT_VALUE_LEN`] bytes (on a char boundary), TXT records are capped
     /// at [`MAX_TXT_RECORDS`], and endpoints at [`MAX_ENDPOINTS`] — applied
     /// after AAAA-first ordering so the IPv6 lead survives the cap.
+    ///
+    /// `domain` is the observing node's operator-declared discovery domain
+    /// (ADR-W026), passed in by the caller from local config. It is stamped
+    /// verbatim and is deliberately **never** read from `raw` — a discovered
+    /// device is untrusted and cannot assert its own authorization scope.
     #[must_use]
     pub fn from_raw(
         raw: &RawDiscoveredService,
         configured_zowietek: Option<&str>,
         expires_at: Instant,
+        domain: Option<String>,
     ) -> Self {
         let service_type = truncate_field(&raw.service_type, MAX_FIELD_LEN);
         let name = truncate_field(&raw.instance_name, MAX_FIELD_LEN);
@@ -355,6 +370,7 @@ impl DiscoveredService {
             primary_address,
             txt,
             last_seen_unix_ns: unix_now_ns(),
+            domain,
             expires_at: Some(expires_at),
         }
     }
@@ -1008,7 +1024,7 @@ mod tests {
     #[test]
     fn from_raw_classifies_and_orders() {
         let now = Instant::now() + Duration::from_secs(60);
-        let svc = DiscoveredService::from_raw(&raw_ndi(), None, now);
+        let svc = DiscoveredService::from_raw(&raw_ndi(), None, now, None);
         assert_eq!(svc.driver_kind, DiscoveryDriverKind::NdiSource);
         assert_eq!(svc.endpoints[0].family, AddressFamily::Ipv6);
         assert!(svc.primary_address.contains("fd00:db8::7"));
@@ -1017,11 +1033,40 @@ mod tests {
     }
 
     #[test]
+    fn from_raw_stamps_domain_from_param_never_from_wire() {
+        // ADR-W026 provenance: the discovery domain is stamped by the OBSERVING
+        // NODE from its own operator-declared config (the param), never from the
+        // untrusted responder payload — a discovered device cannot assert its
+        // own authorization scope.
+        let now = Instant::now() + Duration::from_secs(60);
+
+        let labelled =
+            DiscoveredService::from_raw(&raw_ndi(), None, now, Some("site-a".to_owned()));
+        assert_eq!(labelled.domain.as_deref(), Some("site-a"));
+
+        // No config domain → the row is unlabelled (a discovery-scoped principal
+        // is denied it, fail-closed).
+        let unlabelled = DiscoveredService::from_raw(&raw_ndi(), None, now, None);
+        assert_eq!(unlabelled.domain, None);
+
+        // A responder that advertises a `domain` TXT cannot self-label: from_raw
+        // never reads the domain from the wire.
+        let mut raw = raw_ndi();
+        raw.txt
+            .push(("domain".to_owned(), "attacker-site".to_owned()));
+        let spoofed = DiscoveredService::from_raw(&raw, None, now, None);
+        assert_eq!(
+            spoofed.domain, None,
+            "domain must never be read from responder TXT (untrusted self-assertion)"
+        );
+    }
+
+    #[test]
     fn inventory_dedups_latest_wins() {
         let inv = DiscoveryInventory::new(8);
         let future = Instant::now() + Duration::from_secs(60);
-        inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, future));
-        inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, future));
+        inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, future, None));
+        inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, future, None));
         assert_eq!(inv.snapshot().len(), 1);
     }
 
@@ -1031,7 +1076,7 @@ mod tests {
         let past = Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(Instant::now);
-        inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, past));
+        inv.upsert(DiscoveredService::from_raw(&raw_ndi(), None, past, None));
         assert!(inv.snapshot().is_empty());
     }
 
@@ -1042,7 +1087,7 @@ mod tests {
         for n in 0..5 {
             let mut raw = raw_ndi();
             raw.instance_name = format!("ZB-{n}");
-            inv.upsert(DiscoveredService::from_raw(&raw, None, future));
+            inv.upsert(DiscoveredService::from_raw(&raw, None, future, None));
         }
         assert!(inv.snapshot().len() <= 2);
     }

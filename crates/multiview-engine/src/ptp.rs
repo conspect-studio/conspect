@@ -380,7 +380,7 @@ pub struct ReferenceStatus {
 /// timestamp in ns) and advance time-only with [`ReferenceTracker::tick`] (to let
 /// staleness / holdover expiry fire when no sample arrives). The hardware PHC read
 /// that produces those samples lives behind the off-by-default `ptp` feature (the
-/// [`phc`] module); this state machine never reads a clock or performs I/O and is
+/// `phc` module); this state machine never reads a clock or performs I/O and is
 /// fully unit-tested without a NIC.
 ///
 /// **Invariant #1:** the tracker only *informs* the reference estimate / badge —

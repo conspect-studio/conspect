@@ -284,12 +284,14 @@ fn device_lifecycle_variants_roundtrip_under_v1_envelope() {
             "device.sync",
         ),
         (
-            Event::DeviceDiscovered(DeviceDiscovered {
-                driver: "zowietek".to_owned(),
-                address: "http://[fd00:db8::42]".to_owned(),
-                family: AddressFamily::Ipv6,
-                name: Some("ZowieBox 4K".to_owned()),
-            }),
+            Event::DeviceDiscovered(
+                DeviceDiscovered::new(
+                    "zowietek".to_owned(),
+                    "http://[fd00:db8::42]".to_owned(),
+                    AddressFamily::Ipv6,
+                )
+                .with_name("ZowieBox 4K".to_owned()),
+            ),
             "device.discovered",
         ),
     ];
@@ -414,12 +416,11 @@ fn device_discovered_correlates_with_the_scan_operation() {
         Topic::Devices,
         Seq::new(77),
         ts(),
-        Event::DeviceDiscovered(DeviceDiscovered {
-            driver: "zowietek".to_owned(),
-            address: "http://192.0.2.7".to_owned(),
-            family: AddressFamily::Ipv4Legacy,
-            name: None,
-        }),
+        Event::DeviceDiscovered(DeviceDiscovered::new(
+            "zowietek".to_owned(),
+            "http://192.0.2.7".to_owned(),
+            AddressFamily::Ipv4Legacy,
+        )),
     )
     .with_corr("op:scan-1");
 

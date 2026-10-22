@@ -97,6 +97,8 @@ pub use failure::{
 };
 #[cfg(feature = "cuda")]
 pub use load::NvmlLoadPoller;
+#[cfg(any(feature = "vaapi", feature = "qsv"))]
+pub use load::SysfsLoadPoller;
 pub use load::{
     normalize_pci_bus_id, DeviceId, DeviceLoad, GpuTargetInfo, LoadPoller, LoadProbe, LoadSample,
     LoadSource, NullLoadPoller, PollInterval, SelfShare, Vendor,

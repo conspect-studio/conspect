@@ -16,6 +16,11 @@ export interface SidebarProps {
 /** The primary navigation rail. */
 export function Sidebar({ onNavigate }: SidebarProps): JSX.Element {
   const { t } = useLingui();
+  // A link matches exactly (not by prefix) when it is the root OR another nav
+  // item is nested beneath it (e.g. `/system` vs `/system/actions`, `/settings`
+  // vs `/settings/licence`) — so only the deepest matching item reads active.
+  const isParentOfAnother = (path: string): boolean =>
+    NAV_ITEMS.some((item) => item.path !== path && item.path.startsWith(`${path}/`));
   return (
     <nav aria-label={t`Primary`} className="flex h-full flex-col gap-1 p-3">
       <div className="px-2 pb-3 text-lg font-semibold tracking-tight">
@@ -26,7 +31,7 @@ export function Sidebar({ onNavigate }: SidebarProps): JSX.Element {
           <li key={path}>
             <NavLink
               to={path}
-              end={path === "/"}
+              end={path === "/" || isParentOfAnother(path)}
               onClick={onNavigate}
               className={({ isActive }): string =>
                 cn(

@@ -4,10 +4,13 @@
 //! This is the **only** module in the crate that touches raw libav FFI: every
 //! other wrapper rides `ffmpeg_next`'s safe surface. The types here own an
 //! `AVBufferRef`-counted hardware device / frames context and free it in `Drop`
-//! via `av_buffer_unref`. They are a *scaffold* for later GPU hwaccel
-//! (core-engine §7, §8.1, §12): the structures, RAII, and pixel/sw-format
-//! plumbing exist and compile on a GPU-free machine, while binding a real
-//! decoder/compositor to them is future work.
+//! via `av_buffer_unref`. [`HwDeviceContext`] is wired into the real decode and
+//! encode paths: the decode stream creates one and calls
+//! [`HwDeviceContext::attach_to_decoder`] (moving CUDA output frames to host via
+//! [`transfer_hwframe_to_host`]), and the encoder attaches it via
+//! [`HwDeviceContext::attach_to_encoder`]. [`HwFramesContext`] (the explicit
+//! frames pool) is built and unit-tested but not yet bound in the decode path
+//! (core-engine §7, §8.1, §12) — the remaining GPU-hwaccel scaffold.
 //!
 //! ## Safety contract (CLAUDE.md §7)
 //! * Every `unsafe` block carries a `// SAFETY:` note stating the upheld

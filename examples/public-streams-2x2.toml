@@ -53,8 +53,6 @@ id = "in_cam"
 display_name = "RTSP camera (HEVC 50p, example host)"
 kind = "rtsp"
 url = "rtsp://camera.example.net:8554/stream"
-[sources.rtsp]
-transport = "tcp"
 
 [[sources]]
 id = "in_bbb"
@@ -102,12 +100,9 @@ source = "wall"
 kind = "rtsp_server"
 mount = "/multiview"
 codec = "h264"
-latency_profile = "low_latency"
 
 [[outputs]]
 kind = "ll_hls"
 path = "/hls/multiview"
 codec = "h264"
-part_target_ms = 250
 segment_ms = 2000
-gop_ms = 2000

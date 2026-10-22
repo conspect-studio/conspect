@@ -23,7 +23,7 @@ use multiview_engine::EnginePublisher;
 use serde_json::json;
 use support::{
     body_json, delete_if_match, get, harness, harness_with, post_if_match, post_json, put_json,
-    send, ADMIN_TOKEN, OPERATOR_TOKEN, VIEWER_TOKEN,
+    send, ADMIN_TOKEN, OPERATOR_TOKEN, SCOPED_TOKEN, VIEWER_TOKEN,
 };
 
 /// A valid `zowietek` device body (the canonical `multiview_config::Device`
@@ -100,6 +100,58 @@ async fn list_is_id_sorted() {
         .map(|d| d["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["dev-alpha", "dev-zeta"]);
+}
+
+/// BOLA enumeration (OWASP API1, conventions §H / ADR-W005 / ADR-W025): the
+/// devices COLLECTION read must filter to the principal's object allowlist, by
+/// parity with `GET /devices/{id}` returning `403` for an out-of-scope id. A
+/// scoped operator that lists devices must see ONLY its allowlisted rows — never
+/// enumerate (and read the address/config of) devices it cannot `GET`.
+///
+/// `SCOPED_TOKEN` is an operator scoped to `["scoped-layout"]`. Admin creates two
+/// devices: `scoped-layout` (IN the allowlist) and `dev-other` (OUT). The scoped
+/// list must contain exactly the in-scope row; admin still sees both.
+#[tokio::test]
+async fn list_filters_devices_to_the_scoped_allowlist() {
+    let h = harness();
+    for id in ["scoped-layout", "dev-other"] {
+        let body = json!({
+            "name": id,
+            "body": { "id": id, "driver": "zowietek", "address": "http://[fd00:db8::1]" }
+        });
+        let resp = send(
+            &h.router,
+            post_json(&format!("/api/v1/devices/{id}"), ADMIN_TOKEN, &body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "device seed must land");
+    }
+
+    // The scoped operator lists: only its in-scope device is visible.
+    let resp = send(&h.router, get("/api/v1/devices", SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed = body_json(resp).await;
+    let ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["scoped-layout"],
+        "a scoped principal must see ONLY its allowlisted device, never enumerate others (BOLA)"
+    );
+
+    // An unscoped admin sees BOTH (the filter does not over-restrict).
+    let resp = send(&h.router, get("/api/v1/devices", ADMIN_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listed = body_json(resp).await;
+    assert_eq!(
+        listed.as_array().unwrap().len(),
+        2,
+        "an unscoped admin still sees every device"
+    );
 }
 
 #[tokio::test]

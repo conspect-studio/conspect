@@ -107,6 +107,19 @@ impl EncodedPacket {
         self.packet.is_key()
     }
 
+    /// The coded payload bytes, or `None` for an empty packet.
+    ///
+    /// The encode-once-mux-many file/HLS/push sinks mux the whole [`EncodedPacket`]
+    /// (rescaling its timestamps in place via [`Self::to_owned_packet`]); the
+    /// **WebRTC** outputs instead packetize the *bytes* (one H.264 access unit /
+    /// one Opus frame) into SRTP per viewer, so they read the payload here. Reading
+    /// the bytes never copies the underlying buffer and never re-encodes — it is
+    /// the same coded data the muxers write (invariant #7).
+    #[must_use]
+    pub fn payload(&self) -> Option<&[u8]> {
+        self.packet.data()
+    }
+
     /// The coded payload length in bytes (`0` for an empty packet).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -244,5 +257,24 @@ mod stream_kind_tests {
         // The kind survives the per-muxer ref-counted clone (the fan-out clones
         // before handing each sink its owned copy).
         assert_eq!(a.clone().kind(), StreamKind::Audio);
+    }
+
+    #[test]
+    fn payload_exposes_the_coded_bytes_for_webrtc_packetization() {
+        // The WebRTC outputs (ADR-0049) packetize the coded AU bytes into SRTP per
+        // viewer — the SAME bytes the file/HLS/push muxers write (encode-once,
+        // invariant #7). An empty packet has no payload; a packet built from bytes
+        // exposes exactly those bytes.
+        let empty = EncodedPacket::from_packet(ffmpeg::codec::packet::Packet::empty());
+        assert!(empty.payload().is_none(), "empty packet has no payload");
+
+        let au = [0x00u8, 0x00, 0x00, 0x01, 0x65, 0xAB, 0xCD];
+        let coded = EncodedPacket::from_packet(ffmpeg::codec::packet::Packet::copy(&au));
+        assert_eq!(
+            coded.payload(),
+            Some(au.as_slice()),
+            "payload() returns the coded access-unit bytes verbatim"
+        );
+        assert_eq!(coded.len(), au.len());
     }
 }

@@ -51,10 +51,14 @@ import {
   AdvancedSection,
   ApplySemanticsCallout,
   CheckboxField,
+  DerivedUrlField,
   ExportConfigButton,
   FormField,
+  SecretField,
   SelectField,
 } from '../resources/FormControls';
+import { whipPublishUrl } from '../resources/api';
+import { SourceFromDeviceSection } from '../devices/FromDevice';
 import { tileForSource, useLiveTiles } from '../resources/useLiveTiles';
 import type { LiveTile } from '../realtime/useEngineEvents';
 import { HelpLink } from '../components/HelpLink';
@@ -124,6 +128,8 @@ function SourceKindFields({
           return 'https://www.youtube.com/watch?v=…';
         case 'srt':
           return 'srt://[2001:db8::2]:7001';
+        case 'rist':
+          return 'rist://[2001:db8::2]:5000';
         case 'rtmp':
           return 'rtmp://ingest.example/app/key';
         default:
@@ -206,10 +212,85 @@ function SourceKindFields({
       return <ClockKindFields form={form} setForm={setForm} errors={errors} />;
     case 'timer':
       return <TimerKindFields form={form} setForm={setForm} errors={errors} />;
+    case 'webrtc':
+      return <WebrtcSourceFields form={form} setForm={setForm} />;
     default:
       // `bars` carries only its kind tag.
       return null;
   }
+}
+
+/**
+ * The WHIP-ingest (`webrtc`) source fields (ADR-T014 / ADR-W023). There is no
+ * URL to author — Multiview is the WHIP server, so the form shows the DERIVED
+ * publish endpoint (read-only, copyable) to hand a publisher, plus the optional
+ * publisher token (masked) and the accept-audio toggle.
+ */
+function WebrtcSourceFields({
+  form,
+  setForm,
+}: {
+  readonly form: SourceFormState;
+  readonly setForm: (next: SourceFormState) => void;
+}): JSX.Element {
+  const { t } = useLingui();
+  const id = form.id.trim();
+  return (
+    <>
+      {id === '' ? (
+        <p className="text-xs text-muted-foreground">
+          <Trans>
+            Set an identifier above; the WHIP publish endpoint is derived from
+            it and shown here once it is filled in.
+          </Trans>
+        </p>
+      ) : (
+        <DerivedUrlField
+          id="source-whip-url"
+          label={t`WHIP publish endpoint`}
+          value={whipPublishUrl(id)}
+          hint={
+            <Trans>
+              Give this to a publisher (OBS ≥ 30, GStreamer whipclientsink, or a
+              browser) to push media into this source. Relative to the control
+              plane origin.
+            </Trans>
+          }
+          trailing={
+            <HelpLink
+              to="/help/concepts/glossary#whip"
+              label={t`What is WHIP?`}
+              compact
+            />
+          }
+        />
+      )}
+      <SecretField
+        id="source-webrtc-token"
+        label={t`Publisher token (optional)`}
+        value={form.webrtcToken}
+        placeholder={t`leave blank to require a Write API key`}
+        hint={
+          <Trans>
+            A bearer token the publisher presents on the WHIP POST. Leave blank
+            to require a control-plane API key with Write scope instead —
+            publishing is never anonymous.
+          </Trans>
+        }
+        onChange={(next): void => {
+          setForm({ ...form, webrtcToken: next });
+        }}
+      />
+      <CheckboxField
+        id="source-webrtc-audio"
+        label={t`Accept the publisher's audio (Opus)`}
+        checked={form.webrtcAudio}
+        onChange={(next): void => {
+          setForm({ ...form, webrtcAudio: next });
+        }}
+      />
+    </>
+  );
 }
 
 /** Translate a clock face value to its localized option label. */
@@ -828,14 +909,16 @@ export function SourcesPage(): JSX.Element {
               Synthetic sources (bars, solid colour, clock, timer) apply to the
               running engine immediately when saved, and deleting any source
               removes it from the running engine immediately. Network and file
-              sources are stored and go live via config export + restart. Each
-              save response declares which applied (X-Multiview-Apply: live or
-              restart).
+              sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live
+              on a full-engine run; on the software engine, and for NDI / YouTube
+              / AES67, they are stored and go live via config export + restart.
+              Each save response declares which applied (X-Multiview-Apply: live
+              or restart).
             </Trans>
           }
         />
       }
-      savedDescription={t`Stored. Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately; other kinds go live via config export + restart.`}
+      savedDescription={t`Stored. Synthetic sources (bars, solid colour, clock, timer) and — on a full-engine run — network/file sources apply to the running engine immediately; NDI / YouTube / AES67 (and any kind on the software engine) go live via config export + restart. The response header declares which applied.`}
       deletedDescription={t`Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed.`}
       list={sources.data ?? []}
       isPending={sources.isPending}
@@ -854,6 +937,11 @@ export function SourcesPage(): JSX.Element {
       })}
       renderFields={(form, setForm, creating, errors): JSX.Element => (
         <>
+          {creating ? (
+            // Device-projected streams (ADR-M009 facet (a)): picking one
+            // prefills the transport form and stamps device_ref.
+            <SourceFromDeviceSection form={form} setForm={setForm} />
+          ) : null}
           <FormField
             id="source-id"
             label={t`Identifier`}
