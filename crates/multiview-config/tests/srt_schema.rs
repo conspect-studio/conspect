@@ -1,13 +1,17 @@
 //! SRT (Secure Reliable Transport) config-schema tests: the `SourceKind::Srt`
 //! ingest variant and the `Output::Srt` push-sink variant, with the typed
 //! `SrtOptions` (mode, latency, `AES` encryption holding a passphrase
-//! **reference**, stream id). Pure serde — TOML/JSON round-trip + validation,
-//! no engine, no network, no sockets (SRT-0, ADR-0039).
+//! **reference**, stream id, listener, overhead bandwidth, max bandwidth, the
+//! peer-idle/connect timeouts, backend). Pure serde — TOML/JSON round-trip +
+//! validation, no engine, no network, no sockets (SRT-0, ADR-0039).
 //!
 //! Load-bearing properties:
 //!
 //! * the extension is **purely additive** — a legacy `{ kind = "srt", url }`
 //!   document still round-trips **byte-identical** (no schema version bump);
+//! * **every** option ADR-0039 §2 / the SRT-0 backlog row name is a typed field
+//!   that survives a TOML and a JSON round-trip — nothing documented is silently
+//!   dropped (runtime wiring is SRT-2/#58);
 //! * the passphrase is a `secret_ref` (a secret-manager pointer), **never** a
 //!   plaintext key in the config model;
 //! * `pbkeylen ∈ {0, 16, 24, 32}` and the stream id is capped at SRT's
@@ -23,7 +27,7 @@
 )]
 
 use multiview_config::{
-    Output, Source, SourceKind, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
+    Output, Source, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 use proptest::prelude::*;
 
@@ -277,6 +281,15 @@ fn srt_options_default_is_empty() {
     assert!(opts.latency_ms.is_none());
     assert!(opts.encryption.is_none());
     assert!(opts.stream_id.is_none());
+    // The remaining SRT-0 option surface (ADR-0039 §2) is absent by default so
+    // an `srt` block that names none of them still lowers to libav's own
+    // defaults, and a legacy document is untouched.
+    assert!(opts.listener.is_none());
+    assert!(opts.oheadbw_pct.is_none());
+    assert!(opts.maxbw.is_none());
+    assert!(opts.peer_idle_timeout_ms.is_none());
+    assert!(opts.conn_timeout_ms.is_none());
+    assert!(opts.backend.is_none());
 }
 
 #[test]
@@ -414,4 +427,254 @@ fn srt_encryption_type_is_reachable_via_serde() {
             .expect("encryption parses");
     assert_eq!(enc.key_length, SrtKeyLength::Aes128);
     assert_eq!(enc.passphrase_ref, "env:X");
+}
+
+// ---------------------------------------------------------------------------
+// SRT-0: the remaining documented option surface (listener / oheadbw_pct /
+// maxbw / peer_idle_timeout_ms / conn_timeout_ms / backend)
+// ---------------------------------------------------------------------------
+
+/// The remaining ADR-0039 §2 `SrtOptions` fields as a TOML `[srt]` block body.
+/// `maxbw = 1250000` + `oheadbw_pct = 25` is the reviewer's exact input: it must
+/// survive deserialization and re-export rather than being silently dropped.
+const REMAINING_SRT0_TOML: &str = "listener = true\n\
+     oheadbw_pct = 25\n\
+     maxbw = 1250000\n\
+     peer_idle_timeout_ms = 5000\n\
+     conn_timeout_ms = 3000\n\
+     backend = \"ffmpeg\"\n";
+
+#[test]
+fn srt_options_remaining_srt0_fields_roundtrip_toml() {
+    let src = srt_source_with_block(REMAINING_SRT0_TOML);
+    let opts = match &src.kind {
+        SourceKind::Srt {
+            srt: Some(opts), ..
+        } => opts,
+        other => panic!("expected an SRT source with options, got {other:?}"),
+    };
+    assert_eq!(opts.listener, Some(true));
+    assert_eq!(opts.oheadbw_pct, Some(25));
+    assert_eq!(opts.maxbw, Some(1_250_000));
+    assert_eq!(opts.peer_idle_timeout_ms, Some(5000));
+    assert_eq!(opts.conn_timeout_ms, Some(3000));
+    assert_eq!(opts.backend, Some(SrtBackend::Ffmpeg));
+
+    // Re-export must carry every option, not drop it (the defect this fixes).
+    let out = toml::to_string(&src).expect("serialize TOML");
+    for key in [
+        "listener = true",
+        "oheadbw_pct = 25",
+        "maxbw = 1250000",
+        "peer_idle_timeout_ms = 5000",
+        "conn_timeout_ms = 3000",
+        "backend = \"ffmpeg\"",
+    ] {
+        assert!(out.contains(key), "TOML export dropped {key:?}: {out}");
+    }
+    // And the round trip is lossless.
+    let reparsed: Source = toml::from_str(&out).expect("re-parse TOML");
+    assert_eq!(src, reparsed);
+}
+
+#[test]
+fn srt_options_remaining_srt0_fields_roundtrip_json() {
+    let json_in = r##"{
+        "id": "srt_all",
+        "kind": "srt",
+        "url": "srt://[::1]:9000",
+        "srt": {
+            "mode": "caller",
+            "latency_ms": 120,
+            "stream_id": "#!::r=live/feed,m=publish",
+            "listener": true,
+            "oheadbw_pct": 25,
+            "maxbw": 1250000,
+            "peer_idle_timeout_ms": 5000,
+            "conn_timeout_ms": 3000,
+            "backend": "native"
+        }
+    }"##;
+    let original: Source = serde_json::from_str(json_in).expect("parse json");
+    let opts = match &original.kind {
+        SourceKind::Srt {
+            srt: Some(opts), ..
+        } => opts,
+        other => panic!("expected an SRT source with options, got {other:?}"),
+    };
+    assert_eq!(opts.listener, Some(true));
+    assert_eq!(opts.oheadbw_pct, Some(25));
+    assert_eq!(opts.maxbw, Some(1_250_000));
+    assert_eq!(opts.peer_idle_timeout_ms, Some(5000));
+    assert_eq!(opts.conn_timeout_ms, Some(3000));
+    assert_eq!(opts.backend, Some(SrtBackend::Native));
+
+    let json = serde_json::to_string(&original).expect("serialize json");
+    for key in [
+        "\"listener\":true",
+        "\"oheadbw_pct\":25",
+        "\"maxbw\":1250000",
+        "\"peer_idle_timeout_ms\":5000",
+        "\"conn_timeout_ms\":3000",
+        "\"backend\":\"native\"",
+    ] {
+        assert!(json.contains(key), "JSON export dropped {key:?}: {json}");
+    }
+    let reparsed: Source = serde_json::from_str(&json).expect("re-parse json");
+    assert_eq!(original, reparsed);
+}
+
+#[test]
+fn srt_options_absent_remaining_fields_stay_absent_on_export() {
+    // An `srt` block that names none of the new options must not gain them on
+    // export — the additive contract (ADR-0039 §2).
+    let src = srt_source_with_block("mode = \"listener\"\nlatency_ms = 200\n");
+    let json = serde_json::to_string(&src).expect("serialize");
+    // Match the JSON *key* (`"listener":`), not the bare word — `mode =
+    // "listener"` legitimately contains the latter.
+    for key in [
+        "\"listener\":",
+        "\"oheadbw_pct\":",
+        "\"maxbw\":",
+        "\"peer_idle_timeout_ms\":",
+        "\"conn_timeout_ms\":",
+        "\"backend\":",
+    ] {
+        assert!(
+            !json.contains(key),
+            "an absent {key:?} must not be synthesized: {json}"
+        );
+    }
+}
+
+#[test]
+fn srt_backend_tokens_are_the_documented_backends() {
+    // Research §9 names `{ Ffmpeg | Native }`; `docs/io/inputs.md` §2.4 names the
+    // same two backends as `libav` / `srt-tokio`. Canonical export is snake_case;
+    // both documented vocabularies parse (never a silent drop, never a hard reject).
+    for (token, want) in [
+        ("\"ffmpeg\"", SrtBackend::Ffmpeg),
+        ("\"native\"", SrtBackend::Native),
+        ("\"libav\"", SrtBackend::Ffmpeg),
+        ("\"srt-tokio\"", SrtBackend::Native),
+    ] {
+        let got: SrtBackend =
+            serde_json::from_str(token).unwrap_or_else(|e| panic!("{token} must parse: {e}"));
+        assert_eq!(got, want, "{token} maps to {want:?}");
+    }
+    assert_eq!(
+        serde_json::to_string(&SrtBackend::Ffmpeg).expect("serialize"),
+        "\"ffmpeg\""
+    );
+    assert_eq!(
+        serde_json::to_string(&SrtBackend::Native).expect("serialize"),
+        "\"native\""
+    );
+    assert!(
+        serde_json::from_str::<SrtBackend>("\"bogus\"").is_err(),
+        "an unknown backend token is rejected"
+    );
+}
+
+#[test]
+fn srt_oheadbw_pct_range_edges_accepted() {
+    for ok in [5u32, 25, 100] {
+        let src = srt_source_with_block(&format!("oheadbw_pct = {ok}\n"));
+        src.validate()
+            .unwrap_or_else(|e| panic!("oheadbw_pct = {ok} is in range: {e}"));
+    }
+}
+
+#[test]
+fn srt_out_of_range_oheadbw_pct_rejected() {
+    for bad in [0u32, 4, 101, 1000] {
+        let src = srt_source_with_block(&format!("oheadbw_pct = {bad}\n"));
+        let err = src
+            .validate()
+            .expect_err("an oheadbw_pct outside 5..=100 is rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("oheadbw_pct"),
+            "the error names the field: {msg}"
+        );
+    }
+}
+
+#[test]
+fn srt_maxbw_sentinels_accepted() {
+    for ok in [-1i64, 0, 1_250_000] {
+        let src = srt_source_with_block(&format!("maxbw = {ok}\n"));
+        src.validate()
+            .unwrap_or_else(|e| panic!("maxbw = {ok} is valid: {e}"));
+    }
+}
+
+#[test]
+fn srt_out_of_range_maxbw_rejected() {
+    let src = srt_source_with_block("maxbw = -2\n");
+    let err = src
+        .validate()
+        .expect_err("maxbw below the -1 (unlimited) sentinel is rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("maxbw"), "the error names the field: {msg}");
+}
+
+#[test]
+fn srt_output_carries_the_remaining_srt0_fields() {
+    // The push-sink variant shares `SrtOptions`; the same options must survive
+    // deserialization and export there too (ADR-0039 §2 adds them to both).
+    let toml_str = "kind = \"srt\"\nid = \"srt_push\"\nurl = \"srt://[::1]:9000\"\n\
+         codec = \"h264\"\n\n[srt]\noheadbw_pct = 25\nmaxbw = 1250000\n\
+         peer_idle_timeout_ms = 5000\nconn_timeout_ms = 3000\nlistener = false\n\
+         backend = \"native\"\n";
+    let out: Output = toml::from_str(toml_str).expect("valid SRT output");
+    let opts = match &out {
+        Output::Srt {
+            srt: Some(opts), ..
+        } => opts,
+        other => panic!("expected an SRT output with options, got {other:?}"),
+    };
+    assert_eq!(opts.listener, Some(false));
+    assert_eq!(opts.oheadbw_pct, Some(25));
+    assert_eq!(opts.maxbw, Some(1_250_000));
+    assert_eq!(opts.peer_idle_timeout_ms, Some(5000));
+    assert_eq!(opts.conn_timeout_ms, Some(3000));
+    assert_eq!(opts.backend, Some(SrtBackend::Native));
+    out.validate().expect("the options validate");
+}
+
+proptest! {
+    /// `oheadbw_pct` is exactly libsrt's `SRTO_OVERHEADBW` domain `5..=100`.
+    #[test]
+    fn srt_oheadbw_pct_range_property(pct in 0u32..200u32) {
+        let src = srt_source_with_block(&format!("oheadbw_pct = {pct}\n"));
+        prop_assert_eq!(src.validate().is_ok(), (5..=100).contains(&pct));
+    }
+
+    /// `maxbw` is bytes/sec with `-1` = unlimited and `0` = auto/relative; every
+    /// value below the sentinel is rejected.
+    #[test]
+    fn srt_maxbw_range_property(maxbw in -8i64..1_250_001i64) {
+        let src = srt_source_with_block(&format!("maxbw = {maxbw}\n"));
+        prop_assert_eq!(src.validate().is_ok(), maxbw >= -1);
+    }
+
+    /// Every remaining SRT-0 field survives a JSON round trip for arbitrary
+    /// (including out-of-range) values — serialization never drops one.
+    #[test]
+    fn srt_remaining_srt0_fields_roundtrip_property(
+        listener in any::<bool>(),
+        oheadbw_pct in any::<u32>(),
+        maxbw in any::<i64>(),
+        peer_idle_timeout_ms in any::<u32>(),
+        conn_timeout_ms in any::<u32>(),
+    ) {
+        let json = format!(
+            r#"{{"listener":{listener},"oheadbw_pct":{oheadbw_pct},"maxbw":{maxbw},"peer_idle_timeout_ms":{peer_idle_timeout_ms},"conn_timeout_ms":{conn_timeout_ms}}}"#
+        );
+        let opts: SrtOptions = serde_json::from_str(&json).expect("parses");
+        let round = serde_json::to_string(&opts).expect("serializes");
+        let reparsed: SrtOptions = serde_json::from_str(&round).expect("re-parses");
+        prop_assert_eq!(opts, reparsed);
+    }
 }
