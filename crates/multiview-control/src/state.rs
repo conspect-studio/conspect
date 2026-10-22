@@ -14,6 +14,8 @@ use multiview_engine::EnginePublisher;
 use multiview_events::Event;
 use multiview_licence::verify::PinnedKey;
 use multiview_licence::{ChallengeFile, LeaseStore};
+use multiview_mesh::MeshState;
+use multiview_telemetry::RetentionStore;
 
 use crate::account_audit::{AccountAuditRepository, InMemoryAccountAudit};
 use crate::alarm_store::{AlarmRepository, InMemoryAlarmStore};
@@ -22,21 +24,31 @@ use crate::audit::{AuditRepository, InMemoryAuditLog};
 use crate::auth::ApiKeyStore;
 use crate::command::CommandSender;
 use crate::concurrency::IdempotencyStore;
+use crate::devices::cast::media::CastDelivery;
+use crate::devices::cast::store::CastSessionStore;
 use crate::devices::discovery::{DiscoveryBrowser, DiscoveryInventory, NullBrowser, ScanGate};
 use crate::devices::{DeviceDriverRegistry, DevicePollerRegistry, DeviceStatusRegistry};
 use crate::error::{ControlError, ControlResult};
+use crate::limits::Limiters;
 use crate::nmos::NmosRegistry;
 use crate::pending_actions::{InMemoryPendingActions, PendingActionRepository};
 use crate::repository::{InMemoryRepository, LayoutInput, Repository};
 use crate::resource_store::{
-    InMemoryDeviceStore, InMemoryOutputStore, InMemoryOverlayStore, InMemoryProbeStore,
-    InMemorySourceStore, InMemorySyncGroupStore, ResourceInput, ResourceRepository,
+    InMemoryDeviceStore, InMemoryMediaPlayerStore, InMemoryOutputStore, InMemoryOverlayStore,
+    InMemoryProbeStore, InMemorySourceStore, InMemorySyncGroupStore, ResourceInput,
+    ResourceRepository,
 };
 use crate::router::RouteTable;
 use crate::salvo_store::{InMemorySalvoStore, SalvoRepository};
+use crate::support_bundle::{BundleRepository, InMemoryBundles};
+use crate::support_store::{
+    support_route, DataRequestRepository, InMemoryDataRequests, InMemoryTickets, SupportRoute,
+    TicketContext, TicketEnforcement, TicketEntitlement, TicketRepository,
+};
 use crate::tally_state::{
     InMemoryProfileStore, OverrideRegistry, TallyMirror, TallyProfileRepository,
 };
+use crate::telemetry_consent::{ConsentState, DiagnosticsSnapshotStore};
 use crate::versioning::{ConfigVersionStore, InMemoryConfigVersionStore};
 use crate::warning_store::{InMemoryWarningStore, WarningRepository};
 
@@ -146,6 +158,10 @@ pub struct SeededResources {
     /// The `sync-groups` store, one resource per `config.sync_groups`
     /// (presentation-sync groups, ADR-M008/M010).
     pub sync_groups: Arc<dyn ResourceRepository>,
+    /// The `media-players` registry, one resource per `config.media_players`
+    /// (pre-declared player channels, ADR-0057 / ADR-0097). Read-mostly: the
+    /// transport + vamp-exit routes look players up here for existence + BOLA.
+    pub media_players: Arc<dyn ResourceRepository>,
     /// The device **status** registry, seeded with one `ADOPTING` runtime row
     /// per `config.devices` so a freshly-booted control plane answers
     /// `GET /devices/{id}/status` before any driver probe. Runtime state only —
@@ -154,6 +170,19 @@ pub struct SeededResources {
     /// The audio-routing singleton store, seeded from the config's optional
     /// `[audio]` block (unconfigured when the config carries none).
     pub audio: Arc<AudioRoutingStore>,
+    /// The `salvos` store, one definition per `config.salvos` (ADR-W024 round
+    /// 6). A salvo DEFINITION is runtime-mutable through `PUT/DELETE
+    /// /api/v1/salvos/{id}` — a pure control-plane store edit with NO engine
+    /// command (arm/take/cancel submit recall commands, never the definition),
+    /// so the store IS the adopted state and `active.toml` is composed from it
+    /// (not verbatim from the boot base, which lost runtime edits on resume).
+    pub salvos: Arc<dyn SalvoRepository>,
+    /// The `tally_profiles` store, one profile per `config.tally_profiles`
+    /// (ADR-W024 round 6). A tally PROFILE is runtime-mutable through
+    /// `PUT/DELETE /api/v1/tally/profiles/{id}` — a pure control-plane store
+    /// edit (the override route submits a runtime command, never the profile),
+    /// so the store IS the adopted state and `active.toml` is composed from it.
+    pub tally_profiles: Arc<dyn TallyProfileRepository>,
     /// The layout store carrying the single working layout (canvas + cells).
     pub layouts: Arc<dyn Repository>,
     /// The id the working layout was seeded under (the solved layout's name,
@@ -205,6 +234,12 @@ fn to_body(value: &impl serde::Serialize) -> ControlResult<serde_json::Value> {
 /// [`ControlError::Repository`] if a config value fails to serialize, and any
 /// [`ControlError`] a backing `create` surfaces (e.g. a duplicate id — not
 /// expected for a validated config).
+// A flat seed-each-registry function (one block per resource domain): inherently
+// long and clearer kept whole than split — the per-domain helpers (e.g.
+// `seed_media_players`) are already extracted; the residual length is the
+// one-line-per-registry construction + the `SeededResources` literal (W024's
+// boot-model registries + the media-players registry tipped it 2 over the bound).
+#[allow(clippy::too_many_lines)]
 pub fn seed_resources(config: &MultiviewConfig) -> ControlResult<SeededResources> {
     let sources = InMemorySourceStore::new();
     for source in &config.sources {
@@ -276,6 +311,8 @@ pub fn seed_resources(config: &MultiviewConfig) -> ControlResult<SeededResources
         )?;
     }
 
+    let media_players = seed_media_players(config)?;
+
     let outputs = InMemoryOutputStore::new();
     for (index, output) in config.outputs.iter().enumerate() {
         // Outputs carry no intrinsic id in the config schema; assign a stable,
@@ -291,6 +328,20 @@ pub fn seed_resources(config: &MultiviewConfig) -> ControlResult<SeededResources
         outputs.create(&id, ResourceInput { name: kind, body })?;
     }
 
+    // Salvo definitions + tally profiles (ADR-W024 round 6): seeded one per
+    // config entry so the runtime-mutable definition stores hold the boot
+    // state, and `active.toml` is composed FROM these stores (not verbatim from
+    // the boot base, which lost runtime REST edits on resume). Their CRUD is a
+    // pure store edit — no engine command, so the store IS the adopted state.
+    let salvos = InMemorySalvoStore::new();
+    for salvo in &config.salvos {
+        salvos.create(salvo.clone())?;
+    }
+    let tally_profiles = InMemoryProfileStore::new();
+    for profile in &config.tally_profiles {
+        tally_profiles.put(profile.clone())?;
+    }
+
     let layouts = InMemoryRepository::new();
     let working_layout_id = seed_working_layout(config, &layouts)?;
 
@@ -301,8 +352,11 @@ pub fn seed_resources(config: &MultiviewConfig) -> ControlResult<SeededResources
         probes: Arc::new(probes),
         devices: Arc::new(devices),
         sync_groups: Arc::new(sync_groups),
+        media_players: Arc::new(media_players),
         device_status: Arc::new(device_status),
         audio: Arc::new(AudioRoutingStore::seeded(config.audio.clone())),
+        salvos: Arc::new(salvos),
+        tally_profiles: Arc::new(tally_profiles),
         layouts: Arc::new(layouts),
         working_layout_id,
         // Snapshot the pinned canvas from the LOADED CONFIG (the geometry +
@@ -314,6 +368,32 @@ pub fn seed_resources(config: &MultiviewConfig) -> ControlResult<SeededResources
             config.canvas.fps,
         ),
     })
+}
+
+/// Seed the `media-players` registry, one resource per `config.media_players`
+/// (pre-declared player channels, ADR-0057 / ADR-0097). The body is the typed
+/// [`MediaPlayer`](multiview_config::MediaPlayer) serialized to canonical JSON
+/// (round-trips back to `MediaPlayer`). Config validation (run before this)
+/// already enforced unique player ids and the MVP cap, so the `create` calls
+/// cannot collide; a serialization fault surfaces as
+/// [`ControlError::Repository`] rather than a panic.
+///
+/// # Errors
+///
+/// [`ControlError::Repository`] if a player fails to serialize, and any
+/// [`ControlError`] a backing `create` surfaces.
+fn seed_media_players(config: &MultiviewConfig) -> ControlResult<InMemoryMediaPlayerStore> {
+    let media_players = InMemoryMediaPlayerStore::new();
+    for player in &config.media_players {
+        media_players.create(
+            &player.id,
+            ResourceInput {
+                name: player.id.clone(),
+                body: to_body(player)?,
+            },
+        )?;
+    }
+    Ok(media_players)
 }
 
 /// Seed the single working layout (canvas + grid/layout strategy + cells) into
@@ -346,6 +426,104 @@ fn seed_working_layout(
         },
     )?;
     Ok(id)
+}
+
+/// Default capacity of the bounded log-tail ring (ADR-0060 §4.4): the last
+/// ~2000 structured records are retained for `GET /api/v1/logs`, drop-oldest.
+const DEFAULT_LOG_RING_CAPACITY: usize = 2000;
+
+/// The source kinds the running engine can apply **live** (ADR-W018,
+/// invariant #11) — the run-path capability signal the binary threads into the
+/// control plane so the apply header stays honest per build/run flavour.
+///
+/// * `synthetic` — `bars`/`solid`/`clock` spawn in-process generators through
+///   the live-source hub (both run paths wire this).
+/// * `network` — `rtsp`/`hls`/`ts`/`srt`/`rtmp`/`file`/`rist` spawn the
+///   supervised `ingest_loop` through the hub's ingest spawner (the
+///   full-pipeline / `ffmpeg` run path only; the software engine has no
+///   decoder).
+///
+/// Kinds outside both sets (`ndi`, `youtube`, `aes67`) are never live-applied
+/// in this slice and always answer `restart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSourceCapability {
+    /// Synthetic kinds (`bars`/`solid`/`clock`) are live-appliable.
+    pub synthetic: bool,
+    /// Network/file kinds (`rtsp`/`hls`/`ts`/`srt`/`rtmp`/`file`) are
+    /// live-appliable. RIST is gated separately on [`Self::rist`] because it
+    /// needs the off-by-default `rist` feature in the engine build.
+    pub network: bool,
+    /// RIST (`rist`) is live-appliable. RIST rides the same `ingest_loop` as
+    /// the other network kinds **only when the engine build carries the
+    /// off-by-default `rist` feature** (it lowers to a `rist://` AVIO URL via
+    /// `librist`); on an `ffmpeg`-without-`rist` build a RIST spawn is a typed
+    /// refusal, so the header must NOT claim `live` for it. The binary sets
+    /// this from `cfg!(feature = "rist")` (via [`Self::with_rist`]) — the
+    /// control plane cannot see the engine's compiled features.
+    pub rist: bool,
+}
+
+impl LiveSourceCapability {
+    /// The software-engine run path: only in-process synthetic producers can
+    /// be spawned live (no decoder in the build/run).
+    #[must_use]
+    pub const fn synthetic_only() -> Self {
+        Self {
+            synthetic: true,
+            network: false,
+            rist: false,
+        }
+    }
+
+    /// The full-pipeline (`ffmpeg`) run path: a real ingest spawner is wired
+    /// into the live-source hub, so network/file kinds apply live too. RIST is
+    /// included here for the canonical "full network" meaning; the binary
+    /// narrows it with [`Self::with_rist`] to the build's actual `rist`-feature
+    /// truth so the header never over-claims on an `ffmpeg`-without-`rist`
+    /// build.
+    #[must_use]
+    pub const fn synthetic_and_network() -> Self {
+        Self {
+            synthetic: true,
+            network: true,
+            rist: true,
+        }
+    }
+
+    /// Narrow (or widen) the RIST live-apply capability to the engine build's
+    /// actual `rist`-feature truth (the binary passes `cfg!(feature = "rist")`).
+    #[must_use]
+    pub const fn with_rist(mut self, rist: bool) -> Self {
+        self.rist = rist;
+        self
+    }
+
+    /// Whether the running engine can apply a mutation of this `kind` live.
+    #[must_use]
+    pub fn is_live(&self, kind: &multiview_config::SourceKind) -> bool {
+        if kind.is_synthetic() {
+            return self.synthetic;
+        }
+        // RIST is network media but feature-gated: it is live only when the
+        // engine build actually carries the `rist` feature, else the header
+        // would over-claim `live` for a spawn that refuses (tile rides slate).
+        if matches!(kind, multiview_config::SourceKind::Rist { .. }) {
+            return self.rist;
+        }
+        if kind.is_network_media() {
+            return self.network;
+        }
+        // ndi / youtube / aes67 (and any future kind until explicitly wired):
+        // never live in this slice — restart, honestly.
+        false
+    }
+}
+
+impl Default for LiveSourceCapability {
+    /// Defaults to the conservative truth: synthetic-only (never over-claims).
+    fn default() -> Self {
+        Self::synthetic_only()
+    }
 }
 
 /// The shared application state.
@@ -386,6 +564,12 @@ pub struct AppState {
     /// presentation-sync groups, ADR-M008/M010). The body is a
     /// `multiview_config::SyncGroup`.
     pub sync_groups: Arc<dyn ResourceRepository>,
+    /// The media-players registry (read-mostly, seeded from
+    /// `config.media_players`; ADR-0057 / ADR-0097). The transport + vamp-exit
+    /// routes look a player up here for the existence check (`404` on an unknown
+    /// id) and per-object authorization (BOLA) before submitting to the engine.
+    /// The body is a `multiview_config::MediaPlayer`.
+    pub media_players: Arc<dyn ResourceRepository>,
     /// The latest-wins device **status** registry (runtime state, never
     /// persisted/exported): the conflated `device.status` lane's backing store
     /// and `GET /devices/{id}/status`'s cold-snapshot source. Bounded, control-
@@ -433,6 +617,31 @@ pub struct AppState {
     /// behind the `zowietek` feature. Control-plane-only, `Mutex`-guarded handle
     /// map — it can never back-pressure the engine (invariant #10).
     pub device_pollers: Arc<DevicePollerRegistry>,
+    /// The Cast **delivery map** (DEV-D2, ADR-M011): output id → the
+    /// device-reachable HLS rendition URL + segment format, built by the
+    /// binary from the validated `control.cast_media_base` × the DEV-D1
+    /// `/hls/{output-id}` mounts. [`None`] (the default — no
+    /// `cast_media_base` configured) means no device-reachable URL can be
+    /// derived and the cast-session routes refuse with an honest `409`.
+    /// Read-only control-plane state (invariant #10).
+    pub cast_delivery: Option<Arc<CastDelivery>>,
+    /// The outbound-dial SSRF policy (SEC-02/SEC-04, CWE-918) the managed-device
+    /// poller and Cast session actor screen each resolved dial IP against. The
+    /// non-breaking default
+    /// ([`DialPolicy::allow_lan`](multiview_config::device::net_guard::DialPolicy::allow_lan))
+    /// keeps a self-hosted appliance reaching its LAN devices (private/ULA/carrier
+    /// dialable) while the never-legitimate ranges (loopback, link-local incl. the
+    /// cloud-metadata IP, unspecified, multicast/broadcast) stay blocked; an
+    /// operator `control.device_dial_allow` allowlist tightens the dial to its own
+    /// device subnet(s). Read-only control-plane state (invariant #10).
+    pub dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
+    /// The runtime store of **ephemeral** cast sessions (DEV-D2, ADR-M011):
+    /// runtime-only records that never enter the devices store, so a config
+    /// export can never emit them. "Save as device" promotes one into a
+    /// normal `Device{driver: cast}` registry entry and drops the record.
+    /// Bounded by the number of live sessions; control-plane-only
+    /// (invariant #10).
+    pub cast_sessions: Arc<CastSessionStore>,
     /// The audio-routing singleton store (the document-level `[audio]` block:
     /// program-bus membership/gains and discrete-track wiring), managed over
     /// `GET`/`PUT /api/v1/audio-routing` and overlaid into the config export.
@@ -459,6 +668,14 @@ pub struct AppState {
     pub routes: Arc<RouteTable>,
     /// The API-key + RBAC store.
     pub api_keys: Arc<ApiKeyStore>,
+    /// The management-plane request-concurrency + rate limiters (SEC-14 control-plane
+    /// `DoS` floor): the concurrent-request cap plus the per-IP (pre-auth) and
+    /// per-API-key (post-auth) token buckets. Built from `control.limits` by the
+    /// binary via [`AppState::with_limits`]; the bare constructor defaults to the
+    /// inert (disabled) set, so tests and embedders are unlimited unless they opt
+    /// in. Control-plane only — the guards shed (`429`/`503`), never back-pressure
+    /// the engine (invariant #10).
+    pub(crate) limiters: Arc<Limiters>,
     /// The optional `OAuth2`/JWT validator. When configured, a `Bearer` token that
     /// is not a native API key is validated as an IS-10-aligned JWT (signature +
     /// issuer/audience/expiry, `alg=none` refused) and its claims mapped to a
@@ -510,14 +727,52 @@ pub struct AppState {
     /// a focus session is a best-effort preview consumer that can never
     /// back-pressure the engine.
     pub whep: crate::preview::SharedWhep,
+    /// The WHIP ingest transport seam (RFC 9725 WebRTC contribution sources).
+    /// The default ([`NoWhip`](crate::whip::NoWhip)) refuses every publish with
+    /// an honest `503`; the binary swaps in a `multiview-webrtc`-backed provider.
+    /// Isolation-safe (invariant #10): a WHIP publisher is an ingest source that
+    /// can never back-pressure the engine.
+    pub whip: crate::whip::SharedWhip,
+    /// The WHEP **output-viewer** transport seam (ADR-0049 §5.1): a browser
+    /// `POST`s an SDP offer to `/api/v1/whep/{output_id}` to play the real encoded
+    /// program rendition. The default ([`NoWhepOutput`](crate::whep_output::NoWhepOutput))
+    /// refuses every offer with an honest `503`; the binary swaps in a
+    /// `multiview-webrtc`-backed provider. Isolation-safe (invariant #10): a WHEP
+    /// viewer is a real-output consumer fed the encode-once program over a bounded
+    /// drop-oldest ring and can never back-pressure the engine.
+    pub whep_output: crate::whep_output::SharedWhepOutput,
     /// Whether authentication is **disabled** (every request runs as a local
     /// admin). Off by default — the control plane requires a verified API key.
     /// An operator turns this on **explicitly** (config/env) for a trusted/local
     /// deployment; the binary logs a loud warning when it does. When `true`, the
     /// `Principal` extractor and the realtime `resolve_principal` short-circuit to
     /// [`Principal::local_admin`](crate::auth::Principal::local_admin) without a
-    /// token, so the whole API + WS/SSE are open.
+    /// token, so the whole API + WS/SSE are open. The realtime `Origin` CSWSH gate
+    /// ([`AppState::allowed_origins`]) is enforced **independently** of this flag.
     pub auth_disabled: bool,
+    /// The bounded, single-use realtime **ticket** store (ADR-RT011): a browser
+    /// mints a short-lived ticket via `POST /api/v1/ws/ticket` and connects with
+    /// `?ticket=`, so the durable bearer never rides a WS/SSE URL (SEC-01,
+    /// CWE-598). Control-plane-only, TTL-swept, drop-oldest — it can never
+    /// back-pressure the engine (invariant #10).
+    pub ws_tickets: Arc<crate::realtime::WsTicketStore>,
+    /// The realtime `Origin` allow-list (SEC-13 / CSWSH, ADR-RT011): the WS **and**
+    /// SSE upgrades reject a cross-origin handshake (a foreign page cannot reach the
+    /// firehose), enforced even when [`AppState::auth_disabled`]. Empty (the default)
+    /// permits same-origin only (`Origin` authority == request `Host`); the binary
+    /// widens it from `control.allowed_origins`. Read-only control-plane state
+    /// (invariant #10).
+    pub allowed_origins: Arc<crate::realtime::AllowedOrigins>,
+    /// The CORS allow-list applied to the **WebRTC media-signalling routes**
+    /// (WHIP ingest, WHEP-serve output, the preview-WHEP focus routes, and
+    /// preview capabilities — ADR-0048 §9). Each entry is an allowed `Origin`,
+    /// or the wildcard `"*"` (the default) which reflects any `Origin`. A
+    /// cross-origin request carrying a listed origin gets it reflected in
+    /// `Access-Control-Allow-Origin`; an unlisted origin gets none (the browser
+    /// blocks it). It applies **only** to those routes — never the resource CRUD
+    /// or realtime surfaces — and only to requests that carry an `Origin` (a
+    /// non-browser publisher/player sees no CORS headers). Default `["*"]`.
+    pub cors_allow_origins: Arc<Vec<String>>,
     /// The complete configuration document loaded at startup (serialized
     /// verbatim), used as the baseline for `GET /api/v1/config/export` so
     /// sections the resource stores do not carry (control, placement, audio,
@@ -539,6 +794,120 @@ pub struct AppState {
     /// only; it can never back-pressure the engine or take a program off air
     /// (invariant #1/#10). The default is empty + unpinned.
     pub licence: LicenceState,
+    /// The local-mesh discovery/relay plane (Conspect, ADR-0051): the untrusted
+    /// discovered-peer inventory, the relay opt-in toggle, and the computed mesh
+    /// role the `/api/v1/mesh/*` routes render + toggle. The binary wires the same
+    /// `Arc<MeshState>` the always-on announce/browse loop maintains, so the
+    /// endpoints serve live discovery state. Control-plane only (an `RwLock` over a
+    /// bounded inventory, no engine handle) — it can never back-pressure the engine
+    /// (invariant #10). The default is an empty, relay-declined state.
+    pub mesh: Arc<MeshState>,
+    /// The **telemetry-consent** record (Conspect, ADR-0052 §2): the single
+    /// last-writer-wins document governing the (future, O1-gated) **outbound daily
+    /// telemetry pipe**. Off by default (opt-in, incl. the free tier). This is the
+    /// TELEMETRY pipe's consent — deliberately separate from the licensing
+    /// heartbeat (which lives under `/api/v1/licensing/`, never `/telemetry/`). It
+    /// gates **no** local route; staying off costs none of the local UI/API.
+    /// Control-plane only (a `Mutex` over one record, no engine handle) — it can
+    /// never back-pressure the engine (invariant #10). The default is off/local.
+    pub consent: Arc<ConsentState>,
+    /// The **diagnostics-snapshot** store (Conspect, spec §4.2 / ADR-0053): the
+    /// bounded, in-memory store of assembled `GET /api/v1/diagnostics/{id}`
+    /// bundles, keyed by id, the `POST /api/v1/diagnostics/snapshot` writes. The
+    /// bundle is composed by the shared [`crate::support_bundle::compose_bundle`]
+    /// machinery (#111) from the consent-independent retention store + redacted
+    /// config — logs + engine state, never media. Control-plane only; cannot
+    /// back-pressure the engine (invariant #10).
+    pub diagnostics_snapshots: Arc<DiagnosticsSnapshotStore>,
+    /// The **local support ticket store** (Conspect, ADR-0053 §3 / brief §10/§11):
+    /// `CS-xxxx`-identified tickets with an append-only thread + the auto-attached
+    /// machine context (§7.1). The complete local lifecycle (raise/read/reply/
+    /// close) is functional now; the portal sync mirrors this local source over the
+    /// later O1 transport. Control-plane only; cannot back-pressure the engine
+    /// (inv #10).
+    pub tickets: Arc<dyn TicketRepository>,
+    /// The **inbound data-request store** (Conspect, ADR-0053 §3): egress requests
+    /// awaiting **local approval** — nothing leaves the machine without an explicit
+    /// local yes. Seeded locally now; portal-fed over the later transport.
+    /// Control-plane only; cannot back-pressure the engine (inv #10).
+    pub data_requests: Arc<dyn DataRequestRepository>,
+    /// The **composed support-bundle store** (Conspect, ADR-0053 §3 / brief §7.2):
+    /// previewable, redacted, **media-free** diagnostics packs the operator
+    /// deliberately assembles. Bounded; control-plane only (inv #10).
+    pub support_bundles: Arc<dyn BundleRepository>,
+    /// The **consent-independent local metrics retention store** (CONSPECT S5,
+    /// ADR-0052 §3): the rolling on-box utilisation/shed/reconnect/incident record
+    /// the support bundle + the diagnostics snapshot draw diagnostics from,
+    /// retained **regardless** of telemetry consent. The binary wires the same
+    /// store the off-hot-loop sampler feeds; the default is empty. Control-plane
+    /// only; cannot back-pressure the engine (inv #10).
+    pub retention: Arc<RetentionStore>,
+    /// The config-file watch status slot (ADR-W020): the CLI's watcher records
+    /// applied/rejected loads + restart-pending sections here, and
+    /// `GET /api/v1/config/watch-status` reads it. Defaults to the honest
+    /// "not watched" state. Control-plane-only (invariant #10).
+    pub config_watch: Arc<crate::watch_status::ConfigWatchStatus>,
+    /// The Boot/Loaded/Running model (ADR-W024): the boot path, the immutable
+    /// Loaded snapshot, the cold-start policy, and the boot-model file-write
+    /// serial. `Some` only when the run serves a control plane from a config
+    /// file; `None` for store-only/`--ticks` deployments (the
+    /// `revert-to-start`/`promote`/`boot-model` routes then report `modeled:
+    /// false` and refuse the actions). Control-plane-only (invariant #10).
+    pub boot_model: Option<Arc<crate::boot_model::BootModel>>,
+    /// The installed config-file watch HANDLE (ADR-W024 §6): the
+    /// `POST /api/v1/config/promote` route announces its server-side boot-file
+    /// write through this handle's `expect_write`/`confirm`/`release`
+    /// suppression seam (ADR-W020 §7) so the watcher adopts the write as its
+    /// new baseline instead of re-applying it. Interior-mutable because the
+    /// watcher is spawned WITH this `AppState` and so can only be installed
+    /// after construction ([`AppState::install_watch_handle`]). `None` for
+    /// store-only deployments (no watcher) — promote then skips suppression
+    /// (nothing to suppress). Control-plane-only (invariant #10).
+    watch_handle: Arc<std::sync::RwLock<Option<crate::config_watch::ConfigWatchHandle>>>,
+    /// Serializes the whole-Running mutation critical sections of
+    /// `POST /config/promote` and `POST /config/revert-to-start` (ADR-W024
+    /// MAJOR-C2/C3): each holds it across compose → write/apply → commit so a
+    /// concurrent promote/revert can neither interleave the watcher
+    /// suppression token (C2) nor mutate Running between a promote's compose and
+    /// its commit (C3, a stale commit). Control-plane-only, async, never held
+    /// across the engine bus — it serializes two rare admin operations and can
+    /// never back-pressure the engine (invariant #10).
+    config_mutation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The coalescing **Running-changed** signal (ADR-W024 §3): a one-permit
+    /// [`tokio::sync::Notify`] fired by [`AppState::audit`] — the ONE choke
+    /// point every successful mutation passes through — that the debounced
+    /// `active.toml` persister (`boot_model::spawn_running_persist`) waits on.
+    /// One permit, never queues/grows/blocks, so it can never back-pressure the
+    /// engine (invariant #10). Always present (cheap); only the persister task
+    /// observes it, and only when a boot model is wired.
+    pub running_changed: Arc<tokio::sync::Notify>,
+    /// What the **running** engine can take live, per stored collection
+    /// (ADR-W022): injected by the binary at wiring time so mutation routes
+    /// declare `X-Multiview-Apply` honestly per build + run path. The default
+    /// carries no capability (everything is `restart`).
+    pub live_apply: crate::live_apply::LiveApplyCaps,
+    /// Which source kinds the **running engine** can apply live (ADR-W018):
+    /// the binary declares this per run path, so the `X-Multiview-Apply`
+    /// header never claims `live` for a kind the engine cannot ingest at
+    /// runtime. Defaults to [`LiveSourceCapability::synthetic_only`] (the
+    /// software-engine truth); the full-pipeline run upgrades to
+    /// [`LiveSourceCapability::synthetic_and_network`].
+    pub live_sources: LiveSourceCapability,
+    /// The static system capability + licence snapshot served by
+    /// `GET /api/v1/system/capabilities` (ADR-W030): which codec/compositor
+    /// backends are available, the compositor class, the effective build-profile
+    /// licence, and the NDI attribution. The binary maps `hal::probe()` +
+    /// compiled features + the resolved adapter into this at startup
+    /// (`with_capabilities`); the default is the coarse software-only surface. A
+    /// one-shot snapshot — never an engine channel (invariant #10).
+    pub capabilities: crate::system::SystemCapabilities,
+    /// The bounded, drop-oldest structured **log-tail ring** (ADR-0060 §4.4):
+    /// recent attributed [`LogRecord`](multiview_telemetry::LogRecord)s the
+    /// `GET /api/v1/logs` read route serves. The binary installs the telemetry
+    /// `LogCaptureLayer` feeding the same `Arc<LogRing>`; the default is an empty
+    /// ring (no capture installed → the endpoint honestly returns nothing).
+    /// Bounded and read-only — it can never back-pressure the engine (inv #10).
+    pub logs: Arc<multiview_telemetry::LogRing>,
 }
 
 /// The default [`AckClock`]: system time as nanoseconds since the Unix epoch.
@@ -573,6 +942,7 @@ impl AppState {
             probes: Arc::new(InMemoryProbeStore::new()),
             devices: Arc::new(InMemoryDeviceStore::new()),
             sync_groups: Arc::new(InMemorySyncGroupStore::new()),
+            media_players: Arc::new(InMemoryMediaPlayerStore::new()),
             device_status: Arc::new(DeviceStatusRegistry::new()),
             discovery: Arc::new(DiscoveryInventory::default()),
             discovery_browser: Arc::new(NullBrowser),
@@ -580,6 +950,12 @@ impl AppState {
             discovery_config: Arc::new(multiview_config::DiscoveryConfig::default()),
             device_drivers: Arc::new(DeviceDriverRegistry::new()),
             device_pollers: Arc::new(DevicePollerRegistry::new()),
+            cast_delivery: None,
+            // Non-breaking default: LAN devices (private/ULA/carrier) stay
+            // dialable, never-legitimate ranges stay blocked. An operator
+            // `control.device_dial_allow` allowlist tightens it (SEC-02/SEC-04).
+            dial_policy: Arc::new(multiview_config::device::net_guard::DialPolicy::allow_lan()),
+            cast_sessions: Arc::new(CastSessionStore::new()),
             audio_routing: Arc::new(AudioRoutingStore::new()),
             alarms: Arc::new(InMemoryAlarmStore::new()),
             warnings: Arc::new(InMemoryWarningStore::new()),
@@ -590,6 +966,10 @@ impl AppState {
             nmos: Arc::new(NmosRegistry::new()),
             routes: Arc::new(RouteTable::new()),
             api_keys,
+            // Inert by default (no DoS floor): the binary installs the configured
+            // limiters via `with_limits` (`control.limits`, secure defaults). Tests
+            // and embedders stay unlimited unless they opt in (SEC-14).
+            limiters: Arc::new(Limiters::disabled()),
             jwt: None,
             jwt_api_name: "multiview".to_owned(),
             audit: Arc::new(InMemoryAuditLog::new()),
@@ -605,14 +985,89 @@ impl AppState {
             ack_clock: Arc::new(system_ack_clock),
             preview: crate::preview::no_preview(),
             whep: crate::preview::no_whep(),
+            whip: crate::whip::no_whip(),
+            whep_output: crate::whep_output::no_whep_output(),
             // Secure default: authentication is REQUIRED. An operator opts out
             // explicitly via `with_auth_disabled` (config/env), never silently.
             auth_disabled: false,
+            // A fresh, empty realtime ticket store (ADR-RT011): the browser mints a
+            // short-lived single-use ticket for the WS/SSE upgrade so the durable
+            // bearer never rides a URL (SEC-01). Bounded + TTL-swept (invariant #10).
+            ws_tickets: Arc::new(crate::realtime::WsTicketStore::new()),
+            // Same-origin-only by default (empty allow-list): the embed-web SPA is
+            // permitted with no config; the binary widens it from
+            // `control.allowed_origins`. Enforced on WS + SSE even auth-disabled
+            // (SEC-13 / CSWSH). Read-only control-plane state (invariant #10).
+            allowed_origins: Arc::new(crate::realtime::AllowedOrigins::default()),
+            // Wildcard CORS on the media-signalling routes by default (ADR-0048
+            // §9): a browser served from any web origin can WHIP-publish /
+            // WHEP-play. The binary narrows this from `webrtc.cors_allow_origins`.
+            cors_allow_origins: Arc::new(vec!["*".to_owned()]),
             // Empty + unpinned by default: the licence resource reports
             // unlicensed data and the install path refuses until the binary
             // pins an issuer key + wires a store (CONSPECT-10). Never off air.
             licence: LicenceState::default(),
+            // Empty mesh state by default: always-on discovery with no peers yet
+            // and relay declined. The binary swaps in the shared store the
+            // announce/browse loop maintains. Control-plane only (invariant #10).
+            mesh: Arc::new(MeshState::new()),
+            // Telemetry consent OFF by default (opt-in, incl. the free tier,
+            // ADR-0052 §1). Gates no local route. Control-plane only (inv #10).
+            consent: Arc::new(ConsentState::new()),
+            // An empty diagnostics-snapshot store; bundles are composed on request
+            // (via the shared support_bundle composer) from the retention store.
+            // Control-plane only (inv #10).
+            diagnostics_snapshots: Arc::new(DiagnosticsSnapshotStore::new()),
+            // Empty local support state by default (Conspect, ADR-0053): a fresh
+            // ticket store, an empty inbound data-request queue, an empty composed-
+            // bundle store, and an empty retention store. The binary wires the same
+            // retention store its off-hot-loop sampler feeds. Control-plane only.
+            tickets: Arc::new(InMemoryTickets::new()),
+            data_requests: Arc::new(InMemoryDataRequests::new()),
+            support_bundles: Arc::new(InMemoryBundles::new()),
+            retention: Arc::new(RetentionStore::new()),
+            // No watcher by default: the endpoint reports "not watched".
+            config_watch: Arc::new(crate::watch_status::ConfigWatchStatus::new()),
+            // No boot model by default (store-only / --ticks): the
+            // boot-model routes report `modeled: false` (ADR-W024). The binary
+            // installs one via `with_boot_model` when it runs from a config
+            // file. The coalescing running-changed signal always exists (cheap).
+            boot_model: None,
+            running_changed: Arc::new(tokio::sync::Notify::new()),
+            // No watcher handle by default (store-only): promote skips
+            // self-write suppression (nothing to suppress). The binary installs
+            // the spawned watcher's handle via `install_watch_handle`.
+            watch_handle: Arc::new(std::sync::RwLock::new(None)),
+            // The promote/revert mutation serial (ADR-W024 MAJOR-C2/C3).
+            config_mutation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            // Honest default: nothing applies live until the binary declares
+            // what the running engine can take (ADR-W022).
+            live_apply: crate::live_apply::LiveApplyCaps::default(),
+            // Conservative default (the software-engine truth): only synthetic
+            // kinds live-apply. The binary upgrades this per run path
+            // (`with_live_sources`) — the header never over-claims.
+            live_sources: LiveSourceCapability::synthetic_only(),
+            // The coarse honest software-only capability surface until the binary
+            // maps the real HAL probe + compiled features (`with_capabilities`,
+            // ADR-W030). A static snapshot (inv #10).
+            capabilities: crate::system::SystemCapabilities::default(),
+            // An empty bounded log ring by default (ADR-0060 §4.4). The binary
+            // installs the telemetry capture layer feeding the same Arc; with no
+            // capture installed the endpoint honestly returns nothing. Drop-oldest
+            // beyond the cap; read-only (inv #10).
+            logs: Arc::new(multiview_telemetry::LogRing::new(DEFAULT_LOG_RING_CAPACITY)),
         }
+    }
+
+    /// Install a shared bounded [`LogRing`](multiview_telemetry::LogRing) for the
+    /// `GET /api/v1/logs` tail (ADR-0060). The binary passes the same `Arc` the
+    /// telemetry `LogCaptureLayer` feeds, so the endpoint serves live captured
+    /// records; tests seed a ring directly. Read-only; cannot back-pressure the
+    /// engine (invariant #10).
+    #[must_use]
+    pub fn with_log_ring(mut self, logs: Arc<multiview_telemetry::LogRing>) -> Self {
+        self.logs = logs;
+        self
     }
 
     /// Wire the local entitlement plane (Conspect): the verified-lease store the
@@ -623,6 +1078,152 @@ impl AppState {
     #[must_use]
     pub fn with_licence(mut self, licence: LicenceState) -> Self {
         self.licence = licence;
+        self
+    }
+
+    /// Wire the local-mesh plane (Conspect, ADR-0051): the shared
+    /// [`MeshState`](multiview_mesh::MeshState) the always-on announce/browse loop
+    /// maintains, so `/api/v1/mesh/*` serves live discovery state. The binary
+    /// passes the same `Arc` it spawns the loop with; tests inject a pre-seeded
+    /// store. Control-plane only (invariant #10).
+    #[must_use]
+    pub fn with_mesh(mut self, mesh: Arc<MeshState>) -> Self {
+        self.mesh = mesh;
+        self
+    }
+
+    /// Install a shared config-file watch status slot (ADR-W020). The binary
+    /// shares one slot between the spawned watcher and this router; the
+    /// default reports "not watched".
+    #[must_use]
+    pub fn with_config_watch(
+        mut self,
+        config_watch: Arc<crate::watch_status::ConfigWatchStatus>,
+    ) -> Self {
+        self.config_watch = config_watch;
+        self
+    }
+
+    /// Install the Boot/Loaded/Running model (ADR-W024). The binary wires the
+    /// same `Arc<BootModel>` the debounced persister and the
+    /// `revert-to-start`/`promote`/`boot-model` routes share; the default
+    /// (`None`) reports `modeled: false` and refuses those actions.
+    #[must_use]
+    pub fn with_boot_model(mut self, boot_model: Arc<crate::boot_model::BootModel>) -> Self {
+        self.boot_model = Some(boot_model);
+        self
+    }
+
+    /// Install the management-plane request-concurrency + rate limits (SEC-14
+    /// control-plane `DoS` floor) from operator config. The binary calls this with
+    /// `control.limits` (secure defaults); the bare constructor leaves the inert
+    /// disabled set, so tests and embedders stay unlimited unless they opt in. The
+    /// runtime limiters are built here, so callers never name the internal type.
+    ///
+    /// This is the PUBLIC runtime API, so — unlike the CLI config path, which
+    /// validates at load — an embedder can hand us an unvalidated
+    /// [`ManagementLimits`](multiview_config::limits::ManagementLimits). An invalid
+    /// one is dangerous: a zero concurrency cap installs a permanently-closed
+    /// semaphore (every request `503`) and an oversized cap would be silently clamped
+    /// to a different effective value. So validate here and, on failure, fall back to
+    /// the secure defaults (limits ON) with a warning — fail **SAFE**, never panic
+    /// (rule 17) — rather than honour a broken cap.
+    #[must_use]
+    pub fn with_limits(mut self, limits: &multiview_config::limits::ManagementLimits) -> Self {
+        let installed = match limits.validate() {
+            Ok(()) => limits.clone(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "control.limits failed validation; installing the secure defaults instead"
+                );
+                multiview_config::limits::ManagementLimits::default()
+            }
+        };
+        self.limiters = Arc::new(Limiters::from_config(&installed));
+        self
+    }
+
+    /// Install the spawned config-file watcher's handle (ADR-W024 §6) AFTER
+    /// construction: the watcher is spawned with this `AppState`, so the
+    /// handle it returns can only be wired back in via interior mutability.
+    /// The `promote` route then announces its boot-file write through this
+    /// handle's suppression seam. Idempotent last-writer-wins.
+    pub fn install_watch_handle(&self, handle: crate::config_watch::ConfigWatchHandle) {
+        let mut slot = match self.watch_handle.write() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(handle);
+    }
+
+    /// The installed config-file watch handle, if a watcher was spawned.
+    #[must_use]
+    pub fn watch_handle(&self) -> Option<crate::config_watch::ConfigWatchHandle> {
+        let slot = match self.watch_handle.read() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.clone()
+    }
+
+    /// Acquire the promote/revert mutation serial (ADR-W024 MAJOR-C2/C3): the
+    /// `promote` and `revert-to-start` handlers hold this across their whole
+    /// compose → write/apply → commit critical section so the two cannot
+    /// interleave. Held only by those two rare admin handlers; never across the
+    /// engine bus (invariant #10).
+    pub async fn lock_config_mutation(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.config_mutation_lock).lock_owned().await
+    }
+
+    /// Declare what the **running** engine can take live (ADR-W022). The
+    /// binary calls this with the capabilities of the chosen run path + build;
+    /// the honest default (nothing live) stands otherwise.
+    #[must_use]
+    pub fn with_live_apply(mut self, live_apply: crate::live_apply::LiveApplyCaps) -> Self {
+        self.live_apply = live_apply;
+        self
+    }
+
+    /// Declare which source kinds the running engine can apply live
+    /// (ADR-W018): the binary sets this per run path so the
+    /// `X-Multiview-Apply` header answers from the engine's real runtime
+    /// capability, never from wishful classification.
+    #[must_use]
+    pub fn with_live_sources(mut self, live_sources: LiveSourceCapability) -> Self {
+        self.live_sources = live_sources;
+        self
+    }
+
+    /// Install the static system capability + licence snapshot served by
+    /// `GET /api/v1/system/capabilities` (ADR-W030). The binary maps
+    /// `hal::probe()` + compiled features + the resolved compositor adapter into
+    /// this at startup; the default is the coarse software-only surface. A
+    /// one-shot snapshot — never an engine channel (invariant #10).
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: crate::system::SystemCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Wire the telemetry-consent record (Conspect, ADR-0052): the binary passes
+    /// the persistent/shared record; tests inject a pre-seeded one to exercise
+    /// last-writer-wins. Control-plane only (invariant #10). This is the TELEMETRY
+    /// pipe's consent — never the licensing heartbeat (which is implicit in
+    /// running the official build, not a document).
+    #[must_use]
+    pub fn with_consent(mut self, consent: Arc<ConsentState>) -> Self {
+        self.consent = consent;
+        self
+    }
+
+    /// Replace the diagnostics-snapshot store (e.g. to share one with a test).
+    #[must_use]
+    pub fn with_diagnostics_snapshots(
+        mut self,
+        diagnostics_snapshots: Arc<DiagnosticsSnapshotStore>,
+    ) -> Self {
+        self.diagnostics_snapshots = diagnostics_snapshots;
         self
     }
 
@@ -639,6 +1240,33 @@ impl AppState {
     #[must_use]
     pub fn with_whep(mut self, whep: crate::preview::SharedWhep) -> Self {
         self.whep = whep;
+        self
+    }
+
+    /// Replace the WHIP ingest transport provider (the binary wires a
+    /// `multiview-webrtc`-backed one; the default refuses every publish `503`).
+    #[must_use]
+    pub fn with_whip(mut self, whip: crate::whip::SharedWhip) -> Self {
+        self.whip = whip;
+        self
+    }
+
+    /// Set the CORS allow-list for the WebRTC media-signalling routes
+    /// (`webrtc.cors_allow_origins`, ADR-0048 §9). Each entry is an allowed
+    /// `Origin`, or the wildcard `"*"`. The binary maps the `[webrtc]` config
+    /// section through here; the default is `["*"]`.
+    #[must_use]
+    pub fn with_cors_allow_origins(mut self, origins: Vec<String>) -> Self {
+        self.cors_allow_origins = Arc::new(origins);
+        self
+    }
+
+    /// Replace the WHEP output-viewer transport provider (ADR-0049 §5.1; the
+    /// binary wires a `multiview-webrtc`-backed one, the default refuses every
+    /// viewer `503`).
+    #[must_use]
+    pub fn with_whep_output(mut self, whep_output: crate::whep_output::SharedWhepOutput) -> Self {
+        self.whep_output = whep_output;
         self
     }
 
@@ -662,6 +1290,16 @@ impl AppState {
     #[must_use]
     pub fn with_auth_disabled(mut self, disabled: bool) -> Self {
         self.auth_disabled = disabled;
+        self
+    }
+
+    /// Set the realtime `Origin` allow-list from `control.allowed_origins` (SEC-13 /
+    /// CSWSH, ADR-RT011). Each entry is a full origin (`scheme://host[:port]`); an
+    /// empty list (the default) permits same-origin only. Applied to the WS **and**
+    /// SSE upgrades, even when auth is disabled.
+    #[must_use]
+    pub fn with_allowed_origins(mut self, origins: Vec<String>) -> Self {
+        self.allowed_origins = Arc::new(crate::realtime::AllowedOrigins::new(origins));
         self
     }
 
@@ -708,6 +1346,12 @@ impl AppState {
             self.ack_now(),
             detail,
         );
+        // ADR-W024 §3: this is the ONE choke point every successful control-
+        // plane mutation passes through, so fire the coalescing Running-changed
+        // signal here — the debounced `active.toml` persister waits on it. One
+        // permit, never queues/grows/blocks (invariant #10); a no-op when no
+        // persister is running.
+        self.running_changed.notify_one();
     }
 
     /// Replace the account-side append-only audit store (e.g. to share one with a
@@ -742,6 +1386,88 @@ impl AppState {
         let _seq = self
             .account_audit
             .record(actor, kind, self.ack_now(), detail);
+    }
+
+    /// Replace the local support ticket store (e.g. to share one with a test).
+    #[must_use]
+    pub fn with_tickets(mut self, tickets: Arc<dyn TicketRepository>) -> Self {
+        self.tickets = tickets;
+        self
+    }
+
+    /// Replace the inbound data-request store (e.g. to share one with a test so it
+    /// can seed an inbound request the portal-fed transport will produce later).
+    #[must_use]
+    pub fn with_data_requests(mut self, data_requests: Arc<dyn DataRequestRepository>) -> Self {
+        self.data_requests = data_requests;
+        self
+    }
+
+    /// Replace the composed support-bundle store (e.g. to share one with a test).
+    #[must_use]
+    pub fn with_support_bundles(mut self, support_bundles: Arc<dyn BundleRepository>) -> Self {
+        self.support_bundles = support_bundles;
+        self
+    }
+
+    /// Wire the consent-independent local metrics retention store the support
+    /// bundle draws diagnostics from (the binary passes the same store its
+    /// off-hot-loop sampler feeds). Control-plane only (invariant #10).
+    #[must_use]
+    pub fn with_retention(mut self, retention: Arc<RetentionStore>) -> Self {
+        self.retention = retention;
+        self
+    }
+
+    /// The opaque commercial tier of the currently-installed lease (rendered,
+    /// never computed — O7), or `None` when no lease is installed (the free /
+    /// unlicensed machine).
+    #[must_use]
+    pub fn licence_tier(&self) -> Option<String> {
+        self.licence
+            .store
+            .current()
+            .map(|e| e.tier.as_str().to_owned())
+    }
+
+    /// The tier-derived support route this machine raises tickets against (the
+    /// routing half of the entitlement answer; `community` when unlicensed).
+    #[must_use]
+    pub fn support_route(&self) -> SupportRoute {
+        support_route(self.licence_tier().as_deref())
+    }
+
+    /// Build the auto-attached machine [`TicketContext`] every ticket carries
+    /// (§7.1): the build version, the entitlement summary (opaque tier +
+    /// licensed flag), the computed enforcement-ladder level, and the salted
+    /// fingerprint **score** (a number, never a raw identifier — brief §8). All
+    /// **reported, never raw**: derived from the local entitlement store, off the
+    /// engine hot loop.
+    #[must_use]
+    pub fn ticket_context(&self) -> TicketContext {
+        let status = self.licence.store.status();
+        let tier = self.licence_tier();
+        TicketContext {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            entitlement: TicketEntitlement {
+                licensed: tier.is_some(),
+                tier: tier.unwrap_or_else(|| "none".to_owned()),
+            },
+            enforcement: TicketEnforcement {
+                level: status.map_or_else(
+                    || "unlicensed".to_owned(),
+                    |s| {
+                        // The canonical enforcement-level slug the whole product
+                        // renders identically (kebab-case wire form).
+                        serde_json::to_value(s.enforcement)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "active".to_owned())
+                    },
+                ),
+            },
+            fingerprint_score: self.licence.store.fingerprint_score(),
+        }
     }
 
     /// Replace the alarm store (e.g. to share one store with an ingest task or
@@ -807,6 +1533,14 @@ impl AppState {
     #[must_use]
     pub fn with_sync_groups_store(mut self, sync_groups: Arc<dyn ResourceRepository>) -> Self {
         self.sync_groups = sync_groups;
+        self
+    }
+
+    /// Replace the media-players registry (e.g. to share one store with a test,
+    /// or to install the one seeded from `config.media_players`).
+    #[must_use]
+    pub fn with_media_player_store(mut self, media_players: Arc<dyn ResourceRepository>) -> Self {
+        self.media_players = media_players;
         self
     }
 
@@ -877,6 +1611,8 @@ impl AppState {
                 Arc::clone(&self.device_status),
             ),
             drivers: Arc::clone(&self.device_drivers),
+            cast_sessions: Arc::clone(&self.cast_sessions),
+            clock: Arc::clone(&self.ack_clock),
         }
     }
 
@@ -894,6 +1630,28 @@ impl AppState {
             .iter()
             .filter(|device| self.device_pollers.start(device, &wiring))
             .count()
+    }
+
+    /// Install the Cast delivery map (DEV-D2): the binary builds it from the
+    /// validated `control.cast_media_base` × the DEV-D1 HLS mounts; tests
+    /// inject a fixed map. Without one (the default), the cast-session routes
+    /// refuse with an honest `409` — no device-reachable URL can be derived.
+    #[must_use]
+    pub fn with_cast_delivery(mut self, delivery: Arc<CastDelivery>) -> Self {
+        self.cast_delivery = Some(delivery);
+        self
+    }
+
+    /// Install the outbound-dial SSRF allowlist (SEC-02/SEC-04): the binary
+    /// builds it from `control.device_dial_allow`; tests inject a fixed policy.
+    /// Without one, the secure default denies every internal range.
+    #[must_use]
+    pub fn with_dial_policy(
+        mut self,
+        policy: Arc<multiview_config::device::net_guard::DialPolicy>,
+    ) -> Self {
+        self.dial_policy = policy;
+        self
     }
 
     /// Replace the audio-routing singleton store (e.g. to share one seeded
@@ -919,8 +1677,11 @@ impl AppState {
         self.probes = seeded.probes;
         self.devices = seeded.devices;
         self.sync_groups = seeded.sync_groups;
+        self.media_players = seeded.media_players;
         self.device_status = seeded.device_status;
         self.audio_routing = seeded.audio;
+        self.salvos = seeded.salvos;
+        self.tally_profiles = seeded.tally_profiles;
         self.repository = seeded.layouts;
         self.working_layout_id = Some(seeded.working_layout_id);
         self.running_canvas = Some(seeded.running_canvas);
@@ -1047,11 +1808,12 @@ impl AppState {
         Ok(crate::auth::Principal {
             key_id: claims.sub,
             role,
-            // JWT principals are not object/output scoped here; per-object and
-            // per-output BOLA guards still run and pass (unscoped). A deployment
-            // mapping JWT claims to scopes would populate these.
+            // JWT principals are not object/output/discovery scoped here; every
+            // axis guard still runs and passes (unscoped). A deployment mapping
+            // JWT claims to scopes would populate these.
             scoped_object_ids: None,
             scoped_output_ids: None,
+            scoped_discovery_domains: None,
         })
     }
 }
@@ -1230,10 +1992,10 @@ areas = ["a"]
         let config = MultiviewConfig::load_from_toml(EMPTY_DOC).expect("parse empty config");
         let seeded = seed_resources(&config).expect("seed resources");
 
-        assert!(seeded.sources.list().expect("list").is_empty());
-        assert!(seeded.outputs.list().expect("list").is_empty());
-        assert!(seeded.overlays.list().expect("list").is_empty());
-        assert!(seeded.probes.list().expect("list").is_empty());
+        assert_eq!(seeded.sources.list().expect("list").len(), 0);
+        assert_eq!(seeded.outputs.list().expect("list").len(), 0);
+        assert_eq!(seeded.overlays.list().expect("list").len(), 0);
+        assert_eq!(seeded.probes.list().expect("list").len(), 0);
         let (audio, _) = seeded.audio.snapshot();
         assert!(
             audio.is_none(),

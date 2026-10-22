@@ -479,7 +479,7 @@ mod tests {
             &table,
             &mirror,
         );
-        assert!(updates.is_empty());
+        assert_eq!(updates.len(), 0);
         // The route is still recorded even if no binding watches it.
         assert_eq!(table.source_of(1, 99), Some(10));
         assert!(mirror.is_empty());

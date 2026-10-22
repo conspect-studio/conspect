@@ -83,11 +83,17 @@ impl AvailabilityCounters {
 
 /// Saturating add into one counter (lock-free).
 fn saturating_add(counter: &AtomicU64, delta: u64) {
-    // `fetch_update` lets us saturate rather than wrap; the closure is pure and
-    // the CAS retries on contention.
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(delta))
-    });
+    // A compare-exchange loop saturates rather than wraps (a hand-rolled
+    // `try_update`, which is newer than the workspace MSRV); it retries on
+    // contention and is lock-free.
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(delta);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Whether a severity represents a **service-affecting** (severely-errored)

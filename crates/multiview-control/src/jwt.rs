@@ -42,7 +42,7 @@
 //! whole crate and its tests can exercise without native crypto.
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -208,7 +208,7 @@ impl JwtValidator {
         //    original signing input without re-encoding.
         let signing_input_len = header_b64.len() + 1 + payload_b64.len();
         let signing_input = token.get(..signing_input_len).ok_or(JwtError::Malformed)?;
-        let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(&self.secret) else {
+        let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(&self.secret) else {
             // `new_from_slice` is infallible for HMAC (any key length); this arm
             // is defensive and keeps the method total without unwrap/expect.
             return Err(JwtError::BadSignature);
@@ -234,7 +234,7 @@ mod tests {
     use super::{JwtError, JwtValidator, SignatureAlgorithm};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use serde_json::json;
     use sha2::Sha256;
 
@@ -248,7 +248,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(header).unwrap()),
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap())
         );
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret).unwrap();
         mac.update(input.as_bytes());
         format!(
             "{input}.{}",

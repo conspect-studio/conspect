@@ -1,79 +1,42 @@
 // Monitoring — the live preview wall.
 //
-// Shows the composited PROGRAM and each INPUT as low-rate JPEG stills the control
-// plane serves (GET /api/v1/preview/program.jpg, /preview/inputs,
-// /preview/inputs/{id}.jpg), refreshed ~1/s. Because an <img> tag cannot send an
-// Authorization header, each still is FETCHED with the stored bearer token and
-// shown via an object URL (revoked on refresh). Alongside the pixels, the real
-// per-tile lifecycle state streams over the WebSocket (`useEngineEvents`). All
-// reads are best-effort and never block the engine (invariant #10).
-import { useEffect, useRef, useState } from 'react';
+// The PROGRAM card and the focus dialogs use <PreviewSurface>, the
+// capability-driven WHEP→JPEG ladder (ADR-W023): on a webrtc-native build with
+// the program scope advertised, the program plays sub-second WHEP with an
+// honest fidelity label; otherwise the ~1 fps JPEG poll is the primary path (no
+// "degraded" badge — it is the deployment's honest best). Input thumbnails stay
+// JPEG (cheap, many); clicking one opens a dialog with the live WHEP player for
+// that input. A new outputs section previews served `webrtc` outputs. Alongside
+// the pixels, the real per-tile lifecycle state streams over the WebSocket
+// (`useEngineEvents`). All reads are best-effort and never block the engine
+// (invariant #10).
+import { useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useQuery } from '@tanstack/react-query';
+import { Maximize2 } from 'lucide-react';
 
 import { getStoredToken } from '../api/token';
 import { ConnectionStatus } from '../components/ConnectionStatus';
 import { HelpLink } from '../components/HelpLink';
 import { PageHeader } from '../components/PageHeader';
 import { TileStateBadge } from '../components/TileStateBadge';
+import { Button } from '../components/ui/button';
 import { Card, CardContent } from '../components/ui/card';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '../components/ui/dialog';
+import { PreviewSurface } from '../preview/PreviewSurface';
+import { programFidelity, usePreviewCapabilities } from '../preview/capabilities';
+import type { ProgramFidelity } from '../preview/capabilities';
+import { useJpegPreview } from '../preview/useJpegPreview';
+import { useOutputs } from '../resources/queries';
 import { useLiveTiles } from '../resources/useLiveTiles';
 import { useEngineEvents } from '../realtime/useEngineEvents';
 import type { LiveTile } from '../realtime/useEngineEvents';
-
-/** Fetch a preview JPEG with the bearer token and expose it as an object URL,
- *  refreshed every `refreshMs`. Returns `undefined` until a frame arrives (the
- *  endpoint answers 503 when the engine has produced none yet). */
-function usePreviewUrl(path: string, refreshMs: number): string | undefined {
-  const [url, setUrl] = useState<string | undefined>(undefined);
-  const current = useRef<string | undefined>(undefined);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const revoke = (): void => {
-      if (current.current !== undefined) {
-        URL.revokeObjectURL(current.current);
-        current.current = undefined;
-      }
-    };
-
-    const tick = async (): Promise<void> => {
-      const headers: Record<string, string> = {};
-      const token = getStoredToken();
-      if (token !== undefined) {
-        headers.Authorization = `Bearer ${token}`;
-      }
-      try {
-        const resp = await fetch(path, { headers, cache: 'no-store' });
-        if (!resp.ok) {
-          return;
-        }
-        const blob = await resp.blob();
-        if (cancelled) {
-          return;
-        }
-        const next = URL.createObjectURL(blob);
-        revoke();
-        current.current = next;
-        setUrl(next);
-      } catch {
-        // Best-effort preview; a failed fetch just keeps the last frame.
-      }
-    };
-
-    void tick();
-    const handle = window.setInterval(() => void tick(), refreshMs);
-    return (): void => {
-      cancelled = true;
-      window.clearInterval(handle);
-      revoke();
-    };
-  }, [path, refreshMs]);
-
-  return url;
-}
 
 /** The ids of inputs that can be previewed (GET /api/v1/preview/inputs). */
 function usePreviewInputIds(): readonly string[] {
@@ -117,13 +80,36 @@ function PreviewImage(props: {
   return <img src={props.src} alt={props.alt} className={props.className} />;
 }
 
+/** The honest program fidelity label (ADR-P006), shown when WHEP is live. */
+function FidelityLabel({ fidelity }: { readonly fidelity: ProgramFidelity }): JSX.Element {
+  switch (fidelity) {
+    case 'real-encoded-output':
+      return (
+        <span className="text-xs text-muted-foreground" data-testid="program-fidelity">
+          <Trans>Exact output rendition</Trans>
+        </span>
+      );
+    case 'pre-encode-canvas-approx':
+      return (
+        <span className="text-xs text-muted-foreground" data-testid="program-fidelity">
+          <Trans>Pre-encode canvas approximation</Trans>
+        </span>
+      );
+  }
+}
+
 /** The monitoring page. */
 export function MonitoringPage(): JSX.Element {
   const { t } = useLingui();
   const { status } = useEngineEvents();
-  const program = usePreviewUrl('/api/v1/preview/program.jpg', 1000);
+  const capabilities = usePreviewCapabilities();
   const inputIds = usePreviewInputIds();
   const tiles = useLiveTiles();
+  const outputs = useOutputs();
+  const fidelity = programFidelity(capabilities.data);
+
+  // The served WebRTC (WHEP) outputs — previewable via their OUTPUT scope tap.
+  const webrtcOutputs = (outputs.data ?? []).filter((output) => output.kind === 'webrtc');
 
   return (
     <>
@@ -139,13 +125,20 @@ export function MonitoringPage(): JSX.Element {
       />
 
       <section aria-labelledby="program-heading">
-        <h2 id="program-heading" className="mb-3 text-lg font-semibold">
-          <Trans>Program</Trans>
-        </h2>
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <h2 id="program-heading" className="text-lg font-semibold">
+            <Trans>Program</Trans>
+          </h2>
+          {fidelity !== undefined ? <FidelityLabel fidelity={fidelity} /> : null}
+        </div>
         <Card className="overflow-hidden">
-          <PreviewImage
-            src={program}
-            alt={t`Live program output`}
+          <PreviewSurface
+            scope="program"
+            whepEndpoint="/api/v1/preview/program/whep"
+            jpegPath="/api/v1/preview/program.jpg"
+            label={t`Live program output`}
+            capabilities={capabilities.data}
+            audio
             className="aspect-video w-full bg-black object-contain"
           />
         </Card>
@@ -167,30 +160,82 @@ export function MonitoringPage(): JSX.Element {
         ) : (
           <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {inputIds.map((id) => (
-              <InputThumbnail key={id} id={id} tile={tiles.get(id)} />
+              <InputThumbnail
+                key={id}
+                id={id}
+                tile={tiles.get(id)}
+                capabilities={capabilities.data}
+              />
             ))}
           </ul>
         )}
       </section>
+
+      {webrtcOutputs.length > 0 ? (
+        <section aria-labelledby="outputs-heading" className="mt-8">
+          <h2 id="outputs-heading" className="mb-3 flex items-center gap-2 text-lg font-semibold">
+            <Trans>WebRTC outputs</Trans>
+            <HelpLink to="/help/concepts/glossary#whep" label={t`What is WHEP?`} compact />
+          </h2>
+          <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {webrtcOutputs.map((output) => (
+              <li key={output.id}>
+                <Card className="overflow-hidden">
+                  <PreviewSurface
+                    scope="output"
+                    whepEndpoint={`/api/v1/preview/outputs/${encodeURIComponent(output.id)}/whep`}
+                    jpegPath="/api/v1/preview/program.jpg"
+                    label={t`Preview of WebRTC output ${output.name}`}
+                    capabilities={capabilities.data}
+                    audio
+                    className="aspect-video w-full bg-black object-contain"
+                  />
+                  <CardContent className="py-2">
+                    <code className="truncate text-xs" lang="" dir="auto">
+                      {output.name}
+                    </code>
+                  </CardContent>
+                </Card>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
     </>
   );
 }
 
-/** One input's live thumbnail + lifecycle badge. */
+/** One input's live thumbnail (JPEG) + lifecycle badge + a focus dialog. */
 function InputThumbnail(props: {
   readonly id: string;
   readonly tile: LiveTile | undefined;
+  readonly capabilities: ReturnType<typeof usePreviewCapabilities>['data'];
 }): JSX.Element {
   const { t } = useLingui();
-  const src = usePreviewUrl(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000);
+  const [open, setOpen] = useState(false);
+  const src = useJpegPreview(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000);
   return (
     <li>
       <Card className="overflow-hidden">
-        <PreviewImage
-          src={src}
-          alt={t`Preview of input ${props.id}`}
-          className="aspect-video w-full bg-black object-contain"
-        />
+        <div className="relative">
+          <PreviewImage
+            src={src}
+            alt={t`Preview of input ${props.id}`}
+            className="aspect-video w-full bg-black object-contain"
+          />
+          <Button
+            type="button"
+            variant="secondary"
+            size="icon"
+            className="absolute right-2 top-2"
+            aria-label={t`Open live preview of input ${props.id}`}
+            onClick={(): void => {
+              setOpen(true);
+            }}
+          >
+            <Maximize2 className="size-4" aria-hidden="true" />
+          </Button>
+        </div>
         <CardContent className="flex items-center justify-between gap-2 py-2">
           <code className="truncate text-xs" lang="" dir="auto">
             {props.id}
@@ -198,6 +243,26 @@ function InputThumbnail(props: {
           {props.tile !== undefined ? <TileStateBadge state={props.tile.state} /> : null}
         </CardContent>
       </Card>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>
+              <Trans>Live preview — input {props.id}</Trans>
+            </DialogTitle>
+          </DialogHeader>
+          {open ? (
+            <PreviewSurface
+              scope="input"
+              whepEndpoint={`/api/v1/preview/inputs/${encodeURIComponent(props.id)}/whep`}
+              jpegPath={`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`}
+              label={t`Live preview of input ${props.id}`}
+              capabilities={props.capabilities}
+              className="aspect-video w-full bg-black object-contain"
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </li>
   );
 }

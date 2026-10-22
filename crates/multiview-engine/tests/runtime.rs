@@ -534,6 +534,127 @@ async fn runtime_stops_promptly_on_stop_signal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_stops_promptly_while_parked_on_a_future_tick_deadline() {
+    // The defect ADR-T018's drive loop introduced (the CI ~37-minute "hang"): the
+    // loop PARKS in the pacer waiting for the next tick's wall-clock deadline, and
+    // the pacer had NO stop awareness — so once it parks on a deadline the (here
+    // frozen, in production merely slow/contended) clock has not reached, a raised
+    // `StopSignal` is never observed and the loop spins/sleeps forever. Under
+    // `--features cluster` (extra HA tests oversubscribing the cores) the bounded
+    // soak/stop tests could not advance their manual clock fast enough against the
+    // spinning engine and blew past the job timeout.
+    //
+    // This pins the contract: a stop raised WHILE the loop is parked on a future
+    // deadline must make it return PROMPTLY (within one tick-period-ish), never
+    // wait out the unreachable deadline. The whole test is wrapped in a bounded
+    // wall-clock timeout so a regression fails fast (seconds) instead of hanging
+    // CI for 37 minutes.
+    let body = async {
+        let (w, h) = (16, 16);
+        let mut stores = HashMap::new();
+        stores.insert(
+            "cam-a".to_owned(),
+            Arc::new(TileStore::<Nv12Image>::with_defaults("cam-a")),
+        );
+        let drive = CompositorDrive::new(
+            Arc::new(Layout {
+                name: "one".to_owned(),
+                canvas: Canvas {
+                    width: w,
+                    height: h,
+                    fps_num: 60,
+                    fps_den: 1,
+                },
+                cells: vec![Cell {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                    z: 0,
+                    fit: FitMode::Contain,
+                    source: Some("cam-a".to_owned()),
+                    ..Cell::default()
+                }],
+            }),
+            stores,
+            nosignal_card(w, h),
+            CanvasColor::default(),
+            LinearRgba::TRANSPARENT,
+        )
+        .unwrap();
+
+        let time_source = Arc::new(ManualTimeSource::new());
+        let ts: Arc<dyn TimeSource> = time_source.clone();
+        let publisher: Arc<EnginePublisher<u64, u64>> = Arc::new(EnginePublisher::new(8));
+
+        let mut runtime = EngineRuntime::new(
+            OutputClock::new(Rational::FPS_60).unwrap(),
+            drive,
+            ts,
+            CooperativePacer,
+        );
+        // Freeze the clock EXACTLY at the seed: tick 0's deadline (== seed) is met,
+        // so tick 0 composes; tick 1's deadline (seed + 1/60 s) is in the future
+        // and the frozen clock will never reach it -> the loop parks in the pacer.
+        time_source.set(runtime.seed_nanos());
+
+        let stop = StopSignal::new();
+        let stop2 = stop.clone();
+        let run_pub = Arc::clone(&publisher);
+        let engine = tokio::spawn(async move {
+            // `run` (not `run_for`): only the stop signal can end it.
+            runtime
+                .run(run_pub.as_ref(), &stop2, |f| f.tick.index, |_f| None::<u64>)
+                .await
+        });
+
+        // Wait until tick 0 has been published — the loop has finished tick 0 and
+        // is now advancing toward parking in the pacer for tick 1.
+        let started = Instant::now();
+        while publisher.state.sequence() < 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "tick 0 was never emitted"
+            );
+            tokio::task::yield_now().await;
+        }
+        // Let the loop DEFINITELY reach and settle inside the pacer's wait for
+        // tick 1 (so this exercises the parked-pacer path, not a lucky stop-at-the-
+        // top-of-loop race). A stop-blind pacer is spinning here, NOT at the loop's
+        // stop check; a stop-aware pacer is idle but will observe stop immediately.
+        // The clock stays frozen, so the loop cannot legitimately emit any further
+        // tick during this settle — `ticks == 1` below proves it truly parked.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            publisher.state.sequence(),
+            1,
+            "loop must be parked on tick 1's unreachable deadline (no further ticks)"
+        );
+
+        // Raise stop while parked, then require a prompt return. A stop-blind pacer
+        // spins on the unreachable deadline forever and the outer timeout fires.
+        stop.stop();
+        let outcome = engine.await.unwrap().unwrap();
+        assert_eq!(
+            outcome.stop,
+            multiview_engine::RunStop::Stopped,
+            "raising stop while parked on a future deadline must stop the loop"
+        );
+        assert_eq!(
+            outcome.ticks, 1,
+            "exactly tick 0 was emitted before the stop"
+        );
+    };
+
+    // Hard bound: if the loop ignores stop and spins, fail in seconds — never hang
+    // CI. The honest path returns in microseconds; 10 s is generous slack for a
+    // contended runner.
+    tokio::time::timeout(Duration::from_secs(10), body)
+        .await
+        .expect("runtime did not stop promptly while parked on a future tick deadline (pacer ignored stop -> CI hang)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_hook_runs_every_tick_and_its_layout_swap_drives_the_composed_frame() {
     // The control seam (inv #11): a per-tick hook applies hot reconfiguration at
     // the frame boundary. Prove BOTH that it runs once per tick AND that a
@@ -598,7 +719,16 @@ async fn control_hook_runs_every_tick_and_its_layout_swap_drives_the_composed_fr
         ts,
         CooperativePacer,
     );
-    time_source.set(runtime.seed_nanos() + 1_000_000_000);
+    // Pace deterministically by advancing the manual clock exactly one tick period
+    // per fresh compose (inside the control hook below) — so the loop runs at 1.0×
+    // wall-clock and composes one fresh frame per tick. (The earlier "freeze the
+    // clock 1 s ahead" trick is incompatible with ADR-T018: a clock a full second
+    // ahead of media-time is, correctly, read as overload and backfilled with
+    // last-good repeats — which do NOT run the control hook — so it would observe
+    // far fewer than TICKS hook calls. Per-period pacing keeps one fresh frame per
+    // tick, exactly the inv-#11 contract this test asserts.)
+    let period = oracle_pts_ns(1, Rational::FPS_60);
+    let advance_clock = Arc::clone(&time_source);
 
     // Swap to cam-b at tick index 5 (a frame boundary). Count hook invocations.
     let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -617,6 +747,9 @@ async fn control_hook_runs_every_tick_and_its_layout_swap_drives_the_composed_fr
             // control: on the 6th invocation, hot-swap the layout to cam-b.
             move |drive: &mut CompositorDrive<Nv12Image>| {
                 let n = calls_in_hook.fetch_add(1, Ordering::AcqRel);
+                // Advance wall-clock one tick period per fresh compose → the next
+                // tick's deadline is met exactly, one fresh frame per tick.
+                advance_clock.advance(Duration::from_nanos(u64::try_from(period).unwrap_or(0)));
                 if n == 5 {
                     drive
                         .set_layout(Arc::clone(&swap_to_b))
@@ -627,6 +760,14 @@ async fn control_hook_runs_every_tick_and_its_layout_swap_drives_the_composed_fr
         .await
         .expect("control run completes");
 
+    // The loop composed a FRESH frame every tick — no last-good cadence repeats
+    // fired under this 1.0× pacing — which is precisely what makes "one hook call
+    // per tick" hold (a repeat does not run the control hook; ADR-T018).
+    assert_eq!(
+        runtime.frames_repeated(),
+        0,
+        "healthy 1.0× pacing must not trigger any cadence repeat"
+    );
     // The hook ran exactly once per tick.
     assert_eq!(
         calls.load(Ordering::Acquire),

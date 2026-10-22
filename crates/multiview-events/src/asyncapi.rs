@@ -84,22 +84,22 @@ fn build_info() -> Value {
             "WebSocket and SSE realtime event stream for the Multiview engine. ",
             "Every message uses a single versioned envelope (ADR-RT002). ",
             "Topics: tiles, inputs, outputs, audio.meters, alerts, alarms, tally, ",
-            "layout, config, logs, jobs, preview, system, capabilities, devices. ",
+            "layout, config, logs, jobs, preview, system, capabilities, devices, switcher. ",
             "The WebSocket endpoint (/api/v1/ws) is bidirectional (events + subscription ",
             "control frames); the SSE endpoint (/api/v1/events) is server-to-client only.",
         ),
         "license": {
             "name": "Multiview Source-Available Non-Commercial License",
-            "url": "https://github.com/aperim/multiview/blob/main/LICENSE"
+            "url": "https://github.com/conspect-studio/conspect/blob/main/LICENSE"
         },
         "contact": {
             "name": "The Multiview Authors",
-            "url": "https://github.com/aperim/multiview"
+            "url": "https://github.com/conspect-studio/conspect"
         },
         "externalDocs": {
             // AsyncAPI 3.0 requires `format: uri` — an absolute URL, not a repo-relative path.
             "description": "Realtime API reference",
-            "url": "https://github.com/aperim/multiview/blob/main/docs/api/realtime.md"
+            "url": "https://github.com/conspect-studio/conspect/blob/main/docs/api/realtime.md"
         }
     })
 }
@@ -241,6 +241,8 @@ fn build_messages() -> Value {
     map.extend(build_messages_envelope());
     // Data event messages.
     map.extend(build_messages_data_events());
+    // Switcher realtime surface messages (ADR-RT008).
+    map.extend(build_messages_switcher_events());
     // Devices realtime surface messages (ADR-RT007).
     map.extend(build_messages_device_events());
     // Control frame messages.
@@ -298,6 +300,7 @@ fn build_messages_data_events() -> serde_json::Map<String, Value> {
         "contentType": "application/json",
         "payload": { "$ref": "#/components/schemas/AudioMeter" }
     }));
+    map.insert("AudioLoudness".to_owned(), audio_loudness_message());
     map.insert("SystemMetrics".to_owned(), system_metrics_message());
     map.insert("OutputStatus".to_owned(), json!({
         "name": "OutputStatus",
@@ -449,6 +452,29 @@ fn input_streams_message() -> Value {
     })
 }
 
+/// Build the Switcher realtime-surface message definitions (ADR-RT008): the
+/// lossless `media.player_state` lifecycle event on topic `switcher`.
+fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("MediaPlayerEvent".to_owned(), json!({
+        "name": "MediaPlayerEvent",
+        "title": "Media-player transport-state lifecycle",
+        "summary": "A media player transitioned transport state (media.player_state on topic `switcher`).",
+        "description": concat!(
+            "Emitted on topic `switcher` with envelope `id` = player id. A LOSSLESS ",
+            "lifecycle event kept in the bounded replay ring (ADR-RT008): discrete ",
+            "transport-state changes (cued / playing / paused / stopped / ",
+            "vamping{exit_armed} / eof / loading) plus the playhead `position_frames`. ",
+            "It must never be conflated — a control surface reconstructs authoritative ",
+            "player history from it. Per-frame position is NOT streamed; clients ",
+            "interpolate `position_frames` between events at the output cadence.",
+        ),
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/MediaPlayerEvent" }
+    }));
+    map
+}
+
 /// Build the Devices realtime-surface message definitions (ADR-RT007): the
 /// conflated `device.status` / `timing.status` telemetry lanes plus the
 /// lossless low-rate device lifecycle events, all on topic `devices`.
@@ -521,6 +547,7 @@ fn build_messages_device_events() -> serde_json::Map<String, Value> {
         "contentType": "application/json",
         "payload": { "$ref": "#/components/schemas/DeviceDiscovered" }
     }));
+    insert_cast_session_messages(&mut map);
     map.insert("TimingStatus".to_owned(), json!({
         "name": "TimingStatus",
         "title": "Outbound presentation epoch + sync telemetry",
@@ -537,6 +564,42 @@ fn build_messages_device_events() -> serde_json::Map<String, Value> {
         "payload": { "$ref": "#/components/schemas/TimingStatus" }
     }));
     map
+}
+
+/// Insert the two ephemeral cast-session lifecycle message definitions
+/// (`cast.session.started` / `cast.session.removed`) into the `devices`-topic
+/// message map. Extracted from [`build_messages_device_events`] to keep that
+/// builder under the function-length budget.
+fn insert_cast_session_messages(map: &mut serde_json::Map<String, Value>) {
+    map.insert("CastSessionStarted".to_owned(), json!({
+        "name": "CastSessionStarted",
+        "title": "Ephemeral cast session started",
+        "summary": "An ad-hoc cast session was started (cast.session.started on topic `devices`; lossless lifecycle lane).",
+        "description": concat!(
+            "Emitted on topic `devices` with envelope `id` = session id when ",
+            "`POST /api/v1/cast/sessions` accepts a start (the runtime record ",
+            "exists and its supervised actor is spawned): the session-list ",
+            "MEMBERSHIP changed, so clients refresh the list immediately instead ",
+            "of waiting for a REST re-poll. The session's live state rides the ",
+            "conflated `device.status` lane keyed by the same session id.",
+        ),
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/CastSessionStarted" }
+    }));
+    map.insert("CastSessionRemoved".to_owned(), json!({
+        "name": "CastSessionRemoved",
+        "title": "Ephemeral cast session removed",
+        "summary": "An ad-hoc cast session was removed (cast.session.removed on topic `devices`; lossless lifecycle lane).",
+        "description": concat!(
+            "Emitted on topic `devices` with envelope `id` = session id when a ",
+            "session is stopped (`DELETE /api/v1/cast/sessions/{id}` — the ",
+            "receiver STOP that clears the TV) or promoted to a saved device ",
+            "(`POST /{id}/save` retires the ephemeral record while playback ",
+            "continues under the promoted device id).",
+        ),
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/CastSessionRemoved" }
+    }));
 }
 
 /// Build control-frame message definitions ($hello, $subscribe, …).
@@ -590,7 +653,7 @@ fn envelope_schema() -> Value {
                 "enum": [
                     "$control", "system", "capabilities", "inputs", "tiles", "outputs",
                     "audio.meters", "audio.loudness", "alerts", "alarms", "tally",
-                    "layout", "config", "logs", "jobs", "preview", "devices"
+                    "layout", "config", "logs", "jobs", "preview", "devices", "switcher"
                 ]
             },
             "id": {
@@ -629,6 +692,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/TileState" },
         { "$ref": "#/components/schemas/TilesSnapshot" },
         { "$ref": "#/components/schemas/AudioMeter" },
+        { "$ref": "#/components/schemas/AudioLoudness" },
         { "$ref": "#/components/schemas/OutputStatus" },
         { "$ref": "#/components/schemas/Alert" },
         { "$ref": "#/components/schemas/HealthWarning" },
@@ -638,6 +702,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/AlarmTransition" },
         { "$ref": "#/components/schemas/TallyEvent" },
         { "$ref": "#/components/schemas/SalvoEvent" },
+        { "$ref": "#/components/schemas/MediaPlayerEvent" },
         { "$ref": "#/components/schemas/DeviceStatus" },
         { "$ref": "#/components/schemas/DeviceAdopted" },
         { "$ref": "#/components/schemas/DeviceRemoved" },
@@ -645,6 +710,8 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/DeviceError" },
         { "$ref": "#/components/schemas/DeviceSync" },
         { "$ref": "#/components/schemas/DeviceDiscovered" },
+        { "$ref": "#/components/schemas/CastSessionStarted" },
+        { "$ref": "#/components/schemas/CastSessionRemoved" },
         { "$ref": "#/components/schemas/TimingStatus" },
         { "$ref": "#/components/schemas/Hello" },
         { "$ref": "#/components/schemas/Subscribe" },
@@ -671,6 +738,7 @@ fn build_schemas() -> Value {
     let mut map = serde_json::Map::new();
     for section in [
         core_event_schemas(),
+        switcher_event_schemas(),
         device_event_schemas(),
         control_frame_schemas(),
     ] {
@@ -691,6 +759,7 @@ fn core_event_schemas() -> Value {
         "TileSnapshotEntry": tile_snapshot_entry_schema(),
         "TilesSnapshot": tiles_snapshot_schema(),
         "AudioMeter": audio_meter_schema(),
+        "AudioLoudness": audio_loudness_schema(),
         "SystemMetrics": system_metrics_schema(),
         "GpuMetrics": gpu_metrics_schema(),
         "GpuVendor": gpu_vendor_schema(),
@@ -732,6 +801,8 @@ fn device_event_schemas() -> Value {
         "SyncChange": sync_change_schema(),
         "DeviceSync": device_sync_schema(),
         "DeviceDiscovered": device_discovered_schema(),
+        "CastSessionStarted": cast_session_started_schema(),
+        "CastSessionRemoved": cast_session_removed_schema(),
         "WallClockRef": wall_clock_ref_schema(),
         "SyncGroupSkew": sync_group_skew_schema(),
         "TimingStatus": timing_status_schema()
@@ -866,6 +937,97 @@ fn audio_meter_schema() -> Value {
             "overflow": {
                 "type": "boolean",
                 "description": "Whether the meter pipeline overflowed (dropped windows)."
+            },
+            "sampled_hz": {
+                "type": "integer",
+                "format": "uint32",
+                "description": "Effective wire cadence (Hz)."
+            }
+        }
+    })
+}
+
+fn audio_loudness_message() -> Value {
+    json!({
+        "name": "AudioLoudness",
+        "title": "Program-bus EBU R128 loudness sample",
+        "summary": "Momentary/short-term/integrated LUFS + LRA + true-peak (dBTP) + compliance reference (numeric only).",
+        "description": concat!(
+            "Emitted on topic `audio.loudness` (AUD-8). A high-rate CONFLATED compliance lane ",
+            "(BS.1770-4 / EBU Tech 3341/3342, ADR-R006): the slow-cadence M/S/I/LRA/dBTP sample ",
+            "the loudness meter measures read-only off the audio bus, pushed at ~10 Hz and ",
+            "excluded from the lossless replay ring. A slow consumer can only lose its own samples ",
+            "— the engine never back-pressures (inv #10). BALLISTICS are applied client-side: the ",
+            "wire carries raw measured values; the browser meter applies the display decay/peak-hold. ",
+            "The compliance reference (`target_lufs`/`ceiling_dbtp`/`tolerance_lu`) rides every sample ",
+            "so the meter colours against the same target the program bus is normalised toward.",
+        ),
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/AudioLoudness" }
+    })
+}
+
+fn audio_loudness_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": concat!(
+            "Data body of the `audio.loudness` event: a program-bus EBU R128 loudness sample ",
+            "(M/S/I LUFS, LRA, true-peak dBTP) plus the compliance reference. Numeric metadata ",
+            "only — never audio content. Conflated/sampled at ~10 Hz on the wire (high-rate lane); ",
+            "ballistics are applied client-side. The integrating fields are absent below the ",
+            "-70 LUFS absolute gate (no fabricated value).",
+        ),
+        "required": ["program", "target_lufs", "ceiling_dbtp", "tolerance_lu", "sampled_hz"],
+        "properties": {
+            "program": {
+                "type": "integer",
+                "format": "uint32",
+                "description": "Program/bus index this loudness sample is for."
+            },
+            "momentary": {
+                "type": "number",
+                "format": "float",
+                "description": "Momentary loudness (400 ms window), LUFS. Absent below the absolute gate."
+            },
+            "short_term": {
+                "type": "number",
+                "format": "float",
+                "description": "Short-term loudness (3 s window), LUFS. Absent below the absolute gate."
+            },
+            "integrated": {
+                "type": "number",
+                "format": "float",
+                "description": "Integrated (gated) loudness, LUFS. Absent until enough gated audio."
+            },
+            "lra": {
+                "type": "number",
+                "format": "float",
+                "description": "Loudness range (EBU Tech 3342), LU. Absent until enough gated audio."
+            },
+            "true_peak_dbtp": {
+                "type": "number",
+                "format": "float",
+                "description": "Maximum true-peak across channels (4x oversampled), dBTP. Absent when disabled."
+            },
+            "target_lufs": {
+                "type": "number",
+                "format": "float",
+                "description": "Normalisation target loudness, LUFS (compliance reference, e.g. -23 / -16)."
+            },
+            "ceiling_dbtp": {
+                "type": "number",
+                "format": "float",
+                "description": "True-peak ceiling, dBTP (compliance reference, e.g. -1.5)."
+            },
+            "tolerance_lu": {
+                "type": "number",
+                "format": "float",
+                "description": "Live convergence tolerance, LU (the in-spec band is target ± tolerance)."
+            },
+            "gain_db": {
+                "type": "number",
+                "format": "float",
+                "description": "Makeup gain the loudnorm processor is applying, dB. Absent when no normaliser is engaged."
             },
             "sampled_hz": {
                 "type": "integer",
@@ -1033,7 +1195,7 @@ fn warning_code_schema() -> Value {
             "`#[non_exhaustive]`: the catalog grows over time, so a client must ",
             "treat an unknown code as a forward-compatible warning, not an error.",
         ),
-        "enum": ["gpu-present-no-vulkan-adapter"]
+        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete"]
     })
 }
 
@@ -1154,8 +1316,12 @@ fn input_connection_schema() -> Value {
     json!({
         "type": "object",
         "description": "Data body of the `input.connection` event.",
-        "required": ["state"],
+        "required": ["input_id", "state"],
         "properties": {
+            "input_id": {
+                "type": "string",
+                "description": "The owning input's id (the configured source id) — the object axis this lifecycle event is authorized under (ADR-W026)."
+            },
             "state": { "$ref": "#/components/schemas/LifecycleState" },
             "attempt": {
                 "type": "integer",
@@ -1309,6 +1475,109 @@ fn salvo_event_schema() -> Value {
     })
 }
 
+// --- Switcher realtime-surface schemas (ADR-RT008) ---
+// Mirror the serde wire shapes of the switcher types in `crate::event`; the Rust
+// definitions are the canonical source of truth.
+
+/// The Switcher realtime-surface payload schemas (ADR-RT008): the media-player
+/// transport-state event and its tagged state union.
+fn switcher_event_schemas() -> Value {
+    json!({
+        "MediaPlayerState": media_player_state_schema(),
+        "MediaPlayerEvent": media_player_event_schema()
+    })
+}
+
+fn media_player_state_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": concat!(
+            "A media player's discrete transport state (tagged by `kind`, never ",
+            "untagged). The `vamping` variant carries `exit_armed`: when set, the ",
+            "current vamp lap finishes then the player exits cleanly at the boundary. ",
+            "`#[non_exhaustive]`: a client must treat an unknown kind as forward-",
+            "compatible, not an error.",
+        ),
+        "required": ["kind"],
+        // AsyncAPI 3.0 Schema Object: `discriminator` is the property NAME.
+        "discriminator": "kind",
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "const": "loading" } },
+                "description": "Opening/decoding the asset toward the cue point; not yet primed."
+            },
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "const": "cued" } },
+                "description": "Asset loaded, in-point frame primed, holding paused — ready to take."
+            },
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "const": "playing" } },
+                "description": "Playing forward at the output cadence."
+            },
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "const": "paused" } },
+                "description": "Paused, holding the current frame."
+            },
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "const": "stopped" } },
+                "description": "Stopped/idle; no asset rolling."
+            },
+            {
+                "type": "object",
+                "required": ["kind", "exit_armed"],
+                "properties": {
+                    "kind": { "type": "string", "const": "vamping" },
+                    "exit_armed": {
+                        "type": "boolean",
+                        "description": "Whether a clean exit is armed: finish the current lap, then leave the vamp at the boundary."
+                    }
+                },
+                "description": "Looping a fill segment to hold until a cue (the VT vamp/exit feature)."
+            },
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "type": "string", "const": "eof" } },
+                "description": "Reached end-of-file with no loop/vamp engaged."
+            }
+        ]
+    })
+}
+
+fn media_player_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": concat!(
+            "Data body of `media.player_state` (ADR-RT008): a media player's discrete ",
+            "transport-state transition, envelope `id` = player id. LOSSLESS — kept in ",
+            "the replay ring, never conflated. `position_frames` is the playhead in ",
+            "integer frames at the output cadence (never a float; clients interpolate ",
+            "between events).",
+        ),
+        "required": ["player", "state", "position_frames"],
+        "properties": {
+            "player": { "type": "string", "description": "Stable media-player id (matches the envelope `id`)." },
+            "asset": { "type": "string", "description": "The asset currently loaded in the player, if any." },
+            "state": { "$ref": "#/components/schemas/MediaPlayerState" },
+            "position_frames": {
+                "type": "integer",
+                "format": "uint64",
+                "description": "Playhead position at the transition, in integer frames at the output cadence."
+            }
+        }
+    })
+}
+
 // --- Devices realtime-surface schemas (ADR-RT007) ---
 // Mirror the serde wire shapes of the Devices types in `crate::event`; the
 // Rust definitions are the canonical source of truth.
@@ -1441,6 +1710,39 @@ fn device_removed_schema() -> Value {
     })
 }
 
+fn cast_session_started_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": concat!(
+            "Data body of `cast.session.started`: an ephemeral cast session was started ",
+            "(session-list membership changed). The session's live state rides the ",
+            "conflated `device.status` lane keyed by the same session id.",
+        ),
+        "required": ["session_id", "address", "output"],
+        "properties": {
+            "session_id": { "type": "string", "description": "The runtime session id (`cast-session-…`, UUID-fresh per start)." },
+            "name": { "type": "string", "description": "The operator-facing name, if given." },
+            "address": { "type": "string", "description": "The device authority dialled (`host[:port]`, IPv6 bracketed)." },
+            "output": { "type": "string", "description": "The output id whose HLS rendition the session casts." }
+        }
+    })
+}
+
+fn cast_session_removed_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": concat!(
+            "Data body of `cast.session.removed`: an ephemeral cast session was removed — ",
+            "stopped (the receiver STOP that clears the TV) or promoted to a saved device ",
+            "(playback continues under the promoted device id).",
+        ),
+        "required": ["session_id"],
+        "properties": {
+            "session_id": { "type": "string", "description": "The runtime session id that was removed." }
+        }
+    })
+}
+
 fn impact_class_schema() -> Value {
     json!({
         "type": "string",
@@ -1564,7 +1866,17 @@ fn device_discovered_schema() -> Value {
                 "enum": ["ipv6", "ipv4-legacy"],
                 "description": "Address family — IPv6-first; IPv4 results are labelled legacy."
             },
-            "name": { "type": "string", "description": "The advertised device name, if any." }
+            "name": { "type": "string", "description": "The advertised device name, if any." },
+            "domain": {
+                "type": "string",
+                "description": concat!(
+                    "The discovery domain the observing node stamped on this row (ADR-W026), ",
+                    "sourced solely from that node's operator-declared `[discovery] domain` ",
+                    "config — never from the responder payload or TXT records. Absent when the ",
+                    "observing node declared no domain; a discovery-scoped principal is then ",
+                    "denied the row (fail-closed).",
+                )
+            }
         }
     })
 }
@@ -1785,8 +2097,8 @@ fn resume_schema() -> Value {
 fn resync_reason_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Why a $resync was issued.",
-        "enum": ["seq_evicted", "unknown_session", "session_expired"]
+        "description": "Why a $resync was issued (the client must rebuild, not merge). The first three are unrecoverable resume gaps; `authz_changed` is a mid-session authorization change (object scope narrowed/widened) on an intact connection (ADR-RT010).",
+        "enum": ["seq_evicted", "unknown_session", "session_expired", "authz_changed"]
     })
 }
 

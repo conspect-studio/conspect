@@ -410,13 +410,13 @@ mod tests {
     #[test]
     fn staging_then_immediate_activation_applies_params() {
         let mut state = ConnectionState::default();
-        assert!(state.active.is_empty());
+        assert_eq!(state.active.len(), 0);
         assert!(!state.master_enable);
 
         state.stage(request(true));
         // Staged, not yet active.
         assert!(state.staged.is_some());
-        assert!(state.active.is_empty());
+        assert_eq!(state.active.len(), 0);
 
         let activated = state.activate_if_immediate();
         assert!(activated);
@@ -433,7 +433,7 @@ mod tests {
         let activated = state.activate_if_immediate();
         assert!(!activated, "a stage-only request must not auto-activate");
         assert!(state.staged.is_some(), "it stays staged");
-        assert!(state.active.is_empty());
+        assert_eq!(state.active.len(), 0);
     }
 
     #[test]
@@ -509,7 +509,7 @@ mod tests {
         state.stage(request(false));
         assert!(!state.activate_due(TaiTime::new(2_000_000_000, 0)));
         assert!(state.staged.is_some());
-        assert!(state.active.is_empty());
+        assert_eq!(state.active.len(), 0);
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         let activated = state.activate_due(TaiTime::new(1_700_000_999, 999_999_999));
         assert!(!activated, "absolute schedule must not fire early");
         assert!(state.staged.is_some());
-        assert!(state.active.is_empty());
+        assert_eq!(state.active.len(), 0);
     }
 
     #[test]

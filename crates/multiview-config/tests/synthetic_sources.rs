@@ -426,6 +426,59 @@ fn timer_rejects_a_malformed_time_and_unknown_zone() {
 }
 
 #[test]
+fn network_media_kinds_are_classified_for_live_add() {
+    // ADR-W018 level 2: the network/file kinds that ride the libav
+    // demux/decode `ingest_loop` are the live-add set — disjoint from the
+    // synthetic kinds. `rist` is included (ADR-0095: it lowers to a `rist://`
+    // AVIO URL and rides the SAME supervised ingest path as every other
+    // network transport).
+    for fields in [
+        "kind = \"rtsp\"\nurl = \"rtsp://[2001:db8::1]/cam1\"",
+        "kind = \"hls\"\nurl = \"https://[2001:db8::2]/live/master.m3u8\"",
+        "kind = \"ts\"\nurl = \"udp://[ff3e::1]:5000\"",
+        "kind = \"srt\"\nurl = \"srt://[2001:db8::3]:9000\"",
+        "kind = \"rtmp\"\nurl = \"rtmp://[2001:db8::4]/app/key\"",
+        "kind = \"rist\"\nurl = \"rist://[2001:db8::5]:9001\"",
+        "kind = \"file\"\npath = \"/media/clip.ts\"",
+    ] {
+        let cfg = MultiviewConfig::load_from_toml(&config_with_source(fields))
+            .unwrap_or_else(|e| panic!("parse {fields:?}: {e}"));
+        let kind = &cfg.sources[0].kind;
+        assert!(
+            kind.is_network_media(),
+            "a decoded network/file kind is live-add network media: {fields:?}"
+        );
+        assert!(
+            !kind.is_synthetic(),
+            "network media is disjoint from synthetic: {fields:?}"
+        );
+    }
+}
+
+#[test]
+fn synthetic_and_restart_only_kinds_are_not_network_media() {
+    // Synthetic kinds (in-process generators) and the kinds that need runtime
+    // machinery the live ingest path does not provide — `ndi` (host-memory
+    // receive), `youtube` (yt-dlp resolution), `aes67` (audio-only) — are NOT
+    // network media: they never live-add through `ingest_loop`.
+    for fields in [
+        "kind = \"bars\"",
+        "kind = \"solid\"\ncolor = \"#101010\"",
+        "kind = \"clock\"",
+        "kind = \"ndi\"\nname = \"STUDIO (CAM 1)\"",
+        "kind = \"youtube\"\nurl = \"https://www.youtube.com/watch?v=x\"",
+        "kind = \"aes67\"\nsdp = \"v=0\\r\\nc=IN IP6 ff3e::1\\r\\n\"",
+    ] {
+        let cfg = MultiviewConfig::load_from_toml(&config_with_source(fields))
+            .unwrap_or_else(|e| panic!("parse {fields:?}: {e}"));
+        assert!(
+            !cfg.sources[0].kind.is_network_media(),
+            "a synthetic / restart-only kind is not live-add network media: {fields:?}"
+        );
+    }
+}
+
+#[test]
 fn timer_recur_requires_a_recurring_time_of_day_target() {
     // `recur` on a date_time target is rejected (it would silently degrade).
     let doc = config_with_source(

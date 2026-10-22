@@ -9,6 +9,7 @@
 )]
 
 use multiview_preview::{JpegEncoder, JpegError, Nv12JpegEncoder};
+use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::JpegDecoder;
 
@@ -29,13 +30,13 @@ fn solid_nv12(width: u32, height: u32, y: u8, cb: u8, cr: u8) -> Vec<u8> {
 
 /// Decode a JPEG to packed RGB plus its decoded dimensions.
 fn decode_rgb(jpeg: &[u8]) -> (Vec<u8>, usize, usize) {
-    let mut dec = JpegDecoder::new(jpeg);
+    let mut dec = JpegDecoder::new(ZCursor::new(jpeg));
     let pixels = dec
         .decode()
         .expect("emitted bytes must be a decodable JPEG");
     let info = dec.info().expect("decoded JPEG must expose its dimensions");
     assert_eq!(
-        dec.get_output_colorspace(),
+        dec.output_colorspace(),
         Some(ColorSpace::RGB),
         "default zune output is packed RGB"
     );

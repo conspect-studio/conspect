@@ -1048,7 +1048,7 @@ mod tests {
             #EXTINF:6.0,\n\
             seg0.ts\n";
         let master = MasterPlaylist::parse(text).expect("parse");
-        assert!(master.variants.is_empty());
+        assert_eq!(master.variants.len(), 0, "{:?}", master.variants);
         assert!(master.pick_video_variant(Some(360)).is_none());
         assert!(master.pick_video_variant(None).is_none());
     }

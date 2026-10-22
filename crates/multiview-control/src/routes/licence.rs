@@ -2,8 +2,9 @@
 //! ADR-0050 / the Conspect brief §11).
 //!
 //! Three endpoints render the machine-side entitlement plane, all **local** —
-//! there are **no** licence-server calls here (the heartbeat client is a later,
-//! feature-gated item):
+//! there are **no** licence-server calls *here* (the device→server heartbeat
+//! client is the cli's feature-gated `heartbeat` loop, CONSPECT-3/ADR-0096; this
+//! surface only reports the resulting local lease state):
 //!
 //! * `GET /api/v1/licence` — the computed licence resource (tier + the
 //!   enforcement-ladder `state`/`enforcement` level + dated lease). **Enforcement
@@ -122,12 +123,14 @@ const HEARTBEAT_PAYLOAD_FIELDS: &[&str] = &[
 
 /// The read-only heartbeat-status surface (`GET /api/v1/licensing/heartbeat-status`).
 ///
-/// With no licence-server client yet (blocked on the external wire-protocol doc,
-/// brief §14 O1), this reports **honestly from local state**: the transport the
-/// active lease arrived over, the lease install instant as `last_at`, the lease's
-/// `next_contact_due` as `next_due`, and the exhaustive payload-field list. There
-/// is **no** mutating endpoint for the heartbeat (the spec mandates none) — the
-/// `POST /api/v1/account/licence/heartbeat` force-now action is a later,
+/// This reports **honestly from local lease state** — the transport the active
+/// lease arrived over, the lease install instant as `last_at`, the lease's
+/// `next_contact_due` as `next_due`, and the exhaustive payload-field list —
+/// regardless of whether the cli's feature-gated `heartbeat` loop
+/// (CONSPECT-3/ADR-0096) is the producer that installed the lease (it drives the
+/// same `LeaseStore::install_binding` convergence the offline file-drop uses).
+/// There is **no** mutating endpoint for the heartbeat (the spec mandates none) —
+/// the `POST /api/v1/account/licence/heartbeat` force-now action is a later,
 /// feature-gated item (brief §11 #4), not this read surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -188,8 +191,10 @@ pub(crate) async fn get_heartbeat_status(
 ) -> ControlResult<Json<HeartbeatStatus>> {
     principal.role.require(Action::Read)?;
     // Honest local report: the active lease (if any) supplies the transport +
-    // next-due; the store supplies the install instant (last contact). No
-    // licence-server call (the client is a later, feature-gated item, §14 O1).
+    // next-due; the store supplies the install instant (last contact). This route
+    // makes no licence-server call — the device→server heartbeat is the cli's
+    // feature-gated `heartbeat` loop (CONSPECT-3/ADR-0096); this surface only reads
+    // the local lease state that loop (or the offline file-drop) installed.
     let status = match state.licence.store.current() {
         Some(entitlement) => {
             let last_at = state.licence.store.installed_at().map(|t| t.to_rfc3339());

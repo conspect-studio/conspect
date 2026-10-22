@@ -54,11 +54,17 @@ pub(crate) async fn list_probes(
     principal: Principal,
 ) -> ControlResult<Json<Vec<Resource>>> {
     principal.role.require(Action::Read)?;
+    // Per-object ROW visibility (BOLA, ADR-W005/ADR-W025): a probe is gated by
+    // its OWN id (`get_probe` 403s an out-of-scope id), so the list must drop
+    // rows outside the allowlist — exactly as `list_devices` does. A probe
+    // carries no embedded device_ref, so the row filter alone is complete; it is
+    // a no-op for an unscoped principal.
     let probes = state
         .probes
         .list()?
         .into_iter()
         .map(|v| v.resource)
+        .filter(|resource| crate::auth::authorize_object(&principal, &resource.id).is_ok())
         .collect();
     Ok(Json(probes))
 }

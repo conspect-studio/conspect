@@ -21,6 +21,12 @@ const PAGE_LOADERS: Readonly<Record<string, PageLoader>> = {
   "/help/config": async () => (await import("./ConfigPage")).ConfigPage,
   "/help/api": async () => (await import("./ApiPage")).ApiPage,
   "/help/features": async () => (await import("./FeaturesPage")).FeaturesPage,
+  "/help/devices": async () => (await import("./DevicesHelpPage")).DevicesHelpPage,
+  "/help/devices/adopt": async () =>
+    (await import("./DevicesAdoptHelpPage")).DevicesAdoptHelpPage,
+  "/help/display-nodes": async () =>
+    (await import("./DisplayNodesHelpPage")).DisplayNodesHelpPage,
+  "/help/sync": async () => (await import("./SyncHelpPage")).SyncHelpPage,
   "/help/concepts/transports": async () =>
     (await import("./concepts/TransportsPage")).TransportsPage,
   "/help/concepts/timing-sync": async () =>

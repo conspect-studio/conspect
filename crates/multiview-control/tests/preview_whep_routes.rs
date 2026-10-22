@@ -26,7 +26,10 @@ use multiview_control::{
 use multiview_engine::EnginePublisher;
 
 mod support;
-use support::{body_bytes, body_json, send, ADMIN_TOKEN, OPERATOR_TOKEN, PEPPER, VIEWER_TOKEN};
+use support::{
+    body_bytes, body_json, send, ADMIN_TOKEN, OPERATOR_TOKEN, OUTPUT_SCOPED_TOKEN, PEPPER,
+    SCOPED_TOKEN, VIEWER_TOKEN,
+};
 
 /// A minimal, well-formed SDP offer advertising H.264 on the video m-line.
 const H264_OFFER: &str = "v=0\r\n\
@@ -118,9 +121,35 @@ fn router_with_whep(whep: Arc<FakeWhep>) -> axum::Router {
                 role,
                 scoped_object_ids: None,
                 scoped_output_ids: None,
+                scoped_discovery_domains: None,
             },
         );
     }
+    // Scoped operators for the per-scope BOLA tests (SEC-06/07): object-scoped to
+    // `scoped-layout`, output-scoped to `wall-1` — matching `support::seeded_keys`
+    // so `SCOPED_TOKEN` / `OUTPUT_SCOPED_TOKEN` authenticate.
+    keys.register(
+        "scoped-key",
+        "scoped-secret-jkl",
+        Principal {
+            key_id: "scoped-key".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(vec!["scoped-layout".to_owned()]),
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        },
+    );
+    keys.register(
+        "out-scoped-key",
+        "out-scoped-secret-mno",
+        Principal {
+            key_id: "out-scoped-key".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: None,
+            scoped_output_ids: Some(vec!["wall-1".to_owned()]),
+            scoped_discovery_domains: None,
+        },
+    );
     let state = AppState::new(
         engine,
         tx,
@@ -236,7 +265,7 @@ async fn malformed_offer_is_bad_request() {
 #[tokio::test]
 async fn capacity_exceeded_is_service_unavailable_with_fallback() {
     let whep = Arc::new(FakeWhep::refuse_with(WhepReject::CapacityExceeded {
-        fallback: "ws-jpeg".to_owned(),
+        fallback: "jpeg".to_owned(),
     }));
     let router = router_with_whep(whep);
     let resp = send(
@@ -247,7 +276,7 @@ async fn capacity_exceeded_is_service_unavailable_with_fallback() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let problem = body_json(resp).await;
     // The fallback transport hint is surfaced so the UI degrades honestly.
-    assert_eq!(problem["fallback"], "ws-jpeg");
+    assert_eq!(problem["fallback"], "jpeg");
 }
 
 #[tokio::test]
@@ -303,4 +332,194 @@ async fn release_requires_write_role() {
     let resp = send(&router, delete(&location, VIEWER_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(whep.active_sessions(), 1, "the session is untouched");
+}
+
+// ---- SEC-06/07 (BOLA, ADR-W005/W026): per-scope authorization on focus ----
+//
+// A focus session exposes the live pixels of exactly one entity, so opening OR
+// closing one must be authorized on that entity's axis — enforced at the route
+// layer because the `WhepProvider` seam is codec-only and never sees a
+// `Principal`. `Input`→object scope, `Output`→output scope, `Program`→unrestricted
+// (the canvas embeds every object/output). Each denial is a 403 problem+json with
+// ZERO provider side effect (`active_sessions` unchanged).
+
+#[tokio::test]
+async fn input_focus_is_denied_for_an_out_of_scope_object() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    // scoped-key is object-scoped to "scoped-layout"; cam-1 is out of scope.
+    let resp = send(
+        &router,
+        post_sdp(
+            "/api/v1/preview/inputs/cam-1/whep",
+            SCOPED_TOKEN,
+            H264_OFFER,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await;
+    assert_eq!(problem["type"], "/problems/forbidden");
+    assert_eq!(
+        whep.active_sessions(),
+        0,
+        "no focus is negotiated when authorization is denied"
+    );
+}
+
+#[tokio::test]
+async fn input_focus_is_allowed_for_the_in_scope_object() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    let resp = send(
+        &router,
+        post_sdp(
+            "/api/v1/preview/inputs/scoped-layout/whep",
+            SCOPED_TOKEN,
+            H264_OFFER,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(whep.active_sessions(), 1, "the in-scope input focus opens");
+}
+
+#[tokio::test]
+async fn output_focus_is_denied_for_an_out_of_scope_output() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    // out-scoped-key is output-scoped to "wall-1"; wall-2 is out of scope.
+    let resp = send(
+        &router,
+        post_sdp(
+            "/api/v1/preview/outputs/wall-2/whep",
+            OUTPUT_SCOPED_TOKEN,
+            H264_OFFER,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await;
+    assert_eq!(problem["type"], "/problems/forbidden");
+    assert_eq!(whep.active_sessions(), 0);
+}
+
+#[tokio::test]
+async fn output_focus_is_allowed_for_the_in_scope_output() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    let resp = send(
+        &router,
+        post_sdp(
+            "/api/v1/preview/outputs/wall-1/whep",
+            OUTPUT_SCOPED_TOKEN,
+            H264_OFFER,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(whep.active_sessions(), 1, "the in-scope output focus opens");
+}
+
+#[tokio::test]
+async fn program_focus_is_denied_for_a_scoped_principal() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    // The program canvas embeds every object/output, so only an UNRESTRICTED
+    // principal may focus it. An object-scoped principal is denied...
+    let resp = send(
+        &router,
+        post_sdp("/api/v1/preview/program/whep", SCOPED_TOKEN, H264_OFFER),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await;
+    assert_eq!(problem["type"], "/problems/forbidden");
+    assert_eq!(whep.active_sessions(), 0);
+    // ...and so is an output-scoped principal (the whole-system gate is all-axes).
+    let resp2 = send(
+        &router,
+        post_sdp(
+            "/api/v1/preview/program/whep",
+            OUTPUT_SCOPED_TOKEN,
+            H264_OFFER,
+        ),
+    )
+    .await;
+    assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+    assert_eq!(whep.active_sessions(), 0);
+}
+
+#[tokio::test]
+async fn program_focus_is_allowed_for_an_unscoped_operator() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    let resp = send(
+        &router,
+        post_sdp("/api/v1/preview/program/whep", OPERATOR_TOKEN, H264_OFFER),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "an unscoped operator may focus the whole program canvas"
+    );
+}
+
+#[tokio::test]
+async fn release_is_denied_for_an_out_of_scope_input_session() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    // Admin (unscoped) opens a focus on cam-1.
+    let created = send(
+        &router,
+        post_sdp("/api/v1/preview/inputs/cam-1/whep", ADMIN_TOKEN, H264_OFFER),
+    )
+    .await;
+    let location = created
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .expect("Location present");
+    assert_eq!(whep.active_sessions(), 1);
+    // The object-scoped principal (scoped-layout) may not tear down cam-1's focus.
+    let resp = send(&router, delete(&location, SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let problem = body_json(resp).await;
+    assert_eq!(problem["type"], "/problems/forbidden");
+    assert_eq!(
+        whep.active_sessions(),
+        1,
+        "the out-of-scope session is untouched on a denied release"
+    );
+}
+
+#[tokio::test]
+async fn release_is_allowed_for_the_in_scope_input_session() {
+    let whep = Arc::new(FakeWhep::default());
+    let router = router_with_whep(Arc::clone(&whep));
+    // Admin opens a focus on scoped-layout; the scoped principal may release it.
+    let created = send(
+        &router,
+        post_sdp(
+            "/api/v1/preview/inputs/scoped-layout/whep",
+            ADMIN_TOKEN,
+            H264_OFFER,
+        ),
+    )
+    .await;
+    let location = created
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .expect("Location present");
+    let resp = send(&router, delete(&location, SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        whep.active_sessions(),
+        0,
+        "the in-scope session is freed by its authorized principal"
+    );
 }

@@ -25,6 +25,7 @@ fn api_key_verify_accepts_correct_secret_and_rejects_wrong() {
             role: Role::Operator,
             scoped_object_ids: None,
             scoped_output_ids: None,
+            scoped_discovery_domains: None,
         },
     );
 
@@ -58,6 +59,7 @@ fn pepper_binds_digest_to_deployment() {
         role: Role::Viewer,
         scoped_object_ids: None,
         scoped_output_ids: None,
+        scoped_discovery_domains: None,
     };
     a.register("k", "s", principal.clone());
     b.register("k", "s", principal);
@@ -89,6 +91,7 @@ fn per_object_authz_denies_objects_outside_scope() {
         role: Role::Operator,
         scoped_object_ids: Some(vec!["allowed-1".to_owned()]),
         scoped_output_ids: None,
+        scoped_discovery_domains: None,
     };
     assert!(authorize_object(&scoped, "allowed-1").is_ok());
     assert!(matches!(
@@ -102,6 +105,7 @@ fn per_object_authz_denies_objects_outside_scope() {
         role: Role::Admin,
         scoped_object_ids: None,
         scoped_output_ids: None,
+        scoped_discovery_domains: None,
     };
     assert!(authorize_object(&unscoped, "anything").is_ok());
 }

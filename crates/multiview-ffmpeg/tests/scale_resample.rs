@@ -139,6 +139,71 @@ fn resampler_changes_rate_and_format() {
     assert!(out.samples() > 0, "produced output samples");
 }
 
+/// Build an NV12 frame painted solid "red" (Y=81, Cb=90, Cr=240) with a PTS —
+/// strongly asymmetric chroma, so any plane loss/swap is unambiguous.
+fn red_nv12(w: u32, h: u32, pts: i64) -> Video {
+    let mut frame = Video::new(Pixel::NV12, w, h);
+    let stride0 = frame.stride(0);
+    for row in 0..usize::try_from(h).unwrap() {
+        for col in 0..usize::try_from(w).unwrap() {
+            frame.data_mut(0)[row * stride0 + col] = 81;
+        }
+    }
+    let stride1 = frame.stride(1);
+    for row in 0..usize::try_from(h / 2).unwrap() {
+        for col in 0..usize::try_from(w / 2).unwrap() {
+            frame.data_mut(1)[row * stride1 + col * 2] = 90;
+            frame.data_mut(1)[row * stride1 + col * 2 + 1] = 240;
+        }
+    }
+    frame.set_pts(Some(pts));
+    frame
+}
+
+/// Mean (Cb, Cr) over an NV12 frame's interleaved chroma plane.
+fn nv12_uv_means(frame: &Video) -> (f64, f64) {
+    let stride1 = frame.stride(1);
+    let data = frame.data(1);
+    let (mut cb, mut cr, mut n) = (0_f64, 0_f64, 0_f64);
+    for row in 0..usize::try_from(frame.height() / 2).unwrap() {
+        for col in 0..usize::try_from(frame.width() / 2).unwrap() {
+            cb += f64::from(data[row * stride1 + col * 2]);
+            cr += f64::from(data[row * stride1 + col * 2 + 1]);
+            n += 1.0;
+        }
+    }
+    (cb / n, cr / n)
+}
+
+/// THE DEFECT-A ROOT-CAUSE PIN (hardware run 2026-06-11): an **identity**
+/// request (same format, same geometry — NV12 -> NV12 at one size) must hand
+/// back the input picture intact. libswscale's no-op converter on `FFmpeg` 7/8
+/// copies the luma plane but leaves the interleaved NV12 chroma plane ZEROED
+/// (Cb=Cr=0 ⇒ the saturated green/magenta the live-added tile showed), so the
+/// wrapper must never route an identity request through `sws_scale`.
+#[test]
+fn identity_nv12_to_nv12_preserves_the_chroma_plane() {
+    let spec = ScaleSpec::new(Pixel::NV12, W, H);
+    let mut scaler = Scaler::new(spec, spec).expect("build identity NV12 scaler");
+
+    let input = red_nv12(W, H, 21);
+    let out = scaler.run(&input).expect("identity convert");
+
+    assert_eq!(out.format(), Pixel::NV12, "format preserved");
+    assert_eq!((out.width(), out.height()), (W, H), "geometry preserved");
+    assert_eq!(out.pts(), Some(21), "PTS carried through");
+    // Luma intact…
+    assert_eq!(out.data(0)[0], 81, "luma plane copied");
+    // …and the interleaved chroma plane intact too: red keeps Cr >> Cb. The
+    // broken no-op path zeroes both means.
+    let (cb, cr) = nv12_uv_means(&out);
+    assert!(
+        (cb - 90.0).abs() < 1.0 && (cr - 240.0).abs() < 1.0,
+        "identity scale must preserve the NV12 chroma plane (got cb={cb:.1}, cr={cr:.1}; \
+         the libswscale no-op path zeroes it)"
+    );
+}
+
 #[test]
 fn resampler_and_scaler_are_send() {
     fn assert_send<T: Send>() {}

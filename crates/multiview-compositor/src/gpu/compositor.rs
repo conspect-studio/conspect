@@ -1115,7 +1115,13 @@ impl GpuCompositor {
         let padded = usize::try_from(padded_bytes_per_row)
             .map_err(|_| Error::Geometry("padded stride overflow".to_owned()))?;
 
-        let data = slice.get_mapped_range();
+        // wgpu 30 makes `get_mapped_range` fallible (`Result<BufferView,
+        // MapRangeError>`). Propagate a failed map as a typed readback error rather
+        // than unwrapping — safety rule 3: no panics on the compositor readback
+        // path; hold the typed error, never crash the output.
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| Error::GpuRuntime(format!("buffer get_mapped_range failed: {e}")))?;
         let mut out = Vec::with_capacity(row_len * rows);
         for row in 0..rows {
             let start = row

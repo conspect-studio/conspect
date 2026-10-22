@@ -24,7 +24,7 @@
 //! The resolve step needs three small scratch buffers each tick — the `held`
 //! Arc vector keeping each sampled frame alive, the `placements` vector, and the
 //! z-order index vector. These come from a **pool reused across ticks**
-//! ([`ComposeScratch`], held behind a [`RefCell`]) that is cleared-and-refilled,
+//! (`ComposeScratch`, held behind a [`RefCell`]) that is cleared-and-refilled,
 //! never reallocated, so the protected output clock does no per-tick scratch
 //! allocation in steady state (CLAUDE.md safety rule §5: "frame buffers come from
 //! per-device pools allocated at start, never per-frame"). The pool grows at most
@@ -89,7 +89,7 @@ impl CompositedFrame {
 /// The payload `T` is the per-tile frame type the stores hold. The default
 /// [`CompositorDrive<Nv12Image>::compose`] holds [`Nv12Image`] directly and
 /// dispatches the composite through the configured
-/// [`RunBackend`](multiview_compositor::backend::RunBackend) — the CPU
+/// [`RunBackend`] — the CPU
 /// reference by default, or the wgpu GPU compositor (with CPU fallback) when a
 /// run injects a GPU-preferred backend via [`CompositorDrive::with_backend`].
 /// State sampling ([`CompositorDrive::sample_states`]) is available for any `T`.
@@ -296,7 +296,7 @@ impl<T> CompositorDrive<T> {
 
     /// The kind of compositor backend this drive composites through
     /// ([`RunBackendKind::Cpu`] or, under `wgpu` with a live adapter,
-    /// [`RunBackendKind::Gpu`]). For telemetry / introspection.
+    /// `RunBackendKind::Gpu`). For telemetry / introspection.
     #[must_use]
     pub const fn backend_kind(&self) -> RunBackendKind {
         self.backend.kind()

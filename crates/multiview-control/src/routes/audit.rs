@@ -45,6 +45,28 @@ pub(crate) async fn list_audit(
     Query(query): Query<AuditQuery>,
 ) -> ControlResult<Json<Vec<AuditEntry>>> {
     principal.role.require(Action::Read)?;
-    let entries = state.audit.list(query.object_id.as_deref())?;
+    // BOLA re-disclosure defense (ADR-W005/ADR-W025): the audit log carries every
+    // mutation's `object_id` AND a `detail` body with full resource contents
+    // (device ids, `device_ref`, members). An object-scoped principal must not
+    // re-enumerate objects it could not `GET` through this history.
+    //
+    // (a) An explicit `?object_id=<out-of-scope>` is a per-object probe — denied
+    //     `403`, exactly as a single-object `GET` of that id would be.
+    if let Some(object_id) = query.object_id.as_deref() {
+        crate::auth::authorize_object(&principal, object_id)?;
+    }
+    let mut entries = state.audit.list(query.object_id.as_deref())?;
+    // (b)/(c) For a scoped principal: keep only entries whose `object_id` is in
+    // the allowlist, and redact any out-of-scope `device_ref`/`members[].device`
+    // still embedded in a surviving in-scope entry's `detail` body. No-op for an
+    // unscoped principal (the common admin/operator/viewer).
+    if principal.is_scoped() {
+        entries.retain(|entry| crate::auth::authorize_object(&principal, &entry.object_id).is_ok());
+        for entry in &mut entries {
+            if let Some(detail) = entry.detail.as_mut() {
+                crate::routes::redact_device_refs_in_body(&principal, detail);
+            }
+        }
+    }
     Ok(Json(entries))
 }

@@ -101,6 +101,7 @@ fn messages_block_contains_key_event_types() {
     for key in &[
         "TileState",
         "AudioMeter",
+        "AudioLoudness",
         "OutputStatus",
         "Alert",
         "InputConnection",
@@ -227,6 +228,82 @@ fn audio_meter_message_notes_high_rate() {
             || desc.to_lowercase().contains("high rate"),
         "AudioMeter message must document its high-rate / conflated nature; got: {desc:?}"
     );
+}
+
+#[test]
+fn audio_loudness_message_and_schema_are_present() {
+    // The AUD-8 program-bus loudness lane must be a reusable message under
+    // components.messages, $ref its payload schema, and that schema must carry
+    // the EBU R128 compliance fields the browser meter renders.
+    let doc = generated_doc();
+    let messages = doc
+        .pointer("/components/messages")
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert!(
+        messages.contains_key("AudioLoudness"),
+        "components.messages must contain an AudioLoudness message (audio.loudness wire event)"
+    );
+    let payload_ref = doc
+        .pointer("/components/messages/AudioLoudness/payload/$ref")
+        .and_then(Value::as_str)
+        .expect("AudioLoudness message must $ref its payload schema");
+    assert_eq!(payload_ref, "#/components/schemas/AudioLoudness");
+
+    // The message description must document its high-rate / conflated nature.
+    let desc = doc
+        .pointer("/components/messages/AudioLoudness/description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        desc.to_lowercase().contains("conflat") || desc.to_lowercase().contains("loudness"),
+        "AudioLoudness message must document its loudness/conflated nature; got: {desc:?}"
+    );
+
+    // The schema carries the measured loudness fields + the compliance reference.
+    let schema = doc
+        .pointer("/components/schemas/AudioLoudness")
+        .expect("AudioLoudness schema must be registered");
+    let props = schema
+        .pointer("/properties")
+        .and_then(Value::as_object)
+        .expect("AudioLoudness schema must declare properties");
+    for field in &[
+        "program",
+        "momentary",
+        "short_term",
+        "integrated",
+        "lra",
+        "true_peak_dbtp",
+        "target_lufs",
+        "ceiling_dbtp",
+        "tolerance_lu",
+        "gain_db",
+        "sampled_hz",
+    ] {
+        assert!(
+            props.contains_key(*field),
+            "AudioLoudness schema must declare the `{field}` property"
+        );
+    }
+    // The compliance reference + program index + cadence are always present.
+    let required = schema
+        .pointer("/required")
+        .and_then(Value::as_array)
+        .expect("AudioLoudness schema must list required fields");
+    for field in &[
+        "program",
+        "target_lufs",
+        "ceiling_dbtp",
+        "tolerance_lu",
+        "sampled_hz",
+    ] {
+        assert!(
+            required.iter().any(|r| r.as_str() == Some(*field)),
+            "AudioLoudness `{field}` must be a required (always-present) field"
+        );
+    }
 }
 
 // --- AsyncAPI 3.0 structural-validity gate ---

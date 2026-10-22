@@ -47,7 +47,7 @@ fn hardware_backends_are_unavailable_in_default_build() {
                 reason,
             } => {
                 assert_eq!(reported, kind);
-                assert!(!reason.is_empty());
+                assert_ne!(reason, "");
             }
             other => panic!("expected BackendUnavailable for {kind:?}, got {other:?}"),
         }

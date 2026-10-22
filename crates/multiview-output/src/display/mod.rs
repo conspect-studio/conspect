@@ -74,8 +74,9 @@
 //! (NVIDIA's proprietary driver documents GBM buffer submission to its KMS as
 //! unsupported; dumb buffers are the universal KMS CPU-scanout primitive).
 //!
-//! [ADR-0044]: https://github.com/aperim/multiview/blob/main/docs/decisions/ADR-0044.md
+//! [ADR-0044]: https://github.com/conspect-studio/conspect/blob/main/docs/decisions/ADR-0044.md
 
+pub mod audio;
 pub mod canvas;
 pub mod device;
 pub mod flip;

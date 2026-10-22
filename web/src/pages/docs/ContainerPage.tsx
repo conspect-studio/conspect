@@ -39,14 +39,14 @@ export function ContainerPage(): JSX.Element {
             </Trans>
           </Prose>
           <DocDefinitions>
-            <DocTerm term={<Code>ghcr.io/aperim/multiview:latest</Code>}>
+            <DocTerm term={<Code>ghcr.io/conspect-studio/conspect:latest</Code>}>
               <Trans>
                 Default software image. Also carries the VAAPI userspace and Mesa
                 or Intel drivers, so it can use an Intel or AMD render node when
                 one is passed through.
               </Trans>
             </DocTerm>
-            <DocTerm term={<Code>ghcr.io/aperim/multiview:latest-nvidia</Code>}>
+            <DocTerm term={<Code>ghcr.io/conspect-studio/conspect:latest-nvidia</Code>}>
               <Trans>
                 CUDA-enabled image (NVDEC / NVENC plus a wgpu compositor) for
                 NVIDIA GPUs.
@@ -75,7 +75,7 @@ export function ContainerPage(): JSX.Element {
             {`docker run --rm \\
   -v "$PWD/multiview.toml:/etc/multiview/multiview.toml:ro" \\
   -v multiview-hls:/var/lib/multiview/hls \\
-  ghcr.io/aperim/multiview:latest \\
+  ghcr.io/conspect-studio/conspect:latest \\
   run /etc/multiview/multiview.toml`}
           </CodeBlock>
         </DocSection>
@@ -104,7 +104,7 @@ export function ContainerPage(): JSX.Element {
   --device nvidia.com/gpu=all \\
   -e NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \\
   -e NVIDIA_VISIBLE_DEVICES=all \\
-  ghcr.io/aperim/multiview:latest-nvidia \\
+  ghcr.io/conspect-studio/conspect:latest-nvidia \\
   run /etc/multiview/multiview.toml`}
           </CodeBlock>
 
@@ -123,7 +123,7 @@ export function ContainerPage(): JSX.Element {
   --device /dev/dri/renderD128:/dev/dri/renderD128 \\
   --group-add "$(getent group render | cut -d: -f3)" \\
   -e LIBVA_DEVICE=/dev/dri/renderD128 \\
-  ghcr.io/aperim/multiview:latest \\
+  ghcr.io/conspect-studio/conspect:latest \\
   run /etc/multiview/multiview.toml`}
           </CodeBlock>
         </DocSection>
@@ -187,7 +187,7 @@ test -f "$f" && [ $(( $(date +%s) - $(stat -c %Y "$f") )) -lt 30 ]`}
           <CodeBlock label="Shell command">
             {`docker run --rm -p 8080:8080 \\
   -e MULTIVIEW_CONTROL_TOKEN="$MULTIVIEW_CONTROL_TOKEN" \\
-  ghcr.io/aperim/multiview:latest \\
+  ghcr.io/conspect-studio/conspect:latest \\
   run /etc/multiview/multiview.toml
 # then open http://[::1]:8080/ (UI) and /docs (API playground)`}
           </CodeBlock>

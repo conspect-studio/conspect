@@ -32,6 +32,14 @@ multiview-events = { workspace = true }
 # build; enforcement is DATA the cli samples, never a path that touches a running
 # program (invariant #1/#10).
 multiview-licence = { workspace = true }
+# The local-mesh discovery/relay plane (Conspect, ADR-0051): the cli owns the
+# single shared `MeshState` the always-on announce/browse loop maintains and the
+# control plane (`/api/v1/mesh/*`) renders, so the API serves live discovery
+# state. Pure-Rust leaf crate by default (the live mDNS socket lives behind the
+# mesh crate's own off-by-default `mdns` feature, pulled by the `mesh-mdns`
+# preset); it stays in the CI-green default build, control-plane-only, never able
+# to back-pressure the engine (invariant #10).
+multiview-mesh = { workspace = true }
 arc-swap = "1.9.1"
 multiview-telemetry = { workspace = true }
 multiview-compositor = { workspace = true }
@@ -43,7 +51,7 @@ multiview-hal = { workspace = true }
 # the `gpu` feature (the cli already links wgpu transitively via the compositor's
 # `wgpu` feature there), so the default pure-Rust build never sees it. `std` only —
 # no backend feature is needed to read the adapter-info enums.
-wgpu = { version = "29", default-features = false, features = [
+wgpu = { version = "30", default-features = false, features = [
   "std",
 ], optional = true }
 multiview-ffmpeg = { workspace = true }
@@ -52,6 +60,24 @@ multiview-output = { workspace = true }
 multiview-audio = { workspace = true }
 multiview-overlay = { workspace = true }
 multiview-preview = { workspace = true }
+# The single native WebRTC transport endpoint (ADR-0048): WHIP ingest sources,
+# WHEP preview/output egress, and the whip_push client all mux on one str0m
+# owner. OPTIONAL, pulled in ONLY by the cli `webrtc-native` feature (which also
+# turns on the crate's own `native` feature: the real ICE/DTLS/SRTP stack + the
+# single dual-stack UDP socket). The default + `webrtc` (pure seams) builds never
+# link it and stay GPU/native-free; `cargo deny` scans the default build only
+# (`all-features = false`), so the str0m closure never enters the deny graph.
+multiview-webrtc = { workspace = true, optional = true }
+# The `whip_push` output's HTTP signalling (ADR-0049 §5.2): the WHIP `POST`
+# offer->answer against the remote origin (Bearer, https-only 307/308 redirects).
+# OPTIONAL, pulled in ONLY by `webrtc-native`; pinned to the `rustls-tls` backend
+# (NEVER OpenSSL/native-tls) so the dependency graph stays native-lib-free,
+# mirroring the control crate's reqwest posture. `cargo deny` runs with
+# all-features=false so this off-by-default dep is not in the scanned default graph.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "blocking",
+], optional = true }
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 thiserror = { workspace = true }
@@ -74,12 +100,56 @@ ffmpeg-next = { version = "8.1", optional = true }
 # all-features=false so it never sees this opt-in dependency.
 tempfile = { version = "3", optional = true }
 
+# Used ONLY by the `heartbeat` feature to take a non-blocking advisory `flock`
+# (`rustix::fs::flock`, a SAFE wrapper — no `unsafe` in this crate) on the durable
+# idempotency-nonce lock file, so a SECOND `multiview` process pointed at the same
+# lease-state dir cannot concurrently mint colliding Idempotency-Keys (it fails
+# closed: that process's heartbeat declines to start). The `process` feature adds
+# `geteuid()` for the secret-storage-dir ownership check (tighten an over-permissive
+# dir we own, fail closed on one we don't). Already in the workspace graph (the
+# engine's `ptp` feature); MIT/Apache-2.0/BSD, `cargo deny`-clean. Optional + gated
+# so the default build never pulls the `fs`/`process` surface.
+rustix = { workspace = true, features = ["fs", "process"], optional = true }
+
+# Used ONLY by the `heartbeat` feature for the device-PoP keypair (CONSPECT-3,
+# ADR-I007): GENERATE (the only RNG in the product, at the cli boundary — the leaf
+# crate stays no-RNG) + LOAD a persisted Ed25519 device keypair and SIGN the
+# COSE_Sign1 proof with it. `ed25519-dalek` is `MIT OR Apache-2.0`, deny-clean, and
+# already in the workspace graph (the licence crate's verify path); `getrandom`
+# (`fill`) draws the 32 seed bytes for the one-time keygen, fail-closed on an OS
+# entropy error (so no `SigningKey::generate` RNG-trait surface is needed, and the
+# ed25519-dalek `rand_core` feature is not pulled). Optional + gated so the default
+# build pulls no RNG/signing surface. ed25519-dalek 3.x aligns to rand_core 0.10 /
+# getrandom 0.4 / curve25519-dalek 5 (ADR-I010).
+ed25519-dalek = { version = "3", default-features = false, features = [
+    "alloc",
+], optional = true }
+getrandom = { version = "0.4", default-features = false, optional = true }
+
 # Used by the control bridge (the compact per-tick engine state snapshot the
 # control plane republishes is a `serde_json::Value`) and by the `overlay`
 # pipeline (reading kind-specific `[[overlays]]` params out of
 # `multiview_config::Overlay::params`, a `serde_json::Map`). Pure Rust
 # (MIT/Apache-2.0); stays in the default build.
+serde = { workspace = true }
 serde_json = { workspace = true }
+
+# The `multiview node` bootstrap (DEV-B5 / ADR-0045) parses the node-side TOML
+# config (`node::NodeRuntimeConfig`). Pure Rust (MIT/Apache-2.0), the same crate
+# `multiview-config` already uses; stays in the default build (the node
+# bootstrap is always compiled and CI-tested without hardware). `cargo deny` is
+# already satisfied — `toml` is in the workspace graph.
+toml = "1.1.2"
+# The `multiview node` enrollment request encodes the raw 32-byte Ed25519 device
+# public key as base64url (ADR-I008's verified raw-32 encoding). Pure Rust
+# (MIT/Apache-2.0); already a dev-dep and in the workspace graph (the licence
+# plane). `default-features = false` keeps it `alloc`-only.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# The `multiview node` display pairing code is a Crockford-base32 truncation of
+# the SHA-256 of the device public key — deterministic so the displayed code is
+# stable across power cycles. Pure Rust (MIT/Apache-2.0), the same hash the
+# licence plane's device-PoP uses; already in the workspace graph.
+sha2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = [
@@ -91,6 +161,21 @@ tokio = { workspace = true, features = [
     "io-util",
 ] }
 tempfile = "3"
+# Test-only crypto for the device-ACTIVATE never-off-air chaos gate (ADR-I008): an
+# ECDSA-P256 root signs a fabricated attested keyset (so the chaos server's
+# `fetch_keys` passes `TrustedKeys::verify` and `activate_once` actually REACHES the
+# stalled/partitioned `server.activate(...)`), and an Ed25519 device key signs the PoP.
+# All already in the workspace graph behind `heartbeat` (deny-clean, no new crate);
+# dev-only — the cli's non-test code has no signer/RNG.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+serde_json = { workspace = true }
+# Property tests for the pure media-player transport state machine (ADR-0057 /
+# ADR-0097): the exact-once vamp-exit-latch race over a 2–3-frame vamp segment,
+# and output-anchored stamp monotonicity across loop laps. Matches the
+# workspace proptest pin used by multiview-core/config/etc.
+proptest = "1.5.0"
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).
@@ -148,6 +233,14 @@ required-features = ["ffmpeg", "overlay"]
 name = "incontainer_text_ingest"
 required-features = ["ffmpeg", "overlay"]
 
+# WHIP ingest end-to-end (ADR-T014): synthetic RTP -> the per-session ring ->
+# RtpRingEngine -> WebRtcProducer -> typed MediaEvents, plus the isolation
+# invariants (bounded drop-oldest; a dropped publisher ends the stream so the
+# tile rides NO_SIGNAL without stalling other tiles). Needs `webrtc-native`.
+[[test]]
+name = "whip_ingest"
+required-features = ["webrtc-native"]
+
 # Feature presets for the `multiview` binary. The DEFAULT build is `software`:
 # pure Rust, no native libs, no GPU — the CI-green baseline. The hardware
 # presets aggregate the owning sub-crates' feature flags exactly as documented
@@ -160,12 +253,58 @@ default = ["software"]
 # Software-only reference path (always available).
 software = []
 
+# WebRTC pure seams (ADR-0048 §11): the `multiview-preview` (WHEP preview egress:
+# SDP offer/answer + preview-encoder-selection logic + transport seam) and
+# `multiview-input` (WHIP ingest: SDP negotiation, the Opus/H.264 depacketizers,
+# the MediaEngine pull) WebRTC seams — both already exist and add NO native deps,
+# so this stays in a pure-Rust / `cargo deny`-clean build. On its own it serves
+# no live media (the control plane advertises `webrtc: false` and the SPA stays
+# on the JPEG ladder). It does NOT link str0m; the live transport is
+# `webrtc-native`.
+webrtc = ["multiview-preview/webrtc", "multiview-input/webrtc"]
+
+# AES67 / SMPTE ST 2110-30 open-audio-over-IP (ADR-0033 / ADR-T013 / ADR-0041). RX
+# = the ST 2110 receiver + AES67 L16/L24 depacketizer (`multiview-input/st2110`);
+# TX = the raw-PCM multicast sender (`multiview-output/aes67`). Audio-only — no
+# encode/GPU stage. The config types are always parsed; a document declaring an
+# `Aes67` source/output in a build WITHOUT this feature FAILS validation (the
+# `display-kms` precedent), never a silent skip.
+aes67 = ["multiview-input/st2110", "multiview-output/aes67"]
+
+# WebRTC NATIVE transport (ADR-0048 §11, ADR-T014, ADR-P006): the single str0m
+# ICE/DTLS/SRTP endpoint (`multiview-webrtc/native`) that drives WHIP ingest
+# sources AND WHEP preview/output egress — wired into the control plane so a
+# browser can WHIP-publish or WHEP-play a live preview tap (program/input/output)
+# over real DTLS/SRTP with audio, TURN-enabled. Pulls `multiview-webrtc/native`
+# (the single dual-stack UDP socket + str0m owner) and implies `ffmpeg` (the WHIP
+# ingest path decodes depacketized H.264/Opus via `multiview-ffmpeg` into the
+# standard NV12 / AudioStore pipeline; the real preview H.264/VP8/Opus encoders
+# ride the same libav encode path). OFF by default: it links a native WebRTC
+# stack (str0m + an aws-lc-rs C/assembly crypto blob), so the baseline build
+# stays pure-Rust and CI-green. The cli itself adds NO `unsafe` and stays
+# `forbid(unsafe_code)`; all native code is owned by `multiview-webrtc` and
+# `multiview-ffmpeg`. `cargo deny` runs `all-features = false` so the str0m
+# closure never enters the default LGPL-clean graph.
+webrtc-native = [
+    "webrtc",
+    "dep:multiview-webrtc",
+    "multiview-webrtc/native",
+    "dep:reqwest",
+    "ffmpeg",
+]
+
 # NVIDIA live-load telemetry (NVML): select the real `NvmlLoadPoller`
 # (multiview-hal's `cuda` feature) as the per-GPU source the system-metrics task
 # polls, instead of the always-compiled `NullLoadPoller`. Runtime-loaded
 # (libnvidia-ml) so the build is GPU-free; OFF by default and implied by the
 # `nvidia` preset. Pure telemetry — pulls no codec/compositor backend on its own.
 cuda = ["multiview-hal/cuda"]
+# The cli's `vaapi`/`qsv` features select the DRM sysfs system-metrics poller
+# (`SysfsLoadPoller`) on AMD/Intel — the `linux-vaapi` counterpart to `cuda`.
+# Runtime `/sys` + `/proc` reads only; GPU-free; OFF by default, implied by the
+# `linux-vaapi` preset. Pure telemetry — pulls no codec/compositor backend.
+vaapi = ["multiview-hal/vaapi"]
+qsv = ["multiview-hal/qsv"]
 
 # Embed + serve the built web UI from `multiview run` (same-origin with the API).
 # Pure Rust (rust-embed); requires the web build (`npm --prefix web run build`)
@@ -173,20 +312,31 @@ cuda = ["multiview-hal/cuda"]
 # build can serve the full management UI: `run --features web,overlay`.
 web = ["multiview-control/embed-web"]
 
+# Control-plane TLS termination (TLS-0, ADR-W029): serve the management plane
+# (API + docs + web UI) over HTTPS with an operator-managed cert/key when the
+# config carries `[control.tls]`. Forwards `multiview-control/tls` (axum-server +
+# rustls, aws-lc-rs — already in the lock via the cast/reqwest backends). OFF by
+# default (no native TLS dep in the baseline build); included in the shipped
+# umbrella presets below so the deploy images can terminate HTTPS without a proxy.
+tls = ["multiview-control/tls"]
+
 # mDNS/DNS-SD managed-device discovery (DEV-A5 / ADR-M008 §6 / ADR-0041): install
 # the real `mdns-sd`-backed browser so `POST /api/v1/discovery/devices/scan`
 # browses the LAN for Cast / NDI / (configured) zowietek-control services. The
 # untrusted-inventory model + endpoints are always compiled; this feature only
 # adds the multicast socket. Pure Rust, LGPL-clean, GPU-free.
 discovery = ["multiview-control/discovery"]
-# Managed-device network I/O (DEV-A4, ADR-M009): the live HTTP transport for the
-# `zowietek` driver poller. With this on, a `multiview run` whose config declares
+# Managed-device network I/O (DEV-A4/D2, ADR-M009/M011): the live transports
+# for every device driver — the `zowietek` HTTP poller and the `cast` CASTV2
+# wire layer. With this on, a `multiview run` whose config declares
 # `[[devices]]` with `driver = "zowietek"` spawns a supervised control-plane
 # poller per device (login → probe → enumerate facets → poll status → drive the
-# lifecycle), so the projection routes return real candidates/targets and
-# `set-mode` dispatches convergence. OFF by default so the baseline build stays
-# pure-Rust/socket-free and CI-green; forwards `multiview-control/zowietek`.
-devices-net = ["multiview-control/zowietek"]
+# lifecycle), and a `driver = "cast"` device (or an ad-hoc
+# `POST /api/v1/cast/sessions`) gets a supervised CASTV2 session actor pointing
+# the device at a served HLS rendition (requires `control.cast_media_base`).
+# OFF by default so the baseline build stays pure-Rust/socket-free and
+# CI-green; forwards `multiview-control/devices-net` (= `zowietek` + `cast`).
+devices-net = ["multiview-control/devices-net"]
 
 # Overlay rasterization: bakes the configured overlays (clock/labels, dB
 # meters, safe-area graticules, tally borders, burned-in SRT/VTT subtitles) into
@@ -225,6 +375,49 @@ display-kms = ["multiview-output/display-kms"]
 # elsewhere / on a denied read the badge honestly shows the assumed default.
 ntp = ["multiview-engine/ntp"]
 
+# Live local-mesh discovery (Conspect, ADR-0051 §6): turn on the mesh crate's
+# off-by-default `mdns` feature so the always-on announce/browse loop uses the
+# real link-local-multicast mDNS socket (IPv6-first `ff02::fb`, IPv4 legacy
+# interop) instead of staying a pure shell. OFF by default so the baseline build
+# is socket-free and `cargo deny`-clean; the shipped deploy presets turn it on.
+# The discovered-peer inventory is served read-only over `/api/v1/mesh/peers`
+# regardless of this feature (the shared `MeshState` is always wired); this only
+# gates whether the live socket loop runs. Control-plane only; the loop is
+# best-effort and can never back-pressure the engine (invariant #10).
+mesh-mdns = ["multiview-mesh/mdns"]
+
+# The Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096): turn on
+# the licence crate's off-by-default `heartbeat` feature (the key-trust verifier
+# + the signed-lease verifier + the `HeartbeatClient` loop) AND pull the live
+# `reqwest` (rustls) HTTP transport the cli implements at this boundary. With this
+# on, a configured device (org id + pinned ECDSA-P256 root + Conspect base URL +
+# account JWT + salted device identity, all read from the environment) runs a
+# supervised control-plane heartbeat loop that renews the lease against
+# conspect.studio and drives the SAME `LeaseStore::install_binding` convergence as
+# the offline file-drop + mesh relay. OFF by default so the baseline build is
+# network-free and `cargo deny`-clean; the shipped deploy presets turn it on
+# (mirrors `mesh-mdns`). Control-plane only; the loop holds no engine handle and
+# can never back-pressure the engine, and only ever tightens on a positively-
+# verified signed lease (invariants #1/#10). `reqwest` is pinned to the
+# `rustls-tls` backend (NEVER OpenSSL/native-tls) so the graph stays native-lib-
+# free; `cargo deny` runs `all-features = false` so this opt-in dep is not in the
+# scanned default graph. LGPL-clean.
+heartbeat = [
+    "multiview-licence/heartbeat",
+    "dep:reqwest",
+    "reqwest?/json",
+    "dep:rustix",
+    "dep:ed25519-dalek",
+    "dep:getrandom",
+]
+
+# Sample a PTP Hardware Clock (`[timing] ptp_phc`, e.g. /dev/ptp0) to discipline
+# the outbound presentation epoch's wall estimate (DEV-C1 / ADR-M010): PTP then
+# outranks the system clock while disciplined (ADR-T012). Off by default; pulls
+# the engine's `ptp` feature (safe `rustix` PHC reads -- no unsafe in this crate).
+# Compile-verified only in CI (no PTP NIC); PTP NEVER paces the tick loop.
+ptp = ["multiview-engine/ptp"]
+
 # Real libav* end-to-end pipeline: ingest (demux/decode) -> per-tile framestores
 # -> EngineRuntime drive (CPU reference compositor) -> encode the canvas once
 # (LGPL `mpeg2video` by default) -> fan out to the file + HLS output sinks. Wires
@@ -245,6 +438,29 @@ ffmpeg = [
     "multiview-output/ffmpeg",
     "multiview-audio/ffmpeg",
 ]
+
+# RIST (Reliable Internet Stream Transport, VSF TR-06) ingest + egress
+# (ADR-0095 Tier-0): wire a `rist` source through the libav `rist://` demuxer and
+# a `rist` push output through the `mpegts` muxer over `rist://` — the
+# open-standard sibling of SRT, single-link Simple/Main Profile with PSK-AES.
+# Implies `ffmpeg` (the live run/ingest/encode path lives in the `ffmpeg`-gated
+# pipeline; without it a `rist` kind has nowhere to run). LGPL-clean: librist is
+# BSD-2-Clause and `--enable-librist` forces neither `--enable-gpl` nor
+# `--enable-nonfree` (conventions §7), so this is an off-by-default *native-dep*
+# gate only, NOT a license-escalating one. The deployed FFmpeg must be built
+# `--enable-librist`; without it a `rist://` open fails at run time and the tile
+# rides NO_SIGNAL (it never crashes). Tier-1 stats / Tier-2 bonding (the
+# `multiview-rist-sys` FFI leaf) are gated by the separate `rist-stats` flag.
+rist = ["ffmpeg"]
+
+# RIST link STATISTICS (ADR-0095 Tier-1 / RIST-5): turns on the direct-librist
+# stats surface (`multiview-output/rist-stats` → the `multiview-rist-sys` FFI
+# leaf, runtime-loaded). FFmpeg's `rist://` protocol exposes no stats, so this is
+# the only path that observes a RIST link's retransmit/RTT/quality/bandwidth on
+# telemetry + the realtime `rist.link.stats` event + the `rist-link-loss` health
+# warning. Implies `rist` (the transport it instruments). Off by default; librist
+# is runtime-loaded (never linked), BSD-2-Clause — LGPL-clean.
+"rist-stats" = ["rist", "multiview-output/rist-stats"]
 
 # YouTube live ingest (ADR-0015): resolve a `youtube` source's watch URL to a
 # time-limited `*.googlevideo.com` HLS master via a runtime-discovered `yt-dlp`
@@ -274,7 +490,23 @@ youtube = ["ffmpeg", "multiview-input/youtube"]
 # runs with `all-features = false` so this opt-in obligation never enters the
 # default LGPL-clean deny graph. LGPL-clean: the SDK is dynamically loaded at run
 # time, not linked.
-ndi = ["multiview-input/ndi", "ffmpeg"]
+#
+# Forwards `multiview-output/ndi` too (OUT-4b / NDI-L2): the NDI *output* sink
+# seam (canvas→UYVY→send + the license gate) so a configured `ndi` output is
+# wired off the hot path. The live SDK function table (`SdkNdiApi`) needs the
+# build-time `bindgen` over the licensed header — that is the separate
+# `ndi-bindings` escalation below; plain `ndi` carries the seam (CI-buildable,
+# SDK-free) and refuses an NDI output honestly until `ndi-bindings` + a runtime.
+ndi = ["multiview-input/ndi", "multiview-output/ndi", "ffmpeg"]
+
+# The LIVE NDI binding (ADR-0028 / NDI-L2): turns on `multiview-output`'s
+# `ndi-bindings` (which builds `multiview-ndi-sys`'s `bindings` over the licensed
+# SDK header) so the CLI can construct the real `SdkNdiApi` and actually send the
+# composited canvas to the NDI network. Implies `ndi`. A box/operator concern
+# (needs the SDK header at build time + a resolvable runtime at run time); plain
+# `--features ndi` stays SDK-free and CI-buildable. The default build remains
+# LGPL-clean (nothing linked — the runtime is dynamically loaded).
+ndi-bindings = ["ndi", "multiview-output/ndi-bindings"]
 
 # License-escalating: forwards the GPL software encoders (libx264/libx265) so a
 # `run --features ffmpeg,gpl-codecs` may target H.264/H.265. Enabling this makes
@@ -289,6 +521,9 @@ gpl-codecs = [
 # NVIDIA: CUDA decode/encode + CUDA compositor fast path + FFmpeg demux/mux,
 # wgpu baseline compositor. (cuda + ffmpeg + wgpu.)
 nvidia = [
+    # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
+    # on the management listener with an operator cert (`[control.tls]`).
+    "tls",
     # The cli's OWN `ffmpeg` feature — gates the run/pipeline path itself; without
     # it `multiview run` has no ingest/encode pipeline at all (GPU-6b: the presets
     # forwarded the dependency crates' ffmpeg but not the cli's, so a `--features
@@ -314,6 +549,11 @@ nvidia = [
     # SILENTLY keeps the CPU reference backend (the on-hardware "GPU never engages,
     # CPU pegged at 4K" bug). `gpu` pulls `multiview-compositor/wgpu` + `dep:wgpu`.
     "gpu",
+    # Measure the kernel NTP/chrony discipline (adjtimex) instead of assuming it:
+    # without `ntp` the deploy image's epoch path has NO kernel reading at all and
+    # the published `timing.status` quality honestly reports freerun (DEV-C1
+    # review finding 3) — a Linux deploy build must measure, not assume.
+    "ntp",
     "multiview-hal/cuda",
     "multiview-compositor/cuda",
     "multiview-compositor/wgpu",
@@ -325,11 +565,28 @@ nvidia = [
     "multiview-input/ffmpeg",
     "multiview-output/ffmpeg",
     "multiview-audio/ffmpeg",
+    # WebRTC: the shipped deploy image serves WHIP ingest + WHEP preview/output
+    # egress over the single native str0m endpoint, over real DTLS/SRTP with
+    # audio, TURN-enabled (ADR-0048 §11 / ADR-T014 / ADR-P006).
+    "webrtc-native",
+    # RIST (Reliable Internet Stream Transport) ingest + egress (ADR-0095): the
+    # shipped deploy image takes/delivers `rist://` feeds (the deployed FFmpeg is
+    # built `--enable-librist`). LGPL-clean (librist is BSD-2-Clause).
+    "rist",
+    # Live local-mesh discovery (Conspect, ADR-0051 §6): the shipped deploy image
+    # runs the real mDNS announce/browse loop.
+    "mesh-mdns",
+    # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096): the
+    # shipped deploy image runs the supervised heartbeat loop (when configured).
+    "heartbeat",
 ]
 
 # Apple Silicon / Intel macOS: VideoToolbox codecs + Metal compositor + FFmpeg.
 # (videotoolbox + metal + ffmpeg.)
 apple = [
+    # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
+    # on the management listener with an operator cert (`[control.tls]`).
+    "tls",
     "ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped Apple deploy image
@@ -341,11 +598,23 @@ apple = [
     "multiview-input/ffmpeg",
     "multiview-output/ffmpeg",
     "multiview-audio/ffmpeg",
+    # WebRTC ingest + WHEP preview/output egress over the native str0m endpoint
+    # (ADR-0048 §11 / ADR-P006).
+    "webrtc-native",
+    # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
+    "rist",
+    # Live local-mesh discovery (Conspect, ADR-0051 §6).
+    "mesh-mdns",
+    # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
+    "heartbeat",
 ]
 
 # Linux VAAPI/QSV: VAAPI + QuickSync codecs + wgpu compositor + FFmpeg.
 # (vaapi + qsv + ffmpeg + wgpu.)
 linux-vaapi = [
+    # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
+    # on the management listener with an operator cert (`[control.tls]`).
+    "tls",
     "ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped VAAPI deploy image
@@ -354,6 +623,13 @@ linux-vaapi = [
     # `gpu` gates the run-path GPU-compositor SELECTION (see the `nvidia` note);
     # without it the wgpu compositor compiles but the run stays on the CPU backend.
     "gpu",
+    # Measured kernel NTP discipline for the epoch path (see the `nvidia` note).
+    "ntp",
+    # The cli's own `vaapi`/`qsv` features select the DRM sysfs system-metrics
+    # poller (`SysfsLoadPoller`), the AMD/Intel counterpart to how `cuda`
+    # selects the NVML one.
+    "vaapi",
+    "qsv",
     "multiview-hal/vaapi",
     "multiview-hal/qsv",
     "multiview-compositor/vaapi",
@@ -362,6 +638,15 @@ linux-vaapi = [
     "multiview-input/ffmpeg",
     "multiview-output/ffmpeg",
     "multiview-audio/ffmpeg",
+    # WebRTC ingest + WHEP preview/output egress over the native str0m endpoint
+    # (ADR-0048 §11 / ADR-P006).
+    "webrtc-native",
+    # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
+    "rist",
+    # Live local-mesh discovery (Conspect, ADR-0051 §6).
+    "mesh-mdns",
+    # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
+    "heartbeat",
 ]
 
 # Everything non-GPL: all codec backends, every compositor backend, FFmpeg,
@@ -370,6 +655,10 @@ linux-vaapi = [
 full = [
     "nvidia",
     "linux-vaapi",
+    # `ntp` comes transitively via the Linux presets above; named explicitly so
+    # the everything-non-GPL build keeps the measured discipline path even if a
+    # preset is refactored.
+    "ntp",
     "multiview-hal/videotoolbox",
     "multiview-compositor/metal",
     # The cli `overlay` feature (the pure-Rust overlay/caption burn-in path) comes
@@ -378,19 +667,28 @@ full = [
     # capability marker — it links no native lib in-tree today and degrades ASS/SSA
     # to the pure-Rust text fallback when absent). LGPL/ISC, never GPL.
     "multiview-overlay/libass",
-    # NDI I/O: the cli `ndi` feature wires NDI *ingest* (and forwards
-    # `multiview-input/ndi`); `multiview-output/ndi` adds the NDI *output* sink.
+    # NDI I/O: the cli `ndi` feature wires NDI *ingest* AND *output* (it forwards
+    # both `multiview-input/ndi` and `multiview-output/ndi`). The live SDK binding
+    # (`ndi-bindings`) stays a separate box/operator opt-in (licensed SDK header).
     "ndi",
-    "multiview-output/ndi",
     "multiview-control/embed-web",
     "multiview-control/openapi",
-    "multiview-preview/webrtc",
+    # Live WHEP preview egress over real DTLS/SRTP, with audio, TURN-enabled
+    # (ADR-P006) — supersedes the pure `multiview-preview/webrtc` seam in `full`.
+    "webrtc-native",
     # mDNS managed-device discovery (DEV-A5): pure-Rust, LGPL-clean, GPU-free.
     "multiview-control/discovery",
     # Managed-device live transport (DEV-A4): the `zowietek` driver poller's real
     # HTTP backend. LGPL-clean (reqwest + rustls, no native lib), so it belongs
     # in the non-GPL `full` build.
     "devices-net",
+    # RIST ingest + egress (ADR-0095): comes transitively via the presets above;
+    # named explicitly so the everything-non-GPL build keeps it on a refactor.
+    # LGPL-clean (librist BSD-2-Clause).
+    "rist",
+    # Control-plane HTTPS (TLS-0, ADR-W029): comes transitively via `nvidia` +
+    # `linux-vaapi`; named explicitly so `full` keeps it on a preset refactor.
+    "tls",
 ]
 
 [lints]

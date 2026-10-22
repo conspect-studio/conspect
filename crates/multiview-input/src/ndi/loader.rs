@@ -33,13 +33,34 @@ pub enum NdiLoadStatus {
         /// Human-readable detail of why the found runtime was unusable.
         detail: String,
     },
+    /// The operator has not accepted the NDI SDK license (ADR-0008 §7.5): the NDI
+    /// source/output is refused with the `ndi_unlicensed` status and never
+    /// started. Distinct from a missing runtime — the operator must accept the
+    /// license, not install a dylib. The license axis is checked **before** the
+    /// runtime is probed, so an unaccepted source never touches the SDK.
+    Unlicensed,
 }
 
 impl NdiLoadStatus {
     /// Whether NDI sources may be offered (the runtime resolved successfully).
+    /// Always `false` for [`Self::Unlicensed`] — an unaccepted license is never
+    /// "available", regardless of whether a runtime could load.
     #[must_use]
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Available)
+    }
+
+    /// The stable status token surfaced to telemetry / the UI / the validator,
+    /// matching the names ADR-0008 §7.5 and `docs/io/ndi.md` use verbatim
+    /// (`ndi_unlicensed` for an unaccepted license).
+    #[must_use]
+    pub fn status_label(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::RuntimeNotFound => "ndi_runtime_not_found",
+            Self::Unusable { .. } => "ndi_runtime_unusable",
+            Self::Unlicensed => "ndi_unlicensed",
+        }
     }
 
     /// Map a [`multiview_ndi_sys`] load error to a reported status.

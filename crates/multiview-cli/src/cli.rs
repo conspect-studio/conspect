@@ -51,6 +51,17 @@ pub enum Command {
     /// sources, and run. In `--software` mode this drives the FFmpeg-free output
     /// clock for `--ticks` ticks (or until Ctrl-C) and reports cadence/frames.
     Run(RunArgs),
+    /// Run as a **display node** (DEV-B5, ADR-0045): a small box that ingests
+    /// one stream from a central Multiview, hardware-decodes it, and presents
+    /// the single-source canvas straight to an attached HDMI/DisplayPort head
+    /// via the `display-kms` scanout sink + ALSA HDMI audio.
+    ///
+    /// This slice ships the software **bootstrap/plan** surface (`--plan-only`,
+    /// the default): it loads + validates the node config, resolves the
+    /// keypair-bound device identity + display pairing code, and prints the
+    /// resolved enrollment + presentation plan. The live ingest → scanout path
+    /// and the real enrollment HTTP are hardware/network follow-ons.
+    Node(NodeArgs),
 }
 
 /// Arguments for `multiview validate`.
@@ -60,6 +71,24 @@ pub struct ValidateArgs {
     /// Path to the TOML configuration document to validate.
     #[arg(value_name = "CONFIG")]
     pub config: PathBuf,
+}
+
+/// Arguments for `multiview node`.
+#[derive(Debug, Args)]
+#[non_exhaustive]
+pub struct NodeArgs {
+    /// Path to the TOML node config (the node-side bootstrap document:
+    /// controller endpoint, enrollment token, identity dir, link offset, clock
+    /// mode).
+    #[arg(value_name = "CONFIG")]
+    pub config: PathBuf,
+
+    /// Resolve + validate the node config and identity and print the bootstrap
+    /// plan **without** starting the live ingest → scanout path. This is the
+    /// default in the current slice — the live path is a hardware follow-on, so
+    /// the flag is accepted explicitly and defaults on.
+    #[arg(long, default_value_t = true)]
+    pub plan_only: bool,
 }
 
 /// Arguments for `multiview run`.

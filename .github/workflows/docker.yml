@@ -4,9 +4,12 @@ name: docker
 # NATIVE runners (no QEMU). Each (variant, arch) leg builds + pushes BY DIGEST; a
 # per-variant `merge` job assembles the manifest, then attests provenance + SBOM
 # (verifying they survived the merge) and signs (keyless cosign, --recursive).
-# FFmpeg is NOT built here — it is pulled from the published base image
-# ghcr.io/aperim/multiview-ffmpeg via the FFMPEG_IMAGE build-arg (see
-# .github/workflows/ffmpeg-base.yml + deploy/Dockerfile.ffmpeg, ADR-0031 §5).
+# FFmpeg is NOT built here — it is pulled from the published base image via the
+# FFMPEG_IMAGE build-arg (see .github/workflows/ffmpeg-base.yml +
+# deploy/Dockerfile.ffmpeg, ADR-0031 §5). The image is resolved per leg by
+# scripts/resolve-ffmpeg-image.sh: this owner's ghcr.io/<owner>/multiview-ffmpeg
+# when the tag is published, else the public upstream
+# ghcr.io/aperim/multiview-ffmpeg (the Dockerfiles' own ARG default).
 #
 # On pull_request we BUILD ONLY (no login/push) so forks/PRs can't publish.
 
@@ -24,7 +27,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }} # aperim/multiview
+  IMAGE_NAME: ${{ github.repository }} # conspect-studio/conspect
 
 permissions:
   contents: read
@@ -53,14 +56,14 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_image: ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl
+            ffmpeg_tag: 8.1.1-lgpl
             features: "ffmpeg,linux-vaapi,web"
           - variant: generic
             dockerfile: deploy/Dockerfile
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-            ffmpeg_image: ghcr.io/aperim/multiview-ffmpeg:8.1.1-lgpl
+            ffmpeg_tag: 8.1.1-lgpl
             features: "ffmpeg,linux-vaapi,web"
           # nvidia (CUDA/NVENC) — amd64 ONLY until arm64 CUDA base + nv-codec are validated.
           - variant: nvidia
@@ -68,7 +71,7 @@ jobs:
             platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-            ffmpeg_image: ghcr.io/aperim/multiview-ffmpeg:8.1.1-nvidia
+            ffmpeg_tag: 8.1.1-nvidia
             features: "ffmpeg,nvidia,web"
     runs-on: ${{ matrix.runner }}
     outputs:
@@ -78,23 +81,28 @@ jobs:
       digest-nvidia-amd64: ${{ steps.export.outputs.digest-nvidia-amd64 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v4.2.0
 
       # Login + push only when NOT a pull_request (forks must not publish).
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4.2.0
+        uses: docker/login-action@v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve FFmpeg base image
+        # Owner-published base if the tag exists, else the public upstream one.
+        id: ffmpeg
+        run: echo "image=$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${{ matrix.ffmpeg_tag }}")" >> "$GITHUB_OUTPUT"
+
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -106,7 +114,7 @@ jobs:
           # FFMPEG_IMAGE pulls the published FFmpeg base (COPY --from=ffmpeg);
           # CARGO_FEATURES is threaded identically into chef `cook` and `build`.
           build-args: |
-            FFMPEG_IMAGE=${{ matrix.ffmpeg_image }}
+            FFMPEG_IMAGE=${{ steps.ffmpeg.outputs.image }}
             CARGO_FEATURES=${{ matrix.features }}
           # Registry cache (durable, cross-branch, unbounded) on push; GHA
           # read-only fallback always present for PRs/forks (no GHCR write).
@@ -151,10 +159,10 @@ jobs:
             digests: '["${{ needs.build.outputs.digest-nvidia-amd64 }}"]'
     steps:
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v4.2.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.2.0
+        uses: docker/login-action@v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -162,7 +170,7 @@ jobs:
 
       - name: Compute tags + labels
         id: meta
-        uses: docker/metadata-action@v6.1.0
+        uses: docker/metadata-action@v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |
@@ -199,7 +207,12 @@ jobs:
             echo "::error::no source digests for variant ${SUFFIX:-generic}"; exit 1
           fi
           docker buildx imagetools create "${TAG_ARGS[@]}" "${SRC[@]}"
-          DIGEST="$(docker buildx imagetools inspect "${REF}:${VERSION}${SUFFIX}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          # Inspect via the FIRST tag from the metadata-action list: the action's
+          # `version` output already carries the flavor suffix (e.g. `edge-nvidia`),
+          # so appending ${SUFFIX} again composed a doubled `edge-nvidia-nvidia`
+          # ref that does not exist and failed every nvidia merge on main.
+          FIRST_TAG="$(head -n1 <<< "$TAGS")"
+          DIGEST="$(docker buildx imagetools inspect "$FIRST_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Verify attestations survived the merge
@@ -214,7 +227,7 @@ jobs:
           if [ "$sbom" = "null" ] || [ -z "$sbom" ]; then echo "::error::merged manifest lost SBOM"; exit 1; fi
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4.1.0
+        uses: actions/attest-build-provenance@v4.1.1
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.manifest.outputs.digest }}

@@ -223,6 +223,11 @@ pub struct SoftwareEngine {
     /// registers its flag here, and the live-source hub shares the same
     /// registry, so a live `RemoveSource` can tear down exactly one producer.
     stop_registry: crate::live_sources::StopRegistry,
+    /// The run's epoch **anchor** slot (DEV-C1 / ADR-M010): the forever run
+    /// publishes its tick-0 seed + monotonic source here when the runtime
+    /// seeds, so the timing-status task can derive the outbound presentation
+    /// epoch off the hot path (lock-free store/load — inv #1/#10).
+    epoch_anchor: crate::timing_status::EpochAnchorSlot,
 }
 
 /// An animated synthetic source recorded for a generator thread: its store, the
@@ -369,6 +374,7 @@ impl SoftwareEngine {
             publish_test_frames: true,
             program_preview: crate::preview::program_slot(),
             stop_registry: crate::live_sources::stop_registry(),
+            epoch_anchor: crate::timing_status::anchor_slot(),
         })
     }
 
@@ -418,6 +424,14 @@ impl SoftwareEngine {
     #[must_use]
     pub fn preview_stores(&self) -> HashMap<String, Arc<TileStore<Nv12Image>>> {
         self.stores.clone()
+    }
+
+    /// DEV-C1 (ADR-M010): the run's epoch **anchor** slot, filled by the
+    /// forever run when its runtime seeds tick 0; the timing-status task binds
+    /// to it lazily with a lock-free load (inv #1/#10).
+    #[must_use]
+    pub fn epoch_anchor_slot(&self) -> crate::timing_status::EpochAnchorSlot {
+        Arc::clone(&self.epoch_anchor)
     }
 
     /// The fixed output cadence (exact rational).
@@ -484,10 +498,16 @@ impl SoftwareEngine {
             let canvas = self.canvas_color;
             let cadence = self.cadence;
             let id = store.id().to_owned();
-            crate::live_sources::register_stop(&self.stop_registry, &id, &stop);
+            let exited = crate::live_sources::register_stop(&self.stop_registry, &id, &stop);
+            // ExitGuard built BEFORE spawn: its Drop flips `exited` on thread exit OR if
+            // Builder::spawn fails (the dropped closure drops the guard) — so a failed
+            // spawn never orphans an exited=false entry teardown would busy-wait on
+            // (ADR-W018 §5).
+            let exit_guard = crate::live_sources::ExitGuard::new(&exited);
             let thread_stop = Arc::clone(&stop);
             let builder = std::thread::Builder::new().name(format!("multiview-synth-{id}"));
             match builder.spawn(move || {
+                let _exit = exit_guard;
                 generator_loop(kind, &store, width, height, canvas, cadence, &thread_stop);
             }) {
                 Ok(handle) => producers.push((stop, handle)),
@@ -555,22 +575,40 @@ impl SoftwareEngine {
         self.prime_stores(time_source.as_ref());
         let ts: Arc<dyn TimeSource> = time_source.clone();
         let mut runtime = self.build_runtime(ts, pacer)?;
-        // Jump the (jumpable) clock past the deadline of the final tick so the
-        // cooperative pacer releases every tick of this bounded run without any
-        // real sleep. The last tick emitted has index `max_ticks - 1`; covering
-        // its deadline (`seed + pts_at(max_ticks - 1)`) plus a tick of headroom
-        // releases the whole run. Computing against `max_ticks` is a safe
-        // over-estimate.
-        let headroom = runtime
-            .seed_nanos()
-            .saturating_add(pts_at(self.cadence, max_ticks).as_nanos());
-        time_source.advance_to(headroom);
+        // Pace the (jumpable) clock forward ONE TICK PERIOD PER FRESH COMPOSE rather
+        // than jumping it once to the final tick's deadline. A single up-front jump to
+        // `seed + pts_at(max_ticks)` leaves the clock a full `max_ticks` periods ahead
+        // of media-time, which ADR-T018's drop/repeat-to-cadence loop correctly reads
+        // as massive overload: for `max_ticks > MAX_REPEATS_PER_TICK` it emits a cap's
+        // worth of last-good repeats then `skip_to`s the counter to wall-clock — which
+        // advances the tick counter past `emitted`, so the bounded run can never reach
+        // `max_ticks` frames and parks forever on a post-skip deadline the frozen clock
+        // never covers (the live-overlay-churn / live-source-apply CI hang). Advancing
+        // exactly one period per fresh compose keeps the clock a single tick ahead of
+        // the composing tick, so the cadence-hold path stays dormant (a healthy 1.0×
+        // pace, no spurious repeats) and the loop composes exactly one fresh frame per
+        // tick — still sleep-free and deterministic under the `CooperativePacer`. The
+        // user's `control` hook still runs once per fresh compose, after the advance.
+        let seed = runtime.seed_nanos();
+        let cadence = self.cadence;
+        let advance_ts = Arc::clone(&time_source);
+        let mut fresh_index: u64 = 0;
+        let mut control = control;
+        let paced_control = move |drive: &mut CompositorDrive<Nv12Image>| {
+            // The hook for the tick that is about to compose fresh: release the NEXT
+            // tick's deadline so the pacer never gates and the loop never falls behind
+            // wall-clock (which would wake the cadence-hold repeat path).
+            let next = fresh_index.saturating_add(1);
+            advance_ts.advance_to(seed.saturating_add(pts_at(cadence, next).as_nanos()));
+            fresh_index = next;
+            control(drive);
+        };
         let publisher: EnginePublisher<SoftwareState, SoftwareState> =
             EnginePublisher::new(EVENT_CAPACITY);
         let stop = StopSignal::new();
         // Animated synthetic sources (the `clock`) are driven by wall-clock
         // generator threads; the engine only samples their stores. This bounded,
-        // jumped-clock path runs at executor speed (no real time elapses), so a
+        // paced-clock path runs at executor speed (no real time elapses), so a
         // clock does not visibly animate here — but the generators are still
         // spawned and torn down cleanly after the tick budget so the wiring is
         // identical across paths and no thread leaks.
@@ -591,7 +629,7 @@ impl SoftwareEngine {
                         pts: f.pts(),
                     })
                 },
-                control,
+                paced_control,
             )
             .await;
         generators.shutdown();
@@ -675,7 +713,14 @@ impl SoftwareEngine {
         let time = Arc::new(MonotonicTimeSource::new());
         let ts: Arc<dyn TimeSource> = time;
         self.prime_stores(ts.as_ref());
+        let ts_for_anchor = Arc::clone(&ts);
         let mut runtime = self.build_runtime(ts, RealtimePacer)?;
+        // DEV-C1 (ADR-M010): publish the run's epoch anchor (tick-0 seed + the
+        // run's monotonic source) for the off-hot-path timing-status task -- a
+        // single lock-free store that can never pace the clock (inv #1/#10).
+        self.epoch_anchor.store(Some(std::sync::Arc::new(
+            multiview_engine::epoch::EpochAnchor::new(ts_for_anchor, runtime.seed_nanos()),
+        )));
         // The caller owns the publisher so the control plane can share it
         // (read-only). State is the compact per-tick JSON snapshot; events are
         // left sparse for now (none emitted here — they arrive via change-driven

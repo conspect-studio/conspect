@@ -822,9 +822,45 @@ mod scripted {
 /// The real reqwest-backed transport — off-by-default (`zowietek` feature).
 #[cfg(feature = "zowietek")]
 mod net {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use multiview_config::device::net_guard::{self, DialPolicy};
     use serde_json::Value;
 
     use super::{RpcVerb, TransportError, TransportResponse, ZowietekTransport};
+
+    /// The boxed error type reqwest's DNS resolver returns.
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// A reqwest DNS resolver that screens every RESOLVED IP against the
+    /// outbound-dial SSRF policy (SEC-02, CWE-918). Because reqwest resolves
+    /// (and re-resolves, per redirect / reconnect) through this seam, a public
+    /// name that answers with an internal address — a DNS-rebind — is refused at
+    /// resolution time, so the device poller never dials the cloud-metadata
+    /// endpoint or an internal host.
+    struct ScreeningResolver {
+        policy: Arc<DialPolicy>,
+    }
+
+    impl reqwest::dns::Resolve for ScreeningResolver {
+        fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let policy = Arc::clone(&self.policy);
+            Box::pin(async move {
+                // reqwest supplies the host only; the real port is applied by
+                // reqwest to the returned IPs, so port 0 here is a placeholder.
+                let boxed = |e: std::io::Error| -> BoxError { Box::new(e) };
+                let resolved: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
+                    .await
+                    .map_err(boxed)?
+                    .collect();
+                net_guard::screen_resolved(resolved.iter().map(SocketAddr::ip), &policy)
+                    .map_err(|e| -> BoxError { Box::new(e) })?;
+                let addrs: reqwest::dns::Addrs = Box::new(resolved.into_iter());
+                Ok(addrs)
+            })
+        }
+    }
 
     /// A live HTTP transport to one `ZowieBox` device, over plain HTTP (the vendor
     /// API is plain HTTP JSON-over-POST; a management VLAN is recommended in the
@@ -843,17 +879,84 @@ mod net {
         /// `http://[fd00:db8::42]`). The base is the scheme+authority; the
         /// module path and query are appended per request.
         ///
+        /// The client screens the dial target against `dial_policy` (SEC-02,
+        /// CWE-918) on the **actual** address reqwest will dial:
+        ///
+        /// * An **IP-literal** host — including the alt-encoded IPv4 forms
+        ///   (`2130706433`, `0x7f000001`, `0177.0.0.1`) and IPv4-mapped IPv6
+        ///   (`[::ffff:169.254.169.254]`) — is parsed with the same WHATWG `url`
+        ///   parser reqwest uses, canonicalized to a concrete `IpAddr`, and
+        ///   screened here with [`net_guard::screen_ip`]. reqwest dials an
+        ///   IP-literal host **directly, without invoking any DNS resolver**, so a
+        ///   resolver-only screen never sees these — screening the parsed literal
+        ///   on this path is what closes the bypass.
+        /// * A **DNS name** is screened lazily by the [`ScreeningResolver`], which
+        ///   resolves, screens every answer, and returns **only** the vetted
+        ///   addresses reqwest then dials — pinning the vetted result defeats
+        ///   DNS-rebind.
+        ///
+        /// The client also disables any environment proxy
+        /// ([`no_proxy`](reqwest::ClientBuilder::no_proxy)) so a system
+        /// `HTTP(S)_PROXY` cannot dial the destination unscreened on our behalf,
+        /// and follows **no** redirects
+        /// ([`redirect::Policy::none`](reqwest::redirect::Policy::none)) — a
+        /// validated host cannot 30x-bounce the poller to a blocked one, and the
+        /// device's named credentials are never re-sent to a redirect target.
+        ///
         /// # Errors
         ///
-        /// [`TransportError`] if the HTTP client cannot be constructed.
-        pub fn new(base: &str, timeout: std::time::Duration) -> Result<Self, TransportError> {
+        /// [`TransportError`] if `base` is not a valid URL/authority, has no host,
+        /// resolves to a blocked dial target, or the HTTP client cannot be built.
+        pub fn new(
+            base: &str,
+            timeout: std::time::Duration,
+            dial_policy: Arc<DialPolicy>,
+        ) -> Result<Self, TransportError> {
+            // A device address is either a full `http(s)://` URL or a bare
+            // authority (discovery emits `[fd00:db8::42]:5961`, no scheme).
+            // Normalize to a URL — default scheme plain http (the vendor API is
+            // HTTP JSON-over-POST) — so the SSRF screen and reqwest parse the
+            // exact same canonical host, and so `post` always builds a valid URL.
+            let normalized = if base.contains("://") {
+                base.trim_end_matches('/').to_owned()
+            } else {
+                format!("http://{}", base.trim_end_matches('/'))
+            };
+            let parsed = url::Url::parse(&normalized)
+                .map_err(|e| TransportError::new(format!("invalid device url {base:?}: {e}")))?;
+            match parsed.host() {
+                // An IP literal is dialled directly by reqwest (no resolver hop):
+                // screen the canonical parsed IP here, fail-closed.
+                Some(url::Host::Ipv4(v4)) => {
+                    net_guard::screen_ip(std::net::IpAddr::V4(v4), &dial_policy)
+                        .map_err(|e| TransportError::new(e.to_string()))?;
+                }
+                Some(url::Host::Ipv6(v6)) => {
+                    net_guard::screen_ip(std::net::IpAddr::V6(v6), &dial_policy)
+                        .map_err(|e| TransportError::new(e.to_string()))?;
+                }
+                // A DNS name is screened + pinned by the ScreeningResolver below.
+                Some(url::Host::Domain(_)) => {}
+                None => {
+                    return Err(TransportError::new(format!(
+                        "device url {base:?} has no host to dial"
+                    )));
+                }
+            }
             let client = reqwest::Client::builder()
                 .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                // A system HTTP(S)_PROXY must not dial the destination on our
+                // behalf — that would bypass the screen entirely.
+                .no_proxy()
+                .dns_resolver(Arc::new(ScreeningResolver {
+                    policy: dial_policy,
+                }))
                 .build()
                 .map_err(|e| TransportError::new(e.to_string()))?;
             Ok(Self {
                 client,
-                base: base.trim_end_matches('/').to_owned(),
+                base: normalized,
             })
         }
     }
@@ -887,5 +990,232 @@ mod net {
                 Err(e) => Err(TransportError::new(e.to_string())),
             }
         }
+    }
+}
+
+/// SSRF dial-path regression tests (SEC-02, CWE-918) for the real reqwest
+/// transport, exercised on the **actual connect path** with a real
+/// `TcpListener`: a blocked target (loopback / alt-encoded loopback / a name
+/// resolving to loopback) must never reach the listener, while an ALLOWED target
+/// (a routable interface IP) DOES — so the refusals fail because the screen
+/// blocks, not because the transport is inert.
+///
+/// A prior guard screened only DNS *names* (a custom reqwest resolver), but
+/// reqwest dials an IP-literal / alt-encoded URL (`http://2130706433/` =
+/// `127.0.0.1`) **without invoking the resolver**, so those bypassed the screen
+/// and reached loopback / the cloud-metadata endpoint. These tests exercise the
+/// bytes-on-the-wire path a name-only screen cannot see.
+#[cfg(all(test, feature = "zowietek"))]
+mod dial_screen_tests {
+    // Test-only: `expect`/`unwrap` are the standard test vocabulary here (the
+    // harness reports a panic as a failure). clippy's allow-*-in-tests does not
+    // fire for non-`#[test]` helper fns under a `cfg(all(test, feature = …))`
+    // module, so allow explicitly (rule 20).
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use multiview_config::device::net_guard::DialPolicy;
+    use serde_json::json;
+
+    use super::{ReqwestTransport, RpcVerb, ZowietekTransport};
+
+    /// Drive the real screened transport (built with the non-breaking
+    /// `allow_lan()` policy) at `url` and report whether `listener` ever accepted
+    /// a connection. For a blocked target the screen refuses before any socket
+    /// opens, so the listener stays idle; for an allowed target the POST opens the
+    /// socket and the connection lands on the backlog. Either way a single
+    /// non-blocking `accept` distinguishes the two.
+    fn transport_reaches(url: &str, listener: &TcpListener) -> bool {
+        // The non-breaking default policy: allowlistable LAN (private/ULA/carrier)
+        // is dialable; the never-legit ranges (loopback/link-local/…) are refused
+        // unconditionally — so a refusal is the never-legit floor and a reach is a
+        // genuinely allowed dial, not an allowlist quirk.
+        let policy = Arc::new(DialPolicy::allow_lan());
+        if let Ok(transport) = ReqwestTransport::new(url, Duration::from_millis(500), policy) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            let body = json!({ "group": "account", "opt": "login_account", "data": {} });
+            // Ignore the outcome: on a bypass it is the socket landing on the
+            // listener that fails the test, not the POST's return value (a
+            // connect that hangs maps to Dropped, not an error).
+            let _ = rt.block_on(transport.post("system", RpcVerb::SetInfo, &body));
+        }
+        // Any connection reqwest opened is queued on the listener's backlog by
+        // now (the TCP handshake completes at connect time, before the POST times
+        // out), so a single non-blocking accept detects it. Count ONLY a
+        // successful accept as "reached": a `WouldBlock` means no connection
+        // landed, and any *other* accept error (Interrupted/ConnectionAborted/…)
+        // is treated as not-reached too — so the positive control fails loud on a
+        // spurious error rather than passing vacuously, and a refusal test never
+        // reads a stray error as a reach.
+        listener.accept().is_ok()
+    }
+
+    /// Discover a routable, non-loopback local interface IP — an address the OS
+    /// routes to and, being assigned to a local interface, a listener can bind and
+    /// a dial to it loops back locally. A `UdpSocket::connect` to a documentation
+    /// address (RFC 5737 TEST-NET-1 / RFC 3849) sends **no** packet; it only makes
+    /// the kernel pick the source interface it would dial from, which `local_addr`
+    /// reveals. That address is a routable unicast IP — private/ULA (allowlistable,
+    /// so `allow_lan()` permits it) or globally routable (unblocked) — never
+    /// loopback or link-local, i.e. an *allowed* dial target. Every CI runner and
+    /// dev host has such an interface.
+    fn routable_interface_ip() -> Option<IpAddr> {
+        // IPv4 (192.0.2.0/24) first, then IPv6 (2001:db8::/32) for a v6-only host.
+        for (bind, probe) in [
+            ("0.0.0.0:0", "192.0.2.1:80"),
+            ("[::]:0", "[2001:db8::1]:80"),
+        ] {
+            let Ok(sock) = UdpSocket::bind(bind) else {
+                continue;
+            };
+            if sock.connect(probe).is_err() {
+                continue;
+            }
+            if let Ok(local) = sock.local_addr() {
+                let ip = local.ip();
+                // Only an address the screen will actually PERMIT is a valid
+                // positive-control target. `allow_lan()` refuses loopback,
+                // unspecified AND link-local (IPv4 169.254/16, IPv6 fe80::/10) as
+                // never-legit; the kernel never picks a multicast/broadcast source.
+                // Excluding those leaves private/ULA/CGNAT/global unicast — every
+                // one of which `allow_lan()` permits — so a discovered address is
+                // guaranteed reachable through the screen (else this test would
+                // flake on a host whose egress source is link-local).
+                let never_legit = ip.is_loopback()
+                    || ip.is_unspecified()
+                    || match ip {
+                        IpAddr::V4(v4) => v4.is_link_local(),
+                        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+                    };
+                if !never_legit {
+                    return Some(ip);
+                }
+            }
+        }
+        None
+    }
+
+    /// Bind an idle (never-`accept`ing, non-blocking) listener on `ip:0`,
+    /// returning it and its ephemeral port.
+    fn idle_listener_on(ip: IpAddr) -> (TcpListener, u16) {
+        let listener = TcpListener::bind((ip, 0)).expect("bind idle listener");
+        listener
+            .set_nonblocking(true)
+            .expect("listener set_nonblocking");
+        let port = listener.local_addr().expect("listener local_addr").port();
+        (listener, port)
+    }
+
+    /// Bind an idle loopback listener that never `accept`s on its own.
+    fn idle_loopback_listener() -> (TcpListener, u16) {
+        idle_listener_on(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    }
+
+    #[test]
+    fn refuses_loopback_literal_before_connecting() {
+        let (listener, port) = idle_loopback_listener();
+        // A plain loopback literal: reqwest dials 127.0.0.1 directly (no resolver
+        // hop), so a name-only screen misses it. It must be refused.
+        assert!(
+            !transport_reaches(&format!("http://127.0.0.1:{port}/"), &listener),
+            "loopback literal dial reached the listener (SSRF screen bypassed)"
+        );
+    }
+
+    #[test]
+    fn refuses_alt_encoded_loopback_before_connecting() {
+        let (listener, port) = idle_loopback_listener();
+        // `2130706433` is the 32-bit decimal form of 127.0.0.1: the WHATWG `url`
+        // parser reqwest uses normalizes it to the loopback literal and dials it
+        // directly. Rust's `IpAddr` parser does NOT recognize this form, so the
+        // config-load literal screen misses it — the dial-time screen must catch
+        // it on the canonical parsed IP.
+        assert!(
+            !transport_reaches(&format!("http://2130706433:{port}/"), &listener),
+            "alt-encoded (decimal) loopback dial reached the listener (SSRF screen bypassed)"
+        );
+    }
+
+    #[test]
+    fn refuses_named_host_resolving_to_loopback_before_connecting() {
+        let (listener, port) = idle_loopback_listener();
+        // `localhost` is a DNS *name* (`url::Host::Domain`), not a literal, so it
+        // is not screened pre-dial — it exercises the OTHER half of the fix: the
+        // `ScreeningResolver` resolves it, screens every answer with
+        // `screen_resolved` (fail-closed on the first blocked IP), and returns
+        // only vetted addresses for reqwest to dial. `localhost` resolves to
+        // loopback (127.0.0.1 and/or ::1 — Linux getaddrinfo returns both), a
+        // never-legit range, so the resolver refuses and reqwest never opens the
+        // socket. reqwest DOES consult the custom resolver for named hosts
+        // (unlike IP literals), so this proves the resolver screen is wired in and
+        // defeats a name that answers with an internal address (DNS-rebind).
+        assert!(
+            !transport_reaches(&format!("http://localhost:{port}/"), &listener),
+            "named-host (localhost -> loopback) dial reached the listener (resolver screen bypassed)"
+        );
+    }
+
+    /// Detection control: prove the idle listener + the non-blocking `accept` that
+    /// [`transport_reaches`] relies on actually detect a real connection. Without
+    /// it, the three `!transport_reaches` refusals above could pass *vacuously* —
+    /// a listener whose `accept` never reported a connection would read as "dial
+    /// blocked" even with the screen removed. A raw `TcpStream::connect` (no
+    /// screen) lands on the backlog, and the same non-blocking `accept` the screen
+    /// tests use must see it.
+    ///
+    /// This isolates the accept machinery; that a fully-screened transport DOES
+    /// reach an allowed listener is proven separately by
+    /// `screened_transport_reaches_an_allowed_interface_ip`. Only *loopback* is
+    /// refused unconditionally by
+    /// [`screen_ip`](multiview_config::device::net_guard::screen_ip) — not every
+    /// bindable address — so a routable interface IP is an allowed, reachable
+    /// target.
+    #[test]
+    fn the_non_blocking_accept_detects_a_real_connection() {
+        let (listener, port) = idle_loopback_listener();
+        // Hold the stream open past the accept so the connection stays established.
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("raw connect to the idle loopback listener");
+        assert!(
+            listener.accept().is_ok(),
+            "the non-blocking accept must detect a real connection (else the screen tests are vacuous)"
+        );
+    }
+
+    /// Positive control (the panel-asked shape): the SAME real `ReqwestTransport`,
+    /// under the SAME `allow_lan()` screen the refusal tests use, DOES reach a
+    /// listener bound to an ALLOWED target — proving the three `!transport_reaches`
+    /// refusals fail because the screen BLOCKS the target, not because the
+    /// transport is inert (a `post` that never dialled would pass every refusal
+    /// too, and the detection control above only proves the `accept` side is live).
+    ///
+    /// Loopback cannot be the allowed target — `screen_ip` refuses it
+    /// unconditionally — but a routable non-loopback **interface** IP can: it is
+    /// private/ULA (allowlistable, so `allow_lan()` permits it) or globally
+    /// routable (unblocked), and being assigned to a local interface a dial to it
+    /// loops back to a listener bound there. If a regression makes `post` stop
+    /// dialling, ONLY this test goes red; the refusal tests stay green.
+    #[test]
+    fn screened_transport_reaches_an_allowed_interface_ip() {
+        // Fail loud (never a silent skip, rule 19) if the host has no routable
+        // non-loopback interface — that is a networkless environment, not a pass.
+        let ip = routable_interface_ip()
+            .expect("a routable non-loopback interface to bind an allowed dial target on");
+        let (listener, port) = idle_listener_on(ip);
+        let url = match ip {
+            IpAddr::V6(v6) => format!("http://[{v6}]:{port}/"),
+            IpAddr::V4(v4) => format!("http://{v4}:{port}/"),
+        };
+        assert!(
+            transport_reaches(&url, &listener),
+            "the screened transport did NOT reach an allowed interface-IP listener \
+             ({url}) — a refusal test could be passing on an inert transport"
+        );
     }
 }

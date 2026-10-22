@@ -238,3 +238,181 @@ fn ring_is_bounded_drop_oldest() {
         Some(u32::try_from(total - 1).unwrap())
     );
 }
+
+#[test]
+fn steady_state_pacing_prunes_consumed_frames() {
+    // BOUNDED-MEMORY guard (invariant #9). In the shipping path the producer is
+    // paced ~1:1 with the output clock (multiview-cli `PtsWallClock`), so the
+    // output latches each frame at ~the instant it was published and advances
+    // past every prior frame. Output `now` is monotonic (inv #1/#3), so a frame
+    // older than the current latch can NEVER be selected again — retaining it is
+    // pure dead weight. The ring must prune those consumed past frames instead of
+    // sitting pinned at a full RING_CAPACITY-deep backlog (~3.2 GB/tile at 2160p).
+    let s = store();
+    let cap = TileStore::<u32>::RING_CAPACITY;
+    // Run well past the ceiling so a count-only bound would stay pinned at `cap`.
+    let iters = cap.saturating_mul(4);
+    for i in 0..iters {
+        let at = MediaTime::from_nanos(i64::try_from(i).unwrap().saturating_mul(40_000_000));
+        s.publish(u32::try_from(i).unwrap(), at);
+        // The output clock latches this frame on this tick (1:1 pacing). This
+        // also proves the just-latched frame is never pruned (a prune bound that
+        // dropped the boundary frame would break this read-back).
+        let r = s.read_at(at);
+        assert_eq!(
+            r.frame().map(|f| **f),
+            Some(u32::try_from(i).unwrap()),
+            "output@i must latch the frame it just published"
+        );
+    }
+    // After steady-state pacing the reader has consumed every past frame, so the
+    // ring holds only a tiny trailing window (the latched frame + at most a
+    // handful), NOT ~RING_CAPACITY frames.
+    let retained = s.retained_frames();
+    assert!(
+        retained <= 4,
+        "steady-state ring must prune consumed frames; retained {retained} of cap {cap}"
+    );
+}
+
+#[test]
+fn prune_keeps_the_latched_boundary_frame() {
+    // The prune drops entries STRICTLY older than the latch watermark; the frame
+    // AT the watermark (the one the output clock is currently latched onto) must
+    // be KEPT — an off-by-one that evicted the boundary would make the tile jump
+    // off its held frame the instant the producer publishes again.
+    let s = store();
+    s.publish(10_u32, MediaTime::from_nanos(0));
+    s.publish(20_u32, MediaTime::from_nanos(40_000_000));
+    // Latch frame@40ms -> watermark = 40ms.
+    assert_eq!(
+        s.read_at(MediaTime::from_nanos(40_000_000))
+            .frame()
+            .map(|f| **f),
+        Some(20)
+    );
+    // A further forward publish triggers the prune with watermark = 40ms.
+    s.publish(30_u32, MediaTime::from_nanos(80_000_000));
+    // Re-reading at the latched instant must STILL yield frame@40ms: it sits at
+    // the watermark and must survive the prune (frame@0, strictly older, is gone).
+    assert_eq!(
+        s.read_at(MediaTime::from_nanos(40_000_000))
+            .frame()
+            .map(|f| **f),
+        Some(20),
+        "the frame at the watermark (latched) must survive the prune"
+    );
+}
+
+#[test]
+fn backwards_stamp_reanchors_so_a_reconnect_is_not_pruned() {
+    // Reconnect / source-generation change (bad inputs are the purpose): a
+    // producer that had been latched far along its timeline (advancing the prune
+    // watermark) reconnects and re-stamps from a LOW media time. The watermark is
+    // keyed on the tile-global publish `seq`, and the re-anchored generation's
+    // frames carry strictly higher `seq`s than the old generation — so the old
+    // latch can never prune the fresh low-stamped frames and the tile does not go
+    // blank after a reconnect. (A media-time watermark would have pruned frame@0
+    // as "older than the 10s latch"; keying on the monotonic publish seq is what
+    // prevents that, including under the cross-generation read/reconnect race —
+    // see `tile::cross_generation_watermark_race`.)
+    let s = store();
+    s.publish(1_u32, MediaTime::from_nanos(0));
+    s.publish(2_u32, MediaTime::from_nanos(10_000_000_000));
+    let _ = s.read_at(MediaTime::from_nanos(10_000_000_000)); // watermark -> seq of frame@10s
+                                                              // New generation: a backwards stamp re-anchors at t=0, then a normal forward
+                                                              // publish continues it.
+    s.publish(100_u32, MediaTime::from_nanos(0));
+    s.publish(101_u32, MediaTime::from_nanos(40_000_000));
+    // The re-anchored generation's first frame must survive that forward publish:
+    // its seq outranks the old 10s latch, so the prune keeps it.
+    assert_eq!(
+        s.read_at(MediaTime::from_nanos(0)).frame().map(|f| **f),
+        Some(100),
+        "re-anchored generation must survive the next publish (seq outranks the old latch)"
+    );
+    assert_eq!(
+        s.read_at(MediaTime::from_nanos(40_000_000))
+            .frame()
+            .map(|f| **f),
+        Some(101)
+    );
+}
+
+#[test]
+fn state_at_alone_bounds_the_ring_for_a_monitored_uncomposited_tile() {
+    // A tile that is monitored (state sampled) but not currently composited never
+    // calls `read_at`, yet its producer keeps publishing. `state_at` must advance
+    // the prune watermark too, so such a tile's ring stays bounded (invariant #9)
+    // instead of filling to RING_CAPACITY.
+    let s = store();
+    let cap = TileStore::<u32>::RING_CAPACITY;
+    let iters = cap.saturating_mul(4);
+    for i in 0..iters {
+        let at = MediaTime::from_nanos(i64::try_from(i).unwrap().saturating_mul(40_000_000));
+        s.publish(u32::try_from(i).unwrap(), at);
+        let _ = s.state_at(at); // monitored, not composited: only state_at is called
+    }
+    let retained = s.retained_frames();
+    assert!(
+        retained <= 4,
+        "state_at must bound the ring too; retained {retained} of cap {cap}"
+    );
+}
+
+#[test]
+fn retained_frames_reports_actual_ring_occupancy() {
+    // Pins the introspection accessor's contract: it reports the TRUE number of
+    // frames held in the media-time ring (the bounded-memory tests above rely on
+    // it). A fresh store holds none; publishing three frames with no read to
+    // advance the watermark retains all three (nothing consumed to prune).
+    let s = store();
+    assert_eq!(s.retained_frames(), 0, "empty ring holds no frames");
+    s.publish(1_u32, MediaTime::from_nanos(0));
+    s.publish(2_u32, MediaTime::from_nanos(40_000_000));
+    s.publish(3_u32, MediaTime::from_nanos(80_000_000));
+    assert_eq!(
+        s.retained_frames(),
+        3,
+        "three published, none consumed -> all three retained"
+    );
+}
+
+#[test]
+fn equal_timestamp_publish_stays_forward_and_still_prunes() {
+    // An equal media-time stamp (a duplicate, or a monotonic-guard-clamped PTS)
+    // is NOT a discontinuity: it must be treated as a forward publish, so it
+    // keeps pruning consumed frames and does NOT reset the watermark the way a
+    // genuine backwards (re-anchor) stamp does. If `at == tail` re-anchored, a
+    // duplicate stamp would defeat pruning and let the ring re-accumulate the
+    // frames the output clock already passed.
+    let s = store();
+    s.publish(1_u32, MediaTime::from_nanos(0));
+    s.publish(2_u32, MediaTime::from_nanos(40_000_000));
+    s.publish(3_u32, MediaTime::from_nanos(80_000_000));
+    // Advance the latch watermark to 80ms (the newest instant).
+    assert_eq!(
+        s.read_at(MediaTime::from_nanos(80_000_000))
+            .frame()
+            .map(|f| **f),
+        Some(3)
+    );
+    // Publish a fourth frame stamped at the SAME instant as the tail (80ms).
+    s.publish(4_u32, MediaTime::from_nanos(80_000_000));
+    // Forward semantics: the watermark still pruned the consumed frames (@0, @40)
+    // — only the two @80ms frames remain, not all four (which is what a spurious
+    // re-anchor on `==` would leave).
+    assert_eq!(
+        s.retained_frames(),
+        2,
+        "equal-stamp publish must stay forward (keep pruning), not re-anchor"
+    );
+    // Newest-wins at the shared instant.
+    assert_eq!(
+        s.read_at(MediaTime::from_nanos(80_000_000))
+            .frame()
+            .map(|f| **f),
+        Some(4),
+        "the newer frame at the shared instant wins"
+    );
+}

@@ -4,10 +4,15 @@
 //! A *program focus* promotes the composed multiview canvas from the cheap
 //! WS-JPEG grid to a single low-latency WebRTC preview encode (preview brief §4,
 //! the `POST …/preview/program/whep` route). Per the brief's three-scope model
-//! (§1) and ADR-P005, a program focus is **always** the *pre-encode canvas*
-//! downscale tap — it is never the real encoded output bitstream — so every
-//! program preview surface is non-negotiably labeled
-//! [`FidelityLabel::PreEncodeCanvasApprox`].
+//! (§1) and ADR-P005, the canvas-tap path in this module is the *pre-encode
+//! canvas* downscale, non-negotiably labeled
+//! [`FidelityLabel::PreEncodeCanvasApprox`]. ADR-P006 (PRV-5b) extends the
+//! real-tap preference to the program scope: when the program rendition itself
+//! is WebRTC-compatible (H.264, B-frame-free), a program focus is instead fed
+//! the real encoded bitstream via a fanout `PacketSink` on the
+//! `multiview-output` `PacketRouter` and labeled
+//! [`FidelityLabel::RealEncodedOutput`] — the label always names which path
+//! fed the surface.
 //!
 //! ## What lives here (the testable core)
 //!
@@ -23,7 +28,8 @@
 //! * [`PreviewEncoder`] / [`IdentityPreviewEncoder`] — the NV12 → encoded-sample
 //!   seam. The production path is a low-latency H.264 baseline encode; this seam
 //!   keeps the wiring testable with no native codec, and the live H.264 + str0m
-//!   egress lands behind the further `webrtc-native` gate (PRV-1b).
+//!   egress lives in the `multiview-webrtc` crate's `native` WHEP egress
+//!   transport (`WhepEgress`, ADR-0048 / ADR-P006).
 //! * [`ProgramFocusSource`] — a [`PreviewMediaSource`] that **samples** the tap
 //!   (drop-oldest, never pacing — inv #1/#10), runs each sampled frame through
 //!   the encoder, and pushes the encoded sample into a bounded **drop-oldest**
@@ -37,7 +43,8 @@
 //!
 //! The GPU downscale blit needs a real GPU/compositor and the H.264 encode + str0m
 //! ICE/DTLS/SRTP egress need a native stack + UDP/STUN reachability — none of which
-//! is reliable in CI. Those land behind the further `webrtc-native` gate; this
+//! is reliable in CI. The live str0m egress lives in `multiview-webrtc` (the
+//! single str0m owner, ADR-0048 / ADR-P006); this
 //! module is socket-free and codec-free: the tap, the encode *seam*, the bounded
 //! feed, and the session lifecycle are all unit-testable with injected frames and
 //! the in-memory fake transport in `tests/program_output_whep.rs`.
@@ -57,7 +64,7 @@ use multiview_engine::isolation::{EventSubscription, TryRecvError};
 use crate::tap::{TapError, TapLease, TapRegistry};
 use crate::token::{TapKey, TapScope};
 use crate::whep::transport::{
-    sample_feed, EncodedSample, PreviewMediaSource, SampleFeed, SampleSink,
+    sample_feed, EncodedSample, PreviewMediaSource, SampleFeed, SampleKind, SampleSink,
 };
 use crate::whep::PreviewCodec;
 use crate::FocusLease;
@@ -190,7 +197,7 @@ impl ProgramTap {
 /// canvas; modeling it as a trait keeps the program-focus wiring testable with no
 /// native codec ([`IdentityPreviewEncoder`]) and lets a hardware/software H.264
 /// encoder plug in behind the same seam (the live path, gated behind
-/// `webrtc-native`).
+/// the `multiview-webrtc` `native` WHEP egress transport).
 pub trait PreviewEncoder: Send + Sync {
     /// The codec the samples this encoder emits are encoded with.
     fn codec(&self) -> PreviewCodec;
@@ -208,7 +215,8 @@ pub trait PreviewEncoder: Send + Sync {
 /// timestamp through and marking the first emitted sample a keyframe. It exists
 /// only so the tap → encode → feed wiring and the session lifecycle are testable
 /// with no native codec; the real low-latency H.264 baseline encoder plugs into
-/// the same [`PreviewEncoder`] seam behind the further `webrtc-native` gate.
+/// the same [`PreviewEncoder`] seam, with live egress via the `multiview-webrtc`
+/// `native` transport (ADR-0048 / ADR-P006).
 #[derive(Debug)]
 pub struct IdentityPreviewEncoder {
     codec: PreviewCodec,
@@ -242,6 +250,8 @@ impl PreviewEncoder for IdentityPreviewEncoder {
             data: Arc::clone(&frame.plane),
             rtp_timestamp: frame.rtp_timestamp,
             keyframe: first,
+            // A program-canvas encode is video on the 90 kHz RTP clock.
+            kind: SampleKind::Video,
         })
     }
 }
@@ -249,6 +259,11 @@ impl PreviewEncoder for IdentityPreviewEncoder {
 /// A [`PreviewMediaSource`] for a `program`-scope focus: it samples the program
 /// tap, encodes each sampled frame, and pushes the encoded sample into a bounded
 /// **drop-oldest** feed the transport drains.
+///
+/// This canvas-tap source is **video-only** — its samples are
+/// [`SampleKind::Video`] and its [`PreviewMediaSource::audio_feed`] is the
+/// trait default `None`: program audio is the shared program Opus rendition
+/// (ADR-0049), a different source, never the canvas tap (ADR-P006).
 ///
 /// ## Isolation (invariant #1 + #10)
 ///
@@ -365,19 +380,28 @@ impl<E: PreviewEncoder> PreviewMediaSource for ProgramFocusSource<E> {
 
 /// The fidelity label every preview surface carries on-video (ADR-P005).
 ///
-/// A program focus is **always** [`Self::PreEncodeCanvasApprox`] — it is the
-/// pre-encode canvas downscale, never the real encoded bitstream. The
-/// [`Self::RealEncodedOutput`] label is reserved for an OUTPUT-scope tap of a real
-/// encoded rendition (carrying the tapped protocol); it is defined here so the
-/// program/output labels share one type, but a program focus never uses it.
+/// The label is non-negotiable and names which path fed the surface. The
+/// canvas-tap path in this module ([`ProgramFocusSource`]) is **always**
+/// [`Self::PreEncodeCanvasApprox`] — it is the pre-encode canvas downscale,
+/// not the real encoded bitstream. [`Self::RealEncodedOutput`] marks a tap of
+/// a real encoded rendition (carrying the tapped protocol): an OUTPUT-scope
+/// preview, **or** — per ADR-P006 (PRV-5b) — a PROGRAM focus fed the real
+/// program bitstream via a fanout `PacketSink` registered on the
+/// `multiview-output` `PacketRouter` when the program rendition is
+/// WebRTC-compatible (H.264, B-frame-free); otherwise the program focus falls
+/// back to this module's canvas-approx path and label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FidelityLabel {
-    /// The surface is the pre-encode program canvas downscale, not a real encoded
-    /// output. The mandatory label for every PROGRAM focus.
+    /// The surface is the pre-encode program canvas downscale, not a real
+    /// encoded output. The mandatory label for the canvas-approx path — the
+    /// program-focus fallback whenever the real rendition does not qualify
+    /// (ADR-P006).
     PreEncodeCanvasApprox,
     /// The surface is a tap of a real encoded output rendition over `protocol`
-    /// (e.g. `"rtsp"`, `"ll-hls"`). Used only by OUTPUT-scope previews.
+    /// (e.g. `"rtsp"`, `"ll-hls"`). Used by OUTPUT-scope previews and by
+    /// PROGRAM-scope sessions fed from the fanout `PacketSink` tap of a
+    /// WebRTC-compatible program rendition (PRV-5b / ADR-P006).
     RealEncodedOutput {
         /// The tapped output protocol (the `<proto>` in `tap:<proto>`).
         protocol: String,
@@ -385,14 +409,17 @@ pub enum FidelityLabel {
 }
 
 impl FidelityLabel {
-    /// The non-negotiable label for a PROGRAM focus: pre-encode canvas approx.
+    /// The label for a program focus on the **canvas-approx** path: pre-encode
+    /// canvas approx. (A program focus fed by the real-rendition fanout tap is
+    /// labeled [`Self::RealEncodedOutput`] instead — ADR-P006.)
     #[must_use]
     pub const fn program() -> Self {
         Self::PreEncodeCanvasApprox
     }
 
-    /// Whether this label denotes a real encoded output tap (never true for a
-    /// program focus).
+    /// Whether this label denotes a real encoded output tap — true for an
+    /// OUTPUT-scope tap and for a program focus fed via the fanout
+    /// `PacketSink` path (PRV-5b / ADR-P006).
     #[must_use]
     pub const fn is_real_encoded(&self) -> bool {
         matches!(self, Self::RealEncodedOutput { .. })
@@ -416,8 +443,10 @@ impl FidelityLabel {
 /// concurrency-cap slot, PRV-3 — freed on `Drop`) and the [`ProgramFocusSource`]
 /// (which owns the [`TapLease`] — auto-stopping the downscale blit on the last
 /// leave, ADR-P003). Dropping the session therefore frees the cap slot **and**
-/// tears the tap down, in one move. Its fidelity label is fixed to
-/// [`FidelityLabel::PreEncodeCanvasApprox`] (ADR-P005).
+/// tears the tap down, in one move. As a canvas-tap session its fidelity label
+/// is fixed to [`FidelityLabel::PreEncodeCanvasApprox`] (ADR-P005); the
+/// real-rendition program path of ADR-P006 (PRV-5b) rides the fanout
+/// `PacketSink`, not this type.
 ///
 /// The transport's per-session ICE/DTLS/SRTP lifecycle is tracked separately by
 /// the [`crate::whep::transport::SessionHandle`] the transport returns; this type
@@ -463,7 +492,10 @@ where
     }
 
     /// The fidelity label for this session — always
-    /// [`FidelityLabel::PreEncodeCanvasApprox`] for a program focus (ADR-P005).
+    /// [`FidelityLabel::PreEncodeCanvasApprox`], because this type is the
+    /// canvas-tap path (ADR-P005). A program focus fed the real program
+    /// bitstream via the fanout `PacketSink` (PRV-5b / ADR-P006) carries
+    /// [`FidelityLabel::RealEncodedOutput`] and does not ride this type.
     #[must_use]
     pub const fn label(&self) -> FidelityLabel {
         FidelityLabel::PreEncodeCanvasApprox

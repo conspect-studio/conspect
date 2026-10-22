@@ -87,21 +87,35 @@ pub struct Segment {
     pub duration: f64,
     /// Whether an `EXT-X-DISCONTINUITY` tag precedes this segment.
     pub discontinuity: bool,
+    /// The wall-clock instant of this segment's first sample (integer ns past
+    /// the Unix epoch), rendered as `EXT-X-PROGRAM-DATE-TIME` (ADR-M010:
+    /// derived from the outbound presentation epoch as
+    /// `epoch.wall_at(segment first PTS)`). `None` ⇒ no PDT tag.
+    pub program_date_time_ns: Option<i64>,
     /// LL-HLS parts that make up this segment, in order.
     pub parts: Vec<Part>,
 }
 
 impl Segment {
     /// Construct a segment with the given URI and duration (no discontinuity,
-    /// no parts).
+    /// no parts, no program-date-time).
     #[must_use]
     pub fn new(uri: impl Into<String>, duration: f64) -> Self {
         Self {
             uri: uri.into(),
             duration,
             discontinuity: false,
+            program_date_time_ns: None,
             parts: Vec::new(),
         }
+    }
+
+    /// Attach the wall-clock instant of this segment's first sample (integer
+    /// ns past the Unix epoch); rendered as `EXT-X-PROGRAM-DATE-TIME`.
+    #[must_use]
+    pub const fn with_program_date_time_ns(mut self, unix_ns: i64) -> Self {
+        self.program_date_time_ns = Some(unix_ns);
+        self
     }
 }
 
@@ -336,6 +350,15 @@ impl MediaPlaylist {
         for seg in &self.segments {
             if seg.discontinuity {
                 let _ = writeln!(out, "#EXT-X-DISCONTINUITY");
+            }
+            if let Some(pdt_ns) = seg.program_date_time_ns {
+                // The PDT applies to the first sample of the segment (RFC 8216
+                // §4.4.4.6), so it precedes the segment's parts and EXTINF.
+                let _ = writeln!(
+                    out,
+                    "#EXT-X-PROGRAM-DATE-TIME:{}",
+                    super::pdt::format_program_date_time(pdt_ns)
+                );
             }
             for part in &seg.parts {
                 let _ = write!(

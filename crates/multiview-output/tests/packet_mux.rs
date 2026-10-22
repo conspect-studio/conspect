@@ -355,7 +355,15 @@ fn segment_live_publishes_rolling_playlist_bounded_window_and_prunes() {
     );
 
     let playlist_path = dir.path().join("multiview.m3u8");
-    let sink = PacketMuxSink::segment_live(dir.path(), "seg", &playlist_path, WINDOW);
+    // No epoch is published into the cell here, so the manifest carries no
+    // PDT tags -- byte-identical playlist behaviour to before DEV-C1.
+    let sink = PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        &playlist_path,
+        WINDOW,
+        multiview_output::SharedEpoch::new(),
+    );
     let mut source = VecPackets::new(packets);
     let outcome = sink
         .run(&mut source, &params, time_base)

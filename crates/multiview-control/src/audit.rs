@@ -229,6 +229,6 @@ mod tests {
         );
         assert_eq!(log.list(Some("x")).unwrap().len(), 1);
         assert_eq!(log.list(Some("y")).unwrap().len(), 1);
-        assert!(log.list(Some("z")).unwrap().is_empty());
+        assert_eq!(log.list(Some("z")).unwrap().len(), 0);
     }
 }

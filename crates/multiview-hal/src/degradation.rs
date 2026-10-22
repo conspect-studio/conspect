@@ -33,7 +33,7 @@ pub enum DegradationAction {
     // against the program). These rungs touch only the best-effort, isolated
     // preview side-channel (invariant #10), never the protected output path.
     /// 1. Shed click-to-focus WHEP sessions: suspend existing focus encodes and
-    ///    refuse new focus (the `503 fallback: ws-jpeg` shape). The single most
+    ///    refuse new focus (the `503 fallback: jpeg` shape). The single most
     ///    expensive preview transport, shed first.
     ShedFocusWhep,
     /// 2. Drop the preview grid/thumbnail fps (fewer JPEG/MJPEG ticks).

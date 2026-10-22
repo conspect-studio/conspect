@@ -116,14 +116,17 @@ impl IfMatch {
 impl<S: Sync> FromRequestParts<S> for IfMatch {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let raw = parts
             .headers
             .get(header::IF_MATCH)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let expected = raw.as_deref().and_then(Version::parse_etag);
-        Ok(Self { expected, raw })
+        std::future::ready(Ok(Self { expected, raw }))
     }
 }
 
@@ -134,13 +137,16 @@ pub struct IdempotencyKey(pub Option<String>);
 impl<S: Sync> FromRequestParts<S> for IdempotencyKey {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let key = parts
             .headers
             .get("idempotency-key")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        Ok(Self(key))
+        std::future::ready(Ok(Self(key)))
     }
 }
 

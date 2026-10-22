@@ -66,16 +66,38 @@ pub struct LeaseBinding {
     /// this machine (brief §2.3). At/above [`FINGERPRINT_MATCH_THRESHOLD`] is the
     /// same machine; below is a new machine requiring re-claim.
     pub fingerprint_score: u8,
+    /// The server-issued `instanceBindingId` this lease binds, when the producer
+    /// carries one. **Every** install surface that has it MUST pass it so
+    /// [`LeaseStore::install_binding`] records the device's durable instance
+    /// identity atomically (the single chokepoint behind the cross-instance-replay
+    /// guard): the heartbeat client sets it from the verified lease body, the
+    /// offline file-drop + control-route uploads carry it in the CBOR binding, and
+    /// the mesh relay forwards it end-to-end. An opaque id, never a raw identifier
+    /// (brief §8). `None` for a legacy/binding-less producer (older offline files):
+    /// such an install simply does not anchor identity, exactly as before.
+    /// Defaulted on deserialize so pre-field CBOR bindings still decode (a missing
+    /// field is `None`), keeping `deny_unknown_fields` strict on extra keys.
+    #[serde(default)]
+    pub instance_binding_id: Option<String>,
 }
 
 impl LeaseBinding {
-    /// Bundle a signed lease with its entitlement + fingerprint score.
+    /// Bundle a signed lease with its entitlement, fingerprint score, and the
+    /// server-issued `instanceBindingId` it binds (`None` for a binding-less
+    /// producer). Every producer that has the binding id passes it so
+    /// [`LeaseStore::install_binding`] anchors the device identity on install.
     #[must_use]
-    pub fn new(signed: SignedLease, entitlement: Entitlement, fingerprint_score: u8) -> Self {
+    pub fn new(
+        signed: SignedLease,
+        entitlement: Entitlement,
+        fingerprint_score: u8,
+        instance_binding_id: Option<String>,
+    ) -> Self {
         Self {
             signed,
             entitlement,
             fingerprint_score,
+            instance_binding_id,
         }
     }
 
@@ -189,25 +211,51 @@ impl LicenceStatusView {
     }
 }
 
+/// The install-published snapshot: the verified entitlement plus everything
+/// recorded **with** it, held behind a SINGLE lock so a reader never observes a
+/// torn state. `None` until the first successful install.
+///
+/// Collapsing these four fields into one value is load-bearing: a foreign-binding
+/// activate lease is rejected only when the device is not "fresh", and freshness
+/// is read as `current_binding_id().is_some()`. If the lease and its binding
+/// anchor were published in separate critical sections, a concurrent reader could
+/// see `current().is_some()` while `current_binding_id()` is still `None` (a torn
+/// install) and wrongly take the activate path that SKIPS the cross-instance
+/// guard. One lock, one atomic publish (invariant #10: still control-plane,
+/// off-hot-loop, never back-pressures the engine).
+#[derive(Debug, Clone)]
+struct Installed {
+    /// The currently-installed verified entitlement.
+    entitlement: Entitlement,
+    /// When this lease was installed (the `now` passed to `install_binding`) — the
+    /// honest local "last contact" the heartbeat-status surface reports, distinct
+    /// from the lease's server-side `granted_at`.
+    at: DateTime<Utc>,
+    /// The salted hardware-fingerprint **score** (0–100) that cleared the match
+    /// threshold at install — a score, never a raw identifier (brief §8).
+    fingerprint_score: u8,
+    /// The server-issued `instanceBindingId` this install anchored, when the
+    /// binding carried one (`None` for a binding-less producer). The device's
+    /// durable instance identity for the cross-instance-replay guard — an opaque
+    /// id, never a raw identifier (brief §8).
+    instance_binding_id: Option<String>,
+}
+
 /// The thread-safe, in-memory active-lease store.
 ///
 /// Holds at most one verified [`Entitlement`] and the injected [`Clock`]. Cheap
 /// to `Arc`-share into the control-plane state and the directory watcher.
 pub struct LeaseStore {
-    /// The currently-installed verified entitlement, if any. `RwLock` because the
-    /// store is read-mostly and off the engine hot loop; it can never
-    /// back-pressure the engine (invariant #10).
-    active: RwLock<Option<Entitlement>>,
-    /// The most recent GPU-usage sample (informs the `over_gpu` reason only).
-    /// `RwLock` for the same reason as `active`.
+    /// The install-published snapshot (entitlement + install instant + fingerprint
+    /// score + binding anchor), published under ONE lock so a reader never sees a
+    /// torn (lease-present, binding-absent) state. `RwLock` because the store is
+    /// read-mostly and off the engine hot loop; it can never back-pressure the
+    /// engine (invariant #10).
+    installed: RwLock<Option<Installed>>,
+    /// The most recent GPU-usage sample (informs the `over_gpu` reason only). This
+    /// is a runtime sample, NOT part of an install, so it is a separate lock.
+    /// `RwLock` for the same read-mostly, off-hot-loop reason as `installed`.
     gpus_in_use: RwLock<u32>,
-    /// When the currently-active lease was **installed** (the instant passed to
-    /// [`LeaseStore::install_binding`]). `None` until the first install. This is
-    /// the honest "last contact" the heartbeat-status surface reports — the local
-    /// instant this machine last accepted a lease, distinct from the lease's own
-    /// `granted_at` (the server-side grant instant). `RwLock` for the same reason
-    /// as `active`; read off the hot loop only.
-    installed_at: RwLock<Option<DateTime<Utc>>>,
     /// The injected clock; the store never reads a system clock directly.
     clock: Clock,
 }
@@ -234,11 +282,24 @@ impl LeaseStore {
     #[must_use]
     pub fn with_clock(clock: Clock) -> Self {
         Self {
-            active: RwLock::new(None),
+            installed: RwLock::new(None),
             gpus_in_use: RwLock::new(0),
-            installed_at: RwLock::new(None),
             clock,
         }
+    }
+
+    /// The salted hardware-fingerprint **score** (0–100) of the currently-active
+    /// lease — the score that cleared the match threshold at install — or `None`
+    /// when no lease is installed. A poisoned lock fails toward "unknown" (`None`),
+    /// never a panic. **A score, never a raw identifier** (brief §8): callers
+    /// auto-attach this number (e.g. the support-ticket context) without ever
+    /// handling raw serials/MACs.
+    #[must_use]
+    pub fn fingerprint_score(&self) -> Option<u8> {
+        self.installed
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|i| i.fingerprint_score))
     }
 
     /// When the currently-active lease was installed (the `now` passed to the
@@ -248,7 +309,24 @@ impl LeaseStore {
     /// never a panic.
     #[must_use]
     pub fn installed_at(&self) -> Option<DateTime<Utc>> {
-        self.installed_at.read().ok().and_then(|g| *g)
+        self.installed
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|i| i.at))
+    }
+
+    /// The server-issued `instanceBindingId` recorded for the currently-active
+    /// lease (the heartbeat client records it on a genuine install), or `None`
+    /// when no binding-aware install has occurred. This is the device's durable
+    /// instance identity — the heartbeat client reads it to anchor its
+    /// cross-instance-replay guard even on the activation path. A poisoned lock
+    /// fails toward "unknown" (`None`), never a panic.
+    #[must_use]
+    pub fn current_binding_id(&self) -> Option<String> {
+        self.installed
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|i| i.instance_binding_id.clone()))
     }
 
     /// "Now" as the store sees it, via the injected [`Clock`] seam.
@@ -274,7 +352,10 @@ impl LeaseStore {
     /// resource). A poisoned lock fails toward "no lease" — never a panic.
     #[must_use]
     pub fn current(&self) -> Option<Entitlement> {
-        self.active.read().ok().and_then(|g| g.clone())
+        self.installed
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|i| i.entitlement.clone()))
     }
 
     /// Install a verified binding into the store (the one path the three install
@@ -293,10 +374,18 @@ impl LeaseStore {
         pinned: &PinnedKey,
         now: DateTime<Utc>,
     ) -> Result<Lease, InstallError> {
-        // 1. Verify the Ed25519 signature against the pinned key. A malformed
-        //    signature/key is the same rejection class as a bad signature.
-        let verified = verify_signed_lease(&binding.signed, pinned)
-            .map_err(|_| InstallError::SignatureInvalid)?;
+        // 1. Verify the Ed25519 signature against the pinned key, BOUND to the
+        //    binding's `instance_binding_id`. The signature covers the binding id
+        //    (a presence tag + length-prefixed bytes), so a grafted/tampered or
+        //    absent-vs-present binding id fails here — the device identity anchor
+        //    recorded below therefore always rests on signed material, on every
+        //    install path. A malformed signature/key is the same rejection class.
+        let verified = verify_signed_lease(
+            &binding.signed,
+            pinned,
+            binding.instance_binding_id.as_deref(),
+        )
+        .map_err(|_| InstallError::SignatureInvalid)?;
 
         // The verified lease and the entitlement's lease must be the same grant —
         // a binding that signs lease A but carries entitlement-for-lease-B is a
@@ -327,18 +416,27 @@ impl LeaseStore {
         }
         let _ = now; // `now` reserved for a future not-yet-valid check; staleness is grant-ordered.
 
-        // 4. Install. A poisoned lock is recovered by replacing the inner value
-        //    (the store is a single-value cache; there is no invariant to lose).
+        // 4. Install — publish the ENTIRE snapshot (entitlement + install instant +
+        //    fingerprint score + binding anchor) under ONE lock write, so a
+        //    concurrent reader can NEVER observe a torn state (lease present while
+        //    the binding anchor is still absent). That torn window would make a
+        //    device with a freshly-installed lease look "fresh" to the heartbeat
+        //    client and skip the cross-instance-replay guard. EVERY install surface
+        //    (heartbeat, control-route + offline file-drop uploads, mesh relay)
+        //    converges here, so `current_binding_id()` reflects the installed lease
+        //    the instant `current()` does. A binding-less producer (`None`) simply
+        //    anchors no identity. A poisoned lock is recovered by replacing the
+        //    inner value (the store is a single-value cache; no invariant to lose).
         let lease = binding.entitlement.lease.clone();
-        match self.active.write() {
-            Ok(mut guard) => *guard = Some(binding.entitlement.clone()),
-            Err(poisoned) => *poisoned.into_inner() = Some(binding.entitlement.clone()),
-        }
-        // Record the install instant (the honest local "last contact" the
-        // heartbeat-status surface reports). Same poisoned-lock recovery as above.
-        match self.installed_at.write() {
-            Ok(mut guard) => *guard = Some(now),
-            Err(poisoned) => *poisoned.into_inner() = Some(now),
+        let snapshot = Installed {
+            entitlement: binding.entitlement.clone(),
+            at: now,
+            fingerprint_score: binding.fingerprint_score,
+            instance_binding_id: binding.instance_binding_id.clone(),
+        };
+        match self.installed.write() {
+            Ok(mut guard) => *guard = Some(snapshot),
+            Err(poisoned) => *poisoned.into_inner() = Some(snapshot),
         }
         Ok(lease)
     }

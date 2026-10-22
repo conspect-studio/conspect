@@ -5,10 +5,10 @@
 // `aria-invalid`), so screen readers announce the problem at the field — never
 // a single far-away alert. Error codes come from the pure validators in
 // `./forms`; the localized message lives here (Lingui stays in components).
-import { useId } from 'react';
+import { useId, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
-import { ChevronRight, Download, Info } from 'lucide-react';
+import { Check, ChevronRight, Copy, Download, Eye, EyeOff, Info } from 'lucide-react';
 
 import type { FormErrorCode } from './forms';
 import {
@@ -45,6 +45,8 @@ export function FieldErrorMessage({ code }: { readonly code: FormErrorCode }): J
       return <Trans>An RTSP source URL must start with rtsp:// (or rtsps://).</Trans>;
     case 'scheme-srt':
       return <Trans>An SRT URL must start with srt://.</Trans>;
+    case 'scheme-rist':
+      return <Trans>A RIST URL must start with rist://.</Trans>;
     case 'scheme-rtmp':
       return <Trans>An RTMP URL must start with rtmp:// (or rtmps://).</Trans>;
     case 'scheme-http':
@@ -112,6 +114,10 @@ export function FieldErrorMessage({ code }: { readonly code: FormErrorCode }): J
           2026-07-01T09:00:00.
         </Trans>
       );
+    case 'members-required':
+      return <Trans>Add at least one member device to the group.</Trans>;
+    case 'duplicate-member':
+      return <Trans>This device is already a member of the group.</Trans>;
   }
 }
 
@@ -205,6 +211,181 @@ export function FormField({
       {error !== undefined ? (
         <p id={errorId} className="text-sm text-destructive">
           <FieldErrorMessage code={error} />
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * A labelled secret input: masked by default (`type="password"`), with a
+ * keyboard-accessible reveal toggle. The value is never auto-shown — the
+ * operator opts in per field. Secrets follow the config-secret posture: editable
+ * here, but rendered masked so an over-the-shoulder read does not leak them.
+ */
+export function SecretField({
+  id,
+  label,
+  value,
+  onChange,
+  error,
+  required,
+  placeholder,
+  hint,
+  trailing,
+}: {
+  readonly id: string;
+  readonly label: string;
+  readonly value: string;
+  readonly onChange: (next: string) => void;
+  readonly error?: FormErrorCode | undefined;
+  readonly required?: boolean;
+  readonly placeholder?: string;
+  readonly hint?: ReactNode;
+  readonly trailing?: ReactNode;
+}): JSX.Element {
+  const { t } = useLingui();
+  const [revealed, setRevealed] = useState(false);
+  const errorId = `${id}-error`;
+  const hintId = `${id}-hint`;
+  const describedBy =
+    [error !== undefined ? errorId : undefined, hint !== undefined ? hintId : undefined]
+      .filter((part) => part !== undefined)
+      .join(' ') || undefined;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <Label htmlFor={id}>{label}</Label>
+        {trailing}
+      </div>
+      <div className="flex items-center gap-2">
+        <Input
+          id={id}
+          type={revealed ? 'text' : 'password'}
+          value={value}
+          required={required ?? false}
+          autoComplete="off"
+          aria-invalid={error !== undefined}
+          {...(describedBy !== undefined ? { 'aria-describedby': describedBy } : {})}
+          {...(placeholder !== undefined ? { placeholder } : {})}
+          onChange={(event): void => {
+            onChange(event.target.value);
+          }}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="shrink-0"
+          aria-pressed={revealed}
+          aria-label={revealed ? t`Hide ${label}` : t`Reveal ${label}`}
+          onClick={(): void => {
+            setRevealed((prev) => !prev);
+          }}
+        >
+          {revealed ? (
+            <EyeOff className="size-4" aria-hidden="true" />
+          ) : (
+            <Eye className="size-4" aria-hidden="true" />
+          )}
+        </Button>
+      </div>
+      {hint !== undefined ? (
+        <p id={hintId} className="text-xs text-muted-foreground">
+          {hint}
+        </p>
+      ) : null}
+      {error !== undefined ? (
+        <p id={errorId} className="text-sm text-destructive">
+          <FieldErrorMessage code={error} />
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * A labelled, read-only value with a copy-to-clipboard button — for a DERIVED
+ * locator the operator hands to a publisher/viewer (a WHIP/WHEP endpoint URL,
+ * ADR-W023). Not an editable field: the value is computed, not authored.
+ */
+export function DerivedUrlField({
+  id,
+  label,
+  value,
+  hint,
+  trailing,
+}: {
+  readonly id: string;
+  readonly label: string;
+  readonly value: string;
+  readonly hint?: ReactNode;
+  readonly trailing?: ReactNode;
+}): JSX.Element {
+  const { t } = useLingui();
+  const [copied, setCopied] = useState(false);
+  const hintId = `${id}-hint`;
+  const copy = (): void => {
+    // The Clipboard API is unavailable in an insecure context (the lib.dom type
+    // claims it is always present, but at runtime `navigator.clipboard` is
+    // undefined off HTTPS/localhost); probe the property before using it.
+    if (!('clipboard' in navigator)) {
+      toast({ title: t`Copy unavailable`, description: t`Select and copy the value manually.` });
+      return;
+    }
+    navigator.clipboard
+      .writeText(value)
+      .then((): void => {
+        setCopied(true);
+        window.setTimeout((): void => {
+          setCopied(false);
+        }, 2000);
+        toast({ title: t`Copied`, description: t`${label} copied to the clipboard.` });
+      })
+      .catch((): void => {
+        toast({
+          title: t`Copy failed`,
+          description: t`Select and copy the value manually.`,
+          variant: 'destructive',
+        });
+      });
+  };
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <Label htmlFor={id}>{label}</Label>
+        {trailing}
+      </div>
+      <div className="flex items-center gap-2">
+        <Input
+          id={id}
+          type="text"
+          value={value}
+          readOnly
+          className="font-mono text-xs"
+          {...(hint !== undefined ? { 'aria-describedby': hintId } : {})}
+          onFocus={(event): void => {
+            event.target.select();
+          }}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="shrink-0"
+          aria-label={t`Copy ${label}`}
+          onClick={copy}
+        >
+          {copied ? (
+            <Check className="size-4" aria-hidden="true" />
+          ) : (
+            <Copy className="size-4" aria-hidden="true" />
+          )}
+        </Button>
+      </div>
+      {hint !== undefined ? (
+        <p id={hintId} className="text-xs text-muted-foreground">
+          {hint}
         </p>
       ) : null}
     </div>

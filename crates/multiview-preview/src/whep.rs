@@ -5,14 +5,18 @@
 //! single low-latency WebRTC preview encode session (preview brief §4, the
 //! `POST …/preview/whep` routes). This module owns the **pure** half of that:
 //!
-//! * parse the browser's WHEP **SDP offer**, extract the offered video codecs;
+//! * parse the browser's WHEP **SDP offer**, extract the offered video codecs
+//!   (and, per ADR-P006, whether the offer carries an Opus audio m-line);
 //! * **select** the preview encode codec (prefer H.264 baseline — one cheap
 //!   hardware/software encode session — then VP8);
 //! * enforce that the caller holds [`AccessScope::Focus`] (the concurrent-focus
 //!   cap is only enforceable when focus is granted explicitly, not implied by a
 //!   view token); and
-//! * emit a minimal, well-formed **SDP answer** advertising the chosen payload
-//!   type as the server's send-only preview media.
+//! * emit a minimal, well-formed, browser-shaped **SDP answer** — IPv6-first
+//!   `c=IN IP6 ::` connection lines (ADR-0042), a session-level BUNDLE group,
+//!   per-media `a=mid` + `a=rtcp-mux` — advertising the chosen payload type as
+//!   the server's send-only preview media, plus a send-only Opus audio section
+//!   when the offer negotiated one (ADR-P006).
 //!
 //! The ICE / DTLS / SRTP **transport seam** lives in the [`transport`]
 //! submodule: the [`transport::WhepTransport`] trait, the session lifecycle
@@ -22,11 +26,13 @@
 //! socket-free and pulls **no** native dependency, so even the `webrtc`-feature
 //! build stays pure Rust, green, and deny-clean. A *native* (`str0m`)
 //! implementation of the seam — the part that needs real UDP/STUN + DTLS
-//! certificates — lives in [`native`] behind the *further* off-by-default
-//! `webrtc-native` gate (str0m is sans-IO, so its SDP offer→answer negotiation is
-//! still socket-free and CI-tested; only the live DTLS-SRTP egress needs a
-//! socket). A `MediaMTX`-sidecar republisher is the other option (brief's
-//! "Sidecar reuse" note).
+//! certificates — lives in the **`multiview-webrtc`** crate behind its `native`
+//! feature (`multiview_webrtc::whep_egress::WhepEgress`, ADR-0048 / ADR-P006):
+//! exactly one str0m owner per process, shared with WHIP ingest and the WebRTC
+//! outputs. str0m is sans-IO, so its SDP offer→answer negotiation + SRTP egress
+//! are CI-tested over an in-memory shuttle; only the live browser-play leg needs
+//! a real socket/peer. A `MediaMTX`-sidecar republisher is the other option
+//! (brief's "Sidecar reuse" note).
 //!
 //! ## Isolation (invariant #10)
 //!
@@ -38,8 +44,6 @@ use std::fmt::Write as _;
 
 use crate::token::AccessScope;
 
-#[cfg(feature = "webrtc-native")]
-pub mod native;
 pub mod program;
 pub mod transport;
 
@@ -120,6 +124,9 @@ struct OfferedCodec {
 pub struct WhepSession {
     codec: PreviewCodec,
     payload_type: u16,
+    /// The offer's Opus audio payload type, when it carried an Opus audio
+    /// m-line — the answer then includes a send-only Opus section (ADR-P006).
+    audio_payload_type: Option<u16>,
     answer: String,
 }
 
@@ -129,7 +136,11 @@ impl WhepSession {
     ///
     /// Selects the preview encode codec (H.264 preferred, then VP8) from the
     /// offer's video `m=` line and returns the session carrying a well-formed
-    /// send-only SDP answer.
+    /// send-only SDP answer. When the offer also carries an **Opus** audio
+    /// m-line the answer gains a send-only Opus audio section (ADR-P006);
+    /// audio never gates negotiation — a video-only offer negotiates
+    /// video-only, and a non-Opus audio m-line is left unanswered (audio on
+    /// this seam is Opus by definition, RFC 7874).
     ///
     /// # Errors
     ///
@@ -143,12 +154,14 @@ impl WhepSession {
         }
         let offered = parse_video_codecs(offer)?;
         let chosen = select_codec(&offered).ok_or(WhepError::NoSupportedCodec)?;
-        // The codec-only answer still carries 0.0.0.0 placeholders for the ICE
-        // and DTLS lines; a transport fills those in via `build_answer`.
-        let answer = build_answer_sdp(chosen, None);
+        let audio_payload_type = parse_audio_opus(offer);
+        // The codec-only answer carries no ICE/DTLS attributes yet; a transport
+        // fills those in via `build_answer`.
+        let answer = build_answer_sdp(chosen, audio_payload_type, None);
         Ok(Self {
             codec: chosen.codec,
             payload_type: chosen.payload_type,
+            audio_payload_type,
             answer,
         })
     }
@@ -157,11 +170,10 @@ impl WhepSession {
     /// attributes from `transport`.
     ///
     /// [`Self::negotiate`] does the pure codec selection and leaves the
-    /// connection/ICE/DTLS lines as placeholders; once a
-    /// [`transport::WhepTransport`] has accepted the offer it returns a
-    /// [`TransportAnswer`] whose real ICE ufrag/pwd, DTLS fingerprint, `a=setup`
-    /// role, and gathered candidates this method writes into the answer the WHEP
-    /// `201 Created` body returns.
+    /// ICE/DTLS lines absent; once a [`transport::WhepTransport`] has accepted
+    /// the offer it returns a [`TransportAnswer`] whose real ICE ufrag/pwd,
+    /// DTLS fingerprint, `a=setup` role, and gathered candidates this method
+    /// writes into the answer the WHEP `201 Created` body returns.
     #[must_use]
     pub fn build_answer(&self, transport: &TransportAnswer) -> String {
         build_answer_sdp(
@@ -169,6 +181,7 @@ impl WhepSession {
                 payload_type: self.payload_type,
                 codec: self.codec,
             },
+            self.audio_payload_type,
             Some(transport),
         )
     }
@@ -255,26 +268,78 @@ fn select_codec(offered: &[OfferedCodec]) -> Option<OfferedCodec> {
         .copied()
 }
 
-/// Build a minimal, well-formed **send-only** SDP answer advertising the chosen
-/// codec/payload type as the server's preview media.
+/// Parse the offer's first audio `m=` section for an **Opus** mapping,
+/// returning its dynamic payload type.
 ///
-/// When `transport` is `None` the answer is the codec-only scaffold whose
-/// connection/ICE/DTLS lines are `0.0.0.0` / absent placeholders (what
-/// [`WhepSession::negotiate`] returns before a transport is wired). When
-/// `transport` is `Some`, the transport-supplied ICE ufrag/pwd, DTLS
-/// fingerprint, `a=setup` role, and gathered `a=candidate` lines replace those
-/// placeholders, yielding the answer the WHEP `201 Created` body returns.
-fn build_answer_sdp(chosen: OfferedCodec, transport: Option<&TransportAnswer>) -> String {
+/// Audio on this seam is Opus by definition (RFC 7874's mandatory WebRTC audio
+/// codec; ADR-P006 pins it) at the 48 kHz RTP clock RFC 7587 fixes, so only an
+/// `opus/48000[...]` rtpmap is eligible. A missing audio m-line — or one
+/// carrying no Opus — yields `None`: audio is optional per ADR-P006 ("sessions
+/// whose offer carries no audio m-line simply leave it absent"), never an
+/// error.
+fn parse_audio_opus(offer: &str) -> Option<u16> {
+    let mut in_audio = false;
+    for raw in offer.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("m=") {
+            in_audio = rest.starts_with("audio");
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("a=rtpmap:") {
+            if let Some(pt) = parse_opus_rtpmap(body) {
+                return Some(pt);
+            }
+        }
+    }
+    None
+}
+
+/// Parse one audio `rtpmap` body (`"<pt> opus/48000/2"`) into the Opus payload
+/// type, if it maps Opus at the RFC 7587-fixed 48 kHz clock.
+fn parse_opus_rtpmap(body: &str) -> Option<u16> {
+    let mut parts = body.split_whitespace();
+    let pt = parts.next()?.parse::<u16>().ok()?;
+    let mapping = parts.next()?;
+    let mut fields = mapping.split('/');
+    let name = fields.next()?;
+    let clock = fields.next()?;
+    (name.eq_ignore_ascii_case("opus") && clock == "48000").then_some(pt)
+}
+
+/// Build a minimal, well-formed, **browser-shaped** send-only SDP answer
+/// advertising the chosen codec/payload type as the server's preview media.
+///
+/// The answer is honest, structurally faithful SDP (ADR-P006 move 2): the
+/// connection lines are IPv6-first `c=IN IP6 ::` (ADR-0042 — never `IN IP4`;
+/// the reachable addresses ride the candidate lines), the m-sections are
+/// joined by a session-level `a=group:BUNDLE`, and every m-section carries its
+/// `a=mid` and `a=rtcp-mux`. When `audio_payload_type` is `Some` (the offer
+/// negotiated an Opus audio m-line) a second, send-only `m=audio` Opus section
+/// with `a=mid:1` joins the bundle.
+///
+/// When `transport` is `None` the answer is the codec-only scaffold with no
+/// ICE/DTLS attributes (what [`WhepSession::negotiate`] returns before a
+/// transport is wired). When `transport` is `Some`, the transport-supplied ICE
+/// ufrag/pwd, DTLS fingerprint, `a=setup` role, and gathered `a=candidate`
+/// lines are written into the (BUNDLE-leading) video m-section, yielding the
+/// answer the WHEP `201 Created` body returns — with BUNDLE, the audio section
+/// shares that one transport (RFC 8843), so the attributes are not repeated.
+fn build_answer_sdp(
+    chosen: OfferedCodec,
+    audio_payload_type: Option<u16>,
+    transport: Option<&TransportAnswer>,
+) -> String {
     let pt = chosen.payload_type;
     let name = chosen.codec.rtpmap_name();
-    // The connection + ICE/DTLS block: a `0.0.0.0` placeholder when no transport
-    // is wired yet, or the transport-supplied ICE ufrag/pwd, DTLS fingerprint,
-    // `a=setup` role, and gathered candidate lines once it is.
+    // The ICE/DTLS block of the (BUNDLE-leading) video m-section: absent for
+    // the codec-only scaffold; the transport-supplied ICE ufrag/pwd, DTLS
+    // fingerprint, `a=setup` role, and gathered candidate lines once wired.
     let transport_block = match transport {
-        // Codec-only scaffold: no transport yet, placeholders remain.
-        None => "c=IN IP4 0.0.0.0\r\n".to_owned(),
-        // Transport-supplied connection + ICE/DTLS lines. The `c=` host stays
-        // `0.0.0.0`; the actual reachable addresses ride the candidate lines.
+        // Codec-only scaffold: no transport yet, no ICE/DTLS attributes.
+        None => String::new(),
         Some(t) => {
             // Fold the candidate lines with `write!` (infallible into a
             // `String`) rather than `format!`-into-`collect`, which clippy's
@@ -286,8 +351,7 @@ fn build_answer_sdp(chosen: OfferedCodec, transport: Option<&TransportAnswer>) -
                 acc
             });
             format!(
-                "c=IN IP4 0.0.0.0\r\n\
-a=ice-ufrag:{ufrag}\r\n\
+                "a=ice-ufrag:{ufrag}\r\n\
 a=ice-pwd:{pwd}\r\n\
 a=fingerprint:{algo} {fp}\r\n\
 a=setup:{setup}\r\n\
@@ -300,16 +364,41 @@ a=setup:{setup}\r\n\
             )
         }
     };
-    // Send-only: the preview server transmits, the client receives.
+    // Every m-section rides one transport (RFC 8843 BUNDLE): mid 0 is the
+    // video section, mid 1 the Opus audio section when negotiated.
+    let bundle = if audio_payload_type.is_some() {
+        "a=group:BUNDLE 0 1\r\n"
+    } else {
+        "a=group:BUNDLE 0\r\n"
+    };
+    // The optional send-only Opus audio section (ADR-P006): Opus is fixed at
+    // the 48 kHz RTP clock / 2 channels by RFC 7587.
+    let audio_section = audio_payload_type.map_or_else(String::new, |apt| {
+        format!(
+            "m=audio 9 UDP/TLS/RTP/SAVPF {apt}\r\n\
+c=IN IP6 ::\r\n\
+a=mid:1\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:{apt} opus/48000/2\r\n\
+a=sendonly\r\n"
+        )
+    });
+    // Send-only: the preview server transmits, the client receives. IPv6-first
+    // (ADR-0042): `IN IP6 ::` on the origin and connection lines, never IP4.
     format!(
         "v=0\r\n\
-o=multiview-preview 0 0 IN IP4 0.0.0.0\r\n\
+o=multiview-preview 0 0 IN IP6 ::\r\n\
 s=multiview-preview\r\n\
 t=0 0\r\n\
+{bundle}\
 m=video 9 UDP/TLS/RTP/SAVPF {pt}\r\n\
+c=IN IP6 ::\r\n\
+a=mid:0\r\n\
+a=rtcp-mux\r\n\
 {transport_block}\
 a=rtpmap:{pt} {name}/90000\r\n\
-a=sendonly\r\n"
+a=sendonly\r\n\
+{audio_section}"
     )
 }
 
@@ -324,6 +413,17 @@ mod tests {
         let h264 = parse_rtpmap("96 H264/90000").unwrap();
         assert_eq!(h264.codec, PreviewCodec::H264);
         assert_eq!(h264.payload_type, 96);
+    }
+
+    #[test]
+    fn parse_opus_rtpmap_requires_opus_at_48k() {
+        // Opus at its RFC 7587-fixed 48 kHz clock, case-insensitively.
+        assert_eq!(parse_opus_rtpmap("111 opus/48000/2"), Some(111));
+        assert_eq!(parse_opus_rtpmap("111 OPUS/48000/2"), Some(111));
+        // Anything else is not the seam's audio codec (RFC 7874 / ADR-P006).
+        assert!(parse_opus_rtpmap("0 PCMU/8000").is_none());
+        assert!(parse_opus_rtpmap("111 opus/24000/2").is_none());
+        assert!(parse_opus_rtpmap("nonsense").is_none());
     }
 
     #[test]

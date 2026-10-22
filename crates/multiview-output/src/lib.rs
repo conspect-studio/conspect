@@ -46,6 +46,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// ADR-0033 — AES67 / SMPTE ST 2110-30 PCM-audio RTP egress: the first output
+/// with no encode/GPU stage. The pure send framing (`f32` → big-endian L16/L24
+/// + the RTP header builder) and the bounded drop-oldest `Aes67Sender` are
+/// always compiled and CI-tested; only `aes67::transport` (the UDP send loop,
+/// feature `aes67`) touches a socket.
+pub mod aes67;
+
 /// DEV-B1 / ADR-0044 — local DRM/KMS display output: the raw-frame sink that
 /// scans the pre-encode NV12 canvas out to HDMI/DP glass via atomic page
 /// flips. The mailbox, mode policy (EDID/CVT-RB), flip state machine, and the
@@ -53,9 +60,31 @@
 /// device seam; only `display::kms` (the real ioctl backend, feature
 /// `display-kms`) touches hardware.
 pub mod display;
+
+/// DEV-C1 / ADR-M010 — the shared **outbound presentation epoch** cell: the
+/// per-program `WallClockRef` (output-PTS ns ↔ disciplined wall ns) the
+/// engine-side sampler publishes and the HLS PDT / RTCP SR egress consumers
+/// read. Pure Rust, always compiled.
+pub mod epoch;
 pub mod error;
 pub mod fanout;
 pub mod hls;
+
+/// OUTMETA (ADR-0088 / ADR-0089) — the pure-Rust apply model for per-output
+/// container metadata + presentation orientation: the validated muxer
+/// dictionary entries ([`metadata::MuxMetadata`]), the tag-path display-rotation
+/// matrix ([`metadata::display_matrix`]), and the pixels-path rotated rendition
+/// geometry ([`metadata::rotated_geometry`]). Always compiled; the feature-gated
+/// muxer wiring (`sink`) applies them. Reuses core `QuarterTurn` (no fourth
+/// rotation enum); honors inv #8 (tag, never convert) + #7 (fans with the
+/// rendition, no extra encode for the tag path).
+pub mod metadata;
+
+/// DEV-C1 / ADR-M010 — RTCP **Sender Report** building stamped from the same
+/// outbound epoch: exact integer NTP/RTP field math + the 28-byte wire form +
+/// the [`rtcp::SrStamper`] seam the RTSP serving layer consumes. Pure Rust,
+/// always compiled.
+pub mod rtcp;
 
 /// GP-6 — the per-stream monotonic clamp+offset packet re-stamp (ADR-0030 §4
 /// "Re-stamp rule (#3 for the copy path)"). The COPY-path invariant-#3
@@ -103,8 +132,24 @@ pub mod guarded;
 #[cfg(feature = "ndi")]
 pub mod ndi;
 
+/// RIST link statistics (ADR-0095 Tier-1 / RIST-5): the bridge that drives a
+/// direct-librist sender egress link, drains its stats callback, and lowers each
+/// sample into the telemetry metric series + a `rist.link.stats` wire event +
+/// the `rist-link-loss` health warning. Behind the off-by-default `rist-stats`
+/// feature; all raw librist FFI lives in the `multiview-rist-sys` leaf crate so
+/// this crate stays `forbid(unsafe_code)`. `FFmpeg`'s Tier-0 `rist://` transport
+/// exposes no stats — this is the only path that observes a RIST link's health.
+#[cfg(feature = "rist-stats")]
+pub mod rist;
+
+pub use epoch::SharedEpoch;
 pub use error::{Error, Result};
+pub use metadata::{
+    display_matrix, display_matrix_degrees, rotated_geometry, DisplayMatrix, MetadataEntry,
+    MetadataEntryError, MetadataScope, MuxMetadata,
+};
 pub use restamp::RestampAccumulator;
+pub use rtcp::{rtp_timestamp_at, NtpTimestamp, SenderReport, SrStamper};
 pub use rtsp::{RtspPublishError, RtspPublishTarget};
 pub use rtsp_server::{
     units_to_nanos, BoundedPacketQueue, RtspCapsError, RtspCodec, RtspMount, RtspMountError,

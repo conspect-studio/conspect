@@ -107,7 +107,10 @@ fn mixed_resolution_heads_are_sized_independently() {
 fn bindings_start_empty_and_can_be_updated_by_id() {
     let mut comp = WallComposition::resolve(&wall_2x2(BezelCompensation::default())).unwrap();
     assert_eq!(comp.bindings().len(), 4);
-    assert!(comp.bindings()[0].sources.is_empty());
+    assert_eq!(
+        comp.bindings()[0].sources,
+        Vec::<std::option::Option<std::string::String>>::new()
+    );
 
     let binding = HeadBinding::new("h01")
         .with_sources(vec![Some("cam-1".to_owned()), None])

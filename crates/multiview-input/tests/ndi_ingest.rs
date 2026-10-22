@@ -19,10 +19,22 @@
 use multiview_core::time::MediaTime;
 use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 use multiview_input::ndi::convert::{bgra_to_nv12, uyvy_to_nv12, ReceivedVideoFrame};
+use multiview_input::ndi::license::LicenseAcceptance;
 use multiview_input::ndi::receiver::{FakeNdiReceiver, NdiRecvFourCc, ReceivedFrame};
-use multiview_input::ndi::NdiProducer;
+use multiview_input::ndi::{NdiLicense, NdiProducer};
 use multiview_input::normalize::WrapBits;
 use multiview_input::source::{FrameProducer, IngestConfig, IngestPump};
+
+/// An accepted NDI license guard for fixture construction (the gated
+/// `NdiProducer::new` requires one; ADR-0008 §7.5). These tests exercise the
+/// receive→NV12 conversion + pump, not the gate, so a fixed acceptance suffices.
+fn accepted() -> NdiLicense {
+    NdiLicense::accept(LicenseAcceptance {
+        accepted_by: "test".to_owned(),
+        accepted_at: "2026-06-06T00:00:00Z".to_owned(),
+    })
+    .expect("a complete acceptance is accepted")
+}
 
 /// A 2x2 UYVY frame: two UYVY groups (one per row), `U Y0 V Y1` per group.
 /// Row 0: U=100, Y0=10, V=200, Y1=20. Row 1: U=110, Y0=30, V=210, Y1=40.
@@ -106,7 +118,7 @@ fn producer_samples_and_yields_nv12_frames() {
         ReceivedFrame::Video(uyvy_2x2()),
         ReceivedFrame::Video(uyvy_2x2()),
     ]);
-    let mut producer = NdiProducer::new(Box::new(recv));
+    let mut producer = NdiProducer::new(accepted(), Box::new(recv));
     let f0 = producer.next_frame().unwrap().expect("first frame");
     assert_eq!(f0.meta.width, 2);
     assert_eq!(f0.meta.height, 2);
@@ -124,7 +136,7 @@ fn producer_skips_empty_polls_without_blocking() {
     // NDI receive returns "no frame this tick" frequently (None timeout). The
     // producer must surface that as Ok(None) — it never spins or blocks.
     let recv = FakeNdiReceiver::with_frames(vec![ReceivedFrame::None]);
-    let mut producer = NdiProducer::new(Box::new(recv));
+    let mut producer = NdiProducer::new(accepted(), Box::new(recv));
     assert!(producer.next_frame().unwrap().is_none());
 }
 
@@ -135,7 +147,7 @@ fn producer_drives_the_ingest_pump_into_last_good_store() {
         ReceivedFrame::Video(uyvy_2x2()),
         ReceivedFrame::Video(uyvy_2x2()),
     ]);
-    let mut producer = NdiProducer::new(Box::new(recv));
+    let mut producer = NdiProducer::new(accepted(), Box::new(recv));
     let store: TileStore<multiview_input::source::StoredFrame> = TileStore::new(
         "ndi-test",
         TileThresholds::default(),
@@ -162,7 +174,7 @@ fn producer_timebase_is_ndi_100ns_and_wrap_is_none() {
     // and no fixed-width wrap (WrapBits::None), so the normalizer passes it
     // through as a continuous timeline.
     let recv = FakeNdiReceiver::with_frames(vec![]);
-    let producer = NdiProducer::new(Box::new(recv));
+    let producer = NdiProducer::new(accepted(), Box::new(recv));
     let tb = producer.timebase();
     assert_eq!(tb.num, 1);
     assert_eq!(tb.den, 10_000_000);

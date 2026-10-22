@@ -96,7 +96,7 @@ scaffold retains forever (`Str0mWhepTransport`'s closed entries). `GET /api/v1/p
 `ApiDoc::rest_routes` in `crates/multiview-control/src/openapi.rs` vs the mounted router in
 `tests/openapi.rs`) returns
 `{ "webrtc": bool, "scopes": { "program": { "whep": bool, "fidelity": "real-encoded-output" | "pre-encode-canvas-approx" }, "inputs": { "whep": bool }, "outputs": { "whep": bool } }, "fallback": "jpeg" }`
-so the SPA picks its transport before POSTing an offer ([ADR-W020](ADR-W020.md)). `"jpeg"` is the
+so the SPA picks its transport before POSTing an offer ([ADR-W023](ADR-W023.md)). `"jpeg"` is the
 one fallback literal everywhere — the 503 problem-body hint uses the same value, and the shipped
 `ws-jpeg` literal in `crates/multiview-control/src/routes/preview.rs` is renamed to `jpeg` in this
 push (no consumer exists yet; the route tests update honestly). PRV-4b ships as
@@ -150,7 +150,7 @@ connect+timeout+watchdog teardown — the tombstone eviction completes it).
 
 WHEP preview becomes live end-to-end on `webrtc-native` builds (all release presets carry it),
 with audio, on program/input/output scopes, falling back to the JPEG path on pure builds — the
-SPA's WHEP→JPEG ladder ([ADR-W020](ADR-W020.md)) keys off the capabilities endpoint; the LL-HLS
+SPA's WHEP→JPEG ladder ([ADR-W023](ADR-W023.md)) keys off the capabilities endpoint; the LL-HLS
 fallback rung of [ADR-P002](ADR-P002.md) remains a separate schedule item, unaffected. The
 `EncodedSample`/`PreviewMediaSource` seam change touches every consumer in one push (fakes, native
 transport, focus wiring) — mechanical but not optional. Preview cost stays bounded and idle-free:

@@ -264,7 +264,11 @@ impl TextEngine {
         let metrics = Metrics::new(size_px, size_px);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         let attrs = Attrs::new().family(Family::Name(family.family_name()));
-        buffer.set_text(&mut self.font_system, text, &attrs, Shaping::Advanced);
+        // cosmic-text 0.19 dropped the `&mut FontSystem` first argument from
+        // `set_text` (the buffer no longer needs it until `shape_until_scroll`)
+        // and added a trailing per-line `Option<Align>`. We place a single run
+        // at the pen baseline ourselves, so we apply no line alignment (`None`).
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         let mut placed = Vec::new();

@@ -103,6 +103,46 @@ first.
 with CORE as the staffed critical path and the three coordination points pre‑agreed. Expect CORE to
 dominate wall‑clock; the six parallel lanes finish well before it.
 
+### 1d. SW lane fanout (production switcher — added 2026-06-11, design merged, code not started)
+
+The **SW** stream (Part 2 below; briefs [production-switcher](../research/production-switcher.md) ·
+[media-playout](../research/media-playout.md)) fans out as **one serial lane + five parallel lanes**,
+partitioned by file territory exactly like 1c:
+
+- **Lane SW-A (engine switcher core) — SERIAL WITH LANE-CORE, same owner.** Every SW-A item lands in
+  the data-plane integrator's territory (`pipeline.rs`, `control.rs`, `command.rs`,
+  `events/event.rs`, `config` root) **plus** `engine/src/runtime.rs` + `engine/src/drive.rs`, which
+  join the LANE-CORE file set for the duration of the stream — the per-tick control hook and the
+  compose path are the inv-#1 seam, so they get one owner, never parallel worktrees. Order:
+  **SW-A1 → SW-A2 → SW-A3 → SW-A4 → SW-A5 → SW-A6 → SW-A7**.
+- **Lane SW-B (parallel).** `crates/multiview-compositor/*` (CPU kernel `pipeline.rs`, `gpu/*`,
+  shaders) — SW-B1…SW-B6. Zero file overlap with SW-A.
+- **Lane SW-C (parallel).** Media: `crates/multiview-ffmpeg` (alpha decode, `seek`),
+  `multiview-framestore` payload, new media-library modules — SW-C1…SW-C5; SW-C2's `pipeline.rs`
+  transport wiring hands off to LANE-CORE exactly as IN-3/IN-5 did.
+- **Lane SW-D (parallel).** `crates/multiview-audio/*` — SW-D1…SW-D6; the one-line `consumer_main`
+  seam hand-off goes to LANE-CORE.
+- **Lane SW-E (parallel).** `engine/src/tally/*`, `multiview-input/src/tsl/*`,
+  `multiview-output/src/{tsl,fanout}.rs` — SW-E1…SW-E5.
+- **Lane SW-F (parallel — the coordination hub).** `multiview-control`
+  routes/openapi/realtime/typed_resources + `web/src/` — SW-F1…SW-F7; owns ALL new
+  route/OpenAPI/AsyncAPI registration (the LANE-API rule).
+
+**SW additions to the file-conflict map (1b):**
+
+| Touched by | File | Items |
+|---|---|---|
+| **7+** | `crates/multiview-cli/src/pipeline.rs` | SW-A4…A7, SW-C2 (wiring), SW-D1 (seam), SW-D6 — joins the existing 9-item LANE-CORE contention; serial |
+| 6 | `crates/multiview-engine/src/{runtime,drive}.rs` | SW-A2, SW-A3, SW-A4, SW-A5, SW-A6, SW-E1 (reads scene state) — SW-A owner holds both files |
+| 3 | `crates/multiview-config/src/lib.rs` (+ `program.rs`, new switcher/media modules) | SW-A1 → SW-F1 sequenced (one schema owner); collides with any concurrent `config/schema.rs` item (AUD-7-class) |
+| 3 | `crates/multiview-control/src/openapi.rs` (+ `routes/mod.rs`, `multiview-events/src/asyncapi.rs`) | SW-F2, SW-F3, SW-E4 (RouteOutput spec) — single-owner registration, LANE-API rule |
+
+**Four SW coordination points:** (i) the Tick-widened control-hook signature (SW-A2) freezes before
+SW-A3/SW-E1 build on it; (ii) the NV12+A payload shape is agreed between SW-C3 (producer) and SW-B5
+(consumer) before either ships; (iii) `multiview-config` root edits are sequenced SW-A1 → SW-F1;
+(iv) `openapi.rs`/`asyncapi.rs` registration is single-owner inside SW-F2/SW-F3 — other lanes file
+handler bodies and let SW-F wire the router/spec.
+
 ---
 
 ## Part 2 — Master checklist
@@ -118,7 +158,7 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 - [x] **AUD-5** `M` — `bars` synthetic-source 1 kHz tone companion  ·  _deps: AUD-2, AUD-3_  · _SHIPPED (TDD red→green, clippy default+ffmpeg, fmt; me-verified). `multiview-audio::tone::ToneGenerator` — phase-continuous 1 kHz sine at the EBU −18 dBFS line-up level (`LINE_UP_TONE_PEAK_DBFS == VU_REFERENCE_DBFS`), carrying integer absolute-frame phase reduced mod the sample rate (no float drift — inv #3/#6), `f64→f32` only through the clamped helper (no raw `as`); unit tests assert non-silence, the −18 dBFS peak, phase continuity across a block seam, no drift over a long odd-length run, momentary loudness ≈ −18 LUFS (±0.5), and `seek_to_frame` lands on the analytic sine. cli `audio::tone_publish_loop` keeps the bars source's `AudioStore` filled to a bounded lead ahead of the bus read cursor (seeks forward over a never-read `DropOnOverload` span rather than back-filling — bounded burst), off any hot path (inv #1/#10). pipeline.rs touch is MINIMAL + additive (a bars source gets a store in the SAME `audio_stores` map AUD-2's bus routing iterates + a tone plan; `IngestSupervisor` spawns one tone thread/plan, gated on program-audio). Integration test decodes the on-disk `program.ts`: a bars-only run's program audio is non-silent AND its dominant zero-crossing frequency is ~1 kHz (measured 1002 Hz). `solid`/`clock` stay silent._
 - [x] **AUD-6** `L` — EBU R128 loudness normalisation on the program bus  ·  _deps: AUD-3_  · _shipped #33 (test `27e130e` → green `4bd19cd`, perf-fix red `50c17e1` → green `bbd971b`): new `multiview-audio::loudnorm` — `LoudnormProcessor` drives a one-pole-smoothed makeup gain off the running short-term `LoudnessMeter` toward `LoudnessTarget` (Broadcast −23 / Streaming −16 / Custom), gated at −70 LUFS (a silenced/lost input is never amplified) with a feedforward oversampled true-peak limiter holding the emitted true-peak ≤ −1.5 dBTP; block shape preserved exactly, discrete tracks bypass byte-identical. Bounded + off the hot path (inv #1/#10): runs on the bake-consumer thread, O(block)/tick with O(1) scalar gain state (`LoudnessMeter::retain_recent` bounds history so memory never grows with run length — the `50c17e1`→`bbd971b` perf fix kept rt8b lip-synced). CLI wiring: `program_loudnorm` applies it between `drive_audio_for_item` and the AAC encode (program-bus only). `crates/multiview-audio/src/loudnorm.rs` + `tests/loudnorm.rs` green: converge ±1 LU, true-peak ceiling never exceeded, gated silence not amplified, discrete byte-identical + monotonic-gain property test._
 - [x] **AUD-7** `M` — Audio routing config schema + capability validation  ·  _deps: AUD-3, AUD-4_  · _red `8b30b5e` → green `4357c68` + fix `fefddf1` (schema + audio-crate matrix), then **config-time capability cross-check completed**: `multiview-config::audio` — `AudioRouting`/`AudioRoute` (program-bus membership + per-input `gain_db` + `mute`, discrete `target_track`/`language`, exact-integer `sample_rate_hz`), `AudioChannels`/`OutputAudio`/`OutputAudioMode` (internally tagged, snake_case). The previously-missing piece is now in `multiview-config` itself (NO audio dep): a first-class machine-readable per-output matrix `OutputAudioCapability {delivery: TrackDelivery, discrete_capacity: TrackCapacity, max_channels}` derived by `Output::audio_capability()` from the transport (RTSP/SRT = N simultaneous; HLS/LL-HLS = N select-one; NDI = none/channel-map; legacy RTMP = 1, gated to N by a new `multitrack` endpoint flag). `OutputAudio::validate_against_capability()` is wired into `MultiviewConfig::validate()` and rejects over-capacity selections with the new typed `ConfigError::AudioCapability {output, reason}` (honest "degrade to the mixed bus" message). TDD: `tests/audio_capability.rs` pins the designed-in asymmetry (N tracks pass on SRT/RTSP, rejected on NDI + legacy RTMP, accepted on multitrack-RTMP, select-one on HLS) + the matrix is exported for AUD-8. Reuses the WebUI matrix structure the brief mandates._
-- [ ] **AUD-8** `L` — WebUI audio routing matrix + loudness meters  ·  _deps: AUD-6, AUD-7_
+- [~] **AUD-8** `L` — WebUI audio routing matrix + loudness meters  ·  _deps: AUD-6, AUD-7_  · _routing-matrix half SHIPPED (PR #55): `AudioPage.tsx` — per-source gain/mute/program-bus routing form, capability-aware output track selectors; loudness-meter slice NOT YET wired (no live LUFS/dBTP over WS yet)_
 
 ### OUT — Output servers (RTSP, NDI)
 
@@ -126,20 +166,20 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 - [~] **OUT-2** `XL` — In-process RTSP server via `gst-rtsp-server`, fed pre-encoded NALs (`PacketSink`)  ·  _deps: OUT-1_  · _red `a07fdfb` → green `3948c5a` (orchestrated, REVIEWER-APPROVED, me-verified): the pure-Rust typed seam is ALWAYS compiled + CI-tested — `BoundedPacketQueue` (drop-oldest, push never blocks/grows — inv #1/#10), `RtspServerSink: fanout::PacketSink` (non-blocking, shares the `Arc<EncodedPacket>` — encode-once inv #7), `RtspMount` (validated `rtsp://host:port/mount`), `RtspCodec`+`units_to_nanos`. The actual gst-rtsp-server serving (GLib loop, `set_shared` factory, appsrc need-data pump) is behind a NEW off-by-default `rtsp-server` feature (gstreamer/glib bindings MIT/Apache, optional; LGPL C libs dynamically linked, never vendored; default build pulls ZERO gst). 18 CI tests + 1 `#[ignore]` live playout. **Remaining → OUT-2b:** verify the gst serving path on a gst-equipped runner (the test box can `apt install` gstreamer) — live ffprobe pull, second-client `set_shared` fan-out, slow-client isolation; + the cli `Output::RtspServer` wiring._
 - [ ] **OUT-2b** `M` — RTSP server: validate the gst serving path + cli wiring  ·  _deps: OUT-2_  · _on a gstreamer-equipped runner (apt install gstreamer1.0 + gst-rtsp-server on the test box) verify the `rtsp-server` feature compiles+links + serves: ffprobe pull of the served `rtsp://`, second-client fan-out, slow-client isolation; wire `Output::RtspServer` into pipeline.rs build_outputs/run_one_output._
 - [x] **OUT-3** `L` — NDI dynamic-load backend (`NDIlib_v6_load`) + feature/license scaffolding  ·  _deps: —_  · _`407056a`: NEW `multiview-ndi-sys` FFI crate (deny+SAFETY dlopen/dlsym/NDIlib_v6_load via libloading ISC, opaque NonNull table — no SDK vendored, no build-time link) + `multiview-output::ndi` (loader path-search, runtime license gate, attribution constants, `NdiOutput` sink seam over a fake API). multiview-output stays forbid(unsafe). Live send over the real SDK table + cli `RunnableOutput::Ndi`/NV12→UYVY/`[system.ndi]` license config = OUT-4 + cli glue (gated)_
-- [~] **OUT-4** `L` — NDI output Sender wired as a Sink (host-memory copy from canvas)  ·  _deps: OUT-3_  · _red `1af4a76` → green `405d942` + review-fix `8889273` (orchestrated, reviewed, me-verified): the pure-Rust `multiview-output::ndi::convert` seam — `Nv12Canvas` view (geometry/plane-length validated), `nv12_to_uyvy` (4:2:0→UYVY 4:2:2, vertical chroma replication, checked-indexing only) + `NdiOutput::send_canvas` (tick-derived timecode inv #3, typed `InvalidFrame`/`Closed` refusals, never panics). 8 CI tests under the `ndi` feature (I added the 4x4 chroma-row-stride case the reviewer flagged missing). Default build NDI-free/LGPL-clean. **Remaining → OUT-4b:** the cli runnable egress (`RunnableOutput::Ndi` + `run_one_output` arm + `[system.ndi]` accept-license config + canvas fan-out) and the hardware-gated `ndi_output_roundtrip` (in-process Finder/Receiver) — the agent was scoped to multiview-output only, so the CLI half is genuinely deferred._
-- [ ] **OUT-4b** `M` — NDI output: cli runnable egress + roundtrip test  ·  _deps: OUT-4, NDI-L1_  · _wire `RunnableOutput::Ndi` into `pipeline.rs` build_outputs/run_one_output (canvas → `NdiOutput::send_canvas` off the hot path), add `[system.ndi]` accept-license config field, and the named `tests/ndi_output_roundtrip.rs` (feature `ndi`, in-process Finder/Receiver, content-aware ramp survival, #10 re-assert). Hardware-gated where a real runtime is needed._
+- [x] **OUT-4** `L` — NDI output Sender wired as a Sink (host-memory copy from canvas)  ·  _deps: OUT-3_  · _red `1af4a76` → green `405d942` + review-fix `8889273` (orchestrated, reviewed, me-verified): the pure-Rust `multiview-output::ndi::convert` seam — `Nv12Canvas` view (geometry/plane-length validated), `nv12_to_uyvy` (4:2:0→UYVY 4:2:2, vertical chroma replication, checked-indexing only) + `NdiOutput::send_canvas` (tick-derived timecode inv #3, typed `InvalidFrame`/`Closed` refusals, never panics). 8 CI tests under the `ndi` feature (I added the 4x4 chroma-row-stride case the reviewer flagged missing). Default build NDI-free/LGPL-clean. **CLI half completed in OUT-4b** (the runnable egress + roundtrip test)._
+- [x] **OUT-4b** `M` — NDI output: cli runnable egress + roundtrip test  ·  _deps: OUT-4, NDI-L1_  · _DONE (folds NDI-L2): `RunnableOutput::Ndi` wired into `pipeline.rs` `build_outputs`/`run_one_output` — a raw-canvas sink (NOT a packet sink, like the display head) that taps the composited pre-encode NV12 canvas off the hot path via a wait-free single-slot mailbox (newest-wins drop-oldest; engine never blocks, inv #1/#10) → `NdiOutput::send_canvas` (NV12→UYVY). Tick-derived NDI 100 ns timecode at the exact-rational cadence (inv #3). `[system.ndi] accept_license` gate enforced FIRST via `NdiLicense::from_setting` (before any runtime load, mirroring the ingest gate); accepted license gates `NdiOutput::new` by construction; unaccepted/absent runtime is an honest logged skip, never a panic/pretend-run. Feature-gated: seam rides `--features ndi` (CI-buildable, SDK-free), live sender needs `ndi-bindings`; default build NDI-free/LGPL-clean, deny-clean. 3 offline-fake-API unit tests (drive loop, bounded drop-oldest tap, tick-derived exact-rational timecode) + hardware-gated `#[ignore]` `tests/ndi_output_roundtrip.rs` (in-process Finder/Receiver, ramp survival, #10)._
 
 ### NDI — FULL live implementation (user directive 2026-06-06: NDI + NDI|HX fully implemented & tested, license-gated)
 
 > **As-built (mapped 2026-06-06):** the entire SAFE SEAM exists on BOTH sides + is unit-tested with fakes, and the **license gate is already enforced by construction** (`multiview-output::ndi::license::NdiLicense`, `multiview-input::ndi::license::NdiLicense` — `NdiOutput::new`/ingest require an `NdiLicense` by value; `from_setting(false,_)` = `NotAccepted`, blank audit = `IncompleteAcceptance`). `multiview-ndi-sys` runtime-loads `NDIlib_v6_load` (dlopen, opaque table, never vendored). Conversions (NV12↔UYVY/BGRA), `NdiApi`/`NdiReceiver` traits, `FakeNdiApi`/`FakeNdiReceiver`, attribution constants, loaders, capability matrix — ALL present + tested. **The gap is the LIVE binding + advanced features.** Constraints (ADR-0008 + docs/io/ndi.md): never vendor the SDK (runtime-load only); declare the C ABI structs ourselves from the documented ABI (that is normal FFI, not copying the proprietary SDK); mandatory attribution; host-memory copy at the NDI edge; FrameSync per ingest source; NDI YUV = limited-range by resolution matrix.
 
-- [~] **NDI-L0** `S` — devcontainer NDI SDK provisioning (gated)  ·  _deps: —_  · _BLOCKS NDI-L1: the live binding needs the authoritative NDIlib v6 HEADER to declare the ABI soundly (guessing the function-table offsets = UB — verify-don't-assume + FFI-safety), and the loopback test needs the libndi RUNTIME; both come from the NewTek/Vizrt NDI SDK (NDI is a Vizrt product — NOT Audinate, which makes Dante) whose download = accepting its licence. **Added (2026-06-06) an opt-in, never-vendored devcontainer stage** (.devcontainer/Dockerfile): `--build-arg NDI_SDK_ACCEPT_LICENSE=1 --build-arg NDI_SDK_URL=<operator's SDK tarball>` installs headers→/opt/ndi/include + libndi→/usr/local/lib (+ sets `NDI_RUNTIME_DIR_V6`, which `multiview-ndi-sys` already honors); default OFF = open/LGPL-clean. **REMAINING: operator supplies the SDK URL + rebuilds the image** (Vizrt gates the download behind a form → no public URL to hardcode; the .sh-installer variant needs EULA flags). Until then NDI-L1 is correctly blocked — the open AES67 path (AES67-1..5, ADR-T010) is the unblocked Dante-audio route._
-- [ ] **NDI-L1** `XL` (KEYSTONE) — Live SDK function-table binding  ·  _deps: NDI-L0_  · _DESIGN: ADR-0028 (resolve-once flat NdiV6 table; typestate async-send pinning + free-on-Drop recv; safe NdiSender/NdiFinder/NdiReceiver boundary; regenerate-not-commit bindgen). Bindgen foundation done + gpu-test-box-validated (7a6141d)._  _In `multiview-ndi-sys` (the ONLY `allow(unsafe_code)` leaf), declare the `NDIlib_*` C ABI structs (`video_frame_v2_t`, `audio_frame_v3_t`, `send_create_t`, `recv_create_v3_t`, `source_t`, `find_create_t`, `tally_t`) from the DOCUMENTED ABI (not vendored), resolve the function pointers off the loaded v6 table (`send_create/send_send_video_v2/send_send_audio_v3/send_get_tally/send_destroy`, `recv_create_v3/recv_capture_v3/recv_free_*/recv_destroy`, `find_create_v2/find_get_current_sources/find_destroy`), each `// SAFETY:`-justified. Then implement `SdkNdiApi: multiview_output::ndi::NdiApi` and `SdkNdiReceiver: multiview_input::ndi::NdiReceiver` over the table (the higher-level crates stay `forbid(unsafe)`). This is what makes everything below REAL — today only the fakes exist. TEST: gated loopback (send→find→recv on one host) on a runtime-equipped runner._
-- [ ] **NDI-L2** `M` — Egress live wiring (folds OUT-4b)  ·  _deps: NDI-L1_  · _`RunnableOutput::Ndi` + `run_one_output` arm feeding `NdiOutput::<SdkNdiApi>::send_canvas` off the hot path; `[system.ndi] accept_license` config → `NdiLicense::from_setting`; loopback roundtrip ffprobe/receiver test._
+- [x] **NDI-L0** `S` — devcontainer NDI SDK provisioning (gated)  ·  _deps: —_  · _BLOCKS NDI-L1: the live binding needs the authoritative NDIlib v6 HEADER to declare the ABI soundly (guessing the function-table offsets = UB — verify-don't-assume + FFI-safety), and the loopback test needs the libndi RUNTIME; both come from the NewTek/Vizrt NDI SDK (NDI is a Vizrt product — NOT Audinate, which makes Dante) whose download = accepting its licence. **Added (2026-06-06) an opt-in, never-vendored devcontainer stage** (.devcontainer/Dockerfile): `--build-arg NDI_SDK_ACCEPT_LICENSE=1 --build-arg NDI_SDK_URL=<operator's SDK tarball>` installs headers→/opt/ndi/include + libndi→/usr/local/lib (+ sets `NDI_RUNTIME_DIR_V6`, which `multiview-ndi-sys` already honors); default OFF = open/LGPL-clean. **DONE (2026-06-14):** operator supplied the **NDI Advanced SDK v6.3.2.0** (git-5396c5f15, 2026-04-13). Header `Processing.NDI.Lib.h` located via `NDI_SDK_INCLUDE_DIR`; the runtime `libndi_advanced.so.6` (exports `NDIlib_v6_load`) resolves via `NDI_RUNTIME_DIR_V6`. Verified loadable in the devcontainer (`NdiRuntime::load` reads version `6.3.2.0`) and installed on the x86_64 hardware-validation box at `/usr/local/lib/libndi_advanced.so.6.3.2` (+ `.so.6`/`.so`/`libndi.so.6` aliases, `ldconfig` cached). SDK never vendored/committed (ADR-0008); local-dev + box-validation only._
+- [x] **NDI-L1** `XL` (KEYSTONE) — Live SDK function-table binding  ·  _deps: NDI-L0_  · _DESIGN: ADR-0028 (resolve-once flat NdiV6 table; typestate async-send pinning + free-on-Drop recv; safe NdiSender/NdiFinder/NdiReceiver boundary; regenerate-not-commit bindgen). Bindgen foundation done + gpu-test-box-validated (7a6141d)._  _In `multiview-ndi-sys` (the ONLY `allow(unsafe_code)` leaf), declare the `NDIlib_*` C ABI structs (`video_frame_v2_t`, `audio_frame_v3_t`, `send_create_t`, `recv_create_v3_t`, `source_t`, `find_create_t`, `tally_t`) from the DOCUMENTED ABI (not vendored), resolve the function pointers off the loaded v6 table (`send_create/send_send_video_v2/send_send_audio_v3/send_get_tally/send_destroy`, `recv_create_v3/recv_capture_v3/recv_free_*/recv_destroy`, `find_create_v2/find_get_current_sources/find_destroy`), each `// SAFETY:`-justified. Then implement `SdkNdiApi: multiview_output::ndi::NdiApi` and `SdkNdiReceiver: multiview_input::ndi::NdiReceiver` over the table (the higher-level crates stay `forbid(unsafe)`). This is what makes everything below REAL — today only the fakes exist. TEST: gated loopback (send→find→recv on one host) on a runtime-equipped runner._  _**ABI-VERIFIED + HARDWARE-VALIDATED (2026-06-14)** against the real NDI Advanced SDK **v6.3.2.0** header. (1) **ABI verdict: EXACT MATCH** — all 15 `__bindgen_anon_N` table indices in `crates/multiview-ndi-sys/src/table.rs` were cross-checked against the bindgen output generated from the licensed `Processing.NDI.DynamicLoad.h` (107 append-only slots; version=anon_3, initialize=anon_1, find_create_v2=anon_6, find_get_current_sources=anon_44, find_destroy=anon_7, send_create=anon_9, send_send_video_v2=anon_51, send_send_video_async_v2=anon_52, send_send_audio_v3=anon_97, send_destroy=anon_10, recv_create_v3=anon_85, recv_capture_v3=anon_102, recv_free_video_v2=anon_48, recv_free_audio_v3=anon_103, recv_destroy=anon_24). **No code fix needed.** The crate also compiles clean against the header (every `ffi::NDIlib_*` struct-field ref valid). (2) **Live tests GREEN** on the x86_64 SDK box AND locally in the devcontainer (aarch64 runtime): `live_load` (reads version `6.3.2.0` through the table), `table::tests::resolve_maps_every_slot_on_hardware` (all 15 indices land on non-null fn-pointers — definitive ABI proof), `live_send` (real `NdiSender` pushes 30 UYVY frames + typed ShortBuffer/InvalidCString refusals). Our Rust `NdiFinder` **discovered the real LAN source `ZOW001`** and `NdiReceiver` connected to it (find + recv create/connect ABI end-to-end). NOTE: the in-process `live_loopback` (self send→find→recv on one host) does not deliver frames on this box — reproduced identically with the SDK's own raw C API (discovery + connect succeed, status_change negotiated, but same-host media transport delivers 0 frames), so it is an environment characteristic of this multi-NIC host, NOT a binding defect. A frames-flowing external-source roundtrip awaits an actively-encoding LAN NDI sender (zow001 was discoverable but idle; zow002 is the operator's production decode = off-limits)._
+- [x] **NDI-L2** `M` — Egress live wiring (folds OUT-4b)  ·  _deps: NDI-L1_  · _DONE (with OUT-4b): `RunnableOutput::Ndi` + `run_one_output` arm feeding `NdiOutput::<SdkNdiApi>::send_canvas` off the hot path (wait-free canvas tap, inv #1/#10); `[system.ndi] accept_license` config → `NdiLicense::from_setting` checked before runtime load; hardware-gated loopback Finder/Receiver roundtrip test. Live sender behind `--features ndi-bindings`._
 - [ ] **NDI-L3** `M` — Ingest live wiring (folds IN-3b)  ·  _deps: NDI-L1_  · _construct `SdkNdiReceiver` into the ingest supervisor for `SourceKind::Ndi` (per-source FrameSync, host→GPU copy, LIVE→STALE→RECONNECTING state machine); wire `NdiLicense::from_setting` into `ingest_plan_for` (unaccepted ⇒ tile degrades, never silent); loopback NV12 roundtrip test._
 - [ ] **NDI-L4** `L` — Discovery (`NDIlib_find`)  ·  _deps: NDI-L1_  · _enumerate live sources; `GET /api/v1/discovery/ndi` control endpoint + WebUI source picker; optional `{kind:'ndi', discover:true}` auto-select. Bounded, off the engine path (#10)._
 - [ ] **NDI-L5** `M` — Audio over NDI (send + recv)  ·  _deps: NDI-L1, AUD-4_  · _`send_send_audio_v3` for the program bus (channel-map, the capability matrix already validates this) + `recv` audio → program clock rebase. Planar-float, ≤2ch AAC cap per the matrix._
-- [ ] **NDI-L6** `M` — Tally + metadata  ·  _deps: NDI-L1_  · _`send_get_tally` → engine tally arbiter; extend `ReceivedFrame` (already `#[non_exhaustive]`) with metadata/timecode variants._
+- [ ] **NDI-L6** `M` — Tally + metadata  ·  _deps: NDI-L1_  · _`send_get_tally` → engine tally arbiter; extend `ReceivedFrame` (already `#[non_exhaustive]`) with metadata/timecode variants. Cross-ref (2026-06-11): **SW-E2** wires the engine `TallyArbiter` into the run loop (ADR-MV006) — NDI-L6's `send_get_tally` facts then merge as one more external fact source under the same `ConflictPolicy`; build on that wiring, never a parallel tally path._
 - [ ] **NDI-RECV-OPEN** `L` — OPEN, default-build Full-NDI **receive** (no proprietary SDK)  ·  _deps: —_  · _Research (docs/research/ndi-integration.md) found a licence-free RECEIVE path: VideoLAN **libndi** (C, LGPLv2.1, discovers + receives Full NDI) + FFmpeg's reverse-engineered **SpeedHQ decoder** (libavcodec/speedhq.c, since 2017) — so NDI INGEST (Full NDI, video+audio) can ship in the DEFAULT/LGPL-clean build with NO NewTek/Vizrt SDK. No send, no HX (those stay SDK-gated, NDI-L*/NDI-HX). Evaluate link-libndi vs port-the-receive-path; feed UYVY→NV12 into the existing `NdiReceiver` seam. The best-of-both: everyone gets NDI ingest; licensed operators get send + HX._
 - [ ] **NDI-HX** `XL` — NDI|HX (Advanced SDK, compressed H.264/HEVC)  ·  _deps: NDI-L1_  · _RESEARCH-CONFIRMED (ndi-integration.md): HX **decode is FREE via the standard SDK** (a normal receiver gets uncompressed frames from HX/HX2/HX3 sources — covered by NDI-L3). HX **encode/send** = the NDI **Advanced SDK** (separate licence + vendor ID): `NDIlib_send_create_v2` + submit `NDIlib_compressed_packet` carrying OUR H.264 (HX) / HEVC (HX2/3) bitstream (we already produce these via NVENC/x264-5). Confirm the trial covers Advanced._ _SEPARATE off-by-default `ndi-advanced` feature + its OWN license attestation (Advanced SDK is separately licensed; H.264/HEVC royalties are the operator's). HX-RECEIVE comes largely free via the standard SDK transparently decoding HX sources once NDI-L3 lands — so prioritise documenting/validating HX-recv there. HX-SEND needs the Advanced-SDK entry point + compressed-frame send path. Both inert until the operator attests the Advanced license (mirror the NdiLicense gate)._
 
@@ -159,8 +199,8 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 
 - [x] **IN-1** `M` — ST 2110 receive: frame assembler over the depacketizers  ·  _deps: —_  · _pure SRD/line reassembler (marker/seq/timestamp) tested; pgroup→NV12 unpack + `ProducedFrame` adaptation belong with IN-2_
 - [x] **IN-2** `L` — ST 2110 receive: wire `RtpReceiver`/`DualPathReceiver` into a `FrameProducer` + PTP timing  ·  _deps: IN-1_  · _`549b971`: `St2110Producer: FrameProducer` over the IN-1 assembler + 90 kHz→ns rebase (`WrapBits::Rtp32`, float-free, monotonic) + 2022-7 `DualPathPacketSource` dedup + bounded async→sync bridge; injected-packet tested, live NIC/PTP gated. cli wiring = IN-3_
-- [~] **IN-3** `XL` — NDI ingest: runtime-loaded SDK → `FrameProducer` + CLI wiring  ·  _deps: IN-2_  · _red `0496181` → green `db8de12` + my fix `40c0ba0` (orchestrated, reviewed, me-verified): `multiview-input::ndi` — checked-indexing UYVY→NV12 (4:2:2→4:2:0 chroma avg) + BGRA→NV12 (BT.709 fixed-point), an `NdiReceiver` sample seam + injected `FakeNdiReceiver`, `NdiProducer: FrameProducer` (sampled/non-blocking, NDI-100ns→ns, `WrapBits::None`) driving the IN-2 `IngestPump`; cli `SourceKind::Ndi` planning behind the `ndi` feature (now correctly implies `ffmpeg` since the run wiring is in the ffmpeg-gated pipeline). `forbid(unsafe_code)` (FFI in `multiview-ndi-sys`). Off-by-default/LGPL-clean. **Remaining → IN-3b:** wire the `NdiLicense` accept-gate into `ingest_plan_for` (defined but unwired), the live NDI receive + roundtrip (needs the runtime + a sender — `#[ignore]`), tidy the near-tautological probe test + stale CI comment (IN-7)._
-- [ ] **IN-3b** `M` — NDI ingest: license-accept gate in ingest + live roundtrip  ·  _deps: IN-3_  · _wire `NdiLicense::from_setting` into `ingest_plan_for` so an unaccepted NDI source degrades its tile (not silently); add the runtime-gated live receive + NV12 roundtrip test (NDI runtime + a live sender); strengthen the probe test._
+- [x] **IN-3** `XL` — NDI ingest: runtime-loaded SDK → `FrameProducer` + CLI wiring  ·  _deps: IN-2_  · _red `0496181` → green `db8de12` + my fix `40c0ba0` (orchestrated, reviewed, me-verified): `multiview-input::ndi` — checked-indexing UYVY→NV12 (4:2:2→4:2:0 chroma avg) + BGRA→NV12 (BT.709 fixed-point), an `NdiReceiver` sample seam + injected `FakeNdiReceiver`, `NdiProducer: FrameProducer` (sampled/non-blocking, NDI-100ns→ns, `WrapBits::None`) driving the IN-2 `IngestPump`; cli `SourceKind::Ndi` planning behind the `ndi` feature (now correctly implies `ffmpeg` since the run wiring is in the ffmpeg-gated pipeline). `forbid(unsafe_code)` (FFI in `multiview-ndi-sys`). Off-by-default/LGPL-clean. License accept-gate completed in IN-3b._
+- [x] **IN-3b** `M` — NDI ingest: license-accept gate in ingest + live roundtrip  ·  _deps: IN-3_  · _red `58c9a88` → green `d1e3ab1` (in `origin/main`): the `[system.ndi] accept_license` setting + audit (`accepted_by`/`accepted_at`) added to `multiview-config` (`SystemConfig`/`NdiSystemConfig`, `validate_system` rejects accept-without-audit, round-trips as a flag never a secret); the gate wired into the cli ingest receive path — `Pipeline::build` stamps the acceptance from `config.system` onto each `IngestPlan` (like `cuda_ordinal`), and `connect_ndi_receiver` (reached from `drive_ndi`) calls `NdiLicense::from_setting` FIRST, refusing an unaccepted/incomplete record with `NdiLoadStatus::Unlicensed` (`ndi_unlicensed`) BEFORE the runtime is probed → the tile degrades NO_SIGNAL (never a panic, never a build failure, never silent — inv #1/#2/#10). Tests: config `system_ndi.rs` (5), input `ndi_license_gate.rs` (5), cli lib `ndi_license_gate_tests` (2: refuses-unlicensed-before-probe + passes-when-accepted); live NV12 roundtrip is the `#[ignore]`d `ndi_live.rs` (runtime + a live sender). Off-by-default/LGPL-clean; NDI stays runtime-loaded, never vendored._
 - [x] **IN-4** `M` — YouTube live: pure resolver core over `yt-dlp -J`  ·  _deps: —_
 - [~] **IN-5** `L` — YouTube live: wire to HLS ingest + re-resolution loop  ·  _deps: IN-4_  · _red `a231b46` → green `7a0ba8d` + review-fix `67360e7` (orchestrated, reviewed, me-verified): new `multiview-input::youtube::reresolve` — pure `ReresolveSchedule` (refresh `lead` before `expire`, `ttl_guard` fallback + clamp, 403-burst trigger) + injectable `Resolver`/`UnixClock` + the supervised `run_reresolve_loop` (make-before-break, backoff, inv #1/#10), all unit-proven with fakes/paused-time. cli `youtube` feature: `SourceKind::Youtube` resolves a fresh `*.googlevideo.com` master on every (re)connect via yt-dlp, so the reconnect bracket survives the ~6 h expiry. I fixed the blocking no-aspirational-comments finding (the module doc claimed before-expiry refresh the wired path doesn't do — now an honest "Wiring status" section) + two inaccurate test comments. Default LGPL-clean (youtube off). **Remaining → IN-5b:** spawn `run_reresolve_loop` PROACTIVELY into the cli ingest supervisor (the async-loop↔sync-decode-thread bridge + swappable-URL slot) so it refreshes BEFORE expiry (make-before-break) instead of degrading the tile at the boundary._
 - [ ] **IN-5b** `M` — YouTube: wire the proactive lead-time re-resolution loop into cli ingest  ·  _deps: IN-5_  · _spawn `run_reresolve_loop` as a supervised sibling of the youtube decode thread with a shared swappable-URL slot (async↔sync bridge), so a long run refreshes the manifest `lead` seconds before `expire` (make-before-break) rather than the current re-resolve-on-reconnect (tile briefly degrades at the boundary). The loop + policy already exist + are unit-tested (IN-5)._
@@ -183,7 +223,7 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 - [x] **PRV-3** `M` — Concurrent-focus session caps + isolation enforcement (the `FocusGate`)  ·  _deps: PRV-2_  · _`a67dc24`: `FocusGate` (global + per-scope caps, fail-closed, `FocusLease` Drop frees) + `GatedWhep` decorator admitting before delegate → existing `503 fallback` shed shape; 5+4 tests. HAL cost-budget hook = PRV-4_
 - [x] **PRV-4** `M` — Make preview the topmost (cheapest-to-shed) degradation rung  ·  _deps: PRV-3_  · _`a6023db`: 5 preview rungs prepended ABOVE every tile/program rung in `multiview-hal::degradation` (13-rung ladder, `affects_preview()`/`first_program_level()`) + `FocusGate::suspend()/resume()` hook refusing new focus while degraded (503-fallback); 14 hal + preview tests prove preview is fully shed before any program lever. The cli degradation-loop glue that observes `Hysteresis` and calls `suspend()/resume()` (+ tracing) is **PRV-4b**_
 - [~] **PRV-5** `L` — Sub-second WebRTC OUTPUT (program) focus: program-canvas tap → preview encode → WHEP  ·  _deps: PRV-1, PRV-2, PRV-3_  · _`ec47b48`: preview-side SEAM landed+tested — `ProgramTap`(lazy/last-leave-stop) → `PreviewEncoder` seam → bounded drop-oldest feed → `ProgramFocusSession` (FocusGate cap + tap lease, Drop frees both); inv-#1/#10 proven (1000 publishes never block). cli tap-wiring + output `PacketSink` registration + live str0m = **PRV-5b**_
-  - [ ] **PRV-5b** `M` — Program-output WHEP wiring: register a preview `PacketSink` on `multiview-output::fanout` (route()+1, encode-once preserved) + cli program-canvas tap → `ProgramFocusSource` + `routes/preview.rs` `preview/source` real-vs-approx label  ·  _deps: PRV-5_  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0049/P006/W020)_
+  - [ ] **PRV-5b** `M` — Program-output WHEP wiring: register a preview `PacketSink` on `multiview-output::fanout` (route()+1, encode-once preserved) + cli program-canvas tap → `ProgramFocusSource` + `routes/preview.rs` `preview/source` real-vs-approx label  ·  _deps: PRV-5_  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0049/P006/W023)_
 
 ### ENG — Engine timing & resilience
 
@@ -223,11 +263,11 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 - [x] **ENG-1c** `S` — Make `live_blocked_sink_stays_bounded_and_never_stalls` (streaming_encode) deterministic across encoder speeds  ·  _deps: —_  · _green `c098770` (orchestrated, REVIEWER-APPROVED, me-verified): root-caused empirically (a fast-draining sink → 1 packet/tick; the old test relied on the real mpeg2 encoder saturating the bounded queue within a fixed tick budget — which the box's ffmpeg 5.1 doesn't in the window). Hardened to deterministically overflow regardless of encoder latency without weakening the never-stalls/bounded assertions. The GPU box (ffmpeg 5.1) found this — exactly the hardware-validation payoff._
 
 #### Discovered follow-on slices (batch-8)
-- [ ] **PRV-4b** `S` — cli degradation-loop glue: observe `Hysteresis`/the ladder and call `FocusGate::suspend()/resume()` on the preview rungs + `tracing` each preview adaptation (ADR-P003)  ·  _deps: PRV-4_  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0049/P006/W020)_
-- [~] **PRV-1b** `XL` — Native str0m `WhepTransport` impl: real ICE/DTLS/SRTP behind a `webrtc-native` feature + env-gated DTLS-SRTP loopback test + ffprobe egress check; add str0m/ring to `deny.toml`  ·  _deps: PRV-1_  · _red `20911db` → green `9da6b17` + my doc-fix `<this>` (orchestrated, reviewer-APPROVED [~], me-verified): `Str0mWhepTransport` behind a NEW off-by-default `webrtc-native` feature — the FULL sans-IO SDP offer→answer negotiation (str0m-minted real ICE ufrag/pwd + a real self-signed DTLS sha-256 fingerprint folded into the answer) runs WITHOUT a socket and is CI-tested. `str0m 0.16.2` (MIT/Apache, optional; its closure resolves to MIT/Apache/ISC/BSD — uses **aws-lc-rs, NOT ring**, so the plan's "ring" premise was stale) added to deny.toml allow-list. I fixed the 2 blocking aspirational-comment findings (the loopback test was doc'd as "the real packet-exchange half completing the DTLS handshake/SRTP" but only binds a socket + gathers candidates). **Remaining → PRV-1c:** the live DTLS handshake against a real peer + `SampleFeed`→SRTP media egress + the ffprobe egress check (none CI-runnable; needs a peer)._  ·  _**Relocation (2026-06-10, ADR-0048):** the native transport (the optional str0m dep + `whep/native.rs` + the `webrtc-native` feature) moves out of `multiview-preview` into the new `crates/multiview-webrtc` (feature `native`, tests preserved/moved); preview keeps only the pure `webrtc` seam. PRV-1b completes by relocation under **WRTC-1** in the webrtc-full push (ADR-0048/T014/0049/P006/W020)._
-- [ ] **PRV-1c** `XL` — Native WHEP live egress: DTLS handshake + SampleFeed→SRTP + ffprobe  ·  _deps: PRV-1b_  · _drive str0m's poll_output/handle_input loop against a real peer to complete DTLS, packetize the preview `SampleFeed` into RTP→SRTP, and verify the egress with ffprobe (env/loopback-gated, not CI). The negotiation + transport scaffold + drive_egress_once single-step exist (PRV-1b)._  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0049/P006/W020); the "needs a peer, not CI" premise is retired — a second str0m `Rtc` over UDP loopback is the CI test peer_
+- [ ] **PRV-4b** `S` — cli degradation-loop glue: observe `Hysteresis`/the ladder and call `FocusGate::suspend()/resume()` on the preview rungs + `tracing` each preview adaptation (ADR-P003)  ·  _deps: PRV-4_  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0049/P006/W023)_
+- [~] **PRV-1b** `XL` — Native str0m `WhepTransport` impl: real ICE/DTLS/SRTP behind a `webrtc-native` feature + env-gated DTLS-SRTP loopback test + ffprobe egress check; add str0m/ring to `deny.toml`  ·  _deps: PRV-1_  · _red `20911db` → green `9da6b17` + my doc-fix `<this>` (orchestrated, reviewer-APPROVED [~], me-verified): `Str0mWhepTransport` behind a NEW off-by-default `webrtc-native` feature — the FULL sans-IO SDP offer→answer negotiation (str0m-minted real ICE ufrag/pwd + a real self-signed DTLS sha-256 fingerprint folded into the answer) runs WITHOUT a socket and is CI-tested. `str0m 0.16.2` (MIT/Apache, optional; its closure resolves to MIT/Apache/ISC/BSD — uses **aws-lc-rs, NOT ring**, so the plan's "ring" premise was stale) added to deny.toml allow-list. I fixed the 2 blocking aspirational-comment findings (the loopback test was doc'd as "the real packet-exchange half completing the DTLS handshake/SRTP" but only binds a socket + gathers candidates). **Remaining → PRV-1c:** the live DTLS handshake against a real peer + `SampleFeed`→SRTP media egress + the ffprobe egress check (none CI-runnable; needs a peer)._  ·  _**Relocation (2026-06-10, ADR-0048):** the native transport (the optional str0m dep + `whep/native.rs` + the `webrtc-native` feature) moves out of `multiview-preview` into the new `crates/multiview-webrtc` (feature `native`, tests preserved/moved); preview keeps only the pure `webrtc` seam. PRV-1b completes by relocation under **WRTC-1** in the webrtc-full push (ADR-0048/T014/0049/P006/W023)._
+- [ ] **PRV-1c** `XL` — Native WHEP live egress: DTLS handshake + SampleFeed→SRTP + ffprobe  ·  _deps: PRV-1b_  · _drive str0m's poll_output/handle_input loop against a real peer to complete DTLS, packetize the preview `SampleFeed` into RTP→SRTP, and verify the egress with ffprobe (env/loopback-gated, not CI). The negotiation + transport scaffold + drive_egress_once single-step exist (PRV-1b)._  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0049/P006/W023); the "needs a peer, not CI" premise is retired — a second str0m `Rtc` over UDP loopback is the CI test peer_
 - [x] **SUR-6b** `M` — Swap web realtime consumers (`connection.ts`/`useEngineEvents.ts`) onto the generated envelope types + serve `/asyncapi.json` on the axum router  ·  _deps: SUR-6_  · _`7b9fd90`: GET /asyncapi.json served (embedded, route-tested) + web `LifecycleState`/`TileState` now from generated-types (91 web tests); the AsyncAPI-CLI **CI** validation step is a separate `.github` follow-on (fold into IN-7's CI work)_
-- [ ] **IN-6b** `XL` — WebRTC ingest native engine: a concrete str0m-backed ICE/DTLS/SRTP `MediaEngine` behind a `webrtc-native` feature + env-gated loopback test + wire `WebRtcProducer` into the cli; Opus/VP8 depacketizers; add str0m/ring to `deny.toml`  ·  _deps: IN-6_  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0048/P006/W020; delivered as **WRTC-2** — the transport lives in `multiview-webrtc` not behind a preview feature; we answer H.264+Opus, no VP8 ingest depacketizer; str0m is already in deny.toml via PRV-1b)_
+- [ ] **IN-6b** `XL` — WebRTC ingest native engine: a concrete str0m-backed ICE/DTLS/SRTP `MediaEngine` behind a `webrtc-native` feature + env-gated loopback test + wire `WebRtcProducer` into the cli; Opus/VP8 depacketizers; add str0m/ring to `deny.toml`  ·  _deps: IN-6_  ·  _→ in scope of the **webrtc-full push** (ADR-0048/T014/0048/P006/W023; delivered as **WRTC-2** — the transport lives in `multiview-webrtc` not behind a preview feature; we answer H.264+Opus, no VP8 ingest depacketizer; str0m is already in deny.toml via PRV-1b)_
 - [x] **ENG-3b** `S` — Wire the measured NTP/PTP status into the cli wall-clock badge  ·  _deps: ENG-3_  · _`96ec96c`: cli `ntp` feature + `MeasuredSystemWallClock` `reference()` (off-hot-path `adjtimex` via engine `sysref::live` + `classify_system` → `SelectedReference::to_time_ref`; None→assumed fallback); 4 fake-NtpQuery tests; verified default/ntp/overlay,ntp/overlay,ffmpeg,ntp_
 - [x] **GPU-5b** `L` — GPU-5 remainder: off-hot-path placement controller in `multiview-engine` (EWMA sustained-overload SHED-vs-MIGRATE, make-before-break) + config policy fields + telemetry counters  ·  _deps: GPU-5_  · _`250034b`: `PlacementController::observe→{Hold,Shed,Migrate,Split}` (pure, reuses `Hysteresis`, anti-storm cooldown/budget/min-gain, 11 tests) + `multiview-config` `PlacementConfig`/`DevicePin`/`gpu_pin` + `multiview-telemetry` placement counters. Wiring proposals into the supervisor execution (make-before-break swap) = **GPU-5c**_
 - [x] **ENG-4b** `M` — GPU load probe remainder: live `/proc/<pid>/fdinfo` enc/dec-util walk (sum own PIDs) + telemetry gauge registration  ·  _deps: ENG-4_  · _`4152955`: `FdinfoMediaTracker` two-snapshot diff → `DeviceLoad.enc/dec_util_frac` (pure parser tested on fixtures, live `/proc` walk gated); the existing ENG-4 gauges consume it. i915 PMU `perf_event_open` (needs unsafe → FFI shim) = **ENG-4c**_
@@ -243,12 +283,12 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 - [x] **WEBUI-DOCS-OVERHAUL** `L` — Professional kind-specific management UI + searchable in-app docs (ADR-W015/ADR-W016)  ·  _deps: CTL-3, SUR-4_  · _shipped PR #48 (commits `29d0a37` + `ba756b9` + `bbc9c73` + `bd3ffef`): (ADR-W015) kind-specific sources/outputs/overlays management forms (RTSP/HLS/NDI/SRT/RTMP source forms, file/HLS/RTSP/NDI/SRT/RTMP output forms, text/image/clock overlay forms), live status display, apply-layout trigger, preset selector, config export — all wired to the OpenAPI-generated client; output id namespace preserved on edit; overlay kind-scoped params; unknown-kind edit refused. (ADR-W016) searchable in-app documentation rendered from Markdown, linked from the nav. Adversarial-review fixes (`bbc9c73`+`ba756b9`): B1 (export base overlay) + M1 (output id namespace) + M2 (semantic validation) + M3 (precondition order) + several minor tightening. ADR-W015 + ADR-W016 added to `docs/decisions/`. SPA build + tsc + eslint green._
 - [x] **ADR-BATCH-40-43** `S` — Four new docs-only ADRs pinning load-bearing contracts (PRs #40–#43)  ·  _deps: —_  · _shipped in four separate PRs: **ADR-R010** (PR #41, `05b814d`+`34d201b`) — make-before-break parallel-output migration primitive; corrected to clarify RT-12 bridge is NEW work, keepalive sink makes SWAP zero-new-encode. **ADR-T012** (PR #42, `5c46a28`) — reference-clock/wallclock source-selection contract. **ADR-T013** (PR #43, `ed8fec3`, renumbered from T012 after conflict) — shared RTP-audio → AudioStore rebase seam. **ADR-I005** (PR #40, `a436c36`+`2087f49`) — packet carrier (RT-12); corrected to reflect both `EncodedPacket` carriers live + fix RT-13→RT-12. All four docs-only; no code change._
 
-#### WRTC — Full WebRTC push (brief: [webrtc](../research/webrtc.md); ADR-0048 · ADR-T014 · ADR-0049 · ADR-P006 · ADR-W020 — subsumes PRV-1c/PRV-4b/PRV-5b/IN-6b above; AUD-4b's Opus program rendition is partially delivered by WRTC-3)
+#### WRTC — Full WebRTC push (brief: [webrtc](../research/webrtc.md); ADR-0048 · ADR-T014 · ADR-0049 · ADR-P006 · ADR-W023 — subsumes PRV-1c/PRV-4b/PRV-5b/IN-6b above; AUD-4b's Opus program rendition is partially delivered by WRTC-3)
 
 - [ ] **WRTC-1** `XL` — Shared WebRTC transport endpoint: new leaf crate `crates/multiview-webrtc` (feature `native`, str0m =0.16.2 pinned) — ONE `WebRtcEndpoint` per process on a single dual-stack `[::]` UDP socket (`webrtc.udp_port`, default 8189) muxing ALL sessions (WHIP ingest · WHEP preview · WHEP output viewers · WHIP push) by STUN ICE-ufrag/learned-addr; full-ICE with IPv6-first host candidates + `webrtc.advertised_addresses`; per-run self-signed `DtlsCert`; one bounded driver task (recv → `handle_input`, drain `poll_output()`; inv #10); session GC (`session_idle_timeout` 30 s, tombstone eviction) + `max_sessions` (64); relocate preview's `webrtc-native`/str0m (`whep/native.rs`) here; str0m↔str0m UDP-loopback handshake + media-flow tests run in CI; `examples/whip_publish.rs` (ADR-0048)  ·  _deps: PRV-1b_
 - [ ] **WRTC-2** `XL` — WHIP ingest end-to-end (RFC 9725): `SourceKind::Webrtc {token, audio}` + `POST /api/v1/whip/{source_id}` routes (OPTIONS/POST 201+Location/DELETE/PATCH→405, Bearer, 409 single-publisher, 503+Retry-After capacity, RFC 9457) over a native-free `WhipProvider` seam; RTP-mode session → `MediaEngine` → keyframe-gated H.264 depacketizer → NEW packet-fed multiview-ffmpeg H.264 decoder (decode-at-display-res, VUI→`ColorInfo`) → `TileStore` via `IngestPump` (`WrapBits::Rtp32`) + Opus depacketize→decode→`AudioStore` de-embed (ADR-T013 path); event-driven PLI (session start + after loss while the keyframe gate is closed, ≥2 s rate-limited) + documented OBS publish profile; `drive_webrtc` ingest supervision riding the tile state machine; fixes `WebRtcProducer.to_produced` (geometry from decoder/SPS) (ADR-T014; subsumes IN-6b)  ·  _deps: WRTC-1, IN-6_
 - [ ] **WRTC-3** `XL` — WebRTC program outputs: `Output::Webrtc` (WHEP serve at `POST /api/v1/whep/{output_id}`, fanout `PacketSink` route()+1 encode-once, SPS/PPS cache + prepend at IDR, H.264 + B-frames-off validated at config time, rate-limited (≥2 s) force-IDR seam on the program encoder, `max_viewers`→503) + `Output::WhipPush` (WHIP client: Bearer, 307/308-redirect-follow — https-only, depth-capped, headers preserved — `a=setup:actpass` with the answerer picking the DTLS role, supervised reconnect like RTMP/SRT push) + the ONE program Opus rendition (post-loudnorm `AudioBlock` → bounded ring → single Opus encode, AUD-4b shape) fanned to all WebRTC consumers; engine-protected, never shed, bounded per-viewer drop-oldest rings (ADR-0049)  ·  _deps: WRTC-1_
-- [ ] **WRTC-4** `L` — SPA WebRTC preview & management: `<WhepPlayer>` (injected `RTCPeerConnection` factory, recvonly video+audio, `muted`+`playsinline`, POST after ICE-gathering-complete or 2 s, relative-`Location` resolve, keepalive DELETE teardown) + `GET /api/v1/preview/capabilities` probe + WHEP→JPEG fallback ladder with an honest fallback badge (JPEG poll extracted into a reusable hook); mounts on MonitoringPage program card / input focus dialog / NEW outputs preview / LayoutEditorPage; `webrtc` source form (derived WHIP URL + token copy) + `webrtc`/`whip_push` output forms (ADR-W015 round-trip); in-app docs + glossary + latency row + i18n (en/ar/pseudo); vitest PC-factory fake + MSW, Playwright fallback e2e, real-browser hardware validation (ADR-W020)  ·  _deps: WRTC-2, WRTC-3_
+- [ ] **WRTC-4** `L` — SPA WebRTC preview & management: `<WhepPlayer>` (injected `RTCPeerConnection` factory, recvonly video+audio, `muted`+`playsinline`, POST after ICE-gathering-complete or 2 s, relative-`Location` resolve, keepalive DELETE teardown) + `GET /api/v1/preview/capabilities` probe + WHEP→JPEG fallback ladder with an honest fallback badge (JPEG poll extracted into a reusable hook); mounts on MonitoringPage program card / input focus dialog / NEW outputs preview / LayoutEditorPage; `webrtc` source form (derived WHIP URL + token copy) + `webrtc`/`whip_push` output forms (ADR-W015 round-trip); in-app docs + glossary + latency row + i18n (en/ar/pseudo); vitest PC-factory fake + MSW, Playwright fallback e2e, real-browser hardware validation (ADR-W023)  ·  _deps: WRTC-2, WRTC-3_
 
 ### DEV — Managed devices & display out (briefs: [display-out](../research/display-out.md) · [managed-devices](../research/managed-devices.md); ADR-0044/0045, ADR-M008..M011, ADR-RT007, ADR-W017)
 
@@ -258,19 +298,19 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 > those validation legs are unblocked. Still gated: the Raspberry Pi legs (a Pi 4 is being
 > provisioned; no Pi 5 exists). The build itself was never blocked.
 
-- [ ] **DEV-A1** `M` — `multiview-config`: `Device` + `SyncGroup` types, validation, export semantics (ADR-M008 lands with it)  ·  _deps: —_
-- [ ] **DEV-A2** `S` — `multiview-events`: `Topic::Devices` + device/timing event types (ADR-RT007)  ·  _deps: —_
-- [ ] **DEV-A3** `L` — `multiview-control`: devices + sync-groups stores, CRUD routes, OpenAPI, audit, bare-verb actions (ADR-W017)  ·  _deps: DEV-A1, DEV-A2_
-- [ ] **DEV-A4** `XL` — `zowietek` driver: typed HTTP client + poller actor + three facets + device state machine (feature-gated; socket-free tests) (ADR-M009)  ·  _deps: DEV-A3_
-- [ ] **DEV-A5** `M` — Discovery infra: mDNS browse (new — none exists in-repo) + `/discovery/devices` endpoints + untrusted-inventory confirm-adopt flow  ·  _deps: DEV-A3_
-- [ ] **DEV-A6** `L` — SPA: DevicesPage, adopt flow, detail tabs, "From device" pickers, help pages  ·  _deps: DEV-A3, DEV-A4_
+- [x] **DEV-A1** `M` — `multiview-config`: `Device` + `SyncGroup` types, validation, export semantics (ADR-M008 lands with it)  ·  _deps: —_ · _SHIPPED (PR #67): `multiview-config::device` — `Device` + `SyncGroup` config-as-code with validation + export (ADR-M008)_
+- [x] **DEV-A2** `S` — `multiview-events`: `Topic::Devices` + device/timing event types (ADR-RT007)  ·  _deps: —_ · _SHIPPED (PR #68): `multiview-events` — `Topic::Devices` + `DeviceEvent`/`TimingEvent` types (ADR-RT007)_
+- [x] **DEV-A3** `L` — `multiview-control`: devices + sync-groups stores, CRUD routes, OpenAPI, audit, bare-verb actions (ADR-W017)  ·  _deps: DEV-A1, DEV-A2_ · _SHIPPED (PR #77): devices + sync-groups CRUD routes, stores, state machine, conflating broadcaster (ADR-W017)_
+- [x] **DEV-A4** `XL` — `zowietek` driver: typed HTTP client + poller actor + three facets + device state machine (feature-gated; socket-free tests) (ADR-M009)  ·  _deps: DEV-A3_ · _SHIPPED (PR #87): zowietek typed client + spawned poller actor + three facets + device state machine (ADR-M009)_
+- [x] **DEV-A5** `M` — Discovery infra: mDNS browse (new — none exists in-repo) + `/discovery/devices` endpoints + untrusted-inventory confirm-adopt flow  ·  _deps: DEV-A3_ · _SHIPPED (PR #93): `routes/discovery.rs` — mDNS device-discovery, untrusted inventory, confirm-adopt flow_
+- [x] **DEV-A6** `L` — SPA: DevicesPage, adopt flow, detail tabs, "From device" pickers, help pages  ·  _deps: DEV-A3, DEV-A4_ · _SHIPPED (PR #121): SPA devices — DevicesPage, sync groups, discovery adopt flow, detail tabs, "From device" pickers, help_
 - [x] **DEV-B1** `XL` — `multiview-output/src/display/` behind `display-kms`: drm-rs sink + mailbox/atomic-flip loop + TEST_ONLY probe + EDID/forced-mode policy; `Output::Display` wired through the five config matches + cli `build_outputs` + SPA form (ADR-0044)  ·  _deps: — (1-day fence spike first)_
-- [ ] **DEV-B2** `L` — HAL/placement scanout affinity: KMS connector discovery in probe, sink-locality constraint in select, placement migration gate  ·  _deps: DEV-B1_
-- [ ] **DEV-B3** `L` — Render path: wgpu NV12→XRGB into a GBM/dmabuf scanout buffer (AMD/fallback) + NV12 direct scanout (Intel/Pi) + the wgpu version-pin decision  ·  _deps: DEV-B1_
+- [x] **DEV-B2** `L` — HAL/placement scanout affinity: KMS connector discovery in probe, sink-locality constraint in select, placement migration gate  ·  _deps: DEV-B1_ · _SHIPPED (PR #81): HAL scanout affinity — KMS connector discovery + sink-locality constraint + placement migration gate_
+- [x] **DEV-B3** `L` — Render path: wgpu NV12→XRGB into a GBM/dmabuf scanout buffer (AMD/fallback) + NV12 direct scanout (Intel/Pi) + the wgpu version-pin decision  ·  _deps: DEV-B1_ · _SHIPPED (PR #82): display render path — buffer-strategy selector + NV12-direct scanout + DmabufImage seam; wgpu-version verdict recorded_
 - [ ] **DEV-B4** `L` — ALSA HDMI audio sink: ELD gating, hdmi:/vc4 card config, buffer-level servo + adaptive resampler  ·  _deps: DEV-B1_
 - [ ] **DEV-B5** `L` — `multiview node` subcommand: single-ingest display-node mode + systemd unit + bare-metal/container deploy (kernel-uevent listener; rootless polling fallback) (ADR-0045)  ·  _deps: DEV-B1, DEV-B2, DEV-B3, DEV-B4_
 - [ ] **DEV-B6** `M` — Node enrollment/pairing + `displaynode` driver + Display-tab assignment + wall-head binding  ·  _deps: DEV-A3, DEV-B5_
-- [ ] **DEV-C1** `L` — Outbound presentation epoch: per-program `WallClockRef` on the control WS + RTCP SR on RTSP + `EXT-X-PROGRAM-DATE-TIME` on HLS + optional RFC 7273 SDP attrs (ADR-M010)  ·  _deps: DEV-A2_
+- [x] **DEV-C1** `L` — Outbound presentation epoch: per-program `WallClockRef` on the control WS + RTCP SR on RTSP + `EXT-X-PROGRAM-DATE-TIME` on HLS + optional RFC 7273 SDP attrs (ADR-M010)  ·  _deps: DEV-A2_
 - [ ] **DEV-C2** `M` — Node presentation discipline: epoch+link-offset frame chooser at vblank + skew telemetry  ·  _deps: DEV-B5, DEV-C1_
 - [ ] **DEV-C3** `M` — Sync groups: apply/measure/test-pattern, weakest-member tier computation, drift alarms  ·  _deps: DEV-A3, DEV-C2_
 - [ ] **DEV-C4** `M` — Clock-layer telemetry + deployment guidance: ptp4l/chrony configs, servo offset export, acceptance-soak harness (soak is hardware-gated)  ·  _deps: DEV-C2_
@@ -283,13 +323,90 @@ dominate wall‑clock; the six parallel lanes finish well before it.
 
 > Pure-Rust, default-build (no `ffmpeg`/GPL); the clock/timer **render** is `overlay`-gated like the as-built clock (`synth.rs:150`). All time is integer/`chrono` (inv #3/#6), wall-clock is **sampled** not pacing (inv #1), the disciplined reference is display-only (ADR-T012). Builds on the as-built `clock_face` SDF primitives + `TextEngine` runs + NV12/linear bake — **no new renderer**.
 
-- [ ] **SYN-CLOCK-1** `M` — Pure tz resolver + dual-face/metadata model: `chrono`+`chrono-tz` dep (deny-clean), `resolve_offset(Tz, WallTime) -> TimeZoneOffset` (DST-correct per displayed instant), `UTC±HH:MM` badge formatter; golden tests at DST boundaries  ·  _deps: —_
-- [ ] **SYN-CLOCK-2** `S` — Config: `ClockFaceConfig::Dual` + `Clock` fields (`timezone`, `label`, `show_offset`, `show_reference`, `numerals`); validation (unknown IANA id → typed `ConfigError`; `timezone` wins over `tz_offset_minutes` + warn); round-trip TOML/JSON  ·  _deps: SYN-CLOCK-1_
-- [ ] **SYN-CLOCK-3** `M` — Renderer: `dual` placement (`clock_face` upper + centred readout lower) + metadata strip (label + offset/reference badges) in `render_clock`; per-render tz resolution wired into `SyntheticKind::Clock` + `render_key` field index; content-aware goldens  ·  _deps: SYN-CLOCK-2_
-- [ ] **SYN-TIMER-1** `M` — Pure timer math: `TimerTarget` next-occurrence resolution (time-of-day across midnight/DST; absolute datetime), `displayed_seconds` (down/up), at-target clamp (`hold`/`continue`/`zero_then_up`/`recur`), duration decompose + `TimerFormat` (incl. frames from the cadence `Rational`, drop-leading-zero `auto`); property + golden tests  ·  _deps: SYN-CLOCK-1_
-- [ ] **SYN-TIMER-2** `S` — Config: `SourceKind::Timer` + `TimerTarget`/`TimerDirection`/`TimerOnTarget`/`TimerFormat` enums (`#[serde(flatten)]` target tagged on `target`, distinct from `kind`); validation + round-trip TOML/JSON  ·  _deps: SYN-TIMER-1, SYN-CLOCK-2_
-- [ ] **SYN-TIMER-3** `M` — Renderer + generator: timer render (centred mono run + overrun prefix/badge) + `SyntheticKind::Timer` resolved descriptor wired into `generator_loop` (field-index `render_key`; `_ff` bakes at cadence); content-aware goldens (count, at-zero, overrun)  ·  _deps: SYN-TIMER-2, SYN-CLOCK-3_
-- [ ] **SYN-CLOCK-UI** `L` — SPA + spec: source-kind picker entries for the extended clock + new timer; IANA zone dropdown from `chrono_tz::TZ_VARIANTS`; clock/timer forms; OpenAPI/JSON-schema regen; `examples/clock-timer.toml`; in-app docs  ·  _deps: SYN-CLOCK-3, SYN-TIMER-3_
+- [x] **SYN-CLOCK-1** `M` — Pure tz resolver + dual-face/metadata model: `chrono`+`chrono-tz` dep (deny-clean), `resolve_offset(Tz, WallTime) -> TimeZoneOffset` (DST-correct per displayed instant), `UTC±HH:MM` badge formatter; golden tests at DST boundaries  ·  _deps: —_ · _SHIPPED (PR #76): `resolve_offset` + `UTC±HH:MM` formatter in config/overlay; DST-correct per-render tz resolution_
+- [x] **SYN-CLOCK-2** `S` — Config: `ClockFaceConfig::Dual` + `Clock` fields (`timezone`, `label`, `show_offset`, `show_reference`, `numerals`); validation (unknown IANA id → typed `ConfigError`; `timezone` wins over `tz_offset_minutes` + warn); round-trip TOML/JSON  ·  _deps: SYN-CLOCK-1_ · _SHIPPED (PR #76): `ClockFaceConfig::Dual` + `timezone`/`label`/`show_offset`/`show_reference`/`numerals` in config schema_
+- [x] **SYN-CLOCK-3** `M` — Renderer: `dual` placement (`clock_face` upper + centred readout lower) + metadata strip (label + offset/reference badges) in `render_clock`; per-render tz resolution wired into `SyntheticKind::Clock` + `render_key` field index; content-aware goldens  ·  _deps: SYN-CLOCK-2_ · _SHIPPED (PR #76): dual analogue+digital face + metadata strip renderer; per-render IANA tz in `synth.rs`_
+- [x] **SYN-TIMER-1** `M` — Pure timer math: `TimerTarget` next-occurrence resolution (time-of-day across midnight/DST; absolute datetime), `displayed_seconds` (down/up), at-target clamp (`hold`/`continue`/`zero_then_up`/`recur`), duration decompose + `TimerFormat` (incl. frames from the cadence `Rational`, drop-leading-zero `auto`); property + golden tests  ·  _deps: SYN-CLOCK-1_ · _SHIPPED (PR #79): pure timer math — `TimerTarget` resolution, `displayed_seconds`, `TimerFormat`, property+golden tests_
+- [x] **SYN-TIMER-2** `S` — Config: `SourceKind::Timer` + `TimerTarget`/`TimerDirection`/`TimerOnTarget`/`TimerFormat` enums (`#[serde(flatten)]` target tagged on `target`, distinct from `kind`); validation + round-trip TOML/JSON  ·  _deps: SYN-TIMER-1, SYN-CLOCK-2_ · _SHIPPED (PR #79): `SourceKind::Timer` + `TimerTarget`/`TimerDirection`/`TimerOnTarget`/`TimerFormat` in config schema_
+- [x] **SYN-TIMER-3** `M` — Renderer + generator: timer render (centred mono run + overrun prefix/badge) + `SyntheticKind::Timer` resolved descriptor wired into `generator_loop` (field-index `render_key`; `_ff` bakes at cadence); content-aware goldens (count, at-zero, overrun)  ·  _deps: SYN-TIMER-2, SYN-CLOCK-3_ · _SHIPPED (PR #79): timer renderer (centred mono run + overrun badge) + `SyntheticKind::Timer` wired into `generator_loop`_
+- [x] **SYN-CLOCK-UI** `L` — SPA + spec: source-kind picker entries for the extended clock + new timer; IANA zone dropdown from `chrono_tz::TZ_VARIANTS`; clock/timer forms; OpenAPI/JSON-schema regen; `examples/clock-timer.toml`; in-app docs  ·  _deps: SYN-CLOCK-3, SYN-TIMER-3_ · _SHIPPED (PR #91): SPA Clock+Timer forms — IANA zone picker, timer target/direction/format; OpenAPI regen; `examples/clock-timer.toml`_
+
+### SW — Production switcher (briefs: [production-switcher](../research/production-switcher.md) · [media-playout](../research/media-playout.md); ADR-0054..0059, ADR-M012, ADR-RT008, ADR-W021, ADR-P007, ADR-T015, ADR-C007, ADR-MV006, ADR-R011)
+
+> **Gating (2026-06-11):** design merged (2 briefs + 14 ADRs, all **Proposed**), code NOT started —
+> every SW item is net-new. PR-sized slices, reuse tags and the hard acceptance gates live in
+> [production-switcher-backlog](production-switcher-backlog.md); reference its items only as
+> "SW-\* (see the backlog)" — the backlog numbering and these lane IDs are independent schemes.
+> **Lane SW-A is SERIAL with LANE-CORE** (Part 1 §1d); lanes SW-B…SW-F are parallel. **MVP boundary**
+> (the brief's phased plan): one M/E (designed for N) — PGM/PVW, cut/auto/T-bar, mix + dip + FTB
+> (audio-follow), flip-flop, 2 DSKs (linear/luma, stills via NV12+A), media library + 2 players,
+> AFV + master gain + live meters, clean program tap, derived red/green tally (arbiter-wired),
+> plan/take REST/WS surface, SPA panel + shortcuts, macros + memories. Wipes/DVE/stinger/chroma/
+> aux-via-RT-12/preview-transition/multi-M/E are post-MVP and already itemized below. **Hardware
+> validation expectations:** the CPU reference compositor is the CI enabler (byte-exact oracle);
+> every GPU kernel item (SW-B1…B6) carries an SSIM/PSNR parity leg on the GPU test box (GPU output
+> is never bit-exact-gated); transitions get deterministic `ManualTimeSource` timing tests in CI
+> **plus** a box soak (long-run mix/dip under real NVENC encode, wedge-a-consumer chaos per the MP-1
+> pattern — sibling keeps ticking) before any inv-#1-adjacent item is called done (ADR-R011).
+
+- [ ] **SW-A1** `M` — `[[programs]]` schema root + crosspoint cross-validation (lands MP-5 — the switcher prerequisite)  ·  _deps: —_  · _`programs: Vec<ProgramSpec>` on the non_exhaustive `MultiviewConfig` + legacy-block desugar to one `main` Multiview program + both-populated rejection + cross-validation that every `OutputCrosspoint.program` exists (today any non-empty string validates). Subsumes/lands MP-5 (annotated there); config-only, no engine change. ADR-M012._
+- [ ] **SW-A2** `M` — Tick-widened per-tick control hook + switcher state-machine shell  ·  _deps: —_  · _widen `FnMut(&mut CompositorDrive<Nv12Image>)` (runtime.rs:345) to receive the `Tick` (back-compat wrapper) and add the pure `SwitcherState` value machine at the runtime.rs:432-439 frame-boundary seam — the salvo/tally/alarm house style: mutate own state, RETURN state for the engine to apply. ADR-0054._
+- [ ] **SW-A3** `L` — Render-plan resolver: `fn(scene_states, switcher_state, tick) → placements`  ·  _deps: SW-A2_  · _promote drive's per-tick placement derivation (drive.rs:449 `compose` over pooled scratch) to an injectable resolver over PGM+PVW scene states; allocation-pooled like `ComposeScratch` (drive.rs:670), synchronous on the clock thread (inv #1 by construction). ADR-0054._
+- [ ] **SW-A4** `L` — PVW bus: second compose against the SAME tick + per-bus preview slot + cue/pre-warm arm  ·  _deps: SW-A3_  · _PVW = a second compose per tick inside ONE program (never a second ProgramSet program — independent clocks break frame-aligned take); replicate the `ProgramSlot` wait-free slot per bus; ADR-P004's pre-warm worker IS the PVW arm mechanism (WARM-ON-ARM, `is_primed`-gated — the RT-7 shape, see [decoupled-routing-backlog](decoupled-routing-backlog.md)); the PVW composite is admission-accounted and sheds before program tiles (new ladder rung between preview and tile rungs). ADR-P007._
+- [ ] **SW-A5** `L` — Transition engine wave 1: cut / mix / dip + auto/T-bar + flip-flop  ·  _deps: SW-A3_  · _progress = pure f(tick.index); durations stored as integer FRAMES at the exact-rational output cadence, API accepts ms converted via exact rationals (never float fps — ADR-T015); mix ships via the flat-list fast path (both scenes' cells in one z-ordered list, incoming opacity ramped — zero compositor change) for non-overlapping scenes + NV12 scene pre-render for overlapping scenes detected at arm time; dip{rate, dip_source, switch_point default ½}; T-bar = conflated idempotent absolute progress setter (wire = integer basis points 0..=10000, quantized half-up onto the u16 engine fixed point — ADR-T015/ADR-W021; latest-wins, never one command per sample); flip-flop default-on per M/E; an in-flight transition is program-affecting — NEVER shed mid-transition (complete-then-degrade), AUTO demotes to CUT at arm/admission time under overload. ADR-0055._
+- [ ] **SW-A6** `L` — On-clock DSK + FTB master stage  ·  _deps: SW-A3, SW-B4, SW-B5, SW-C3_  · _downstream keyers + FTB must be frame-coordinated with on-clock switcher state, so they move ON-CLOCK into the engine render plan; the current off-thread egress overlay bake is NOT frame-coordinated and stays for monitoring overlays (labels, meters, captions, watermark) — the split is explicit and budgeted (ADR-0054/0056). 2 DSKs (linear/luma; stills via NV12+A) with independent TIE/CUT/AUTO; FTB = final master stage AFTER the DSKs, own rate, audio-follow flag (rides SW-D3)._
+- [ ] **SW-A7** `L` — Switcher `Command` variants + frame-boundary drain + outcome events  ·  _deps: SW-A5_  · _extend the `#[non_exhaustive]` `Command` enum (set-preview/program punch/cut/auto/set-transition/T-bar/FTB/DSK on-off/media transport/recall) + `CommandDrain` arms (coalesced last-wins per M/E destination, `MAX_REPOINTS_PER_TICK`-style caps, control.rs:598) + lossless lifecycle outcome events (transition.started/.completed, ftb.engaged, keyer.on_air…). Cut/auto/FTB outcomes MUST correlate (CorrKey arms land in SW-F2 — today's Route\* never correlate; do not repeat that)._
+- [ ] **SW-B1** `L` — Scene pre-pass / on-GPU pass fusion  ·  _deps: —_  · _render-to-texture scene handles fused via the pooled `Rgba16Float` chain (`composite_with_overlays`, gpu/compositor.rs:326, already chains composite→overlay→encode without readback — the template); ONE NV12 readback per tick; the CPU reference accepts the measured budget behind a bench gate (the 40 ms `composite_realtime` pattern). Also the home of the multi-box composition source (the existing Layout model rendered as a drive-internal pre-pass in the same tick — NOT a chained ProgramSet program, which adds a tick of latency + NV12 generation loss). ADR-0056._
+- [ ] **SW-B2** `L` — Wipe masks: per-tile SDF mask function + softness/border  ·  _deps: —_  · _extend `TileParams` (uniforms.rs:82 — `dst_size`/`opacity_transfer` carry spare lanes) and the CPU `Tile`/`fold_tile_into_band` (compositor pipeline.rs:413/1075) with a mask fn id + params evaluated exactly where uniform opacity applies today; house SDF style (`rect_coverage`/`segment_distance` — overlay.wgsl:84, subpass.rs:853); linear-edge/circle/box + softness + border fill source. Post-MVP wave 2. ADR-0055._
+- [ ] **SW-B3** `L` — Per-tile affine transform + sub-pixel placement + wire FitMode/crop/rotation  ·  _deps: —_  · _the DVE push/squeeze substrate; finally consumes the modeled-and-validated-but-IGNORED `Cell.fit/crop/rotation` (every source stretches today; `cell_dst_rect` drive.rs:728 floors to integers); both kernels (CPU reference + wgpu). Post-MVP wave 2. ADR-0055._
+- [ ] **SW-B4** `M` — Keyer math: luma + linear/fill+key (chroma/pattern post-MVP)  ·  _deps: —_  · _`KeySpec` per tile; key alpha computed at the verified insertion points — luma clip/gain on post-range-expand code-value Y, chroma distance in linear RGB after YUV→RGB — multiplied in before the premultiplied linear-light `over` (inv #8 order preserved); fill+key = an optional second per-tile source reference (the GPU already binds per-tile texture-array layers); clip/gain/invert + rectangular garbage matte; key priority = explicit z-order. ADR-0056/ADR-C007._
+- [ ] **SW-B5** `M` — NV12+A tile input: R8 alpha plane sampled as per-tile alpha  ·  _deps: SW-C3 (payload-shape agreement — coordination point ii)_  · _the payload carries **straight** alpha (ADR-0058); the kernel premultiplies exactly once in linear light at the existing `Cell.opacity` premultiply step; premultiplied-authored assets are normalized at import — reject premultiplied payloads at the boundary rather than branching kernels; never per-tile RGBA video (inv #5). ADR-0058._
+- [ ] **SW-B6** `M` — Kernel test pins: CPU-oracle/GPU-SSIM parity + the dissolve law  ·  _deps: SW-B4 (+ SW-B2, SW-B3 for the wipe/DVE parity legs only)_  · _linear-light premultiplied `over` stays the ONLY blend domain (one code path, inv #8 intact); the optional perceptual progress-curve mapping applies to t, never to pixels (gamma-coded-domain mixing is de-facto industry practice — the operator-visible midpoint difference is documented); keyer threshold domains pinned (luma = code-value Y, chroma = linear RGB); PQ/HLG canvas behavior under mixes/dips defined + tested. The MVP dissolve-law/progress-curve/PQ-HLG goldens ride the wave-1 mix path (SW-A5 + SW-B4); SW-B2/SW-B3 gate only the post-MVP wipe/DVE legs of the parity matrix. ADR-C007._
+- [ ] **SW-C1** `M` — `Still` source kind: decode-once + HoldForever  ·  _deps: —_  · _the EOF-hold path already proves the semantics (a finite file plays once and the store holds the last frame forever); additive `SourceKind::Still{path,…}` on the `#[non_exhaustive]` enum; rides the ADR-W018 live UpsertSource path. ADR-0057._
+- [ ] **SW-C2** `L` — Media-player transport on the production ingest path  ·  _deps: SW-C1_  · _extends the CLI `ingest_loop`/`open_and_stream` (pipeline.rs:5533/5812) — explicitly NOT the unwired multiview-input `IngestPump` scaffold: cue (open + decode first frame + pause; `is_primed`-gated), play/pause (gate `PtsWallClock`), seek (`Demuxer::seek`, demux.rs:549 — exists, zero production callers), loop (in-place seek to the in-point on EOF per ADR-0057; the reconnect bracket is the failed-seek fallback), EOF policy {hold_last_frame | loop | black | auto_off}, play-on-take, frame-accurate start. The pipeline.rs wiring hands off to LANE-CORE. ADR-0057._
+- [ ] **SW-C3** `L` — NV12+A framestore payload + alpha decode  ·  _deps: —_  · _optional R8 alpha plane on the media/graphics fill path (NV12+A, 2.5 B/px); formats FFmpeg actually decodes with alpha: ProRes 4444/4444XQ, qtrle/Animation, PNG/TGA sequences, VP9-alpha via libvpx-vp9; HEVC-with-alpha REJECTED or import-transcoded (FFmpeg decodes its alpha as opaque); the payload carries **straight** alpha (premultiplied-authored media normalized at import; the kernel premultiplies once in linear light — ADR-0058); never bolted onto the overlay stack (overlays are input-decoupled by design). ADR-0058._
+- [ ] **SW-C4** `M` — Media library: assets + import/validation/transcode pipeline  ·  _deps: SW-C3_  · _library (asset storage: stills/clips/audio) distinct from media-player channels (bus-selectable sources); import requires canvas resolution + output frame rate + explicit trigger-point metadata; transport-control posture: native API only for v1 (CasparCG-AMCP-style cue/auto-chain semantics; VDCP/AMP are legacy RS-422-era external-server protocols — out of scope). ADR-0057._
+- [ ] **SW-C5** `M` — Stinger mezzanine: bounded pre-decoded NV12+A ring  ·  _deps: SW-C3, SW-C4_  · _pre-decode at import into a pool-allocated in-memory mezzanine (a 3 s 1080p60 stinger ≈ 0.93 GB NV12+A vs ≈ 1.49 GB RGBA), hard cap + decode-ahead ring for longer clips, never per-frame allocation (standing efficiency review). The stinger transition itself is wave 3 (post-MVP). ADR-0058._
+- [ ] **SW-D1** `M` — Audio control seam (the subtitle seam's twin)  ·  _deps: —_  · _`AudioControlHandle` polled by the bake consumer per `StreamItem` (the `SubtitleRouteHandle` shape, captions.rs:130) — unblocks the production-HELD `Command::RouteAudio` (control.rs:933) with zero new invariant risk; the `ProgramBus` stays bake-consumer-owned. ADR-0059._
+- [ ] **SW-D2** `M` — Honor `gain_db`/`mute` at apply + gain-preserving mute  ·  _deps: SW-D1_  · _`RouteApplier::apply_audio` currently destructures both away (route.rs:367 `..`); add per-strip gain-preserving mute (today mute = unroute, losing gain state) + set-gain-with-ramp; stop hardcoding gain 0.0/mute false in the REST take. ADR-0059._
+- [ ] **SW-D3** `M` — Master/program gain stage  ·  _deps: SW-D1_  · _one multiply pass in `ProgramBus::mix` — the FTB audio fade + master gain envelope; pure-crate change with existing test patterns. ADR-0059._
+- [ ] **SW-D4** `M` — AFV: transition-coupled crossfade  ·  _deps: SW-D1, SW-A5_  · _`ProgramBus::repoint_crossfade` (program.rs:217 — per-sample equal-power, engine-tested) with `ramp_frames = SampleClock::total_at(s + T) − SampleClock::total_at(s)` (integer cumulative-sample delta; never the naive `T × samples_per_tick` product — ADR-0059 §2/ADR-T015 §5), driven by the SAME switcher state-machine tick window as video; per-input mode {fade_with_transition (default), hard_cut}; resolves the Class tension — program-bus crossfade = **Class-1** on this always-decode→mix→re-encode path; `SwitchTier::ClickFree`'s Class-2 self-description refers to the unbuilt coded-passthrough alternative (docs updated). ADR-0059._
+- [ ] **SW-D5** `M` — Live meters: `Event::AudioMeter` emitters at ~30 Hz  ·  _deps: —_  · _the event type exists with ZERO production emitters (event.rs:111); conflate from the bake consumer onto the drop-oldest publisher; REQUIRED before the switcher UI ships (SW-F5 dep). ADR-0059._
+- [ ] **SW-D6** `S` — Program audio config-declared / default-on for switcher use  ·  _deps: —_  · _today `--program-audio` is a CLI flag only; gate on AAC encoder open success; byte-identical-when-off is already test-proven. ADR-0059._
+- [ ] **SW-E1** `L` — Internally-derived tally: per-tick pure derivation over the composition graph  ·  _deps: SW-A3_  · _PROGRAM-tallied iff reachable from any on-air output through the live composition — both transition sources mid-transition, keyer FILL **and** KEY sources of on-air keyers, stinger media while it covers, members of on-air multi-box compositions/nested M/Es (recursive contributes-to-program; the untallied-overlay anti-pattern is called out); PREVIEW-tallied iff reachable from the top-level M/E's PVW; amber = ISO/record. Emits `TallyFacts`. ADR-MV006 (extends ADR-MV002)._
+- [ ] **SW-E2** `M` — Wire `TallyArbiter` into the run loop + spawn `run_tally_ingest`  ·  _deps: SW-E1_  · _feed internal facts into the EXISTING pure arbiter (engine tally/arbiter.rs:145) so internal + external (TSL/IS-07/router) facts merge under one `ConflictPolicy`; replace the `SetTallyOverride` echo; spawn the library-complete-but-unspawned `run_tally_ingest` (control tally_ingest.rs:75 — the binary spawns only `run_warning_ingest`, cli control.rs:134). ADR-MV006._
+- [ ] **SW-E3** `M` — TSL codec spec-reconciliation + golden on-wire vectors  ·  _deps: —_  · _verified against the official TSL spec PDF: v5.0 DLE must be 0xFE not 0x10; CONTROL bit order is RH(0-1)/Text(2-3)/LH(4-5); drop the invented DLE/ETX terminator; skip DMSGs with CONTROL bit 15; rebuild v4.0 as v3.1+CHKSUM(mod-128)+VBC+XDATA; drop the invented v4.0/v3.1 byte-stream DLE/STX (0x10 0x02) wrapper (`decode_framed`/`encode_display_framed` — the spec has no byte-stream framing below v5.0: serial delimiting is the 0x80 address sync bit, UDP is one message per datagram). Round-trip tests structurally cannot catch shared-model errors → golden vectors hand-transcribed from the spec; ports always configurable (vendor conventions vary); fix the stale ADR-MV001 citation in all four engine tally files (mod.rs/arbiter.rs/profile.rs/gpio.rs → ADR-MV002 + ADR-MV006). ADR-MV006._
+- [ ] **SW-E4** `L` — RT-12 output←program crosspoint bridge  ·  _deps: SW-A1_  · _`RouteIntent::Output` + `Command::RouteOutput` + the engine bridge to `PacketRouter::move_sink` (fanout.rs:212 — BUILT and proof-tested in multiview-output, ZERO engine callers; the ADR-R010-admitted empty seam); unlocks aux buses, bus→output routing and Class-2 MBB; shared with CTL-6/GPU-5c. See RT-12 in [decoupled-routing-backlog](decoupled-routing-backlog.md). Aux-bus wiring itself is post-MVP._
+- [ ] **SW-E5** `M` — Clean-feed/aux tap taxonomy  ·  _deps: SW-A6, SW-E4_  · _bus taps {program (post-FTB), clean (pre-DSK), preview, me[n], aux[j]}; the pre-overlay canvas `Arc` is already published per tick (pipeline.rs:2122 — the preview `ProgramSlot` gets the canvas BEFORE the off-thread overlay bake) and is the clean-feed anchor; once DSKs are on-clock (SW-A6) clean = a render-plan tap point; ADR-0037's CLEAN/DIRTY vocabulary adopted; each extra clean/aux encode is inv-#7-sanctioned and admission-accounted. ADR-0054._
+- [ ] **SW-F1** `M` — Config blocks: `switcher` / `media_library` / `media_players` / `macros`  ·  _deps: SW-A1_  · _additive `#[serde(default)]` optional blocks on the non_exhaustive root, internally-tagged unions ONLY (never untagged); per-item `validate()` + document-level `validate_switcher()` cross-refs + cycle check for composition/M/E re-entry; desired-state ONLY (live bus state — crosspoints, T-bar, keyer on-air, FTB level — is engine-owned and mirrored read-only; warm-restart = an explicit separate persisted snapshot resource, off by default, control-plane-owned); typed keyer/graphics layer model replaces untyped Overlay params for the new surfaces. Sequenced after SW-A1 on the config root (coordination point iii). ADR-M012._
+- [ ] **SW-F2** `L` — Control domain: switcher CRUD + bare-verb actions + plan/take + CorrKey  ·  _deps: SW-F1, SW-A7_  · _copy the sync-groups domain file-set verbatim (resource_store.rs markers · typed_resources.rs `TypedCollection` · routes/ · openapi.rs paths + `rest_routes` table · tests/); ADR-W017 bare verbs: `/api/v1/switcher/mix-effects/{id}/cut|auto|ftb|preview|program` (preview = PVW crosspoint set, program = direct punch), `…/transition`, `…/tbar` (conflated absolute), `/api/v1/switcher/downstream-keyers/{id}/on-air|off-air|auto|tie`, `/api/v1/media/players/{id}/load|cue|play|pause|stop|seek`, `/api/v1/macros/{id}/run`; every state-changing take classified Class-1/Reset-lite/Class-2 with a `/plan` dry-run (inv #11; the routing plan/take precedent); 200 for immediate Class-1 vs 202+operation-id for timed/Class-2; Idempotency-Key everywhere; NEW CorrKey variants so cut/auto/ftb outcomes correlate on the stream. ADR-W021._
+- [ ] **SW-F3** `M` — Realtime: `switcher` topic + conflated lanes + snapshot frames + AsyncAPI  ·  _deps: SW-F2_  · _one coarse `switcher` Topic; lossless lifecycle events in the replay ring; transition.progress + audio.meter are conflated latest-wins at a **publisher-side ~30 Hz cadence**, while tally is edge-triggered and rides the existing lossless `tally.state` lane (ADR-RT008 — no conflation change there) (PINNED: `$subscribe`/`$set_rate`/`$resume` are types-only — `run_ws_session` (realtime.rs:878) never reads inbound frames, every client gets the firehose; per-client subscribe is a follow-on lane item) + connect-time snapshot frames (the DeviceStatusRegistry/devices_snapshot_frames pattern); update BOTH spec generators in the same change (utoipa ApiDoc + rest_routes test table; multiview-events asyncapi.rs) + `gen-openapi`/`gen-asyncapi` + web `generate:api`. ADR-RT008._
+- [ ] **SW-F4** `M` — SPA shared realtime service + operation-correlation + Idempotency-Key  ·  _deps: —_  · _ONE shared realtime connection with a topic-keyed listener registry (today `useEngineEvents`/`useSystemMetrics`/`useHealth` each open their OWN WebSocket — migrate them first); store `operation_id` per submitted command and resolve against envelope `corr`; `crypto.randomUUID()` Idempotency-Key in the shared submit helper. ADR-W021._
+- [ ] **SW-F5** `L` — SPA switcher panel: `/switcher` lazy route + bus rows + monitors  ·  _deps: SW-F2, SW-F3, SW-F4, SW-D5_  · _spec-first so the typed openapi-fetch path is used (no raw-fetch bypass); bus state per ADR-W011 — never colour alone (PGM red/filled+label, PVW green/outline+label; TallyLampBadge/LiveDot patterns); monitors = 1 Hz JPEG stills per bus first (replicate `ProgramSlot` + CliPreviewProvider), WHEP is a fidelity-upgrade lane with the preview crate; T-bar + transition controls; the layout-editor pure model (NormalizedRect/clamp/snap/validate + 'pip' preset) is imported, not forked, for the multi-box/DVE editor; fast-check property tests for the pure bus/transition TS model. ADR-W021._
+- [ ] **SW-F6** `M` — Global keyboard-shortcut subsystem  ·  _deps: SW-F5_  · _none exists in the SPA; number keys = PVW selection, Shift+number = PGM, dedicated CUT/AUTO keys; disabled in editable elements/dialogs; visible shortcut reference; every shortcut paired with an on-screen button; live-region announcements. ADR-W021._
+- [ ] **SW-F7** `M` — Memories + macros + in-app docs  ·  _deps: SW-F2_  · _memories/snapshots = EXTEND Salvo (config salvo.rs + engine arm/take/cancel are BUILT, salvo.rs:158/189) with recall-scope masks (`{scope: {sources, keyers, transition, audio}}`, all true by default — pinned in ADR-M012) + the RT-16 mixed-recall shape (see [decoupled-routing-backlog](decoupled-routing-backlog.md)) — supersedes ADR-MV004's salvo-only automation story; macros = a CONTROL-PLANE sequencer replaying ordinary Commands with wait steps (`wait_frames`/`wait_ms`), never engine-side (inv #10), desugaring onto the same engine intents as live commands; batched multi-op takes drain at ONE tick (the openly-published obs-websocket SERIAL_FRAME batch semantic maps 1:1 onto the existing drain); one DOCS_REGISTRY entry + lazy `/help` concept page. ADR-M012/ADR-W021._
+
+### RIST — Reliable Internet Stream Transport (input + output) (brief [rist-transport](../research/rist-transport.md); [ADR-0095](../decisions/ADR-0095.md))
+
+> **Gating (2026-06-13):** design merged (brief + ADR-0095, **Proposed**), code NOT started. A
+> **tiered seam mirroring SRT/ADR-0039**: Tier-0 (RIST-1…RIST-4) is the license-clean single-link
+> baseline through FFmpeg's `rist://` protocol — **no new FFI**; Tier-1 (RIST-5) owns link stats via
+> a `multiview-rist-sys` FFI leaf (FFmpeg exposes none); Tier-2 bonding/seamless-switching is
+> **deferred only-if-required** (verified: FFmpeg calls `rist_peer_create` once). **Pipeline.rs
+> serialization:** RIST-3 (CLI ingest/egress wiring of the `PushProtocol::Rist` arm + `Rist` source)
+> touches `crates/multiview-cli/src/pipeline.rs` — it **joins LANE-CORE** (the serial integrator),
+> exactly as IN-3/IN-5 and SW-A4…A7 do; everything else is parallel-safe. RIST-1 (schema) is sequenced
+> on the single `multiview-config` owner (the SW-A1 → SW-F1 rule). RIST loss/retransmit/reconnect is
+> **expected** — the lossy-link netem chaos gate (RIST-4) is the acceptance proof, not an extra.
+> librist is **BSD-2-Clause** → default build stays LGPL-clean (no `gpl-codecs`-style escalation).
+
+- [ ] **RIST-1** `M` — Typed RIST schema (input + output) + URL lowering  ·  _deps: —_  · _add `SourceKind::Rist { url, rist: Option<RistOptions> }` + `Output::Rist { id, url, codec, gpu_pin, audio }` to `multiview-config/src/schema.rs` (internally-tagged, `#[non_exhaustive]`, `skip_serializing_if`), the typed `RistOptions`/`RistEncryption`/`RistProfile`/`RistAesBits` model, `validate()` + `to_url`/`to_url_redacted` lowering to the `rist://…?rist_profile=&buffer_size=&pkt_size=&encryption=&secret=` AVIO URL (option names verified against `libavformat/librist.c`), PSK `secret_ref` resolved at run time + redacted in logs, IPv6 literals bracketed, default listen `[::]`. **A non-empty `bonding` list is rejected with a clear typed error on a Tier-0-only build** (never silently single-linked). Round-trip TOML/JSON + property tests. Sequenced on the config owner (SW-A1 → SW-F1 rule). ADR-0095._
+- [ ] **RIST-2** `S` — `PushProtocol::Rist` egress selector  ·  _deps: —_  · _add the `Rist` variant to `PushProtocol` (`multiview-output/src/sink.rs`) with `muxer_name()` = `"mpegts"` (RIST carries MPEG-TS, like SRT/UDP); exhaustive-match coverage; unit test the muxer-name mapping. Parallel-safe (sink.rs is not pipeline.rs). ADR-0095._
+- [ ] **RIST-3** `M` — CLI ingest + egress wiring (LANE-CORE / pipeline.rs)  ·  _deps: RIST-1, RIST-2_  · _`Output::Rist { url, .. }` match arm → `PacketMuxSink::push(PushProtocol::Rist, lowered_url)` fanned by the tolerant `run_push_output` (encode-once-mux-many inv #7); `SourceKind::Rist` opened through the existing `FileSource`/`Demuxer` path (lowered `rist://` URL, like `Srt`). **Joins LANE-CORE** (serial integrator) — `pipeline.rs` contention. The `rist` feature gates the libav-`--enable-librist` requirement. ADR-0095._
+- [ ] **RIST-4** `M` — Conformance oracle + lossy-link chaos/soak gate (the acceptance proof)  ·  _deps: RIST-3_  · _clean-link `rist://[::1]` loopback round-trip TS-fidelity test (the SRT-oracle pattern, `--enable-librist` FFmpeg); then drive it through **netem/tc** (1–10% loss + jitter + reorder + a brief full blackout) and assert (a) the output **never stalls** (inv #1 — tick keeps emitting), (b) the tile rides STALE→LIVE and **recovers** rather than dies (inv #2, bad-inputs-are-the-purpose), (c) the engine is **never back-pressured** by the RIST socket (inv #10, existing chaos harness); manage librist `log_level` so recovery is not log-spam; multi-hour soak asserts no drift / no unbounded memory / no reconnect storm. ADR-0095._
+- [ ] **RIST-5** `L` — Tier-1: `multiview-rist-sys` FFI leaf + link statistics → telemetry/HealthWarning  ·  _deps: RIST-3_  · _own the librist FFI (ADR-0028 pattern, `unsafe`+`// SAFETY:`, RAII ctx/peer lifecycles, callback thread that never unwinds across the boundary — safety §4); `rist_stats_callback_set` → retransmit/loss/RTT/bandwidth published on a watch/broadcast drop-oldest channel (inv #10, off the data plane), conflated; a sustained-loss `HealthWarning` (ADR-0035) that clears on recovery; assert non-zero stats under RIST-4's injected loss without blocking the data plane. Behind the same `rist` feature. ADR-0095._
+- [ ] **RIST-6** `M` — WebUI RIST source/output forms + spec surface  ·  _deps: RIST-1_  · _source-kind + output-kind picker entries for RIST; typed forms (profile/buffer_ms/pkt_size/encryption cipher + `secret_ref`); **bonding bandwidth advisory** (replicate = N× uplink) surfaced so an operator does not accidentally multiply their uplink; OpenAPI/JSON-schema regen + web `generate:api`; `examples/rist.toml`; in-app docs entry. ADR-0095._
+- [ ] **RIST-7** `XL` — Tier-2 (DEFER, only-if-required): bonding / load-sharing / seamless multi-ISP switching + DTLS/EAP-SRP  ·  _deps: RIST-5_  · _**NOT built speculatively** — only when a concrete multi-link requirement lands. Multiple `rist_peer_create` into one librist ctx on the RIST-5 FFI leaf (bonding=replicate / load-share=split, re-aggregate by RTP sequence), the `bonding` peer list lowered to the peer set; DTLS + EAP-SHA256-SRP6a (TR-06-3) credential plumbing; two-impaired-loopback bonding chaos test (kill one link mid-stream → zero-loss continuation). The schema seam (RIST-1) + the explicit "requires direct-FFI build" error are the complete, honest Tier-0 behaviour until this ships. ADR-0095 / ADR-0028._
 
 
 ---
@@ -382,7 +499,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** Keep the capability matrix machine-readable for reuse by the WebUI (AUD-8). Don't over-build NDI/RTMP multitrack now (those sinks aren't runnable yet, pipeline.rs:2719) — validate + degrade honestly.
 - **Read first:** ADR-R005 (capability matrix, routing data model §4.1-4.2); resilience-and-av §10 data-model anchors (`AudioRoute`, `OutputCapability`).
 
-### `[ ]` AUD-8 — WebUI audio routing matrix + loudness meters · effort: L · deps: AUD-7, AUD-6
+### `[~]` AUD-8 — WebUI audio routing matrix + loudness meters · effort: L · deps: AUD-7, AUD-6
 - **Goal:** Expose the routing matrix (program bus + discrete tracks, per-input gain/mute/include) and live program-bus loudness compliance in the SPA, with the capability-aware validator greying out impossible selections per output.
 - **Touches:** `web/src/pages/` (new `AudioPage.tsx` peer of `MonitoringPage.tsx`); `web/src/resources/api.ts` (extend the Outputs bindings api.ts:295 with audio routes/codec); `web/src/realtime/` (loudness over the existing engine WebSocket, useEngineEvents.ts) reusing `multiview_audio::meterdata`/`Conflator` (loudness/meterdata, ~30 Hz) per ADR-R006.
 - **Approach:**
@@ -406,7 +523,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 ## SYN — Clock & timer synthetic sources (extends ADR-0027; brief [clock-timer-sources](../research/clock-timer-sources.md); [ADR-0047](../decisions/ADR-0047.md))
 
 
-### `[ ]` SYN-CLOCK-1 — Pure tz resolver + dual-face/metadata model · effort: M · deps: none
+### `[x]` SYN-CLOCK-1 — Pure tz resolver + dual-face/metadata model · effort: M · deps: none
 - **Goal:** Add the missing **upstream offset resolver** the clock model already anticipates (`clock.rs:57` "DST resolved upstream to a concrete offset") so an IANA `timezone` renders a DST-correct offset for the *displayed* instant, plus the formatters the dual-face + metadata need — all pure, deterministic, injected-time.
 - **Touches:** workspace `Cargo.toml` + `crates/multiview-cli/Cargo.toml` (add `chrono` + `chrono-tz`, `default-features = false`); a new pure helper (in `multiview-config` or a `multiview-overlay::tz` module) `resolve_offset(tz: chrono_tz::Tz, at: WallTime) -> TimeZoneOffset`; a `format_utc_offset(TimeZoneOffset) -> String` (`UTC±HH:MM`). Reuses `multiview_overlay::clock::{WallTime, TimeZoneOffset}` (clock.rs:30/:57).
 - **Approach:**
@@ -417,7 +534,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** Bound binary size with `chrono-tz` `default-features=false` (+ `filter-by-regex` if needed). Keep the resolver pure so the control plane can reuse it for the form preview. The bundled tz db means a tz-rule change needs a dep bump (documented in the brief §9 / ADR-0047).
 - **Read first:** brief [clock-timer-sources](../research/clock-timer-sources.md) §5; [ADR-0047](../decisions/ADR-0047.md); `multiview-overlay/src/clock.rs` header + `:57`.
 
-### `[ ]` SYN-CLOCK-2 — Config: `Dual` face + clock metadata fields · effort: S · deps: SYN-CLOCK-1
+### `[x]` SYN-CLOCK-2 — Config: `Dual` face + clock metadata fields · effort: S · deps: SYN-CLOCK-1
 - **Goal:** Extend `SourceKind::Clock` additively (`schema_version` unchanged) with `ClockFaceConfig::Dual`, `timezone` (IANA), `label`, `show_offset`, `show_reference`, `numerals`, validated and serde-round-tripping across TOML+JSON.
 - **Touches:** `crates/multiview-config/src/schema.rs:197` (`ClockFaceConfig::Dual`) + `:225` (the `Clock` variant fields per brief §6.1); `crates/multiview-config/src/error.rs` (unknown-IANA-id `ConfigError`); the example-validation test.
 - **Approach:**
@@ -427,7 +544,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** Keep `tz_offset_minutes` working (legacy fixed offset). `Dual` must default-skip nothing existing.
 - **Read first:** brief §6.1; conventions §5 (serde policy); `schema.rs:189-239`.
 
-### `[ ]` SYN-CLOCK-3 — Renderer: dual placement + metadata strip + per-render tz · effort: M · deps: SYN-CLOCK-2
+### `[x]` SYN-CLOCK-3 — Renderer: dual placement + metadata strip + per-render tz · effort: M · deps: SYN-CLOCK-2
 - **Goal:** Render `dual` (analogue face + digital readout) and the metadata strip (label + `UTC±HH:MM` + optional reference badge) onto the slate, resolving the IANA offset **per render** so a long-running clock follows DST.
 - **Touches:** `crates/multiview-cli/src/synth.rs:150` (`render_clock` `dual` branch + strip), `:45/:72` (`SyntheticKind::Clock` carries `mode`, `tz: Option<Tz>`, `label`, `show_offset`, `show_reference`, `numerals`), `:138` (`render_key` → field index). Reuses `clock_face`/`ClockFaceStyle::at` (subpass.rs:328/:342) + `TextEngine::rasterize_run` (text.rs).
 - **Approach:**
@@ -438,7 +555,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** Keep the bake NV12/linear (inv #5/#8) — only text placement is new. Cost stays one bake/visible-field change (inv #9). Reference badge is display-only (ADR-T012, inv #1).
 - **Read first:** brief §2, §4, §5.2-5.3; `synth.rs:150-261` + `:464-556`; `subpass.rs:283-417`.
 
-### `[ ]` SYN-TIMER-1 — Pure timer math: target resolution, direction, at-target, format · effort: M · deps: SYN-CLOCK-1
+### `[x]` SYN-TIMER-1 — Pure timer math: target resolution, direction, at-target, format · effort: M · deps: SYN-CLOCK-1
 - **Goal:** All countdown/countup math, pure and deterministic (injected now + target + cadence): next-occurrence resolution, `displayed_seconds`, the at-target clamp policies, and the duration→string formats including frames from the cadence rational.
 - **Touches:** a new pure module (in `multiview-overlay` or `multiview-config`): `resolve_target(TimerTarget, now: WallTime) -> i64` (target Unix), `displayed_seconds(direction, target, now, on_target) -> i64`, `format_duration(seconds: i64, sub_ns: i64, cadence: Rational, fmt: TimerFormat, overrun: …) -> String`.
 - **Approach:**
@@ -449,7 +566,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** Midnight/DST edge cases are the footguns — test them explicitly. Frames only meaningful for `_ff`; keep it integer division against the `Rational`.
 - **Read first:** brief §3, §5.4; [ADR-0047](../decisions/ADR-0047.md) (Decision 4, alt F); `multiview-core::time::Rational`.
 
-### `[ ]` SYN-TIMER-2 — Config: `SourceKind::Timer` + target/direction/policy/format enums · effort: S · deps: SYN-TIMER-1, SYN-CLOCK-2
+### `[x]` SYN-TIMER-2 — Config: `SourceKind::Timer` + target/direction/policy/format enums · effort: S · deps: SYN-TIMER-1, SYN-CLOCK-2
 - **Goal:** Add the `Timer` source variant + its enums per brief §6.2, internally tagged (target on `target`, flattened under `kind = "timer"`), validated and round-tripping.
 - **Touches:** `crates/multiview-config/src/schema.rs` (new `SourceKind::Timer`, `TimerTarget`, `TimerDirection`, `TimerOnTarget`, `TimerFormat`); `error.rs` (bad `at` string / unknown zone / `recur` without `recur_daily` → typed errors).
 - **Approach:**
@@ -459,7 +576,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** Double-tag (`kind` + `target`) is intentional — assert it in a test so a future refactor can't collapse them.
 - **Read first:** brief §6.2 (incl. the tag-collision note); conventions §5.
 
-### `[ ]` SYN-TIMER-3 — Renderer + generator: timer render + overrun + generator wiring · effort: M · deps: SYN-TIMER-2, SYN-CLOCK-3
+### `[x]` SYN-TIMER-3 — Renderer + generator: timer render + overrun + generator wiring · effort: M · deps: SYN-TIMER-2, SYN-CLOCK-3
 - **Goal:** Render the timer (centred mono duration run + optional overrun prefix/badge) and wire `SyntheticKind::Timer` into the per-tick `generator_loop`, re-rendering once per displayed field.
 - **Touches:** `crates/multiview-cli/src/synth.rs` (`render` arm for `Timer`, `SyntheticKind::Timer` resolved descriptor, `from_source_kind` mapping, `render_key` field index incl. `_ff` per-frame, `animated()==true`).
 - **Approach:**
@@ -469,7 +586,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** `_ff` is the one cadence-rate baker — keep it opt-in and cheap (one text run). Never read wall clock outside the generator (tests inject `now`).
 - **Read first:** brief §3.3, §4.2, §4.4; `synth.rs:107-344`.
 
-### `[ ]` SYN-CLOCK-UI — SPA + spec surface for the extended clock + timer · effort: L · deps: SYN-CLOCK-3, SYN-TIMER-3
+### `[x]` SYN-CLOCK-UI — SPA + spec surface for the extended clock + timer · effort: L · deps: SYN-CLOCK-3, SYN-TIMER-3
 - **Goal:** Surface the new clock fields + the `timer` source in the WebUI source-kind picker/forms with an IANA zone dropdown, regenerate the OpenAPI/JSON-schema, ship an example, and document it in-app.
 - **Touches:** `web/src/` source-kind picker + forms (clock `face`/`timezone`/`label`/`show_offset`/`numerals`; timer target/direction/on_target/format/label); zone dropdown from `chrono_tz::TZ_VARIANTS` (exposed via a `/capabilities/timezones` endpoint or a generated list); `cargo xtask gen-openapi`; `examples/clock-timer.toml`; in-app docs/concepts page.
 - **Approach:**
@@ -531,7 +648,7 @@ _Each item: Goal · Touches · Approach · Acceptance · Risks · Read‑first. 
 - **Risks/notes:** NDI SDK is proprietary/royalty-free — CI/Docker for the `ndi` feature must *fetch* the SDK (not vendored); the default CI must **not**. Runtime needs a resolvable dylib or the dynamic-load path. Attribution + no-"NDI"-in-product-name obligations are mandatory (ADR-0008). Guardrails: libloading is `unsafe` FFI — confine all `unsafe` to a thin `multiview-ffmpeg`-style boundary or to grafton-ndi; keep `multiview-output` `unsafe_code = forbid` by isolating the loader. No `unwrap`/`as`/indexing in non-test.
 - **Read first:** ADR-0008; core-engine §10 (NDI integration & licensing); `docs/io/ndi.md`.
 
-### `[~]` OUT-4 — NDI output Sender wired as a Sink (host-memory copy from canvas) · effort: L · deps: OUT-3
+### `[x]` OUT-4 — NDI output Sender wired as a Sink (host-memory copy from canvas) · effort: L · deps: OUT-3
 - **Goal:** Publish the composited multiview as a single NDI source (one `NDIlib` Sender) fed from the canvas, wired into the CLI's sink fan-out exactly like the file/HLS/push sinks, so NDI output is a real, runnable egress (gated + license-accepted).
 - **Touches:** `crates/multiview-cli/src/pipeline.rs:2719` (replace the warn-and-skip `Output::Ndi` arm); a new `RunnableOutput::Ndi` variant (pipeline.rs:326) + its `run_one_output` arm (pipeline.rs:1733); `crates/multiview-output/src/ndi/` Sender from OUT-3; reuses `StreamingFrameSource`'s baked `Arc<Nv12Image>` fan-out (pipeline.rs:2785).
 - **Approach:**
@@ -619,16 +736,9 @@ Key architectural fact established by the scaffold: every ingest path must produ
 - **Risks/notes:** real network + a current `yt-dlp` (ideally a JS runtime like Deno for n-sig) needed — gate the live test, keep CI on fixtures. Extraction breakage is *expected and handled*, not a hard failure.
 - **Read first:** ADR-0015 consequences ("re-resolution is load-bearing"); ADR-T004 (HLS pacing) + docs/io/inputs.md §3 (input pacer); ADR-R003/R004.
 
-### `[~]` IN-6 — WebRTC ingest: ICE/DTLS/SRTP transport behind an application-layer media engine · effort: XL · deps: IN-1 (shares the RTP→assembler→FrameProducer bridge)
-- **Goal:** Turn the compile-only `webrtc::transport::WebRtcSession` shell into a real receive session, driving the pure SDP negotiation (`negotiate_answer`, mod.rs:266) through ICE/DTLS/SRTP into RTP → the IN-1 assembler → `IngestPump`.
-- **Touches:** `crates/multiview-input/src/webrtc/transport.rs` (current shell holds only `NegotiatedSession`); `webrtc/Cargo.toml` feature (currently `"webrtc" = []`); a `WebRtcProducer: source::FrameProducer`. Per the module doc, the concrete media-engine binding "is supplied by the application layer" — so define the trait/seam here, keep the native WebRTC crate out of `multiview-input` to preserve the pure/LGPL-clean default.
-- **Approach:**
-  1. Define a `MediaEngine` trait in `transport.rs` (the application-layer seam): `start(negotiated) -> rtp packet stream`. `multiview-input` provides the SDP negotiation + the RTP→frame adapter; the ICE/DTLS/SRTP engine (e.g. `str0m`, sans-IO, pure-Rust — verify license before adopting) is wired at the application layer behind the `webrtc` feature so the default build stays pure.
-  2. `WebRtcSession::start` consumes `NegotiatedSession` (already held), drives the engine, and routes decrypted RTP payloads (matching the negotiated `Codec`/payload type from `mod.rs`) into IN-1's assembler for video (H264/VP8 keyframe-gated) and the audio rebaser.
-  3. Bridge to `FrameProducer` exactly as IN-2 (bounded channel, drop-oldest, never block — invariant #10). RTP timestamp → `raw_pts`, 32-bit wrap.
-- **Acceptance (done when):** `crates/multiview-input/tests/webrtc_sdp.rs` stays green (pure negotiation unchanged); a new gated integration test (`#[ignore]` in CI, needs a peer) negotiates an answer and receives RTP through a fake/loopback `MediaEngine`, asserting frames reach the `TileStore`. `cargo check --features webrtc` + `cargo clippy --features webrtc -- -D warnings` green. Re-assert #1/#10 (sampled, never pacing).
-- **Risks/notes:** no ICE peer/TURN/real network in CI → engine path is gated/ignored; the sans-IO engine choice must be license-vetted (LGPL-clean default) and kept at the application layer, not pulled into `multiview-input` (which stays `unsafe_code = forbid`, no native WebRTC lib). Highest-effort item; consider phasing (negotiation seam + adapter first, full engine second).
-- **Read first:** the `webrtc::transport` module doc (compile-only rationale) + `webrtc/mod.rs` `negotiate_answer`; docs/research/streaming-gotchas.md §7 (RTCP SR lip-sync, jitter); ADR-0009.
+### `[x]` IN-6 — WebRTC ingest: ICE/DTLS/SRTP transport behind an application-layer media engine · effort: XL · deps: IN-1
+- **Superseded — delivered differently.** Real WebRTC/WHIP ingest is the `multiview-webrtc` crate (a sans-IO **str0m** endpoint terminating ICE/DTLS/SRTP), wired into the run via `multiview-cli`'s `webrtc_ingest` (ADR-0048, ADR-T014). str0m owns SDP offer/answer negotiation; `multiview-input` keeps only the pure, gated `MediaEngine` seam + keyframe-gated H.264/Opus depacketizers + payload-type `RtpRouter` that str0m drives (bounded, drop-oldest, sampled — invariants #1/#10).
+- The former hand-rolled `multiview-input` SDP offer/answer negotiator and its compile-only session shell (`WebRtcSession`/`SessionState`) were **removed** as modeled-but-not-wired debt (#188); the depacketizer/router seam and the `NegotiatedSession` value model are what remain and are consumed by `multiview-webrtc`.
 
 ### `[x]` IN-7 — CI strategy: feature-gated compile + integration gating for the wired transports · effort: S · deps: IN-2, IN-3, IN-6
 - **Goal:** Ensure the four new gated paths are clippy/check-verified without requiring NICs/peers/SDKs in CI, closing the gap that today's clippy job (ci.yml:32) runs **default features only** and never lints `st2110`/`webrtc`/`ndi`/`youtube`.
@@ -759,7 +869,7 @@ Key facts that shape the plan: WHEP today is **pure SDP/codec negotiation only**
 - **Goal:** Expose the WHEP focus endpoints the brief §5 specifies so the SPA can actually open a focus session, enforcing `AccessScope::Focus` and the focus cap at the HTTP edge.
 - **Touches:** `crates/multiview-control/src/routes/preview.rs` (add handlers alongside `program_jpeg`, `routes/preview.rs:35`), `crates/multiview-control/src/routes/mod.rs` (route registration), `crates/multiview-control/src/preview.rs` (extend `PreviewProvider` seam, `preview.rs:21`, with a `whep_negotiate`/`whep_close` capability OR a sibling `WhepProvider` trait so control stays codec-free), `crates/multiview-control/src/state.rs` (hold the new provider in `AppState`).
 - **Approach:**
-  1. Add `POST /api/v1/preview/program/whep`, `POST /api/v1/preview/inputs/{id}/whep`, `POST /api/v1/preview/outputs/{id}/whep` (+ matching `DELETE …/{session_id}`) per brief §5. Each: SDP offer body in (`Content-Type: application/sdp`), `201 Created` + `Location:` resource URL + answer SDP body out; `503` with `application/problem+json` (RFC 9457 per control CLAUDE.md) + `fallback: ws-jpeg|llhls` hint when cap hit or HW budget unavailable. *(Historical as-shipped record — the hint literal is renamed to `jpeg` in the webrtc-full push, ADR-P006/W020.)*
+  1. Add `POST /api/v1/preview/program/whep`, `POST /api/v1/preview/inputs/{id}/whep`, `POST /api/v1/preview/outputs/{id}/whep` (+ matching `DELETE …/{session_id}`) per brief §5. Each: SDP offer body in (`Content-Type: application/sdp`), `201 Created` + `Location:` resource URL + answer SDP body out; `503` with `application/problem+json` (RFC 9457 per control CLAUDE.md) + `fallback: ws-jpeg|llhls` hint when cap hit or HW budget unavailable. *(Historical as-shipped record — the hint literal is renamed to `jpeg` in the webrtc-full push, ADR-P006/W023.)*
   2. Verify `AccessScope::Focus` via the existing `TokenIssuer::verify` (`token.rs:270`) — control must map its `Principal`/`Action` (`routes/preview.rs:13`) to a minted preview token scoped to the exact `TapKey`. Reuse the `WhepError::AccessDenied` → `403` mapping.
   3. Delegate the actual negotiation+transport to a `WhepProvider` the binary implements (same isolation discipline as `PreviewProvider`); control never links str0m.
 - **Acceptance (done when):** `tests/preview_whep_routes.rs` in control (TDD): View token → `403`; malformed SDP → `400`; valid Focus offer → `201` + `Location` + `application/sdp` answer; `DELETE` of the resource URL → `204` and frees the session (assert subscriber count via descriptor drops to 0). OpenAPI (`openapi.rs`) regenerates with the new paths. Inv #10: assert the handler path holds only a `TapLease`/`WhepProvider` handle, never the engine.
@@ -844,7 +954,8 @@ Key facts that shape the plan: WHEP today is **pure SDP/codec negotiation only**
 
 ---
 
-### `[ ]` ENG-2b — Pacer/ReorderBuffer decision + content-aware wrap-boundary soak (ENG-2 follow-on) · effort: M · deps: ENG-2
+### `[~]` ENG-2b — Pacer/ReorderBuffer decision + content-aware wrap-boundary soak (ENG-2 follow-on) · effort: M · deps: ENG-2
+> **As-built (ENG-2b, 2026-06-14):** `multiview-input::Pacer` + `ReorderBuffer` are wired into the **`FrameProducer` raw-RTP / ST-2110 ingest** path via `source::IngestPump`, where the network reorders/bursts/wraps — *not* the libav demux path (which yields presentation-ordered frames and keeps the latch-on-tick + `PtsWallClock` model). A new `IngestConfig.pace: PacePolicy` selects `Passthrough` (file/VOD/latch-on-tick default) vs `WallClock` (live raw-RTP/ST-2110): the `Pacer` sits **behind** the `ReorderBuffer` and is fed the **normalized** PTS (reorder-on-raw → normalize → pace → publish), releasing at `anchor_wall + (pts − pts0)`. Ingest-side only — the normalized timeline is anchored source-relative and the output clock still re-stamps from its own tick (inv #1); bounded everywhere (reorder + pending queue drop-oldest, inv #5/#9); clock-injected (`pump_one_paced`/`run_paced_to_end` over `PaceClock`) so it never blocks the engine and is sleep-free under test. Proven end-to-end on a real `St2110Producer` (burst-smoothed + a 32-bit-wrap-crossing soak in `st2110_ingest.rs`) plus a pump-direct suite + a reorder/wrap `proptest` (`pacer_ingest.rs`, `pacer_reorder_properties.rs`). Decision landed in ADR-0021 §As-built (2026-06-14). **Remaining:** (b) the content-aware overlays-OFF GPU/soak wrap-boundary check stays on the soak tier (no GPU tier in this CI); (point-1) retiring `PtsWallClock` on the libav path is a cosmetic de-dup, still open.
 - **Goal:** Close the remaining ENG-2 acceptance: (a) decide & document whether `PtsWallClock` stays or is replaced by `multiview-input::Pacer`, and whether `ReorderBuffer`/`jitter` is wired at all on the libav path; (b) add the content-aware end-to-end wrap-boundary verification on the GPU/soak tier.
 - **Touches:** `crates/multiview-cli/src/pipeline.rs` (`PtsWallClock` vs `Pacer`); `crates/multiview-input/src/pacer.rs`, `src/jitter.rs` (confirm they are needed only for raw-RTP/ST-2110 ingest, where the demuxer does not reorder); a GPU-tier soak/golden harness.
 - **Approach:**
@@ -1147,35 +1258,36 @@ no Pi 5 exists).
 
 ---
 
-### `[ ]` DEV-A1 — `multiview-config`: `Device` + `SyncGroup` types, validation, export · effort: M · deps: none
+### `[x]` DEV-A1 — `multiview-config`: `Device` + `SyncGroup` types, validation, export · effort: M · deps: none
 - **Goal:** Config-as-code is the durable source for devices: typed `Device` (driver, address, auth `secret_ref`, `desired_mode`, reconnect, display assignment) + `SyncGroup` (mode, `target_skew_ms`, members with per-member `offset_ms`).
 - **Touches:** `crates/multiview-config/src/` (new `device.rs`, `sync_group.rs`, registered beside `schema.rs`/`wall.rs`).
 - **Acceptance (done when):** serde round-trip (TOML + JSON; tagged unions only — `display.assign` is externally tagged single-key to match the brief §7.3 authored shape, everything else internally tagged, never `untagged`; exact integers, no float; unknown keys rejected at parse) for all three driver variants; validation rejects duplicate ids, unknown drivers, dangling sync-group members, cast sync-group members (Tier D, ADR-M011); export emits desired state only (no runtime status, no discovered-unadopted devices, no ad-hoc Cast sessions; secrets as `ref|redact`). ADR-M008 commits in the same push.
 
-### `[ ]` DEV-A2 — `multiview-events`: `Topic::Devices` + device/timing event types (ADR-RT007) · effort: S · deps: none
+### `[x]` DEV-A2 — `multiview-events`: `Topic::Devices` + device/timing event types (ADR-RT007) · effort: S · deps: none
 - **Goal:** One coarse ids-filtered `Topic::Devices` carrying `device.status` (conflated latest-wins: state/mode/streams/temperature), `device.adopted/.removed/.mode/.error/.sync` (lossless low-rate), `device.discovered` (during scans), plus `TimingStatus` for F3.
 - **Touches:** `crates/multiview-events/src/` (topic + event types + envelope registration).
 - **Acceptance (done when):** versioned-envelope serde round-trip tests for every new event type; topic ids-filtering tested; no new engine→outside channel (drivers publish from the control plane — inv #10 untouched).
 
-### `[ ]` DEV-A3 — `multiview-control`: devices + sync-groups stores, CRUD, OpenAPI, actions · effort: L · deps: DEV-A1, DEV-A2
+### `[x]` DEV-A3 — `multiview-control`: devices + sync-groups stores, CRUD, OpenAPI, actions · effort: L · deps: DEV-A1, DEV-A2
 - **Goal:** The Devices domain REST surface: registry stores + CRUD + bare-verb actions, OpenAPI-first.
 - **Touches:** `crates/multiview-control/src/resource_store.rs` (add `DeviceKind`/`SyncGroupKind` markers), new `crates/multiview-control/src/devices/mod.rs` (registry + state machine), new routes + `openapi.rs` registration.
 - **Acceptance (done when):** `/devices` + `/sync-groups` CRUD with ETag/If-Match→412 + Idempotency-Key; `DELETE /devices/{id}` 409s while sources/outputs are bound; bare-verb actions (`probe`, `set-mode` → 202+operation id with declared impact, `reboot` → 202, `identify`/`test-pattern` → 204) per ADR-W017; the DISCOVERED→ADOPTING→ONLINE/DEGRADED/AUTH_FAILED/UNREACHABLE state machine unit-tested; the **conflating broadcaster + session-pump ring rule** (`topic.is_high_rate() || event.is_conflated()`, ADR-RT007) implemented and explicitly tested — resume-after-gap replays lifecycle events losslessly while `device.status` arrives as a fresh snapshot; event `driver` strings constructed only from `multiview_config::DeviceDriver`'s serde wire form, never hand-typed; handlers tested socket-free via `tower::oneshot`; `cargo xtask gen-openapi` regenerated; audit entries on every mutation; IPv6-first examples (bracketed literals).
 
-### `[ ]` DEV-A4 — `zowietek` driver: typed client + poller + three facets (ADR-M009) · effort: XL · deps: DEV-A3
+### `[x]` DEV-A4 — `zowietek` driver: typed client + poller + three facets (ADR-M009) · effort: XL · deps: DEV-A3
 - **Goal:** First vendor driver, clean-room over the vendor-published HTTP API; devices stay a control-plane concern (no engine/`multiview-input` feature).
 - **Touches:** new `crates/multiview-control/src/devices/{driver,zowietek}.rs`; per-driver off-by-default feature (`zowietek` / `devices-net` umbrella).
 - **Acceptance (done when):** typed JSON-RPC client survives the verified doc hazards (per-device request serialization; backoff on busy codes; `"00000"` vs `"000000"` + `rsp` text drift tolerated; no-HTTP-response on LAN/mDNS/port sets handled as expected reboot); poll-only status ≤1 Hz per status group; the three facets produce **ordinary** managed Sources/Outputs carrying a `device_ref`; `desired_mode` convergence declares device-side (DEV-class) impact before apply (close-before-open semantics); default `cargo check` stays pure-Rust/socket-free with the model compiled + fake-transport tests; bitrate-unit ambiguity recorded as a hardware-verification item, never guessed into the schema. (Hardware leg: typed client validated on a real ZowieBox — **gated on purchase**.)
 
-### `[ ]` DEV-A5 — Discovery infra: mDNS browse + `/discovery/devices` + confirm-adopt · effort: M · deps: DEV-A3
+### `[x]` DEV-A5 — Discovery infra: mDNS browse + `/discovery/devices` + confirm-adopt · effort: M · deps: DEV-A3
 - **Goal:** New shared discovery infrastructure (verified: no working mDNS code exists in-repo) for zowietek/cast/displaynode browsing.
 - **Touches:** new mDNS module in `multiview-control` (an `mdns-sd`-class crate behind the net feature), `/discovery/devices` routes.
 - **Acceptance (done when):** `POST /discovery/devices/scan` → 202 + results as events; `GET /discovery/devices` returns an **untrusted inventory** requiring explicit confirm-adopt (ADR-0041 doctrine — never auto-ingest); results AAAA-first with IPv4 entries labelled *legacy*; browse task bounded + off the engine path; socket-free tests via an injected browser seam.
 
-### `[ ]` DEV-A6 — SPA: DevicesPage, adopt flow, detail tabs, pickers, help · effort: L · deps: DEV-A3, DEV-A4
+### `[x]` DEV-A6 — SPA: DevicesPage, adopt flow, detail tabs, pickers, help · effort: L · deps: DEV-A3, DEV-A4
+- **Status:** SHIPPED (branch `ship/dev-a6-devices-spa`). DevicesPage (state badges icon+text, driver/mode/temperature/last-seen/sync-chip, current-stream link — first device-reported stream's role+health linking to the detail Streams tab via `?tab=streams` — conflated `device.status` WS lane + REST fallback), adopt by address+driver and from the untrusted discovery inventory (scan 202, corr-correlated rows, explicit confirm-adopt — never auto), detail tabs Overview/Streams/Sync/Maintenance/Events (202 verbs via `submitOperation`, declared DEV-class impact before set-mode, §11 failure UX for UNREACHABLE/AUTH_FAILED/DEGRADED), SyncGroupsPage CRUD (per-member `offset_ms`, `target_skew_ms`, weakest-member tier, cast excluded), "From device" sections in the Sources/Outputs add flows (bound streams become ordinary Sources/Outputs with `device_ref`, so they appear in `SourcePalette` automatically), the four help pages + glossary/config-reference. **Scope boundaries (per this schedule's own lanes):** the detail **Display** tab + enrollment tokens ship with **DEV-B6** (its `Touches` owns "SPA Display tab"; the enroll/pair/head-binding routes don't exist yet); `/help/casting` ships with **DEV-D3** (cast driver DEV-D2 unbuilt). **Backend gap:** no firmware *version* exists in `DeviceStatus`/OpenAPI (only the `firmware_update` capability bool), so the "firmware chip where known" has no data source until a driver surfaces one — UI follow-up is trivial once the field lands.
 - **Goal:** Devices nav entry (between Outputs and Monitoring) + full device management UX.
 - **Touches:** `web/src/pages/` (DevicesPage, device detail tabs, Sync Groups page), `web/src/layout/components/SourcePalette.tsx` ("From device" picker), generated OpenAPI client, in-app help.
-- **Acceptance (done when):** list shows state badge (never colour-alone), mode, firmware chip, temperature, sync-group chip, last-seen; adopt flow from discovery inventory; detail tabs (Overview/Display/Streams/Sync/Maintenance/Events); Sources/Outputs pickers gain "From device" sections; 202 actions ride `submitOperation`; `/help/devices`, `/help/devices/adopt`, `/help/display-nodes`, `/help/sync` pages exist; vitest component tests + `tsc`/`eslint` clean.
+- **Acceptance (done when):** list shows state badge (never colour-alone), mode, firmware chip, temperature, current stream link (role + health, deep-linking to the detail Streams tab), sync-group chip, last-seen; adopt flow from discovery inventory; detail tabs (Overview/Display/Streams/Sync/Maintenance/Events); Sources/Outputs pickers gain "From device" sections; 202 actions ride `submitOperation`; `/help/devices`, `/help/devices/adopt`, `/help/display-nodes`, `/help/sync` pages exist; vitest component tests + `tsc`/`eslint` clean.
 
 ### `[x]` DEV-B1 — `display-kms` sink + `Output::Display` wired end-to-end (ADR-0044) · effort: XL · deps: none (1-day fence spike first: IN_FENCE_FD/OUT_FENCE_PTR via the drm-rs property API; syncobjs fallback)
 - **Status:** SHIPPED (branch `ship/dev-b1-display-kms`). Spike verdict: both fence properties ARE expressible via drm-rs 0.15's generic property path (`Value::SignedRange` / `Value::Unknown`), but `OUT_FENCE_PTR` needs raw-pointer plumbing for zero v1 benefit (the v1 producer is the CPU; `PageFlipEvent` timestamps already cover skew telemetry) — **flip-event-only v1**, syncobjs (verified present) reserved for DEV-B3's GPU path. gbm 0.18's BO API suffices for XRGB scanout (`SCANOUT|WRITE|LINEAR` + `map_mut`); its `drm-support` targets drm 0.14, so GEM handles cross via prime-fd export/import (zero `unsafe`). v1 frame path: CPU NV12→XRGB (BT.709, integer 8.8) into GBM-allocated buffers, dumb-buffer fallback (NVIDIA). Hardware-only code is confined to `display/kms.rs`; everything else (mailbox, mode policy + kernel-golden CVT-RB, FlipDriver, sink thread over the `KmsBackend` mock seam) is CI-tested hardware-free. Hardware validation legs (TEST_ONLY probe on real planes, t630/NVIDIA smoke) ride DEV-B2/B3 hardware time.
@@ -1183,18 +1295,19 @@ no Pi 5 exists).
 - **Touches:** new `crates/multiview-output/src/display/` behind a new off-by-default `display-kms` feature (drm + gbm crates; `cargo deny` green); `crates/multiview-config/src/schema.rs` `Output::Display` threaded through the five exhaustive same-crate matches (`explicit_id`/`gpu_pin`/`audio`/`label`/`validate_outputs`); `crates/multiview-cli/src/pipeline.rs` `build_outputs` (pipeline.rs:3724); the SPA output form (a schema-only edit would be a parseable-but-skipped output — ships fully wired).
 - **Acceptance (done when):** a dedicated sink thread owns the DRM fd; flip loop = page-flip-complete → take latest mailbox frame → `atomic_commit(NONBLOCK | PAGE_FLIP_EVENT)`, at most one in-flight commit per CRTC, no-new-frame → do nothing (KMS repeats); a wedged display provably cannot stall the canvas publish (mailbox conflation test — inv #1/#10); `ALLOW_MODESET` never on the frame path; `TEST_ONLY` probes validate plane formats/modifiers at startup; EDID preferred mode chosen by **exact-rational** refresh match (never float fps) + CVT-RB forced-mode fallback for EDID-less heads (per-connector config override); `Output::Display` parses, round-trips, and is built (not skipped) by `build_outputs`; KMS-less CI green via a fake-DRM seam.
 
-### `[ ]` DEV-B2 — HAL/placement scanout affinity · effort: L · deps: DEV-B1
+### `[x]` DEV-B2 — HAL/placement scanout affinity · effort: L · deps: DEV-B1
 - **Goal:** The display sink is the first GPU-resident raw-frame consumer; the framebuffer must live on the connector-owning GPU.
 - **Touches:** `crates/multiview-hal/src/probe.rs` (KMS card-node/connector discovery), `crates/multiview-hal/src/select.rs` (sink-locality constraint), `crates/multiview-engine/src/placement.rs` (migration/split awareness).
 - **Acceptance (done when):** probe reports connector-owning card nodes; selection pins composite to the display GPU when a Display sink exists; the placement controller never proposes migrating composite off the scanout GPU (which would force the per-frame GPU→host→GPU copy ADR-0018 forbids) — unit-tested on multi-GPU fixtures; trivially satisfied single-GPU. (Hardware leg: multi-GPU affinity gate exercised on the GPU test server.)
 
-### `[ ]` DEV-B3 — Render path: NV12 direct scanout + wgpu NV12→XRGB fallback · effort: L · deps: DEV-B1
+### `[x]` DEV-B3 — Render path: NV12 direct scanout + wgpu NV12→XRGB fallback · effort: L · deps: DEV-B1
 - **Status:** CODE SHIPPED (branch `ship/dev-b3-render-path`), hardware-validation legs pending. The per-hardware buffer-strategy decision is a pure, always-compiled, GPU-free module (`display/strategy.rs`): `select_buffer_strategy` resolves a probed head to **NV12-direct** (Intel Gen9+/vc4, incl. SAND128), the **wgpu XRGB pass**, or the **CPU NV12→XRGB** default; `plane_supports_nv12` gates on format AND the `IN_FORMATS` modifier (the #5727 mis-tile hazard); `parse_in_formats_blob` reads the kernel modifier blob (bounds-checked, `None` not panic on garbage). 14 strategy + 4 canvas-seam unit tests, all GPU-free. The **NV12-direct ADDFB2 path is fully built in `display/kms.rs`** (drm/gbm only — `prime_fd_to_buffer` per plane → `PlanarBuffer` adapter → `add_planar_framebuffer` with the modifier → flip; 0 copies/0 passes; retired-fb teardown; CPU fallback on import failure) and **compiles on the current pin** (drm 0.15 + gbm 0.18). `DisplayCanvas` gained `delivery()` + `dmabuf_image()` (borrowed fds) so a dmabuf canvas opts into the zero-copy path; the shipped CLI `CanvasFrame` is CPU-planes, so the CPU convert runs today. **wgpu-version verdict (RECORDED):** workspace pin is **wgpu 29.0.3**; `SurfaceTargetUnsafe::Drm` + `create_texture_from_hal` + `wgpu_hal::vulkan::texture_from_raw(external_memory…)` all exist, but there is **no safe `texture_from_dmabuf_fd` in v29** (lands later) — dmabuf import on this pin needs `wgpu-hal`+`ash` as new direct deps + raw-Vulkan `unsafe` in this `forbid(unsafe_code)` crate. **Decision: defer the wgpu pass, ship the CPU NV12→XRGB path as the AMD/fallback default** (correct + modest ~0.7 GB/s budget); a whole-workspace wgpu bump to get safe import is the unilateral bump this task says not to make. The `WgpuXrgbPass` variant + `gpu_pass_available` seam compile + are unit-tested; flipping it on is a localized follow-up when the pin advances. Default `cargo check`/`test`/`clippy`/`fmt`/`deny` green with **zero new deps**; `display-kms` build + clippy + tests green. Hardware legs remain: Pi golden NV12-scanout (gated on Pi acquisition); t630 RGB/CPU-path validation; a real dmabuf-canvas to exercise NV12-direct end-to-end on glass.
 - **Goal:** Per-hardware buffer strategy, verified per display block.
 - **Touches:** `crates/multiview-output/src/display/` (+ wgpu interop, GBM allocation path).
 - **Acceptance (done when):** Intel Gen9+/Pi vc4 path does NV12 (Pi: NV12/P030 + SAND modifier) decoder-dmabuf → `ADDFB2` → plane with **0 copies/0 render passes**; AMD DCE11 path (no NV12 scanout exists — confirmed in kernel source) runs exactly one wgpu NV12→XRGB pass into a GBM-allocated scanout buffer (dmabuf import; `SurfaceTargetUnsafe::Drm` fallback), budget documented (~0.7 GB/s @ 1080p60); NVIDIA documented as wgpu-DRM-surface-only tier-2 (no raw-KMS GBM path); the workspace wgpu version pin is decided + recorded. (Hardware legs: Pi golden NV12-scanout test on the deploy kernel — **gated on Pi acquisition**; t630 RGB-pass validation — runs on the dedicated t630 test target.)
 
 ### `[ ]` DEV-B4 — ALSA HDMI audio sink (ELD-gated) + buffer servo · effort: L · deps: DEV-B1
+- **Status:** CODE SHIPPED (branch `ship/dev-b4-alsa-hdmi`), hardware-validation legs pending. The whole sink logic is pure, always-compiled and CI-tested over two trait seams (`EldSource`/`AlsaSink`, `display/audio/`): binary-ELD parse at the kernel's real `hda_eld.c` offsets + the kernel-verbatim **textual** `/proc` ELD parser; bounded drop-oldest `AudioFifo` (wait-free push, inv #1/#10); PI `BufferServo` whose drain demand is applied to multiview-audio's new ratio-driven `AdaptiveResampler` (ADR-R005 reuse) via the **reciprocal** `drain_ratio` (the direct application is positive feedback — pinned by a closed-loop sim over the real parts under a +300 ppm crystal); `skew_ms` scanout-alignment term anchored on the head's `last_flip_ns` flip clock through `start_with_flip_clock`; channel fold (`ChannelMatrix` reuse) when the ELD clamps below the program layout; `XrunRecovery` underrun/suspend → recover/Degraded-backoff machine; ELD hotplug re-check re-gates + renegotiates. Hardware leg (`display-kms`, zero default-graph deps): `hdmi:CARD=` PCM with raw-`hw:` fallback over the SAFE `alsa` crate (libasound dyn-linked LGPL, no `unsafe`, crate stays `forbid(unsafe_code)`); ELD via proc text (x86 HDA) **and** the binary `"ELD"` ctl elem (Pi vc4/ASoC has no proc file); connector→card discovery = pure policy (`discover.rs`: vc4 card-per-port + first-lit-`eld#` heuristic with the entry ordinal as `hdmi:` `DEV=`) + thin I/O shell. Wired end-to-end in `pipeline.rs`: `Output::Display` audio flag → discovery → sink start with the head's flip clock (EDID-less head → video-only, logged); heads hear the post-loudnorm program block from the bake consumer (wait-free FIFO push), or a dedicated tick-driven bus on video-only runs. All gates green (default + `display-kms` check/clippy/test, fmt, deny). Hardware legs remain: t630 HDA leg (ELD text + hdmi: PCM + xrun soak) and Pi vc4 leg (ctl-elem ELD + card config; gated on Pi acquisition); multi-lit-pin DEV ordinal heuristic verified on hardware.
 - **Goal:** HDMI audio for display heads, reconciling three independent clocks (engine tick, pixel clock, sample clock).
 - **Touches:** new ALSA sink under `crates/multiview-output/src/display/` (feature-gated); reuses the adaptive resampler carried in `crates/multiview-audio`.
 - **Acceptance (done when):** opens the `hdmi:CARD=…` PCM (sets IEC958 channel status; Pi vc4-hdmi via the alsa-lib card config, not raw `hw:`); ELD-gated via `/proc/asound/cardN/eld#C.P` — audio flows only while the pipe is lit (our always-lit sink guarantees it), EDID-less heads get **no** audio path (documented); bounded audio FIFO + buffer-level servo drives the resampler (the mpv/Kodi display-resample technique); the audio path can never block the flip loop; CI tests over fake ELD/PCM seams.
@@ -1206,13 +1319,14 @@ no Pi 5 exists).
 
 ### `[ ]` DEV-B6 — Node enrollment/pairing + `displaynode` driver + head binding · effort: M · deps: DEV-A3, DEV-B5
 - **Goal:** Nodes become managed devices: enrollment, pairing, and display-head assignment.
-- **Touches:** `multiview-control` devices module (`displaynode` driver variant), `/devices/enroll` + `/devices/pair` routes, SPA Display tab, wall-head binding against `crates/multiview-config/src/wall.rs` (`WallConfig`/`HeadConfig`).
-- **Acceptance (done when):** enroll = node→controller with a TTL'd token bound to a node keypair; pair = operator completes screen pairing (6-char code + QR); a paired node appears as a device projecting display heads; head assignment binds `{ wall_head }` / `{ program }` / `{ output }` per the config sketch; enrollment tokens one-time-display + hashed at rest.
+- **Touches:** `multiview-control` devices module (`displaynode` driver variant), `/devices/enroll` + `/devices/pair` routes, SPA Display tab, SPA Settings → Display Nodes (node image/package download + enrollment tokens), wall-head binding against `crates/multiview-config/src/wall.rs` (`WallConfig`/`HeadConfig`).
+- **Acceptance (done when):** enroll = node→controller with a TTL'd token bound to a node keypair; pair = operator completes screen pairing (6-char code + QR); a paired node appears as a device projecting display heads; head assignment binds `{ wall_head }` / `{ program }` / `{ output }` per the config sketch; enrollment tokens one-time-display + hashed at rest; Settings → Display Nodes offers the node image/package download alongside token minting (the managed-devices.md §9 surface).
 
-### `[ ]` DEV-C1 — Outbound presentation epoch (ADR-M010) · effort: L · deps: DEV-A2
+### `[x]` DEV-C1 — Outbound presentation epoch (ADR-M010) · effort: L · deps: DEV-A2
 - **Goal:** One outbound `WallClockRef` per program so consumers can present against a common wall timeline — the core new outbound timing work.
 - **Touches:** `crates/multiview-engine/src/` (epoch derivation from the existing `ptp.rs` servo / `sysref.rs` chrony estimate), reuse of `crates/multiview-core/src/wallclock.rs` `WallClockRef`, `multiview-events` publication, `crates/multiview-output/` (RTCP SR on RTSP — today the crate emits no RTCP; `EXT-X-PROGRAM-DATE-TIME` field on `hls/media.rs` segments; optional RFC 7273 `ts-refclk`/`mediaclk` SDP attributes).
 - **Acceptance (done when):** `{stream_id, WallClockRef, link_offset, clock_source/quality}` published per program on the control WS (conflated, drop-oldest — inv #10); RTCP SR NTP↔RTP pairs and HLS PDT are stamped from the **same** epoch; chaos test kills PTP/WS mid-run and the output cadence is unaffected (PTP disciplines an estimate, never paces the tick loop — inv #1); exact-integer arithmetic throughout (never float).
+- **As-built:** `multiview_engine::epoch` — `EpochTracker` (anchor-once → **hold** inside a 2 ms deadband → bounded **slew** ≤5 ms/observation → **step** only past 250 ms, the Class-2-like re-anchor; property-tested) + `EpochSampler` (`wall@tick0 = wall_now − (mono_mid − seed)`, media units = output-PTS ns at `EPOCH_RATE` 1 GHz, exact `i128` via the new `WallClockRef::media_at` inverse) selecting per ADR-T012 through the existing `ReferenceSelector`: PTP-while-disciplined (servo `local−master` offset subtracted; holdover stays PTP) else the system clock, with honest `ClockSource`/`ClockQuality`. Publication: `multiview_cli::timing_status` (~1 Hz task, both run paths) binds lazily to the run's tick-0 anchor slot (lock-free `ArcSwapOption`, filled when the program clock seeds) and pushes conflated `timing.status` (`stream_id "main"`, `groups: []` until DEV-C3 measures) through the drop-oldest `EnginePublisher` the WS pump forwards, while mirroring the epoch into the `multiview_output::SharedEpoch` cell. HLS: `LivePlaylist`/`MediaPlaylist` stamp `EXT-X-PROGRAM-DATE-TIME: epoch.wall_at(segment first PTS)` via a pure-integer ISO 8601 formatter (hardware-checked live: consecutive segments exactly +1.000 s, stable ms phase). Config: `[timing] link_offset_ms` (default 150, ≤10 s bound) + `ptp_phc` (the `ptp`-feature PHC sampling leg; compile-verified only — no PTP NIC). **Honest boundary:** RTCP SR ships as the fully-tested `rtcp::SrStamper` seam (exact NTP/RTP math + 28-byte wire form) carried by `RtspServerSink::sender_report` — the `gst-rtsp-server` path still emits its own pipeline-clock SRs (adopting the seam needs the rtpbin `on-sending-rtcp` hook on a GStreamer-equipped runner; the CLI cannot run the RTSP server at all today); RFC 7273 SDP attrs are **not emitted** (the only SDP generator lives inside `gst-rtsp-server`; optional/non-load-bearing per the ADR). Chaos: `epoch_observation_does_not_change_the_tick_stream` pins inv #1; a consumer that loses the WS keeps the last epoch by construction (conflated latest-wins, ring-excluded).
 
 ### `[ ]` DEV-C2 — Node presentation discipline + skew telemetry · effort: M · deps: DEV-B5, DEV-C1
 - **Goal:** Frame-accurate presentation on nodes: pure pull-side frame choice, never engine feedback.
@@ -1392,6 +1506,10 @@ MP-6/MP-8 fan out once MP-2 lands.
   3-program config (multiview+passthrough+transcode) validates and round-trips losslessly;
   a config with both legacy + `[[programs]]` is rejected.
   *Re-verify:* config invariants only (no engine change); #7 (per-program outputs).
+  *Cross-ref (2026-06-11):* the production-switcher stream lands this slice FIRST — **SW-A1**
+  ships the `programs` schema root + the `OutputCrosspoint.program` cross-validation as the
+  switcher prerequisite (ADR-M012; brief [production-switcher](../research/production-switcher.md)).
+  MP-5 is subsumed by SW-A1, not duplicated; flip both together.
 
 - **MP-6 — Programs API + realtime.**
   `PROGRAM_KIND` + `routes/programs.rs` CRUD (ETag/If-Match→412, Idempotency-Key, RFC 9457);
@@ -1472,7 +1590,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
 `12` (live wire + hardware, behind operator confirmations). Critical path:
 `0 → 1 → {2,3} → 7 → 9 → 11 → 12`.
 
-### `[ ]` CONSPECT-0 — `multiview-licence` shell: EXACT constants + `LicenceStatus` types · effort: M · deps: none
+### `[x]` CONSPECT-0 — `multiview-licence` shell: EXACT constants + `LicenceStatus` types · effort: M · deps: none · _SHIPPED (PR #86): `multiview-licence` crate — entitlement/lease/ladder/fingerprint/verify, §2 EXACT constants, CONSPECT-0 data model_
 - **Goal:** Stand up the greenfield leaf crate with the §2 constants as named items, the
   `LicenceStatus`/`Enforcement{level,reasons,since,lease}` published types, and the
   `enforcement.level` enum — the *data* every surface renders. Pure-Rust shell; no network.
@@ -1490,7 +1608,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   default build network-free so CI stays pure.
 - **Read first:** brief §2, §6.1; [conventions §3](../architecture/conventions.md); [ADR-0050](../decisions/ADR-0050.md) §1–§4.
 
-### `[ ]` CONSPECT-1 — entitlement/lease/claim/transfer/fingerprint state machines (data, not control flow) · effort: L · deps: CONSPECT-0
+### `[x]` CONSPECT-1 — entitlement/lease/claim/transfer/fingerprint state machines (data, not control flow) · effort: L · deps: CONSPECT-0 · _SHIPPED (PR #86/90): state machines in `crates/multiview-licence/src/{lease,ladder,verify,fingerprint,challenge,watcher}.rs` + lease-lifecycle routes_
 - **Goal:** Implement the pure state machines that *compute* `enforcement.level` off the hot loop, plus
   the salted-digest fingerprint **score**, all as data — tested with `proptest-state-machine`.
 - **Touches:** `crates/multiview-licence/src/{lease,claim,transfer,fingerprint,ladder}.rs`.
@@ -1507,7 +1625,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   provenance is operator-confirm O6 — take it as a constructor parameter for now.
 - **Read first:** brief §6, §12; [ADR-0050](../decisions/ADR-0050.md) §2, §4, §6, §8.
 
-### `[ ]` CONSPECT-2 — engine seams S1/S2/S3 + the never-off-air chaos test · effort: M · deps: CONSPECT-1
+### `[x]` CONSPECT-2 — engine seams S1/S2/S3 + the never-off-air chaos test · effort: M · deps: CONSPECT-1 · _SHIPPED (PR #94): S1 startup gate + S3 tile-watermark signal in `crates/multiview-cli/src/licence.rs` + `run.rs`; enforcement hooks wired_
 - **Goal:** Wire the three engine seams as **two pre-derived atomics + a startup gate**, and prove
   never-off-air with an executable chaos test (the §6.3 proof made real).
 - **Touches:** `crates/multiview-cli/src/run.rs` (S1 at `SoftwareEngine::build()` before
@@ -1528,7 +1646,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   (no full-canvas colour round-trip).
 - **Read first:** brief §5, §6.3, §16; [ADR-0050](../decisions/ADR-0050.md) §3, §5; [ADR-I001](../decisions/ADR-I001.md); [ADR-T001](../decisions/ADR-T001.md).
 
-### `[ ]` CONSPECT-3 — heartbeat client (feature-gated) + S4 status surface + lease renew · effort: L · deps: CONSPECT-1
+### `[ ]` CONSPECT-3 — heartbeat client (feature-gated) + S4 status surface + lease renew · effort: L · deps: CONSPECT-1 · _O1-blocked on external Licensing Architecture wire protocol (no `heartbeat.rs` on main yet)_
 - **Goal:** The `heartbeat`-feature network client that contacts the licence server (monthly minimum),
   renews the lease on success, and publishes `LicenceStatus` wait-free (seam S4). State model stays
   always-compiled; a build with the feature **off** reports `unlicensed-build` honestly.
@@ -1545,7 +1663,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   The client is off in default/CI, on in shipped presets.
 - **Read first:** brief §4, §7, §8; [ADR-0050](../decisions/ADR-0050.md) §3, §7; [ADR-0052](../decisions/ADR-0052.md) §1.
 
-### `[ ]` CONSPECT-4 — `multiview-mesh` discovery: always-on mDNS + signed summaries + untrusted confirm-adopt · effort: M · deps: CONSPECT-1
+### `[x]` CONSPECT-4 — `multiview-mesh` discovery: always-on mDNS + signed summaries + untrusted confirm-adopt · effort: M · deps: CONSPECT-1 · _SHIPPED (PR #104): `crates/multiview-mesh/` — always-on mDNS announce, untrusted peer inventory, signed summaries, confirm-adopt_
 - **Goal:** The greenfield mesh crate's discovery half — IPv6-first mDNS announce/browse of
   Ed25519-signed salted-digest summaries into a bounded **untrusted** inventory with explicit
   confirm-adopt (the ADR-0041 doctrine).
@@ -1564,7 +1682,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
 - **Risks/notes:** auto-adopt is the classic mDNS footgun — forbidden; confirm-adopt only.
 - **Read first:** brief §9.1, §8; [ADR-0051](../decisions/ADR-0051.md) §2, §3; [ADR-0041](../decisions/ADR-0041.md); [ADR-0042](../decisions/ADR-0042.md).
 
-### `[ ]` CONSPECT-5 — mesh relay (end-to-end signed, bounded, dumb carrier) · effort: L · deps: CONSPECT-3, CONSPECT-4
+### `[x]` CONSPECT-5 — mesh relay (end-to-end signed, bounded, dumb carrier) · effort: L · deps: CONSPECT-3, CONSPECT-4 · _SHIPPED (PR #104): mesh relay carrier in `crates/multiview-mesh/`; CONSPECT-3a mesh plane wired into daemon_
 - **Goal:** Relay an adopted offline neighbour's heartbeat to the licence server and carry the signed
   response back — the relayer a **dumb carrier** that cannot read/forge/alter the assertion.
 - **Touches:** `crates/multiview-mesh/src/relay.rs`; the bounded drop-oldest relay queue; the cli
@@ -1580,7 +1698,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   O1/O2) — code against the same `LicenceServer`/fake.
 - **Read first:** brief §9.2; [ADR-0051](../decisions/ADR-0051.md) §4, §5.
 
-### `[ ]` CONSPECT-6 — telemetry two-pipe + consent (LWW) + S5 consent-independent retention · effort: M · deps: CONSPECT-0
+### `[x]` CONSPECT-6 — telemetry two-pipe + consent (LWW) + S5 consent-independent retention · effort: M · deps: CONSPECT-0 · _SHIPPED (PR #92/120): `multiview-telemetry::retention` (S5 consent-independent store) + telemetry consent/diagnostics routes_
 - **Goal:** Add the **opt-in daily telemetry** pipe (distinct from the heartbeat), the LWW consent
   document, and the **consent-independent** bounded local metrics buffer (seam S5) — all additive in
   `multiview-telemetry`, never co-mingled with the heartbeat.
@@ -1596,7 +1714,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   UI/API copy must never present the two pipes as one switch.
 - **Read first:** brief §7, §8; [ADR-0052](../decisions/ADR-0052.md) §1–§5.
 
-### `[ ]` CONSPECT-7 — control routes batch A: licence/claim/transfer/fingerprint/enforcement + OpenAPI · effort: L · deps: CONSPECT-1, CONSPECT-3
+### `[x]` CONSPECT-7 — control routes batch A: licence/claim/transfer/fingerprint/enforcement + OpenAPI · effort: L · deps: CONSPECT-1, CONSPECT-3 · _SHIPPED (PR #90/106/109): `routes/licence.rs` (GET/POST/challenge) + `routes/account.rs` (audit+actions) + relay-toggle audit_
 - **Goal:** The §11 routes 1–15 in **new** `routes/account/*.rs`, registered + documented by the
   **single** route/OpenAPI owner (§15 coordination) so the WebUI session codes against named routes.
 - **Touches:** new `crates/multiview-control/src/routes/account/{licence,claim,transfer,fingerprint}.rs`;
@@ -1613,7 +1731,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   `routes/mod.rs` churn (§15); the WebUI session is told the route/schema names up front.
 - **Read first:** brief §11, §15; [ADR-0050](../decisions/ADR-0050.md) §8; control-api scout patterns.
 
-### `[ ]` CONSPECT-8 — control routes batch B: telemetry/consent/metrics/mesh · effort: M · deps: CONSPECT-6, CONSPECT-4
+### `[x]` CONSPECT-8 — control routes batch B: telemetry/consent/metrics/mesh · effort: M · deps: CONSPECT-6, CONSPECT-4 · _SHIPPED (PR #92/104): `routes/telemetry.rs` (consent/diagnostics/metrics) + `routes/mesh.rs` (status/relay/peers)_
 - **Goal:** The §11 routes 16–25 — telemetry/consent/local-metrics + mesh peers/adopt/relay.
 - **Touches:** new `routes/account/telemetry.rs` + `routes/mesh.rs`; `routes/mod.rs`/`openapi.rs`
   (single owner); `state.rs` (mesh + telemetry stores).
@@ -1625,7 +1743,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
 - **Risks/notes:** same single-owner registration discipline (§15).
 - **Read first:** brief §7, §9, §11; [ADR-0052](../decisions/ADR-0052.md); [ADR-0051](../decisions/ADR-0051.md).
 
-### `[ ]` CONSPECT-9 — support: ticketing + context-pack + data-request approval + append-only audit · effort: L · deps: CONSPECT-7, CONSPECT-6
+### `[x]` CONSPECT-9 — support: ticketing + context-pack + data-request approval + append-only audit · effort: L · deps: CONSPECT-7, CONSPECT-6 · _SHIPPED (PR #111): `routes/support.rs` — LOCAL support/ticketing, context-pack, append-only audit; 8 endpoints_
 - **Goal:** The §11 routes 26–34 — tickets, the **redacted** context-pack, **data-request local
   approval**, and the **append-only** account audit.
 - **Touches:** new `routes/account/{support,audit}.rs`; the support/audit stores (in-memory default,
@@ -1641,7 +1759,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
 - **Risks/notes:** reuse the existing audit-log rotation; keep secrets reference-only (ADR-M006).
 - **Read first:** brief §10, §11; [ADR-0053](../decisions/ADR-0053.md); [ADR-M006](../decisions/ADR-M006.md); [ADR-W015](../decisions/ADR-W015.md); [ADR-I003](../decisions/ADR-I003.md).
 
-### `[ ]` CONSPECT-10 — cli wiring: spawn the plane tasks + thread the two atomics · effort: M · deps: CONSPECT-2, CONSPECT-3, CONSPECT-4, CONSPECT-6
+### `[x]` CONSPECT-10 — cli wiring: spawn the plane tasks + thread the two atomics · effort: M · deps: CONSPECT-2, CONSPECT-3, CONSPECT-4, CONSPECT-6 · _SHIPPED (PR #94/92): `cli/licence.rs` (S1/S3 atomics + LeaseStore) + `cli/metrics_retention.rs` (S5); mesh plane wired in CONSPECT-3a_
 - **Goal:** Wire the planes into `multiview run`: spawn the heartbeat (S4), local-metrics (S5), and
   mesh announce/relay tasks; derive the two engine atomics (config-lock/watermark) from
   `LicenceStatus`; gate S1 at `SoftwareEngine::build()`. Additive, behind the `account` aggregation.
@@ -1656,7 +1774,7 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   data-plane integrator; keep the additions strictly additive + off-hot-loop.
 - **Read first:** brief §5, §13.6; [ADR-0050](../decisions/ADR-0050.md) §5, §9.
 
-### `[ ]` CONSPECT-11 — web/: 7 screens + chrome + generated-client regen · effort: XL · deps: CONSPECT-7, CONSPECT-8, CONSPECT-9
+### `[x]` CONSPECT-11 — web/: 7 screens + chrome + generated-client regen · effort: XL · deps: CONSPECT-7, CONSPECT-8, CONSPECT-9 · _SHIPPED (PR #122): AccountPage/LicencePage/MeshPage/DataPage + global chrome (header chip, ladder banner, pending-action strip)_
 - **Goal:** The 7 account screens (`/welcome`, `/settings/account`, `/licence`, `/data`, `/mesh`,
   `/system/actions`, account-side `/help` nested under DocsLayout) + global chrome (header chip,
   ladder banner, pending-action strip, config-lock interceptor), behind the WebUI-owner coordination.
@@ -1693,3 +1811,666 @@ used by the external portals — never round): `CLAIM_CODE_TTL`=15m · `CLAIM_RE
   licence-server availability) — explicitly gated, not parked. Everything upstream is buildable
   against the fake.
 - **Read first:** brief §14; [ADR-0050](../decisions/ADR-0050.md)/[ADR-0051](../decisions/ADR-0051.md) operator-confirm sections.
+
+
+---
+
+## SW — Production switcher
+
+**Grounding summary.** Designed 2026-06-11, code not started. Briefs:
+[production-switcher](../research/production-switcher.md) (M/E-inside-one-Program architecture,
+transitions, keyers, tally, control surface) and [media-playout](../research/media-playout.md)
+(media library, players, alpha media). Decisions: ADR-0054..0059, ADR-M012, ADR-RT008, ADR-W021,
+ADR-P007, ADR-T015, ADR-C007, ADR-MV006, ADR-R011 (all Proposed). Every claim below was re-verified
+against the worktree (the older briefs' as-built tables are stale — cite code, not briefs):
+
+- **The frame-boundary seam (BUILT):** `EngineRuntime::run_inner` invokes the per-tick control hook
+  between `clock.tick()` and `drive.compose(tick)` (`crates/multiview-engine/src/runtime.rs:432-439`,
+  invocation `control(&mut self.drive)` at :439). The hook type is
+  `FnMut(&mut CompositorDrive<Nv12Image>)` (runtime.rs:345) — it does **not** receive the `Tick`,
+  so deterministic `progress = f(tick.index)` needs the SW-A2 signature widening.
+- **Compose path (BUILT):** `CompositorDrive::compose(tick)` (`crates/multiview-engine/src/drive.rs:449`)
+  rebuilds a transient z-sorted placement list per tick from pooled scratch (`ComposeScratch`,
+  drive.rs:670) and dispatches `multiview_compositor::backend::RunBackend::composite`;
+  `rebind_cell` (drive.rs:376) is the O(1) live crosspoint, `set_layout` (drive.rs:318) the validated
+  swap; `cell_dst_rect` (drive.rs:728) floors to integer rects — no sub-pixel, no transform, no mask.
+  `Cell.crop`/`Cell.rotation`/`FitMode` are type-level only (no compose-path consumer).
+- **Compositor primitives (BUILT, limited):** CPU `Tile<'a>` = integer dst rect + uniform opacity
+  (`crates/multiview-compositor/src/pipeline.rs:413`); per-pixel alpha is applied in
+  `fold_tile_into_band` (pipeline.rs:1075) — the wipe-mask/keyer insertion point; GPU `TileParams`
+  (`crates/multiview-compositor/src/gpu/uniforms.rs:82`) carries spare lanes in `dst_size`/
+  `opacity_transfer`; `composite_with_overlays` (`crates/multiview-compositor/src/gpu/compositor.rs:326`)
+  already chains composite→overlay→encode on-GPU without readback — the pass-fusion template; the
+  house SDF style exists twice (`gpu/shaders/overlay.wgsl:84` `rect_coverage`,
+  `src/overlay/subpass.rs:853`).
+- **Audio nucleus (BUILT, unreachable live):** `ProgramBus::repoint_crossfade`
+  (`crates/multiview-audio/src/program.rs:217`) + per-sample equal-power `GainRamp`
+  (`crates/multiview-audio/src/mixer.rs:35`) + `tick_to` (program.rs:306). But the run path HOLDS
+  `Command::RouteAudio` with a warn (`crates/multiview-cli/src/control.rs:933`), and
+  `RouteApplier::apply_audio` (`crates/multiview-engine/src/route.rs:358`) destructures
+  `RouteIntent::Audio { target, source, .. }` — `gain_db`/`mute` are dropped (route.rs:367).
+  `Event::AudioMeter` exists with zero production emitters
+  (`crates/multiview-events/src/event.rs:111`, :1138).
+- **Salvo + tally machines (BUILT, partially wired):** engine salvo `arm`/`cancel`/`take`
+  (`crates/multiview-engine/src/salvo.rs:158/169/189`) are wired through the drain; the pure
+  `TallyArbiter` (`crates/multiview-engine/src/tally/arbiter.rs:145`, `resolve` :185) has NO run-loop
+  caller — `SetTallyOverride` is an event echo; `run_tally_ingest`
+  (`crates/multiview-control/src/tally_ingest.rs:75`) is library-complete but unspawned (the binary
+  spawns only `run_warning_ingest`, `crates/multiview-cli/src/control.rs:134`).
+- **Routing + drain (BUILT):** `command_drain*` (`crates/multiview-cli/src/control.rs:523/574`) drains
+  at the frame boundary with `MAX_REPOINTS_PER_TICK = 32` (control.rs:598); `RouteIntent`/`RouteApplier`
+  (`crates/multiview-engine/src/route.rs:54/275/297`) coalesce last-wins per target.
+  `PacketRouter::move_sink` (`crates/multiview-output/src/fanout.rs:212`; `EncodeOnceDriver` :299,
+  :331) is BUILT + proof-tested in multiview-output with ZERO engine/cli callers — the RT-12 empty seam
+  (ADR-R010's own admission).
+- **Clean-feed anchor (BUILT):** the per-tick composited canvas `Arc` is stored into the wait-free
+  `ProgramSlot` (`crates/multiview-cli/src/preview.rs:28`) BEFORE the off-thread overlay bake —
+  `preview.store(Some(Arc::clone(&canvas)))` at `crates/multiview-cli/src/pipeline.rs:2122`; the bake
+  consumer (`consumer_main`, pipeline.rs:3015; `drive_audio_for_item`, pipeline.rs:2986) burns
+  overlays + encodes after the tap.
+- **Media substrate (BUILT, ~30% of a player):** production ingest is `ingest_loop`/`open_and_stream`
+  (`crates/multiview-cli/src/pipeline.rs:5533/5812` — NOT the unwired multiview-input `IngestPump`);
+  files pace via `PtsWallClock` (pipeline.rs:6189), play once, hold last frame forever;
+  `Demuxer::seek` exists with zero production callers (`crates/multiview-ffmpeg/src/demux.rs:549`);
+  `TileStore::is_primed` (`crates/multiview-framestore/src/tile.rs:311`) is the cue/ready gate;
+  `LiveSourceHub` (`crates/multiview-cli/src/live_sources.rs:189`) owns off-thread producer spawn.
+- **Control-plane pattern (BUILT):** the sync-groups domain file-set is the copy template —
+  `SyncGroupKind` marker (`crates/multiview-control/src/resource_store.rs:93`),
+  `TypedCollection` (`crates/multiview-control/src/typed_resources.rs:60`),
+  `routes/sync_groups.rs`, `rest_routes` test table (`crates/multiview-control/src/openapi.rs:300`).
+  The WS session never reads inbound frames (`run_ws_session`,
+  `crates/multiview-control/src/realtime.rs:878` — the loop only sends), so `$subscribe`/`$set_rate`
+  are types-only: ADR-RT008 pins publisher-side ~30 Hz conflation for high-rate switcher lanes.
+
+Lanes: **SW-A** engine core (SERIAL with LANE-CORE — §1d) · **SW-B** compositor primitives ·
+**SW-C** media · **SW-D** audio · **SW-E** tally & routing · **SW-F** control plane + SPA.
+Invariant posture: transitions/keyers/FTB are **sampled per tick, never pacing** (inv #1); all
+control rides the bounded bus → frame-boundary drain (inv #10); durations are integer frames at the
+exact-rational cadence (inv #3); every take is Class-classified with a `/plan` dry-run (inv #11).
+PR-sized slices + reuse tags + hard acceptance gates:
+[production-switcher-backlog](production-switcher-backlog.md).
+Format note (a deliberate two-tier deviation from the other streams' Part-3 shape): keystone items
+below carry the full Goal/Touches/Approach/Acceptance/Risks/Read-first structure; thin slices carry
+a one-paragraph summary and defer to their backlog row + ADR for the detail.
+
+---
+
+### `[ ]` SW-A1 — `[[programs]]` schema root + crosspoint cross-validation (lands MP-5) · effort: M · deps: none
+- **Goal:** The switcher prerequisite slice: add `programs: Vec<ProgramSpec>` to `MultiviewConfig`
+  so M/E programs and (later) aux/clean-feed programs are config-expressible, and close the latent
+  hole that `OutputCrosspoint.program` is only checked non-empty (any unknown program string
+  validates today).
+- **Touches:** `crates/multiview-config/src/lib.rs` (root field + desugar + validation),
+  `crates/multiview-config/src/program.rs` (`ProgramSpec` exists and is consumed by
+  `engine/programset.rs`; the schema root is the explicitly-deferred MP-5), `routing.rs`
+  (crosspoint cross-check).
+- **Approach:** the routing-block precedent verbatim: optional `#[serde(default)]` root, legacy
+  block desugars to one `Multiview` program (`id = "main"`) via `into_programs()`, both-populated
+  rejection, document-level checks (unique program ids, every `OutputCrosspoint.program` resolves,
+  unique output labels across programs). Round-trip TOML↔JSON.
+- **Acceptance (done when):** every existing v1 config parses to one `main` program; a 2-program
+  config validates + round-trips losslessly; both-populated rejected; an `OutputCrosspoint` naming
+  an unknown program now FAILS validation (new test, currently impossible to fail). MP-5 flips
+  with this item.
+- **Risks/notes:** config-only — no engine change; coordinate with SW-F1 (same root file,
+  coordination point iii). Multi-program runtime for N>1 remains MP-6+ scope.
+- **Read first:** [ADR-M012](../decisions/ADR-M012.md); [ADR-0030](../decisions/ADR-0030.md);
+  `crates/multiview-config/src/program.rs` docstring.
+
+### `[ ]` SW-A2 — Tick-widened control hook + switcher state-machine shell · effort: M · deps: none
+- **Goal:** Give the frame-boundary seam the `Tick`, and land the pure `SwitcherState` value machine
+  (PGM/PVW per M/E, armed next-transition set, in-flight transition descriptor, FTB level) that
+  every later SW-A item drives.
+- **Touches:** `crates/multiview-engine/src/runtime.rs` (hook signature at :345/:376/:401, invocation
+  :439 — back-compat wrapper so existing `FnMut(&mut CompositorDrive)` callers keep compiling), new
+  `crates/multiview-engine/src/switcher/` module, `crates/multiview-cli/src/control.rs` (drain
+  closure adopts the widened signature).
+- **Approach:** the salvo/tally/alarm house style — a pure machine over injected tick/MediaTime that
+  mutates only its own state and RETURNS the state for the engine to apply; no I/O, no allocation in
+  steady state, no `await`. The hook widening is mechanical: thread `tick` into the closure
+  parameter list (the `Tick` is already in scope at runtime.rs:431).
+- **Acceptance (done when):** all existing engine + cli tests green with the widened hook (proves
+  back-compat); new unit tests drive the machine with `ManualTimeSource`-style injected ticks and
+  assert cut/arm/progress state transitions as pure data; chaos re-assert: the hook still never
+  awaits (inv #1/#10 tests unchanged).
+- **Risks/notes:** this is THE inv-#1 seam — a design-note-bearing change; keep the wrapper so no
+  call site is forced to migrate in the same PR. Serial with LANE-CORE.
+- **Read first:** [ADR-0054](../decisions/ADR-0054.md);
+  [production-switcher](../research/production-switcher.md) (state-machine section);
+  `crates/multiview-engine/src/runtime.rs:420-445`.
+
+### `[ ]` SW-A3 — Render-plan resolver: `fn(scene_states, switcher_state, tick) → placements` · effort: L · deps: SW-A2
+- **Goal:** Promote drive's per-tick placement derivation into an injectable resolver so ONE program
+  renders as a function of TWO scene states + transition progress — the structural keystone for
+  PVW, transitions, keyers and derived tally.
+- **Touches:** `crates/multiview-engine/src/drive.rs` (the derivation inside `compose`,
+  drive.rs:449 onward; scratch pooling drive.rs:670), the SW-A2 switcher module (resolver input).
+- **Approach:** keep `compose(tick)` the only entry; the resolver consumes (PGM scene, PVW scene,
+  `SwitcherState`, `Tick`) and emits the same transient placement list `compose` builds today —
+  allocation-pooled like `ComposeScratch`, synchronous on the clock thread. A no-switcher
+  configuration must resolve to byte-identical placements (regression gate).
+- **Acceptance (done when):** no-switcher runs produce identical `CompositedFrame`s (golden test);
+  a two-scene resolve emits the union list with per-tick computed opacities; zero steady-state
+  allocation (the existing scratch-reuse assertions extended); `compose` budget unchanged on the
+  40 ms CPU bench.
+- **Risks/notes:** hot-path surgery in the protected core — serial with LANE-CORE, chaos/soak proof
+  per the MP-1 pattern (wedge a consumer, sibling keeps ticking) required in the same PR.
+- **Read first:** [ADR-0054](../decisions/ADR-0054.md); `crates/multiview-engine/src/drive.rs`
+  module doc; [ADR-R011](../decisions/ADR-R011.md).
+
+### `[ ]` SW-A4 — PVW bus: second compose per tick + per-bus preview slot + cue/pre-warm arm · effort: L · deps: SW-A3
+- **Goal:** An honest preview bus: the PVW scene composed against the SAME `Tick` inside the same
+  program, served to the UI, with cold sources warmed on arm so "what you see is what you take".
+- **Touches:** `crates/multiview-engine/src/drive.rs` (second resolve+composite), the degradation
+  ladder (`crates/multiview-hal/src/degradation.rs` — new rung between preview and tile rungs),
+  `crates/multiview-cli/src/preview.rs` (+ pipeline.rs projection: one `ProgramSlot` per bus),
+  cue/pre-warm worker per ADR-P004 (preview-crate Tier-B low-res cue decoder, prime-gated).
+- **Approach:** never a second `ProgramSet` program (independent clocks break frame-aligned take);
+  the PVW composite is a second `RunBackend::composite` dispatch over the SAME tick (shared
+  `TileStore`s are lock-free multi-reader by design); publish into a per-bus `ProgramSlot`
+  (the pipeline.rs:2122 pattern); selecting a cold source on PVW arms the pre-warm worker
+  (WARM-ON-ARM, `is_primed`-gated — RT-7 shape) so bind-on-take is Class-1.
+- **Acceptance (done when):** PVW slot serves a JPEG distinct from PGM within one tick of a
+  preview-bus change; the PVW composite cost is admission-accounted and shed BEFORE any program
+  rung (ladder test); a cold source selected on PVW reaches `is_primed` before take is offered
+  (gating test); chaos: a wedged PVW consumer never stalls the clock (inv #10).
+- **Risks/notes:** ~2× composite cost per tick when PVW is live — the reduced-rate/resolution PVW
+  is the documented degradation rung, not an afterthought. Vocabulary discipline: the switcher
+  PREVIEW BUS is operator state; the preview SUBSYSTEM (ADR-P001..P006) is monitoring — API
+  namespaces stay disjoint.
+- **Read first:** [ADR-P007](../decisions/ADR-P007.md); [ADR-P004](../decisions/ADR-P004.md);
+  [production-switcher](../research/production-switcher.md) (PVW + vocabulary sections).
+
+### `[ ]` SW-A5 — Transition engine wave 1: cut / mix / dip + auto/T-bar + flip-flop · effort: L · deps: SW-A3
+- **Goal:** The MVP transition family executed by the resolver: cut (atomic), mix{rate},
+  dip{rate, dip_source, switch_point default ½}, with auto, T-bar, direct program punch,
+  preview-transition, flip-flop, and next-transition arming ({background, key[1..n]}).
+- **Touches:** the SW-A2 switcher module (transition typestate), `drive.rs` resolver hooks; NO
+  compositor change for wave 1.
+- **Approach:** progress is a pure exact-rational function of `tick.index`; durations are integer
+  frames at the output cadence (API ms→frames via exact rationals — ADR-T015; never float).
+  Mix = the flat-list fast path (both scenes' cells in one z-ordered list, incoming opacity ramped)
+  for scenes without internal overlap; overlapping scenes detected at ARM time pre-render to NV12
+  intermediates (`Nv12Image` is both compose output and input — expressible today; fused on-GPU by
+  SW-B1). Dip = mix-to-`dip_source`-then-mix-from at `switch_point`. T-bar = idempotent absolute
+  progress setter, conflated latest-wins (never one command per sample); completion at 1.0 swaps
+  PGM↔PVW when flip-flop is on (default, per-M/E configurable).
+- **Acceptance (done when):** `ManualTimeSource` tests pin frame-exact start/progress/completion
+  for mix + dip at NTSC rationals (1001 denominators — long-run drift test); flip-flop and abort
+  semantics tested; an in-flight transition is NEVER shed (complete-then-degrade test) and AUTO
+  demotes to CUT at arm under injected overload; under source loss each side samples last-good —
+  a dying source cannot stall a transition (inv #2 test, ADR-R011); frames==ticks throughout
+  (inv #1 re-assert).
+- **Risks/notes:** the scene-pre-render path costs ~3× composite + an 8-bit NV12 re-quantization
+  per generation on CPU until SW-B1 fuses passes — bench-gate it; degradation interaction is part
+  of THIS item, not a follow-up.
+- **Read first:** [ADR-0055](../decisions/ADR-0055.md); [ADR-T015](../decisions/ADR-T015.md);
+  [ADR-R011](../decisions/ADR-R011.md); [ADR-C007](../decisions/ADR-C007.md) (dissolve law).
+
+### `[ ]` SW-A6 — On-clock DSK + FTB master stage · effort: L · deps: SW-A3, SW-B4, SW-B5, SW-C3
+- **Goal:** Downstream keyers and fade-to-black as render-plan stages frame-coordinated with
+  switcher state: M/E composite → DSK 1..n → FTB → program; clean = pre-DSK.
+- **Touches:** the resolver (canvas-level key stages after the M/E result), `drive.rs`; consumes
+  SW-B4 keyer kernels + SW-B5 alpha-plane sampling + SW-C3 NV12+A fills.
+- **Approach:** the existing off-thread egress overlay bake (OverlayBaker on the consumer thread)
+  is NOT frame-coordinated with on-clock state — it stays for monitoring overlays (labels, meters,
+  captions, watermark); production graphics that must cut/mix with the switcher run on-clock. DSKs:
+  linear/luma MVP, fill+key via the second per-tile source reference, TIE (join next transition) /
+  CUT (instant) / AUTO (own rate). FTB: final master stage AFTER the DSKs, fades everything at its
+  own integer-frame rate, optional audio-follow flag driving the SW-D3 master `GainRamp`; FTB is
+  always available regardless of source health (ADR-R011).
+- **Acceptance (done when):** a DSK TIE'd into an auto transition lands on the SAME frame as the
+  background cut (frame-exact test via `ManualTimeSource`); FTB ramps to true black in exactly N
+  frames and back, with the audio fade sample-aligned when the flag is set; keyer fill/key source
+  loss drops the keyer to off-air-safe (configurable) without touching the clock; the on-clock
+  stage cost is admission-accounted; monitoring overlays remain byte-identical when no DSK/FTB is
+  configured.
+- **Risks/notes:** this moves work onto the clock thread — budget it (the standing efficiency
+  review) and document the on-clock vs off-thread split in code; cross-lane deps make this the
+  natural lane-A/B/C integration point.
+- **Read first:** [ADR-0056](../decisions/ADR-0056.md); [ADR-0054](../decisions/ADR-0054.md)
+  (DSK placement decision); [ADR-0058](../decisions/ADR-0058.md).
+
+### `[ ]` SW-A7 — Switcher `Command` variants + drain + outcome events · effort: L · deps: SW-A5
+- **Goal:** Every switcher operation rides the existing bounded command bus and applies at the
+  frame boundary with observable outcomes.
+- **Touches:** `crates/multiview-control/src/command.rs` (`#[non_exhaustive]` `Command` —
+  set-preview/program-punch/cut/auto/set-transition/T-bar/FTB/DSK/media-transport/recall variants,
+  each carrying `OperationId`), `crates/multiview-cli/src/control.rs` (drain arms),
+  `crates/multiview-events/src/event.rs` (lifecycle events: transition.started/.completed,
+  ftb.engaged, keyer.on_air, media.player_state, macro.step).
+- **Approach:** mirror the route-coalescing rule — last-wins per M/E destination per tick, capped
+  like `MAX_REPOINTS_PER_TICK`; T-bar updates conflate into a latest-wins slot (high-rate input,
+  one apply per tick); outcome events publish drop-oldest from the drain. Lifecycle events are
+  lossless-ring class; progress is the conflated lane (SW-F3).
+- **Acceptance (done when):** a flooded bus of T-bar positions applies at most one per tick and
+  never stalls the clock (the CTL-1 `control_command_flood_never_falters_the_output_clock`
+  pattern); every accepted cut/auto/ftb yields exactly one outcome event; 503-shed on bus-full
+  preserved; events round-trip the versioned envelope.
+- **Risks/notes:** correlation (CorrKey) lands control-plane-side in SW-F2 — keep the event
+  payloads keyed by (me_id, phase) so the CorrKey arm is unambiguous, mirroring `Salvo{salvo,phase}`.
+- **Read first:** [ADR-W008](../decisions/ADR-W008.md); [ADR-RT008](../decisions/ADR-RT008.md);
+  `crates/multiview-cli/src/control.rs:480-600`.
+
+### `[ ]` SW-B1 — Scene pre-pass / on-GPU pass fusion · effort: L · deps: none
+- **Goal:** Render-to-texture scene handles so a general mix over overlapping scenes (and the
+  multi-box composition source) costs one fused GPU submission + ONE NV12 readback per tick instead
+  of three serialized submit+readbacks.
+- **Touches:** `crates/multiview-compositor/src/gpu/compositor.rs` (pass chaining — the
+  `composite_with_overlays` :326 template), `crates/multiview-compositor/src/pipeline.rs` (CPU
+  reference equivalent), `crates/multiview-engine/src/drive.rs` consumption seam (read-only — the
+  drive asks the backend for a scene handle; coordinate with the SW-A owner).
+- **Approach:** scenes composite into pooled `Rgba16Float` intermediates (linear light — no NV12
+  re-quantization between fused passes on GPU), final pass blends scene textures + encodes NV12
+  once; CPU reference chains `Nv12Image` composites (accepting the documented re-quantization) and
+  bench-gates the 2-scene mix exactly as `composite_realtime` hard-asserts 40 ms. Multi-box
+  composition = the same pre-pass fed by an internal `Layout` (background + overlapping z-ordered
+  cells), exposed as a bus-selectable source — never a chained ProgramSet program (one tick latency
+  + NV12 generation loss).
+- **Acceptance (done when):** GPU 2-scene mix produces SSIM ≥ threshold vs the CPU oracle on the
+  GPU box; exactly one readback per tick (counter assert); CPU 2-scene bench gate green; multi-box
+  source renders in the same tick as its consumers (no added latency vs a direct cell).
+- **Risks/notes:** MAX_TILES=64 budget now covers 2×N tiles + keys — assert the union fits or
+  degrade per the ladder; GPU-runner legs are `#[ignore]`-gated like GPU-4b.
+- **Read first:** [ADR-0056](../decisions/ADR-0056.md) (multi-box);
+  [ADR-0054](../decisions/ADR-0054.md); `crates/multiview-compositor/src/gpu/compositor.rs:326-422`.
+
+### `[ ]` SW-B2 — Wipe masks: per-tile SDF mask fn + softness/border · effort: L · deps: none
+- **Goal:** The wave-2 wipe family: per-tile closed-form mask functions (linear-edge, circle, box)
+  with softness and border fill, evaluated as per-pixel alpha.
+- **Touches:** `crates/multiview-compositor/src/gpu/uniforms.rs:82` (`TileParams` spare lanes →
+  mask id + params), `gpu/shaders/composite.wgsl` (mask evaluation at the opacity step),
+  `crates/multiview-compositor/src/pipeline.rs:1075` (`fold_tile_into_band` — the CPU twin).
+- **Approach:** reuse the house SDF style (`rect_coverage`/`segment_distance`/ring — identical
+  CPU+GPU in the overlay code already); mask alpha multiplies the uniform opacity exactly where it
+  applies today, BEFORE the premultiplied linear-light `over` (inv #8 preserved); wipe parameters
+  {pattern, softness, border_width, border_fill_source, position_xy, reverse, flip_flop} are data
+  on the transition descriptor (ADR-0055) — progress drives the SDF threshold.
+- **Acceptance (done when):** CPU oracle renders byte-exact goldens for each pattern at progress
+  ∈ {0, ¼, ½, ¾, 1}; GPU matches by SSIM/PSNR on the box; soft edges are monotonic (property test
+  over progress); no allocation per tick (params ride the existing uniform upload).
+- **Risks/notes:** keep mask math in one shared module consumed by both kernels or goldens WILL
+  drift; border fill needs a second source sample — bounded by the SW-B4 second-layer machinery.
+- **Read first:** [ADR-0055](../decisions/ADR-0055.md) (taxonomy);
+  `crates/multiview-compositor/src/overlay/subpass.rs:853`; [ADR-C007](../decisions/ADR-C007.md).
+
+### `[ ]` SW-B3 — Per-tile affine transform + sub-pixel placement + FitMode/crop/rotation wiring · effort: L · deps: none
+- **Goal:** The DVE substrate (push/squeeze, fly-key, aspect-correct boxes) — and finally consume
+  the modeled-but-dead `Cell.fit`/`crop`/`rotation`.
+- **Touches:** both kernels (`composite.wgsl` sampling math; CPU `fold_tile_into_band`),
+  `crates/multiview-engine/src/drive.rs:728` (`cell_dst_rect` — fractional placement),
+  `crates/multiview-config` (surface core crop/rotation fields — the mapper explicitly spreads
+  defaults today).
+- **Approach:** placement becomes a per-tile 2×3 affine (scale/translate now; rotation via the
+  existing `QuarterTurn` first, arbitrary later) with sub-pixel sampling; `FitMode` contain/cover
+  resolves to transform + crop at resolve time so the kernels stay dumb; bilinear taps in linear
+  light (after YUV→RGB+EOTF — inv #8 order).
+- **Acceptance (done when):** contain/cover/crop/quarter-turn each render correct goldens on the
+  CPU oracle (today everything stretches — the new tests fail on main); sub-pixel push at ½-pixel
+  offsets is smooth (no integer snapping) by golden sequence; GPU SSIM parity on the box; config
+  round-trips the newly surfaced fields.
+- **Risks/notes:** the single biggest compositor work item (budget as such); decode-at-display-
+  resolution interactions (inv #6) — a DVE move samples the same decoded tile, never re-negotiates
+  decode size mid-transition.
+- **Read first:** [ADR-0055](../decisions/ADR-0055.md) (DVE);
+  [ADR-E001](../decisions/ADR-E001.md)/[ADR-E002](../decisions/ADR-E002.md);
+  `crates/multiview-engine/src/drive.rs:700-760`.
+
+### `[ ]` SW-B4 — Keyer math: luma + linear/fill+key kernels · effort: M · deps: none
+- **Goal:** Key-alpha generation in both kernels at the verified insertion points, with fill+key
+  pairing — the substrate for USKs, DSKs (SW-A6) and graphics fills.
+- **Touches:** `composite.wgsl` + `fold_tile_into_band` (front-half steps 3-4: between range
+  expansion and the premultiply), `TileParams`/CPU `Tile` (a `KeySpec` + optional second source
+  layer index — the GPU already binds per-tile texture-array layers).
+- **Approach:** `KeySpec{ luma{clip, gain, invert}, linear{key_source, premultiplied} }` (chroma +
+  pattern post-MVP); luma operates on post-range-expand code-value Y (operator-familiar); the
+  computed key alpha multiplies into the premultiplied linear-light `over` so inv #8 order is
+  untouched; rectangular garbage matte = a clamp rect on the key; key priority = explicit z-order.
+- **Acceptance (done when):** CPU goldens for luma clip/gain sweeps + linear fill+key over known
+  test mattes (both premultiplied and straight inputs); GPU SSIM parity; an invert + matte combo
+  golden; the kernels pin the ADR-C007 threshold-domain decision in tests.
+- **Risks/notes:** chroma key needs linear-RGB distance — design the `KeySpec` enum
+  `#[non_exhaustive]` so wave-2 chroma is additive; coordinate the second-source-layer plumbing
+  with SW-B2's border fill (same mechanism).
+- **Read first:** [ADR-0056](../decisions/ADR-0056.md); [ADR-C007](../decisions/ADR-C007.md);
+  [color-management](../research/color-management.md) (pipeline order).
+
+### `[ ]` SW-B5 — NV12+A tile input: R8 alpha plane as per-tile alpha · effort: M · deps: SW-C3 (payload shape)
+- **Goal:** Tiles whose frames carry the optional R8 alpha plane (media/graphics fills, stingers)
+  blend with true per-pixel alpha — never per-tile RGBA video (inv #5).
+- **Touches:** both kernels (sample A where uniform opacity applies), the tile binding plumbing
+  (one more plane per tile on GPU; one more slice on CPU).
+- **Approach:** the payload carries **straight** alpha (ADR-0058 — agreed with SW-C3); the kernel
+  premultiplies exactly once in linear light at the existing `Cell.opacity` premultiply step; A
+  multiplies the per-tile opacity exactly like the SW-B2 mask path, so the three alpha sources
+  (uniform, mask, plane) compose in one place.
+- **Acceptance (done when):** an NV12+A test frame over bars renders the correct soft-edge golden
+  on CPU; GPU SSIM parity; an opaque-plane NV12+A tile is byte-identical to plain NV12 (regression
+  gate); 2.5 B/px budget documented in the kernel docs.
+- **Risks/notes:** coordination point ii — the payload shape (plane layout, straight-alpha
+  contract) is agreed with SW-C3 before either side ships; premultiplied-authored media is
+  normalized at import — reject premultiplied payloads at the boundary rather than branching
+  kernels.
+- **Read first:** [ADR-0058](../decisions/ADR-0058.md);
+  [media-playout](../research/media-playout.md) (alpha-media sections).
+
+### `[ ]` SW-B6 — Kernel test pins: parity pattern + dissolve law · effort: M · deps: SW-B4 (+ SW-B2, SW-B3 for the wipe/DVE parity legs only)
+- **Goal:** Lock every new kernel to the ADR-C007 color decisions with the established
+  CPU-oracle/GPU-SSIM pattern, so transition/keyer math can never silently drift.
+- **Touches:** `crates/multiview-compositor/tests/` (golden + parity suites), kernel docs.
+- **Approach:** linear-light premultiplied `over` is the ONLY blend domain; the optional perceptual
+  progress-curve mapping applies to `t`, never to pixels (the operator-visible midpoint difference
+  vs de-facto gamma-coded mixing is documented + golden-pinned at t=½); keyer thresholds: luma =
+  post-range-expand code-value Y, chroma = linear RGB (pinned now even though chroma ships later);
+  PQ/HLG canvas mixes/dips get explicit goldens (the in-shader HDR transfer support already exists).
+  The MVP dissolve-law/progress-curve/PQ-HLG goldens ride the wave-1 mix path (SW-A5 + SW-B4) so
+  the color-law pin lands with the MVP wave; the full wipe/DVE parity matrix is the post-MVP
+  closure gated on SW-B2/SW-B3.
+- **Acceptance (done when):** a mid-dissolve golden distinguishes linear vs gamma midpoints (i.e.
+  the test FAILS if someone "fixes" the blend into gamma domain); each progress-curve option has a
+  golden; PQ + HLG mix goldens land; the parity suite runs the full new-kernel matrix on the GPU
+  box.
+- **Risks/notes:** goldens must be content-aware, not byte hashes on GPU (SSIM/PSNR thresholds);
+  keep the curve LUT exact-rational-sampled so CI is deterministic.
+- **Read first:** [ADR-C007](../decisions/ADR-C007.md); [ADR-C003](../decisions/ADR-C003.md);
+  [efficiency](../research/efficiency.md) (testing tiers).
+
+### `[ ]` SW-C1 — `Still` source kind: decode-once + HoldForever · effort: M · deps: none
+One PR: additive `SourceKind::Still{path,…}` + validation, ingest = decode one frame via libav and
+publish once into an ordinary `TileStore` with `HoldForever` (the EOF-hold path already proves the
+semantics), rides ADR-W018 live UpsertSource so stills hot-load. Full slice detail:
+[production-switcher-backlog](production-switcher-backlog.md) (SW-\* media items) +
+[ADR-0057](../decisions/ADR-0057.md).
+
+### `[ ]` SW-C2 — Media-player transport on the production ingest path · effort: L · deps: SW-C1
+- **Goal:** Turn a file source into a media player: cue/play/pause/seek/loop/EOF-policy/
+  play-on-take — on the ingest path the product actually runs.
+- **Touches:** `crates/multiview-cli/src/pipeline.rs` `ingest_loop`/`open_and_stream`
+  (:5533/:5812 — the LANE-CORE hand-off), `PtsWallClock` (:6189 — play/pause gate),
+  `crates/multiview-ffmpeg/src/demux.rs:549` (`Demuxer::seek` — first production caller),
+  a per-player transport-command slot polled by the decode thread, config fields on the
+  player binding (SW-F1).
+- **Approach:** explicitly extend the CLI ingest path, NOT the unwired multiview-input
+  `IngestPump` scaffold (the divergent-twin trap is documented — say which one is built on). Cue =
+  open + decode first frame + pause, readiness via `TileStore::is_primed` (tile.rs:311); play/pause
+  = gate the `PtsWallClock` pacer; seek = `Demuxer::seek` + normalizer/pacer re-anchor; loop =
+  in-place `Demuxer::seek` to the in-point on EOF (+ decoder flush) per ADR-0057, with the existing
+  supervised-reconnect bracket as the failed-seek fallback; EOF policy
+  {hold_last_frame | loop | black | auto_off} maps onto the store's existing hold/slate machinery;
+  play-on-take = the transport command issued by the switcher state machine at the take tick
+  (roll-clip semantics). Transport commands are conflated latest-wins per player, drained by the
+  decode thread — never the clock thread.
+- **Acceptance (done when):** cue shows the first frame and reports ready (`is_primed`) without
+  advancing; play starts frame-accurately at the commanded tick (`ManualTimeSource` test);
+  pause holds last-good (inv #2); each EOF policy behaves per spec (loop has no gap-frame —
+  content-aware test across the wrap); a player that underruns rides its EOF policy, never stalls
+  the clock; CasparCG-AMCP-style cue/auto-chain semantics documented (open project citation),
+  VDCP/AMP explicitly out of scope.
+- **Risks/notes:** seek-accuracy on long-GOP files (seek lands on a keyframe — frame-accurate start
+  decodes forward from the prior IDR; budget it at cue time, never at take time); pipeline.rs edits
+  are LANE-CORE territory — file the transport module separately, hand the wiring to the CORE owner.
+- **Read first:** [ADR-0057](../decisions/ADR-0057.md);
+  [media-playout](../research/media-playout.md) (transport semantics);
+  `crates/multiview-cli/src/pipeline.rs:5533-5900`.
+
+### `[ ]` SW-C3 — NV12+A framestore payload + alpha decode · effort: L · deps: none
+One PR-chain: the optional R8 alpha plane payload extension (NV12+A, 2.5 B/px, straight-alpha
+payload — premultiplied-authored media normalized at import, the kernel premultiplies once in
+linear light) + alpha-capable decode for the formats FFmpeg actually delivers (ProRes 4444/4444XQ,
+qtrle, PNG/TGA sequences, VP9-alpha via libvpx-vp9) + HEVC-alpha rejection/import-transcode (FFmpeg
+decodes its alpha as opaque — a silent-wrong hazard, so reject loudly). Shape agreed with SW-B5
+(coordination point ii). Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-0058](../decisions/ADR-0058.md).
+
+### `[ ]` SW-C4 — Media library: assets + import/validation/transcode · effort: M · deps: SW-C3
+One PR: the asset-storage domain (stills/clips/audio) distinct from player channels; import
+validates canvas resolution + output frame rate + explicit trigger-point metadata and transcodes
+nonconforming media off-line; native API only (no VDCP/AMP). Details:
+[production-switcher-backlog](production-switcher-backlog.md) + [ADR-0057](../decisions/ADR-0057.md).
+
+### `[ ]` SW-C5 — Stinger mezzanine: bounded pre-decoded NV12+A ring · effort: M · deps: SW-C3, SW-C4
+One PR: import-time pre-decode into a pool-allocated bounded in-memory NV12+A mezzanine (≈0.93 GB
+for 3 s 1080p60 — the budget is the point), hard cap + decode-ahead ring for longer clips, never
+per-frame allocation. The stinger transition itself is wave 3. Details:
+[production-switcher-backlog](production-switcher-backlog.md) + [ADR-0058](../decisions/ADR-0058.md).
+
+### `[ ]` SW-D1 — Audio control seam (the subtitle seam's twin) · effort: M · deps: none
+- **Goal:** A re-point/gain command path into the bake-consumer-owned `ProgramBus`, unblocking the
+  production-HELD `Command::RouteAudio` and giving every later audio item (gain, mute, AFV, master
+  fade) its apply seam.
+- **Touches:** new `AudioControlHandle` in `crates/multiview-cli/src/` (the `SubtitleRouteHandle`
+  twin — captions.rs:130: ArcSwap-pending commands, polled at the consumer), `consumer_main`
+  (pipeline.rs:3015 — poll once per `StreamItem` before `drive_audio_for_item`, :2986),
+  `command_drain_with_seams` (control.rs:574 — plug the handle in next to the subtitle seam),
+  retire the `RouteAudio` hold (control.rs:933).
+- **Approach:** the bus stays moved-into/owned-by the consumer thread (the architectural reason the
+  hold exists); the drain pushes conflated audio commands into the handle; the consumer drains them
+  between items — off the output-clock loop by construction, so inv #1/#10 hold with zero new locks.
+- **Acceptance (done when):** `Command::RouteAudio` 202s AND audibly re-points (the
+  `repoint_crossfade` integration test pattern, now reachable from the API); a flooded handle
+  conflates (latest-wins per target) and never blocks the consumer; the chaos suite re-asserts the
+  clock under audio-command flood; the hold-warn is gone.
+- **Risks/notes:** one-line `consumer_main` touch is LANE-CORE — hand the wiring over; everything
+  else is new files. This unlocks SW-D2/D3/D4 — schedule it first in the lane.
+- **Read first:** [ADR-0059](../decisions/ADR-0059.md); `crates/multiview-cli/src/captions.rs:120-180`;
+  `crates/multiview-cli/src/control.rs:920-960`.
+
+### `[ ]` SW-D2 — Honor `gain_db`/`mute` + gain-preserving mute · effort: M · deps: SW-D1
+One PR: `RouteApplier::apply_audio` reads the `RouteIntent::Audio` fields it currently drops
+(route.rs:367 `..`), `Mixer` gains a per-strip gain-preserving mute (today mute = unroute, losing
+gain state) + set-gain-with-ramp, REST take stops hardcoding 0.0/false; Class-1 per ADR-M004.
+Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-0059](../decisions/ADR-0059.md).
+
+### `[ ]` SW-D3 — Master/program gain stage · effort: M · deps: SW-D1
+One PR: a master `GainRamp` applied as one multiply pass in `ProgramBus::mix` — the FTB audio fade
+(driven by SW-A6's flag) and master gain; pure-crate change, existing ramp test patterns. Details:
+[production-switcher-backlog](production-switcher-backlog.md) + [ADR-0059](../decisions/ADR-0059.md).
+
+### `[ ]` SW-D4 — AFV: transition-coupled crossfade · effort: M · deps: SW-D1, SW-A5
+One PR: the switcher state machine issues `repoint_crossfade` (program.rs:217) at the transition
+start tick with `ramp_frames = SampleClock::total_at(s + T) − SampleClock::total_at(s)` (the
+integer cumulative-sample delta — never the naive `T × samples_per_tick` product, which is off by
+up to a frame under NTSC 1601/1602 alternation; ADR-0059 §2/ADR-T015 §5); per-input AFV mode
+{fade_with_transition (default), hard_cut}; the
+Class-1-vs-`SwitchTier::ClickFree` doc tension resolved (program-bus crossfade = Class-1 on this
+always-re-encode path; Class-2 language reserved for the unbuilt coded-passthrough). Details:
+[production-switcher-backlog](production-switcher-backlog.md) + [ADR-0059](../decisions/ADR-0059.md).
+
+### `[ ]` SW-D5 — Live meters: `Event::AudioMeter` at ~30 Hz · effort: M · deps: none
+One PR: tap per-source decode + the post-loudnorm program block with the existing
+Ballistics/LoudnessMeter DSP, conflate via the 30 Hz `Conflator`, publish the zero-emitter
+`Event::AudioMeter` (event.rs:111) on the drop-oldest publisher; retires the build-time-timeline
+meters for live sources; REQUIRED before SW-F5. Details:
+[production-switcher-backlog](production-switcher-backlog.md) + [ADR-0059](../decisions/ADR-0059.md).
+
+### `[ ]` SW-D6 — Program audio config-declared / default-on · effort: S · deps: none
+One PR: lift `--program-audio` from CLI-flag-only into config (declared/default-on for switcher
+use), gated on AAC encoder open success; the byte-identical-when-off guarantee is already
+test-proven. Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-0059](../decisions/ADR-0059.md).
+
+### `[ ]` SW-E1 — Internally-derived tally: per-tick derivation over the composition graph · effort: L · deps: SW-A3
+- **Goal:** The switcher owns red/green truth: derive PROGRAM/PREVIEW facts from what is actually
+  reachable in the live composition each tick — nothing externally asserted, nothing guessed.
+- **Touches:** new pure derivation in `crates/multiview-engine/src/tally/` consuming the SW-A3
+  resolver's scene/plan state; `TallyFacts` emission on the slow control tick.
+- **Approach:** recursive contributes-to-program: a source is PROGRAM-tallied iff reachable from
+  any on-air output through the live composition — BOTH transition sources mid-transition, keyer
+  FILL **and** KEY sources of on-air keyers, stinger media while it covers, members of on-air
+  multi-box compositions/nested M/Es (the untallied-overlay anti-pattern is the documented
+  failure mode to test against); PREVIEW-tallied iff reachable from the top-level M/E's PVW;
+  amber = ISO/record. Pure function of (render plan, switcher state) — trivially `ManualTimeSource`
+  testable.
+- **Acceptance (done when):** property tests over generated compositions assert reachability
+  equivalence (tally set == graph reachability); mid-transition both sides are PROGRAM (frame-exact
+  on/off at the transition window edges); keyer key-source-only contribution is tallied; a
+  multi-box member on PGM is tallied while an off-air composition's members are not; derivation
+  cost is O(plan) on the control tick, never the clock thread.
+- **Risks/notes:** feeds SW-E2 (the arbiter merge) — keep facts in the existing `TallyFacts`
+  vocabulary so external TSL/IS-07 facts merge without translation; cross-lane dep on SW-A3's
+  scene-state shape (coordination point i).
+- **Read first:** [ADR-MV006](../decisions/ADR-MV006.md) (extends
+  [ADR-MV002](../decisions/ADR-MV002.md));
+  [production-switcher](../research/production-switcher.md) (tally section);
+  `crates/multiview-engine/src/tally/arbiter.rs`.
+
+### `[ ]` SW-E2 — Wire `TallyArbiter` into the run loop + spawn `run_tally_ingest` · effort: M · deps: SW-E1
+One PR: sample the existing pure arbiter (arbiter.rs:145) on the run loop's control tick with
+SW-E1's internal facts + external facts under one `ConflictPolicy`; replace the `SetTallyOverride`
+echo with real arbitration; spawn the library-complete `run_tally_ingest` (tally_ingest.rs:75)
+beside `run_warning_ingest` (cli control.rs:134) so `GET /api/v1/tally` is live under
+`multiview run`. NDI-L6's `send_get_tally` later merges as one more fact source (annotated there).
+Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-MV006](../decisions/ADR-MV006.md).
+
+### `[ ]` SW-E3 — TSL codec spec-reconciliation + golden on-wire vectors · effort: M · deps: none
+One PR: fix the verified spec deviations before any TSL egress ships — v5.0 DLE 0xFE (not 0x10),
+CONTROL bit order RH(0-1)/Text(2-3)/LH(4-5), drop the invented DLE/ETX terminator, skip
+DMSGs with CONTROL bit 15 set (control data); rebuild v4.0 as v3.1+CHKSUM(mod-128)+VBC+XDATA;
+drop the invented v4.0/v3.1 byte-stream DLE/STX (0x10 0x02) wrapper
+(`decode_framed`/`encode_display_framed` — the spec defines no byte-stream framing below v5.0:
+serial delimiting is the 0x80 address sync bit, UDP is one message per datagram); golden on-wire
+vectors hand-transcribed from the official TSL spec (round-trip property tests share one value
+model and structurally CANNOT catch these); ports configurable-always; fix the stale ADR-MV001
+citation in all four `crates/multiview-engine/src/tally/` files (`mod.rs`, `arbiter.rs`,
+`profile.rs`, `gpio.rs` → ADR-MV002 + ADR-MV006). Details:
+[production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-MV006](../decisions/ADR-MV006.md).
+
+### `[ ]` SW-E4 — RT-12 output←program crosspoint bridge · effort: L · deps: SW-A1
+One PR-chain: `RouteIntent::Output` (+ `Command::RouteOutput`) and the engine-side bridge to the
+BUILT-but-caller-less `PacketRouter::move_sink`/`EncodeOnceDriver` (fanout.rs:212/:299) per
+ADR-R010's five-phase contract — built once, shared with CTL-6/GPU-5c; unlocks aux buses and
+Class-2 MBB. Sequence against EncodedPacket convergence (ADR-I005). See RT-12 in
+[decoupled-routing-backlog](decoupled-routing-backlog.md). Details:
+[production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-R010](../decisions/ADR-R010.md).
+
+### `[ ]` SW-E5 — Clean-feed/aux tap taxonomy · effort: M · deps: SW-A6, SW-E4
+One PR: the bus-tap enum {program (post-FTB), clean (pre-DSK), preview, me[n], aux[j]} as the
+output-selection vocabulary; clean anchors on the pre-overlay canvas `Arc` published per tick
+(pipeline.rs:2122) and becomes a render-plan tap once DSKs are on-clock (SW-A6); ADR-0037
+CLEAN/DIRTY vocabulary; each extra encode is inv-#7-sanctioned + admission-accounted, shed before
+program. Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-0054](../decisions/ADR-0054.md).
+
+### `[ ]` SW-F1 — Config blocks: `switcher`/`media_library`/`media_players`/`macros` · effort: M · deps: SW-A1
+One PR: the four additive `#[serde(default)]` blocks (internally-tagged unions only), per-item
+`validate()` + `validate_switcher()` cross-refs + the composition/M/E re-entry cycle check;
+desired-state ONLY (live bus state engine-owned + mirrored; warm-restart = a separate persisted
+snapshot resource, off by default); typed keyer/graphics layer model; reserved-token pattern for
+well-known bus names. Sequenced after SW-A1 on the config root. Details:
+[production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-M012](../decisions/ADR-M012.md).
+
+### `[ ]` SW-F2 — Control domain: switcher CRUD + bare verbs + plan/take + CorrKey · effort: L · deps: SW-F1, SW-A7
+- **Goal:** The full REST surface for the switcher, on the proven domain pattern, with inv-#11
+  classification before every take and observable outcomes.
+- **Touches:** `crates/multiview-control/src/resource_store.rs` (new markers),
+  `typed_resources.rs` (`TypedCollection` variants validating the SW-F1 config types), new
+  `routes/switcher*.rs` + `routes/media_players.rs` + `routes/macros.rs`, `openapi.rs`
+  (paths/components/tags + the `rest_routes` test table, :300), `openapi_schemas.rs` (`*Doc`
+  mirrors), AppState fields + `seed_resources`, `realtime.rs` `CorrKey` arms, `tests/`.
+- **Approach:** copy the sync-groups file-set verbatim; ADR-W017 bare verbs:
+  `POST /api/v1/switcher/mix-effects/{id}/cut|auto|ftb|preview|program` (preview = PVW crosspoint
+  set, program = direct punch), `…/transition` (set type/rate),
+  `…/tbar` (conflated absolute), `/api/v1/switcher/downstream-keyers/{id}/on-air|off-air|auto|tie`,
+  `/api/v1/switcher/aux-buses/{id}/route`,
+  `/api/v1/media/players/{id}/load|cue|play|pause|stop|seek`, `/api/v1/macros/{id}/run`. Every
+  state-changing take classified Class-1/Reset-lite/Class-2 with a `/plan` dry-run (the
+  routing plan/take precedent); 200 `{class, applied}` for immediate Class-1 vs 202+operation-id
+  for timed/Class-2; Idempotency-Key on every verb; NEW `CorrKey` variants keyed (me_id, phase) so
+  cut/auto/ftb outcomes correlate on the stream — Route\* today never correlate; do not repeat
+  that. Control-surface friendliness is a first-class requirement: long-lived WS + full snapshot +
+  deltas, stable string IDs, idempotent single-shot commands, boolean state-feedback queries
+  (source-on-pgm, keyer-on-air, ftb-active, media-playing) — the shape a generic external
+  control-surface module needs (an official module + OSC namespace are post-MVP adapters).
+- **Acceptance (done when):** CRUD with ETag/If-Match→412 + RBAC/BOLA + audit; every verb 202s
+  (or 200s Class-1) with Idempotency-Key replay semantics tested; `/plan` classifies without
+  applying; the `rest_routes` table test + `gen-openapi` + web `generate:api` all pass in the same
+  change; corr-correlation integration test: a cut's 202 op id appears as `corr` on its
+  transition.completed envelope.
+- **Risks/notes:** IPv6-first examples throughout (bracketed literals, `[::1]` in docs); bound the
+  new correlation bookkeeping with the CorrRegistry drop-oldest pattern; IdempotencyStore growth is
+  a known pre-existing issue — high-frequency switcher verbs make it real (note for the lane).
+- **Read first:** [ADR-W021](../decisions/ADR-W021.md); [ADR-W017](../decisions/ADR-W017.md);
+  `crates/multiview-control/src/routes/sync_groups.rs` (the template);
+  [ADR-W008](../decisions/ADR-W008.md).
+
+### `[ ]` SW-F3 — Realtime: `switcher` topic + conflated lanes + snapshots + AsyncAPI · effort: M · deps: SW-F2
+One PR: the coarse `switcher` Topic; lossless lifecycle events in the replay ring;
+transition.progress/audio.meter conflated latest-wins at publisher-side ~30 Hz, while tally stays
+edge-triggered on the existing lossless `tally.state` lane (ADR-RT008 — no conflation change there)
+(pinned:
+`run_ws_session` never reads inbound frames — realtime.rs:878 — so `$subscribe`/`$set_rate` stay a
+follow-on lane item); connect-time snapshot frames per the DeviceStatusRegistry/
+devices_snapshot_frames pattern; BOTH spec generators updated in the same change
+(utoipa + `rest_routes`; `multiview-events/src/asyncapi.rs`) + `gen-openapi`/`gen-asyncapi` +
+web `generate:api`. Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-RT008](../decisions/ADR-RT008.md).
+
+### `[ ]` SW-F4 — SPA shared realtime service + operation-correlation + Idempotency-Key · effort: M · deps: none
+One PR (can start immediately): one module-level `RealtimeConnection` with a topic-keyed listener
+registry; migrate `useEngineEvents`/`useSystemMetrics`/`useHealth` off their per-hook sockets
+BEFORE adding switcher topics; store `operation_id` per submitted command and resolve against
+envelope `corr`; `crypto.randomUUID()` Idempotency-Key in the shared submit helper. Details:
+[production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-W021](../decisions/ADR-W021.md).
+
+### `[ ]` SW-F5 — SPA switcher panel: `/switcher` route + bus rows + monitors · effort: L · deps: SW-F2, SW-F3, SW-F4, SW-D5
+One PR-chain: lazy `/switcher` route + NAV_ITEMS entry; spec-first typed openapi-fetch (no
+raw-fetch bypass); PGM/PVW bus rows per ADR-W011 (red/filled+label vs green/outline+label — never
+colour alone); T-bar + transition + DSK + FTB controls; 1 Hz JPEG per-bus monitors first (per-bus
+`ProgramSlot` replication), WHEP as the fidelity-upgrade lane; the layout-editor pure model
+imported (not forked) for the multi-box/DVE editor; audio meters from SW-D5; fast-check property
+tests for the pure bus/transition TS model; Lingui extract/compile + shared Playwright fixtures
+extracted first. Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-W021](../decisions/ADR-W021.md).
+
+### `[ ]` SW-F6 — Global keyboard-shortcut subsystem · effort: M · deps: SW-F5
+One PR: a page-scoped document-level keydown subsystem (none exists in the SPA) — number = PVW,
+Shift+number = PGM, dedicated CUT/AUTO; suppressed in editable elements + open dialogs; visible
+shortcut reference; every shortcut paired with an on-screen button; live-region announcements
+(WCAG 2.1 AA). Details: [production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-W021](../decisions/ADR-W021.md).
+
+### `[ ]` SW-F7 — Memories + macros + in-app docs · effort: M · deps: SW-F2
+One PR-chain: memories = EXTEND the BUILT Salvo machinery (engine arm/take/cancel, salvo.rs:158/189)
+with recall-scope masks (`{scope: {sources, keyers, transition, audio}}`, all true by default —
+pinned in ADR-M012) + the RT-16 mixed-recall shape
+(see [decoupled-routing-backlog](decoupled-routing-backlog.md)) — supersedes ADR-MV004's salvo-only
+automation story; macros = a control-plane sequencer replaying ordinary Commands with
+`wait_frames`/`wait_ms` steps, never engine-side (inv #10), desugaring onto the same engine intents
+as live commands; batched multi-op takes drain at one tick (the openly-published obs-websocket
+SERIAL_FRAME batch semantic — cited as an open protocol precedent); sequencer failure → halt +
+event, zero engine impact (ADR-R011); one DOCS_REGISTRY entry + lazy `/help` concept page. Details:
+[production-switcher-backlog](production-switcher-backlog.md) +
+[ADR-M012](../decisions/ADR-M012.md)/[ADR-W021](../decisions/ADR-W021.md).
+
+### Critical Files for Implementation
+
+- `/workspaces/mosaic/crates/multiview-engine/src/runtime.rs` — the per-tick control hook (:345 signature, :432-439 invocation); SW-A2 widens it
+- `/workspaces/mosaic/crates/multiview-engine/src/drive.rs` — compose/rebind_cell/set_layout/ComposeScratch/cell_dst_rect; SW-A3..A6 territory
+- `/workspaces/mosaic/crates/multiview-engine/src/route.rs` — RouteIntent/RouteApplier (apply_audio drops gain/mute at :367); SW-D2, SW-E4
+- `/workspaces/mosaic/crates/multiview-engine/src/salvo.rs` — arm/cancel/take (:158/:169/:189); SW-F7 extends
+- `/workspaces/mosaic/crates/multiview-engine/src/tally/arbiter.rs` — the pure TallyArbiter (:145); SW-E1/E2
+- `/workspaces/mosaic/crates/multiview-cli/src/pipeline.rs` — ingest_loop (:5533), open_and_stream (:5812), PtsWallClock (:6189), consumer_main (:3015), drive_audio_for_item (:2986), pre-overlay ProgramSlot publish (:2122); LANE-CORE
+- `/workspaces/mosaic/crates/multiview-cli/src/control.rs` — command_drain* (:523/:574), MAX_REPOINTS_PER_TICK (:598), RouteAudio hold (:933), run_warning_ingest spawn (:134); SW-A7, SW-D1, SW-E2
+- `/workspaces/mosaic/crates/multiview-cli/src/captions.rs` — SubtitleRouteHandle (:130), the seam template for SW-D1
+- `/workspaces/mosaic/crates/multiview-cli/src/preview.rs` — ProgramSlot (:28); SW-A4 per-bus replication
+- `/workspaces/mosaic/crates/multiview-compositor/src/pipeline.rs` — CPU Tile (:413) + fold_tile_into_band (:1075); SW-B2/B3/B4/B5
+- `/workspaces/mosaic/crates/multiview-compositor/src/gpu/uniforms.rs` — TileParams (:82); SW-B2/B3/B4
+- `/workspaces/mosaic/crates/multiview-compositor/src/gpu/compositor.rs` — composite_with_overlays (:326), the pass-fusion template; SW-B1
+- `/workspaces/mosaic/crates/multiview-compositor/src/gpu/shaders/composite.wgsl` — the GPU kernel; SW-B2/B3/B4/B5
+- `/workspaces/mosaic/crates/multiview-audio/src/program.rs` — ProgramBus repoint_crossfade (:217)/tick_to (:306); SW-D3/D4
+- `/workspaces/mosaic/crates/multiview-audio/src/mixer.rs` — GainRamp (:35); SW-D2/D3
+- `/workspaces/mosaic/crates/multiview-ffmpeg/src/demux.rs` — Demuxer::seek (:549, zero callers); SW-C2
+- `/workspaces/mosaic/crates/multiview-framestore/src/tile.rs` — is_primed (:311); SW-A4, SW-C2
+- `/workspaces/mosaic/crates/multiview-output/src/fanout.rs` — PacketRouter::move_sink (:212), EncodeOnceDriver (:299); SW-E4
+- `/workspaces/mosaic/crates/multiview-config/src/lib.rs` + `/workspaces/mosaic/crates/multiview-config/src/program.rs` — the schema root; SW-A1, SW-F1
+- `/workspaces/mosaic/crates/multiview-control/src/routes/sync_groups.rs` + `/workspaces/mosaic/crates/multiview-control/src/typed_resources.rs` + `/workspaces/mosaic/crates/multiview-control/src/openapi.rs` — the domain template; SW-F2
+- `/workspaces/mosaic/crates/multiview-control/src/realtime.rs` — run_ws_session (:878), CorrKey; SW-F2/F3
+- `/workspaces/mosaic/crates/multiview-control/src/tally_ingest.rs` — run_tally_ingest (:75, unspawned); SW-E2
+- `/workspaces/mosaic/crates/multiview-events/src/event.rs` + `/workspaces/mosaic/crates/multiview-events/src/asyncapi.rs` — events + generator; SW-A7, SW-F3
+- `/workspaces/mosaic/web/src/realtime/connection.ts` + `/workspaces/mosaic/web/src/app/navigation.tsx` + `/workspaces/mosaic/web/src/layout/model.ts` — SPA seams; SW-F4/F5

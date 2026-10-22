@@ -61,9 +61,11 @@
 //! * [`dash`] — **MPEG-DASH** (ISO/IEC 23009-1) MPD manifest model + a pure
 //!   segment-selection / ABR-ladder-awareness model; the HTTP fetch reuses the
 //!   existing libav ingest.
-//! * [`webrtc`] — **WebRTC** ingest: a pure, testable SDP offer/answer model;
-//!   the ICE/DTLS/SRTP transport lives behind the off-by-default `webrtc`
-//!   feature and is compile-verified only.
+//! * [`webrtc`] — **WebRTC** ingest: a pure, testable model of a *negotiated*
+//!   media session (SDP offer/answer negotiation is str0m's, in `multiview-webrtc`,
+//!   ADR-0048) plus the gated depacketizer/router seam that turns decrypted RTP
+//!   into typed media events. No ICE/DTLS/SRTP transport lives in this crate —
+//!   that is str0m's; the off-by-default `webrtc` feature gates only the seam.
 //! * [`srt`] — **SRT** caller/listener/rendezvous + AES-encryption + stream-id
 //!   connection model and option parsing (pure); the socket lives behind the
 //!   `ffmpeg`/`srt` gating.
@@ -105,6 +107,8 @@ pub mod normalize;
 pub mod pacer;
 pub mod param_probe;
 pub mod reconnect;
+pub mod rtp_audio;
+pub mod sap;
 pub mod scte;
 pub mod source;
 pub mod srt;

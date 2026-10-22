@@ -89,7 +89,7 @@ For the public images that bundle `libav*.so.*`, LGPL-2.1 §6 requires (advisory
 | Workflow | What it does today | Public/private |
 |---|---|---|
 | `release.yml` | LGPL-clean release **binaries** (`--disable-gpl --disable-nonfree`), tar.gz + sha256 + provenance attestation. Comment line 10: *"the GPL `gpl-codecs` build is NOT a [release artifact]."* | **Public only** ✅ |
-| `docker.yml` | App images to `ghcr.io/aperim/multiview` off `-lgpl`/`-nvidia` bases; features `ffmpeg,linux-vaapi,web` / `ffmpeg,nvidia,web`; provenance + SBOM + keyless cosign. | **Public only** ✅ |
+| `docker.yml` | App images to `ghcr.io/conspect-studio/conspect` off `-lgpl`/`-nvidia` bases; features `ffmpeg,linux-vaapi,web` / `ffmpeg,nvidia,web`; provenance + SBOM + keyless cosign. | **Public only** ✅ |
 | `ffmpeg-base.yml` | FFmpeg base images via `FF_HWACCEL`+`FF_LICENSE`. Also pushes a `multiview-ffmpeg:8.1.1-gpl` **base** (FFmpeg-only, GPL upstream) — fine in itself; **must never be combined into the published app image** under NC terms. | Mixed base; app stays clean |
 | `ci.yml` | cargo-deny license gate where `gpl-codecs` *"fails the allowlist by design"* (line 170); `--all-features` deliberately avoided; NDI not a Cargo feature yet. | n/a |
 
@@ -107,7 +107,7 @@ Structured as parallel teams (the operator asked for a fan-out):
   scan); cargo-deny on the exact published feature set. Belt-and-suspenders over the existing
   `ffmpeg-build.sh` abort.
 - **Team B — private GPL lane.** Wire `FF_LICENSE=gpl` + `CARGO_FEATURES=…,gpl-codecs` into a publish
-  job targeting a **private** ghcr package (e.g. `ghcr.io/aperim/multiview-gpl`) + `-gpl` binaries to a
+  job targeting a **private** ghcr package (e.g. `ghcr.io/conspect-studio/conspect-gpl`) + `-gpl` binaries to a
   gated release — with provenance + cosign + SBOM parity.
 - **Team C — private proprietary lane (NDI).** Same shape, never-vendored, fed by an
   operator-supplied SDK. **Blocked** until the feature lands — NDI-L1 awaits the operator's SDK URL.

@@ -163,10 +163,18 @@ impl OutputClock {
     /// # Errors
     ///
     /// Returns [`Error::InvalidCadence`] if the cadence is not a positive,
-    /// non-degenerate rational (`num > 0`, `den > 0`) — the clock must have an
-    /// exact, usable frame rate (invariant #1/#3).
+    /// non-degenerate rational (`num > 0`, `den > 0`), or if it is so fast that one
+    /// tick's **exact** period is under 1 ns (`fps > 1 GHz`, see
+    /// [`Rational::has_subnanosecond_period`]) — the clock must have an exact, usable
+    /// frame rate with a per-tick period of at least 1 ns, so that output PTS is
+    /// strictly increasing (invariant #3) and the cadence-hold wall-clock resync
+    /// (ADR-T018) has an exact floor.
     pub fn new(cadence: Rational) -> Result<Self> {
-        if !cadence.is_valid() || cadence.num <= 0 || cadence.den <= 0 {
+        if !cadence.is_valid()
+            || cadence.num <= 0
+            || cadence.den <= 0
+            || cadence.has_subnanosecond_period()
+        {
             return Err(Error::invalid_cadence(cadence));
         }
         Ok(Self {
@@ -226,6 +234,20 @@ impl OutputClock {
         Tick { index, pts }
     }
 
+    /// Skip the counter forward to `index` — the wall-clock catch-up primitive
+    /// (ADR-T018): sets `next_index = next_index.max(index)`.
+    ///
+    /// **Monotonic, saturating, forward-only** — it never rewinds the counter, so
+    /// `out_pts = f(tick)` stays strictly monotonic (invariant #3). The drive loop
+    /// uses it under overload to make the emitted tick track wall-clock: skipped
+    /// indices are filled with last-good repeats (invariant #2) instead of being
+    /// emitted as sequential late composites, so the output holds exactly 1.0×
+    /// wall-clock cadence (invariant #1) rather than accumulating lag. A no-op when
+    /// `index <= next_index`.
+    pub fn skip_to(&mut self, index: u64) {
+        self.next_index = self.next_index.max(index);
+    }
+
     /// One tick period as a [`Duration`] (`1/cadence` seconds), for pacing.
     ///
     /// Returns [`Duration::ZERO`] for a degenerate cadence (which
@@ -235,5 +257,91 @@ impl OutputClock {
         // period_ns = pts_at(1) - pts_at(0); exact, derived from the cadence.
         let ns = self.pts_at(1).as_nanos().max(0);
         Duration::from_nanos(u64::try_from(ns).unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NTSC 29.97 as an exact rational — the inv-#3 footgun if ever floated.
+    fn cad() -> Rational {
+        Rational::new(30_000, 1_001)
+    }
+
+    #[test]
+    fn skip_to_advances_forward_with_exact_pts() {
+        let mut clock = OutputClock::new(cad()).unwrap();
+        clock.skip_to(100);
+        assert_eq!(clock.next_index(), 100);
+        let t = clock.tick();
+        assert_eq!(t.index, 100);
+        // pts is the exact f(tick) — identical to an independent recompute, no drift.
+        assert_eq!(t.pts, clock.pts_at(100));
+        assert_eq!(t.pts, MediaTime::from_tick(100, cad()));
+        // strictly increasing afterwards
+        assert_eq!(clock.tick().index, 101);
+    }
+
+    #[test]
+    fn skip_to_is_forward_only_never_rewinds() {
+        let mut clock = OutputClock::new(cad()).unwrap();
+        clock.skip_to(100);
+        let _ = clock.tick(); // now at 101
+        assert_eq!(clock.next_index(), 101);
+        clock.skip_to(50); // a backwards request must be a no-op (saturating max)
+        assert_eq!(clock.next_index(), 101);
+        assert_eq!(clock.tick().index, 101);
+    }
+
+    #[test]
+    fn skip_to_saturates_without_panic() {
+        let mut clock = OutputClock::new(cad()).unwrap();
+        clock.skip_to(u64::MAX);
+        assert_eq!(clock.next_index(), u64::MAX);
+        // tick() saturates the counter rather than wrapping.
+        assert_eq!(clock.tick().index, u64::MAX);
+        assert_eq!(clock.next_index(), u64::MAX);
+    }
+
+    #[test]
+    fn rejects_subnanosecond_cadence_but_accepts_the_1ghz_boundary() {
+        // A sub-nanosecond per-tick period (fps > 1 GHz) collapses consecutive ticks
+        // onto the same nanosecond → breaks strictly-increasing PTS (inv #3) and the
+        // cadence-hold exact-floor resync (ADR-T018). `new` must reject it.
+        for cadence in [
+            Rational::new(10_000_000_000, 1), // 10 GHz: period rounds to 0 ns
+            Rational::new(1_000_000_001, 1),  // just over 1 GHz: exact period < 1 ns
+            Rational::new(1_500_000_000, 1),  // 1.5 GHz: rounded period 1 ns but exact < 1
+            Rational::new(2_000_000_000, 1),  // 2 GHz
+        ] {
+            assert!(
+                OutputClock::new(cadence).is_err(),
+                "cadence {}/{} (sub-ns period) must be rejected",
+                cadence.num,
+                cadence.den
+            );
+        }
+        // Exactly 1 GHz (period == 1 ns) is the accepted boundary, and its PTS is
+        // strictly increasing (tick i is at exactly i ns).
+        let clock = OutputClock::new(Rational::new(1_000_000_000, 1))
+            .expect("1 GHz (period == 1 ns) is accepted");
+        assert_eq!(
+            clock.pts_at(1).as_nanos(),
+            1,
+            "1 GHz period is exactly 1 ns"
+        );
+        assert!(
+            clock.pts_at(2).as_nanos() > clock.pts_at(1).as_nanos(),
+            "PTS strictly increasing at the 1 GHz boundary"
+        );
+        // Real broadcast cadences remain accepted.
+        for cadence in [
+            Rational::new(60, 1),
+            Rational::new(30_000, 1_001),
+            Rational::new(24_000, 1_001),
+        ] {
+            assert!(OutputClock::new(cadence).is_ok());
+        }
     }
 }

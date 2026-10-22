@@ -22,8 +22,8 @@ best available backend at runtime.
 
 ```bash
 # 1. Clone
-git clone https://github.com/aperim/multiview.git
-cd multiview
+git clone https://github.com/conspect-studio/conspect.git
+cd conspect
 
 # 2. Default build — pure Rust, no native deps, LGPL-clean, no GPU/FFmpeg/NDI
 cargo build --release
@@ -43,7 +43,7 @@ system prerequisites below.
 
 ### 2.1 Rust toolchain (all platforms)
 
-The toolchain is **pinned** via `rust-toolchain.toml` (stable, edition 2021). Install
+The toolchain is **pinned** via `rust-toolchain.toml` (stable `1.99.1`, edition 2021; CI pins the same version). Install
 [rustup](https://rustup.rs); it picks up the pinned channel automatically on first build. The MSRV
 is documented in the README.
 

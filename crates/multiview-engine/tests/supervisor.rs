@@ -89,13 +89,13 @@ impl Actor for FlakyActor {
         &self.name
     }
 
-    async fn run(&mut self) -> ActorExit {
+    fn run(&mut self) -> impl std::future::Future<Output = ActorExit> {
         let n = self.runs.fetch_add(1, Ordering::SeqCst);
-        if n < u64::from(self.fail_count) {
+        std::future::ready(if n < u64::from(self.fail_count) {
             ActorExit::Failed
         } else {
             ActorExit::Completed
-        }
+        })
     }
 }
 
@@ -137,9 +137,9 @@ impl Actor for AlwaysFails {
     fn name(&self) -> &str {
         "always-fails"
     }
-    async fn run(&mut self) -> ActorExit {
+    fn run(&mut self) -> impl std::future::Future<Output = ActorExit> {
         self.runs.fetch_add(1, Ordering::SeqCst);
-        ActorExit::Failed
+        std::future::ready(ActorExit::Failed)
     }
 }
 

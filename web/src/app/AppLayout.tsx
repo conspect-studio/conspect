@@ -7,6 +7,12 @@ import { Trans, useLingui } from "@lingui/react/macro";
 import { Menu } from "lucide-react";
 import { Outlet, useLocation } from "react-router-dom";
 
+import {
+  ConfigLockBanner,
+  LadderBanner,
+  LicenceChip,
+  PendingActionStrip,
+} from "../components/account/chrome";
 import { ConnectionStatus } from "../components/ConnectionStatus";
 import { HealthBanner } from "../components/HealthBanner";
 import { LocaleSwitcher } from "../components/LocaleSwitcher";
@@ -77,6 +83,9 @@ export function AppLayout(): JSX.Element {
             </div>
 
             <div className="ms-auto flex items-center gap-2">
+              {/* Account-side licence chip: links to claim (unclaimed) or the
+                  licence screen (claimed); colour paired with text. */}
+              <LicenceChip />
               <ConnectionStatus status={status} />
               <LocaleSwitcher />
               <ThemeToggle />
@@ -87,6 +96,21 @@ export function AppLayout(): JSX.Element {
               an actionable callout (severity + message + remediation) when a
               capability mismatch is active (e.g. GPU present but CPU compositing). */}
           <HealthBanner />
+
+          {/* Account-side enforcement-ladder banner: quiet when the licence is
+              active, an actionable callout (the reason + a link to the licence
+              screen) at warning-or-worse. The tile watermark is an engine
+              concern; the SPA only explains it. */}
+          <LadderBanner />
+
+          {/* Account-side pending-action strip: surfaces remote actions awaiting
+              local review; renders nothing when the queue is empty. */}
+          <PendingActionStrip />
+
+          {/* Config-lock interceptor: while enforcement locks reconfiguration,
+              this explains why and links to the licence screen. The API also
+              returns 409 config_locked, so the lock holds if the UI is bypassed. */}
+          <ConfigLockBanner />
 
           <main
             id="main-content"

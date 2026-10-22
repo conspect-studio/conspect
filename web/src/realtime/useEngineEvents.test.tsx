@@ -73,12 +73,41 @@ const TILES_SNAPSHOT_FRAME = JSON.stringify({
   },
 });
 
+/**
+ * The connection mints a single-use ticket (ADR-RT011) before opening the
+ * socket, so the WebSocket is created after a microtask. Wait for it (under
+ * `act`, so the connect-driven state updates are flushed).
+ */
+async function firstSocket(): Promise<FakeWebSocket> {
+  await act(async () => {
+    await vi.waitFor(() => {
+      expect(FakeWebSocket.instances.length).toBeGreaterThan(0);
+    });
+  });
+  const socket = FakeWebSocket.instances[0];
+  if (socket === undefined) {
+    throw new Error('no socket');
+  }
+  return socket;
+}
+
 describe('useEngineEvents connect-time tiles snapshot', () => {
   let client: QueryClient;
 
   beforeEach(() => {
     FakeWebSocket.instances = [];
     vi.stubGlobal('WebSocket', FakeWebSocket);
+    // The realtime auth ticket mint (`POST /api/v1/ws/ticket`, ADR-RT011).
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({ ticket: 'test-ticket', expires_in_secs: 30 }),
+        }),
+      ),
+    );
     client = new QueryClient();
   });
 
@@ -93,13 +122,9 @@ describe('useEngineEvents connect-time tiles snapshot', () => {
     );
   }
 
-  it('seeds the tiles cache from the $snapshot frame with no delta', () => {
+  it('seeds the tiles cache from the $snapshot frame with no delta', async () => {
     const { unmount } = renderHook(() => useEngineEvents(), { wrapper });
-    const socket = FakeWebSocket.instances[0];
-    expect(socket).toBeDefined();
-    if (socket === undefined) {
-      return;
-    }
+    const socket = await firstSocket();
 
     act(() => {
       socket.onopen?.();
@@ -117,13 +142,9 @@ describe('useEngineEvents connect-time tiles snapshot', () => {
     unmount();
   });
 
-  it('a later snapshot REBUILDS (replaces) the tile cache, never merges', () => {
+  it('a later snapshot REBUILDS (replaces) the tile cache, never merges', async () => {
     const { unmount } = renderHook(() => useEngineEvents(), { wrapper });
-    const socket = FakeWebSocket.instances[0];
-    expect(socket).toBeDefined();
-    if (socket === undefined) {
-      return;
-    }
+    const socket = await firstSocket();
 
     act(() => {
       socket.onopen?.();

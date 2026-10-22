@@ -17,7 +17,7 @@ security model of the management surface.
 
 **Please do not open public GitHub issues for security vulnerabilities.**
 
-Report privately via GitHub's **[Security Advisories](https://github.com/aperim/multiview/security/advisories/new)**
+Report privately via GitHub's **[Security Advisories](https://github.com/conspect-studio/conspect/security/advisories/new)**
 ("Report a vulnerability") on this repository. This keeps the details embargoed until a
 fix is available.
 

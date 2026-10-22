@@ -346,7 +346,7 @@ async fn head_serves_metadata_with_content_length_and_no_body() {
             .and_then(|v| v.to_str().ok()),
         Some(ORIGIN)
     );
-    assert!(body_bytes(response).await.is_empty());
+    assert_eq!(body_bytes(response).await, Vec::<u8>::new());
 }
 
 /// Only HLS media extensions are served: a sibling non-media file 404s, and a

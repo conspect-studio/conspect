@@ -21,26 +21,38 @@
 //! ([`ladder::LadderState::program_stays_on_air`]). A broadcaster's program is
 //! sacred; this crate cannot violate that even by mistake.
 //!
-//! ## Scope of THIS crate (CONSPECT-0 + CONSPECT-1)
+//! ## Scope of THIS crate (CONSPECT-0 + CONSPECT-1 + CONSPECT-3)
 //!
 //! The pure data + verification model ([`entitlement`], [`lease`], [`ladder`],
 //! [`fingerprint`], [`verify`], [`status`]) **plus** the local lease lifecycle
 //! (CONSPECT-1): the in-memory active-lease [`store`], the lease-directory
 //! [`watcher`] (a dependency-free poll loop that picks up a dropped lease file
 //! and verifies it against the pinned key), and the [`challenge`] CBOR export.
-//! There are **no** licence-server calls (the `heartbeat` network client is a
-//! later, feature-gated item) and **no** engine seams wired here (those are
-//! CONSPECT-2/CONSPECT-10). The pinned verifying key is a **parameter**
-//! ([`verify::PinnedKey`]); key pinning/rotation policy (O2) lives in the caller.
+//! The pinned verifying key is a **parameter** ([`verify::PinnedKey`]); key
+//! pinning/rotation policy (O2) lives in the caller.
+//!
+//! Under the **off-by-default `heartbeat` feature** (CONSPECT-3, ADR-0096) the
+//! crate also carries the device-licensing client [`heartbeat`]: the Conspect
+//! key-trust verifier (pinned-root ECDSA-P256 → attested Ed25519 intermediates),
+//! the bare-Ed25519 signed-lease verifier, and the
+//! [`HeartbeatClient`](heartbeat::HeartbeatClient) loop that drives the same
+//! [`store::LeaseStore::install_binding`] convergence on a positively-verified
+//! lease. The **live HTTP transport stays at the cli/app boundary** behind the
+//! [`LicenceServer`](heartbeat::LicenceServer) seam — under this feature the leaf
+//! crate gains only pure-Rust crypto + `tokio` (the loop's sleep), never a socket
+//! of its own. The default build has **no** licence-server calls and stays a
+//! network-free, LGPL-clean shell.
 //!
 //! The lifecycle pieces are still **physically incapable of touching output**:
 //! the [`store`] holds an `RwLock` over control-plane-only state read off the hot
 //! loop, and the [`watcher`] does control-plane filesystem I/O only — neither
 //! holds an engine handle, and a malformed dropped file is logged + skipped, not
-//! crashed on (bad-inputs-are-the-purpose). The only system-clock read in the
-//! whole crate is the watcher's wall-clock sample for each install, off the
-//! engine; everything else takes the instant as a parameter (the [`store::Clock`]
-//! seam).
+//! crashed on (bad-inputs-are-the-purpose). The heartbeat client likewise holds
+//! no engine handle: it only ever **tightens** on a positively-verified signed
+//! lease and keeps last-good on every failure (never off air, invariants #1/#10).
+//! The only system-clock reads are off the engine (the watcher's per-install
+//! wall sample and the heartbeat loop's `nextDue`/now sample); everything in the
+//! pure model takes the instant as a parameter (the [`store::Clock`] seam).
 //!
 //! ## Data minimisation
 //!
@@ -58,6 +70,8 @@ pub mod constants;
 pub mod entitlement;
 pub mod error;
 pub mod fingerprint;
+#[cfg(feature = "heartbeat")]
+pub mod heartbeat;
 pub mod ladder;
 pub mod lease;
 pub mod status;

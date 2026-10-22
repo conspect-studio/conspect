@@ -70,7 +70,7 @@ fn tile_levers_come_before_program_levers() {
 
 #[test]
 fn actions_at_level_is_cumulative_and_clamped() {
-    assert!(actions_at_level(0).is_empty());
+    assert_eq!(actions_at_level(0), []);
     // Level 1 sheds the single cheapest rung — preview focus WHEP, not a tile.
     assert_eq!(actions_at_level(1), &[DegradationAction::ShedFocusWhep]);
     assert_eq!(

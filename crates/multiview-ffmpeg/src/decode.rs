@@ -348,6 +348,33 @@ impl VideoDecoder {
         result
     }
 
+    /// Flush the decoder's buffered state (`avcodec_flush_buffers`), discarding
+    /// every buffered/reordered frame so decoding can resume cleanly from a new
+    /// position after a container seek.
+    ///
+    /// A seek without a flush leaves the decoder holding pictures decoded
+    /// *before* the seek; for codecs that reorder (B-frames) those stale frames
+    /// would surface after the seek as out-of-order garbage. It is safe to call
+    /// between packets (a no-op on a fresh/drained decoder), and the decoder
+    /// stays usable afterwards.
+    ///
+    /// # Safety / FFI invariant
+    /// The flush runs through `ffmpeg_next`'s safe `Decoder::flush` wrapper,
+    /// which owns the single `unsafe` `avcodec_flush_buffers` call — this module
+    /// adds no raw FFI (it is zero-`unsafe` by construction). Soundness rests on
+    /// the `AVCodecContext` being **owned** by this decoder and reached only
+    /// through `&mut self` (the type is `Send + !Sync`, satisfying libav's
+    /// single-threaded-access rule); flushing only drops buffered frames and
+    /// resets decode state, which is valid between packets.
+    ///
+    /// # Errors
+    /// Returns [`Result::Ok`] — the underlying libav flush is infallible; the
+    /// `Result` return mirrors the rest of this crate's decoder API.
+    pub fn flush(&mut self) -> Result<()> {
+        self.decoder.flush();
+        Ok(())
+    }
+
     /// Try to receive exactly one frame from the decoder.
     ///
     /// Returns `Ok(Some(info))` if a frame was produced, `Ok(None)` if the

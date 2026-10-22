@@ -1,0 +1,77 @@
+[package]
+name = "multiview-mesh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io
+# (matches the rest of the workspace). This lets cargo-deny's
+# allow-wildcard-paths exempt the intra-workspace path deps while still denying
+# real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+# The signed digest/summary + lease-binding types the mesh announces (the
+# entitlement summary it advertises) and relays (the end-to-end-signed binding
+# the carrier passes through, ADR-0051 §4). The mesh never mints or verifies a
+# server key itself — it carries the licence crate's already-signed artefacts.
+multiview-licence = { workspace = true }
+multiview-events = { workspace = true }
+serde = { workspace = true }
+# Compact JSON wire form for the mDNS TXT-record announce payload (robust across
+# the mdns-sd property encoding) — pure Rust, `MIT OR Apache-2.0`, already in the
+# workspace graph + deny-clean.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# The lease-bound instants the entitlement summary advertises (`DateTime<Utc>`).
+# Carries the workspace `default-features = false` (no `clock`/`std`-time reads —
+# the cli samples the wall clock and hands instants in, so this leaf crate reads
+# no system clock itself). `serde` for the dated summary fields. `MIT OR
+# Apache-2.0`, deny-clean, already in the workspace graph.
+chrono = { workspace = true, features = ["serde"] }
+# Ed25519 signature VERIFICATION of the originator-signed announce summary
+# (data-minimisation: the announcer signs its OWN summary so a peer can detect a
+# spoofed/tampered announcement). `MIT OR Apache-2.0`; its closure
+# (`curve25519-dalek`, `ed25519`, `signature`, `sha2`, `zeroize`, `subtle`) is
+# already on the deny.toml allowlist (the licence crate pulls the identical
+# closure). Default features disabled + only `alloc` (signature/key parsing); no
+# RNG/keygen in non-test code — the mesh checks signatures handed to it.
+# ed25519-dalek 3.x aligns to curve25519-dalek 5 / signature 3 (ADR-I010);
+# `verify_strict` + `Signature::from_bytes` are byte-identical to 2.x.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
+
+# The mDNS socket layer (announce + browse) is OFF by default (brief §13.2 / O5):
+# the default build is a pure shell so `cargo check --workspace` stays GPU-free,
+# native-dep-free, and deny-clean. The `mdns` feature pulls the maintained,
+# deny-clean `mdns-sd` crate (the design's named "mdns-sd-class" default, O5) and
+# `tokio` for the off-hot-loop announce/browse task.
+#
+# `mdns-sd` (MIT OR Apache-2.0) is the most-maintained pure-Rust mDNS-SD
+# (RFC 6762/6763) implementation; its closure — `fastrand`, `flume`, `if-addrs`,
+# `mio`, `socket-pktinfo`, `socket2` — is entirely `MIT`/`Apache-2.0`/`BSD`
+# already on the deny.toml allowlist (proven by `cargo deny check --all-features`).
+mdns-sd = { version = "0.20", optional = true }
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+# Live mDNS over the wire: the socket announce/browse task. The pure announce
+# payload, peer table, role model, and relay carrier are ALWAYS compiled +
+# tested without this feature (offline, no socket).
+mdns = ["dep:mdns-sd", "dep:tokio"]
+
+[dev-dependencies]
+# Test-only deterministic keypair generation for the Ed25519 announce-signature
+# tests (valid / tampered / wrong-key). The ed25519-dalek `rand_core` feature
+# enables `SigningKey::generate` + re-exports the rand_core (0.10) it binds to; OS
+# entropy is `getrandom::SysRng` wrapped in `rand_core::UnwrapErr` (ADR-I010). The
+# non-test library never depends on an RNG (data minimisation).
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core"] }
+getrandom = { version = "0.4", default-features = false, features = ["sys_rng"] }
+
+[lints]
+workspace = true

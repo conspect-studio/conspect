@@ -1,15 +1,18 @@
-// Settings — appearance + language controls, the API access token, and a
-// demonstration of the accessible toast notifications.
-import { useState } from "react";
+// Settings — appearance + language controls, the API access token, the
+// config-file watch status (ADR-W020), and a demonstration of the accessible
+// toast notifications.
+import { useMemo, useState } from "react";
 import type { JSX } from "react";
 import { Trans, useLingui } from "@lingui/react/macro";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { createApiClient } from "../api/client";
 import { getStoredToken, setStoredToken } from "../api/token";
 import { ExportConfigButton } from "../resources/FormControls";
 import { LocaleSwitcher } from "../components/LocaleSwitcher";
 import { PageHeader } from "../components/PageHeader";
 import { ThemeToggle } from "../components/ThemeToggle";
+import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import {
   Card,
@@ -21,6 +24,103 @@ import {
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { toast } from "../components/ui/use-toast";
+import { useActiveLocale } from "../i18n/I18nProvider";
+import { formatDateTime } from "../i18n/format";
+
+/**
+ * The "Configuration file" card (ADR-W020): whether the boot config file is
+ * watched for external edits, the watched path, the last applied/rejected
+ * loads, and any sections pending a restart — read from
+ * `GET /api/v1/config/watch-status`.
+ */
+function ConfigWatchCard(): JSX.Element {
+  const { t } = useLingui();
+  const locale = useActiveLocale();
+  const client = useMemo(() => createApiClient(), []);
+  const query = useQuery({
+    queryKey: ["config", "watch-status"],
+    queryFn: async () => {
+      const { data } = await client.GET("/api/v1/config/watch-status");
+      if (data === undefined) {
+        throw new Error(t`Could not load the configuration file watch status.`);
+      }
+      return data;
+    },
+    refetchInterval: 15_000,
+  });
+  const status = query.data;
+  const lastApplied = status?.last_applied ?? null;
+  const lastRejected = status?.last_rejected ?? null;
+  const path = status?.path ?? null;
+
+  return (
+    <Card className="lg:col-span-2">
+      <CardHeader>
+        <CardTitle>
+          <Trans>Configuration file</Trans>
+        </CardTitle>
+        <CardDescription>
+          <Trans>
+            External edits to the boot configuration file hot-reload the parts
+            that can apply live; an invalid file changes nothing and is
+            reported here and on the health banner. Sections that cannot
+            hot-apply stay listed until a restart.
+          </Trans>
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2 text-sm">
+        {status === undefined ? (
+          <p className="text-muted-foreground">
+            {query.isError ? (
+              <Trans>The watch status is unavailable.</Trans>
+            ) : (
+              <Trans>Loading…</Trans>
+            )}
+          </p>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant={status.active ? "default" : "outline"}>
+                {status.active ? (
+                  <Trans>Watching</Trans>
+                ) : (
+                  <Trans>Not watched</Trans>
+                )}
+              </Badge>
+              {path !== null && (
+                <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+                  {path}
+                </code>
+              )}
+            </div>
+            {lastApplied !== null && (
+              <p>
+                <Trans>Last applied:</Trans>{" "}
+                {formatDateTime(locale, new Date(lastApplied.at_ms))} —{" "}
+                {lastApplied.detail}
+              </p>
+            )}
+            {lastRejected !== null && (
+              <p className="text-destructive">
+                <Trans>Last rejected:</Trans>{" "}
+                {formatDateTime(locale, new Date(lastRejected.at_ms))} —{" "}
+                {lastRejected.detail}
+              </p>
+            )}
+            {status.restart_pending.length > 0 && (
+              <p>
+                <Trans>Restart pending:</Trans>{" "}
+                <span className="font-medium">
+                  {status.restart_pending.join(", ")}
+                </span>
+              </p>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 /** The settings page. */
 export function SettingsPage(): JSX.Element {
@@ -131,6 +231,8 @@ export function SettingsPage(): JSX.Element {
             </div>
           </CardContent>
         </Card>
+
+        <ConfigWatchCard />
 
         <Card className="lg:col-span-2">
           <CardHeader>

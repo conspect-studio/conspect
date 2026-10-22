@@ -22,6 +22,7 @@ use crate::normalize::WrapBits;
 use crate::source::{FrameProducer, ProducedFrame};
 
 use super::convert::{bgra_to_nv12, uyvy_to_nv12, ReceivedVideoFrame};
+use super::license::{LicenseAcceptance, NdiLicense, NdiLicenseError};
 use super::receiver::{NdiReceiver, NdiRecvFourCc, ReceivedFrame};
 
 /// NDI's timecode media clock: a 64-bit monotonic value in **100 ns units**, so
@@ -43,14 +44,56 @@ const NDI_FALLBACK_FPS: i64 = 30;
 /// [`FrameProducer::next_frame`] samples the receiver once and converts a ready
 /// frame to NV12; a quiet sample (no frame this instant) returns `Ok(None)`.
 pub struct NdiProducer {
+    /// The accepted NDI license guard (ADR-0008 §7.5). Held to enforce acceptance
+    /// by construction and to expose the audit record (who/when) for export — the
+    /// ingest mirror of `multiview_output`'s `NdiOutput`.
+    license: NdiLicense,
     receiver: Box<dyn NdiReceiver + Send>,
 }
 
 impl NdiProducer {
-    /// Build a producer over an application-supplied [`NdiReceiver`].
+    /// Build a producer over an application-supplied [`NdiReceiver`], gated by an
+    /// accepted [`NdiLicense`].
+    ///
+    /// Mirrors `multiview_output`'s `NdiOutput::new`: the only way to construct an
+    /// NDI source is with an accepted license, so — ADR-0008 §7.5 — a source
+    /// cannot start receiving without acceptance. Obtain the [`NdiLicense`] via
+    /// [`NdiProducer::start`] (from the `[system.ndi] accept_license` setting) or
+    /// [`NdiLicense::accept`].
     #[must_use]
-    pub fn new(receiver: Box<dyn NdiReceiver + Send>) -> Self {
-        Self { receiver }
+    pub fn new(license: NdiLicense, receiver: Box<dyn NdiReceiver + Send>) -> Self {
+        Self { license, receiver }
+    }
+
+    /// Evaluate the `[system.ndi] accept_license` setting + its audit record and,
+    /// when accepted, build the gated producer — the single decision point an NDI
+    /// source start flows through.
+    ///
+    /// When the operator has not accepted the NDI SDK license (or the audit record
+    /// is incomplete), returns the typed [`NdiLicenseError`] refusal and **no
+    /// producer is constructed**, so the receive seam is never sampled and no
+    /// frames flow (the tile degrades; the output clock is untouched).
+    ///
+    /// # Errors
+    /// [`NdiLicenseError::NotAccepted`] when `accept_license` is `false`;
+    /// [`NdiLicenseError::IncompleteAcceptance`] when accepted but the audit
+    /// fields (who/when) are blank.
+    pub fn start(
+        accept_license: bool,
+        acceptance: LicenseAcceptance,
+        receiver: Box<dyn NdiReceiver + Send>,
+    ) -> core::result::Result<Self, NdiLicenseError> {
+        // NOTE: the crate-local `Result` alias fixes `E = crate::Error`; this gate
+        // returns the typed `NdiLicenseError`, so spell out the std `Result`.
+        let license = NdiLicense::from_setting(accept_license, acceptance)?;
+        Ok(Self::new(license, receiver))
+    }
+
+    /// The accepted license guard, exposing the audit record (who/when) for the
+    /// audit log / config export.
+    #[must_use]
+    pub fn license(&self) -> &NdiLicense {
+        &self.license
     }
 
     /// Convert a received video frame into an NV12 [`ProducedFrame`], mapping the

@@ -92,22 +92,6 @@ impl<C: Clone> CaptionCueStore<C> {
             .find(|e| e.start <= now && now < e.end)
             .map(|e| e.cue.clone())
     }
-
-    /// Drop cues that ended at or before `watermark`, so a long-running source's
-    /// bounded buffer holds live cues rather than history. A no-op (no
-    /// allocation) when nothing has expired.
-    pub fn prune_before(&self, watermark: MediaTime) {
-        let current = self.entries.load();
-        if current.iter().all(|e| e.end > watermark) {
-            return;
-        }
-        let next: Vec<Entry<C>> = current
-            .iter()
-            .filter(|e| e.end > watermark)
-            .cloned()
-            .collect();
-        self.entries.store(Arc::new(next));
-    }
 }
 
 impl<C: Clone> Default for CaptionCueStore<C> {
@@ -176,16 +160,6 @@ mod tests {
         assert_eq!(store.active_at(mt(500)), None); // "a" dropped
         assert_eq!(store.active_at(mt(2_500)), Some("b"));
         assert_eq!(store.active_at(mt(4_500)), Some("c"));
-    }
-
-    #[test]
-    fn prune_before_drops_only_ended_cues() {
-        let store = CaptionCueStore::new();
-        store.publish(mt(0), mt(1_000), "old");
-        store.publish(mt(2_000), mt(3_000), "keep");
-        store.prune_before(mt(1_500));
-        assert_eq!(store.active_at(mt(500)), None);
-        assert_eq!(store.active_at(mt(2_500)), Some("keep"));
     }
 
     proptest! {

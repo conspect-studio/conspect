@@ -223,13 +223,20 @@ async fn software_run_serves_the_control_api_while_running() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     // IPv6-first: the serve path must bind the IPv6 loopback `[::1]`.
-    let (addr, server) = control::bind_and_serve(
+    let (addr, server, _state) = control::bind_and_serve(
         "[::1]:0",
         &cfg,
         Arc::clone(&publisher),
         commands,
         multiview_control::no_preview(),
-        None,
+        None, // whep
+        None, // whip
+        None, // whep_output
+        None, // licence
+        None, // mesh
+        multiview_control::LiveApplyCaps::default(),
+        multiview_control::LiveSourceCapability::synthetic_only(),
+        None, // boot_model (ADR-W024)
         async move {
             let _ = shutdown_rx.await;
         },

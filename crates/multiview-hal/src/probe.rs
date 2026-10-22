@@ -530,11 +530,11 @@ mod tests {
         for kind in HardwareKind::ALL {
             for stage in Stage::ALL {
                 match EnvProbe.detect(kind, stage) {
-                    ProbeOutcome::Absent { reason } => assert!(!reason.is_empty()),
+                    ProbeOutcome::Absent { reason } => assert_ne!(reason, ""),
                     // With a feature on and a real device present this could be
                     // Present; that arm is exercised on hardware, not here.
                     ProbeOutcome::Present(caps) => {
-                        assert!(!caps.formats.is_empty());
+                        assert_ne!(caps.formats.len(), 0, "no formats");
                     }
                 }
             }
@@ -560,7 +560,7 @@ mod tests {
                     | BackendKind::Qsv
                     | BackendKind::VideoToolbox
             ));
-            assert!(!kind.feature_name().is_empty());
+            assert_ne!(kind.feature_name(), "");
         }
     }
 }

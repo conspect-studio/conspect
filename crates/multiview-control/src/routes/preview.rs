@@ -33,6 +33,31 @@ fn jpeg_response(bytes: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// `GET /api/v1/preview/capabilities` — what preview transports this build can
+/// serve, so the SPA picks WHEP vs the JPEG ladder before issuing an offer
+/// (ADR-P006 move 6, ADR-W020). Role: read.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/preview/capabilities",
+        tag = "preview",
+        responses(
+            (status = 200, description = "Preview transport capabilities.", body = crate::preview::PreviewCapabilities),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn capabilities(State(state): State<AppState>, principal: Principal) -> Response {
+    if let Err(err) = principal.role.require(Action::Read) {
+        return err.into_response();
+    }
+    Json(crate::preview::PreviewCapabilities::from_provider(
+        state.whep.as_ref(),
+    ))
+    .into_response()
+}
+
 /// `GET /api/v1/preview/program.jpg` — the latest composited program frame
 /// (role: read). `503` when no frame has been produced yet.
 pub(crate) async fn program_jpeg(State(state): State<AppState>, principal: Principal) -> Response {
@@ -58,6 +83,13 @@ pub(crate) async fn input_jpeg(
     // `{id}.jpg` — strip the extension the UI requests so the id matches the
     // engine's source id.
     let id = id.strip_suffix(".jpg").unwrap_or(&id);
+    // Per-object authz (BOLA, SEC-05 / ADR-W005): a preview input id is a source
+    // id (the same object-scope axis as `GET /inputs/{id}/streams`), so a scoped
+    // principal may view only its in-scope inputs. Checked on the stripped id,
+    // BEFORE the provider is consulted — a denial never samples the frame.
+    if let Err(err) = crate::auth::authorize_object(&principal, id) {
+        return err.into_response();
+    }
     match state.preview.input_jpeg(id, PREVIEW_QUALITY) {
         Some(bytes) => jpeg_response(bytes),
         None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -73,7 +105,17 @@ pub(crate) async fn list_input_ids(
     if let Err(err) = principal.role.require(Action::Read) {
         return err.into_response();
     }
-    Json(state.preview.input_ids()).into_response()
+    // Per-object ROW visibility (BOLA, SEC-05 / ADR-W005): drop input ids outside
+    // the principal's object scope so the enumeration cannot leak inputs a
+    // single-id `GET` would 403 (wholesale-enumeration defense). A no-op for an
+    // unscoped principal — exactly the `list_layouts` row-filter idiom.
+    let ids: Vec<String> = state
+        .preview
+        .input_ids()
+        .into_iter()
+        .filter(|id| crate::auth::authorize_object(&principal, id).is_ok())
+        .collect();
+    Json(ids).into_response()
 }
 
 /// The base path of a WHEP scope's focus resource (the `POST` target and the
@@ -90,7 +132,7 @@ fn whep_base_path(scope: &WhepScope) -> String {
 /// Map a [`WhepReject`] onto its RFC 9457 `application/problem+json` response.
 ///
 /// A `CapacityExceeded` carries the `fallback` transport hint as a non-standard
-/// problem member so the UI can degrade to the named transport (`ws-jpeg`,
+/// problem member so the UI can degrade to the named transport (`jpeg`,
 /// `llhls`) honestly rather than silently failing.
 fn whep_reject_response(scope: &WhepScope, reject: WhepReject) -> Response {
     let instance = whep_base_path(scope);
@@ -143,6 +185,39 @@ fn whep_reject_response(scope: &WhepScope, reject: WhepReject) -> Response {
     }
 }
 
+/// Per-scope authorization for a WHEP focus (BOLA, SEC-06/07 / ADR-W005/W026).
+///
+/// A focus session exposes the live pixels of exactly one entity, so opening or
+/// releasing one must be authorized on that entity's axis — the same per-object /
+/// per-output checks the REST twins use, enforced HERE at the route layer because
+/// the [`crate::preview::WhepProvider`] seam is codec-only and never sees a
+/// [`Principal`]:
+///
+/// * [`WhepScope::Input`] → the object (source) axis ([`crate::auth::authorize_object`]).
+/// * [`WhepScope::Output`] → the output (rendition) axis ([`crate::auth::authorize_output`]).
+/// * [`WhepScope::Program`] → the whole composited canvas, which embeds every
+///   object and output, so only an unrestricted principal may focus it
+///   ([`crate::routes::require_unscoped_for_whole_system`]).
+///
+/// The match carries no wildcard, so a newly-added [`WhepScope`] variant
+/// compile-forces its authorization policy here rather than silently defaulting
+/// to allow.
+///
+/// # Errors
+///
+/// [`crate::error::ControlError::Forbidden`] if the principal's relevant scope
+/// axis denies the focus.
+fn authorize_whep_scope(
+    principal: &Principal,
+    scope: &WhepScope,
+) -> Result<(), crate::error::ControlError> {
+    match scope {
+        WhepScope::Program => crate::routes::require_unscoped_for_whole_system(principal),
+        WhepScope::Input(id) => crate::auth::authorize_object(principal, id),
+        WhepScope::Output(id) => crate::auth::authorize_output(principal, id),
+    }
+}
+
 /// Negotiate a WHEP focus session for `scope` from an SDP `offer` body.
 ///
 /// Shared by the program / input / output `POST …/whep` handlers. Opening a
@@ -162,6 +237,12 @@ fn negotiate_whep(
     offer: &str,
 ) -> Response {
     if let Err(err) = principal.role.require(Action::Write) {
+        return err.into_response();
+    }
+    // Per-scope authz (BOLA, SEC-06/07): the focus exposes one entity's live
+    // pixels, so authorize the scope's axis BEFORE negotiating — a denial never
+    // reaches the transport (zero side effect).
+    if let Err(err) = authorize_whep_scope(principal, scope) {
         return err.into_response();
     }
     match state.whep.negotiate(scope, offer) {
@@ -205,6 +286,11 @@ fn release_whep(
     session_id: &str,
 ) -> Response {
     if let Err(err) = principal.role.require(Action::Write) {
+        return err.into_response();
+    }
+    // Per-scope authz (BOLA, SEC-06/07): a teardown is scoped exactly like an
+    // open — a principal may release only a focus on an entity within its scope.
+    if let Err(err) = authorize_whep_scope(principal, scope) {
         return err.into_response();
     }
     if state.whep.release(scope, session_id) {

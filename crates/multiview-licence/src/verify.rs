@@ -87,14 +87,22 @@ impl SignedLease {
         }
     }
 
-    /// The canonical, deterministic bytes a signature covers for `lease`.
+    /// The canonical, deterministic bytes a signature covers for `lease` bound to
+    /// `instance_binding_id`.
     ///
     /// Domain-separated then each covered field is appended length-prefixed in a
     /// fixed order, so the encoding is unambiguous and stable. The covered fields
     /// are exactly those a tamper must not be able to alter undetected: the
-    /// serial, the source, and the dated bounds.
+    /// serial, the source, the dated bounds, **and** the server-issued
+    /// `instance_binding_id` the binding anchors the device identity to. The
+    /// binding id is carried with a 1-byte presence tag (`0` = absent, `1` =
+    /// present) before its length-prefixed bytes, so a `None` binding id signs to
+    /// a value distinct from an empty-string id and a tampered (or grafted)
+    /// binding id changes the bytes and invalidates the signature. Anchoring the
+    /// device identity therefore always rests on signed material on every install
+    /// path (offline file-drop, control-route upload, mesh relay, heartbeat).
     #[must_use]
-    pub fn signing_bytes(lease: &Lease) -> Vec<u8> {
+    pub fn signing_bytes(lease: &Lease, instance_binding_id: Option<&str>) -> Vec<u8> {
         let mut out = Vec::with_capacity(SIGNING_DOMAIN.len() + 128);
         out.extend_from_slice(SIGNING_DOMAIN);
         append_field(&mut out, lease.serial.as_bytes());
@@ -117,21 +125,38 @@ impl SignedLease {
             &mut out,
             lease.next_contact_due.timestamp_nanos_opt().unwrap_or(0),
         );
+        // The instance binding id: a presence tag then the length-prefixed bytes,
+        // so `None` and `Some("")` are distinct signed values and any graft of the
+        // anchor field changes the signed bytes (tamper-evident).
+        match instance_binding_id {
+            None => out.push(0),
+            Some(id) => {
+                out.push(1);
+                append_field(&mut out, id.as_bytes());
+            }
+        }
         out
     }
 }
 
-/// Verify a signed lease against the pinned key.
+/// Verify a signed lease against the pinned key, bound to `instance_binding_id`.
+///
+/// The signature is checked over [`SignedLease::signing_bytes`] computed with the
+/// SAME `instance_binding_id` the caller will anchor — so a binding whose
+/// `instance_binding_id` was grafted/tampered after signing (or is absent when
+/// the signature covered one, or vice-versa) fails to verify. The device identity
+/// anchor therefore always rests on signed material.
 ///
 /// Returns a reference to the verified lease on success.
 ///
 /// # Errors
 /// - [`LicenceError::MalformedSignature`] if the signature is not 64 bytes.
 /// - [`LicenceError::BadSignature`] if the signature does not verify against the
-///   pinned key (tampered payload, wrong signer, or forgery).
+///   pinned key (tampered payload/binding id, wrong signer, or forgery).
 pub fn verify_signed_lease<'a>(
     signed: &'a SignedLease,
     pinned: &PinnedKey,
+    instance_binding_id: Option<&str>,
 ) -> Result<&'a Lease, LicenceError> {
     let sig_bytes: [u8; Signature::BYTE_SIZE] = signed
         .signature
@@ -139,7 +164,7 @@ pub fn verify_signed_lease<'a>(
         .try_into()
         .map_err(|_| LicenceError::MalformedSignature)?;
     let signature = Signature::from_bytes(&sig_bytes);
-    let message = SignedLease::signing_bytes(&signed.lease);
+    let message = SignedLease::signing_bytes(&signed.lease, instance_binding_id);
     pinned
         .key
         .verify_strict(&message, &signature)

@@ -28,12 +28,21 @@
 //! facets into the [`DeviceDriverRegistry`] the projection endpoints read. With
 //! a driver adopted, `GET /devices/{id}/source-candidates` and `/output-targets`
 //! return the driver's real enumerated candidates; without one they stay
-//! honestly empty. mDNS/DNS-SD **discovery** ([`discovery`], DEV-A5) is real and
-//! complete too: a bounded, TTL-expiring, **untrusted** inventory of services
-//! found on the LAN, requiring explicit confirm-adopt (ADR-0041) — discovery
-//! never creates a device.
+//! honestly empty. The discovery driver actor is DEV-A5.
+//!
+//! The DEV-D2 [`cast`] driver (ADR-M011) is the second: a Google Cast session
+//! actor over the same registry/factory/tombstone machinery, pointing a Cast
+//! device at an HLS rendition the engine already serves — pure control plane,
+//! the media graph untouched. Multiple driver factories compose through the
+//! [`CompositePollerFactory`] (first managing member wins).
+//!
+//! mDNS/DNS-SD **discovery** ([`discovery`], DEV-A5) is real and complete too:
+//! a bounded, TTL-expiring, **untrusted** inventory of services found on the
+//! LAN, requiring explicit confirm-adopt (ADR-0041) — discovery never creates
+//! a device.
 
 pub mod broadcaster;
+pub mod cast;
 pub mod discovery;
 pub mod driver_registry;
 pub mod projection;
@@ -54,6 +63,7 @@ pub use zowietek::poller::{PollerConfig, PollerControl, PollerHandle, PollerStep
 #[cfg(feature = "zowietek")]
 pub use zowietek::runtime::ReqwestPollerFactory;
 pub use zowietek::runtime::{
-    DevicePollerFactory, DevicePollerRegistry, NoPollerFactory, PollerWiring,
+    CompositePollerFactory, DevicePollerFactory, DevicePollerRegistry, NoPollerFactory,
+    PollerWiring,
 };
 pub use zowietek::{ModeConvergence, WorkMode, ZowietekDriver};

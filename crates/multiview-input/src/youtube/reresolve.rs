@@ -33,19 +33,17 @@
 //! It does no decoding of its own — the resolved manifest is fed to the standard
 //! HLS ingest path, which owns the actual demux/decode.
 //!
-//! ## Wiring status (honest, no aspiration)
+//! ## Wiring status
 //!
-//! [`ReresolveSchedule`] + [`run_reresolve_loop`] are implemented and unit-tested
-//! here, but the **proactive lead-time loop is not yet spawned by the CLI** — that
-//! bridge (the async loop ↔ the synchronous std decode thread, with a swappable
-//! URL slot) is the remaining slice (tracked as **IN-5b**). What the CLI ingest
-//! path (`multiview-cli`'s `open_and_stream`) does **today** is re-resolve a fresh
-//! master on every (re)connect via the existing reconnect/backoff bracket: a
-//! long run still survives the ~6 h expiry — the segment fetch 403s, the reconnect
-//! re-resolves, and the tile rides LIVE → STALE → reconnect back to LIVE — but the
-//! tile **does briefly degrade at the boundary** (break-before-make) rather than
-//! refreshing ahead of it. Wiring the loop above into ingest upgrades that to the
-//! make-before-break, refresh-before-expiry behaviour this module already provides.
+//! [`ReresolveSchedule`] + [`run_reresolve_loop`] are implemented, unit-tested
+//! here, and **wired into the CLI ingest path**: for a `YouTube` source the
+//! `multiview-cli` pipeline spawns a dedicated `multiview-yt-reresolve-*` thread
+//! that runs [`run_reresolve_loop`] off the data plane and publishes each fresh
+//! master into a lock-free swap slot the synchronous decode thread reads — the
+//! make-before-break, refresh-before-expiry behaviour this module provides. The
+//! reconnect/backoff bracket is the backstop: if a URL still expires early the
+//! segment fetch 403s and the tile rides LIVE → STALE → reconnect back to LIVE,
+//! so a long run survives the ~6 h expiry either way.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

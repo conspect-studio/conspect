@@ -13,7 +13,7 @@
 services:
   multiview:
     # The default LGPL image already carries libva2 + mesa/intel VAAPI drivers.
-    image: ghcr.io/aperim/multiview:latest
+    image: ghcr.io/conspect-studio/conspect:latest
     devices:
       # The render node (Intel/AMD). Add /dev/dri/card0 too if your driver needs it.
       - "/dev/dri/renderD128:/dev/dri/renderD128"

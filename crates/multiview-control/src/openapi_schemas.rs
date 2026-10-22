@@ -11,6 +11,14 @@
 //! These types are used **only** to describe the schema in the generated
 //! `OpenAPI` document — the handlers serialise the real core types. A round-trip
 //! test (`tests/alarms.rs`) pins the two shapes together so they cannot drift.
+// `large_stack_arrays`: the `utoipa::ToSchema` derive on a large tagged enum
+// (`OutputBodyDoc` — every output kind × its fields, including the OUTMETA
+// `metadata`/`orientation` mirrors) expands to a const array of schema entries
+// that crosses clippy's 16 KiB stack-array threshold. Every type in this module
+// is an OpenAPI documentation mirror evaluated once at spec generation
+// (`xtask gen-openapi`), never on a request/data path — the array lives in the
+// derive's generated builder, not runtime code. Scoped to this doc-only module.
+#![allow(clippy::large_stack_arrays)]
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -692,12 +700,72 @@ pub struct DevicePinDoc {
     pub stable_id: String,
 }
 
-/// `OpenAPI` mirror of `multiview_config::RtspOptions`.
+/// `OpenAPI` mirror of `multiview_config::RistProfile` (VSF `TR-06`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RistProfileDoc {
+    /// Simple Profile (`TR-06-1`).
+    Simple,
+    /// Main Profile (`TR-06-2`) — the default.
+    #[default]
+    Main,
+    /// Advanced Profile (`TR-06-3`) — Tier-1/2 only.
+    Advanced,
+}
+
+/// `OpenAPI` mirror of `multiview_config::RistAesBits` (RIST PSK key length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RistAesBitsDoc {
+    /// `AES-128`.
+    Aes128,
+    /// `AES-256`.
+    Aes256,
+}
+
+/// `OpenAPI` mirror of `multiview_config::RistEncryption` (PSK; secret by
+/// reference only — never a plaintext key).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
-pub struct RtspOptionsDoc {
-    /// Lower-transport selection (`tcp` / `udp`).
-    pub transport: String,
+pub struct RistEncryptionDoc {
+    /// `AES` key length (`aes128` / `aes256`).
+    pub aes_bits: RistAesBitsDoc,
+    /// Reference to the pre-shared passphrase (`op://…` / `env:VAR`); resolved
+    /// at run time, never stored or logged in plaintext.
+    pub secret_ref: String,
+}
+
+/// `OpenAPI` mirror of `multiview_config::RistPeer` (Tier-2 bonding endpoint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct RistPeerDoc {
+    /// The peer's `rist://host:port` URL.
+    pub url: String,
+}
+
+/// `OpenAPI` mirror of `multiview_config::RistOptions` (typed RIST connection
+/// options; lowered to the `rist://…?…` `AVIO` URL on the Tier-0 `FFmpeg` path).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct RistOptionsDoc {
+    /// RIST profile (absent ⇒ `main`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<RistProfileDoc>,
+    /// Recovery/jitter buffer depth in milliseconds (the `ARQ` window;
+    /// `0`/absent ⇒ `librist` auto).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_ms: Option<u32>,
+    /// `MPEG-TS`-aligned packet size (default 1316).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pkt_size: Option<u16>,
+    /// Pre-shared-key `AES` encryption (Main Profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<RistEncryptionDoc>,
+    /// Tier-2 only: bonding/load-sharing peers (rejected on the Tier-0 build).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bonding: Vec<RistPeerDoc>,
 }
 
 /// `OpenAPI` mirror of `multiview_config::ClockFaceConfig`.
@@ -870,9 +938,6 @@ pub enum SourceKindDoc {
     Rtsp {
         /// Source URL.
         url: String,
-        /// RTSP transport options.
-        #[serde(default)]
-        rtsp: Option<RtspOptionsDoc>,
     },
     /// HLS / M3U pull.
     Hls {
@@ -893,6 +958,14 @@ pub enum SourceKindDoc {
     Srt {
         /// Source URL.
         url: String,
+    },
+    /// RIST (VSF `TR-06`) input — the open-standard sibling of SRT (ADR-0095).
+    Rist {
+        /// Source URL (`rist://[::]:port` or peer host).
+        url: String,
+        /// Optional typed RIST options (profile, buffer, PSK encryption, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rist: Option<RistOptionsDoc>,
     },
     /// RTMP input.
     Rtmp {
@@ -1003,6 +1076,114 @@ pub struct OutputAudioDoc {
     pub tracks: Vec<String>,
 }
 
+/// `OpenAPI` mirror of `multiview_config::OutputTimedMetadata` (ADR-0088 §4):
+/// the HLS/TS now-playing/cue timed-metadata carrier opt-ins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct OutputTimedMetadataDoc {
+    /// Emit in-band ID3 metadata frames as MPEG-TS PES.
+    #[serde(default)]
+    pub id3: bool,
+    /// Emit out-of-band `EXT-X-DATERANGE` playlist tags.
+    #[serde(default)]
+    pub daterange: bool,
+}
+
+/// `OpenAPI` mirror of `multiview_config::OutputMetadata` (ADR-0088): per-output
+/// declarative metadata intent, projected onto whatever the transport can carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct OutputMetadataDoc {
+    /// Service/program title (TS SDT `service_name`, RTMP `onMetaData` title,
+    /// container `title`, SDP `s=`).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Service provider (TS SDT `provider_name`). No carrier on most transports.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Primary program language, ISO-639-2 (three lowercase ASCII letters).
+    #[serde(default)]
+    pub language: Option<String>,
+    /// DVB / MPEG-TS service id (program number), `1..=65535`.
+    #[serde(default)]
+    pub service_id: Option<u32>,
+    /// Free-text description / comment (container `comment`, SDT free-text).
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Timed-metadata opt-ins (HLS/TS now-playing/cue side stream).
+    #[serde(default)]
+    pub timed: Option<OutputTimedMetadataDoc>,
+}
+
+/// `OpenAPI` mirror of `multiview_config::OrientationMode` (ADR-0089 §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+#[non_exhaustive]
+pub enum OrientationModeDoc {
+    /// Prefer the display-rotation tag where the transport carries one, else
+    /// rotate the pixels. The default.
+    #[default]
+    Auto,
+    /// Emit the display-rotation tag only (rejected on tag-less transports).
+    Tag,
+    /// Produce a rotated-canvas rendition (real pixels).
+    Pixels,
+}
+
+/// `OpenAPI` mirror of `multiview_config::OutputFlip` (ADR-0089 §2.2). A flip is
+/// pixel-only (no container "flip" tag), so it forces the pixels path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+#[non_exhaustive]
+pub enum OutputFlipDoc {
+    /// No flip.
+    #[default]
+    None,
+    /// Mirror horizontally.
+    Horizontal,
+    /// Mirror vertically.
+    Vertical,
+}
+
+/// `OpenAPI` mirror of `multiview_core::layout::QuarterTurn` for the output
+/// orientation turn (`none`/`cw90`/`cw180`/`cw270`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+#[non_exhaustive]
+pub enum QuarterTurnDoc {
+    /// No rotation (0°).
+    #[default]
+    None,
+    /// 90° clockwise.
+    Cw90,
+    /// 180°.
+    Cw180,
+    /// 270° clockwise.
+    Cw270,
+}
+
+/// `OpenAPI` mirror of `multiview_config::OutputOrientation` (ADR-0089):
+/// per-output presentation orientation (quarter-turn + mechanism + flip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct OutputOrientationDoc {
+    /// The clockwise quarter-turn. Defaults to `none`.
+    #[serde(default)]
+    pub turn: QuarterTurnDoc,
+    /// The orientation mechanism. Defaults to `auto`.
+    #[serde(default)]
+    pub mode: OrientationModeDoc,
+    /// Optional flip (forces the pixels path). Defaults to `none`.
+    #[serde(default)]
+    pub flip: OutputFlipDoc,
+}
+
 /// `OpenAPI` mirror of `multiview_config::audio::AudioChannels` (tagged by
 /// `kind`, `snake_case`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1094,15 +1275,18 @@ pub enum OutputBodyDoc {
         mount: String,
         /// Video codec (`h264`, `hevc`, …).
         codec: String,
-        /// Latency profile hint.
-        #[serde(default)]
-        latency_profile: Option<String>,
         /// Encode-stage GPU pin.
         #[serde(default)]
         gpu_pin: Option<DevicePinDoc>,
         /// Per-output audio selection.
         #[serde(default)]
         audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
     },
     /// Low-latency HLS packager.
     LlHls {
@@ -1113,21 +1297,21 @@ pub enum OutputBodyDoc {
         path: String,
         /// Video codec.
         codec: String,
-        /// Target part duration (ms).
-        #[serde(default)]
-        part_target_ms: Option<u32>,
         /// Segment duration (ms).
         #[serde(default)]
         segment_ms: Option<u32>,
-        /// GOP duration (ms).
-        #[serde(default)]
-        gop_ms: Option<u32>,
         /// Encode-stage GPU pin.
         #[serde(default)]
         gpu_pin: Option<DevicePinDoc>,
         /// Per-output audio selection.
         #[serde(default)]
         audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
     },
     /// HLS packager.
     Hls {
@@ -1147,6 +1331,12 @@ pub enum OutputBodyDoc {
         /// Per-output audio selection.
         #[serde(default)]
         audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
     },
     /// NDI output.
     Ndi {
@@ -1161,6 +1351,12 @@ pub enum OutputBodyDoc {
         /// Per-output audio selection.
         #[serde(default)]
         audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
     },
     /// RTMP push.
     Rtmp {
@@ -1177,6 +1373,12 @@ pub enum OutputBodyDoc {
         /// Per-output audio selection.
         #[serde(default)]
         audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
     },
     /// SRT push.
     Srt {
@@ -1193,6 +1395,37 @@ pub enum OutputBodyDoc {
         /// Per-output audio selection.
         #[serde(default)]
         audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
+    },
+    /// RIST push — the open-standard sibling of the SRT push (ADR-0095).
+    Rist {
+        /// Stable operator id; may be omitted.
+        #[serde(default)]
+        id: Option<String>,
+        /// Destination URL (`rist://host:port`).
+        url: String,
+        /// Video codec.
+        codec: String,
+        /// Encode-stage GPU pin.
+        #[serde(default)]
+        gpu_pin: Option<DevicePinDoc>,
+        /// Per-output audio selection.
+        #[serde(default)]
+        audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
+        /// Optional typed RIST options (profile, buffer, PSK encryption, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rist: Option<RistOptionsDoc>,
     },
     /// AES67 / ST 2110-30 audio-over-IP send (raw PCM multicast, no encode).
     Aes67 {
@@ -1218,6 +1451,12 @@ pub enum OutputBodyDoc {
         /// Per-output audio selection.
         #[serde(default)]
         audio: Option<OutputAudioDoc>,
+        /// Per-output declarative metadata intent (ADR-0088).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<OutputMetadataDoc>,
+        /// Per-output presentation orientation (ADR-0089).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orientation: Option<OutputOrientationDoc>,
     },
 }
 
@@ -1743,4 +1982,167 @@ pub struct LeaseInstalledDoc {
     pub serial: String,
     /// The instant the installed lease term expires (RFC 3339).
     pub valid_to: String,
+}
+
+/// `OpenAPI` mirror of [`multiview_mesh::DiscoveryMode`] (Conspect, ADR-0051 §2).
+///
+/// Serde-equivalent: a unit enum rendered `snake_case`. There is exactly **one**
+/// value — `always_on` — and no way to set any other: discovery runs whenever the
+/// account plane runs (the spec's *locked* row, no off switch exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DiscoveryModeDoc {
+    /// Discovery is always on (the only value).
+    AlwaysOn,
+}
+
+/// `OpenAPI` mirror of [`multiview_mesh::MeshRole`] (Conspect, ADR-0051 §4).
+///
+/// Serde-equivalent: **internally tagged** on `kind` (`direct`/`relay`/`leaf`,
+/// kebab) — never untagged (conventions §5). The `leaf` variant carries the `via`
+/// peer (a salted-digest hex id) it leafs its heartbeat through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum MeshRoleDoc {
+    /// Own internet path; not relaying for neighbours.
+    Direct,
+    /// Online and opted-in to relay an offline neighbour's heartbeat.
+    Relay,
+    /// Offline; leafing through an adopted relaying neighbour.
+    Leaf {
+        /// The peer this machine relays its heartbeat through (salted-digest hex
+        /// id — never a raw identifier).
+        via: String,
+    },
+}
+
+/// `OpenAPI` mirror of [`multiview_mesh::MeshStatus`] — the always-on mesh
+/// discovery + relay summary `GET /api/v1/mesh/status` (and the `PUT
+/// /api/v1/mesh/relay` reply) renders.
+///
+/// Serde-equivalent to the real status (pinned byte-for-byte by a round-trip test
+/// in `tests/mesh.rs`). The mesh crate carries no `utoipa` dependency, so this
+/// module owns the `OpenAPI` contract. Discovery is always-on (no off switch);
+/// `via` is present only when the role is `leaf`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct MeshStatusDoc {
+    /// Discovery is always-on (the only value; no off switch exists).
+    pub discovery: DiscoveryModeDoc,
+    /// Whether this machine relays neighbours' heartbeats (the opt-in toggle).
+    pub relay_enabled: bool,
+    /// The computed mesh role (`direct`/`relay`/`leaf`).
+    pub role: MeshRoleDoc,
+    /// The peer this machine leafs through, present only when the role is `leaf`
+    /// (a salted-digest hex id).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub via: Option<String>,
+    /// How many peers are in the untrusted discovered-peer inventory.
+    pub peers_count: usize,
+}
+
+/// `OpenAPI` mirror of [`multiview_mesh::Peer`] — a single entry in the untrusted
+/// discovered-peer inventory `GET /api/v1/mesh/peers` returns.
+///
+/// Serde-equivalent to the real peer. The `key` is the salted-digest **hex** id
+/// (64 chars, never a raw identifier — brief §8); `name` is present only once the
+/// operator has confirm-adopted + named the peer; `last_seen` is whole seconds;
+/// `relaying_for_us` is an operator-set adoption flag, never auto (the peer is
+/// **untrusted** until explicitly confirm-adopted — ADR-0041 doctrine).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct MeshPeerDoc {
+    /// The peer's salted-digest id (64-char lowercase hex; never a raw identifier).
+    pub key: String,
+    /// An operator-assigned name, present only once the peer is adopted + named.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+    /// Whether the peer advertised itself as claimed (observed from the announce).
+    pub claimed: bool,
+    /// The whole-seconds monotonic instant the peer was last seen.
+    pub last_seen: u64,
+    /// Whether THIS machine relays for the peer — set only by explicit operator
+    /// confirm-adopt, never by observation (untrusted inventory).
+    pub relaying_for_us: bool,
+}
+
+/// `OpenAPI` mirror of [`multiview_telemetry::LogLevel`] (ADR-0060): the five
+/// `tracing` severities. Serde-equivalent: a unit enum rendered lowercase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevelDoc {
+    /// `tracing::Level::TRACE`.
+    Trace,
+    /// `tracing::Level::DEBUG`.
+    Debug,
+    /// `tracing::Level::INFO`.
+    Info,
+    /// `tracing::Level::WARN`.
+    Warn,
+    /// `tracing::Level::ERROR`.
+    Error,
+}
+
+/// `OpenAPI` mirror of [`multiview_telemetry::LogResourceKind`] (ADR-0060 §2.2):
+/// the resource a log record is attributed to. Serde-equivalent: a unit enum
+/// rendered `snake_case`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LogResourceKindDoc {
+    /// An ingest source (`Source.id`).
+    Source,
+    /// An output sink (`Output.id`).
+    Output,
+    /// A layout / hot-reconfig operation (`Layout.id`).
+    Layout,
+    /// The protected output core's own rare program-level events.
+    Program,
+    /// A managed device (`Device.id`).
+    Device,
+}
+
+/// `OpenAPI` mirror of [`multiview_telemetry::LogRecord`] — one structured
+/// record in the `GET /api/v1/logs` tail (ADR-0060 §2.3).
+///
+/// Serde-equivalent field-for-field to the real record: the optional resource
+/// attribution (`run_id` / `resource_kind` / `resource_id` / `label`), the libav
+/// `component` / `repeated`, and the always-present `seq` / `timestamp_ms` /
+/// `level` / `target` / `message`. Optionals are omitted when absent — an
+/// unattributed line carries no `resource_id` (honesty over a wrong id, §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LogRecordDoc {
+    /// Monotonic capture sequence number (the cursor for the `since` filter).
+    pub seq: u64,
+    /// Wall-clock capture time, milliseconds since the Unix epoch.
+    pub timestamp_ms: u64,
+    /// The record's severity.
+    pub level: LogLevelDoc,
+    /// The `tracing` target (e.g. `libav`, `multiview_engine`).
+    pub target: String,
+    /// The rendered event message.
+    pub message: String,
+    /// The process run id, when configured.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run_id: Option<String>,
+    /// The resource kind this record is attributed to, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resource_kind: Option<LogResourceKindDoc>,
+    /// The stable config resource id this record is attributed to, if any.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resource_id: Option<String>,
+    /// The resource's human label, if the span carried one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub label: Option<String>,
+    /// The libav component class (`hevc`, `hls`), for bridge records.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub component: Option<String>,
+    /// The coalesced suppressed-repeat count, when a bridge record flushes a
+    /// summary.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub repeated: Option<u64>,
 }

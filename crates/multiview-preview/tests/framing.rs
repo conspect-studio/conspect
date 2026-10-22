@@ -24,7 +24,7 @@ fn mjpeg_content_type_carries_the_boundary() {
         .nth(1)
         .expect("boundary token present");
     assert_eq!(declared, stream.boundary());
-    assert!(!stream.boundary().is_empty());
+    assert_ne!(stream.boundary(), "");
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn snapshot_carries_dimensions_and_bytes() {
     assert_eq!(snap.bytes(), &[0xFF, 0xD8, 0xFF, 0xD9]);
     // A stable ETag derived from the bytes lets the HTTP layer do conditional
     // GETs (the brief's grid-thumbnail polling path).
-    assert!(!snap.etag().is_empty());
+    assert_ne!(snap.etag(), "");
     let same = Snapshot::new(320, 180, vec![0xFF, 0xD8, 0xFF, 0xD9]);
     assert_eq!(
         snap.etag(),

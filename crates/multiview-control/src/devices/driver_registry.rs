@@ -100,8 +100,8 @@ mod tests {
     #[test]
     fn empty_until_a_driver_enumerates() {
         let reg = DeviceDriverRegistry::new();
-        assert!(reg.source_candidates("dev-a").is_empty());
-        assert!(reg.output_targets("dev-a").is_empty());
+        assert_eq!(reg.source_candidates("dev-a").len(), 0);
+        assert_eq!(reg.output_targets("dev-a").len(), 0);
     }
 
     #[test]
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(reg.source_candidates("dev-a").len(), 1);
         // Latest-wins: a fresh enumeration replaces the prior list.
         reg.set_source_candidates("dev-a", Vec::new());
-        assert!(reg.source_candidates("dev-a").is_empty());
+        assert_eq!(reg.source_candidates("dev-a").len(), 0);
 
         reg.set_output_targets(
             "dev-a",
@@ -144,6 +144,6 @@ mod tests {
             }],
         );
         reg.forget("dev-a");
-        assert!(reg.output_targets("dev-a").is_empty());
+        assert_eq!(reg.output_targets("dev-a").len(), 0);
     }
 }

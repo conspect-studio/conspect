@@ -27,6 +27,13 @@ use crate::decode::ensure_initialized;
 use crate::error::{FfmpegError, Result};
 use crate::mux_options::MuxOptions;
 
+/// The typed error for a metadata key/value carrying an interior NUL byte: it
+/// could never become a C string for `av_dict_set`. Mapped onto the muxer's
+/// `InvalidData` (a contradictory request, surfaced not swallowed).
+fn nul_err() -> FfmpegError {
+    FfmpegError::Mux(ffmpeg::Error::InvalidData)
+}
+
 /// A registered output stream: its index and the encoder time-base whose
 /// packets feed it (the source side of the rescale into stream time-base).
 #[derive(Debug, Clone, Copy)]
@@ -211,6 +218,146 @@ impl Muxer {
             stream_time_base: encoder_time_base,
         });
         Ok(index)
+    }
+
+    /// Set a **format-level** (container) metadata key/value on the output
+    /// `AVFormatContext.metadata` dictionary (ADR-0088 §3) — e.g. `title`,
+    /// `comment`, the MPEG-TS `service_name`/`service_provider` (SDT). Must be
+    /// called **before** [`write_header`](Muxer::write_header) (the muxer reads
+    /// the metadata dict when it writes the header/SDT).
+    ///
+    /// # Errors
+    /// * [`FfmpegError::Mux`] — the header is already written (the container is
+    ///   sealed) or `key`/`value` carries an interior NUL byte (it could not
+    ///   become a C string for `av_dict_set`).
+    #[allow(unsafe_code)]
+    pub fn set_format_metadata(&mut self, key: &str, value: &str) -> Result<()> {
+        if self.header_written {
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        let c_key = std::ffi::CString::new(key).map_err(|_| nul_err())?;
+        let c_val = std::ffi::CString::new(value).map_err(|_| nul_err())?;
+        // SAFETY: `output.as_mut_ptr()` is the live, owned output
+        // `AVFormatContext` (we hold `&mut self`). `&raw mut (*ctx).metadata` is
+        // its metadata dict slot; `av_dict_set` allocates/extends the dict in
+        // place. `c_key`/`c_val` are valid NUL-terminated C strings that outlive
+        // the call. The header is not yet written, so mutating the dict is the
+        // supported pre-header path.
+        let r = unsafe {
+            let ctx = self.output.as_mut_ptr();
+            ffmpeg::ffi::av_dict_set(&raw mut (*ctx).metadata, c_key.as_ptr(), c_val.as_ptr(), 0)
+        };
+        if r < 0 {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(r)));
+        }
+        Ok(())
+    }
+
+    /// Set a **per-stream** metadata key/value on `AVStream[index].metadata`
+    /// (ADR-0088 §3) — e.g. the ISO-639 `language` PMT/container tag. Must be
+    /// called after the stream is added and **before**
+    /// [`write_header`](Muxer::write_header).
+    ///
+    /// # Errors
+    /// * [`FfmpegError::Mux`] — the header is already written, the stream index
+    ///   is unknown, or `key`/`value` carries an interior NUL byte.
+    #[allow(unsafe_code)]
+    pub fn set_stream_metadata(&mut self, index: usize, key: &str, value: &str) -> Result<()> {
+        if self.header_written {
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        if !self.streams.iter().any(|s| s.index == index) {
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        let c_key = std::ffi::CString::new(key).map_err(|_| nul_err())?;
+        let c_val = std::ffi::CString::new(value).map_err(|_| nul_err())?;
+        let mut stream = self
+            .output
+            .stream_mut(index)
+            .ok_or(FfmpegError::Mux(ffmpeg::Error::InvalidData))?;
+        // SAFETY: `stream.as_mut_ptr()` is the live `AVStream` this `StreamMut`
+        // wraps (owned by the `AVFormatContext` we hold `&mut`).
+        // `&raw mut (*sptr).metadata` is its metadata dict slot; `av_dict_set`
+        // allocates/extends it in place. `c_key`/`c_val` are valid
+        // NUL-terminated C strings outliving the call; the header is not yet
+        // written.
+        let r = unsafe {
+            let sptr = stream.as_mut_ptr();
+            ffmpeg::ffi::av_dict_set(&raw mut (*sptr).metadata, c_key.as_ptr(), c_val.as_ptr(), 0)
+        };
+        if r < 0 {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(r)));
+        }
+        Ok(())
+    }
+
+    /// Attach a **display-rotation matrix** as `AV_PKT_DATA_DISPLAYMATRIX`
+    /// stream side data on `AVStream[index]` (ADR-0089 mechanism *a*, the tag
+    /// path). The muxer (MP4/MOV) writes it into the `tkhd` display matrix so a
+    /// tag-aware player rotates on render — **zero pixel cost** (invariant #8:
+    /// tag, never convert). Must be called after the stream is added and
+    /// **before** [`write_header`](Muxer::write_header).
+    ///
+    /// `matrix` is the libav 16.16 fixed-point 3×3 row-major matrix (the
+    /// `multiview_output::metadata::display_matrix` form); the nine `i32`s are
+    /// written as 36 little-endian bytes, exactly the `AVPacketSideData`/
+    /// `displaymatrix` wire layout libav's `av_display_rotation_get` reads back.
+    ///
+    /// # Errors
+    /// * [`FfmpegError::Mux`] — the header is written, the stream index is
+    ///   unknown, or libav could not allocate the side-data block.
+    #[allow(unsafe_code)]
+    pub fn set_stream_display_matrix(&mut self, index: usize, matrix: [i32; 9]) -> Result<()> {
+        /// The DISPLAYMATRIX side-data size: nine 32-bit fixed-point entries.
+        const N: usize = 9 * std::mem::size_of::<i32>();
+        if self.header_written {
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        if !self.streams.iter().any(|s| s.index == index) {
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        let mut stream = self
+            .output
+            .stream_mut(index)
+            .ok_or(FfmpegError::Mux(ffmpeg::Error::InvalidData))?;
+        // Pack the nine i32s little-endian (the displaymatrix wire layout) via
+        // iterators — no slice indexing.
+        let mut bytes = [0u8; N];
+        for (chunk, value) in bytes.chunks_exact_mut(4).zip(matrix) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        // SAFETY: `stream.as_mut_ptr()` is the live `AVStream` owned by the
+        // `AVFormatContext` we hold `&mut`. `av_packet_side_data_add` appends a
+        // side-data block of `N` bytes to the stream's `codecpar.coded_side_data`
+        // array (it takes ownership of the heap buffer we hand it, freeing it on
+        // failure) — the FFmpeg-7 successor to the removed
+        // `av_stream_new_side_data`. We allocate the buffer with `av_memdup` of
+        // the little-endian displaymatrix so libav can free it uniformly. A null
+        // return (OOM) is surfaced. The header is not yet written.
+        let added = unsafe {
+            let sptr = stream.as_mut_ptr();
+            let buf = ffmpeg::ffi::av_memdup(bytes.as_ptr().cast(), N);
+            if buf.is_null() {
+                return Err(FfmpegError::Mux(ffmpeg::Error::from(ffmpeg::ffi::AVERROR(
+                    ffmpeg::ffi::ENOMEM,
+                ))));
+            }
+            let sd = ffmpeg::ffi::av_packet_side_data_add(
+                &raw mut (*(*sptr).codecpar).coded_side_data,
+                &raw mut (*(*sptr).codecpar).nb_coded_side_data,
+                ffmpeg::ffi::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+                buf,
+                N,
+                0,
+            );
+            !sd.is_null()
+        };
+        if !added {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(ffmpeg::ffi::AVERROR(
+                ffmpeg::ffi::ENOMEM,
+            ))));
+        }
+        Ok(())
     }
 
     /// Write the container header. Call once, after all streams are added.

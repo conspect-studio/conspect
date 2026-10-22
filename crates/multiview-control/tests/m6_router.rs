@@ -15,7 +15,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use multiview_control::{
     command_bus, AppState, EngineStateSnapshot, InMemoryRepository, JwtValidator, Role,
 };
@@ -45,7 +45,7 @@ fn sign(header: &serde_json::Value, payload: &serde_json::Value, secret: &[u8]) 
         b64(&serde_json::to_vec(header).unwrap()),
         b64(&serde_json::to_vec(payload).unwrap())
     );
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret).unwrap();
     mac.update(input.as_bytes());
     format!("{input}.{}", b64(&mac.finalize().into_bytes()))
 }

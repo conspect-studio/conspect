@@ -39,6 +39,7 @@ import {
   SelectField,
 } from '../resources/FormControls';
 import { HelpLink } from '../components/HelpLink';
+import { LoudnessMeter } from './LoudnessMeter';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -504,6 +505,13 @@ export function AudioPage(): JSX.Element {
           </div>
 
           <SelectableTracks form={form} />
+
+          {/* Live program-bus loudness compliance meter (AUD-8): subscribes to
+              the engine's conflated `audio.loudness` realtime topic and renders
+              M/S/I/LRA/dBTP against the compliance target, ballistics applied
+              client-side. UI-only — it consumes telemetry, never the engine path
+              (invariant #10). */}
+          <LoudnessMeter />
         </div>
       )}
     </div>

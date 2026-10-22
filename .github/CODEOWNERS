@@ -1,0 +1,60 @@
+# Code owners — review routing for the highest-blast-radius paths.
+#
+# What this file does and does not do, stated honestly:
+#   * GitHub auto-requests review from an owner on any PR touching a matched path.
+#   * `main` currently has NO branch protection and NO rulesets, so "Require review from Code
+#     Owners" is not in force. Until that is enabled, this file ROUTES review; it does not BLOCK
+#     a merge. See docs/standards/engineering.md Part C ("documented but not mechanically enforced").
+#
+# The governance paths below are R2-or-higher by definition in scripts/classify.sh. Listing them
+# here is what makes "the agent cannot lower its own class" a mechanism rather than a promise:
+# a change to the classifier, the standard, or the agent instructions routes to the operator.
+
+# Default owner for everything not matched below.
+*                                   @troykelly
+
+# ── Agent policy and the classifier itself (R2 by definition) ────────────────
+/AGENTS.md                          @troykelly
+/CLAUDE.md                          @troykelly
+**/CLAUDE.md                        @troykelly
+/docs/standards/                    @troykelly
+/scripts/classify.sh                @troykelly
+/.claude/                           @troykelly
+/.mcp.json                          @troykelly
+/.github/CODEOWNERS                 @troykelly
+
+# ── CI/CD and anything that publishes (R2/R3) ───────────────────────────────
+/.github/workflows/                 @troykelly
+/deploy/                            @troykelly
+/lefthook.yml                       @troykelly
+/rust-toolchain.toml                @troykelly
+
+# ── Supply chain and security gates (R2/R3) ─────────────────────────────────
+/Cargo.lock                         @troykelly
+/deny.toml                          @troykelly
+/.gitleaks.toml                     @troykelly
+/renovate.json                      @troykelly
+/.github/dependabot.yml             @troykelly
+
+# ── Trust boundaries: authn/authz, tokens, outbound egress, TLS (R3) ────────
+/crates/multiview-control/src/auth.rs               @troykelly
+/crates/multiview-control/src/devices/              @troykelly
+/crates/multiview-config/src/device/net_guard.rs    @troykelly
+/crates/multiview-config/src/tls.rs                 @troykelly
+/crates/multiview-preview/src/token.rs              @troykelly
+/crates/multiview-webrtc/src/turn/auth.rs           @troykelly
+/crates/multiview-licence/                          @troykelly
+
+# ── Legal and licensing content — never edited as engineering work (R3) ─────
+/LICENSE                            @troykelly
+/LICENSE-COMMERCIAL.md              @troykelly
+/NOTICE                             @troykelly
+/THIRD-PARTY-NOTICES.md             @troykelly
+/CONTRIBUTOR-LICENSE-AGREEMENT.md   @troykelly
+/CODE_OF_CONDUCT.md                 @troykelly
+/SECURITY.md                        @troykelly
+/docs/licensing/                    @troykelly
+
+# ── The protected output core — invariants #1, #2, #9, #10 live here ────────
+/crates/multiview-engine/           @troykelly
+/crates/multiview-framestore/       @troykelly

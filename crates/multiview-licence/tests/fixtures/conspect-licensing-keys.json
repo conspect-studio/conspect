@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "root": {
+    "kid": "root",
+    "algorithm": "ecdsa-p256-sha256",
+    "public_key": "BN4f6BIHOFZmFqXp9YM1U65bJTGpOOob1I9X8C_FpfJOWanTCs4Z3c-l8C1wqH4g8Rl01VNkQNC78XixViLiwRY",
+    "public_key_encoding": "base64url-uncompressed-p256-point"
+  },
+  "attestation_contract": {
+    "key_statement": "conspect.key-attestation.v1",
+    "revocation_statement": "conspect.key-revocation.v1",
+    "encoding": "deterministic-cbor-rfc8949-section-4.2.1",
+    "key_pre_image": [
+      "key_id",
+      "key_type",
+      "statement",
+      "public_key",
+      "valid_from",
+      "valid_until"
+    ],
+    "revocation_pre_image": [
+      "issued_at",
+      "statement",
+      "revoked_key_ids"
+    ],
+    "field_order": "canonical CBOR map order (RFC 8949 §4.2.1: shortest-encoded-key first, then bytewise) — build the map in the listed order; it equals the RFC sort result",
+    "signature": "ecdsa-p256-sha256-raw-r-s-base64url",
+    "public_key_encoding": "raw-32-byte-ed25519-point",
+    "time_unit": "epoch-milliseconds"
+  },
+  "lease_keys": [
+    {
+      "kid": "intermediate-v1",
+      "key_type": "lease",
+      "algorithm": "ed25519",
+      "public_key": "EYwdPYlasNl8JRksWWrFbGBrJD4SFumP0SeLDv2R3Cc",
+      "valid_from": 1781510167548,
+      "valid_until": 1816070167548,
+      "status": "current",
+      "root_sig": "UeVn9jIuku_HfGT_HAnSRm2ozZJDz0fcRLXUmBX5KWPEGrKiTp6DOjQMEf5zQwA5AhnG_6XuIhANNk_-lMVfQw"
+    },
+    {
+      "kid": "intermediate-v2",
+      "key_type": "lease",
+      "algorithm": "ed25519",
+      "public_key": "ht_UXIIuzGj5Tk2NQr0fg9NlkYab_eKUVtWlNlMLERg",
+      "valid_from": 1781510167548,
+      "valid_until": 1850630167548,
+      "status": "next",
+      "root_sig": "gltvCw6zzXpMbDp-AceIBFy2ZOuxPnNA-MQ-VNP0-3YUs8Yq1wWK7kf_-ntr9E0hyy0GwSwXGQBD4UjplfWouA"
+    }
+  ],
+  "update_keys": [
+    {
+      "kid": "update-v1",
+      "key_type": "update",
+      "algorithm": "ed25519",
+      "public_key": "Fa3Lk7gBP_C4ONZa6LHye2HIkS1jJ6GDntLYLKDO-K0",
+      "valid_from": 1781510167548,
+      "valid_until": 1816070167548,
+      "status": "current",
+      "root_sig": "4kzRZcE7H5QyHt0Tl5rtjAbI_BNU0dMGCRsQxUJdYLCyj30_LwKqXrjXk-13Akz_kfIWxI-hk-qJoc7bpUazQQ"
+    }
+  ],
+  "revocation": {
+    "statement": "conspect.key-revocation.v1",
+    "issued_at": 1781570867301,
+    "revoked_key_ids": [],
+    "root_revocation_sig": "OKfSLG4lJcXGyVH3N7rimRd-k9WIhchag7ETUuThocbWeqLp2yXUH3RVTXFtLTXxbNjuwGZmGJSLHlSklbjtIA"
+  }
+}

@@ -252,7 +252,7 @@ mod tests {
             warning_ingest_step(&mut sub, &store).await,
             WarningIngestStep::Skipped
         );
-        assert!(store.list(&WarningFilter::default()).unwrap().is_empty());
+        assert_eq!(store.list(&WarningFilter::default()).unwrap().len(), 0);
     }
 
     #[tokio::test]

@@ -17,8 +17,8 @@
 //!   a chosen codec + media source and return [`TransportAnswer`] attributes;
 //!   `close` a session by id.
 //! * [`TransportAnswer`] — the transport-supplied SDP attributes that
-//!   [`super::WhepSession::build_answer`] folds into the answer in place of the
-//!   codec-only scaffold's `0.0.0.0` placeholders.
+//!   [`super::WhepSession::build_answer`] folds into the answer, which the
+//!   codec-only scaffold leaves absent.
 //! * [`SessionState`] / [`SessionHandle`] — the session lifecycle
 //!   (`Created → Connecting → Connected → Closed`) as an explicit, testable
 //!   state machine; illegal transitions are rejected, never panicked.
@@ -96,10 +96,9 @@ pub struct DtlsFingerprint {
 /// The transport-supplied SDP attributes for a session's answer.
 ///
 /// [`super::WhepSession::build_answer`] takes these and fills the ICE/DTLS lines
-/// that the codec-only scaffold previously left as `0.0.0.0` placeholders. A
-/// real transport gathers candidates and a DTLS certificate; the in-memory fake
-/// used in tests supplies deterministic non-placeholder values to prove the
-/// wiring.
+/// the codec-only scaffold leaves absent. A real transport gathers candidates
+/// and a DTLS certificate; the in-memory fake used in tests supplies
+/// deterministic non-placeholder values to prove the wiring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportAnswer {
     /// The transport's session id (also the WHEP resource id).
@@ -270,21 +269,54 @@ impl SessionHandle {
     }
 }
 
+/// The media kind of one [`EncodedSample`] — and therefore which RTP clock its
+/// [`EncodedSample::rtp_timestamp`] is expressed in (ADR-P006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SampleKind {
+    /// An encoded video access unit. Video timestamps ride the **90 kHz** RTP
+    /// clock every video payload's SDP `rtpmap` advertises.
+    Video,
+    /// An encoded audio frame — **Opus by definition** on this seam (RFC 7874
+    /// makes Opus WebRTC's mandatory audio codec; ADR-P006 pins it). Audio
+    /// timestamps ride the **48 kHz** RTP clock RFC 7587 fixes for Opus.
+    Audio,
+}
+
+impl SampleKind {
+    /// The RTP clock rate (Hz) this kind's timestamps are expressed in:
+    /// 90 kHz for video, 48 kHz for (Opus) audio (RFC 7587).
+    #[must_use]
+    pub const fn rtp_clock_hz(self) -> u32 {
+        match self {
+            Self::Video => 90_000,
+            Self::Audio => 48_000,
+        }
+    }
+}
+
 /// One encoded preview media sample handed from the encoder to the transport.
 ///
-/// Carries the access-unit bytes plus its presentation timestamp (90 kHz RTP
-/// units, the video clock the SDP advertises) and whether it begins a keyframe.
-/// The transport packetizes this into RTP/SRTP; the preview core never inspects
-/// the bytes.
+/// Carries the encoded bytes plus its presentation timestamp (in the RTP clock
+/// of its [`kind`](Self::kind)) and whether it begins a keyframe. The transport
+/// packetizes this into RTP/SRTP; the preview core never inspects the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedSample {
-    /// Encoded access-unit bytes (e.g. an H.264 Annex-B / AVCC frame).
+    /// Encoded bytes: a video access unit (e.g. an H.264 Annex-B / AVCC frame)
+    /// or one Opus audio frame, per [`kind`](Self::kind).
     pub data: Arc<[u8]>,
-    /// Presentation timestamp in 90 kHz RTP clock units.
+    /// Presentation timestamp in RTP clock units **of this sample's kind**:
+    /// video samples ride the 90 kHz RTP clock, audio (Opus) samples the
+    /// 48 kHz clock RFC 7587 fixes — see [`SampleKind::rtp_clock_hz`].
     pub rtp_timestamp: u32,
     /// Whether this sample begins a keyframe (IDR) — the transport may gate the
-    /// first delivered packet on a keyframe boundary.
+    /// first delivered packet on a keyframe boundary. Audio frames are
+    /// independently decodable, so audio producers set `false`.
     pub keyframe: bool,
+    /// Which media kind this sample is — video on the 90 kHz RTP clock or Opus
+    /// audio on the 48 kHz clock (ADR-P006). Determines how the transport
+    /// packetizes the bytes and which negotiated m-line they ride.
+    pub kind: SampleKind,
 }
 
 /// The producer end of a bounded, drop-oldest sample feed.
@@ -417,11 +449,27 @@ pub trait PreviewMediaSource: Send + Sync {
     /// The codec the samples from [`Self::feed`] are encoded with.
     fn codec(&self) -> PreviewCodec;
 
-    /// The drop-oldest feed the transport drains encoded samples from.
+    /// The drop-oldest feed the transport drains encoded video samples from.
     ///
     /// Called once when a session is accepted; the transport owns the returned
     /// [`SampleFeed`] for the life of the session.
     fn feed(&self) -> SampleFeed;
+
+    /// The **optional** drop-oldest audio feed (ADR-P006).
+    ///
+    /// Audio on this seam is **Opus by definition** (RFC 7874's mandatory
+    /// WebRTC audio codec; ADR-P006 pins 48 kHz / 20 ms frames): the samples
+    /// it yields are [`SampleKind::Audio`] on the 48 kHz RTP clock. Like
+    /// [`Self::feed`], this is called at most once per session, when the
+    /// transport accepts it — and only when the session's offer negotiated an
+    /// audio m-line.
+    ///
+    /// The default is `None`: sessions whose offer carries no audio m-line,
+    /// and scopes with no audio source, simply leave audio absent (ADR-P006),
+    /// so video-only sources need no override.
+    fn audio_feed(&self) -> Option<SampleFeed> {
+        None
+    }
 }
 
 /// The transport seam: ICE/DTLS/SRTP for one or more WHEP focus sessions.
@@ -442,8 +490,10 @@ pub trait WhepTransport: Send + Sync {
     ///
     /// The caller ([`super::WhepSession`]) has already selected `codec` from the
     /// offer; the transport gathers ICE candidates + a DTLS fingerprint, mints a
-    /// [`SessionId`], wires `media`'s [`SampleFeed`] to its egress, and returns
-    /// the [`TransportAnswer`] the caller folds into the SDP answer.
+    /// [`SessionId`], wires `media`'s [`SampleFeed`] (and, when the offer
+    /// negotiated an Opus audio m-line, its optional
+    /// [`PreviewMediaSource::audio_feed`]) to its egress, and returns the
+    /// [`TransportAnswer`] the caller folds into the SDP answer.
     ///
     /// # Errors
     ///
@@ -518,6 +568,7 @@ mod tests {
             data: Arc::from(ts.to_le_bytes().as_slice()),
             rtp_timestamp: ts,
             keyframe: ts == 0,
+            kind: SampleKind::Video,
         };
         assert!(!sink.push(mk(0)));
         assert!(!sink.push(mk(1)));
@@ -537,6 +588,7 @@ mod tests {
             data: Arc::from([1u8].as_slice()),
             rtp_timestamp: 7,
             keyframe: true,
+            kind: SampleKind::Audio,
         };
         assert!(!sink.push(s.clone()));
         assert_eq!(feed.buffered(), 1);

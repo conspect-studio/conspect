@@ -10,9 +10,9 @@
 // can never back-pressure the engine, and the client buffer never grows.
 import { useEffect, useState } from "react";
 
-import { getStoredToken } from "../api/token";
 import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
+import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
 
 /** The GPU vendor classes the control plane reports (mirrors `GpuVendor`). */
 export type GpuVendor = "nvidia" | "intel" | "amd" | "apple" | "other";
@@ -396,19 +396,6 @@ export class SystemMetricsRing {
   }
 }
 
-function resolveWsUrl(): string {
-  // Same-origin: the dev proxy and the embedded build both serve `/api/v1/ws`.
-  const { protocol, host } = window.location;
-  const wsProtocol = protocol === "https:" ? "wss:" : "ws:";
-  const base = `${wsProtocol}//${host}/api/v1/ws`;
-  // A browser WebSocket cannot send an Authorization header; the control plane
-  // also accepts the bearer token as an `access_token` query parameter.
-  const token = getStoredToken();
-  return token === undefined
-    ? base
-    : `${base}?access_token=${encodeURIComponent(token)}`;
-}
-
 /** What {@link useSystemMetrics} returns. */
 export interface SystemMetricsState extends SystemMetricsSnapshot {
   /** Coarse realtime connection status (drives the footer's live dot). */
@@ -440,23 +427,27 @@ export function useSystemMetrics(): SystemMetricsState {
 
   useEffect(() => {
     const ring = new SystemMetricsRing();
-    const connection: RealtimeConnection = new RealtimeConnection(resolveWsUrl(), {
-      onStatus: (next): void => {
-        setStatus(next);
+    const connection: RealtimeConnection = new RealtimeConnection(
+      realtimeWsBaseUrl(),
+      {
+        onStatus: (next): void => {
+          setStatus(next);
+        },
+        onEnvelope: (envelope): void => {
+          // Only fold our topic's metric samples; everything else is ignored.
+          if (envelope.t !== "system.metrics") {
+            return;
+          }
+          const metrics = parseSystemMetrics(envelope.data);
+          if (metrics === undefined) {
+            return;
+          }
+          ring.push(metrics);
+          setSnapshot(ring.snapshot());
+        },
       },
-      onEnvelope: (envelope): void => {
-        // Only fold our topic's metric samples; everything else is ignored.
-        if (envelope.t !== "system.metrics") {
-          return;
-        }
-        const metrics = parseSystemMetrics(envelope.data);
-        if (metrics === undefined) {
-          return;
-        }
-        ring.push(metrics);
-        setSnapshot(ring.snapshot());
-      },
-    });
+      mintWsTicket,
+    );
     connection.start();
     return (): void => {
       connection.stop();

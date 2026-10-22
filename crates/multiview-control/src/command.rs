@@ -104,6 +104,120 @@ impl ResolvedLayout {
     }
 }
 
+/// Resolve + solve a stored `{canvas, layout, cells}` body into the
+/// [`ResolvedLayout`] a [`Command::ApplyLayout`] carries, enforcing the
+/// ADR-W019 Class-1 pinned-canvas gate.
+///
+/// The **one** resolve machinery with two triggers (ADR-W020): the
+/// `POST /commands/apply-layout` route calls this with the repository body,
+/// and the config-file watcher calls it with the file's
+/// `{canvas, layout, cells}` — both off the render thread, so the engine's
+/// frame-boundary drain only ever swaps a pre-solved artifact.
+///
+/// The gate compares against `running_canvas` — the immutable pinned-canvas
+/// snapshot captured at seed time (ADR-W019 MAJOR-1); [`None`] **fails
+/// closed**: without a known running canvas no document-carrying apply may be
+/// built. Cadence equality is by value (`Fps`/`Rational` cross-multiply), so
+/// a non-reduced `50/2` matches a running `25/1`.
+///
+/// # Errors
+///
+/// [`ControlError::Validation`](crate::error::ControlError::Validation) when
+/// the body does not parse as a layout document, does not solve, was authored
+/// for a different canvas (Class-2, ADR-R004), or the running canvas is
+/// unknown (the gate fails closed).
+pub fn resolve_layout_document(
+    id: &str,
+    body: &serde_json::Value,
+    running_canvas: Option<&multiview_config::LayoutCanvas>,
+) -> Result<ResolvedLayout, crate::error::ControlError> {
+    use crate::error::ControlError;
+    let document = multiview_config::LayoutDocument::from_body(body).map_err(|e| {
+        ControlError::Validation(format!(
+            "stored layout {id:?} does not parse as a {{canvas, layout, cells}} document: {e}"
+        ))
+    })?;
+    let solved = document.solve_named(id).map_err(|e| {
+        ControlError::Validation(format!("stored layout {id:?} does not solve: {e}"))
+    })?;
+    let Some(running) = running_canvas else {
+        return Err(ControlError::Validation(format!(
+            "layout {id:?} cannot be applied live: the running canvas is unknown to the \
+             control plane (no pinned-canvas snapshot was seeded), so the Class-1 gate \
+             fails closed (ADR-W019)"
+        )));
+    };
+    let new = &document.canvas;
+    if running != new {
+        return Err(ControlError::Validation(format!(
+            "layout {id:?} was authored for canvas {}x{}@{} but the running session's canvas \
+             is pinned at {}x{}@{} — a Class-2 change (output geometry/cadence cannot change \
+             live; ADR-R004)",
+            new.width, new.height, new.fps, running.width, running.height, running.fps
+        )));
+    }
+    Ok(ResolvedLayout::new(solved, document))
+}
+
+/// The transport verb a [`Command::MediaTransport`] applies to a media player
+/// (ADR-0057 Decision 4, ADR-0097): the play-deck controls that swap *what* a
+/// pre-declared player channel plays without spawning or tearing an engine-path
+/// thread. Each verb is Class-1 Hot (no encoder reset; invariant #11).
+///
+/// An adjacently/internally-tagged union (`#[serde(tag = "verb")]`, never
+/// `untagged`; house style) so the wire form is unambiguous — e.g.
+/// `{"verb":"load","asset":"opener"}`, `{"verb":"seek","frame":240}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MediaTransportVerb {
+    /// Load an asset into the player (does not start playout). Carries the
+    /// asset id to resolve against the media library.
+    Load {
+        /// The media-library asset id to load.
+        asset: String,
+    },
+    /// Cue the player to its in-point (or an explicit frame) and hold there,
+    /// primed for take to air (preview-before-trigger). [`None`] cues the
+    /// asset's declared in-point.
+    Cue {
+        /// The frame to cue to (asset-relative, integer frames at the output
+        /// cadence; ADR-T015), or [`None`] for the declared in-point.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<u64>,
+    },
+    /// Play forward at the output cadence.
+    Play,
+    /// Pause, holding the current frame.
+    Pause,
+    /// Stop (idle) — re-cue to the in-point; no asset rolls.
+    Stop,
+    /// Seek to a frame and continue in the current transport state. [`None`]
+    /// seeks to the declared in-point.
+    Seek {
+        /// The target frame (asset-relative, integer frames; ADR-T015), or
+        /// [`None`] for the declared in-point.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame: Option<u64>,
+    },
+}
+
+impl MediaTransportVerb {
+    /// A stable machine-readable label for the transport verb (the
+    /// [`Command::kind`] surfaced in a `media_*` 202 body / audit record).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Load { .. } => "media_load",
+            Self::Cue { .. } => "media_cue",
+            Self::Play => "media_play",
+            Self::Pause => "media_pause",
+            Self::Stop => "media_stop",
+            Self::Seek { .. } => "media_seek",
+        }
+    }
+}
+
 /// A control-plane command destined for the engine.
 ///
 /// These are the management mutations that must be applied on the data plane
@@ -252,6 +366,49 @@ pub enum Command {
         /// The source id to remove.
         id: String,
     },
+    /// Create **or replace** a managed overlay document on the **running**
+    /// engine (ADR-W022 live apply, invariant #11). Carries the full,
+    /// already-validated (ADR-W015) config document; the engine drain upserts
+    /// it by id into the working overlay set at a frame boundary and publishes
+    /// the set through a lock-free slot the bake consumer re-derives from —
+    /// pure data mutation, no rasterization, no I/O. Kinds the running build
+    /// does not render are mirrored + warned (never lied about); the route's
+    /// `X-Multiview-Apply` header already declared `restart` for them.
+    UpsertOverlay {
+        /// Correlation id for the async outcome.
+        op: OperationId,
+        /// The validated overlay document to apply (boxed: the document's
+        /// verbatim params map is larger than the other command variants).
+        overlay: Box<multiview_config::Overlay>,
+    },
+    /// Remove a managed overlay document from the **running** engine
+    /// (ADR-W022): the drain drops it from the working overlay set at a frame
+    /// boundary and republishes the set; a rendered face disappears on the
+    /// next baked frame. Removing an unknown id is a logged no-op.
+    RemoveOverlay {
+        /// Correlation id for the async outcome.
+        op: OperationId,
+        /// The overlay id to remove.
+        id: String,
+    },
+    /// Re-sequence the **running** engine's overlay working set to a new draw
+    /// order (task #130, ADR-W022 live apply, invariant #11). A pure
+    /// permutation: it carries the full desired overlay id sequence and the
+    /// drain re-orders its working-set mirror to match, then republishes the set
+    /// (a generation bump) so the bake consumer re-derives the new draw order at
+    /// the next frame. Declaration order is the equal-`z` draw-order tie-break
+    /// (the overlay stack's `sort_by_key(|l| l.z)` is **stable**), so a reorder
+    /// genuinely changes the composite — and `UpsertOverlay` edits the mirror in
+    /// place by id, so it can never express the reorder. Class-1 hot/seamless:
+    /// no add/remove/content change, no rasterization, no I/O. Ids not currently
+    /// in the working set are ignored; an order already matching is a no-op
+    /// (idempotent — a shed retry re-submitting the same order cannot thrash).
+    ReorderOverlays {
+        /// Correlation id for the async outcome.
+        op: OperationId,
+        /// The full desired overlay id sequence (working-set draw order).
+        order: Vec<String>,
+    },
     /// Force (or clear) a manual tally override on a tile/element, taking
     /// precedence over the arbitrated bus state until released. A `color` of
     /// [`None`] clears the override and returns the element to arbitration.
@@ -262,6 +419,54 @@ pub enum Command {
         target: multiview_events::TallyTarget,
         /// The colour to force, or `None` to clear the override.
         color: Option<multiview_core::tally::TallyColor>,
+    },
+    /// Drive a pre-declared media player's transport (ADR-0057 Decision 4,
+    /// ADR-0097): load/cue/play/pause/stop/seek. All Class-1 Hot — the engine
+    /// drain submits the verb into the player's bounded two-class transport
+    /// mailbox (state verbs conflated latest-wins; targeted load/cue/seek a
+    /// bounded drop-oldest FIFO) at a frame boundary; the player thread drains it
+    /// between frames and never paces the engine (inv #1/#10). The player channel
+    /// exists from boot, so a transport verb never spawns or tears an engine-path
+    /// thread (sidesteps ADR-W018).
+    MediaTransport {
+        /// Correlation id for the async outcome.
+        op: OperationId,
+        /// The target media-player id.
+        player: String,
+        /// The transport verb to apply (carries its own params).
+        verb: MediaTransportVerb,
+    },
+    /// Arm (stage) a media player's clean vamp exit (ADR-0097 §3): set
+    /// `Vamping.exit_armed = true` so the current vamp lap finishes and the
+    /// player transitions out at the next vamp boundary. Mirrors
+    /// [`Command::ArmSalvo`] — staging an intent, committed at a boundary,
+    /// withdrawable via [`Command::CancelMediaExit`]. Idempotent.
+    ArmMediaExit {
+        /// Correlation id for the async outcome.
+        op: OperationId,
+        /// The target media-player id.
+        player: String,
+    },
+    /// Take a media player's vamp exit (ADR-0097 §3): arm **and** request the
+    /// soonest boundary in one verb. Still fires at the next *vamp boundary*,
+    /// never a mid-lap cut (the clean-seam guarantee). Functionally
+    /// [`Command::ArmMediaExit`] on a not-yet-armed vamp. Mirrors
+    /// [`Command::TakeSalvo`].
+    TakeMediaExit {
+        /// Correlation id for the async outcome.
+        op: OperationId,
+        /// The target media-player id.
+        player: String,
+    },
+    /// Cancel a media player's previously-armed vamp exit (ADR-0097 §3): set
+    /// `Vamping.exit_armed = false`; the vamp keeps looping. A cancel that
+    /// races a just-fired boundary is a no-op (the boundary won). Mirrors
+    /// [`Command::CancelSalvo`].
+    CancelMediaExit {
+        /// Correlation id for the async outcome.
+        op: OperationId,
+        /// The target media-player id.
+        player: String,
     },
 }
 
@@ -282,7 +487,14 @@ impl Command {
             | Self::CancelSalvo { op, .. }
             | Self::UpsertSource { op, .. }
             | Self::RemoveSource { op, .. }
-            | Self::SetTallyOverride { op, .. } => op,
+            | Self::UpsertOverlay { op, .. }
+            | Self::RemoveOverlay { op, .. }
+            | Self::ReorderOverlays { op, .. }
+            | Self::SetTallyOverride { op, .. }
+            | Self::MediaTransport { op, .. }
+            | Self::ArmMediaExit { op, .. }
+            | Self::TakeMediaExit { op, .. }
+            | Self::CancelMediaExit { op, .. } => op,
         }
     }
 
@@ -302,7 +514,16 @@ impl Command {
             Self::CancelSalvo { .. } => "cancel_salvo",
             Self::UpsertSource { .. } => "upsert_source",
             Self::RemoveSource { .. } => "remove_source",
+            Self::UpsertOverlay { .. } => "upsert_overlay",
+            Self::RemoveOverlay { .. } => "remove_overlay",
+            Self::ReorderOverlays { .. } => "reorder_overlays",
             Self::SetTallyOverride { .. } => "set_tally_override",
+            // Media transport: the kind reflects the verb so the 202 body / audit
+            // record names what the player was asked to do.
+            Self::MediaTransport { verb, .. } => verb.kind(),
+            Self::ArmMediaExit { .. } => "arm_media_exit",
+            Self::TakeMediaExit { .. } => "take_media_exit",
+            Self::CancelMediaExit { .. } => "cancel_media_exit",
         }
     }
 
@@ -516,5 +737,104 @@ mod tests {
             op: OperationId::new(),
         };
         assert!(start.route_intent().is_none());
+    }
+
+    #[test]
+    fn media_transport_verbs_carry_per_verb_kinds() {
+        // The 202 `kind` label reflects the transport verb so an operator/audit
+        // sees what the player was asked to do (load/cue/play/pause/stop/seek),
+        // mirroring how each salvo verb has its own `kind()` string.
+        let cases = [
+            (
+                MediaTransportVerb::Load {
+                    asset: "opener".to_owned(),
+                },
+                "media_load",
+            ),
+            (MediaTransportVerb::Cue { frame: None }, "media_cue"),
+            (MediaTransportVerb::Cue { frame: Some(120) }, "media_cue"),
+            (MediaTransportVerb::Play, "media_play"),
+            (MediaTransportVerb::Pause, "media_pause"),
+            (MediaTransportVerb::Stop, "media_stop"),
+            (MediaTransportVerb::Seek { frame: Some(48) }, "media_seek"),
+        ];
+        for (verb, kind) in cases {
+            let cmd = Command::MediaTransport {
+                op: OperationId::new(),
+                player: "vt-1".to_owned(),
+                verb,
+            };
+            assert_eq!(cmd.kind(), kind);
+            assert!(cmd.route_intent().is_none());
+        }
+    }
+
+    #[test]
+    fn media_exit_verbs_mirror_the_salvo_triad_kinds() {
+        // ADR-0097 §3: the three exit verbs mirror ArmSalvo/TakeSalvo/CancelSalvo
+        // exactly, with `arm_media_exit`/`take_media_exit`/`cancel_media_exit`.
+        let arm = Command::ArmMediaExit {
+            op: OperationId::new(),
+            player: "vt-1".to_owned(),
+        };
+        let take = Command::TakeMediaExit {
+            op: OperationId::new(),
+            player: "vt-1".to_owned(),
+        };
+        let cancel = Command::CancelMediaExit {
+            op: OperationId::new(),
+            player: "vt-1".to_owned(),
+        };
+        assert_eq!(arm.kind(), "arm_media_exit");
+        assert_eq!(take.kind(), "take_media_exit");
+        assert_eq!(cancel.kind(), "cancel_media_exit");
+        assert!(arm.route_intent().is_none());
+        assert!(take.route_intent().is_none());
+        assert!(cancel.route_intent().is_none());
+    }
+
+    #[test]
+    fn media_commands_expose_their_operation_id() {
+        // Every new media variant participates in `operation_id()` so the
+        // command surface can correlate its 202 like any other command.
+        let op = OperationId::new();
+        let transport = Command::MediaTransport {
+            op: op.clone(),
+            player: "vt-1".to_owned(),
+            verb: MediaTransportVerb::Play,
+        };
+        assert_eq!(transport.operation_id(), &op);
+        let arm = Command::ArmMediaExit {
+            op: op.clone(),
+            player: "vt-1".to_owned(),
+        };
+        assert_eq!(arm.operation_id(), &op);
+    }
+
+    #[test]
+    fn media_transport_verb_serde_round_trips_tagged_by_verb() {
+        // The verb union is an adjacently/internally-tagged enum (house style,
+        // never `untagged`): `{"verb":"load","asset":"opener"}` etc.
+        let load = MediaTransportVerb::Load {
+            asset: "opener".to_owned(),
+        };
+        let json = serde_json::to_value(&load).unwrap();
+        assert_eq!(json["verb"], "load");
+        assert_eq!(json["asset"], "opener");
+        let back: MediaTransportVerb = serde_json::from_value(json).unwrap();
+        assert_eq!(back, load);
+
+        let cue = MediaTransportVerb::Cue { frame: Some(90) };
+        let json = serde_json::to_value(&cue).unwrap();
+        assert_eq!(json["verb"], "cue");
+        assert_eq!(json["frame"], 90);
+        let back: MediaTransportVerb = serde_json::from_value(json).unwrap();
+        assert_eq!(back, cue);
+
+        let play = MediaTransportVerb::Play;
+        let json = serde_json::to_value(&play).unwrap();
+        assert_eq!(json["verb"], "play");
+        let back: MediaTransportVerb = serde_json::from_value(json).unwrap();
+        assert_eq!(back, play);
     }
 }

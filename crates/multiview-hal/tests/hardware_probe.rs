@@ -44,7 +44,7 @@ fn absent_device_detects_unavailable_for_every_hardware_kind() {
                     reason,
                 } => {
                     assert_eq!(reported, kind.backend_kind());
-                    assert!(!reason.is_empty());
+                    assert_ne!(reason, "");
                 }
                 other => panic!("expected BackendUnavailable, got {other:?}"),
             }
@@ -145,7 +145,7 @@ fn probe_resolves_cleanly(kind: BackendKind) {
                 reason,
             }) => {
                 assert_eq!(reported, kind);
-                assert!(!reason.is_empty());
+                assert_ne!(reason.len(), 0);
             }
             Err(other) => panic!("probe must only ever fail as BackendUnavailable, got {other:?}"),
         }

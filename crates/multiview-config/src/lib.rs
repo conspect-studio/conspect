@@ -29,13 +29,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod api;
 pub mod audio;
 pub mod device;
+pub mod diff;
 pub mod discovery;
 pub mod error;
 pub mod failover;
 pub mod grid;
 pub mod layout_doc;
+pub mod limits;
+pub mod media;
+pub mod origin;
 pub mod placement;
 pub mod probe;
 pub mod program;
@@ -45,7 +50,10 @@ pub mod schema;
 pub mod sync_group;
 pub mod tally;
 pub mod timer;
+pub mod timing;
+pub mod tls;
 pub mod wall;
+pub mod webrtc;
 
 use std::collections::{HashMap, HashSet};
 
@@ -54,16 +62,23 @@ use multiview_core::layout::{
 };
 use multiview_core::stream::StreamKind as CoreStreamKind;
 
+pub use api::{ApiConfig, ApiKeyConfig, ApiKeyRole};
 use audio::PROGRAM_TRACK as PROGRAM_TRACK_NAME;
 pub use audio::{
     AudioChannels, AudioRoute, AudioRouting, OutputAudio, OutputAudioCapability, OutputAudioMode,
     TrackCapacity, TrackDelivery, PROGRAM_TRACK,
 };
 pub use device::{Device, DeviceAuth, DeviceDisplay, DeviceDriver, DisplayAssign, ReconnectPolicy};
+pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
 pub use error::ConfigError;
 pub use failover::{default_failover_slate, FailoverSlate};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
+pub use media::{
+    frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
+    MediaPlayerAudio,
+};
+pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
@@ -73,9 +88,12 @@ pub use routing::{
 };
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
-    Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig, ColorOverride,
-    DisplayModeSpec, Fps, Layout, Output, Overlay, Rect, RtspOptions, Source, SourceAuth,
-    SourceKind,
+    lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
+    ColorOverride, DisplayModeSpec, Fps, Layout, MetadataCapability, MetadataField,
+    OrientationMechanism, OrientationMode, OrientationTagCapability, Output, OutputFlip,
+    OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata, Overlay, Rect,
+    RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
+    SourceAuth, SourceKind,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -83,7 +101,29 @@ pub use timer::{
     compute as compute_timer, decompose as decompose_duration, frame_index, overrun_badge_word,
     TimerDirection, TimerError, TimerFormat, TimerOnTarget, TimerReadout, TimerState, TimerTarget,
 };
+pub use timing::{TimingConfig, MAX_LINK_OFFSET_MS, MAX_PTP_UTC_OFFSET_S};
+pub use tls::TlsConfig;
 pub use wall::{HeadConfig, WallBezel, WallConfig};
+pub use webrtc::{DurationString, IceServerConfig, IceServerKindConfig, WebrtcConfig};
+
+/// The cold-start policy (ADR-W024): where `multiview run` takes its starting
+/// **Running** state from.
+///
+/// The token is serde-typed, so an unknown value fails parse (validated by
+/// construction) and the absent default is [`StartMode::Boot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartMode {
+    /// Start from the boot config file itself (the deliberate cold-start
+    /// baseline). Any persisted `active.toml` from a previous run is ignored.
+    #[default]
+    Boot,
+    /// Resume from `<config-dir>/.multiview/active.toml` (the last persisted
+    /// Running state) when it exists, parses, AND validates; otherwise fall
+    /// back to the boot document with a warning. The boot file stays the
+    /// Loaded snapshot and the watch target in both modes.
+    Resume,
+}
 
 /// The management control-plane listener.
 ///
@@ -104,6 +144,119 @@ pub struct ControlConfig {
     /// default. Validated as a parseable [`std::net::SocketAddr`] by
     /// [`MultiviewConfig::validate`].
     pub listen: String,
+    /// The cold-start policy (ADR-W024): `"boot"` (default) starts from this
+    /// config file; `"resume"` starts from the persisted Running state
+    /// (`<config-dir>/.multiview/active.toml`) when it is valid, falling back
+    /// to boot with a warning otherwise.
+    #[serde(default)]
+    pub start: StartMode,
+    /// The externally-reachable base URL Cast media URLs are derived from
+    /// (DEV-D2, ADR-M011), e.g. `"http://[2001:db8::7]:8080"` or — Cast
+    /// devices being effectively IPv4-legacy in practice (conventions §10
+    /// carve-out) — `"http://192.0.2.7:8080"`. Cast devices ignore
+    /// DHCP-provided DNS and resolve via hardcoded public resolvers, so this
+    /// must be an **IP literal** the device can reach (never a loopback,
+    /// never `.local`, never a bare LAN name) or a **publicly resolvable**
+    /// name. Scheme + non-emptiness are validated here; the full host rules
+    /// are enforced by the cast driver's base parser at startup. Absent ⇒ no
+    /// Cast delivery (cast sessions cannot derive a device-reachable URL and
+    /// are refused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_media_base: Option<String>,
+    /// The outbound-dial SSRF allowlist (SEC-02/SEC-04, CWE-918, ADR-M013): the
+    /// operator CIDRs the managed-device poller and Cast session actor lock their
+    /// outbound dial to. IPv6-first (e.g. `["fd00:db8::/32", "192.168.0.0/16"]`);
+    /// a bare IP is a `/32` (IPv4) or `/128` (IPv6) host route.
+    ///
+    /// **Absent** ⇒ the non-breaking default: LAN devices (private/ULA/carrier)
+    /// stay dialable while the never-legitimate ranges (loopback, link-local incl.
+    /// the cloud-metadata IP, unspecified, multicast/broadcast) stay blocked.
+    /// **Set** ⇒ *tightens* the dial — an allowlistable target is reachable only
+    /// inside one of these CIDRs (the recommended SEC-04 hardening); an empty list
+    /// denies every allowlistable range (globally-routable hosts only). Each entry
+    /// is validated as a CIDR by [`MultiviewConfig::validate`], so a typo fails at
+    /// config load (fail-closed) rather than silently widening the screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_dial_allow: Option<Vec<String>>,
+    /// The realtime `Origin` allow-list (SEC-13 / CSWSH, ADR-RT011): extra browser
+    /// origins permitted to open the WebSocket (`/api/v1/ws`) and SSE
+    /// (`/api/v1/events`) streams, **in addition to** the always-allowed same-origin
+    /// case (an `Origin` whose authority equals the request `Host`). Each entry is a
+    /// full origin — `scheme://host[:port]`, e.g. `"https://ops.example"` or
+    /// `"http://[2001:db8::7]:8080"` — matched case-insensitively.
+    ///
+    /// **Absent/empty** ⇒ same-origin only: the embed-web SPA served from the
+    /// appliance works with no config. **Set** ⇒ also permit these origins (a
+    /// separate web origin, or a reverse proxy that rewrites `Host`). A cross-origin
+    /// WS/SSE handshake bypasses SOP/CORS, so this list is the CSWSH defense and is
+    /// enforced even when auth is disabled. Each entry is validated as a
+    /// `scheme://host` origin by [`MultiviewConfig::validate`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
+    /// Management-plane request-concurrency + rate limits (SEC-14 control-plane `DoS`
+    /// floor): the concurrent-request cap plus the per-IP (pre-auth) and
+    /// per-API-key (post-auth) token-bucket rates the control plane enforces.
+    /// Absent ⇒ the secure defaults (limits enabled); validated by
+    /// [`MultiviewConfig::validate`].
+    #[serde(default)]
+    pub limits: crate::limits::ManagementLimits,
+    /// Control-plane TLS termination (TLS-0, [ADR-W029](../../docs/decisions/ADR-W029.md)):
+    /// when present, the served management plane terminates HTTPS (rustls) on
+    /// [`listen`](ControlConfig::listen) instead of plain HTTP; absent ⇒ plain
+    /// HTTP (the default build pulls no native TLS dependency). `mode = "static"`
+    /// carries operator-managed cert/key PEM paths. Validated for shape by
+    /// [`MultiviewConfig::validate`]; the file contents are loaded (and a build
+    /// without the control plane's `tls` feature rejects a configured section) at
+    /// serve time by `multiview-control`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::tls::TlsConfig>,
+}
+
+/// Process-wide system settings.
+///
+/// Currently the NDI® runtime license-acceptance gate (ADR-0008 §7.5); future
+/// process-wide settings join here as additional sub-tables. Absent ⇒ no system
+/// settings are configured (NDI I/O stays inert — unaccepted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemConfig {
+    /// The NDI® SDK runtime license-acceptance gate. Absent ⇒ NDI I/O is refused
+    /// (`ndi_unlicensed`) and never started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ndi: Option<NdiSystemConfig>,
+}
+
+/// The operator's NDI® SDK runtime license acceptance (ADR-0008 §7.5).
+///
+/// NDI I/O (source **and** output) is gated twice: the off-by-default `ndi` build
+/// feature, and this explicit, audited runtime acceptance. Until
+/// `accept_license = true` — with the audit fields [`accepted_by`](Self::accepted_by)
+/// and [`accepted_at`](Self::accepted_at) (who/when) — every configured NDI
+/// source/output is refused with the `ndi_unlicensed` status and never started
+/// (the output-clock invariant is untouched; the tile degrades).
+///
+/// The acceptance is **exported with config as a flag, never a secret**: it is
+/// ordinary, version-controllable config (no `secret_ref`, nothing redacted) so
+/// the legal acceptance travels with the configuration. It is a plain
+/// constructable data struct (mirroring the runtime `LicenseAcceptance` the gate
+/// consumes) so the control-plane settings handler and tests build it directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NdiSystemConfig {
+    /// Operator confirmation that the NDI SDK license has been read and accepted.
+    /// `false`/absent ⇒ all NDI I/O is refused (`ndi_unlicensed`).
+    #[serde(default)]
+    pub accept_license: bool,
+    /// Audit — **who** accepted (operator id/principal). Required (non-empty) when
+    /// `accept_license = true`; enforced at config load by
+    /// [`MultiviewConfig::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_by: Option<String>,
+    /// Audit — **when** acceptance was recorded (free-form, e.g. RFC 3339).
+    /// Required (non-empty) when `accept_license = true`; enforced at config load
+    /// by [`MultiviewConfig::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<String>,
 }
 
 /// A complete Multiview configuration document (config-as-code).
@@ -166,6 +319,20 @@ pub struct MultiviewConfig {
     /// serves the API + docs (+ web UI) alongside the engine; absent ⇒ headless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ControlConfig>,
+    /// Config-declared API keys (ADR-W026): scoped, non-admin principals minted
+    /// declaratively (secrets via `secret_env`, never inlined). Absent ⇒ only the
+    /// bootstrap admin (env token) exists. Registered at startup by
+    /// `multiview-cli`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiConfig>,
+    /// The shared WebRTC transport endpoint section (ADR-0048 §9): the single
+    /// dual-stack UDP media socket every WebRTC role multiplexes onto — WHIP
+    /// ingest (ADR-T014), WHEP preview, WHEP output viewers and the
+    /// `whip_push` client (ADR-0049). An absent `[webrtc]` table yields the
+    /// fully-defaulted [`WebrtcConfig`], and a default-valued section does not
+    /// serialize.
+    #[serde(default, skip_serializing_if = "WebrtcConfig::is_default")]
+    pub webrtc: WebrtcConfig,
     /// The GPU work-placement policy (ADR-0018). Absent ⇒ the engine uses its
     /// conservative built-in defaults (single-GPU hosts add zero behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +352,30 @@ pub struct MultiviewConfig {
     /// its desugared v3 form route identically. Schema v3 introduces this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingTable>,
+    /// Outbound presentation-timing knobs (ADR-M010 / DEV-C1): the per-
+    /// deployment link offset every epoch consumer adds before presenting, and
+    /// the optional PHC device the `ptp` build disciplines the epoch from.
+    /// Absent ⇒ [`TimingConfig::default`] (a uniform 150 ms link offset,
+    /// system-clock wall source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingConfig>,
+    /// Process-wide system settings (ADR-0008 §7.5): currently the NDI® runtime
+    /// license-acceptance gate (`[system.ndi] accept_license`). Absent ⇒ no
+    /// system settings (NDI I/O stays inert — unaccepted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemConfig>,
+    /// The media library (ADR-0057 Decision 1): a root directory plus declared
+    /// [`MediaAsset`]s (stills, clips, audio). Absent ⇒ no media library is
+    /// configured. Asset ids are referenced by media players' `default` and by
+    /// [`SourceKind::Still`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_library: Option<MediaLibrary>,
+    /// Media-player channels (ADR-0057 Decision 2): pre-declared, bus-selectable
+    /// source channels, each owning one supervised ingest from boot. The MVP
+    /// allows at most two ([`MultiviewConfig::validate`] enforces the bound).
+    /// Bound onto the canvas by [`SourceKind::MediaPlayer`].
+    #[serde(default)]
+    pub media_players: Vec<MediaPlayer>,
 }
 
 /// Parse a `#RGB` / `#RRGGBB` hex color into its `(r, g, b)` bytes.
@@ -285,7 +476,10 @@ impl MultiviewConfig {
     ///   device, no device belongs to two groups, and skew/offset bounds are
     ///   sane;
     /// - every `[discovery]` service type is a well-formed DNS-SD type
-    ///   (`_name._tcp` / `_name._udp`, optionally `.local.`-suffixed).
+    ///   (`_name._tcp` / `_name._udp`, optionally `.local.`-suffixed);
+    /// - the `[webrtc]` section (ADR-0048 §9) carries a usable non-zero media
+    ///   port, session pool, idle-GC horizon, advertised addresses and CORS
+    ///   origins.
     ///
     /// # Errors
     ///
@@ -310,9 +504,16 @@ impl MultiviewConfig {
         self.validate_devices()?;
         self.validate_sync_groups()?;
         self.validate_discovery()?;
+        self.validate_api()?;
         self.validate_control()?;
+        self.validate_webrtc()?;
+        self.validate_system()?;
         self.validate_placement()?;
         self.validate_routing()?;
+        self.validate_media()?;
+        if let Some(timing) = &self.timing {
+            timing.validate()?;
+        }
 
         // Solving + the core structural check covers geometry (rects in 0..1,
         // positive extent, valid cadence) and grid wiring (areas resolve).
@@ -341,6 +542,16 @@ impl MultiviewConfig {
     fn validate_discovery(&self) -> Result<(), ConfigError> {
         match &self.discovery {
             Some(discovery) => discovery.validate(),
+            None => Ok(()),
+        }
+    }
+
+    /// Validate the `[api]` config-declared API keys (ADR-W026): unique key ids,
+    /// a `secret_env` per key, well-formed `program:` output grants, and
+    /// DNS-label discovery domains ([`ApiConfig::validate`]).
+    fn validate_api(&self) -> Result<(), ConfigError> {
+        match &self.api {
+            Some(api) => api.validate(),
             None => Ok(()),
         }
     }
@@ -447,6 +658,123 @@ impl MultiviewConfig {
         Ok(())
     }
 
+    /// Validate the media library and media players (ADR-0057 Decisions 1/2,
+    /// ADR-0097 vamp window, [media-playout §3/§15](../docs/research/media-playout.md)):
+    ///
+    /// - each asset's playout window nests as `in_point ≤ vamp_in < vamp_out ≤
+    ///   out_point` when the fields are present (a zero-length or half-specified
+    ///   vamp window is rejected), and `in_point ≤ out_point` when only those are
+    ///   present;
+    /// - asset ids and player ids are each unique;
+    /// - every player `default` resolves to a declared asset, and every
+    ///   [`SourceKind::Still`] / [`SourceKind::MediaPlayer`] binding resolves to a
+    ///   declared asset / player;
+    /// - the MVP bound of **at most two** media players is respected.
+    fn validate_media(&self) -> Result<(), ConfigError> {
+        // Asset ids (also the resolution set for `Still`/player `default` refs).
+        let mut asset_ids: HashSet<&str> = HashSet::new();
+        if let Some(library) = &self.media_library {
+            asset_ids.reserve(library.assets.len());
+            for asset in &library.assets {
+                if !asset_ids.insert(asset.id.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "duplicate media asset id {:?}",
+                        asset.id
+                    )));
+                }
+                Self::validate_asset_window(asset)?;
+            }
+        }
+
+        // MVP bound: at most two media-player channels.
+        if self.media_players.len() > 2 {
+            return Err(ConfigError::Validation(format!(
+                "{} media players configured: the MVP allows at most 2 (ADR-0057)",
+                self.media_players.len()
+            )));
+        }
+
+        // Player ids unique + every `default` resolves to a declared asset.
+        let mut player_ids: HashSet<&str> = HashSet::with_capacity(self.media_players.len());
+        for player in &self.media_players {
+            if !player_ids.insert(player.id.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate media player id {:?}",
+                    player.id
+                )));
+            }
+            if let Some(asset) = &player.default {
+                if !asset_ids.contains(asset.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "media player {:?} default references unknown asset {asset:?}",
+                        player.id
+                    )));
+                }
+            }
+        }
+
+        // Source bindings resolve: `Still { asset }` → an asset, `MediaPlayer {
+        // player }` → a player.
+        for source in &self.sources {
+            match &source.kind {
+                SourceKind::Still { asset } if !asset_ids.contains(asset.as_str()) => {
+                    return Err(ConfigError::Validation(format!(
+                        "source {:?} still binding references unknown asset {asset:?}",
+                        source.id
+                    )));
+                }
+                SourceKind::MediaPlayer { player } if !player_ids.contains(player.as_str()) => {
+                    return Err(ConfigError::Validation(format!(
+                        "source {:?} media_player binding references unknown player {player:?}",
+                        source.id
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a single asset's integer-frame playout window (ADR-0097): the
+    /// vamp pair must be both-present-or-both-absent, and the four points must
+    /// nest as `in_point ≤ vamp_in < vamp_out ≤ out_point`. With only `in`/`out`
+    /// present, `in_point ≤ out_point` is enforced. Absent endpoints default to
+    /// the open bounds (`0` / `u64::MAX`) so the nesting checks compose.
+    fn validate_asset_window(asset: &MediaAsset) -> Result<(), ConfigError> {
+        let in_point = asset.in_point_frames.unwrap_or(0);
+        let out_point = asset.out_point_frames.unwrap_or(u64::MAX);
+        if in_point > out_point {
+            return Err(ConfigError::Validation(format!(
+                "media asset {:?}: in_point_frames {in_point} > out_point_frames {out_point}",
+                asset.id
+            )));
+        }
+        match (asset.vamp_in_frames, asset.vamp_out_frames) {
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ConfigError::Validation(format!(
+                    "media asset {:?}: vamp_in_frames and vamp_out_frames must both be set or \
+                     both omitted (a half-specified vamp window is ambiguous)",
+                    asset.id
+                )));
+            }
+            (Some(vamp_in), Some(vamp_out)) => {
+                // Reject a degenerate (zero-length) vamp segment and any window
+                // not nested as in ≤ vamp_in < vamp_out ≤ out.
+                if !(in_point <= vamp_in && vamp_in < vamp_out && vamp_out <= out_point) {
+                    return Err(ConfigError::Validation(format!(
+                        "media asset {:?}: vamp window must satisfy in_point ≤ vamp_in < \
+                         vamp_out ≤ out_point (got in={in_point} vamp_in={vamp_in} \
+                         vamp_out={vamp_out} out={out_point})",
+                        asset.id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the optional control-plane listener: its `listen` must parse as a
     /// [`std::net::SocketAddr`], so a typo fails at config-validation time rather
     /// than when `multiview run` tries to bind the socket.
@@ -461,6 +789,95 @@ impl MultiviewConfig {
                         control.listen
                     ))
                 })?;
+            if let Some(base) = &control.cast_media_base {
+                // Shape only: http/https + non-empty. The host rules (IP
+                // literal / publicly resolvable, never loopback or `.local`)
+                // are enforced by the cast driver's base parser at startup
+                // (DEV-D2, ADR-M011) — this layer has no URL model.
+                if base.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "control.cast_media_base is empty (omit the field to disable Cast \
+                         delivery)"
+                            .to_owned(),
+                    ));
+                }
+                if !(base.starts_with("http://") || base.starts_with("https://")) {
+                    return Err(ConfigError::Validation(format!(
+                        "control.cast_media_base {base:?} must be an http:// or https:// base \
+                         URL (Cast receivers fetch HLS over HTTP)"
+                    )));
+                }
+            }
+            if let Some(cidrs) = &control.device_dial_allow {
+                // Build the dial policy purely to validate every CIDR — a typo
+                // must fail at config load (fail-closed), not be silently ignored
+                // and leave the dial screen wider than the operator intended
+                // (SEC-02/SEC-04, ADR-M013). This is the same parser the runtime
+                // dial policy is built from.
+                crate::device::net_guard::DialPolicy::from_cidrs(cidrs).map_err(|e| {
+                    ConfigError::Validation(format!("control.device_dial_allow: {e}"))
+                })?;
+            }
+            for origin in &control.allowed_origins {
+                // Strictly parse each entry as a serialized origin (scheme://host
+                // [:port], nothing else). A malformed entry must fail at config
+                // load — a silently never-matching allow-list line is a fail-open
+                // usability trap (SEC-13): the operator believes an origin is
+                // permitted when it can never match. The same parser backs the
+                // runtime `AllowedOrigins` construction + request-header check
+                // (`crate::origin::Origin`), so config and runtime cannot diverge.
+                crate::origin::Origin::parse(origin).map_err(|err| {
+                    ConfigError::Validation(format!(
+                        "control.allowed_origins entry {origin:?} is not a valid scheme://host \
+                         origin: {err} (e.g. \"https://ops.example\" or \
+                         \"http://[2001:db8::7]:8080\")"
+                    ))
+                })?;
+            }
+            // The management-plane request-concurrency + rate limits (SEC-14): a zero
+            // concurrency cap or a zero token-bucket burst/refill would turn the
+            // DoS floor into a self-inflicted outage, so reject it at config load.
+            control.limits.validate()?;
+            // Control-plane TLS termination (TLS-0, ADR-W029): reject an empty
+            // cert/key path at config load rather than at first bind. File
+            // existence/parse is checked at serve time (a config may be authored
+            // off the deployment host).
+            if let Some(tls) = &control.tls {
+                tls.validate()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the `[webrtc]` section (ADR-0048 §9): a non-zero media port, a
+    /// non-empty session pool, a non-zero idle-GC horizon, and advertised
+    /// addresses / CORS origins that are structurally usable. The defaulted
+    /// (absent) section always validates.
+    fn validate_webrtc(&self) -> Result<(), ConfigError> {
+        self.webrtc.validate()
+    }
+
+    /// Validate the optional `[system.ndi]` license-acceptance gate (ADR-0008
+    /// §7.5): when `accept_license = true`, the audit fields `accepted_by` +
+    /// `accepted_at` (who/when) must be present and non-empty — the same who/when
+    /// invariant the runtime `NdiLicense::accept` enforces, surfaced at
+    /// config-load so a malformed acceptance fails fast rather than at first NDI
+    /// start. Declining (`accept_license = false`) needs no audit.
+    fn validate_system(&self) -> Result<(), ConfigError> {
+        let Some(ndi) = self.system.as_ref().and_then(|s| s.ndi.as_ref()) else {
+            return Ok(());
+        };
+        if !ndi.accept_license {
+            return Ok(());
+        }
+        let nonblank = |f: &Option<String>| f.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if !nonblank(&ndi.accepted_by) || !nonblank(&ndi.accepted_at) {
+            return Err(ConfigError::Validation(
+                "system.ndi.accept_license = true requires the audit fields \
+                 accepted_by and accepted_at (who/when); add them, or set \
+                 accept_license = false to decline"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -548,6 +965,16 @@ impl MultiviewConfig {
             }
         };
 
+        // `CoreCell` carries only what the compositor drive renders today:
+        // geometry (x/y/w/h), z-order, fit, the `source.input_id` binding, and
+        // per-tile opacity. The remaining schema `Cell` fields — `align`,
+        // `corner_radius`, `scaler`, `visible`, `static_friendly`, `border`, and
+        // `qos` — are intentionally NOT mapped here: ADR-W019 carries them in the
+        // stored/working config document (persisted, exported, round-tripped) and
+        // the `apply-layout` API reports them as `carried_only`, but compositing
+        // them is drive work not yet built. They are BLOCKED-not-dead
+        // (planned-but-unwired), not rule-6 dead fields — do not delete them to
+        // "tidy" this mapper; wire the compositor instead.
         Ok(CoreCell {
             x,
             y,
@@ -561,10 +988,6 @@ impl MultiviewConfig {
             // it in the premultiplied linear-light `over` blend; out-of-range
             // values are rejected by `Layout::validate` downstream.
             opacity: cell.opacity.unwrap_or(1.0),
-            // Broadcast per-tile crop/rotation are additive, defaulted fields on
-            // the shared `Cell`; this mapper does not yet surface them from the
-            // config schema, so spread their defaults.
-            ..CoreCell::default()
         })
     }
 
@@ -1040,6 +1463,20 @@ impl Source {
                     }
                 }
             }
+            SourceKind::Webrtc { token, .. } => {
+                // The WHIP endpoint URL is derived from the source id
+                // (ADR-T014 §1), so only the bearer needs a structural check:
+                // an authored-but-empty token is a misconfiguration, not
+                // "no token" (omit the field to require a Write-scope API key
+                // — publishing is never anonymous).
+                if matches!(token.as_deref(), Some("")) {
+                    return Err(ConfigError::Validation(format!(
+                        "source {:?}: webrtc token, when set, must be non-empty (omit `token` \
+                         to require a Write-scope API key instead — ADR-T014)",
+                        self.id
+                    )));
+                }
+            }
             SourceKind::Timer {
                 target,
                 on_target,
@@ -1071,6 +1508,16 @@ impl Source {
                     }
                 }
             }
+            // RIST (ADR-0095): the typed options validate structurally here — a
+            // non-empty bonding list is rejected on the Tier-0 build (FFmpeg's
+            // protocol is single-peer; honest capability reporting, never a
+            // silent single-link), and an encryption block must carry a
+            // non-empty secret_ref. The URL's reachability is a runtime concern.
+            SourceKind::Rist { rist, .. } => {
+                if let Some(opts) = rist {
+                    validate_rist_options(&self.id, opts)?;
+                }
+            }
             // Network/synthetic kinds carry no kind-specific field that can be
             // validated structurally here (a URL's reachability is a runtime
             // concern, not a config one). The `youtube` URL is resolved at
@@ -1085,6 +1532,12 @@ impl Source {
             | SourceKind::Rtmp { .. }
             | SourceKind::Ndi { .. }
             | SourceKind::File { .. }
+            // The `still` asset ref and `media_player` channel ref are resolved
+            // against `media_library` / `media_players` at the document level
+            // (`MultiviewConfig::validate_media`), not per-source — there are no
+            // per-source structural fields to check here.
+            | SourceKind::Still { .. }
+            | SourceKind::MediaPlayer { .. }
             // AES67's binding (SDP / multicast group / PTP domain) is a runtime
             // ingest concern, like the network URL kinds — accepted as authored.
             | SourceKind::Aes67 { .. } => {}
@@ -1141,7 +1594,10 @@ impl Output {
             | Output::LlHls { codec, .. }
             | Output::Hls { codec, .. }
             | Output::Rtmp { codec, .. }
-            | Output::Srt { codec, .. } => Some(codec),
+            | Output::Srt { codec, .. }
+            | Output::Rist { codec, .. }
+            | Output::Webrtc { codec, .. }
+            | Output::WhipPush { codec, .. } => Some(codec),
             // NDI carries a channel-map, AES67 sends raw PCM, and a display
             // head scans out raw frames — none has a (video) codec to validate.
             Output::Ndi { .. } | Output::Aes67 { .. } | Output::Display { .. } => None,
@@ -1174,7 +1630,123 @@ impl Output {
         {
             validate_display_output(connector, mode.as_ref(), forced_mode.as_ref())?;
         }
+        // RIST push options (bonding rejection + PSK secret_ref) are validated
+        // by the same shared helper the `rist` source uses (ADR-0095 §4).
+        if let Output::Rist {
+            rist: Some(opts), ..
+        } = self
+        {
+            validate_rist_options(&self.label(), opts)?;
+        }
+        // Per-output metadata (ADR-0088): reject contradictions only
+        // (service_id range, ISO-639-2 language). An unsupported-but-harmless
+        // field degrades to a visible `Dropped` in `Output::metadata_plan`, not
+        // an error.
+        if let Some(metadata) = self.metadata() {
+            metadata.validate(&self.label())?;
+        }
+        // Per-output orientation (ADR-0089): reject `mode = "tag"` on a
+        // transport that carries no display-rotation tag (MPEG-TS/RTSP/NDI);
+        // `auto`/`pixels`/flip are always valid.
+        if let Some(orientation) = self.orientation() {
+            orientation.validate(&self.label(), self.orientation_tag_capability())?;
+        }
+        self.validate_webrtc_rules()
+    }
+
+    /// The WebRTC-kind-specific rules (ADR-0049): `codec = "h264"` is the only
+    /// v1 value (the variant names a program rendition to consume, never an
+    /// encode to spawn), a WHEP output needs at least one viewer slot, a
+    /// `whip_push` destination must be an `http(s)` URL (https recommended),
+    /// and an authored bearer token may not be empty.
+    fn validate_webrtc_rules(&self) -> Result<(), ConfigError> {
+        match self {
+            Output::Webrtc {
+                max_viewers,
+                token,
+                codec,
+                ..
+            } => {
+                Self::validate_webrtc_codec(&self.label(), codec)?;
+                if *max_viewers == 0 {
+                    return Err(ConfigError::Validation(format!(
+                        "output {:?}: max_viewers must be >= 1 (ADR-0049 defaults to 8)",
+                        self.label()
+                    )));
+                }
+                Self::validate_webrtc_token(&self.label(), token.as_deref())
+            }
+            Output::WhipPush {
+                url, token, codec, ..
+            } => {
+                Self::validate_webrtc_codec(&self.label(), codec)?;
+                Self::validate_whip_push_url(&self.label(), url)?;
+                Self::validate_webrtc_token(&self.label(), token.as_deref())
+            }
+            // The non-WebRTC kinds carry none of these fields.
+            Output::RtspServer { .. }
+            | Output::LlHls { .. }
+            | Output::Hls { .. }
+            | Output::Ndi { .. }
+            | Output::Rtmp { .. }
+            | Output::Srt { .. }
+            | Output::Rist { .. }
+            | Output::Aes67 { .. }
+            | Output::Display { .. } => Ok(()),
+        }
+    }
+
+    /// Reject any WebRTC output codec other than `"h264"` (the only v1 value,
+    /// ADR-0049: the field names an existing program rendition to consume).
+    fn validate_webrtc_codec(label: &str, codec: &str) -> Result<(), ConfigError> {
+        // The shared empty-codec rule already fired in `validate`; this names
+        // the v1 constraint precisely for a present-but-unsupported value.
+        if codec.is_empty() || codec == "h264" {
+            return Ok(());
+        }
+        Err(ConfigError::Validation(format!(
+            "output {label:?}: codec {codec:?} is not supported — v1 WebRTC outputs consume an \
+             existing \"h264\" program rendition (a rendition to consume, not an encode to \
+             spawn; ADR-0049)"
+        )))
+    }
+
+    /// Reject an authored-but-empty WebRTC bearer token (omit the field to
+    /// require an API key instead).
+    fn validate_webrtc_token(label: &str, token: Option<&str>) -> Result<(), ConfigError> {
+        if matches!(token, Some("")) {
+            return Err(ConfigError::Validation(format!(
+                "output {label:?}: token, when set, must be non-empty (omit `token` to require \
+                 an API key instead)"
+            )));
+        }
         Ok(())
+    }
+
+    /// Reject a `whip_push` destination that is not an `http(s)` URL with a
+    /// host. `https` is recommended (the push client follows redirects
+    /// https-only and aborts on a plaintext downgrade, ADR-0049); plain `http`
+    /// still validates. IPv6 literals are bracketed
+    /// (`https://[2001:db8::15]:8443/whip/pgm1`, ADR-0042).
+    fn validate_whip_push_url(label: &str, url: &str) -> Result<(), ConfigError> {
+        // Schemes are case-insensitive (RFC 3986 §3.1).
+        let rest = ["https://", "http://"].iter().find_map(|scheme| {
+            url.get(..scheme.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                .and_then(|_| url.get(scheme.len()..))
+        });
+        match rest {
+            Some(authority) if !authority.is_empty() && !authority.starts_with('/') => Ok(()),
+            Some(_) => Err(ConfigError::Validation(format!(
+                "output {label:?}: whip_push url {url:?} has no host — expected e.g. \
+                 \"https://[2001:db8::15]:8443/whip/pgm1\""
+            ))),
+            None => Err(ConfigError::Validation(format!(
+                "output {label:?}: whip_push url {url:?} must be an http(s) URL (https \
+                 recommended) addressing an RFC 9725 WHIP endpoint, e.g. \
+                 \"https://[2001:db8::15]:8443/whip/pgm1\""
+            ))),
+        }
     }
 }
 
@@ -1182,6 +1754,38 @@ impl Output {
 /// non-empty connector, `mode`/`forced_mode` mutual exclusion (an explicit
 /// EDID override and an EDID-less forced timing are contradictory requests),
 /// and a structurally sound [`DisplayModeSpec`] wherever one is given.
+/// Validate a [`crate::schema::RistOptions`] block (shared by the `rist` source
+/// and the `rist` push output).
+///
+/// Tier-0 (`FFmpeg` `rist://`) honest capability reporting (ADR-0095 §4):
+/// - a **non-empty `bonding`** list is rejected with a clear error — bonding is
+///   genuinely unreachable through `FFmpeg`'s single-peer protocol (it is the
+///   Tier-2 direct-FFI feature), so it is never silently single-linked;
+/// - an **encryption block** must carry a non-empty `secret_ref` (`PSK`
+///   requested with no key reference is a misconfiguration).
+fn validate_rist_options(
+    owner: &str,
+    opts: &crate::schema::RistOptions,
+) -> Result<(), ConfigError> {
+    if !opts.bonding.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "rist {owner:?}: bonding/load-sharing ({} peer(s)) requires the `rist` direct-FFI \
+             build (Tier-2); the Tier-0 FFmpeg `rist://` path is single-link only — remove the \
+             `bonding` list or build the direct-FFI leaf (ADR-0095)",
+            opts.bonding.len()
+        )));
+    }
+    if let Some(enc) = &opts.encryption {
+        if enc.secret_ref.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "rist {owner:?}: encryption is configured but secret_ref is empty (the PSK is a \
+                 secret-manager reference, e.g. `op://…` or `env:VAR`; it is never a plaintext key)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_display_output(
     connector: &str,
     mode: Option<&DisplayModeSpec>,

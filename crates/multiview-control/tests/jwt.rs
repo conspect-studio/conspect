@@ -15,7 +15,7 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use multiview_control::{
     Is10Claims, JwtError, JwtValidator, NmosAccess, NmosApiClaim, Role, SignatureAlgorithm,
 };
@@ -43,7 +43,7 @@ fn sign_hs256(header: &serde_json::Value, payload: &serde_json::Value, secret: &
         b64(serde_json::to_vec(header).unwrap().as_slice()),
         b64(serde_json::to_vec(payload).unwrap().as_slice())
     );
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret).unwrap();
     mac.update(signing_input.as_bytes());
     let sig = mac.finalize().into_bytes();
     format!("{signing_input}.{}", b64(&sig))

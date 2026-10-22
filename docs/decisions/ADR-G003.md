@@ -1,9 +1,14 @@
 # ADR-G003: Mandatory adversarial cross-vendor review in a fresh context; human is the final approver
 
-- **Status:** Proposed
+- **Status:** Proposed — **amended by [ADR-G005](ADR-G005.md) (2026-06-14)**
 - **Area:** Engineering Guardrails
 - **Date:** 2026-06-02
 - **Source:** [agent-guardrails.md](../development/agent-guardrails.md)
+
+> **Amended by [ADR-G005](ADR-G005.md) (2026-06-14):** routine final approval **and merge** are
+> delegated to the agent. The mandatory adversarial cross-vendor review below is **unchanged**; the
+> operator retains ultimate authority/override. The "human is the final approver" / "≥1 human
+> approval" language below is superseded for routine changes by ADR-G005.
 
 ## Decision
 

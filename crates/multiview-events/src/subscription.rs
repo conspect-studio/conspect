@@ -65,7 +65,7 @@ pub struct Resume {
     pub last_seq: Seq,
 }
 
-/// Why a [`Resync`] was issued (the gap could not be replayed).
+/// Why a [`Resync`] was issued (the client must rebuild rather than merge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -76,14 +76,23 @@ pub enum ResyncReason {
     UnknownSession,
     /// The session expired (TTL elapsed since the client went away).
     SessionExpired,
+    /// The principal's authorization changed mid-session (object scope narrowed
+    /// or widened), so the client must rebuild the object-bearing topics to drop
+    /// now-hidden objects and pick up newly-visible ones (ADR-RT010). Distinct
+    /// from a replay-ring miss: the connection is intact, only the authorized
+    /// view changed.
+    AuthzChanged,
 }
 
-/// `$resync` body — the gap is unrecoverable; the client MUST **rebuild** state
-/// (not merge) from the fresh snapshot that follows. The listed topics must be
-/// re-snapshotted on a new `seq` baseline.
+/// `$resync` body — the client MUST **rebuild** state (not merge) from the fresh
+/// snapshot that follows. The listed topics must be re-snapshotted on a new `seq`
+/// baseline. Issued when a resume gap is unrecoverable ([`ResyncReason::SeqEvicted`]
+/// / [`UnknownSession`](ResyncReason::UnknownSession) /
+/// [`SessionExpired`](ResyncReason::SessionExpired)) or when the authorized view
+/// changed ([`ResyncReason::AuthzChanged`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resync {
-    /// Why the resume failed.
+    /// Why the resync was issued.
     pub reason: ResyncReason,
     /// The topics the client must rebuild.
     pub resubscribe: Vec<Topic>,

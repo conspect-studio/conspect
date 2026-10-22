@@ -83,7 +83,7 @@ an ordered ladder. Higher rank wins **only while it is disciplined** (`LockState
    a PTP **slave/receiver only** — it reads a PHC disciplined by external linuxptp
    (`ptp4l` + `phc2sys`); it never authors PTP messages and never runs BMCA itself (ADR-0033 §4).
 2. **NTP-disciplined system clock** — `RefSource::Ntp` (badge label `SYS` is retained for the
-   host-clock case; see §4 on the `Ntp`/`System` distinction). Selected when PTP is absent/not
+   host-clock case; see §5 on the `Ntp`/`System` distinction). Selected when PTP is absent/not
    disciplined **and** the kernel reports the system clock synchronised within tolerance
    (`classify_system` → `Locked`/`Holdover`).
 3. **Free-run** — `RefSource::System` in `RefStatus::Freerun`. The terminal fallback: the local
@@ -158,7 +158,23 @@ This is the load-bearing half of the contract.
   `.await`s a reference reader. A failed/denied PHC or `adjtimex` read is a missing sample that lets
   the tracker's staleness/holdover logic fire on the next tick — it stalls nothing.
 
-### 4. Source/status taxonomy (badge + API contract)
+### 4. Timescale at the consumption boundary: PTP time is TAI; published wall surfaces are UTC
+
+The reference this contract selects is consumed by **UTC-defined** surfaces (ADR-M010's outbound
+presentation epoch: HLS `EXT-X-PROGRAM-DATE-TIME` per RFC 8216, the RTCP SR NTP word, the control-WS
+`timing.status` epoch), while the PHC under the standard linuxptp deployment this ADR names
+(`ptp4l` ST 2059-2 + `phc2sys`) carries **PTP time = TAI** — currently 37 s ahead of UTC. Any
+consumer deriving a wall-clock estimate from the PTP leg MUST therefore apply the configured
+TAI−UTC offset (`[timing] ptp_utc_offset_s`, default `37`, integer seconds — sourced from `ptp4l`'s
+`currentUtcOffset`, which tracks leap seconds) so the published value is always UTC and a
+PTP↔system reference transition never steps the published timeline by the TAI−UTC difference. A
+post-conversion disagreement of ≥30 s against the system clock indicates a misconfigured offset (or
+a PHC on an unexpected timescale): the consumer MUST NOT publish the suspect PTP estimate — it
+degrades to the system leg with a non-locked quality and warns. The selection ladder (§1) itself is
+timescale-agnostic; this section governs only the wall-estimate consumers (`multiview-engine`'s
+`epoch` module implements it for ADR-M010).
+
+### 5. Source/status taxonomy (badge + API contract)
 
 - `RefSource` is the public taxonomy: `Ptp` (label `PTP`), `Ntp` (label `NTP`, NTP-disciplined
   system clock), `System` (label `SYS`, undisciplined host clock / free-run floor). The

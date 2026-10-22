@@ -117,7 +117,7 @@ source = "wall"            # the always-ticking clock doubles as a falter sentin
 #
 # Codec: the default LGPL-clean image encodes **mpeg2video** (plays in VLC /
 # ffplay). For browser-friendly **H.264** HLS, use the GPL image
-# (`ghcr.io/aperim/multiview:<tag>-gpl`) and set `codec = "h264"` — note H.264/
+# (`ghcr.io/conspect-studio/conspect:<tag>-gpl`) and set `codec = "h264"` — note H.264/
 # H.265 make the build GPL (see the README "GPL build" note).
 [[outputs]]
 kind = "hls"

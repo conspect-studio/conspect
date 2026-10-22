@@ -1,6 +1,6 @@
 //! WHEP concurrent-focus cap tests (PRV-3): the `FocusGate`, wired into the
 //! negotiate path via [`GatedWhep`], bounds concurrent focus sessions and sheds
-//! the overflow to the existing `503 fallback: ws-jpeg` shape.
+//! the overflow to the existing `503 fallback: jpeg` shape.
 //!
 //! These drive the real route layer (axum `oneshot`) over an in-memory fake
 //! transport, never a real str0m engine (PRV-1b). They re-assert invariant #10:
@@ -85,9 +85,9 @@ a=rtpmap:96 H264/90000\r\na=sendonly\r\n"
 }
 
 /// Build a router whose WHEP seam is `inner` wrapped by a [`GatedWhep`] with the
-/// given caps and the `ws-jpeg` fallback hint.
+/// given caps and the `jpeg` fallback hint.
 fn router_with_caps(inner: Arc<UncappedWhep>, caps: FocusCaps) -> axum::Router {
-    let gated = Arc::new(GatedWhep::new(inner, caps, "ws-jpeg"));
+    let gated = Arc::new(GatedWhep::new(inner, caps, "jpeg"));
     let engine = Arc::new(EnginePublisher::new(64));
     let (tx, _rx) = command_bus(4);
     let mut keys = ApiKeyStore::new(PEPPER.to_vec());
@@ -104,6 +104,7 @@ fn router_with_caps(inner: Arc<UncappedWhep>, caps: FocusCaps) -> axum::Router {
                 role,
                 scoped_object_ids: None,
                 scoped_output_ids: None,
+                scoped_discovery_domains: None,
             },
         );
     }
@@ -166,7 +167,7 @@ async fn focuses_up_to_the_global_cap_succeed_then_overflow_is_503_with_fallback
         assert_eq!(resp.status(), StatusCode::CREATED, "admitted: {path}");
     }
     // The 4th focus exceeds the global cap → 503 with the honest fallback hint,
-    // NOT queued (invariant #10): the existing `503 fallback: ws-jpeg` shape.
+    // NOT queued (invariant #10): the existing `503 fallback: jpeg` shape.
     let over = send(
         &router,
         post_sdp(
@@ -179,7 +180,7 @@ async fn focuses_up_to_the_global_cap_succeed_then_overflow_is_503_with_fallback
     assert_eq!(over.status(), StatusCode::SERVICE_UNAVAILABLE);
     let problem = body_json(over).await;
     assert_eq!(problem["status"], 503);
-    assert_eq!(problem["fallback"], "ws-jpeg");
+    assert_eq!(problem["fallback"], "jpeg");
 }
 
 #[tokio::test]
@@ -239,7 +240,7 @@ async fn per_scope_caps_are_independent() {
         "the program scope is at its per-scope cap"
     );
     let problem = body_json(second_program).await;
-    assert_eq!(problem["fallback"], "ws-jpeg");
+    assert_eq!(problem["fallback"], "jpeg");
     // A DIFFERENT scope is independent: still admitted.
     let resp = send(
         &router,

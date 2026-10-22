@@ -55,6 +55,12 @@ export interface RequestOptions {
    * endpoint does not require optimistic concurrency.
    */
   readonly etag?: string;
+  /**
+   * An `Idempotency-Key` for a start/stop/swap-style command so a replayed
+   * request reserves the same operation rather than starting a second one
+   * (conventions section 6). Omit when the endpoint does not reserve by key.
+   */
+  readonly idempotencyKey?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -103,6 +109,9 @@ export function buildHeaders(options: RequestOptions, withJsonBody: boolean): He
   }
   if (options.etag !== undefined && options.etag !== '') {
     headers.set('If-Match', options.etag);
+  }
+  if (options.idempotencyKey !== undefined && options.idempotencyKey !== '') {
+    headers.set('Idempotency-Key', options.idempotencyKey);
   }
   return headers;
 }

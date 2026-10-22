@@ -456,6 +456,12 @@ segment_ms = 1000
 /// plane + live program preview. Proves ingestion, processing, output, and
 /// management are one process — and that serving never stalls the output clock
 /// (inv #1) nor back-pressures the engine (inv #10).
+// A single linear end-to-end proof that one process *ingests/composites/encodes*
+// AND *serves* the control API + live program preview concurrently; its deliberate
+// setup → concurrent-run → assert flow is legitimately long (just over the 100-line
+// clippy cap once the `webrtc-native` feature adds its bind-arg). Splitting it would
+// only shuffle locals into a wide tuple, not aid the reader — so suppress, not carve.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn pipeline_serves_control_api_and_live_preview_while_ingesting() {
     use std::sync::Arc;
@@ -491,13 +497,20 @@ async fn pipeline_serves_control_api_and_live_preview_while_ingesting() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     // IPv6-first: the serve path must bind the IPv6 loopback `[::1]`.
-    let (addr, server) = control::bind_and_serve(
+    let (addr, server, _state) = control::bind_and_serve(
         "[::1]:0",
         &config,
         Arc::clone(&publisher),
         commands,
         Arc::clone(&provider),
-        None,
+        None, // whep
+        None, // whip
+        None, // whep_output
+        None, // licence
+        None, // mesh
+        multiview_control::LiveApplyCaps::default(),
+        multiview_control::LiveSourceCapability::synthetic_only(),
+        None, // boot_model (ADR-W024)
         async move {
             let _ = shutdown_rx.await;
         },

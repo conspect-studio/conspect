@@ -85,7 +85,7 @@ fn readiness_report_lists_pending_gates() {
     state.satisfy(&GateId::new("output"));
     let report = state.readiness();
     assert!(report.ready);
-    assert!(report.pending.is_empty());
+    assert_eq!(report.pending, Vec::<multiview_telemetry::GateId>::new());
 }
 
 #[test]

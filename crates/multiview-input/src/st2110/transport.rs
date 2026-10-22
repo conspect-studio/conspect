@@ -43,10 +43,10 @@
 //! [`IngestPump`]: crate::source::IngestPump
 //! [streaming-gotchas §5]: ../../../docs/research/streaming-gotchas.md
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 
 use multiview_core::color::ColorInfo;
 use multiview_core::frame::FrameMeta;
@@ -67,6 +67,41 @@ pub const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// The largest UDP datagram an ST 2110 receiver will buffer. ST 2110-20 uses a
 /// ~1500-byte standard MTU (or up to ~9000 jumbo); 9 KiB covers both with margin.
 pub const MAX_DATAGRAM: usize = 9216;
+
+/// Which network interface to join an IPv6 multicast group on.
+///
+/// IPv6 multicast is **interface-scoped** (RFC 4291 scope-id): the OS index `0`
+/// ("unspecified" — let the kernel pick) is not portable and commonly fails for
+/// **link-local** (`ff02::/16`) and **site-local** (`ff05::/16`) groups, which
+/// must name a concrete interface. A deployment supplies the intended interface
+/// (from config or the SDP), so the RX wiring is not silently pinned to index 0
+/// (panel F6). Applies to the IPv6 path only — IPv4 multicast joins via
+/// `INADDR_ANY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MulticastInterface {
+    /// Let the OS pick the default multicast interface (IPv6 index `0`).
+    /// Portable for a global-scope group on a single-homed host; NOT reliable
+    /// for link/site-local groups or a multi-homed host.
+    #[default]
+    Unspecified,
+    /// A specific IPv6 interface by its OS index / scope-id (e.g. resolved from
+    /// an interface name or supplied by config). Required for link/site-local
+    /// groups and to pin the join on a multi-homed host.
+    Index(u32),
+}
+
+impl MulticastInterface {
+    /// The IPv6 interface index this selection passes to
+    /// [`join_multicast_v6`](RtpReceiver::join_multicast_v6): `0` for
+    /// [`Unspecified`](Self::Unspecified), else the explicit index.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        match self {
+            MulticastInterface::Unspecified => 0,
+            MulticastInterface::Index(index) => index,
+        }
+    }
+}
 
 /// A single-path ST 2110 RTP receive socket.
 ///
@@ -101,14 +136,49 @@ impl RtpReceiver {
     /// # Errors
     ///
     /// [`Error::Ingest`] if the membership cannot be joined.
-    pub fn join_multicast_v4(
-        &self,
-        group: std::net::Ipv4Addr,
-        interface: std::net::Ipv4Addr,
-    ) -> Result<()> {
+    pub fn join_multicast_v4(&self, group: Ipv4Addr, interface: Ipv4Addr) -> Result<()> {
         self.socket
             .join_multicast_v4(group, interface)
             .map_err(|e| Error::Ingest(format!("st2110 join {group}: {e}")))
+    }
+
+    /// Join an IPv6 multicast `group` on the interface with OS index `interface`
+    /// (`0` = the default multicast interface). The IPv6-first counterpart of
+    /// [`join_multicast_v4`](Self::join_multicast_v4) (ADR-0042).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ingest`] if the membership cannot be joined.
+    pub fn join_multicast_v6(&self, group: Ipv6Addr, interface: u32) -> Result<()> {
+        self.socket
+            .join_multicast_v6(&group, interface)
+            .map_err(|e| Error::Ingest(format!("st2110 join {group}: {e}")))
+    }
+
+    /// Join a multicast `group` of either family, dispatching on the address
+    /// family so the pipeline wiring makes one family-agnostic
+    /// `rx.join_multicast(group, interface)` call regardless of an SDP
+    /// `c=IN IP4` / `c=IN IP6` line (ADR-0042 IPv6-first).
+    ///
+    /// `interface` selects the IPv6 multicast interface (its scope-id / OS index)
+    /// — required for link/site-local IPv6 groups, where the OS default
+    /// ([`MulticastInterface::Unspecified`] → index `0`) is not portable
+    /// (panel F6). The IPv4 path always joins via `INADDR_ANY`; the interface
+    /// selection does not apply to it. **Live validation on a real IPv6 multicast
+    /// network is hardware-gated** (rule 26) — the interface-index selection is
+    /// plumbed here and exercised by the join tests on the devcontainer's
+    /// multicast-capable interface.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Ingest`] if the membership cannot be joined (e.g. the group's
+    /// family does not match the bound socket's family, or the interface index
+    /// names no interface).
+    pub fn join_multicast(&self, group: IpAddr, interface: MulticastInterface) -> Result<()> {
+        match group {
+            IpAddr::V4(v4) => self.join_multicast_v4(v4, Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(v6) => self.join_multicast_v6(v6, interface.index()),
+        }
     }
 
     /// Receive one datagram and return the number of payload bytes read into the
@@ -156,28 +226,26 @@ impl RtpReceiver {
     /// future ends (clean end-of-stream) if the receiver half is dropped or a
     /// socket error occurs; it is the live, NIC-bound path and is exercised only
     /// by the gated live test.
-    #[must_use]
     pub fn channel_bridge(mut self, capacity: usize) -> (ChannelPacketSource, ReceiveLoop) {
-        let (tx, source) = ChannelPacketSource::bounded(capacity);
+        let (sink, source) = ChannelPacketSource::bounded(capacity);
         let task = async move {
             loop {
+                // Stop as soon as the sync reader is gone — nothing to feed.
+                if sink.is_closed() {
+                    return;
+                }
                 let unit = match self.recv_rtp().await {
                     Ok(packet) => St2110Packet::from_rtp(&packet),
                     // A socket/parse error ends the loop; the supervisor
-                    // reconnects. The sender drops, signalling clean EOS to the
+                    // reconnects. Dropping the sink signals clean EOS to the
                     // sync side.
                     Err(_) => return,
                 };
-                // Drop-oldest on a full channel: never block the receive loop.
-                if tx.try_send(unit).is_err() {
-                    // Full or closed. If closed, the reader is gone — stop.
-                    if tx.is_closed() {
-                        return;
-                    }
-                    // Full: the bounded channel is at capacity; this newest unit
-                    // is dropped to preserve the bound (drop-oldest is realized
-                    // by the reader consuming the front; we never grow).
-                }
+                // Genuine drop-oldest on a full ring (ADR-0033 §7): the push
+                // never blocks and never grows — the freshest media is retained
+                // and a stalled reader can never back-pressure the wire
+                // (invariant #10).
+                sink.push(unit);
             }
         };
         (source, Box::pin(task))
@@ -260,10 +328,20 @@ impl<P> DualPathReceiver<P> {
 pub struct St2110Packet {
     /// The RFC 4175 marker bit: `true` flags the **last packet of a frame**.
     pub marker: bool,
-    /// The 90 kHz RTP media timestamp (one value per video frame).
+    /// The 32-bit RTP media timestamp. Units are essence-specific: 90 kHz for
+    /// ST 2110-20 video (one value per frame), the audio sample rate for
+    /// ST 2110-30 / AES67 (e.g. 48 kHz, advancing by sample-groups per packet).
     pub timestamp: u32,
     /// The 16-bit RTP sequence number (gap detection / 2022-7 dedup / reorder).
     pub sequence: u16,
+    /// The 32-bit RTP synchronization source. The video assembler ignores it;
+    /// the ST 2110-30 / AES67 audio path forwards it to the
+    /// [`RtpAudioRebaser`](crate::rtp_audio) so a genuine SSRC change re-anchors.
+    pub ssrc: u32,
+    /// The 7-bit RTP payload type (RFC 3550 §5.1). The video assembler ignores it
+    /// (like `ssrc`); the ST 2110-30 / AES67 audio producer filters on it so a
+    /// stray / multiplexed RTP stream sharing the 5-tuple is not decoded as PCM.
+    pub payload_type: u8,
     /// The owned RTP payload bytes (after the fixed header) the SRD segments of
     /// the depacketized [`V20Payload`] index into.
     pub payload: Vec<u8>,
@@ -280,6 +358,8 @@ impl St2110Packet {
             marker: packet.header.marker,
             timestamp: packet.header.timestamp,
             sequence: packet.header.sequence,
+            ssrc: packet.header.ssrc,
+            payload_type: packet.header.payload_type,
             payload: packet.payload.to_vec(),
         }
     }
@@ -407,46 +487,171 @@ impl core::fmt::Debug for DualPathPacketSource {
     }
 }
 
+/// Shared bounded-ring state behind the [`PacketSink`] producer half and the
+/// [`ChannelPacketSource`] consumer half.
+///
+/// A plain [`VecDeque`](std::collections::VecDeque) guarded by a `Mutex` held
+/// only for the O(1) push/pop — never across a socket call or an `.await` — so
+/// the *property* it provides is genuine bounded **drop-oldest**: a full ring
+/// sheds its oldest unit instead of growing, and neither half ever blocks the
+/// other (invariants #1 / #5 / #10). Mirrors the display-audio sink's
+/// `AudioFifo`.
+#[derive(Debug)]
+struct PacketRing {
+    queue: std::collections::VecDeque<St2110Packet>,
+    capacity: usize,
+    dropped: u64,
+    /// Set when the consuming [`ChannelPacketSource`] is dropped, so the
+    /// producing receive task learns the reader is gone and can stop.
+    consumer_gone: bool,
+}
+
+/// The producer half of the receive bridge, handed to the async receive task.
+///
+/// [`push`](PacketSink::push) is a bounded, genuine **drop-oldest** enqueue:
+/// on a full ring the *oldest* queued unit is evicted so the freshest media is
+/// retained (ADR-0033 §7). It never blocks and never grows, so a stalled reader
+/// can never back-pressure the receive task or the wire (invariant #10).
+/// Cloneable so the receive task can hold it while the sync source drains the
+/// other half.
+#[derive(Debug, Clone)]
+pub struct PacketSink {
+    ring: Arc<Mutex<PacketRing>>,
+}
+
+impl PacketSink {
+    /// Enqueue one unit, evicting the **oldest** queued unit first when the ring
+    /// is already at capacity (genuine drop-oldest — ADR-0033 §7). Never blocks;
+    /// the receive task is never back-pressured by a slow reader (invariant #10).
+    pub fn push(&self, unit: St2110Packet) {
+        // `try_lock`, never a blocking `lock`: the tokio receive task must never
+        // wait on the sync consumer holding the ring (inv #10 — a stalled reader
+        // can never back-pressure the wire). On contention (or a poisoned lock —
+        // a holder panicked) the unit is shed; the critical section is a few O(1)
+        // `VecDeque` ops so genuine contention is nanosecond-scale, and bounded /
+        // never-grow is preserved (only the freshest unit is ever at risk).
+        let Ok(mut ring) = self.ring.try_lock() else {
+            return;
+        };
+        // Genuine drop-oldest (ADR-0033 §7): a full ring evicts its OLDEST unit
+        // before appending the newest, so the freshest media is retained and the
+        // ring never grows past capacity.
+        while ring.queue.len() >= ring.capacity {
+            ring.queue.pop_front();
+            ring.dropped = ring.dropped.saturating_add(1);
+        }
+        ring.queue.push_back(unit);
+    }
+
+    /// Whether the consuming [`ChannelPacketSource`] has been dropped (the reader
+    /// is gone, so the receive task should stop).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        // `try_lock`, never block the receive task on the consumer's lock
+        // (inv #10). Momentary contention is "not closed" (re-checked next loop
+        // iteration); a poisoned lock (a holder panicked) is treated as closed so
+        // the task stops rather than spins.
+        match self.ring.try_lock() {
+            Ok(ring) => ring.consumer_gone,
+            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::Poisoned(_)) => true,
+        }
+    }
+}
+
 /// A bounded, drop-oldest packet source fed by an async receive task.
 ///
 /// This is the seam the live (NIC-bound) [`RtpReceiver`] / [`DualPathReceiver`]
-/// path crosses into the sync [`St2110Producer`]: the async receive loop sends
-/// units down a **bounded** channel; this source `try_recv`s them. A stalled
-/// reader can never back-pressure the sender — the receive task drops the oldest
-/// queued unit when the channel is full (invariant #10). It never blocks the
-/// data plane: an empty channel yields `Ok(None)` (the producer re-polls next
-/// tick), and a closed sender (the receive task ended) yields clean
-/// end-of-stream.
+/// path crosses into the sync [`St2110Producer`]: the async receive loop pushes
+/// units into a **bounded ring** via a [`PacketSink`]; this source drains the
+/// front. A stalled reader can never back-pressure the sender — the sink drops
+/// the *oldest* queued unit when the ring is full (invariant #10). It never
+/// blocks the data plane: an empty ring yields `Ok(None)` (the producer re-polls
+/// next tick), and a dropped sink (the receive task ended) simply drains to
+/// empty and then yields `Ok(None)` (clean end-of-stream).
 #[derive(Debug)]
 pub struct ChannelPacketSource {
-    rx: mpsc::Receiver<St2110Packet>,
+    ring: Arc<Mutex<PacketRing>>,
 }
 
 impl ChannelPacketSource {
-    /// Build a bounded channel of `capacity` units, returning the sender (for the
-    /// async receive task) and the sync [`PacketSource`] half.
+    /// Build a bounded ring of `capacity` units, returning the [`PacketSink`]
+    /// producer half (for the async receive task) and the sync [`PacketSource`]
+    /// consumer half.
     ///
-    /// The receive task should `try_send` and, on a full channel, drop-oldest
-    /// (drain one then re-send) so a slow producer never stalls the receiver —
-    /// the channel is bounded and never grows (invariant #10 / #5).
+    /// The receive task calls [`PacketSink::push`], which on a full ring drops
+    /// the **oldest** unit so a slow reader never stalls the receiver — the ring
+    /// is bounded and never grows (invariant #10 / #5).
     #[must_use]
-    pub fn bounded(capacity: usize) -> (mpsc::Sender<St2110Packet>, Self) {
-        let (tx, rx) = mpsc::channel(capacity.max(1));
-        (tx, Self { rx })
+    pub fn bounded(capacity: usize) -> (PacketSink, Self) {
+        let ring = Arc::new(Mutex::new(PacketRing {
+            queue: std::collections::VecDeque::new(),
+            capacity: capacity.max(1),
+            dropped: 0,
+            consumer_gone: false,
+        }));
+        (
+            PacketSink {
+                ring: Arc::clone(&ring),
+            },
+            Self { ring },
+        )
+    }
+
+    /// The number of units dropped to drop-oldest overflow since construction
+    /// (telemetry / test observability).
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        // Telemetry read: `try_lock`, never block the data plane; report 0 on the
+        // rare momentary contention (the caller re-reads next time).
+        self.ring.try_lock().map_or(0, |ring| ring.dropped)
+    }
+}
+
+impl Drop for ChannelPacketSource {
+    fn drop(&mut self) {
+        // Source teardown — NOT the engine data plane. This Drop runs when the
+        // ingest consumer (the sync `St2110Producer`) is torn down, off the output
+        // clock, so inv #10 (a client/consumer must never back-pressure the ENGINE)
+        // does not bind here: there is no engine tick waiting on this lock.
+        //
+        // A blocking `lock` is the RIGHT choice, and its block is bounded: the ring
+        // `Mutex` is only ever held for O(1) `VecDeque` push/pop/flag ops and NEVER
+        // across an `.await` or a socket `send`/`recv` (see `PacketSink::push` and
+        // `poll_packet`, which take it only for those O(1) sections). The single
+        // other contender is the receive task's `push`, so the worst-case wait is
+        // ≤ one push's critical section — a few nanoseconds, never an unbounded
+        // stall — and it cannot deadlock (the consumer's `poll_packet` has already
+        // released; nothing holds this lock across a suspension point).
+        //
+        // Why NOT `try_lock` here (unlike `push`/`poll_packet`/`dropped`, which shed
+        // on contention): Drop runs EXACTLY ONCE, and setting `consumer_gone` is the
+        // only signal the producing receive task gets that the reader is gone. A
+        // `try_lock` that lost the nanosecond race would drop the flag forever (Drop
+        // never runs again) and leave that task spinning on a dead stream until its
+        // socket faults. A guaranteed, bounded one-time block is strictly better
+        // than a best-effort teardown signal. The inv #10 non-blocking guarantee on
+        // the live path stays on `push`/`poll_packet`, which `try_lock`.
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.consumer_gone = true;
+        }
     }
 }
 
 impl PacketSource for ChannelPacketSource {
     fn poll_packet(&mut self) -> Result<Option<St2110Packet>> {
-        match self.rx.try_recv() {
-            Ok(unit) => Ok(Some(unit)),
-            // Empty (nothing ready this tick — hold, never block, invariant #1)
-            // and Disconnected (the receive task ended — clean end-of-stream)
-            // both surface to the non-blocking producer as "no frame now".
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                Ok(None)
-            }
-        }
+        // `try_lock`, never a blocking `lock`: the ingest consumer must never
+        // wait on the tokio receive task holding the ring (inv #10 / F2). Pop the
+        // oldest buffered unit. An empty ring (nothing ready this tick — hold,
+        // never block, inv #1), momentary lock contention (or a poisoned lock),
+        // and a dropped sink (the receive task ended — clean end-of-stream) all
+        // surface to the non-blocking producer as "no frame now"; the producer
+        // re-polls next tick.
+        Ok(self
+            .ring
+            .try_lock()
+            .ok()
+            .and_then(|mut ring| ring.queue.pop_front()))
     }
 }
 
@@ -469,6 +674,18 @@ pub struct St2110Producer {
 }
 
 impl St2110Producer {
+    /// The maximum number of source packets a single [`next_frame`](FrameProducer::next_frame)
+    /// call pulls before yielding `Ok(None)`.
+    ///
+    /// A sample must be **bounded work**: a malformed-packet flood must never
+    /// make one poll loop until the source drains, which would delay the output
+    /// clock (invariant #1). After this many pulled units without a closed
+    /// frame the call returns `Ok(None)` and the pump re-polls next tick, so a
+    /// flood is drained at up to this rate per tick rather than all at once.
+    /// Sized well above any real per-tick packet count (a raster is a handful of
+    /// SRD units per frame, one frame per tick).
+    pub const MAX_PACKETS_PER_POLL: usize = 64;
+
     /// Build a producer over an application-supplied [`PacketSource`],
     /// reassembling into `geometry`.
     #[must_use]
@@ -529,12 +746,26 @@ impl core::fmt::Debug for St2110Producer {
 }
 
 impl FrameProducer for St2110Producer {
+    /// Pull source packets until a complete raster emerges, the source signals
+    /// clean end-of-stream, or the per-poll budget is spent. Each pull is
+    /// non-blocking; an empty pull ends this call (the pump re-polls on the next
+    /// tick) rather than spinning.
+    ///
+    /// **Bounded work (inv #1):** at most [`MAX_PACKETS_PER_POLL`] units are
+    /// pulled per call. A malformed-packet flood — units that depacketize but
+    /// never close a frame — is drained at that rate per tick rather than all at
+    /// once, so one call (whether it runs on the output-sample side or a shared
+    /// ingest thread) can never do unbounded work and delay the output clock
+    /// (panel F1). Budget spent with no frame closed yields `Ok(None)`; the pump
+    /// re-polls next tick.
+    ///
+    /// The bound is on packet **count**, not wall-clock time: it assumes each
+    /// `poll_packet` + depacketize step is itself bounded, which the fixed
+    /// ST 2110-20 depacketize is (its work is bounded by the datagram size).
+    ///
+    /// [`MAX_PACKETS_PER_POLL`]: St2110Producer::MAX_PACKETS_PER_POLL
     fn next_frame(&mut self) -> Result<Option<ProducedFrame>> {
-        // Pull from the source until a complete raster emerges or the source
-        // signals clean end-of-stream. Each pull is non-blocking; an empty pull
-        // ends this call (the pump re-polls on the next tick) rather than
-        // spinning.
-        loop {
+        for _ in 0..Self::MAX_PACKETS_PER_POLL {
             let Some(packet) = self.source.poll_packet()? else {
                 return Ok(None);
             };
@@ -542,6 +773,10 @@ impl FrameProducer for St2110Producer {
                 return Ok(Some(frame));
             }
         }
+        // Budget spent on units that never closed a frame this tick: yield and
+        // re-poll next tick so a malformed flood can never make one sample
+        // unbounded work (inv #1).
+        Ok(None)
     }
 
     fn timebase(&self) -> Rational {
@@ -559,5 +794,69 @@ impl FrameProducer for St2110Producer {
 
     fn wrap_bits(&self) -> WrapBits {
         WrapBits::Rtp32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn sample_packet(sequence: u16) -> St2110Packet {
+        St2110Packet {
+            marker: false,
+            timestamp: 0,
+            sequence,
+            ssrc: 0,
+            payload_type: 96,
+            payload: vec![0u8; 4],
+        }
+    }
+
+    /// While the ring lock is held, a concurrent `poll_packet` on the ingest
+    /// data plane must NOT block on it: it sheds (`Ok(None)`) and the caller
+    /// re-polls next tick (inv #10 — the sync consumer never blocks behind the
+    /// tokio producer). A blocking `.lock()` waits for the guard, so the result
+    /// never arrives within the deadline.
+    #[test]
+    fn poll_packet_never_blocks_on_a_held_ring_lock() {
+        let (sink, mut source) = ChannelPacketSource::bounded(4);
+        let guard = sink.ring.lock().expect("uncontended lock");
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(source.poll_packet());
+        });
+        let received = rx.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        let _ = worker.join();
+        let outcome =
+            received.expect("contended poll_packet must not block on the ring lock (inv #10)");
+        assert!(
+            matches!(outcome, Ok(None)),
+            "a contended poll sheds to None, never a unit: {outcome:?}"
+        );
+    }
+
+    /// While the ring lock is held, a concurrent `push` from the receive task
+    /// must NOT block on it: it sheds the unit (never grows, never waits) and
+    /// returns immediately (inv #10 — a stalled reader can never back-pressure
+    /// the wire). A blocking `.lock()` waits for the guard.
+    #[test]
+    fn push_never_blocks_on_a_held_ring_lock() {
+        let (sink, _source) = ChannelPacketSource::bounded(4);
+        let guard = sink.ring.lock().expect("uncontended lock");
+        let producer = sink.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            producer.push(sample_packet(1));
+            let _ = tx.send(());
+        });
+        let received = rx.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        let _ = worker.join();
+        received.expect("contended push must not block on the ring lock (inv #10)");
     }
 }

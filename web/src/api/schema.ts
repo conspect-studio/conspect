@@ -4,6 +4,75 @@
  */
 
 export interface paths {
+    "/api/v1/account/audit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/account/audit` — the append-only account audit log, paginated
+         *     (role: read).
+         * @description Returns `{entries, next_cursor}`: entries oldest-first within the page,
+         *     resumable via `?cursor=next_cursor`, optionally `?filter=<kind>`. There is no
+         *     mutating verb on this resource — the log is append-only by construction.
+         */
+        get: operations["list_account_audit"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/actions/pending": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/actions/pending` — the pending remote-actions strip (role: read).
+         * @description Returns the actions awaiting local execution or cancellation, oldest-first.
+         *     An action that has executed or been cancelled drops out of this list.
+         */
+        get: operations["list_pending_actions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/actions/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/actions/{id}/cancel` — cancel a pending action locally (role:
+         *     write).
+         * @description **Local always wins:** a pending action the operator cancels here is
+         *     cancelled, and any later (portal-fed) execution attempt is refused. An action
+         *     that has **already executed** answers `410 Gone` `already_executed` — the
+         *     truthful "too late", never a fake success. An unknown id is `404`. The cancel
+         *     is recorded in the append-only account audit store.
+         */
+        post: operations["cancel_action"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/alarms": {
         parameters: {
             query?: never;
@@ -85,6 +154,103 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/cast/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/cast/sessions` — list the live ephemeral sessions (role: read). */
+        get: operations["list_cast_sessions"];
+        put?: never;
+        /**
+         * `POST /api/v1/cast/sessions` — start an ad-hoc cast session (role: write).
+         * @description Resolves the rendition, spawns the supervised session actor through the
+         *     shared poller registry, and records the ephemeral session. The actor
+         *     CONNECTs → `LAUNCH`es the Default Media Receiver (`CC1AD845`) → `LOAD`s the
+         *     device-reachable HLS URL, then supervises the session (ADR-M011).
+         */
+        post: operations["start_cast_session"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cast/sessions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/cast/sessions/{id}` — fetch one session (role: read). */
+        get: operations["get_cast_session"];
+        put?: never;
+        post?: never;
+        /**
+         * `DELETE /api/v1/cast/sessions/{id}` — stop a session (role: write; `204`).
+         * @description Dispatches the voluntary [`PollerControl::StopCast`] teardown (the actor
+         *     `STOP`s the receiver app — what actually clears the TV — then exits), joins
+         *     it gracefully (abort after the grace window), drops the runtime
+         *     status/record, and **clears the registry tombstone**: session ids are
+         *     UUID-fresh and never reused, so clearing after the deterministic stop keeps
+         *     the tombstone set bounded under churning sessions.
+         */
+        delete: operations["stop_cast_session"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cast/sessions/{id}/save": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/cast/sessions/{id}/save` — promote an ephemeral session to a
+         *     normal `Device{driver: cast}` registry entry (role: write; `201`).
+         * @description The promoted device carries the session's address and rendition assignment
+         *     and **does** export (desired state). One actor remains, keyed by the device
+         *     id: the ephemeral actor is stopped (a plain abort — **no** receiver `STOP`,
+         *     so the TV keeps playing across the promotion) and the device's supervised
+         *     actor takes over through the same registry.
+         */
+        post: operations["save_cast_session"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cast/sessions/{id}/volume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/cast/sessions/{id}/volume` — set the receiver volume
+         *     (role: write; `202` + operation id).
+         * @description Dispatches a receiver-namespace `SET_VOLUME` to the running session actor
+         *     — non-blocking `try_send`, never awaited (invariant #10).
+         */
+        post: operations["set_cast_volume"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/commands/apply-layout": {
         parameters: {
             query?: never;
@@ -121,6 +287,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/config/boot-model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/config/boot-model` — the Boot/Loaded/Running model status
+         *     (ADR-W024 §7; role: read).
+         * @description Reports whether this run carries a boot model, the boot path and start
+         *     policy, whether the run resumed (+ the fallback reason), the per-section
+         *     divergence of Running from the Loaded snapshot and from the current boot
+         *     file, and the last `active.toml` write time.
+         */
+        get: operations["boot_model_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/config/export": {
         parameters: {
             query?: never;
@@ -136,8 +326,103 @@ export interface paths {
          *     [`multiview_config::MultiviewConfig`], validates the whole document, and
          *     returns it as TOML. This closes the management loop honestly today: edit in
          *     the UI → export → persist as the config file → the next start applies it.
+         *
+         *     **Secrets are redacted.** The export is outward-facing, so every inline
+         *     cleartext secret (WebRTC ICE `password`/`static_auth_secret`, WHIP/WHEP/
+         *     `whip_push` bearer `token`s, and any other secret-class field — see
+         *     [`crate::support_bundle::redact_config_for_export`]) is replaced with the
+         *     `<redacted>` placeholder. A `secret_ref` pointer (`op://…`) is preserved (it is
+         *     not a secret). The placeholder keeps the document re-importable, but it is a
+         *     **clearly-marked placeholder**: the operator restores the real credential (or
+         *     confirms the `secret_ref`) before the exported file is used to run — the
+         *     placeholder never authenticates.
          */
         get: operations["export_config"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/config/promote": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/config/promote` — write the current Running document to the
+         *     BOOT file path, server-side (ADR-W024 §6; role: write; `Idempotency-Key`;
+         *     audited; UI-confirmed).
+         * @description Compose → validate → render TOML → announce the write through the
+         *     installed ADR-W020 watcher's `expect_write` suppression seam (this is
+         *     the seam's designed caller — the watcher adopts the write as its new
+         *     baseline without re-applying) → atomic write to the boot path → a
+         *     config-versioning commit (target `boot`) → audit. With no watcher
+         *     installed there is nothing to suppress and the step is skipped.
+         */
+        post: operations["promote_to_boot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/config/revert-to-start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/config/revert-to-start` — Running := Loaded, live
+         *     (ADR-W024 §5; role: write; `Idempotency-Key`; audited).
+         * @description Composes the current Running document, diffs it against the immutable
+         *     Loaded snapshot, and applies the diff through the ONE ADR-W020
+         *     diff→apply machinery ([`crate::config_watch::apply_document_diff`]) under
+         *     the requesting principal: synthetic source changes ride
+         *     `UpsertSource`/`RemoveSource` on the bounded bus, layout/cells ride the
+         *     shared resolve+solve+Class-1 gate, stores resync to the Loaded values, and
+         *     restart-only sections are reported honestly. The ADR-W020 watcher's file
+         *     baseline is deliberately untouched (it tracks the last applied FILE
+         *     content). An empty diff applies nothing and reports `reverted: false`.
+         *
+         *     This is a distinct operator capability from the config-versioning
+         *     `POST /config/{target}/rollback` (which restores a prior committed
+         *     revision of one tracked document): revert-to-start returns the whole
+         *     Running state to the deliberate cold-start baseline, live (ADR-W024 §1).
+         */
+        post: operations["revert_to_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/config/watch-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/config/watch-status` — the config-file watch status
+         *     (ADR-W020; role: read).
+         * @description Reports whether this process watches its boot config file for external
+         *     edits, the watched path, the last applied/rejected loads, and the
+         *     restart-pending section names. A store-only deployment (no watcher)
+         *     honestly reports `active: false`.
+         */
+        get: operations["watch_status"];
         put?: never;
         post?: never;
         delete?: never;
@@ -385,6 +670,55 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/diagnostics/snapshot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/diagnostics/snapshot` — assemble the §4.2 one-button support
+         *     bundle (role: write).
+         * @description Returns `202 {snapshot_id}`; the assembled bundle is then readable at
+         *     `GET /api/v1/diagnostics/{id}`. The bundle is logs + engine state (the local
+         *     retention buffer), **never** media (ADR-0053, brief §8). Assembly is
+         *     synchronous (the buffer is in-memory) but the contract is `202 + id` so a
+         *     future asynchronous/large-bundle composer is a non-breaking change. A
+         *     `ContextPackExport`-adjacent action is **not** recorded here: the bundle stays
+         *     on the machine (no egress) until an explicit operator-approved data request,
+         *     which is the audited egress gate, not this assemble step.
+         */
+        post: operations["request_snapshot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/diagnostics/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/diagnostics/{id}` — the assembled diagnostics snapshot (role:
+         *     read).
+         * @description `200` with the bundle when the id is known; `404` (RFC 9457 problem) when not.
+         */
+        get: operations["get_snapshot"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/discovery/devices": {
         parameters: {
             query?: never;
@@ -618,6 +952,295 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/logs` — recent buffered structured log records (role: read). */
+        get: operations["list_logs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/media/players` — list the configured players (role: read). */
+        get: operations["list_players"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/media/players/{id}` — fetch one configured player (role: read). */
+        get: operations["get_player"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/cue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/media/players/{id}/cue` — cue to in-point or a frame
+         *     (role: write; 202).
+         */
+        post: operations["cue_player"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/exit/arm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/media/players/{id}/exit/arm` — arm the vamp exit
+         *     (role: write; 202).
+         */
+        post: operations["arm_exit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/exit/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/media/players/{id}/exit/cancel` — cancel an armed vamp exit
+         *     (role: write; 202).
+         */
+        post: operations["cancel_exit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/exit/take": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/media/players/{id}/exit/take` — take the vamp exit (arm + fire
+         *     at the soonest boundary) (role: write; 202).
+         */
+        post: operations["take_exit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/load": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/media/players/{id}/load` — load an asset (role: write; 202). */
+        post: operations["load_player"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/media/players/{id}/pause` — pause (role: write; 202). */
+        post: operations["pause_player"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/play": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/media/players/{id}/play` — play forward (role: write; 202). */
+        post: operations["play_player"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/seek": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/media/players/{id}/seek` — seek to a frame (role: write; 202). */
+        post: operations["seek_player"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/media/players/{id}/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/media/players/{id}/stop` — stop / re-cue (role: write; 202). */
+        post: operations["stop_player"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/mesh/peers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/mesh/peers` — the untrusted discovered-peer inventory (role:
+         *     read).
+         * @description Each peer is a salted-digest id, an optional name (only once adopted), a
+         *     `claimed` flag, `last_seen` (seconds), and `relaying_for_us`. A peer is
+         *     **never** auto-trusted; relaying is an explicit operator confirm-adopt
+         *     (ADR-0041 doctrine). The ids are pure hex — never a raw identifier (brief §8).
+         */
+        get: operations["list_peers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/mesh/relay": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * `PUT /api/v1/mesh/relay` — opt this machine in/out of relaying neighbours
+         *     (role: write).
+         * @description A real, persisted toggle: the new state is written to the shared mesh state
+         *     and the updated status is returned. Discovery is unaffected (always-on) — this
+         *     toggles only the **relay** opt-in (brief §9.2). Every successful toggle is
+         *     recorded in **both** trails: the change-audit log and — as an
+         *     actor-attributed [`AccountAuditKind::RelayToggle`](crate::account_audit::AccountAuditKind::RelayToggle)
+         *     entry — the append-only account-audit store (the spec's relay opt-in/out row,
+         *     brief §10/§11).
+         */
+        put: operations["set_relay"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/mesh/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/mesh/status` — the always-on discovery + relay summary (role:
+         *     read).
+         * @description Always `200`: discovery is always-on, so this is a pure data report —
+         *     `{discovery, relay_enabled, role, via?, peers_count}`.
+         */
+        get: operations["get_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/outputs": {
         parameters: {
             query?: never;
@@ -687,6 +1310,27 @@ export interface paths {
         post: operations["create_overlay"];
         /** `DELETE /api/v1/overlays/{id}` — delete an overlay (role: administer; If-Match). */
         delete: operations["delete_overlay"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/preview/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/preview/capabilities` — what preview transports this build can
+         *     serve, so the SPA picks WHEP vs the JPEG ladder before issuing an offer
+         *     (ADR-P006 move 6, ADR-W020). Role: read.
+         */
+        get: operations["capabilities"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -963,6 +1607,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/salvos/{id}/fire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/salvos/{id}/fire` — fire a named salvo through the command bus
+         *     (role: write) → `202 {action_id, queued_at}`.
+         * @description The named salvo must exist (else `404 salvo_unknown`). On success a `Salvo`
+         *     pending action is queued, the engine `TakeSalvo` command is submitted to the
+         *     bounded bus (a full bus sheds to `503`, never blocking the engine), the action
+         *     is marked executed, and the fire is recorded in the account audit store. The
+         *     action id is the pending-action id (the operator can correlate it on the
+         *     strip + the audit trail).
+         */
+        post: operations["fire_salvo"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/salvos/{id}/take": {
         parameters: {
             query?: never;
@@ -1012,6 +1682,204 @@ export interface paths {
         post: operations["create_source"];
         /** `DELETE /api/v1/sources/{id}` — delete a source (role: administer; If-Match). */
         delete: operations["delete_source"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/bundle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/support/bundle` — compose a previewable, redacted, media-free
+         *     context-pack (role: write; entitled tiers only). Composing performs **no
+         *     consent check** (§7.2): consent governs the daily outbound pipe, not a
+         *     deliberate operator attachment. Every compose lands a `bundle-compose`
+         *     account-audit entry. → `202 {bundle_id}`; read the preview at
+         *     `GET /support/bundle/{bundle_id}`.
+         */
+        post: operations["compose"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/bundle/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/support/bundle/{id}` — read a composed bundle's preview (role:
+         *     read; entitled tiers only). Unknown/evicted id → `404`. The preview lists
+         *     every redaction and carries no media.
+         */
+        get: operations["get_bundle"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/data-request/{id}/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/support/data-request/{id}/approve` — approve an inbound egress
+         *     request **locally** (role: write). **Nothing leaves without this yes:** the
+         *     request transitions to `approved` and egress is gated on that state. An
+         *     already-expired request is `410 request_expired` (and stays expired). Unknown
+         *     id → `404`. Lands a `data-request-approve` account-audit entry.
+         */
+        post: operations["approve_data_request"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/data-request/{id}/deny": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/support/data-request/{id}/deny` — deny an inbound egress request
+         *     locally (role: write). Nothing leaves. Symmetric to approve.
+         */
+        post: operations["deny_data_request"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/entitlement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/support/entitlement` — the tier-derived support routing (role:
+         *     read). Always `200`: the free tier gets `eligible:false` + the community
+         *     route + the one quiet line, an eligible tier gets its support queue + SLA.
+         */
+        get: operations["get_entitlement"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/tickets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/support/tickets` — list local ticket summaries newest-first
+         *     (role: read; entitled tiers only).
+         */
+        get: operations["list_tickets"];
+        put?: never;
+        /**
+         * `POST /api/v1/support/tickets` — raise a local ticket (role: write; entitled
+         *     tiers only → else `403 not_entitled`). The store mints the `CS-xxxx` id, seeds
+         *     the thread with the opening body, and auto-attaches the machine context
+         *     (§7.1). Every raise lands a `ticket` account-audit entry. → `201 Created`.
+         */
+        post: operations["raise_ticket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/tickets/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/support/tickets/{id}` — fetch one ticket (full thread) (role:
+         *     read; entitled tiers only). Unknown id → `404`.
+         */
+        get: operations["get_ticket"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/tickets/{id}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/support/tickets/{id}/close` — close a ticket locally (role:
+         *     write; entitled tiers only). Idempotent (re-closing an already-closed ticket
+         *     is still `200`). Unknown id → `404`. → `200`.
+         */
+        post: operations["close_ticket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/support/tickets/{id}/reply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/support/tickets/{id}/reply` — append a reply to a ticket's
+         *     thread (role: write; entitled tiers only). A reply to a **closed** ticket is
+         *     `409 ticket_closed` (pinned). Unknown id → `404`. Each reply lands a `ticket`
+         *     account-audit entry. → `200` with the updated thread.
+         */
+        post: operations["reply_ticket"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1076,6 +1944,27 @@ export interface paths {
          *     original id.
          */
         post: operations["measure_sync_group"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/system/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/system/capabilities` — the build's codec/compositor backend
+         *     availability, compositor classification, effective build-profile licence, and
+         *     NDI attribution (ADR-W030). Role: read.
+         */
+        get: operations["system_capabilities"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1156,6 +2045,190 @@ export interface paths {
          */
         put: operations["put_profile"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/telemetry/consent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/telemetry/consent` — the recorded telemetry-consent document
+         *     (role: read).
+         * @description Always `200`: a data report. Off by default (opt-in, incl. the free tier).
+         */
+        get: operations["get_consent"];
+        /**
+         * `PUT /api/v1/telemetry/consent` — set telemetry consent (role: write).
+         * @description Recorded on the machine under last-writer-wins by timestamp: a machine-UI
+         *     write is the `local` actor, stamped from the acknowledgement clock. A
+         *     successful change writes a
+         *     [`AccountAuditKind::ConsentChange`](crate::account_audit::AccountAuditKind::ConsentChange)
+         *     entry to the account-side append-only audit store (#106) and the change-audit
+         *     log. The detail carries only the new boolean — never a raw identifier (data
+         *     minimisation, brief §8).
+         *
+         *     Returns the updated consent resource. Because the local clock is monotonic the
+         *     machine-UI write always advances the timestamp, so it always applies; the LWW
+         *     guard exists for the portal mirror's later, out-of-order writes (pinned by the
+         *     `ConsentState` unit + integration LWW tests).
+         */
+        put: operations["set_consent"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/telemetry/schema": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/telemetry/schema` — the published daily-pipe telemetry schema
+         *     (role: read).
+         * @description A static, versioned report of exactly what the daily pipe sends when consented
+         *     and — load-bearing — what it NEVER sends. Served from the versioned consts so
+         *     the never-sent guarantee is a single source of truth pinned by test.
+         */
+        get: operations["get_schema"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/whep/{output_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/whep/{output_id}` — view: an SDP offer in, `201` + answer SDP +
+         *     `Location` out (the program is then sent over SRTP).
+         */
+        post: operations["whep_view"];
+        delete?: never;
+        /**
+         * `OPTIONS /api/v1/whep/{output_id}` — CORS preflight; advertises
+         *     `Accept-Post: application/sdp`.
+         */
+        options: operations["whep_options"];
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/whep/{output_id}/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * `DELETE /api/v1/whep/{output_id}/sessions/{session_id}` — tear the viewer
+         *     session down. `200` (idempotent within the tombstone window), `404` for an
+         *     unknown id.
+         */
+        delete: operations["whep_delete"];
+        options?: never;
+        head?: never;
+        /**
+         * `PATCH /api/v1/whep/{output_id}/sessions/{session_id}` — **`405`** (vanilla
+         *     ICE; trickle / ICE restart unimplemented, ADR-0049 §5.1). `Allow: DELETE,
+         *     OPTIONS`.
+         */
+        patch: operations["whep_patch"];
+        trace?: never;
+    };
+    "/api/v1/whip/{source_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/whip/{source_id}` — publish: an SDP offer in, `201` + answer
+         *     SDP + `Location` out (RFC 9725).
+         */
+        post: operations["whip_publish"];
+        delete?: never;
+        /**
+         * `OPTIONS /api/v1/whip/{source_id}` — CORS preflight; advertises
+         *     `Accept-Post: application/sdp`. Unauthenticated by browser construction.
+         */
+        options: operations["whip_options"];
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/whip/{source_id}/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * `DELETE /api/v1/whip/{source_id}/sessions/{session_id}` — tear the session
+         *     down. `200` (idempotent within the tombstone window), `404` for an unknown id.
+         */
+        delete: operations["whip_delete"];
+        options?: never;
+        head?: never;
+        /**
+         * `PATCH /api/v1/whip/{source_id}/sessions/{session_id}` — **`405`** (vanilla
+         *     ICE; trickle / ICE restart unimplemented, ADR-T014 §2). `Allow: DELETE,
+         *     OPTIONS`.
+         */
+        patch: operations["whip_patch"];
+        trace?: never;
+    };
+    "/api/v1/ws/ticket": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/ws/ticket` — mint a short-lived, single-use realtime auth ticket
+         *     for the browser transports (ADR-RT011, implementing ADR-RT005).
+         * @description Authenticated exactly like a REST call — `Authorization: Bearer` header or JWT,
+         *     **never** a URL query (that is the SEC-01 leak this replaces). The ticket
+         *     carries the caller's full [`Principal`] (role + every scope axis) and its
+         *     RT010 baseline, so the stream it opens has exactly the authorization the bearer
+         *     would; the read gate ([`Action::Read`]) matches the WS/SSE gate. The durable
+         *     bearer therefore never appears in a WS/SSE URL.
+         */
+        post: operations["ws_ticket_handler"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1275,6 +2348,61 @@ export interface components {
              *     realtime stream.
              */
             operation_id: string;
+        };
+        /**
+         * @description One immutable account-audit entry: who did what, and when.
+         *
+         *     The four spec fields (brief §11: `{at, actor, kind, detail}`) plus a
+         *     monotonic `seq` cursor the store assigns on append so pagination is stable
+         *     and resumable even when two entries share an `at` timestamp.
+         */
+        AccountAuditEntry: {
+            /**
+             * @description The authenticated principal that performed the action (its key id), or a
+             *     well-known system actor for machine-originated events — the **actor**.
+             */
+            actor: string;
+            /**
+             * Format: int64
+             * @description The media-timeline timestamp (nanoseconds) the action was recorded — the
+             *     **when** (`at`).
+             */
+            at_nanos: number;
+            /**
+             * @description An optional structured detail (e.g. the lease serial, the salvo name, the
+             *     action id). Never contains secrets or raw identifiers (brief §8).
+             */
+            detail?: unknown;
+            /** @description The kind of account action — the **kind**. */
+            kind: components["schemas"]["AccountAuditKind"];
+            /**
+             * Format: int64
+             * @description The monotonic sequence number the store assigned on append — the stable
+             *     pagination cursor. Strictly increasing; never reused.
+             */
+            seq: number;
+        };
+        /**
+         * @description The kind of account-side action an [`AccountAuditEntry`] records.
+         *
+         *     Each variant names a distinct auditable account action from ADR-0053 §4 +
+         *     the brief §10. Serialised `kebab-case` so the slug is stable across the
+         *     machine and the portal. `#[non_exhaustive]` so a future account action adds a
+         *     variant without breaking the wire contract.
+         * @enum {string}
+         */
+        AccountAuditKind: "claim" | "transfer" | "lease-grant" | "lease-install" | "enforcement-change" | "consent-change" | "relay-toggle" | "context-pack-export" | "ticket" | "bundle-compose" | "data-request-approve" | "data-request-deny" | "action-requested" | "action-cancelled" | "action-executed";
+        /** @description A page of account-audit entries plus the cursor to resume from. */
+        AccountAuditPage: {
+            /** @description The entries in this page, oldest-first within the page (ascending `seq`). */
+            entries: components["schemas"]["AccountAuditEntry"][];
+            /**
+             * Format: int64
+             * @description The cursor to pass as `?cursor=` to fetch the next page, or `None` when
+             *     this page reached the end of the log. Opaque to clients (the `seq` of the
+             *     last returned entry).
+             */
+            next_cursor?: number | null;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_core::alarm::AckState`].
@@ -1484,6 +2612,48 @@ export interface components {
             /** @description The resource collection the object belongs to (e.g. `layout`). */
             object_kind: string;
         };
+        /**
+         * @description The availability + probed capability of one `(kind, stage)` backend.
+         *
+         *     `available` is the honest single signal: the backend is compiled **and** a
+         *     usable device is present. The compiled-but-device-absent distinction
+         *     (`compiled_in`) needs HAL-side feature introspection and is deferred to the
+         *     SA-1+ deep probe (task #180).
+         */
+        BackendCapability: {
+            /** @description Whether the backend is compiled in **and** a usable device is present. */
+            available: boolean;
+            /**
+             * @description Whether the backend can resize during decode — present only on an
+             *     available decode-stage backend (meaningless elsewhere).
+             */
+            decode_resize?: boolean | null;
+            /** @description The backend kind. */
+            kind: components["schemas"]["BackendKind"];
+            max_resolution?: null | components["schemas"]["BackendResolution"];
+            /** @description The pipeline stage this entry describes. */
+            stage: components["schemas"]["PipelineStage"];
+        };
+        /**
+         * @description The concrete kind of a codec/compositor backend. Serialized to match the
+         *     Cargo feature names (`cuda`, `vaapi`, `qsv`, `videotoolbox`, `wgpu`, `metal`,
+         *     `software`).
+         * @enum {string}
+         */
+        BackendKind: "software" | "cuda" | "videotoolbox" | "vaapi" | "qsv" | "wgpu" | "metal";
+        /** @description A backend's maximum supported resolution (as probed). */
+        BackendResolution: {
+            /**
+             * Format: int32
+             * @description Maximum frame height in pixels.
+             */
+            height: number;
+            /**
+             * Format: int32
+             * @description Maximum frame width in pixels.
+             */
+            width: number;
+        };
         /** @description `OpenAPI` mirror of [`multiview_config::BitColor`]. */
         BitColorDoc: {
             /**
@@ -1494,6 +2664,135 @@ export interface components {
             /** @description The lamp colour asserted when the bit is set. */
             color: components["schemas"]["TallyColorDoc"];
         };
+        /**
+         * @description The `GET /api/v1/config/boot-model` body (ADR-W024 §7): the run's
+         *     Boot/Loaded/Running model and the per-section divergence the UI indicator
+         *     shows.
+         */
+        BootModelBody: {
+            /** @description The persisted Running state path (`<config-dir>/.multiview/active.toml`). */
+            active_path?: string | null;
+            /**
+             * Format: int64
+             * @description Unix milliseconds of the last successful `active.toml` write this run.
+             */
+            active_written_at_ms?: number | null;
+            /**
+             * @description Why the boot file could not be compared (unreadable / parse /
+             *     validation failure), when it could not.
+             */
+            boot_file_error?: string | null;
+            /** @description The boot config file path (the watch + promote target). */
+            boot_path?: string | null;
+            /**
+             * @description The section names where Running diverges from the **current boot
+             *     file** on disk; `null` when the file is unreadable/invalid (see
+             *     [`boot_file_error`](Self::boot_file_error)).
+             */
+            diverged_from_boot_file?: string[] | null;
+            /**
+             * @description The section names where Running diverges from the **Loaded** startup
+             *     snapshot (exact, computed by the pure `ConfigDiff`). Empty ⇒ in sync.
+             */
+            diverged_from_loaded: string[];
+            /**
+             * @description Whether this run carries a boot model (started from a config file with
+             *     a control plane). `false` ⇒ every other field is its honest empty
+             *     default and the revert/promote actions refuse with `409`.
+             */
+            modeled: boolean;
+            /** @description Why a `start = "resume"` run fell back to boot, if it did. */
+            resume_fallback?: string | null;
+            /** @description Whether this run started from a valid persisted `active.toml`. */
+            resumed: boolean;
+            /** @description The `[control] start` cold-start policy (`boot` | `resume`). */
+            start?: string | null;
+        };
+        /**
+         * @description The build-profile compliance surface: effective licence, redistributability,
+         *     the compiled feature set, and whether NDI is present.
+         */
+        BuildInfo: {
+            /** @description The effective codec-linking licence of this artifact. */
+            effective_license: components["schemas"]["EffectiveLicense"];
+            /** @description The compiled, capability/licence-relevant Cargo features. */
+            features: string[];
+            /**
+             * @description Whether the `ndi` feature is compiled (the proprietary, runtime-loaded
+             *     SDK path). When `true`, [`SystemCapabilities::ndi_attribution`] is set.
+             */
+            ndi: boolean;
+            /**
+             * @description Whether the artifact is redistributable. `true` for every shippable
+             *     Multiview build: the default is LGPL-clean, `gpl-codecs` is GPL
+             *     (redistributable under copyleft), and NDI is runtime-loaded (never
+             *     vendored/linked) — there is no non-redistributable `--enable-nonfree`
+             *     closure (no `nonfree` Cargo feature exists).
+             */
+            redistributable: boolean;
+        };
+        /**
+         * @description One composed support bundle: the echoed request, the redacted/diagnostic
+         *     sections, and the list of every redaction the config pass made. **Carries no
+         *     media** by construction — there is no field that could hold a frame/picture.
+         */
+        Bundle: {
+            /** @description The bundle id (the read-back key). */
+            bundle_id: string;
+            /**
+             * Format: int64
+             * @description The media-timeline instant (nanoseconds) the bundle was composed.
+             */
+            composed_at_nanos: number;
+            /**
+             * @description The redacted config sections, present iff `config` was requested. A JSON
+             *     object keyed by resource collection (`sources`/`outputs`/…); every secret
+             *     has been removed and every URL masked.
+             */
+            config?: unknown;
+            diagnostics?: null | components["schemas"]["Diagnostics"];
+            /**
+             * @description The incident markers in the window, present iff `incidents` (or
+             *     `diagnostics`) was requested.
+             */
+            incidents?: components["schemas"]["Incident"][] | null;
+            /**
+             * @description Every redaction the config pass made (the masking the operator sees).
+             *     Empty when nothing was masked; never omitted (the surface is uniform).
+             */
+            redactions: components["schemas"]["Redaction"][];
+            /** @description The reporting window token the bundle was composed over. */
+            window: string;
+        };
+        /** @description The `202` body of a successful compose: the id to read the preview back under. */
+        BundleAccepted: {
+            /** @description The composed bundle's id (read the preview at `GET .../bundle/{bundle_id}`). */
+            bundle_id: string;
+        };
+        /**
+         * @description Which diagnostic section a bundle includes. Serialised `lowercase` so the slug
+         *     is stable across the machine and the (later) portal sync. `#[non_exhaustive]`
+         *     so a future section is additive.
+         * @enum {string}
+         */
+        BundleInclude: "diagnostics" | "metrics" | "config" | "incidents";
+        /**
+         * @description The `POST /api/v1/support/bundle` request body: the reporting `window` and the
+         *     sections to `include`.
+         */
+        BundleRequest: {
+            /** @description The sections to include (deduplicated by the composer). */
+            include: components["schemas"]["BundleInclude"][];
+            /** @description The reporting window (`1h` / `24h` / `7d`). */
+            window: components["schemas"]["BundleWindow"];
+        };
+        /**
+         * @description The time window a bundle reports over (spec §7.2). Serialised as the operator-
+         *     facing token (`1h` / `24h` / `7d`). `#[non_exhaustive]` so a future window is
+         *     additive.
+         * @enum {string}
+         */
+        BundleWindow: "1h" | "24h" | "7d";
         /**
          * @description `OpenAPI` mirror of [`multiview_core::tally::BusSource`].
          *
@@ -1521,6 +2820,11 @@ export interface components {
             index: number;
             /** @enum {string} */
             kind: "iso";
+        };
+        /** @description The `200` body of a successful cancel. */
+        CancelledBody: {
+            /** @description Always `true` on the `200` path — the action is cancelled. */
+            cancelled: boolean;
         };
         /** @description `OpenAPI` mirror of `multiview_config::CaptionSelector` (tagged by `mode`). */
         CaptionSelectorDoc: {
@@ -1552,6 +2856,46 @@ export interface components {
             mode: "sidecar";
             /** @description Filesystem path to the sidecar. */
             path: string;
+        };
+        /**
+         * @description One ephemeral cast session as the API serves it: the descriptive record
+         *     plus the live lifecycle state.
+         */
+        CastSessionDoc: {
+            /** @description The device authority dialled (`host[:port]`, IPv6 bracketed). */
+            address: string;
+            /** @description The runtime session id (`cast-session-…`, UUID-fresh per start). */
+            id: string;
+            /** @description The resolved device-reachable media URL the session LOADs. */
+            media_url: string;
+            /** @description The operator-facing name, if given. */
+            name?: string | null;
+            /** @description The output id whose rendition the session casts. */
+            output: string;
+            /**
+             * Format: int64
+             * @description When the receiver **accepted** the session's `LOAD` (the first
+             *     `MEDIA_STATUS` attributing an active media session to the actor — the
+             *     moment the cast verifiably began showing), as Unix nanoseconds from
+             *     the control plane's clock. Absent until then: a session whose LOAD was
+             *     refused, or is still establishing, has not started (DEV-D3.1).
+             */
+            started_unix_ns?: number | null;
+            /**
+             * @description The session's live lifecycle state (the DEV-A3 wire vocabulary, e.g.
+             *     `ADOPTING`/`ONLINE`/`DEGRADED`), read from the latest-wins status
+             *     registry.
+             */
+            state: string;
+        };
+        /** @description The `POST /api/v1/cast/sessions/{id}/volume` request body. */
+        CastVolumeRequest: {
+            /**
+             * Format: int32
+             * @description The desired receiver volume as an integer percent (0–100); the actor
+             *     maps it to the protocol's unit `level`.
+             */
+            level_percent: number;
         };
         /**
          * @description An IS-08 **map**: each named output channel → its [`ChannelSource`].
@@ -1608,6 +2952,26 @@ export interface components {
             /** @description A short commit message. */
             message?: string;
         };
+        /** @description The compositor's resolved acceleration tier. */
+        CompositorCapability: {
+            /** @description The composite-usability class. */
+            class: components["schemas"]["CompositorClass"];
+            device_type?: null | components["schemas"]["CompositorDeviceType"];
+            /** @description The adapter's driver string — present only when an adapter resolved. */
+            driver?: string | null;
+        };
+        /**
+         * @description The SA-0 composite-usability classification of the resolved wgpu adapter
+         *     (ADR-0035): the acceleration tier the compositor actually runs on. `None`
+         *     means no adapter resolved — the CPU composite path only.
+         * @enum {string}
+         */
+        CompositorClass: "gpu" | "low-confidence-gpu" | "software" | "none";
+        /**
+         * @description The kind of graphics device backing the compositor adapter.
+         * @enum {string}
+         */
+        CompositorDeviceType: "discrete-gpu" | "integrated-gpu" | "virtual-gpu" | "cpu" | "other";
         /** @description One immutable revision of a target's config/layout document. */
         ConfigRevision: {
             /** @description The principal that committed this revision (its key id / subject). */
@@ -1653,10 +3017,81 @@ export interface components {
             staged_at?: string | null;
         };
         /**
+         * @description Who recorded a telemetry-consent change.
+         *
+         *     The local machine UI/API or the (later, O1-gated) portal mirror. Serialised
+         *     lower-case so the slug is stable across the machine and the portal.
+         *     `#[non_exhaustive]` so a future actor is additive on the wire.
+         * @enum {string}
+         */
+        ConsentActor: "local" | "portal";
+        /**
+         * @description The `GET /api/v1/telemetry/consent` body: the recorded consent document
+         *     (ADR-0052 §2). `enabled` is the outbound-daily-pipe consent (off by default);
+         *     `changed_at` is the RFC 3339 instant it was last written (absent when never
+         *     written); `actor` is who wrote it (`local` | `portal`).
+         */
+        ConsentResource: {
+            /** @description Who wrote the record: `local` (the machine UI/API) or `portal`. */
+            actor: components["schemas"]["ConsentActor"];
+            /**
+             * @description When the record was last written (RFC 3339); `None` when never written
+             *     (the opt-in default).
+             */
+            changed_at?: string | null;
+            /** @description Whether the outbound daily telemetry pipe is consented (default `false`). */
+            enabled: boolean;
+        };
+        /** @description The `PUT /api/v1/telemetry/consent` request body: the new consent state. */
+        ConsentSetRequest: {
+            /** @description Whether to consent to the outbound daily telemetry pipe. */
+            enabled: boolean;
+        };
+        /**
          * @description `OpenAPI` mirror of [`multiview_core::stream::DataKind`].
          * @enum {string}
          */
         DataKindDoc: "scte35" | "klv";
+        /**
+         * @description One inbound data request awaiting **local approval**: support (or the licence
+         *     server, over the later transport) asks for additional data; nothing leaves
+         *     until the operator approves it here (ADR-0053 §3).
+         */
+        DataRequest: {
+            /**
+             * @description An optional structured detail (e.g. the ticket the request relates to).
+             *     Never the requested data.
+             */
+            detail?: unknown;
+            /** @description The request id (the `DR-xxxx` / portal correlation key when synced). */
+            request_id: string;
+            /**
+             * Format: int64
+             * @description The media-timeline timestamp (nanoseconds) the request was recorded.
+             */
+            requested_at_nanos: number;
+            /** @description The lifecycle state. */
+            state: components["schemas"]["DataRequestState"];
+            /**
+             * @description A human-readable description of what is being requested (never the data
+             *     itself — this is the *ask*, not the payload).
+             */
+            what: string;
+        };
+        /**
+         * @description The `200` body of a data-request approve/deny: the request's new terminal
+         *     state.
+         */
+        DataRequestActioned: {
+            /** @description The new state slug (`approved` / `denied`). */
+            state: components["schemas"]["DataRequestState"];
+        };
+        /**
+         * @description The lifecycle state of an inbound data request. Approve/deny are one-way; an
+         *     elapsed (un-actioned) request is `Expired` (`410 request_expired`).
+         * @enum {string}
+         */
+        DataRequestState: "pending" | "approved" | "denied" | "expired";
         /**
          * @description `OpenAPI` mirror of `multiview_config::DetectionZone` (normalized
          *     sub-rectangle of a tile, `0.0..=1.0` on both axes).
@@ -1779,6 +3214,64 @@ export interface components {
              */
             temperature_c?: number | null;
         };
+        /** @description The utilisation/diagnostics summary a bundle carries over its window. */
+        Diagnostics: {
+            /**
+             * Format: double
+             * @description CPU busy-fraction floor (p0) over the window.
+             */
+            cpu_p0: number;
+            /**
+             * Format: double
+             * @description CPU busy-fraction ceiling (p100) over the window.
+             */
+            cpu_p100: number;
+            /**
+             * Format: double
+             * @description CPU busy-fraction median (p50) over the window.
+             */
+            cpu_p50: number;
+            /**
+             * Format: double
+             * @description CPU busy-fraction 95th percentile over the window.
+             */
+            cpu_p95: number;
+            /** @description The number of per-input reconnects recorded in the window. */
+            reconnects: number;
+            /**
+             * Format: int64
+             * @description Total utilisation samples folded across the window.
+             */
+            samples: number;
+            /** @description The number of shed-load events recorded in the window. */
+            shed_events: number;
+        };
+        /**
+         * @description The assembled diagnostics snapshot bundle (`GET /api/v1/diagnostics/{id}`).
+         *
+         *     The `diagnostics` section is the **shared** [`crate::support_bundle::Bundle`]
+         *     the #111 context-pack composer produces — utilisation percentiles + shed/
+         *     reconnect counts, incident markers, and the redacted config — so this snapshot
+         *     and the support-ticket context-pack draw their diagnostics from one source of
+         *     truth (the consent-independent retention store + the config redactor). Logs +
+         *     engine state, **never** media, raw identifiers, or secrets (brief §8).
+         */
+        DiagnosticsSnapshot: {
+            /**
+             * Format: int64
+             * @description The Unix second the snapshot was assembled.
+             */
+            assembled_at_unix_seconds: number;
+            /**
+             * @description The redacted diagnostics bundle (the shared #111 composer output): logs +
+             *     engine state, never media.
+             */
+            diagnostics: components["schemas"]["Bundle"];
+            /** @description The snapshot id. */
+            snapshot_id: string;
+            /** @description The lifecycle status (`ready` when readable). */
+            status: components["schemas"]["SnapshotStatus"];
+        };
         /**
          * @description One resolved management endpoint of a discovered service: a presentation-
          *     ready address and its family. IPv6 is the lead family (ADR-0042); IPv4 is
@@ -1802,6 +3295,16 @@ export interface components {
          *     it is not a device.
          */
         DiscoveredService: {
+            /**
+             * @description The discovery **domain** the observing node stamped on this row
+             *     (ADR-W026) — sourced solely from the node's operator-declared
+             *     `[discovery] domain` config, **never** from the responder payload, TXT
+             *     records, or mesh peer identity. `None` = the observing node declared no
+             *     domain; a discovery-scoped principal is denied an unlabelled row
+             *     (fail-closed). Event (`device.discovered`) and this REST row are stamped
+             *     from the one config value so they can never disagree.
+             */
+            domain?: string | null;
             /** @description The inferred driver family. */
             driver_kind: components["schemas"]["DiscoveryDriverKind"];
             /** @description The management endpoints, **AAAA-first** (IPv6 lead, IPv4 legacy). */
@@ -1848,6 +3351,15 @@ export interface components {
          */
         DiscoveryDriverKind: "cast" | "ndi-source" | "zowietek-control" | "unknown";
         /**
+         * @description `OpenAPI` mirror of [`multiview_mesh::DiscoveryMode`] (Conspect, ADR-0051 §2).
+         *
+         *     Serde-equivalent: a unit enum rendered `snake_case`. There is exactly **one**
+         *     value — `always_on` — and no way to set any other: discovery runs whenever the
+         *     account plane runs (the spec's *locked* row, no off switch exists).
+         * @enum {string}
+         */
+        DiscoveryModeDoc: "always_on";
+        /**
          * @description The added / removed / changed top-level keys between two documents.
          *
          *     A pragmatic, UI-facing structural diff over JSON objects: it reports which
@@ -1880,6 +3392,14 @@ export interface components {
             up_ms: number;
         };
         /**
+         * @description The effective **build-profile** licence — the codec-linking licence of the
+         *     compiled artifact (ADR-0012 / AGENTS.md §G). Distinct from the project's
+         *     source-available licence and from NDI's redistribution restriction (carried
+         *     separately by [`BuildInfo::ndi`] / [`NdiAttribution`]).
+         * @enum {string}
+         */
+        EffectiveLicense: "LGPL-clean" | "GPL";
+        /**
          * @description `OpenAPI` mirror of [`multiview_licence::EnforcementLevel`].
          *
          *     Serde-equivalent: a unit enum rendered `kebab-case`. Every level keeps a
@@ -1888,6 +3408,23 @@ export interface components {
          * @enum {string}
          */
         EnforcementLevelDoc: "active" | "warning" | "config-locked" | "watermark" | "block-new-instance" | "unlicensed-build";
+        /** @description The `202` body of a successful salvo fire. */
+        FiredBody: {
+            /** @description The queued action id (also the pending-action + audit correlation id). */
+            action_id: string;
+            /**
+             * Format: int64
+             * @description The media-timeline timestamp (nanoseconds, from the ack-clock) the fire
+             *     was queued — the audit entry and the pending action share this instant.
+             */
+            queued_at_nanos: number;
+        };
+        /**
+         * @description The first-line support route a tier maps to (spec §11): a real support queue
+         *     for eligible tiers, or the community channel for the free tier.
+         * @enum {string}
+         */
+        FirstLine: "partner" | "conspect" | "community";
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::GpuLimit`].
          *
@@ -1952,12 +3489,14 @@ export interface components {
         /**
          * @description The read-only heartbeat-status surface (`GET /api/v1/licensing/heartbeat-status`).
          *
-         *     With no licence-server client yet (blocked on the external wire-protocol doc,
-         *     brief §14 O1), this reports **honestly from local state**: the transport the
-         *     active lease arrived over, the lease install instant as `last_at`, the lease's
-         *     `next_contact_due` as `next_due`, and the exhaustive payload-field list. There
-         *     is **no** mutating endpoint for the heartbeat (the spec mandates none) — the
-         *     `POST /api/v1/account/licence/heartbeat` force-now action is a later,
+         *     This reports **honestly from local lease state** — the transport the active
+         *     lease arrived over, the lease install instant as `last_at`, the lease's
+         *     `next_contact_due` as `next_due`, and the exhaustive payload-field list —
+         *     regardless of whether the cli's feature-gated `heartbeat` loop
+         *     (CONSPECT-3/ADR-0096) is the producer that installed the lease (it drives the
+         *     same `LeaseStore::install_binding` convergence the offline file-drop uses).
+         *     There is **no** mutating endpoint for the heartbeat (the spec mandates none) —
+         *     the `POST /api/v1/account/licence/heartbeat` force-now action is a later,
          *     feature-gated item (brief §11 #4), not this read surface.
          */
         HeartbeatStatus: {
@@ -1982,6 +3521,21 @@ export interface components {
              *     `"none"` when no lease is installed.
              */
             transport: string;
+        };
+        /** @description One incident marker in a bundle (a diagnostic event — never media). */
+        Incident: {
+            /**
+             * Format: int64
+             * @description The Unix second the incident was recorded.
+             */
+            at_unix_seconds: number;
+            /**
+             * @description The incident class label (`input_flap` / `encoder_saturation` /
+             *     `clock_holdover`).
+             */
+            kind: string;
+            /** @description What the incident applied to (input id, `program`, `system`, …). */
+            subject: string;
         };
         /** @description `OpenAPI` mirror of [`multiview_config::IndexCell`]. */
         IndexCellDoc: {
@@ -2162,6 +3716,62 @@ export interface components {
             watermark: boolean;
         };
         /**
+         * @description `OpenAPI` mirror of [`multiview_telemetry::LogLevel`] (ADR-0060): the five
+         *     `tracing` severities. Serde-equivalent: a unit enum rendered lowercase.
+         * @enum {string}
+         */
+        LogLevelDoc: "trace" | "debug" | "info" | "warn" | "error";
+        /**
+         * @description `OpenAPI` mirror of [`multiview_telemetry::LogRecord`] — one structured
+         *     record in the `GET /api/v1/logs` tail (ADR-0060 §2.3).
+         *
+         *     Serde-equivalent field-for-field to the real record: the optional resource
+         *     attribution (`run_id` / `resource_kind` / `resource_id` / `label`), the libav
+         *     `component` / `repeated`, and the always-present `seq` / `timestamp_ms` /
+         *     `level` / `target` / `message`. Optionals are omitted when absent — an
+         *     unattributed line carries no `resource_id` (honesty over a wrong id, §3.3).
+         */
+        LogRecordDoc: {
+            /** @description The libav component class (`hevc`, `hls`), for bridge records. */
+            component?: string | null;
+            /** @description The resource's human label, if the span carried one. */
+            label?: string | null;
+            /** @description The record's severity. */
+            level: components["schemas"]["LogLevelDoc"];
+            /** @description The rendered event message. */
+            message: string;
+            /**
+             * Format: int64
+             * @description The coalesced suppressed-repeat count, when a bridge record flushes a
+             *     summary.
+             */
+            repeated?: number | null;
+            /** @description The stable config resource id this record is attributed to, if any. */
+            resource_id?: string | null;
+            resource_kind?: null | components["schemas"]["LogResourceKindDoc"];
+            /** @description The process run id, when configured. */
+            run_id?: string | null;
+            /**
+             * Format: int64
+             * @description Monotonic capture sequence number (the cursor for the `since` filter).
+             */
+            seq: number;
+            /** @description The `tracing` target (e.g. `libav`, `multiview_engine`). */
+            target: string;
+            /**
+             * Format: int64
+             * @description Wall-clock capture time, milliseconds since the Unix epoch.
+             */
+            timestamp_ms: number;
+        };
+        /**
+         * @description `OpenAPI` mirror of [`multiview_telemetry::LogResourceKind`] (ADR-0060 §2.2):
+         *     the resource a log record is attributed to. Serde-equivalent: a unit enum
+         *     rendered `snake_case`.
+         * @enum {string}
+         */
+        LogResourceKindDoc: "source" | "output" | "layout" | "program" | "device";
+        /**
          * @description `OpenAPI` mirror of `multiview_config::LoudnessTarget` (tagged by `kind`,
          *     `snake_case`).
          */
@@ -2198,6 +3808,91 @@ export interface components {
          */
         MediaFormat: "video" | "audio" | "data";
         /**
+         * @description `OpenAPI` mirror of [`multiview_mesh::Peer`] — a single entry in the untrusted
+         *     discovered-peer inventory `GET /api/v1/mesh/peers` returns.
+         *
+         *     Serde-equivalent to the real peer. The `key` is the salted-digest **hex** id
+         *     (64 chars, never a raw identifier — brief §8); `name` is present only once the
+         *     operator has confirm-adopted + named the peer; `last_seen` is whole seconds;
+         *     `relaying_for_us` is an operator-set adoption flag, never auto (the peer is
+         *     **untrusted** until explicitly confirm-adopted — ADR-0041 doctrine).
+         */
+        MeshPeerDoc: {
+            /** @description Whether the peer advertised itself as claimed (observed from the announce). */
+            claimed: boolean;
+            /** @description The peer's salted-digest id (64-char lowercase hex; never a raw identifier). */
+            key: string;
+            /**
+             * Format: int64
+             * @description The whole-seconds monotonic instant the peer was last seen.
+             */
+            last_seen: number;
+            /** @description An operator-assigned name, present only once the peer is adopted + named. */
+            name?: string | null;
+            /**
+             * @description Whether THIS machine relays for the peer — set only by explicit operator
+             *     confirm-adopt, never by observation (untrusted inventory).
+             */
+            relaying_for_us: boolean;
+        };
+        /**
+         * @description `OpenAPI` mirror of [`multiview_mesh::MeshRole`] (Conspect, ADR-0051 §4).
+         *
+         *     Serde-equivalent: **internally tagged** on `kind` (`direct`/`relay`/`leaf`,
+         *     kebab) — never untagged (conventions §5). The `leaf` variant carries the `via`
+         *     peer (a salted-digest hex id) it leafs its heartbeat through.
+         */
+        MeshRoleDoc: {
+            /** @enum {string} */
+            kind: "direct";
+        } | {
+            /** @enum {string} */
+            kind: "relay";
+        } | {
+            /** @enum {string} */
+            kind: "leaf";
+            /**
+             * @description The peer this machine relays its heartbeat through (salted-digest hex
+             *     id — never a raw identifier).
+             */
+            via: string;
+        };
+        /**
+         * @description `OpenAPI` mirror of [`multiview_mesh::MeshStatus`] — the always-on mesh
+         *     discovery + relay summary `GET /api/v1/mesh/status` (and the `PUT
+         *     /api/v1/mesh/relay` reply) renders.
+         *
+         *     Serde-equivalent to the real status (pinned byte-for-byte by a round-trip test
+         *     in `tests/mesh.rs`). The mesh crate carries no `utoipa` dependency, so this
+         *     module owns the `OpenAPI` contract. Discovery is always-on (no off switch);
+         *     `via` is present only when the role is `leaf`.
+         */
+        MeshStatusDoc: {
+            /** @description Discovery is always-on (the only value; no off switch exists). */
+            discovery: components["schemas"]["DiscoveryModeDoc"];
+            /** @description How many peers are in the untrusted discovered-peer inventory. */
+            peers_count: number;
+            /** @description Whether this machine relays neighbours' heartbeats (the opt-in toggle). */
+            relay_enabled: boolean;
+            /** @description The computed mesh role (`direct`/`relay`/`leaf`). */
+            role: components["schemas"]["MeshRoleDoc"];
+            /**
+             * @description The peer this machine leafs through, present only when the role is `leaf`
+             *     (a salted-digest hex id).
+             */
+            via?: string | null;
+        };
+        /**
+         * @description The mandatory NDI attribution (AGENTS.md §G) — present iff the `ndi` feature
+         *     is compiled.
+         */
+        NdiAttribution: {
+            /** @description The required trademark line. */
+            trademark: string;
+            /** @description A link to the NDI site. */
+            url: string;
+        };
+        /**
          * @description The NMOS access level granted for one API (the `x-nmos-api` value vocabulary).
          * @enum {string}
          */
@@ -2225,6 +3920,11 @@ export interface components {
          *     on the realtime stream (`corr`) when the command's outcome is known.
          */
         OperationId: string;
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::OrientationMode` (ADR-0089 §2.2).
+         * @enum {string}
+         */
+        OrientationModeDoc: "auto" | "tag" | "pixels";
         /** @description `OpenAPI` mirror of `multiview_config::audio::OutputAudio`. */
         OutputAudioDoc: {
             /** @description `program` (mixed bus) or `tracks` (explicit selection). */
@@ -2252,8 +3952,10 @@ export interface components {
             kind: "rtsp_server";
             /** @description Latency profile hint. */
             latency_profile?: string | null;
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
             /** @description Mount point (e.g. `/multiview`). */
             mount: string;
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
         } | {
             audio?: null | components["schemas"]["OutputAudioDoc"];
             /** @description Video codec. */
@@ -2268,6 +3970,8 @@ export interface components {
             id?: string | null;
             /** @enum {string} */
             kind: "ll_hls";
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
             /**
              * Format: int32
              * @description Target part duration (ms).
@@ -2289,6 +3993,8 @@ export interface components {
             id?: string | null;
             /** @enum {string} */
             kind: "hls";
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
             /** @description Output path. */
             path: string;
             /**
@@ -2303,8 +4009,10 @@ export interface components {
             id?: string | null;
             /** @enum {string} */
             kind: "ndi";
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
             /** @description NDI source name to advertise. */
             name: string;
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
         } | {
             audio?: null | components["schemas"]["OutputAudioDoc"];
             /** @description Video codec. */
@@ -2314,6 +4022,8 @@ export interface components {
             id?: string | null;
             /** @enum {string} */
             kind: "rtmp";
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
             /** @description Destination URL. */
             url: string;
         } | {
@@ -2325,7 +4035,23 @@ export interface components {
             id?: string | null;
             /** @enum {string} */
             kind: "srt";
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
             /** @description Destination URL. */
+            url: string;
+        } | {
+            audio?: null | components["schemas"]["OutputAudioDoc"];
+            /** @description Video codec. */
+            codec: string;
+            gpu_pin?: null | components["schemas"]["DevicePinDoc"];
+            /** @description Stable operator id; may be omitted. */
+            id?: string | null;
+            /** @enum {string} */
+            kind: "rist";
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
+            rist?: null | components["schemas"]["RistOptionsDoc"];
+            /** @description Destination URL (`rist://host:port`). */
             url: string;
         } | {
             audio?: null | components["schemas"]["OutputAudioDoc"];
@@ -2338,8 +4064,10 @@ export interface components {
             kind: "aes67";
             /** @description Display name (no mount/path/url to derive one from). */
             label: string;
+            metadata?: null | components["schemas"]["OutputMetadataDoc"];
             /** @description Multicast `group:port` to send to (`[ff3e::1]:5004`). */
             multicast: string;
+            orientation?: null | components["schemas"]["OutputOrientationDoc"];
             /**
              * Format: int32
              * @description Packet time in milliseconds (`1` = Class A).
@@ -2350,6 +4078,47 @@ export interface components {
              * @description Optional PTP domain (`0..=127`).
              */
             ptp_domain?: number | null;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::OutputFlip` (ADR-0089 §2.2). A flip is
+         *     pixel-only (no container "flip" tag), so it forces the pixels path.
+         * @enum {string}
+         */
+        OutputFlipDoc: "none" | "horizontal" | "vertical";
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::OutputMetadata` (ADR-0088): per-output
+         *     declarative metadata intent, projected onto whatever the transport can carry.
+         */
+        OutputMetadataDoc: {
+            /** @description Free-text description / comment (container `comment`, SDT free-text). */
+            description?: string | null;
+            /** @description Primary program language, ISO-639-2 (three lowercase ASCII letters). */
+            language?: string | null;
+            /** @description Service provider (TS SDT `provider_name`). No carrier on most transports. */
+            provider?: string | null;
+            /**
+             * Format: int32
+             * @description DVB / MPEG-TS service id (program number), `1..=65535`.
+             */
+            service_id?: number | null;
+            timed?: null | components["schemas"]["OutputTimedMetadataDoc"];
+            /**
+             * @description Service/program title (TS SDT `service_name`, RTMP `onMetaData` title,
+             *     container `title`, SDP `s=`).
+             */
+            title?: string | null;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::OutputOrientation` (ADR-0089):
+         *     per-output presentation orientation (quarter-turn + mechanism + flip).
+         */
+        OutputOrientationDoc: {
+            /** @description Optional flip (forces the pixels path). Defaults to `none`. */
+            flip?: components["schemas"]["OutputFlipDoc"];
+            /** @description The orientation mechanism. Defaults to `auto`. */
+            mode?: components["schemas"]["OrientationModeDoc"];
+            /** @description The clockwise quarter-turn. Defaults to `none`. */
+            turn?: components["schemas"]["QuarterTurnDoc"];
         };
         /** @description The request envelope for `POST`/`PUT /api/v1/outputs/{id}` (`name` + body). */
         OutputResourceInputDoc: {
@@ -2369,6 +4138,16 @@ export interface components {
             kind: string;
             /** @description A human-friendly label for the decode slot, if the driver reports one. */
             label?: string | null;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::OutputTimedMetadata` (ADR-0088 §4):
+         *     the HLS/TS now-playing/cue timed-metadata carrier opt-ins.
+         */
+        OutputTimedMetadataDoc: {
+            /** @description Emit out-of-band `EXT-X-DATERANGE` playlist tags. */
+            daterange?: boolean;
+            /** @description Emit in-band ID3 metadata frames as MPEG-TS PES. */
+            id3?: boolean;
         };
         /**
          * @description `OpenAPI` mirror of `multiview_config::Overlay` — the body accepted by
@@ -2407,6 +4186,47 @@ export interface components {
             /** @description The tally target the override applies to. */
             target: components["schemas"]["TallyTargetDoc"];
         };
+        /** @description One queued remote action. */
+        PendingAction: {
+            /** @description The opaque, unique action id (a UUID) the cancel/execute paths address. */
+            action_id: string;
+            /**
+             * @description An optional structured detail (e.g. the salvo name a `salvo` action
+             *     fires). Never contains secrets.
+             */
+            detail?: unknown;
+            /** @description The kind of action. */
+            kind: components["schemas"]["PendingActionKind"];
+            /**
+             * Format: int64
+             * @description The media-timeline timestamp (nanoseconds) the action was queued.
+             */
+            requested_at_nanos: number;
+            /** @description The principal (or portal/system actor) that requested the action. */
+            requested_by: string;
+            /** @description The action's lifecycle state. */
+            state: components["schemas"]["PendingActionState"];
+        };
+        /**
+         * @description The kind of remote action queued for local approval/execution.
+         *
+         *     Serialised `kebab-case` so the slug is stable across the machine and the
+         *     portal. `#[non_exhaustive]` so a future action kind adds a variant without
+         *     breaking the wire contract.
+         * @enum {string}
+         */
+        PendingActionKind: "restart" | "reboot" | "salvo";
+        /**
+         * @description The lifecycle state of a queued action.
+         *
+         *     An action is `Pending` until it is either `Executed` (it ran) or `Cancelled`
+         *     (the operator cancelled it locally first). Both terminal states are immutable
+         *     once reached — the local cancel cannot be undone by a later execution, and an
+         *     executed action cannot be retroactively cancelled (local-always-wins applies
+         *     only *before* execution).
+         * @enum {string}
+         */
+        PendingActionState: "pending" | "executed" | "cancelled";
         /**
          * @description `OpenAPI` mirror of [`multiview_core::alarm::PerceivedSeverity`] (X.733).
          *
@@ -2419,6 +4239,30 @@ export interface components {
          * @enum {string}
          */
         PinVendorDoc: "nvidia" | "intel" | "amd" | "apple";
+        /**
+         * @description The pipeline stage a backend serves.
+         * @enum {string}
+         */
+        PipelineStage: "decode" | "composite" | "encode";
+        /**
+         * @description The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
+         *     transports this build can serve, so the SPA picks WHEP vs the JPEG ladder
+         *     (ADR-W020) **before** issuing an offer.
+         */
+        PreviewCapabilities: {
+            /**
+             * @description The always-available fallback transport literal: `"jpeg"` (the one
+             *     fallback literal everywhere — ADR-P006 move 6).
+             */
+            fallback: string;
+            /** @description Per-scope WHEP availability + the program fidelity label. */
+            scopes: components["schemas"]["ScopeCapabilities"];
+            /**
+             * @description Whether this build can serve WHEP/WebRTC at all (a native transport is
+             *     wired). `false` on a pure / negotiation-only build.
+             */
+            webrtc: boolean;
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::Probe` — the body accepted by
          *     `POST`/`PUT /api/v1/probes/{id}`.
@@ -2506,6 +4350,56 @@ export interface components {
             /** @description A URI reference identifying the problem type (here a `/problems/<slug>`). */
             type: string;
         };
+        /**
+         * @description The fidelity a **program** WHEP focus would carry (ADR-P005/P006). Serialized
+         *     in the capabilities response so the SPA can label the program preview before
+         *     it opens one.
+         * @enum {string}
+         */
+        ProgramFidelity: "real-encoded-output" | "pre-encode-canvas-approx";
+        /** @description The `POST /api/v1/config/promote` response (ADR-W024 §6). */
+        PromoteBody: {
+            /**
+             * Format: int64
+             * @description The number of bytes written.
+             */
+            bytes?: number | null;
+            /** @description The operation id this promote is correlated under. */
+            operation_id: string;
+            /** @description The boot file path the Running document was written to. */
+            path?: string | null;
+            /**
+             * @description `true` when a replayed `Idempotency-Key` answered from the original
+             *     reservation: the file was NOT rewritten and `path`/`bytes`/`revision`
+             *     are absent (the original response carried them).
+             */
+            replayed: boolean;
+            /**
+             * Format: int64
+             * @description The committed `boot` config revision id.
+             */
+            revision?: number | null;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_core::layout::QuarterTurn` for the output
+         *     orientation turn (`none`/`cw90`/`cw180`/`cw270`).
+         * @enum {string}
+         */
+        QuarterTurnDoc: "none" | "cw90" | "cw180" | "cw270";
+        /** @description The `POST /api/v1/support/tickets` request body. */
+        RaiseTicketRequest: {
+            /**
+             * @description Attachment ids the operator references (recorded on the opening update's
+             *     context; the deliberate-attachment path is the bundle composer). Optional.
+             */
+            attachments?: string[];
+            /** @description The opening body (seeds the append-only thread). */
+            body: string;
+            /** @description The declared severity. */
+            severity: components["schemas"]["TicketSeverity"];
+            /** @description The operator-supplied subject line. */
+            subject: string;
+        };
         /** @description An IS-04 **Receiver**: an ingress flow (a Multiview input). */
         Receiver: components["schemas"]["ResourceCore"] & {
             /** @description The id of the device this receiver belongs to. */
@@ -2534,6 +4428,27 @@ export interface components {
             max_ms: number;
         };
         /**
+         * @description What a single redaction removed/masked, surfaced in the preview so the
+         *     operator sees exactly what was taken out (never the value itself).
+         */
+        Redaction: {
+            /**
+             * @description The dotted path of the redacted field (e.g. `cam-1.auth.secret_ref`). A
+             *     location, never the value.
+             */
+            path: string;
+            /**
+             * @description Why it was redacted: `secret` (a reference-only secret, removed) or `url`
+             *     (a transport URL, masked).
+             */
+            reason: components["schemas"]["RedactionReason"];
+        };
+        /**
+         * @description Why a field was redacted from a bundle.
+         * @enum {string}
+         */
+        RedactionReason: "secret" | "url";
+        /**
          * @description An IS-04 **registration request**: the `{type, data}` body posted to a
          *     Registry's `POST /x-nmos/registration/v1.3/resource`.
          *
@@ -2546,6 +4461,16 @@ export interface components {
             data: Record<string, never>;
             /** @description The kind of resource being registered. */
             type: components["schemas"]["ResourceType"];
+        };
+        /** @description The `PUT /api/v1/mesh/relay` request body: the relay opt-in state. */
+        RelaySetRequest: {
+            /** @description Whether this machine should relay neighbours' heartbeats (brief §9.2). */
+            enabled: boolean;
+        };
+        /** @description The `POST /api/v1/support/tickets/{id}/reply` request body. */
+        ReplyRequest: {
+            /** @description The reply text to append to the thread. */
+            body: string;
         };
         /**
          * @description A persisted management resource: a stable `id`, a display `name`, and the
@@ -2589,19 +4514,105 @@ export interface components {
         ResourceInput: {
             /** @description The opaque resource document. */
             body: unknown;
-            /** @description Human-friendly name. */
-            name: string;
+            /**
+             * @description Human-friendly name. Optional on the wire: a create/update that omits it
+             *     (e.g. a programmatic seed that only carries the typed `body`) defaults to
+             *     an empty name rather than failing deserialization — the display name is a
+             *     label, never load-bearing, and callers that care always supply one.
+             */
+            name?: string;
         };
         /**
          * @description The IS-04 resource type discriminator used by the registration protocol.
          * @enum {string}
          */
         ResourceType: "node" | "device" | "sender" | "receiver";
+        /** @description The `POST /api/v1/config/revert-to-start` response (ADR-W024 §5). */
+        RevertToStartBody: {
+            /** @description The operation id this revert is correlated under. */
+            operation_id: string;
+            /**
+             * @description `true` when a replayed `Idempotency-Key` answered from the original
+             *     reservation (nothing was re-applied; the other fields are this
+             *     replay's empty defaults, not a record of the original outcome).
+             */
+            replayed: boolean;
+            /** @description The sections that could not hot-revert and re-converge on restart. */
+            restart_only: string[];
+            /**
+             * @description Whether the revert FULLY applied (`false` ⇒ either Running already
+             *     equalled Loaded and nothing was enqueued, or — when
+             *     [`shed`](Self::shed) is non-zero — the revert applied only partially).
+             */
+            reverted: boolean;
+            /**
+             * Format: int32
+             * @description How many engine commands were shed on a full command bus (review M4):
+             *     `0` ⇒ every command landed; non-zero ⇒ the stores were reverted but
+             *     the engine may not reflect every change — retry the revert once the
+             *     bus drains (the `config-file-apply-incomplete` warning is raised).
+             */
+            shed: number;
+            /**
+             * @description Per-section applied/warned summary parts from the one apply machinery
+             *     (e.g. `sources: in_a changed`).
+             */
+            summary: string[];
+        };
         /**
          * Format: int64
          * @description A monotonic, per-target revision number (starts at 1).
          */
         RevisionId: number;
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::RistAesBits` (RIST PSK key length).
+         * @enum {string}
+         */
+        RistAesBitsDoc: "aes128" | "aes256";
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::RistEncryption` (PSK; secret by
+         *     reference only — never a plaintext key).
+         */
+        RistEncryptionDoc: {
+            /** @description `AES` key length (`aes128` / `aes256`). */
+            aes_bits: components["schemas"]["RistAesBitsDoc"];
+            /**
+             * @description Reference to the pre-shared passphrase (`op://…` / `env:VAR`); resolved
+             *     at run time, never stored or logged in plaintext.
+             */
+            secret_ref: string;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::RistOptions` (typed RIST connection
+         *     options; lowered to the `rist://…?…` `AVIO` URL on the Tier-0 `FFmpeg` path).
+         */
+        RistOptionsDoc: {
+            /** @description Tier-2 only: bonding/load-sharing peers (rejected on the Tier-0 build). */
+            bonding?: components["schemas"]["RistPeerDoc"][];
+            /**
+             * Format: int32
+             * @description Recovery/jitter buffer depth in milliseconds (the `ARQ` window;
+             *     `0`/absent ⇒ `librist` auto).
+             */
+            buffer_ms?: number | null;
+            encryption?: null | components["schemas"]["RistEncryptionDoc"];
+            /**
+             * Format: int32
+             * @description `MPEG-TS`-aligned packet size (default 1316).
+             */
+            pkt_size?: number | null;
+            profile?: null | components["schemas"]["RistProfileDoc"];
+        };
+        /** @description `OpenAPI` mirror of `multiview_config::RistPeer` (Tier-2 bonding endpoint). */
+        RistPeerDoc: {
+            /** @description The peer's `rist://host:port` URL. */
+            url: string;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::RistProfile` (VSF `TR-06`).
+         * @enum {string}
+         */
+        RistProfileDoc: "simple" | "main" | "advanced";
         /**
          * @description A coarse role governing which actions a principal may perform.
          *
@@ -2733,6 +4744,13 @@ export interface components {
             /** @description UMD label changes. */
             umd?: components["schemas"]["UmdRecallDoc"][];
         };
+        /** @description The `POST /api/v1/cast/sessions/{id}/save` request body. */
+        SaveCastSessionRequest: {
+            /** @description The device id to register the promoted device under. */
+            device_id: string;
+            /** @description The promoted device's display name (defaults to the session's name). */
+            display_name?: string | null;
+        };
         /**
          * @description The `202 Accepted` body for a scan: the operation id correlating the scan and
          *     the human-readable scope of what is browsed.
@@ -2760,6 +4778,21 @@ export interface components {
              *     zowietek-control type).
              */
             service_types: string[];
+        };
+        /** @description The per-scope capability map. */
+        ScopeCapabilities: {
+            /** @description The per-input scope. */
+            inputs: components["schemas"]["ScopeCapability"];
+            /** @description The per-output rendition scope. */
+            outputs: components["schemas"]["ScopeCapability"];
+            /** @description The composited program canvas scope. */
+            program: components["schemas"]["ScopeCapability"];
+        };
+        /** @description Per-scope WHEP availability (plus the program scope's fidelity label). */
+        ScopeCapability: {
+            fidelity?: null | components["schemas"]["ProgramFidelity"];
+            /** @description Whether a WHEP focus can be opened on this scope. */
+            whep: boolean;
         };
         /** @description An IS-04 **Sender**: an egress flow (a Multiview program/preview output). */
         Sender: components["schemas"]["ResourceCore"] & {
@@ -2796,6 +4829,25 @@ export interface components {
             /** @description The desired converged work mode (driver vocabulary, e.g. `encoder`). */
             mode: string;
         };
+        /**
+         * @description The `202 Accepted` body of `POST /api/v1/diagnostics/snapshot`: the id to read
+         *     the assembled bundle back with.
+         */
+        SnapshotAccepted: {
+            /** @description The id of the assembled diagnostics snapshot. */
+            snapshot_id: string;
+        };
+        /**
+         * @description The lifecycle status of a diagnostics snapshot.
+         *
+         *     Snapshots are assembled synchronously on request (the local retention buffer
+         *     is in-memory), so a returned bundle is always `Ready`; the status is modelled
+         *     explicitly so the §4.2 one-button flow and the SPA can render a stable shape,
+         *     and so a future asynchronous composer (large bundles, attachment export) can
+         *     add a `Pending` arm without a breaking change. `#[non_exhaustive]`.
+         * @enum {string}
+         */
+        SnapshotStatus: "ready";
         /** @description `OpenAPI` mirror of `multiview_config::SourceAuth` (reference-only secret). */
         SourceAuthDoc: {
             /** @description A secret reference (e.g. `op://Servers/cam/credentials`), never plaintext. */
@@ -2916,6 +4968,12 @@ export interface components {
             url: string;
         } | {
             /** @enum {string} */
+            kind: "rist";
+            rist?: null | components["schemas"]["RistOptionsDoc"];
+            /** @description Source URL (`rist://[::]:port` or peer host). */
+            url: string;
+        } | {
+            /** @enum {string} */
             kind: "rtmp";
             /** @description Source URL. */
             url: string;
@@ -2988,6 +5046,24 @@ export interface components {
             kind_scope: string;
             /** @description How stable the key is. */
             tier: components["schemas"]["StabilityTierDoc"];
+        };
+        /** @description The `POST /api/v1/cast/sessions` request body. */
+        StartCastSessionRequest: {
+            /**
+             * @description The device authority to dial: `host[:port]`, IPv6 bracketed
+             *     (`[2001:db8::20]:8009`); the CASTV2 port 8009 is the default when
+             *     omitted (Cast **groups** advertise non-default ports — give the
+             *     advertised one).
+             */
+            address: string;
+            /** @description An operator-facing name for the session (e.g. the room/TV name). */
+            name?: string | null;
+            /**
+             * @description The output id whose HLS rendition to cast. Omitted: the **first
+             *     declared** rendition is cast (every HLS output is a rendition of the
+             *     program canvas).
+             */
+            output?: string | null;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_core::stream::StreamDescriptor`].
@@ -3146,6 +5222,35 @@ export interface components {
             /** @description The stable stream id string (e.g. `v/pid:256`). */
             id: string;
         };
+        /**
+         * @description The full entitlement-routing answer the `GET /support/entitlement` endpoint
+         *     returns: whether the machine is eligible for entitled support, the route, and
+         *     the SLA token (a quiet line for the free tier).
+         */
+        SupportEntitlement: {
+            /**
+             * @description Whether the machine is eligible for an entitled support queue (false →
+             *     community only).
+             */
+            eligible: boolean;
+            /** @description The tier-derived route. */
+            route: components["schemas"]["SupportRoute"];
+            /**
+             * @description The SLA token (e.g. `standard`, or the free tier's `community-best-effort`
+             *     one-line note). Always present so the surface is uniform.
+             */
+            sla: string;
+        };
+        /**
+         * @description The tier-derived support route the entitlement endpoint renders + a ticket is
+         *     raised against.
+         */
+        SupportRoute: {
+            /** @description The first-line owner. */
+            first_line: components["schemas"]["FirstLine"];
+            /** @description The destination queue label (a stable slug the portal shares). */
+            to: string;
+        };
         /** @description The body of a `POST /commands/swap` request. */
         SwapRequest: {
             /** @description The new source/input id to bind. */
@@ -3186,6 +5291,19 @@ export interface components {
              * @description The per-member presentation offset trim in milliseconds (defaults to 0).
              */
             offset_ms?: number;
+        };
+        /**
+         * @description The `GET /api/v1/system/capabilities` response (ADR-W030): the honest
+         *     default-build capability + licence surface.
+         */
+        SystemCapabilities: {
+            /** @description Per-`(kind, stage)` backend availability. */
+            backends: components["schemas"]["BackendCapability"][];
+            /** @description The build-profile compliance surface. */
+            build: components["schemas"]["BuildInfo"];
+            /** @description The compositor's resolved acceleration tier. */
+            compositor: components["schemas"]["CompositorCapability"];
+            ndi_attribution?: null | components["schemas"]["NdiAttribution"];
         };
         /** @description The `200` body of a hot (Class-1 / Reset-lite) `/routing/{kind}/take`. */
         TakeApplied: {
@@ -3269,6 +5387,126 @@ export interface components {
          * @enum {string}
          */
         TcSourceKindDoc: "ltc" | "vitc" | "atc_rp188" | "generated";
+        /** @description The `GET /api/v1/telemetry/schema` body: the published daily-pipe schema. */
+        TelemetrySchema: {
+            /** @description The exhaustive list of categories that are NEVER sent. */
+            never_sent: string[];
+            /** @description The exhaustive list of categories sent when consented. */
+            sent: string[];
+            /** @description The schema version (stable across machine + portal). */
+            version: string;
+        };
+        /**
+         * @description A ticket: a `CS-xxxx` id, the subject + severity, the auto-attached machine
+         *     context, an append-only update thread (opening body first), and the route +
+         *     state. The portal sync mirrors this local resource over the later transport.
+         */
+        Ticket: {
+            /** @description The auto-attached machine context (§7.1). */
+            context: components["schemas"]["TicketContext"];
+            /** @description The tier-derived support route this ticket was raised against. */
+            route: components["schemas"]["SupportRoute"];
+            /** @description The declared severity. */
+            severity: components["schemas"]["TicketSeverity"];
+            /** @description The lifecycle state (`open` → `closed`). */
+            state: components["schemas"]["TicketState"];
+            /** @description The operator-supplied subject line. */
+            subject: string;
+            /** @description The `CS-xxxx` ticket id (the portal correlation key). */
+            ticket_id: string;
+            /** @description The append-only thread: the opening body, then every reply. */
+            updates: components["schemas"]["TicketUpdate"][];
+        };
+        /**
+         * @description The auto-attached machine context every ticket carries (§7.1): identity,
+         *     version, entitlement, ladder state, and the fingerprint score. **Reported,
+         *     never raw** — it carries the opaque tier + the salted fingerprint **score**
+         *     (a number), never raw serials/MACs (brief §8).
+         */
+        TicketContext: {
+            /** @description The application version (the build identity), always reported. */
+            app_version: string;
+            /** @description The enforcement-ladder summary (the computed level), reported as data. */
+            enforcement: components["schemas"]["TicketEnforcement"];
+            /** @description The entitlement summary (the opaque tier + whether a lease is licensed). */
+            entitlement: components["schemas"]["TicketEntitlement"];
+            /**
+             * Format: int32
+             * @description The salted hardware-fingerprint **score** (0–100, brief §2.3/§8) of the
+             *     active lease, or `None` when no lease is installed. A number, never raw.
+             */
+            fingerprint_score?: number | null;
+        };
+        /**
+         * @description The enforcement summary auto-attached to a ticket — the computed ladder level
+         *     (data, never control flow; brief §6).
+         */
+        TicketEnforcement: {
+            /** @description The canonical enforcement level slug (e.g. `active`, `unlicensed`). */
+            level: string;
+        };
+        /**
+         * @description The entitlement summary auto-attached to a ticket — the opaque tier + the
+         *     licensed flag (rendered, never computed; brief §1, O7).
+         */
+        TicketEntitlement: {
+            /** @description Whether a verified lease is installed. */
+            licensed: boolean;
+            /** @description The opaque commercial tier (rendered), or `none` when unlicensed. */
+            tier: string;
+        };
+        /**
+         * @description The operator-declared severity of a ticket (spec §11): `question`,
+         *     `degraded`, `blocking`. Serialised `lowercase` so the slug is stable across
+         *     the machine and the portal.
+         *
+         *     This is a **closed** set the spec pins to exactly these three levels (§11) —
+         *     deliberately **not** `#[non_exhaustive]` so a consumer (and the contract test)
+         *     can match it exhaustively. A new severity would be a contract change, not an
+         *     additive one.
+         * @enum {string}
+         */
+        TicketSeverity: "question" | "degraded" | "blocking";
+        /**
+         * @description The lifecycle state of a ticket. Local lifecycle is fully functional: an
+         *     operator can `close` a ticket they opened; a closed ticket refuses replies.
+         * @enum {string}
+         */
+        TicketState: "open" | "closed";
+        /**
+         * @description A ticket summary for the list surface (the thread is omitted to keep the
+         *     listing light; fetch a single ticket for the full thread).
+         */
+        TicketSummary: {
+            /** @description The declared severity. */
+            severity: components["schemas"]["TicketSeverity"];
+            /** @description The lifecycle state. */
+            state: components["schemas"]["TicketState"];
+            /** @description The subject line. */
+            subject: string;
+            /** @description The `CS-xxxx` ticket id. */
+            ticket_id: string;
+            /** @description The number of updates on the thread. */
+            updates: number;
+        };
+        /**
+         * @description One immutable update on a ticket's append-only thread (the opening body or a
+         *     reply): who wrote it, when, and the text.
+         */
+        TicketUpdate: {
+            /**
+             * Format: int64
+             * @description The media-timeline timestamp (nanoseconds) the update was recorded.
+             */
+            at_nanos: number;
+            /**
+             * @description The authenticated principal that wrote this update (its key id), or a
+             *     well-known support actor when the portal-fed sync lands later.
+             */
+            author: string;
+            /** @description The update text. */
+            body: string;
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::timer::TimerDirection`.
          * @enum {string}
@@ -3314,6 +5552,22 @@ export interface components {
              * @description Fixed UTC offset in minutes (legacy / no-DST). Ignored when set.
              */
             tz_offset_minutes?: number;
+        };
+        /**
+         * @description The optional JSON body a transport verb may carry: an `asset` (for `load`)
+         *     and/or a `frame` (for `cue`/`seek`). All fields are optional so a verb that
+         *     needs no body (`play`/`pause`/`stop`, or `cue`/`seek` to the in-point) may
+         *     carry an empty body.
+         */
+        TransportBody: {
+            /** @description The media-library asset id (required for `load`, ignored otherwise). */
+            asset?: string | null;
+            /**
+             * Format: int64
+             * @description The target frame, asset-relative, integer frames at the output cadence
+             *     (ADR-T015); used by `cue`/`seek`. Absent cues/seeks to the in-point.
+             */
+            frame?: number | null;
         };
         /**
          * @description One leg's RTP transport parameters (IS-05 supports up to two legs for
@@ -3365,6 +5619,54 @@ export interface components {
          * @enum {string}
          */
         WarningSeverityDoc: "info" | "warning" | "critical";
+        /** @description One recorded watch event: when it happened and what it was. */
+        WatchStamp: {
+            /**
+             * Format: int64
+             * @description When the load was applied/rejected, as Unix milliseconds (UTC).
+             */
+            at_ms: number;
+            /** @description What happened: an applied-change summary, or the rejection reason. */
+            detail: string;
+        };
+        /** @description The body of `GET /api/v1/config/watch-status`. */
+        WatchStatusBody: {
+            /** @description Whether a config-file watcher is running for this process. */
+            active: boolean;
+            /**
+             * Format: int64
+             * @description How many file changes have been successfully applied since start.
+             */
+            applied_count: number;
+            last_applied?: null | components["schemas"]["WatchStamp"];
+            last_rejected?: null | components["schemas"]["WatchStamp"];
+            /**
+             * @description The watched config file path (absent when no watcher was ever
+             *     started; kept after a stop so the status names what *was* watched).
+             */
+            path?: string | null;
+            /**
+             * @description Section names changed on disk that only apply on restart (sorted,
+             *     deduplicated; latched until restart — ADR-W020).
+             */
+            restart_pending: string[];
+        };
+        /**
+         * @description The `POST /api/v1/ws/ticket` response: a short-lived, single-use realtime auth
+         *     ticket the browser passes as `?ticket=` on the WS/SSE upgrade (ADR-RT011).
+         */
+        WsTicketResponse: {
+            /**
+             * Format: int64
+             * @description Seconds until the ticket expires ([`WS_TICKET_TTL`]).
+             */
+            expires_in_secs: number;
+            /**
+             * @description The opaque single-use ticket. Present it once as `?ticket=` within
+             *     `expires_in_secs`; it is consumed on the first WS/SSE upgrade.
+             */
+            ticket: string;
+        };
     };
     responses: never;
     parameters: never;
@@ -3374,6 +5676,154 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_account_audit: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Resume strictly after this `seq` cursor (from a previous `next_cursor`).
+                 *     Absent fetches from the beginning of the log.
+                 */
+                cursor?: number | null;
+                /** @description Restrict the listing to a single action kind (`kebab-case` slug). */
+                filter?: null | components["schemas"]["AccountAuditKind"];
+                /**
+                 * @description The maximum number of entries to return (clamped to
+                 *     [`MAX_AUDIT_PAGE_LIMIT`]; defaults to [`DEFAULT_AUDIT_PAGE_LIMIT`]).
+                 */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A page of account-audit entries (oldest-first) + the resume cursor. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountAuditPage"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_pending_actions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The pending remote actions (oldest-first). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingAction"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    cancel_action: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The action id to cancel. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The action was pending and is now cancelled (local wins). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelledBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to cancel. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No action with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The action has already executed — too late to cancel. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_alarms: {
         parameters: {
             query?: {
@@ -3635,6 +6085,337 @@ export interface operations {
             };
         };
     };
+    list_cast_sessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All live ephemeral sessions, id-sorted, each with its live lifecycle state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CastSessionDoc"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    start_cast_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StartCastSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description The started ephemeral session (runtime-only; never exported). */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CastSessionDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to start a session. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No castable rendition (control.cast_media_base unset / no HLS output) or no live cast driver in this build. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The address is not a valid host[:port], or the named output is not a served HLS rendition. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_cast_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cast session id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The session, with its live lifecycle state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CastSessionDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read this session. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No live session with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    stop_cast_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cast session id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The session was stopped and forgotten. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to stop this session. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No live session with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    save_cast_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cast session id to promote. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SaveCastSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description The promoted device (ETag in the response header). */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to write devices. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No live session with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A device with that id already exists. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The promoted device document does not validate. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    set_cast_volume: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Cast session id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CastVolumeRequest"];
+            };
+        };
+        responses: {
+            /** @description Volume change accepted; applied by the session actor. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to control this session. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No live session with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description level_percent is out of range (0–100). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     cmd_apply_layout: {
         parameters: {
             query?: never;
@@ -3695,6 +6476,53 @@ export interface operations {
             };
         };
     };
+    boot_model_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The Boot/Loaded/Running model status with per-section divergence. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BootModelBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The live stores do not compose into a valid Running document. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     export_config: {
         parameters: {
             query?: never;
@@ -3733,6 +6561,156 @@ export interface operations {
             };
             /** @description The stores do not compose into a valid configuration (detail names the violation). */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    promote_to_boot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The Running document was written to the boot file and committed as a `boot` config revision. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PromoteBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to write. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description This run has no boot model (no config file); there is no boot file to promote to. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The live stores do not compose into a valid Running document. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    revert_to_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The revert was applied (or was an honest no-op) with a per-section summary. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RevertToStartBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to write. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description This run has no boot model (no config file); there is no start state to revert to. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The live stores do not compose into a valid Running document. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    watch_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The config-file watch status: active flag, watched path, last applied/rejected loads, restart-pending sections. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WatchStatusBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -4420,6 +7398,94 @@ export interface operations {
             };
         };
     };
+    request_snapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Snapshot assembled; read it back by id. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SnapshotAccepted"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to write. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_snapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The diagnostics snapshot id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The assembled diagnostics snapshot. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiagnosticsSnapshot"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No snapshot with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_discovered: {
         parameters: {
             query?: never;
@@ -5027,6 +8093,828 @@ export interface operations {
             };
         };
     };
+    list_logs: {
+        parameters: {
+            query?: {
+                /** @description Keep only records attributed to this stable config resource id. */
+                resource_id?: string | null;
+                /**
+                 * @description Keep only records of this resource kind (`source`/`output`/`layout`/
+                 *     `program`/`device`).
+                 */
+                kind?: string | null;
+                /**
+                 * @description Keep only records at or above this severity (`trace`/`debug`/`info`/
+                 *     `warn`/`error`).
+                 */
+                level?: string | null;
+                /** @description Keep only records with a `seq` strictly greater than this cursor. */
+                since?: number | null;
+                /** @description Return at most this many of the most-recent matching records. */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Matching log records, oldest first. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogRecordDoc"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description An unrecognised level or kind filter. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_players: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The configured media players. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_player: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The media player. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    cue_player: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransportBody"];
+            };
+        };
+        responses: {
+            /** @description Cue accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    arm_exit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Arm accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    cancel_exit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancel accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    take_exit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Take accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    load_player: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransportBody"];
+            };
+        };
+        responses: {
+            /** @description Load accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Missing/invalid asset. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    pause_player: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Pause accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    play_player: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Play accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    seek_player: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TransportBody"];
+            };
+        };
+        responses: {
+            /** @description Seek accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    stop_player: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Media-player id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stop accepted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No media player with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_peers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The untrusted discovered-peer inventory. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeshPeerDoc"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    set_relay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelaySetRequest"];
+            };
+        };
+        responses: {
+            /** @description Relay opt-in updated; the new mesh status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeshStatusDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to toggle relay. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The always-on mesh discovery + relay status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeshStatusDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_outputs: {
         parameters: {
             query?: never;
@@ -5393,7 +9281,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The replaced overlay (new ETag in the response header). */
+            /** @description The replaced overlay (new ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the edit was applied at a frame boundary and the running picture visibly follows it — the renderer draws the new document, or it drew the previous one (editing a rendered face away makes it vanish, itself a live change); `restart` otherwise (ADR-W022). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5456,7 +9344,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The created overlay (ETag in the response header). */
+            /** @description The created overlay (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine's renderer draws the document (e.g. an analog-face clock on an overlay-rendering build) and it was applied at a frame boundary; `restart` otherwise — non-rendering kinds are stored losslessly and mirrored to the engine with a warning, never lied about (ADR-W022). */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -5506,7 +9394,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The overlay was deleted. */
+            /** @description The overlay was deleted. X-Multiview-Apply: `live` when the running renderer drew the document (its face disappears at the next frame boundary), `restart` otherwise (ADR-W022). */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -5542,6 +9430,35 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    capabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Preview transport capabilities. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PreviewCapabilities"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6534,6 +10451,65 @@ export interface operations {
             };
         };
     };
+    fire_salvo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The named salvo to fire. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fire queued + submitted; outcome on the realtime stream. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FiredBody"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to fire. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No salvo with that name. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Engine command bus at capacity; shed. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     take_salvo: {
         parameters: {
             query?: {
@@ -6700,7 +10676,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The replaced source (new ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` for synthetic kinds applied to the running engine, `restart` otherwise (ADR-W018). */
+            /** @description The replaced source (new ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary (synthetic kinds on every run; network/file kinds on a full-engine run — an edit swaps the producer behind the same tile store), `restart` otherwise (ADR-W018). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -6772,7 +10748,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` for synthetic kinds (bars/solid/clock) applied to the running engine at a frame boundary, `restart` otherwise (ADR-W018). */
+            /** @description The created source (ETag in the response header). X-Multiview-Apply declares how it takes effect: `live` when the running engine applies it at a frame boundary — synthetic kinds (bars/solid/clock) on every run, network/file kinds (rtsp/hls/ts/srt/rtmp/rist/file) on a full-engine run — `restart` otherwise (ndi/youtube/aes67, or a run without the decoder; ADR-W018). */
             201: {
                 headers: {
                     [name: string]: unknown;
@@ -6858,6 +10834,497 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    compose: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BundleRequest"];
+            };
+        };
+        responses: {
+            /** @description The bundle was composed; read the preview by id. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BundleAccepted"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized, or the free tier is not entitled. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_bundle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The composed bundle id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The composed bundle preview (redacted, media-free). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Bundle"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized, or the free tier is not entitled. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No bundle with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    approve_data_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The DR-xxxx data-request id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request was approved locally. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataRequestActioned"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to approve. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No request with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request window elapsed — too late to approve. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    deny_data_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The DR-xxxx data-request id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request was denied locally. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataRequestActioned"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to deny. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No request with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request window elapsed — too late to deny. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_entitlement: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tier-derived support entitlement + route (always 200). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SupportEntitlement"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_tickets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local ticket summaries (newest-first). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TicketSummary"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized, or the free tier is not entitled. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    raise_ticket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RaiseTicketRequest"];
+            };
+        };
+        responses: {
+            /** @description The ticket was raised; the full thread is returned. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Ticket"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized, or the free tier is not entitled. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_ticket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The CS-xxxx ticket id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The ticket with its full thread + machine context. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Ticket"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized, or the free tier is not entitled. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No ticket with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    close_ticket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The CS-xxxx ticket id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The ticket is closed (idempotent). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Ticket"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized, or the free tier is not entitled. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No ticket with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    reply_ticket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The CS-xxxx ticket id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplyRequest"];
+            };
+        };
+        responses: {
+            /** @description The reply appended; the updated thread is returned. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Ticket"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized, or the free tier is not entitled. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No ticket with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The ticket is closed — replies are refused. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7188,6 +11655,35 @@ export interface operations {
             };
         };
     };
+    system_capabilities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description System capability + licence surface. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SystemCapabilities"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_tally: {
         parameters: {
             query?: never;
@@ -7429,6 +11925,532 @@ export interface operations {
             };
             /** @description The profile failed validation. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_consent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The recorded telemetry-consent document (off by default). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsentResource"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    set_consent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConsentSetRequest"];
+            };
+        };
+        responses: {
+            /** @description Consent updated; the new consent document. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsentResource"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to write. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_schema: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The published daily-pipe telemetry schema (sent + never-sent). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TelemetrySchema"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    whep_view: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc output id to view. */
+                output_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description SDP offer */
+        requestBody: {
+            content: {
+                "application/sdp": string;
+            };
+        };
+        responses: {
+            /** @description Session created; SDP answer in the body, Location at the session resource. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/sdp": unknown;
+                };
+            };
+            /** @description Malformed SDP offer. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Missing credentials (the output token or a View API key). */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A credential lacking view rights. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No configured webrtc output by that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The offer shares no supported codec (H.264 + Opus). */
+            406: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is not application/sdp. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Over max_viewers / the viewer pool, or no serve transport. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    whep_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc output id. */
+                output_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Preflight; Accept-Post: application/sdp. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    whep_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc output id. */
+                output_id: string;
+                /** @description The WHEP session id from the view Location. */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session released (idempotent within the tombstone window). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A credential lacking rights. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such live/known session. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    whep_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc output id. */
+                output_id: string;
+                /** @description The WHEP session id. */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Trickle ICE / ICE restart are not supported (vanilla ICE). */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    whip_publish: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc source id to publish to. */
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        /** @description SDP offer */
+        requestBody: {
+            content: {
+                "application/sdp": string;
+            };
+        };
+        responses: {
+            /** @description Session created; SDP answer in the body, Location at the session resource. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/sdp": unknown;
+                };
+            };
+            /** @description Malformed SDP offer. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Missing credentials (the source token or a Write API key). */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A credential lacking publish rights. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The offer shares no supported codec (H.264 + Opus). */
+            406: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A publisher already holds this source. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The request body is not application/sdp. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No ingest transport available to admit the publisher. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    whip_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc source id. */
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Preflight; Accept-Post: application/sdp. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    whip_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc source id. */
+                source_id: string;
+                /** @description The WHIP session id from the publish Location. */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session released (idempotent within the tombstone window). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A credential lacking rights. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such live/known session. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    whip_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The webrtc source id. */
+                source_id: string;
+                /** @description The WHIP session id. */
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Trickle ICE / ICE restart are not supported (vanilla ICE). */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    ws_ticket_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A short-lived single-use realtime ticket to present as `?ticket=` on the WS/SSE upgrade. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WsTicketResponse"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read (below the viewer role). */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

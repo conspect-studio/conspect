@@ -194,6 +194,35 @@ export function TransportsPage(): JSX.Element {
           </Prose>
         </DocSection>
 
+        <DocSection id="webrtc" title={<Trans>WebRTC (WHIP and WHEP)</Trans>}>
+          <Prose>
+            <Trans>
+              WebRTC carries sub-second video and audio straight to and from a
+              browser with no plugin. Multiview speaks the two open HTTP
+              signalling profiles built on it: <strong>WHIP</strong> (WebRTC-HTTP
+              Ingestion Protocol) for a browser or encoder to publish a feed into
+              a <Code>webrtc</Code> source, and <strong>WHEP</strong> (WebRTC-HTTP
+              Egress Protocol) for a browser to play a <Code>webrtc</Code> output
+              or a live preview. Both negotiate once over HTTPS — the client POSTs
+              an SDP offer and gets the answer back — then media flows directly
+              over the negotiated peer connection.
+            </Trans>
+          </Prose>
+          <Prose>
+            <Trans>
+              This is the lowest-latency way to reach a web page (well under a
+              second, glass to glass) and the transport the in-app live preview
+              uses when the build supports it, falling back to a ~1 fps still
+              image otherwise. Reaching viewers across restrictive networks can
+              need a TURN relay; that is configured by the operator on the server,
+              not in the browser. A <Code>webrtc</Code> output is published at a
+              derived WHEP URL and a <Code>webrtc</Code> source is published to at
+              a derived WHIP URL — the forms show both so a publisher or viewer
+              can be configured without reading the protocol specs.
+            </Trans>
+          </Prose>
+        </DocSection>
+
         <DocSection id="file-and-synthetic" title={<Trans>Files and synthetic sources</Trans>}>
           <Prose>
             <Trans>
@@ -283,6 +312,13 @@ export function TransportsPage(): JSX.Element {
                   network={<Trans>Managed facility LAN</Trans>}
                   robustness={<Trans>No recovery; loss = glitch</Trans>}
                   use={<Trans>In-facility broadcast distribution</Trans>}
+                />
+                <ComparisonRow
+                  transport={<Trans>WebRTC (WHIP / WHEP)</Trans>}
+                  latency={<Trans>Very low (&lt;1 s)</Trans>}
+                  network={<Trans>Browser-direct; TURN for hard NATs</Trans>}
+                  robustness={<Trans>Good; degrades over poor links</Trans>}
+                  use={<Trans>Browser publish/play, live preview</Trans>}
                 />
                 <ComparisonRow
                   transport={<Trans>File / synthetic</Trans>}

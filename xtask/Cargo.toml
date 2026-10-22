@@ -34,6 +34,9 @@ net = ["dep:ureq"]
 multiview-control = { workspace = true, features = ["openapi"] }
 # gen-asyncapi calls multiview-events::asyncapi::generate_asyncapi_document().
 multiview-events = { workspace = true }
+# soak-report runs the pure multiview-telemetry::soak analyzer over a captured
+# metrics series (DEV-C4, ADR-R012). Pure Rust, no native deps.
+multiview-telemetry = { workspace = true }
 utoipa = { version = "5.5.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -15,9 +15,14 @@
 //!    scans it.
 //! 2. **Runtime license gate** ([`license::NdiLicense`]): even in an `ndi`-enabled
 //!    build, **no NDI source starts receiving** until an operator has accepted the
-//!    NDI SDK license. Until then a configured NDI source is **refused with a typed
-//!    status — never started, never a panic, never a block** (the output-clock
-//!    invariant is untouched; the tile degrades).
+//!    NDI SDK license. Enforced *by construction* — [`NdiProducer`]'s constructors
+//!    (`new`/`start`) require an accepted [`license::NdiLicense`] held by value
+//!    (mirroring `multiview_output`'s `NdiOutput::new`), and the only way to obtain
+//!    one is by evaluating the `[system.ndi] accept_license` setting through
+//!    `NdiLicense::from_setting` (the CLI receive path) or `NdiLicense::accept`.
+//!    Until accepted, a configured NDI source is **refused with a typed status
+//!    (`ndi_unlicensed`) — never started, never a panic, never a block** (the
+//!    output-clock invariant is untouched; the tile degrades `LIVE→…→NO_SIGNAL`).
 //!
 //! ## Layering
 //!

@@ -30,7 +30,9 @@
 
 use crate::blend::LinearRgba;
 use crate::error::Result;
-use crate::pipeline::{composite as cpu_composite, CanvasColor, Nv12Image, Tile};
+use crate::pipeline::{
+    auto_thread_count, composite_core, CanvasColor, LutCache, Nv12Image, ScratchPool, Tile,
+};
 
 /// A **wgpu-free** description of the one GPU a load-aware admission decision
 /// pinned the whole pipeline island to (ADR-0035 Tier-1 / ADR-0018).
@@ -186,6 +188,108 @@ pub enum RunBackendKind {
     Gpu,
 }
 
+/// The persistent CPU-reference backend: owns the transfer-LUT cache and the
+/// reusable per-band composite scratch for the whole run (efficiency findings #5
+/// and #6). Constructed by [`RunBackend::cpu`]; callers normally interact through
+/// [`RunBackend::composite`].
+///
+/// The scratch is behind a [`std::sync::Mutex`] because `composite` takes `&self`
+/// (the same API as the GPU backend), while the per-run caches are mutated in
+/// place. The output clock has one compositor thread, so this is uncontended in
+/// production; the lock is held only for the synchronous composite and never
+/// across an `.await`. A poisoned lock is recovered rather than crashing the
+/// protected output clock — the next composite advances every coverage sentinel
+/// before reading pooled scratch, so stale partial state is not observable.
+#[derive(Debug, Default)]
+pub struct CpuBackend {
+    scratch: std::sync::Mutex<CpuScratch>,
+}
+
+/// The two reusable CPU resources owned together so `CpuBackend::composite` can
+/// split-borrow them: the memoized transfer LUTs and the per-band scratch pool.
+#[derive(Debug, Default)]
+struct CpuScratch {
+    luts: LutCache,
+    pool: ScratchPool,
+}
+
+impl CpuBackend {
+    /// Lock the per-run scratch, recovering the inner value after a poison rather
+    /// than propagating a panic/failure into the output clock (safety rule §3).
+    fn lock_scratch(&self) -> std::sync::MutexGuard<'_, CpuScratch> {
+        match self.scratch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Composite one CPU frame with memoized transfer LUTs + reused band scratch,
+    /// fanning across [`auto_thread_count`] worker threads (the production path).
+    fn composite(
+        &self,
+        canvas_w: u32,
+        canvas_h: u32,
+        canvas: CanvasColor,
+        background: LinearRgba,
+        tiles: &[Tile<'_>],
+    ) -> Result<Nv12Image> {
+        self.composite_with_thread_count(
+            canvas_w,
+            canvas_h,
+            canvas,
+            background,
+            tiles,
+            auto_thread_count(),
+        )
+    }
+
+    /// As [`CpuBackend::composite`] but with an explicit worker-thread count — the
+    /// deterministic seam that lets a test force the multi-band parallel branch
+    /// (or the serial branch) regardless of host CPU count. The output is
+    /// byte-identical for any `n_threads` (the band split only partitions work;
+    /// [`crate::pipeline::composite_with_threads`] documents the invariant), so
+    /// this changes only *which* code path runs, never the pixels.
+    fn composite_with_thread_count(
+        &self,
+        canvas_w: u32,
+        canvas_h: u32,
+        canvas: CanvasColor,
+        background: LinearRgba,
+        tiles: &[Tile<'_>],
+        n_threads: usize,
+    ) -> Result<Nv12Image> {
+        let mut scratch = self.lock_scratch();
+        let CpuScratch { luts, pool } = &mut *scratch;
+        let luts = luts.ensure(canvas, tiles);
+        composite_core(
+            canvas_w,
+            canvas_h,
+            canvas,
+            background,
+            tiles,
+            Some(luts),
+            pool,
+            n_threads,
+        )
+    }
+
+    /// Number of transfer-LUT set builds since this backend was constructed.
+    fn lut_build_count(&self) -> u64 {
+        self.lock_scratch().luts.build_count()
+    }
+
+    /// Number of per-band scratch allocations since this backend was constructed.
+    fn scratch_alloc_count(&self) -> u64 {
+        self.lock_scratch().pool.alloc_count()
+    }
+
+    /// Number of per-band scratch slots the reused pool holds (grow-only): `1`
+    /// after a serial composite, the clamped worker count after a parallel one.
+    fn band_count(&self) -> usize {
+        self.lock_scratch().pool.band_count()
+    }
+}
+
 /// A constructed compositor backend: the CPU reference, or (under `wgpu` with a
 /// live adapter) the GPU compositor.
 ///
@@ -195,8 +299,9 @@ pub enum RunBackendKind {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RunBackend {
-    /// The pure-Rust CPU reference compositor. Always available.
-    Cpu,
+    /// The pure-Rust CPU reference compositor. Always available; owns its
+    /// run-persistent transfer-LUT cache + reusable band scratch.
+    Cpu(CpuBackend),
     /// The wgpu GPU compositor, holding its initialized device/pipelines.
     #[cfg(feature = "wgpu")]
     Gpu(Box<crate::gpu::GpuCompositor>),
@@ -205,8 +310,8 @@ pub enum RunBackend {
 impl RunBackend {
     /// The pure-Rust CPU reference backend. Always available, never fails.
     #[must_use]
-    pub const fn cpu() -> Self {
-        Self::Cpu
+    pub fn cpu() -> Self {
+        Self::Cpu(CpuBackend::default())
     }
 
     /// Select a backend, GPU-preferred-with-CPU-fallback, pinned to `target`.
@@ -256,14 +361,14 @@ impl RunBackend {
                 );
             }
         }
-        Self::Cpu
+        Self::cpu()
     }
 
     /// The backend this resolved to (for telemetry / introspection).
     #[must_use]
     pub const fn kind(&self) -> RunBackendKind {
         match self {
-            Self::Cpu => RunBackendKind::Cpu,
+            Self::Cpu(_) => RunBackendKind::Cpu,
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => RunBackendKind::Gpu,
         }
@@ -273,9 +378,60 @@ impl RunBackend {
     #[must_use]
     pub const fn is_gpu(&self) -> bool {
         match self {
-            Self::Cpu => false,
+            Self::Cpu(_) => false,
             #[cfg(feature = "wgpu")]
             Self::Gpu(_) => true,
+        }
+    }
+
+    /// The number of transfer-LUT set builds the persistent CPU backend has
+    /// performed since construction. A stable transfer set builds once across
+    /// any number of ticks (efficiency finding #5). Returns `0` for the GPU
+    /// backend, whose shader transfer functions do not use CPU LUTs.
+    ///
+    /// This counter is an observability/test seam, not part of the composite
+    /// algorithm; reading it does not mutate or rebuild the cache.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn lut_build_count(&self) -> u64 {
+        match self {
+            Self::Cpu(cpu) => cpu.lut_build_count(),
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(_) => 0,
+        }
+    }
+
+    /// The number of reusable CPU band-scratch allocations since construction.
+    /// The count may grow during warmup/resizes but stays constant across steady-
+    /// state ticks (efficiency finding #6). Returns `0` for the GPU backend,
+    /// which exposes its own surface-pool counter.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scratch_alloc_count(&self) -> u64 {
+        match self {
+            Self::Cpu(cpu) => cpu.scratch_alloc_count(),
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(_) => 0,
+        }
+    }
+
+    /// The number of per-band scratch slots the CPU backend's reused pool holds
+    /// (grow-only high-water): `1` after a serial composite, the clamped worker
+    /// count after a parallel one. `>= 2` proves a composite actually fanned
+    /// across the multi-band parallel path rather than falling back to serial —
+    /// the deterministic signal a test needs when it forces the worker count via
+    /// [`RunBackend::composite_with_thread_count`]. Returns `0` for the GPU
+    /// backend (it has no CPU band scratch).
+    ///
+    /// An observability/test seam, not part of the composite algorithm; reading it
+    /// does not mutate the pool.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn band_count(&self) -> usize {
+        match self {
+            Self::Cpu(cpu) => cpu.band_count(),
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(_) => 0,
         }
     }
 
@@ -308,9 +464,46 @@ impl RunBackend {
         tiles: &[Tile<'_>],
     ) -> Result<Nv12Image> {
         match self {
-            Self::Cpu => cpu_composite(canvas_w, canvas_h, canvas, background, tiles),
+            Self::Cpu(cpu) => cpu.composite(canvas_w, canvas_h, canvas, background, tiles),
             #[cfg(feature = "wgpu")]
             Self::Gpu(gpu) => gpu.composite(canvas_w, canvas_h, canvas, background, tiles),
+        }
+    }
+
+    /// As [`RunBackend::composite`], but with an explicit CPU worker-thread count
+    /// — the deterministic seam a test uses to force the multi-band parallel
+    /// branch (or the serial branch) regardless of the host CPU count, then assert
+    /// which ran via [`RunBackend::band_count`].
+    ///
+    /// The output is **byte-identical** for any `n_threads` on the CPU path (the
+    /// band split only partitions the same deterministic per-pixel pipeline; see
+    /// [`crate::pipeline::composite_with_threads`]), so this changes only which
+    /// code path executes, never the pixels — production still sizes the fan-out
+    /// from `auto_thread_count()` via [`RunBackend::composite`]. `n_threads` is
+    /// ignored by the GPU backend, which does not use CPU band scratch.
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`RunBackend::composite`].
+    #[doc(hidden)]
+    pub fn composite_with_thread_count(
+        &self,
+        canvas_w: u32,
+        canvas_h: u32,
+        canvas: CanvasColor,
+        background: LinearRgba,
+        tiles: &[Tile<'_>],
+        n_threads: usize,
+    ) -> Result<Nv12Image> {
+        match self {
+            Self::Cpu(cpu) => cpu.composite_with_thread_count(
+                canvas_w, canvas_h, canvas, background, tiles, n_threads,
+            ),
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => {
+                let _ = n_threads;
+                gpu.composite(canvas_w, canvas_h, canvas, background, tiles)
+            }
         }
     }
 }

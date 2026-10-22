@@ -68,6 +68,14 @@ pub enum Topic {
     /// device lifecycle events, scoped finer with the `ids` filter.
     #[serde(rename = "devices")]
     Devices,
+    /// Broadcast-switcher lifecycle (ADR-RT008): the lossless, operator-meaningful
+    /// transition events (M/E transition + FTB + keyer state, **media-player
+    /// transport state**, and macro progress), scoped finer with the envelope `id`
+    /// (an M/E, keyer, player, or macro id). Deliberately coarse: every switcher
+    /// element rides this one topic and a client filters by `id`. NOT high-rate —
+    /// its events stay in the lossless replay ring (ADR-RT003).
+    #[serde(rename = "switcher")]
+    Switcher,
 }
 
 impl Topic {
@@ -92,6 +100,7 @@ impl Topic {
             Self::Jobs => "jobs",
             Self::Preview => "preview",
             Self::Devices => "devices",
+            Self::Switcher => "switcher",
         }
     }
 
@@ -102,8 +111,8 @@ impl Topic {
     }
 
     /// Whether this topic is a **high-rate** lane that is conflated/sampled and
-    /// excluded from the lossless replay ring (ADR-RT003): `audio.meters` and
-    /// `system` (cpu/gpu/encoder telemetry).
+    /// excluded from the lossless replay ring (ADR-RT003): `audio.meters`,
+    /// `audio.loudness`, and `system` (cpu/gpu/encoder telemetry).
     ///
     /// High-rate lanes are latest-only and re-snapshotable, so they must not be
     /// kept in the bounded replay ring; the engine never blocks on a slow client
@@ -119,6 +128,6 @@ impl Topic {
     /// Devices events yet.
     #[must_use]
     pub const fn is_high_rate(self) -> bool {
-        matches!(self, Self::AudioMeters | Self::System)
+        matches!(self, Self::AudioMeters | Self::AudioLoudness | Self::System)
     }
 }

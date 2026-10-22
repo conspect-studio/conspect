@@ -82,4 +82,3 @@ source = "wall"             # the always-ticking clock doubles as a falter senti
 kind = "rtsp_server"
 mount = "/multiview"
 codec = "h264"
-latency_profile = "low_latency"

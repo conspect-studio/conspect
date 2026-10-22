@@ -133,3 +133,36 @@ fn health_warning_severity_renders_snake_case() {
         assert_eq!(back, sev);
     }
 }
+
+#[test]
+fn config_file_warning_codes_round_trip_kebab_case() {
+    // ADR-W020: the config-file watcher's two catalog codes — raised by the
+    // control-plane watcher (not the engine) through the same drop-oldest
+    // publisher, mirrored by the same warning ingest.
+    for (code, wire) in [
+        (WarningCode::ConfigFileInvalid, "config-file-invalid"),
+        (
+            WarningCode::ConfigFileRequiresRestart,
+            "config-file-requires-restart",
+        ),
+    ] {
+        assert_eq!(code.as_str(), wire, "as_str must match the wire string");
+        let v = serde_json::to_value(code).unwrap();
+        assert_eq!(v, json!(wire));
+        let back: WarningCode = serde_json::from_value(v).unwrap();
+        assert_eq!(back, code, "{wire} must round-trip");
+    }
+}
+
+#[test]
+fn config_file_apply_incomplete_code_round_trips_kebab_case() {
+    // ADR-W020 review M1: the interim warning raised while a valid file
+    // change was only PARTIALLY applied (engine command(s) shed on a full
+    // bus); the watcher retries and clears it when the apply completes.
+    let code = WarningCode::ConfigFileApplyIncomplete;
+    assert_eq!(code.as_str(), "config-file-apply-incomplete");
+    let v = serde_json::to_value(code).unwrap();
+    assert_eq!(v, json!("config-file-apply-incomplete"));
+    let back: WarningCode = serde_json::from_value(v).unwrap();
+    assert_eq!(back, code);
+}

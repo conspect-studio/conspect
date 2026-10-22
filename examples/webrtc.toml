@@ -1,0 +1,134 @@
+# examples/webrtc.toml — WebRTC contribution in, WebRTC distribution out.
+#
+# Exercises the three WebRTC config surfaces (IPv6-first, ADR-0042):
+#   - `kind = "webrtc"` SOURCES (ADR-T014): RFC 9725 WHIP ingest — Multiview is
+#     the server; a browser or OBS (>= 30) publishes TO the derived endpoint
+#     `POST /api/v1/whip/{source_id}` (e.g.
+#     `https://[2001:db8::10]:8443/api/v1/whip/cam-field-1`). The URL is never
+#     configured. `token` is the publisher's bearer; omit it to require a
+#     Write-scope API key instead (publishing is never anonymous).
+#   - `kind = "webrtc"` / `kind = "whip_push"` OUTPUTS (ADR-0049): WHEP serve to
+#     N browser viewers / RFC 9725 push to a remote origin. Neither encodes —
+#     both consume the already-encoded H.264 program rendition (invariant #7),
+#     so `codec = "h264"` is the only v1 value (and the default).
+#   - the `[webrtc]` section (ADR-0048 §9): the single shared dual-stack UDP
+#     media socket every session multiplexes onto. Absent keys default
+#     (udp_port 8189, max_sessions 64, session_idle_timeout "30s",
+#     cors_allow_origins ["*"]).
+# Schema: docs/templates/layout-and-config.md
+schema_version = 1
+
+[canvas]
+width = 1920
+height = 1080
+fps = "30000/1001"          # rational string, never a float (NTSC 29.97 exact)
+pixel_format = "nv12"
+background = "#101014"
+
+[canvas.color]
+profile = "sdr-bt709-limited"
+
+[layout]
+kind = "grid"
+columns = ["1fr", "1fr"]
+rows = ["1fr", "1fr"]
+gap = 8
+areas = ["field1 field2", "bars clock"]
+
+# A tokened WHIP contribution source: the publisher POSTs its SDP offer with
+# `Authorization: Bearer s3cret-field-1`. One publisher at a time; until one
+# connects the tile shows the NO_SIGNAL placeholder (nothing to dial).
+[[sources]]
+id = "cam-field-1"
+display_name = "Field unit 1"
+kind = "webrtc"
+token = "s3cret-field-1"
+
+# An API-key-only WHIP source (no `token` ⇒ Write-scope API key required) that
+# answers the publisher's audio m-line inactive — video-only contribution.
+[[sources]]
+id = "cam-field-2"
+display_name = "Field unit 2"
+kind = "webrtc"
+audio = false
+
+[[sources]]
+id = "bars"
+kind = "bars"
+
+[[sources]]
+id = "clk_syd"
+display_name = "Sydney"
+kind = "clock"
+face = "dual"
+timezone = "Australia/Sydney"
+label = "Sydney"
+show_offset = true
+
+[[cells]]
+id = "cell_field1"
+area = "field1"
+fit = "contain"
+[cells.source]
+input_id = "cam-field-1"
+
+[[cells]]
+id = "cell_field2"
+area = "field2"
+fit = "contain"
+[cells.source]
+input_id = "cam-field-2"
+
+[[cells]]
+id = "cell_bars"
+area = "bars"
+fit = "contain"
+[cells.source]
+input_id = "bars"
+
+[[cells]]
+id = "cell_clock"
+area = "clock"
+fit = "contain"
+[cells.source]
+input_id = "clk_syd"
+
+# WHEP serve: up to 16 browser viewers pull the program at
+# `POST /api/v1/whep/pgm-whep` with `Authorization: Bearer viewer-secret`
+# (omit `token` to require a View-scope API key instead). `codec` defaults to
+# "h264" — the program rendition this output consumes, not an encode it spawns.
+[[outputs]]
+kind = "webrtc"
+id = "pgm-whep"
+label = "Program WHEP"
+max_viewers = 16
+token = "viewer-secret"
+
+# WHIP push: Multiview is the RFC 9725 client, publishing the same encoded
+# program rendition to a remote origin. https recommended (redirects are
+# followed https-only); bracket IPv6 literals.
+[[outputs]]
+kind = "whip_push"
+id = "origin-push"
+url = "https://[2001:db8::15]:8443/whip/pgm1"
+token = "push-secret"
+
+# The classic path stays available alongside WebRTC (encode-once-mux-many:
+# all three outputs fan out the same encoded program packets).
+[[outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+
+# The shared WebRTC transport endpoint (ADR-0048): ONE dual-stack UDP port
+# (bound `[::]`, never `0.0.0.0`) carries all ICE/DTLS/SRTP media — ingest
+# publishers, WHEP viewers, and the push client. `advertised_addresses` is the
+# NAT 1:1 / Docker additional-hosts pattern: bare IP literals or hostnames
+# (no brackets, no port), IPv6 listed first.
+[webrtc]
+udp_port = 8189
+advertised_addresses = ["2001:db8::15", "192.0.2.15"]
+max_sessions = 64                  # preview + output-viewer pool only;
+                                   # ingest/push are admitted outside it
+session_idle_timeout = "30s"       # no media/STUN for 30 s => session GC
+cors_allow_origins = ["*"]         # media-signalling routes only

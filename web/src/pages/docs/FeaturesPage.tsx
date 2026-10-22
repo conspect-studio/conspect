@@ -146,6 +146,21 @@ export function FeaturesPage(): JSX.Element {
           </Prose>
         </DocSection>
 
+        <DocSection id="media-players" title={<Trans>Media players</Trans>}>
+          <Prose>
+            <Trans>
+              A media player is a pre-declared channel that rolls a clip or still
+              with VT (video-tape) transport: load an asset, cue to its in-point,
+              play, pause, stop, and seek. For openers and loops it can vamp —
+              loop a fill segment to hold until a cue — and then exit cleanly at
+              the next loop boundary: arm the exit to leave after the current lap
+              finishes, take it to leave at the soonest boundary, or cancel a
+              pending exit to keep vamping. The transport panel shows each
+              player&apos;s live state and playhead.
+            </Trans>
+          </Prose>
+        </DocSection>
+
         <DocSection id="alarms" title={<Trans>Alarms</Trans>}>
           <Prose>
             <Trans>

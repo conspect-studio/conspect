@@ -47,7 +47,8 @@ fn rolling_live_playlist_windows_publishes_and_prunes() {
         let name = format!("seg{i}.ts");
         let path = touch_segment(dir.path(), &name);
         seg_paths.push(path.clone());
-        live.push_closed_segment(name, path, 2.0)
+        let start_pts_ns = i64::try_from(i).unwrap_or(0) * 2_000_000_000;
+        live.push_closed_segment(name, path, 2.0, start_pts_ns)
             .expect("publish closed segment");
     }
 
@@ -119,10 +120,11 @@ fn finalize_appends_endlist() {
     let playlist_path = dir.path().join("multiview.m3u8");
     let mut live = LivePlaylist::new(playlist_path.clone(), 6);
 
-    for i in 0..3 {
+    for i in 0..3i64 {
         let name = format!("seg{i}.ts");
         let path = touch_segment(dir.path(), &name);
-        live.push_closed_segment(name, path, 2.0)
+        let start_pts_ns = i * 2_000_000_000;
+        live.push_closed_segment(name, path, 2.0, start_pts_ns)
             .expect("publish closed segment");
     }
     // Mid-run: no ENDLIST.

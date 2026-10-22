@@ -281,9 +281,8 @@ plug-and-play on NMOS** — Dante interop depends on SAP/SDP, not NMOS.
 The existing `parse_sdp_transport` (`is05.rs:340`) handles **only** `c=`/`m=video`/
 `a=source-filter` — no `m=audio`, no `a=rtpmap` L16/L24/rate/channels, no `a=ptime`/
 `a=ts-refclk`/`a=mediaclk`, **no generator**. Build **one** AES67-audio SDP parse+generate
-in `st2110/sdp.rs` (next to `v30`), reusing the **rtpmap-parsing pattern** from
-`webrtc/sdp.rs` `RtpMap` (PT/name/clock/channels) — but **not** that module (it is
-UDP/TLS/RTP/SAVPF + ICE/DTLS shaped). It fills the depacketizer's
+in `st2110/sdp.rs` (next to `v30`), with an `a=rtpmap` parser (`parse_rtpmap`,
+PT/name/clock/channels) specialized to L16/L24 audio. It fills the depacketizer's
 channels/depth(L16|L24) + ptime + ts-refclk (GMID/domain) + mediaclk offset; the
 control-plane IS-05 `transport_file` path **delegates** to it (one audio-SDP parser, DRY).
 

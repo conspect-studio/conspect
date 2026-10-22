@@ -1,0 +1,111 @@
+[package]
+name = "multiview-webrtc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Workspace-internal implementation crate; never published to crates.io.
+# Lets cargo-deny's allow-wildcard-paths exempt intra-workspace path deps while
+# still denying real "*" version wildcards.
+publish = false
+
+[dependencies]
+multiview-core = { workspace = true }
+multiview-preview = { workspace = true, features = ["webrtc"] }
+multiview-input = { workspace = true, features = ["webrtc"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+# OS-RNG-backed >=128-bit random session ids (ADR-0048 §8) and TURN transaction
+# ids / ICE tie-breakers. `getrandom`-backed; `MIT OR Apache-2.0` (allowlisted),
+# already in the workspace graph transitively. Pure-Rust, in the DEFAULT build —
+# session-id minting and the TURN client codec are pure and CI-tested without
+# any native dependency.
+rand = "0.10"
+# HMAC-SHA1 for STUN/TURN MESSAGE-INTEGRITY (RFC 5389 §15.4) and HMAC-SHA256 for
+# coturn-style ephemeral REST credentials (the `turn_rest` username:credential
+# derivation). RustCrypto, pinned; `MIT OR Apache-2.0` (already allowlisted in
+# deny.toml via multiview-preview). Pure-Rust, in the DEFAULT build (the TURN
+# client message codec + auth are pure and offline-tested).
+hmac = "0.13.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+md-5 = "0.11.0"
+base64 = "0.22.1"
+# Native WebRTC (ICE/DTLS/SRTP) stack — OPTIONAL, pulled in ONLY by `native`.
+# str0m is sans-IO (`MIT OR Apache-2.0`), pinned EXACTLY to =0.16.2 (ADR-0048 §3,
+# a tightening of multiview-preview's caret requirement; lockfile-resolved to the
+# same version). `default-features = false, features = ["rust-crypto"]` selects
+# the RustCrypto SRTP provider whose DTLS impl (`dimpl`) transitively links
+# `aws-lc-rs` (`ISC AND (Apache-2.0 OR ISC)` — allowlisted) for the cert / EC
+# primitives. The default + pure builds never link it; cargo-deny scans the
+# default build only (`all-features = false`), so the gate stays clean.
+str0m = { version = "=0.16.2", default-features = false, features = ["rust-crypto"], optional = true }
+# The dual-stack UDP socket bind (`[::]`, `IPV6_V6ONLY=false`; ADR-0042/§4) — the
+# std `UdpSocket` cannot set `IPV6_V6ONLY`. `socket2` (`MIT OR Apache-2.0`,
+# allowlisted, already in the workspace graph transitively via tokio/hyper) gives
+# the one syscall we need; OPTIONAL, pulled in ONLY by `native`, so the default
+# build never links it.
+socket2 = { version = "0.6", optional = true }
+# Raw `recvmsg(2)` cmsg parsing (`IPV6_PKTINFO` / `IP_PKTINFO`) to recover the
+# CONCRETE local address each inbound datagram arrived on — the address str0m
+# gathered as a candidate, not the unspecified `[::]` bind (box-validation defect
+# #3; ADR-0048 §4). `libc` (`MIT OR Apache-2.0`, allowlisted, already in the
+# workspace graph) is the one FFI surface here; OPTIONAL, pulled in ONLY by
+# `native`, so the default build links no FFI and stays `forbid(unsafe_code)`.
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net"] }
+
+[features]
+"default" = []
+# The native ICE/DTLS/SRTP transport: the single dual-stack UDP socket, the
+# str0m-backed session engine, and the driver task (ADR-0048 §4-§7). Everything
+# that links str0m sits behind this gate, so the default build stays pure-Rust
+# and deny-clean. `tokio/net` provides the UDP socket the driver and the TURN
+# client own.
+"native" = ["dep:str0m", "dep:socket2", "dep:libc", "tokio/net"]
+
+[[example]]
+name = "whip_publish"
+path = "examples/whip_publish.rs"
+required-features = ["native"]
+
+# FFI crate exception (mirrors `multiview-ntpsys`). The workspace forbids
+# `unsafe_code`, and a `forbid` level can never be relaxed by a downstream
+# manifest or inner attribute — so this crate cannot use `[lints] workspace =
+# true` (cargo also rejects inheriting + overriding in one table). Instead it
+# restates the workspace lint set verbatim with the single change of
+# `unsafe_code` from `forbid` to `deny`, so the `native`-gated `recvmsg(2)`
+# cmsg-parsing FFI (`local_addr.rs`) is allowed only with justified `// SAFETY:`
+# comments. The default build links no FFI and stays effectively unsafe-free.
+# Keep in sync with the root Cargo.toml `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all      = { level = "deny",  priority = -2 }
+pedantic = { level = "warn",  priority = -1 }
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+get_unwrap       = "deny"
+indexing_slicing = "deny"
+as_conversions   = "deny"
+exit             = "deny"
+mem_forget       = "deny"
+dbg_macro        = "deny"
+print_stdout     = "deny"
+print_stderr     = "deny"
+str_to_string    = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+must_use_candidate = "warn"

@@ -50,11 +50,22 @@ pub(crate) async fn list_outputs(
     principal: Principal,
 ) -> ControlResult<Json<Vec<Resource>>> {
     principal.role.require(Action::Read)?;
+    // Per-object ROW visibility (BOLA, ADR-W005/ADR-W025): an output is gated by
+    // its OWN id (`get_output` 403s an out-of-scope id), so the list must drop
+    // rows outside the allowlist — exactly as `list_devices` does. THEN redact an
+    // embedded out-of-scope `device_ref` on a surviving in-scope row. Both are
+    // no-ops for an unscoped principal.
     let outputs = state
         .outputs
         .list()?
         .into_iter()
-        .map(|v| v.resource)
+        .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
+        .map(|v| {
+            let mut resource = v.resource;
+            crate::routes::redact_out_of_scope_device_refs(&principal, &mut resource);
+            crate::support_bundle::redact_inline_secrets_for_read(&principal, &mut resource.body);
+            resource
+        })
         .collect();
     Ok(Json(outputs))
 }
@@ -82,7 +93,13 @@ pub(crate) async fn get_output(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.outputs.get(&id)?;
+    let mut versioned = state.outputs.get(&id)?;
+    // Redact an embedded out-of-scope `device_ref` (BOLA visibility,
+    // ADR-W005/ADR-W025): the output itself is in scope, but its device-projection
+    // link must not leak a device id the principal could not `GET`. No-op when
+    // unscoped.
+    crate::routes::redact_out_of_scope_device_refs(&principal, &mut versioned.resource);
+    crate::support_bundle::redact_inline_secrets_for_read(&principal, &mut versioned.resource.body);
     Ok(output_response(StatusCode::OK, &versioned))
 }
 

@@ -16,7 +16,7 @@ multiview-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-toml = "0.8.19"
+toml = "1.1.2"
 # IANA timezone validation for the clock synthetic source (ADR-0047): a
 # `timezone` id is rejected at config load if it is not a known IANA zone, via
 # the canonical `multiview_overlay::clock::parse_tz` (one source of truth shared
@@ -31,6 +31,11 @@ multiview-overlay = { workspace = true }
 # instant is injected, so the math is deterministic and testable.
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+# CIDR parsing + membership for the outbound-dial SSRF guard's operator
+# allowlist (SEC-02/SEC-04, CWE-918): `control.device_dial_allow` entries are
+# parsed to `IpNet` and matched against the RESOLVED dial IP. Permissive
+# (MIT/Apache-2.0), pure Rust, already in the workspace lock; deny-clean.
+ipnet = "2.12.0"
 
 [dev-dependencies]
 proptest = "1.5.0"

@@ -68,6 +68,14 @@ pub enum AccountAuditKind {
     RelayToggle,
     /// A redacted support context-pack was exported (brief §10).
     ContextPackExport,
+    /// A local support ticket was raised or replied to (brief §10/§11, the
+    /// `CS-xxxx` thread; the local lifecycle the portal sync mirrors later).
+    Ticket,
+    /// A support **bundle** (context-pack) was composed locally — the previewable
+    /// redacted diagnostics pack (secrets/source-URLs masked, never media; brief
+    /// §7.2/§10). Distinct from [`AccountAuditKind::ContextPackExport`], which
+    /// marks a later *egress* of an exported pack.
+    BundleCompose,
     /// A data-request egress was approved locally (brief §10, local-wins).
     DataRequestApprove,
     /// A data-request egress was denied locally (brief §10).

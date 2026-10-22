@@ -324,7 +324,7 @@ mod tests {
         enqueue(&store, "a", PendingActionKind::Reboot);
         assert_eq!(store.cancel("a"), CancelOutcome::Cancelled);
         // A cancelled action drops out of the strip.
-        assert!(store.list_pending().is_empty());
+        assert_eq!(store.list_pending().len(), 0);
         // And a later execution attempt is refused — the local cancel precedes it.
         assert_eq!(store.mark_executed("a"), ExecuteOutcome::Cancelled);
         assert_eq!(

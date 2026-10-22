@@ -7,7 +7,7 @@ ordinary hardware and to **never drop a frame**.
 
 <!-- badges: CI / license / container — kept minimal on purpose -->
 [![License: Source-Available Non-Commercial](https://img.shields.io/badge/license-Source--Available%20Non--Commercial-blue.svg)](#licensing)
-[![Container: GHCR](https://img.shields.io/badge/container-ghcr.io%2Faperim%2Fmultiview-2496ED.svg)](https://github.com/aperim/multiview/pkgs/container/multiview)
+[![Container: GHCR](https://img.shields.io/badge/container-ghcr.io%2Fconspect-studio%2Fconspect-2496ED.svg)](https://github.com/conspect-studio/conspect/pkgs/container/conspect)
 
 > [!NOTE]
 > **Early stage, under active development.** The architecture, full API/UI design, ADRs and
@@ -48,8 +48,8 @@ publishes a **synthetic** test feed (no real or private sources), composites a 2
 it, serves the result as HLS, and serves the web UI + API on `:8080`.
 
 ```bash
-git clone https://github.com/aperim/multiview.git
-cd multiview
+git clone https://github.com/conspect-studio/conspect.git
+cd conspect
 docker compose -f deploy/compose.yaml up -d
 ```
 
@@ -72,8 +72,8 @@ source and re-run `up -d`. Tear down with `docker compose -f deploy/compose.yaml
 
 | Method | Get it |
 |--------|--------|
-| **Container (recommended)** | `docker pull ghcr.io/aperim/multiview:latest` (multi-arch `amd64`+`arm64`, SLSA provenance + cosign-signed). NVIDIA variant: `:latest-nvidia`. |
-| **Prebuilt binaries** | Linux (`x86_64`/`aarch64`) and macOS (Apple Silicon/Intel, signed + notarized) on the [Releases page](https://github.com/aperim/multiview/releases). Requires FFmpeg 7.x on the host. |
+| **Container (recommended)** | `docker pull ghcr.io/conspect-studio/conspect:latest` (multi-arch `amd64`+`arm64`, SLSA provenance + cosign-signed). NVIDIA variant: `:latest-nvidia`. |
+| **Prebuilt binaries** | Linux (`x86_64`/`aarch64`) and macOS (Apple Silicon/Intel, signed + notarized) on the [Releases page](https://github.com/conspect-studio/conspect/releases). Requires FFmpeg 7.x on the host. |
 | **From source** | `cargo build` (pure-Rust, LGPL-clean default). Feature presets and the FFmpeg/toolchain requirements are in **[docs/operations/building.md](docs/operations/building.md)**. |
 
 ---

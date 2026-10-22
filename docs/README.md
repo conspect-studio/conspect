@@ -157,10 +157,16 @@ Deep, verification-hardened design records — the substrate the ADRs and topic 
 
 | Doc | Description |
 |-----|-------------|
-| [working-in-this-monorepo.md](development/working-in-this-monorepo.md) | The agent playbook for this monorepo: nested `CLAUDE.md`, context discipline, subagents, navigation. |
+| [working-in-this-monorepo.md](development/working-in-this-monorepo.md) | The agent playbook for this monorepo: nested `CLAUDE.md`, context discipline, subagents, navigation, build-dir hygiene. |
 | [codebase-map.md](development/codebase-map.md) | One-screen map of the whole repo (crates, web, docs). |
-| [agent-guardrails.md](development/agent-guardrails.md) | Non-negotiable engineering guardrails: absolute typing, TDD + mutation testing, adversarial cross-vendor review. |
+| [agent-guardrails.md](development/agent-guardrails.md) | Toolchain forensics: the lint set and its traps, `clippy.toml` test scoping, mutation-testing exit codes, reviewer brief, tool-version gotchas. |
 | [completeness-checklist.md](development/completeness-checklist.md) | The 212-item checklist verifying the UI + API fully manage the engine. |
+
+### Standards (`standards/`)
+
+| Doc | Description |
+|-----|-------------|
+| [engineering.md](standards/engineering.md) | **The process contract.** Change classes R0–R3, the gate matrix, safety invariants, evidence rules, delegation, context discipline, exceptions. |
 
 ---
 

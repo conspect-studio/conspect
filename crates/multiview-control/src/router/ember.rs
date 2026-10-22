@@ -503,7 +503,7 @@ mod tests {
             let encoded = ber::encode_length(len);
             let (decoded, rest) = ber::decode_length(&encoded).unwrap();
             assert_eq!(decoded, len, "len {len}");
-            assert!(rest.is_empty());
+            assert_eq!(rest.len(), 0);
         }
         // Short form is exactly one byte for < 128.
         assert_eq!(ber::encode_length(10), vec![10]);

@@ -45,6 +45,10 @@ pub const DEVICE_KIND: &str = "device";
 /// The resource collection name used in problem documents and not-found errors
 /// for the `sync-groups` resource (presentation-sync groups, ADR-M008/M010).
 pub const SYNC_GROUP_KIND: &str = "sync-group";
+/// The resource collection name used in problem documents and not-found errors
+/// for the `media-players` resource (pre-declared bus-selectable player
+/// channels, ADR-0057 / ADR-0097).
+pub const MEDIA_PLAYER_KIND: &str = "media-player";
 
 /// A marker selecting which resource collection a store serves, supplying the
 /// stable kind name used in errors and audit records.
@@ -95,6 +99,14 @@ impl ResourceKind for SyncGroupKind {
     const KIND: &'static str = SYNC_GROUP_KIND;
 }
 
+/// The `media-players` resource marker (pre-declared bus-selectable player
+/// channels, ADR-0057 / ADR-0097).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaPlayerKind;
+impl ResourceKind for MediaPlayerKind {
+    const KIND: &'static str = MEDIA_PLAYER_KIND;
+}
+
 /// A persisted management resource: a stable `id`, a display `name`, and the
 /// opaque `body` document (the config-as-code shape as canonical JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,7 +134,11 @@ pub struct VersionedResource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ResourceInput {
-    /// Human-friendly name.
+    /// Human-friendly name. Optional on the wire: a create/update that omits it
+    /// (e.g. a programmatic seed that only carries the typed `body`) defaults to
+    /// an empty name rather than failing deserialization — the display name is a
+    /// label, never load-bearing, and callers that care always supply one.
+    #[serde(default)]
     pub name: String,
     /// The opaque resource document.
     pub body: serde_json::Value,
@@ -205,6 +221,8 @@ pub type InMemoryProbeStore = InMemoryResourceStore<ProbeKind>;
 pub type InMemoryDeviceStore = InMemoryResourceStore<DeviceKind>;
 /// An in-memory `sync-groups` store (presentation-sync groups, ADR-M008/M010).
 pub type InMemorySyncGroupStore = InMemoryResourceStore<SyncGroupKind>;
+/// An in-memory `media-players` store (player channels, ADR-0057 / ADR-0097).
+pub type InMemoryMediaPlayerStore = InMemoryResourceStore<MediaPlayerKind>;
 
 impl<K: ResourceKind> Default for InMemoryResourceStore<K> {
     fn default() -> Self {

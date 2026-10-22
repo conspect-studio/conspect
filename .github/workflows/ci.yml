@@ -50,8 +50,8 @@ jobs:
       # 'true' when at least one changed file is NOT in the prose allowlist.
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           # Default `some` would treat the leading `!` negations as ordinary
@@ -128,15 +128,17 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # --locked enforces the committed Cargo.lock — cargo ignores the lockfile
+        # without it — so the lint build is deterministic.
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
     name: check + test (${{ matrix.os }})
@@ -153,19 +155,21 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       # Default features are pure-Rust (no FFmpeg/GPU), so CI needs no native libs.
+      # --locked enforces the committed Cargo.lock — cargo ignores the lockfile
+      # without it — so check + test are deterministic.
       - name: cargo check
-        run: cargo check --workspace
+        run: cargo check --locked --workspace
       - name: cargo test
         # Skip the compositor per-tick perf BUDGET test on shared CI runners: it
         # asserts a wall-clock ceiling only meaningful on consistent hardware
         # (ADR-E009 — perf gates run on dedicated runners). The tile-driven
         # SCALING correctness is covered unconditionally by
         # tile_driven_scales_with_coverage_not_tile_count.
-        run: cargo test --workspace -- --skip tile_driven_meets_budget
+        run: cargo test --locked --workspace -- --skip tile_driven_meets_budget
 
   # ── feature-gated clippy + test matrix (IN-7) ────────────────────────────────
   # The default `lint` and `test` jobs run with default features only (pure-Rust,
@@ -222,12 +226,114 @@ jobs:
             feature: is07-mqtt
           - crate: multiview-control
             feature: nmos
+          # multiview-control + multiview-cli off-by-default `tls` feature (TLS-0,
+          # ADR-W029): static-certificate rustls termination on the control
+          # listener. The default `lint`/`test` jobs build NEITHER the
+          # `serve_router_tls`/`load_tls_material` path NOR the `tls_serve` e2e
+          # (it is `required-features = ["tls"]`), so without these legs the TLS
+          # code would ship CI-untested. Pure Rust at the CI level — rustls +
+          # aws-lc-rs is a CPU C build (cc + cmake, already built on this bare
+          # runner by the `multiview-webrtc`/`native` leg below), no hardware/NIC.
+          # The `multiview-control` leg's `cargo test --features tls` runs the
+          # `tls_serve` end-to-end (rcgen self-signed → real reqwest HTTPS →
+          # per-IP 200-then-429), pinning the SEC-14 ConnectInfo preservation
+          # under TLS (ADR-W028). The `multiview-cli` leg gates the serve-vs-
+          # serve_tls selection + the feature-off `[control.tls]` rejection path.
+          - crate: multiview-control
+            feature: tls
+          - crate: multiview-cli
+            feature: tls
           # multiview-hal off-by-default features
           - crate: multiview-hal
             feature: i915-pmu
+          # multiview-hal + multiview-cli `vaapi`/`qsv`: the AMD/Intel DRM sysfs +
+          # /proc fdinfo per-GPU load source (`SysfsLoadPoller`, ADR-0017 ENG-4b)
+          # and its `default_load_source` wiring. Pure `std::fs` — no native
+          # VAAPI/QSV lib at compile time — so it lints + tests on the bare
+          # runner. The default `lint`/`test` jobs build NONE of the `linux_sysfs`
+          # module (it is `#[cfg(any(vaapi, qsv))]`), so without this leg the
+          # poller ships un-clippy'd under its own feature. `vaapi` exercises the
+          # shared `any(vaapi, qsv)` code (qsv is symmetric).
+          - crate: multiview-hal
+            feature: vaapi
+          - crate: multiview-cli
+            feature: vaapi
+          # multiview-licence off-by-default feature: the Conspect device
+          # heartbeat client (CONSPECT-3 / ADR-0096). Pure Rust — p256 + base64 +
+          # hex + tokio, no native deps — so it lints + tests on the bare runner.
+          # This is the key-trust verifier + the signed-lease verifier + the
+          # HeartbeatClient loop + the fake-server tests (incl. the live well-known
+          # golden vectors); the default `lint`/`test` jobs build none of it.
+          - crate: multiview-licence
+            feature: heartbeat
+          # multiview-cli off-by-default feature: the heartbeat wiring +
+          # the live reqwest/rustls transport + the never-off-air chaos gate that
+          # SIGKILLs/stalls/partitions the heartbeat task against the output clock.
+          # `heartbeat` does NOT imply the cli `ffmpeg` feature (reqwest is pure
+          # rustls, no libav), so it lints + tests on the bare runner alongside the
+          # default `software` feature.
+          - crate: multiview-cli
+            feature: heartbeat
+          # Overlay text engine (cosmic-text + swash + etagere atlas + bundled OFL
+          # fonts; ADR-R007/ADR-E002). Pure Rust — GPU-free and links NO ffmpeg —
+          # so it lints + tests on the bare runner. The default `lint`/`test` jobs
+          # build NONE of this: a cosmic-text 0.19 `set_text` signature break
+          # reached main (the text.rs render path lives in `multiview-compositor`
+          # under `--features overlay`) because no gate built the overlay feature
+          # (PR #203). These legs gate that surface going forward.
+          #
+          # The text rasterizer + the GPU overlay sub-pass live in
+          # `multiview-compositor`'s `overlay` feature — this is the leg that
+          # actually compiles the cosmic-text `Buffer`/`FontSystem` call sites.
+          - crate: multiview-compositor
+            feature: overlay
+          # The wgpu compositor backend (the DEFAULT GPU backend; ADR-E002, §F inv#5).
+          # Pure Rust at COMPILE time — wgpu/naga/wgpu-hal build GPU-free — and every
+          # wgpu-gated test (tests/gpu_*.rs, backend_select.rs) matches
+          # `Error::NoAdapter`/`DeviceRequest` and SKIPS when no adapter is present
+          # (the real-GPU parity checks carry `#[ignore]`), so this leg lints + tests
+          # on the bare runner. The default `lint`/`test` jobs build NONE of the
+          # `gpu/` module: a wgpu 30 API drift (`RequestAdapterOptions.apply_limit_buckets`
+          # + fallible `get_mapped_range`) sat red on main unnoticed (#55) because no
+          # gate built `--features wgpu`. This leg gates that surface going forward
+          # (same rationale as the `overlay` legs above).
+          - crate: multiview-compositor
+            feature: wgpu
+          # The `multiview-cli` umbrella `overlay` feature gates
+          # `multiview-compositor/overlay` (it does NOT imply `ffmpeg` — it is the
+          # GPU-free, LGPL-clean overlay tier the `nvidia`/`apple`/`linux-vaapi`/
+          # `full` presets all pull in), plus the cli's own overlay wiring + tests.
+          - crate: multiview-cli
+            feature: overlay
+          # NOTE: `multiview-overlay --features libass` is gated by a SEPARATE
+          # job (`feature-clippy-overlay-libass`) below — its own cargo cache
+          # graph — but that job now runs BOTH clippy AND `cargo test`, the same
+          # as this matrix's legs (the `subtitle` capability test is cfg-gated by
+          # feature, #141, so the suite is green under `--features libass`).
+          # WebRTC native egress/ingest (str0m + aws-lc-rs). The default `lint`
+          # and `test` jobs build none of these, so the wave-1 union (#141↔#147)
+          # broke `webrtc-native` silently on main; this leg gates it going
+          # forward. multiview-webrtc owns the Session/egress API (the
+          # method-name break that silently hit main lived here) and is pure
+          # str0m — it links NO ffmpeg, so it runs on the bare runner.
+          #
+          # NOTE: the `multiview-cli` (`webrtc-native`) build links ffmpeg —
+          # `webrtc-native` implies the cli `ffmpeg` feature (the WHIP ingest
+          # decode + WHEP encode ride the libav path), so `ffmpeg-sys-next`'s
+          # build.rs probes pkg-config for libav* and the build fails on this
+          # ffmpeg-free runner. (The paired `multiview-preview --features webrtc`
+          # is itself pure-Rust — it links NO ffmpeg — but its lint coverage rides
+          # the same ffmpeg-equipped leg as the cli for one cohesive webrtc gate.)
+          # Guarding the ffmpeg-linked cli surface needs the pinned FFmpeg base
+          # image (ghcr.io/<owner>/multiview-ffmpeg:8.1.1-lgpl, libavcodec .so.62) —
+          # that is the dedicated `feature-clippy-ffmpeg-webrtc` job below. The
+          # crate leg here already guards the pure-str0m Session/egress API
+          # surface that broke.
+          - crate: multiview-webrtc
+            feature: native
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -235,34 +341,327 @@ jobs:
           # Scope the cache per feature so entries don't collide across matrix legs.
           key: feature-${{ matrix.crate }}-${{ matrix.feature }}
       - name: clippy (${{ matrix.feature }})
-        # --all-targets: also lints integration-test binaries under the feature.
-        # -D warnings: matches the default `lint` job gate.
+        # --locked: enforce the committed Cargo.lock for a deterministic build
+        # (cargo ignores it otherwise). --all-targets: also lints integration-test binaries under
+        # the feature. -D warnings: matches the default `lint` job gate.
         # Hardware/network live paths are gated in the tests themselves via
         # #[ignore] or cfg_attr(not(feature=...), ignore), so this never needs
         # a real NIC, PTP device, MQTT broker, or NDI sender.
         run: >
           cargo clippy
+          --locked
           -p ${{ matrix.crate }}
           --features ${{ matrix.feature }}
           --all-targets
           -- -D warnings
       - name: test (${{ matrix.feature }})
         # cargo test --no-fail-fast: surface all failures, not just the first.
-        # Hardware-gated tests carry #[ignore] and are excluded from shared CI
-        # by default; they run on dedicated self-hosted runners with the real
-        # devices attached.
+        # Hardware-gated tests carry #[ignore] and are excluded from shared CI.
+        # NOT VERIFIED ANYWHERE TODAY: no self-hosted or GPU-tagged runner exists
+        # in this repository (every `runs-on:` is a GitHub-hosted ubuntu/macos
+        # image), and no nightly workflow exists. ADR-E009/ADR-0022 describe a
+        # dedicated-runner tier that has not been built, so these tests and the
+        # SSIM/PSNR parity assertions currently never execute. Do not describe
+        # them as gated.
+        #
+        # --skip tile_driven_meets_budget: the compositor per-tick perf BUDGET
+        # test asserts a wall-clock ceiling only meaningful on consistent
+        # hardware (ADR-E009/ADR-0022), so
+        # it is flaky on shared CI. The default `test` job skips it for the same
+        # reason; mirror that here for the `multiview-compositor`/`overlay` leg
+        # (it lives only in that crate, so the flag is a no-op for every other
+        # leg). The tile-driven SCALING correctness stays covered unconditionally
+        # by tile_driven_scales_with_coverage_not_tile_count.
         run: >
           cargo test
+          --locked
           -p ${{ matrix.crate }}
           --features ${{ matrix.feature }}
+          -- --skip tile_driven_meets_budget
+
+  # ── multiview-overlay libass clippy + test (closes a #134/#141 gap) ──────────
+  # `multiview-overlay`'s off-by-default `libass` capability gate (the ASS/SSA
+  # subtitle burn-in seam, ADR-R007/R008) has zero coverage in the default
+  # `lint`/`test` jobs. It gets its OWN job (rather than a slot in the shared
+  # `feature-clippy` clippy+test matrix) only because its cargo-cache graph is
+  # scoped separately; it now runs BOTH clippy AND `cargo test` like every
+  # matrix leg. Previously this was clippy-only because the crate's `subtitle`
+  # test asserted the libass-OFF fallback (`AssCapability::detect() ==
+  # Unavailable`) UNCONDITIONALLY, so `cargo test --features libass` was red by
+  # design. That test is now cfg-gated by feature (#141) — the libass-OFF
+  # assertion runs only without the feature and the libass-ON dual asserts
+  # `Available` — so the test suite is green under `--features libass` and we
+  # gain real run-time coverage of the libass-gated path. The crate is pure Rust
+  # here (the native libass/HarfBuzz/FriBidi toolchain is wired downstream), so
+  # both steps run on the bare runner.
+  feature-clippy-overlay-libass:
+    name: feature-gated clippy + test (multiview-overlay, libass)
+    runs-on: ubuntu-latest
+    # A single crate clippy + test under one feature (~1min warm); a cold
+    # per-feature cargo cache can take a few minutes. 20min matches the
+    # `feature-clippy` legs.
+    timeout-minutes: 20
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-multiview-overlay-libass
+      - name: clippy (libass)
+        # --locked enforces the committed Cargo.lock — cargo ignores it otherwise. --all-targets also
+        # lints the test binaries under the feature; -D warnings matches the
+        # default `lint` gate.
+        run: >
+          cargo clippy
+          --locked
+          -p multiview-overlay
+          --features libass
+          --all-targets
+          -- -D warnings
+      - name: test (libass)
+        # Now that the `subtitle` capability test is cfg-gated by feature (#141),
+        # the suite is green under `--features libass`, so run it for real run-time
+        # coverage of the libass-gated path. --locked mirrors CI determinism —
+        # cargo ignores the lockfile without it. The crate has no perf-budget test, so no
+        # `--skip tile_driven_meets_budget` is needed here.
+        run: >
+          cargo test
+          --locked
+          -p multiview-overlay
+          --features libass
+
+  # ── ffmpeg-linked webrtc-native clippy (closes the #154 follow-up gap) ───────
+  # The `feature-clippy` matrix above runs on a libav-FREE runner, so it cannot
+  # clippy the targets whose feature pulls ffmpeg. `multiview-cli`'s
+  # `webrtc-native` feature implies the cli `ffmpeg` feature (WHIP ingest decode
+  # + WHEP encode ride the libav path), and `multiview-preview`'s `webrtc` seam
+  # is the paired preview surface — neither is covered by the default `lint`
+  # clippy (default features only) NOR by the libav-free `feature-clippy` matrix.
+  # That is exactly the gap that let the wave-1 webrtc-native break (ADR-0049 /
+  # ADR-0060 cli wiring: a `too_many_lines` + a `double_must_use`) reach main
+  # silently: a `cargo build` never runs those clippy lints, and no clippy leg
+  # built these features.
+  #
+  # This leg clippies them against the SAME pinned FFmpeg the deploy images link:
+  # ghcr.io/<owner>/multiview-ffmpeg:8.1.1-lgpl (libavcodec .so.62 — the soname
+  # `ffmpeg-sys-next 8.1.0` binds, NOT ubuntu apt's 6.x/so.60, which would
+  # generate the WRONG bindings). That base image is `FROM scratch` (it ships
+  # ONLY /opt/multiview-ffmpeg — no shell/apt, so it cannot be a job `container:`),
+  # so we pull it and `docker cp` /opt/multiview-ffmpeg out onto the runner, then
+  # point pkg-config + the loader at it — the identical mechanism deploy/Dockerfile
+  # uses (`COPY --from=ffmpeg /opt/multiview-ffmpeg` + PKG_CONFIG_PATH, ADR-0031).
+  feature-clippy-ffmpeg-webrtc:
+    name: ffmpeg-linked webrtc clippy
+    runs-on: ubuntu-latest
+    # Pull the base image + a per-feature-scoped clippy build (str0m + aws-lc-rs
+    # + ffmpeg-sys bindgen from cold). A cold cargo cache pushes this into the
+    # several-minute range; 30min is generous headroom while capping a wedge.
+    timeout-minutes: 30
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    permissions:
+      contents: read
+      # docker pull from GHCR needs a token to read the (private) base package.
+      packages: read
+    env:
+      # The pinned, LGPL-clean FFmpeg 8.1.1 base (libavcodec .so.62) — the same
+      # image the docker app build COPYs /opt/multiview-ffmpeg from (ADR-0031 §5).
+      # Only the TAG is fixed here; the extract step resolves the image via
+      # scripts/resolve-ffmpeg-image.sh: this owner's ghcr.io/<owner>/multiview-ffmpeg
+      # (published by ffmpeg-base.yml) when that tag exists, else the public
+      # upstream ghcr.io/aperim/multiview-ffmpeg (before the owner's first publish).
+      FFMPEG_TAG: 8.1.1-lgpl
+      # Where we extract /opt/multiview-ffmpeg to on the runner. pkg-config + the
+      # dynamic loader are pointed here so ffmpeg-sys-next's build.rs discovers
+      # FFmpeg 8.1.1 (detects ffmpeg_8_1 → libavcodec 62) and the link finds .so.62.
+      FFMPEG_PREFIX: /opt/multiview-ffmpeg
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache key — this leg's graph (ffmpeg-sys + str0m + aws-lc-rs)
+          # differs from every libav-free `feature-clippy` leg.
+          key: feature-clippy-ffmpeg-webrtc
+      - name: Log in to GHCR
+        # The base image package is read via the workflow token (packages: read).
+        uses: docker/login-action@v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install bindgen toolchain + VAAPI runtime
+        # ffmpeg-sys-next's build.rs runs bindgen (needs clang/libclang) and the
+        # libav build wants nasm present; pkg-config locates our prefix's .pc.
+        # Installed BEFORE the extract step so the modversion assertion below has
+        # a guaranteed pkg-config (the ubuntu image ships one, but don't rely on it).
+        #
+        # The RUNTIME libs the pinned LGPL FFmpeg 8.1.1 links (per
+        # deploy/ffmpeg-build.sh: --enable-vaapi/--enable-libdrm, --enable-libopus,
+        # --enable-libsrt [gnutls], --enable-libvpl): an ffmpeg-linked TEST binary
+        # (the aes67 leg below) fails to LOAD with exit 127 without them on the bare
+        # runner; clippy never loads the binary, so it did not need them. Mapping
+        # soname -> ubuntu-noble package:
+        #   libva.so.2 / libva-drm.so.2 -> libva2 / libva-drm2  (VAAPI)
+        #   libopus.so.0                -> libopus0
+        #   libsrt.so.1.5               -> libsrt1.5-gnutls      (matches --enable-gnutls; universe)
+        #   libvpl.so.2                 -> libvpl2               (oneVPL)
+        # gnutls + libdrm are preinstalled on ubuntu-latest; NO x264/x265 (GPL-gated,
+        # absent from the -lgpl build). The `ldd` completeness guard below fails fast
+        # if this list ever drifts, naming the exact missing soname.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev nasm \
+            libva2 libva-drm2 libopus0 libsrt1.5-gnutls libvpl2
+      - name: Extract pinned FFmpeg 8.1.1 from the base image
+        # The base is `FROM scratch` (only /opt/multiview-ffmpeg), so we create a
+        # (never-run) container from it and `docker cp` the prefix out — the same
+        # libav* tree deploy/Dockerfile pulls via `COPY --from=ffmpeg`.
+        run: |
+          set -euo pipefail
+          FFMPEG_IMAGE="$(scripts/resolve-ffmpeg-image.sh "${{ github.repository_owner }}" "${FFMPEG_TAG}")"
+          docker pull "${FFMPEG_IMAGE}"
+          # `docker create` on a `FROM scratch` image with no CMD/ENTRYPOINT fails
+          # with "no command specified"; pass a dummy argv so the create succeeds.
+          # It is NEVER executed — `docker cp` only reads the container's rootfs,
+          # which already holds /opt/multiview-ffmpeg from the image layer.
+          cid="$(docker create "${FFMPEG_IMAGE}" /nonexistent)"
+          sudo mkdir -p "$(dirname "${FFMPEG_PREFIX}")"
+          # Copy the whole prefix ({lib,include,lib/pkgconfig}) to its canonical
+          # location so the .pc files' absolute prefix= paths resolve unchanged.
+          sudo docker cp "${cid}:${FFMPEG_PREFIX}" "${FFMPEG_PREFIX}"
+          docker rm "${cid}" >/dev/null
+          # Sanity: the extracted prefix must actually carry the .pc + the .so.
+          test -f "${FFMPEG_PREFIX}/lib/pkgconfig/libavcodec.pc" \
+            || { echo "::error::libavcodec.pc missing under ${FFMPEG_PREFIX}"; exit 1; }
+          # Assert we got the soname the binding targets (FFmpeg 8.1.x →
+          # libavcodec 62.x). A wrong major here would compile the wrong cfg and
+          # link the wrong .so — fail loudly rather than silently mis-bind.
+          MODVER="$(PKG_CONFIG_PATH="${FFMPEG_PREFIX}/lib/pkgconfig" pkg-config --modversion libavcodec)"
+          echo "libavcodec modversion: ${MODVER}"
+          case "${MODVER}" in
+            62.*) echo "FFmpeg 8.1.x confirmed (libavcodec ${MODVER})." ;;
+            *) echo "::error::Expected libavcodec 62.x (FFmpeg 8.1.x), got ${MODVER}"; exit 1 ;;
+          esac
+          # Export the discovery env for the clippy steps (build.rs probes these).
+          {
+            echo "PKG_CONFIG_PATH=${FFMPEG_PREFIX}/lib/pkgconfig"
+            echo "LD_LIBRARY_PATH=${FFMPEG_PREFIX}/lib"
+          } >> "$GITHUB_ENV"
+      - name: clippy multiview-cli --features webrtc-native
+        # The ffmpeg-linked target the libav-free matrix cannot build. --locked
+        # enforces the committed Cargo.lock — cargo ignores it otherwise; -D warnings matches the
+        # default `lint` gate; --all-targets also lints test binaries.
+        run: >
+          cargo clippy
+          --locked
+          -p multiview-cli
+          --features webrtc-native
+          --all-targets
+          -- -D warnings
+      - name: clippy multiview-cli --features overlay,webrtc-native
+        # The overlay × webrtc-native cross-feature pair (#137): both gate code in
+        # `multiview-cli`, and `webrtc-native` implies `ffmpeg`, so this combo can
+        # only build on this ffmpeg-equipped leg — not on the libav-free
+        # `feature-clippy` matrix. A `cargo build` of the binary never runs these
+        # clippy lints, and no leg built the pair, so a non-exhaustive `match` over
+        # `SourceLocation` (the overlay-gated `resolve_incontainer_sub_route`
+        # missing the webrtc-native `Webrtc` arm) slipped through (fixed in PR #202).
+        # This step gates the pair going forward. --locked enforces the committed
+        # Cargo.lock — cargo ignores it otherwise.
+        run: >
+          cargo clippy
+          --locked
+          -p multiview-cli
+          --features overlay,webrtc-native
+          --all-targets
+          -- -D warnings
+      - name: clippy multiview-preview --features webrtc
+        # The paired preview WHEP seam. Built here alongside the cli target so the
+        # whole webrtc-native surface is clippy-gated in one ffmpeg-equipped leg.
+        # --locked enforces the committed Cargo.lock — cargo ignores it otherwise.
+        run: >
+          cargo clippy
+          --locked
+          -p multiview-preview
+          --features webrtc
+          --all-targets
+          -- -D warnings
+      - name: clippy multiview-cli --features ffmpeg,aes67
+        # AES67 / SMPTE ST 2110-30 raw-PCM audio wiring (#96 / #103). The CLI RX
+        # (`drive_aes67_rx`) + TX (`build_aes67_output` / `run_aes67_output`) sit
+        # behind `#[cfg(feature = "aes67")]` NESTED in `#[cfg(feature = "ffmpeg")]`
+        # in `pipeline.rs`, so — exactly like the webrtc-native steps above — the
+        # libav-free `feature-clippy` matrix physically cannot build them
+        # (ffmpeg-sys-next's build.rs needs libav) and a clippy break in that
+        # wiring would reach main CI-green. This leg closes that false-green gap,
+        # reusing the SAME pinned FFmpeg env already set up above. --locked (rule
+        # 33), -D warnings mirrors the default `lint` gate, --all-targets also
+        # lints the aes67 test binaries.
+        run: >
+          cargo clippy
+          --locked
+          -p multiview-cli
+          --features ffmpeg,aes67
+          --all-targets
+          -- -D warnings
+      - name: Assert the pinned-FFmpeg runtime libs all resolve
+        # Fail fast BEFORE the test if any pinned-FFmpeg .so has an unresolved
+        # runtime dependency on this bare runner — prints the exact missing soname,
+        # so a drifted/incomplete apt list above is diagnosed in ONE run rather than
+        # cascading one exit-127 at a time (the aes67 test binary loads the same
+        # libav* .so, so this is a faithful pre-flight). LD_LIBRARY_PATH (exported by
+        # the extract step) points at the FFmpeg prefix so its own inter-lib deps
+        # resolve. `ldd`'s OWN failure (unmatched glob, unreadable/invalid ELF, loader
+        # error) fails the step too — an empty "not found" list must not false-pass a
+        # check that never actually ran.
+        run: |
+          set -euo pipefail
+          if ! out=$(ldd "${FFMPEG_PREFIX}"/lib/libav*.so.* 2>&1); then
+            echo "::error::ldd failed to inspect the pinned FFmpeg libs: ${out}"
+            exit 1
+          fi
+          missing=$(printf '%s\n' "${out}" | awk '/not found/{print $1}' | sort -u)
+          if [ -n "${missing}" ]; then
+            printf 'missing runtime shared libraries:\n%s\n' "${missing}"
+            echo "::error::pinned FFmpeg is missing the runtime libs listed above on this runner"
+            exit 1
+          fi
+          echo "OK: all pinned-FFmpeg runtime deps resolve on this runner"
+      - name: test multiview-cli --features ffmpeg,aes67 (aes67 lib tests)
+        # Runs the aes67 cli lib unit tests (RX resolve/plan + non-48kHz reject,
+        # TX build + zero-ptime reject, stable ssrc + same-group collision reject,
+        # payload-type/program-audio guards, audio-block framing, and the
+        # audio-store-not-video-tile + cell-binding RED guardrails) on the real
+        # ffmpeg-linked build — these `#[cfg(feature = "aes67")]` tests never execute
+        # on the libav-free matrix, so without this step the aes67 regressions are
+        # compiled but never run. The FFmpeg runtime libs installed above (VAAPI +
+        # opus/srt/oneVPL) let the ffmpeg-linked test binary LOAD (else exit 127),
+        # and the guard step above proves that on every run. `--lib aes67` filters to
+        # the lib target's aes67-named tests; --locked enforces Cargo.lock — cargo ignores it otherwise.
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,aes67
+          --lib aes67
 
   # ── AsyncAPI 3.0 spec validation (SUR-6b follow-on, folded into IN-7) ────────
   # Validates docs/api/asyncapi.json against the AsyncAPI 3.0 JSON Schema using
   # the official @asyncapi/cli. The spec is generated by `cargo xtask gen-asyncapi`
   # and committed; this job fails if the committed file is not valid AsyncAPI 3.0.
-  # The job does NOT re-generate the spec (that would require the full Rust build
-  # here); it validates the already-committed artifact. Regeneration + diff-check
-  # is deferred until SUR-6 (the gen-asyncapi xtask) lands.
+  # The job does NOT re-generate the spec (that needs the full Rust build); it
+  # validates the already-committed artifact (schema-conformance). The companion
+  # `spec-freshness` job below regenerates BOTH specs and fails on any git diff, so
+  # the committed artifact validated here is also guaranteed up to date.
   asyncapi-validate:
     name: AsyncAPI 3.0 spec validation
     runs-on: ubuntu-latest
@@ -273,8 +672,8 @@ jobs:
     # prose allowlist), so this validation always runs whenever a spec moves.
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
       - name: install @asyncapi/cli
@@ -283,6 +682,60 @@ jobs:
         run: npm install --global @asyncapi/cli@2.17.0
       - name: validate asyncapi.json
         run: asyncapi validate docs/api/asyncapi.json
+
+  # ── OpenAPI/AsyncAPI spec freshness (drift gate, ADR-RT006) ──────────────────
+  # The committed specs `docs/api/{openapi,asyncapi}.json` are generated from the
+  # Rust source of truth: openapi.json from `multiview-control`'s utoipa
+  # annotations, asyncapi.json from `multiview-events::asyncapi` — both via
+  # `cargo xtask gen-{openapi,asyncapi}`. Nothing forced a regen when those
+  # annotations changed, so the specs drifted behind the served document (e.g. the
+  # ADR-W024 boot-model endpoints `/config/{boot-model,promote,revert-to-start}`
+  # landed in the utoipa surface without a spec regen). ADR-RT006's Decision is
+  # explicit: "CI regenerates OpenAPI/AsyncAPI ... and fails on any git diff."
+  #
+  # This job regenerates both specs and `git diff --exit-code docs/api/` — failing
+  # if the committed artifacts differ from a fresh generation of the current Rust
+  # sources. It mirrors the `i18n-catalogs` freshness pattern (regenerate → diff).
+  # The generators are deterministic (re-running is byte-identical), so a green
+  # main stays green. Pure-Rust default features (no FFmpeg/GPU) — xtask depends on
+  # `multiview-control` + `multiview-events`, both of which build on the bare
+  # runner, so no native libs are needed.
+  spec-freshness:
+    name: OpenAPI/AsyncAPI spec freshness
+    runs-on: ubuntu-latest
+    # Toolchain + an xtask build (multiview-control's utoipa graph from cold is the
+    # long pole) + two quick gen runs + a diff. 30min covers a cold cargo cache
+    # while still failing a wedged runner far under the 6h default.
+    timeout-minutes: 30
+    needs: changes
+    # A docs/api/** spec change keeps `code == 'true'` (the specs are NOT in the
+    # prose allowlist), and any Rust change to the annotations is code too, so this
+    # freshness check runs whenever either side could move.
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache key — this leg builds xtask + the control/events spec
+          # graph, not the default workspace check/test graph.
+          key: spec-freshness
+      - name: regenerate OpenAPI spec
+        # --locked enforces the committed Cargo.lock for a deterministic build
+        # (cargo ignores it otherwise), matching the discipline of every other cargo invocation here.
+        run: cargo run --locked -p xtask -- gen-openapi
+      - name: regenerate AsyncAPI spec
+        run: cargo run --locked -p xtask -- gen-asyncapi
+      - name: specs are fresh (no uncommitted drift)
+        # Fail if either committed spec differs from a fresh regeneration of the
+        # current Rust sources. The fix is local: run `cargo xtask gen-openapi &&
+        # cargo xtask gen-asyncapi` and commit docs/api/{openapi,asyncapi}.json.
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- docs/api/; then
+            echo "::error::API specs are stale. Run 'cargo run -p xtask -- gen-openapi && cargo run -p xtask -- gen-asyncapi' and commit docs/api/{openapi,asyncapi}.json."
+            exit 1
+          fi
 
   deny:
     name: cargo-deny (licenses + advisories)
@@ -293,16 +746,50 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Run cargo-deny on the runner — the action's musl Docker image cannot
       # honour rust-toolchain.toml's pinned toolchain. Default features only:
       # this is the LGPL-clean build; --all-features would pull the opt-in
       # gpl-codecs (GPL) and fail the license allowlist by design.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  # ── release-artifact feature guard (task #109) ───────────────────────────────
+  # A test-only Cargo feature (multiview-control's `_test-seams`, the config-watch
+  # test-interpose seam) must NEVER compile into a shipped/release artifact.
+  # `cargo deny` cannot gate a feature and there is no reliable "release" cfg, so
+  # this leg RESOLVES each shipped release preset's feature graph with `cargo tree`
+  # (resolution only — never a target compile) and fails if any preset enables a
+  # `*test-seam*` feature on any crate. See docs/runbooks/release-feature-guard.md.
+  release-feature-guard:
+    name: release-feature guard (no shipped _test-seams)
+    runs-on: ubuntu-latest
+    # Building `xtask` (the multiview-control/utoipa graph is the long pole, like
+    # spec-freshness) dominates; the `cargo tree` resolutions themselves compile
+    # nothing. 30min covers a cold cargo cache while failing a wedged runner far
+    # under the 6h default.
+    timeout-minutes: 30
+    needs: changes
+    # A preset / feature change lives in a Cargo.toml (never in the prose
+    # allowlist), so `code == 'true'` whenever a preset or the guard could move.
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache key — this leg builds xtask + the control feature graph,
+          # not the default workspace check/test graph.
+          key: release-feature-guard
+      - name: no shipped release preset enables a test-only seam feature
+        # Resolves nvidia/apple/linux-vaapi/full + the Docker CARGO_FEATURES combos
+        # and fails (exit 1) if any resolves multiview-control/_test-seams (or any
+        # `*test-seam*` feature). Fix: remove the feature edge that pulls the seam
+        # into a release preset. --locked pins the committed Cargo.lock — cargo ignores it otherwise.
+        run: cargo run --locked -p xtask -- check-release-features
 
   # ── always-run light jobs ────────────────────────────────────────────────
   # These run on EVERY push and PR — including docs-only PRs that skip the heavy
@@ -315,7 +802,7 @@ jobs:
     # Checkout + a single grep-based shell script (seconds).
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ./scripts/check-inclusive-language.sh
 
   docs-sanity:
@@ -324,7 +811,7 @@ jobs:
     # Checkout + a dependency-free markdown link-check script (seconds).
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: check relative markdown links resolve
         # Lightweight, dependency-free link check: for every committed Markdown
         # file, resolve each inline relative link target [..](path) against the
@@ -334,22 +821,188 @@ jobs:
         # or ADR) without pulling a Node/Ruby link-checker toolchain.
         run: ./scripts/check-markdown-links.sh
 
-  web:
-    name: web build
+  # Blast-radius classification (docs/standards/engineering.md Part B). Prints the
+  # class this PR owes gates for, so the class is visible on the PR rather than
+  # asserted in its body. Also shellchecks the classifier itself.
+  #
+  # ADDITIVE and ADVISORY: this job reports, it never fails a build on the class.
+  # It does NOT replace or gate the `changes` job above — `changes` decides which
+  # CI jobs run; this decides which human/agent gates the change owes. The two
+  # share one prose allowlist (ADR-0046) deliberately so they cannot disagree.
+  # Not gated on `changes`: it is seconds long and a docs-only PR still has a class.
+  classify:
+    name: change class
     runs-on: ubuntu-latest
-    # npm install + Vite production build (~1-5min). 20min absorbs a cold npm
-    # cache and a slow registry while still failing a wedge well under 6h.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The classifier diffs against the merge base, so it needs real history.
+          fetch-depth: 0
+      - name: shellcheck the classifier
+        # The Ubuntu runner ships shellcheck (same pattern as soak-harness below).
+        run: shellcheck scripts/classify.sh
+      - name: classify the change
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_REF}" ]; then
+            git fetch --no-tags --depth=0 origin "${GITHUB_BASE_REF}" || true
+            ./scripts/classify.sh "${BASE_REF}" | tee "${GITHUB_STEP_SUMMARY}"
+          else
+            # push to main: classify the pushed commit against its parent.
+            ./scripts/classify.sh "HEAD~1" | tee "${GITHUB_STEP_SUMMARY}"
+          fi
+
+  soak-harness:
+    name: soak harness self-test (DEV-C4)
+    runs-on: ubuntu-latest
+    # shellcheck (seconds) + a `cargo run -p xtask` build for the --dry-run leg.
+    # The toolchain + xtask build dominate; 20min covers a cold cache.
     timeout-minutes: 20
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - name: shellcheck the acceptance-soak harness
+        # The Ubuntu runner ships shellcheck; lint the harness so a quoting/word-
+        # split bug in the real-run scrape/skew path is caught (ADR-R012).
+        run: shellcheck scripts/soak-acceptance.sh
+      - name: soak harness --dry-run (analyzer wiring, no hardware)
+        # Feeds bundled fixtures through `cargo xtask soak-report` and asserts a
+        # clean capture PASSes while a single-node offset breach, a CROSS-NODE
+        # SKEW breach, and a cadence stall each FAIL — the CI-exercised proof that
+        # the harness→analyzer wiring gates a de-synced/stalled deployment.
+        run: ./scripts/soak-acceptance.sh --dry-run
+
+  # ── web SPA gates (eslint + tsc + vitest + build) ────────────────────────────
+  # Gates the EXISTING web/ scripts (web/package.json): `lint` (eslint
+  # --max-warnings=0), an explicit `tsc --noEmit` typecheck, `test` (vitest run),
+  # and `build` (lingui compile && tsc --noEmit && vite build). `npm ci` honours
+  # the committed web/package-lock.json (deterministic builds), and the
+  # built-in setup-node npm cache (keyed on the lockfile) keeps the install fast.
+  # tsc is run as its own step (ahead of the heavier build) so a type error
+  # reports as a distinct, early failure even though `build` also runs tsc.
+  web:
+    name: web (eslint + tsc + vitest + build)
+    runs-on: ubuntu-latest
+    # npm ci + eslint + tsc + vitest + Vite production build (~2-6min). 20min
+    # absorbs a cold npm cache and a slow registry while still failing a wedge
+    # well under 6h.
+    timeout-minutes: 20
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: install
         working-directory: web
-        run: npm install
+        run: npm ci
+      - name: lint (eslint)
+        working-directory: web
+        run: npm run lint
+      - name: typecheck (tsc --noEmit)
+        working-directory: web
+        run: npx tsc --noEmit
+      - name: test (vitest)
+        working-directory: web
+        run: npm test
       - name: build
         working-directory: web
         run: npm run build
+
+  # ── web Playwright end-to-end (real browser) ─────────────────────────────────
+  # Drives the REAL built SPA in a real Chromium (the failure class these specs
+  # guard — e.g. the ResourceTable re-render-loop renderer OOM — only reproduces
+  # with real browser effects jsdom does not implement; see web/playwright.config.ts).
+  # The Playwright webServer builds the app and serves `dist` via `vite preview`,
+  # mocking the API per-test (page.route), so no backend is required. The runner's
+  # auto-set CI=true makes the config enforce forbidOnly + no server reuse. This is
+  # a separate (heavier: chromium download + browser run) job so it parallelises
+  # with the lint/tsc/vitest/build job above and stays legible.
+  web-e2e:
+    name: web e2e (Playwright)
+    runs-on: ubuntu-latest
+    # npm ci + chromium download (~110MB) + a build + 11 browser specs (~1-3min
+    # warm). 25min absorbs a cold npm + browser cache and the in-webServer build.
+    timeout-minutes: 25
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install
+        working-directory: web
+        run: npm ci
+      - name: install Playwright chromium
+        # --with-deps pulls the OS libraries Chromium needs on the ubuntu runner;
+        # the config launches with --no-sandbox for the containerised browser.
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: e2e (playwright)
+        # The webServer block builds the SPA and serves it; the specs mock the API.
+        working-directory: web
+        run: npm run test:e2e
+
+  # ── i18n catalog freshness (lingui extract + compile must be committed) ──────
+  # The production `vite build` lingui macro STRIPS the source-string fallback, so
+  # any `<Trans>`/`t` string NOT present in the compiled catalog renders as a
+  # content-hash ID *in production only* (dev/test keep the fallback, so vitest +
+  # build stay green). The other web gates (eslint/tsc/vitest/build) never run
+  # `lingui extract`, so a catalog that drifts behind the source strings ships
+  # broken hash IDs with a green CI. This job makes that drift a hard failure: it
+  # runs the SAME canonical scripts the app uses (web/package.json `i18n:extract` /
+  # `i18n:compile` → lingui.config.ts), with `--clean` so obsolete entries are
+  # pruned too, then `git diff --exit-code` on web/src/locales/** — failing if the
+  # committed catalogs differ from a fresh extract+compile of the current sources.
+  i18n-catalogs:
+    name: i18n catalog freshness (lingui)
+    runs-on: ubuntu-latest
+    # npm ci + a lingui extract + compile over the source tree (~1-2min). 15min
+    # absorbs a cold npm cache while still failing a wedge far under 6h.
+    timeout-minutes: 15
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install
+        working-directory: web
+        run: npm ci
+      - name: extract message catalogs (lingui extract --clean)
+        # The canonical `i18n:extract` script (`lingui extract`) plus `--clean` to
+        # also drop obsolete entries — re-scans every `t`/`<Trans>` macro in src/
+        # into the per-locale PO catalogs. Any new/changed string surfaces here.
+        working-directory: web
+        run: npm run i18n:extract -- --clean
+      - name: compile message catalogs (lingui compile)
+        # The canonical `i18n:compile` script — regenerates the compiled `.ts`
+        # catalogs the production build imports (the prod macro strips the source
+        # fallback, so these MUST match the `.po` sources).
+        working-directory: web
+        run: npm run i18n:compile
+      - name: catalogs are fresh (no uncommitted drift)
+        # Fail if the committed catalogs differ from the fresh extract+compile.
+        # The fix is local: run `npm --prefix web run i18n:extract -- --clean &&
+        # npm --prefix web run i18n:compile` and commit web/src/locales/**.
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- web/src/locales/; then
+            echo "::error::i18n catalogs are stale. Run 'npm --prefix web run i18n:extract -- --clean && npm --prefix web run i18n:compile' and commit web/src/locales/**."
+            exit 1
+          fi

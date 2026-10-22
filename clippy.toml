@@ -9,3 +9,9 @@ allow-panic-in-tests            = true
 allow-dbg-in-tests              = true
 allow-print-in-tests            = true
 allow-indexing-slicing-in-tests = true
+
+# Domain acronyms that are prose in doc comments and must NOT trip
+# `clippy::doc_markdown` (which flags mixed-case tokens as "missing backticks").
+# `..` preserves clippy's built-in default ident list. `PoP` = device
+# proof-of-possession (the Conspect device-licensing wire, ADR-I007).
+doc-valid-idents = ["PoP", ".."]

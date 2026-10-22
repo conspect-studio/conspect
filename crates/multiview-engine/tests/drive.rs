@@ -420,7 +420,6 @@ fn per_cell_opacity_cross_fades_overlapping_tiles_in_linear_light() {
                 fit: FitMode::Contain,
                 source: Some("bottom".to_owned()),
                 opacity: 1.0,
-                ..Cell::default()
             },
             Cell {
                 x: 0.0,
@@ -431,7 +430,6 @@ fn per_cell_opacity_cross_fades_overlapping_tiles_in_linear_light() {
                 fit: FitMode::Contain,
                 source: Some("top".to_owned()),
                 opacity: 0.5,
-                ..Cell::default()
             },
         ],
     };

@@ -475,10 +475,10 @@ mod tests {
         h.observe(0.0);
         h.observe(123.0);
         let snap = h.snapshot();
-        assert!(snap.bounds.is_empty());
+        assert_eq!(snap.bounds, Vec::<f64>::new());
         assert_eq!(snap.overflow, 2);
         assert_eq!(snap.count, 2);
-        assert!(snap.cumulative_counts().is_empty());
+        assert_eq!(snap.cumulative_counts(), Vec::<u64>::new());
         assert_eq!(snap.inf_count(), 2);
     }
 

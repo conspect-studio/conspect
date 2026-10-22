@@ -205,6 +205,288 @@ export function parseTilesSnapshot(
   };
 }
 
+// --- devices topic (ADR-M008 / ADR-RT007) -----------------------------------
+
+// The device payload types come from the generated AsyncAPI schema — the
+// canonical source of truth for the `devices` topic. The guards below narrow
+// raw `data` defensively (§2: unknown shapes are dropped, never thrown on).
+import type {
+  AchievedSync,
+  DeviceCapabilities,
+  DeviceDiscovered,
+  DeviceState,
+  DeviceStatus,
+  DeviceStreamStatus,
+  DeviceSyncSummary,
+  ImpactClass,
+  MediaPlayerEvent,
+  MediaPlayerState,
+  SyncCapability,
+} from "./generated-types";
+
+// Runtime guard over the six canonical DeviceState values from the generated
+// spec, pinned here so a spec/runtime divergence is immediately visible.
+function isDeviceState(value: unknown): value is DeviceState {
+  return (
+    value === "DISCOVERED" ||
+    value === "ADOPTING" ||
+    value === "ONLINE" ||
+    value === "DEGRADED" ||
+    value === "AUTH_FAILED" ||
+    value === "UNREACHABLE"
+  );
+}
+
+function isAchievedSync(value: unknown): value is AchievedSync {
+  return value === "frame-accurate" || value === "bounded-skew" || value === "none";
+}
+
+function isSyncCapability(value: unknown): value is SyncCapability {
+  return value === "frame-accurate" || value === "offset-only" || value === "none";
+}
+
+function parseStreamStatus(value: unknown): DeviceStreamStatus | undefined {
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+  const role = record.role;
+  if ((role !== "encode" && role !== "decode") || typeof record.healthy !== "boolean") {
+    return undefined;
+  }
+  const stream: {
+    role: "encode" | "decode";
+    healthy: boolean;
+    bitrate_bps?: number;
+    fps?: number;
+    output_ref?: string;
+  } = { role, healthy: record.healthy };
+  if (typeof record.bitrate_bps === "number") {
+    stream.bitrate_bps = record.bitrate_bps;
+  }
+  if (typeof record.fps === "number") {
+    stream.fps = record.fps;
+  }
+  if (typeof record.output_ref === "string") {
+    stream.output_ref = record.output_ref;
+  }
+  return stream;
+}
+
+function parseSyncSummary(value: unknown): DeviceSyncSummary | undefined {
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+  if (
+    typeof record.group !== "string" ||
+    !isAchievedSync(record.achieved) ||
+    typeof record.offset_ms !== "number"
+  ) {
+    return undefined;
+  }
+  return { group: record.group, achieved: record.achieved, offset_ms: record.offset_ms };
+}
+
+function parseCapabilities(value: unknown): DeviceCapabilities | undefined {
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+  if (
+    typeof record.audio !== "boolean" ||
+    typeof record.decode !== "boolean" ||
+    typeof record.display !== "boolean" ||
+    typeof record.encode !== "boolean" ||
+    typeof record.firmware_update !== "boolean" ||
+    typeof record.reboot !== "boolean" ||
+    !isSyncCapability(record.sync)
+  ) {
+    return undefined;
+  }
+  return {
+    audio: record.audio,
+    decode: record.decode,
+    display: record.display,
+    encode: record.encode,
+    firmware_update: record.firmware_update,
+    reboot: record.reboot,
+    sync: record.sync,
+  };
+}
+
+/**
+ * Narrow an envelope `data` to a `device.status` snapshot (the conflated
+ * latest-wins lane; also the wire shape of the `/devices/{id}/status` REST
+ * fallback). Optional facets parse independently: a malformed sub-shape is
+ * dropped, the snapshot survives.
+ */
+export function parseDeviceStatus(data: unknown): DeviceStatus | undefined {
+  const record = asRecord(data);
+  if (record === undefined) {
+    return undefined;
+  }
+  if (typeof record.device_id !== "string" || !isDeviceState(record.state)) {
+    return undefined;
+  }
+  const status: {
+    device_id: string;
+    state: DeviceState;
+    mode?: string;
+    last_seen_ts?: number;
+    temperature_c?: number;
+    streams?: readonly DeviceStreamStatus[];
+    sync?: DeviceSyncSummary;
+    capabilities?: DeviceCapabilities;
+  } = { device_id: record.device_id, state: record.state };
+  if (typeof record.mode === "string") {
+    status.mode = record.mode;
+  }
+  if (typeof record.last_seen_ts === "number") {
+    status.last_seen_ts = record.last_seen_ts;
+  }
+  if (typeof record.temperature_c === "number") {
+    status.temperature_c = record.temperature_c;
+  }
+  if (Array.isArray(record.streams)) {
+    const streams: DeviceStreamStatus[] = [];
+    for (const raw of record.streams) {
+      const stream = parseStreamStatus(raw);
+      if (stream !== undefined) {
+        streams.push(stream);
+      }
+    }
+    status.streams = streams;
+  }
+  const sync = parseSyncSummary(record.sync);
+  if (sync !== undefined) {
+    status.sync = sync;
+  }
+  const capabilities = parseCapabilities(record.capabilities);
+  if (capabilities !== undefined) {
+    status.capabilities = capabilities;
+  }
+  return status;
+}
+
+/**
+ * A device lifecycle event from the lossless `devices` lane, normalized for
+ * the session event ring (the Events tab).
+ */
+export type DeviceLifecycleEvent =
+  | {
+      readonly kind: "adopted";
+      readonly deviceId: string;
+      readonly driver: string;
+      readonly name?: string;
+    }
+  | { readonly kind: "removed"; readonly deviceId: string }
+  | {
+      readonly kind: "mode";
+      readonly deviceId: string;
+      readonly mode: string;
+      readonly phase: "started" | "finished" | "failed";
+      readonly impact: ImpactClass;
+      readonly detail?: string;
+    }
+  | {
+      readonly kind: "error";
+      readonly deviceId: string;
+      readonly message: string;
+      readonly code?: string;
+    };
+
+function isImpactClass(value: unknown): value is ImpactClass {
+  return value === "cp" || value === "c1" || value === "c2" || value === "dev";
+}
+
+/**
+ * Narrow a lossless devices-lane event (`device.adopted` / `device.removed` /
+ * `device.mode` / `device.error`) to its normalized form, or `undefined` for
+ * any other `t` or a malformed payload.
+ */
+export function parseDeviceEvent(
+  t: string,
+  data: unknown,
+): DeviceLifecycleEvent | undefined {
+  const record = asRecord(data);
+  if (record === undefined || typeof record.device_id !== "string") {
+    return undefined;
+  }
+  const deviceId = record.device_id;
+  switch (t) {
+    case "device.adopted": {
+      if (typeof record.driver !== "string") {
+        return undefined;
+      }
+      return typeof record.name === "string"
+        ? { kind: "adopted", deviceId, driver: record.driver, name: record.name }
+        : { kind: "adopted", deviceId, driver: record.driver };
+    }
+    case "device.removed":
+      return { kind: "removed", deviceId };
+    case "device.mode": {
+      const phase = record.phase;
+      if (
+        typeof record.mode !== "string" ||
+        (phase !== "started" && phase !== "finished" && phase !== "failed") ||
+        !isImpactClass(record.impact)
+      ) {
+        return undefined;
+      }
+      return typeof record.detail === "string"
+        ? {
+            kind: "mode",
+            deviceId,
+            mode: record.mode,
+            phase,
+            impact: record.impact,
+            detail: record.detail,
+          }
+        : { kind: "mode", deviceId, mode: record.mode, phase, impact: record.impact };
+    }
+    case "device.error": {
+      if (typeof record.message !== "string") {
+        return undefined;
+      }
+      return typeof record.code === "string"
+        ? { kind: "error", deviceId, message: record.message, code: record.code }
+        : { kind: "error", deviceId, message: record.message };
+    }
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Narrow an envelope `data` to a `device.discovered` row (an UNTRUSTED hint
+ * streamed while a scan runs, correlated via the envelope `corr`; ADR-0041).
+ */
+export function parseDeviceDiscovered(data: unknown): DeviceDiscovered | undefined {
+  const record = asRecord(data);
+  if (record === undefined) {
+    return undefined;
+  }
+  const family = record.family;
+  if (
+    typeof record.address !== "string" ||
+    typeof record.driver !== "string" ||
+    (family !== "ipv6" && family !== "ipv4-legacy")
+  ) {
+    return undefined;
+  }
+  const row: {
+    address: string;
+    driver: string;
+    family: "ipv6" | "ipv4-legacy";
+    name?: string;
+  } = { address: record.address, driver: record.driver, family };
+  if (typeof record.name === "string") {
+    row.name = record.name;
+  }
+  return row;
+}
+
 /** Narrow an envelope `data` to a tile.state delta payload. */
 export function parseTileStateDelta(
   data: unknown,
@@ -239,4 +521,74 @@ export function parseTileStateDelta(
     delta.since_ts = record.since_ts;
   }
   return delta;
+}
+
+// --- switcher topic: media players (ADR-0057 / ADR-0097 / ADR-RT008) ---------
+
+// Narrow an unknown value to a `MediaPlayerState` (the discriminated transport
+// state, tagged by `kind`). The seven known kinds from the generated AsyncAPI
+// schema are pinned here so a spec/runtime divergence is immediately visible;
+// `vamping` additionally requires a boolean `exit_armed`. An unrecognized or
+// malformed shape returns `undefined` and the whole frame is dropped (§2:
+// unknown shapes are dropped, never thrown on) — forward-compatible.
+function parseMediaPlayerState(value: unknown): MediaPlayerState | undefined {
+  const record = asRecord(value);
+  if (record === undefined || typeof record.kind !== "string") {
+    return undefined;
+  }
+  switch (record.kind) {
+    case "loading":
+    case "cued":
+    case "playing":
+    case "paused":
+    case "stopped":
+    case "eof":
+      return { kind: record.kind };
+    case "vamping":
+      if (typeof record.exit_armed !== "boolean") {
+        return undefined;
+      }
+      return { kind: "vamping", exit_armed: record.exit_armed };
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Narrow an envelope `data` to a `media.player_state` event (topic `switcher`,
+ * envelope `id` = player id; ADR-RT008). A LOSSLESS transport-state transition:
+ * the player's new {@link MediaPlayerState} plus the integer `position_frames`
+ * playhead and the optional loaded `asset`. A malformed payload is dropped.
+ */
+export function parseMediaPlayerEvent(
+  data: unknown,
+): MediaPlayerEvent | undefined {
+  const record = asRecord(data);
+  if (record === undefined) {
+    return undefined;
+  }
+  if (
+    typeof record.player !== "string" ||
+    typeof record.position_frames !== "number"
+  ) {
+    return undefined;
+  }
+  const state = parseMediaPlayerState(record.state);
+  if (state === undefined) {
+    return undefined;
+  }
+  const event: {
+    player: string;
+    position_frames: number;
+    state: MediaPlayerState;
+    asset?: string;
+  } = {
+    player: record.player,
+    position_frames: record.position_frames,
+    state,
+  };
+  if (typeof record.asset === "string") {
+    event.asset = record.asset;
+  }
+  return event;
 }

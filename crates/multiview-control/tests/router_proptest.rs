@@ -243,5 +243,5 @@ fn ember_module_reexports_are_reachable() {
         value: None,
     };
     let frame = ember::s101::encode(&node.encode_ber());
-    assert!(!frame.is_empty());
+    assert_ne!(frame, Vec::<u8>::new());
 }

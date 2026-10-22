@@ -240,11 +240,13 @@ export function sourceLocatorKey(kind: SourceKind): 'url' | 'name' | 'path' | un
     case 'file':
       return 'path';
     // Synthetic kinds (ADR-0027 / ADR-0047) carry no locator; `test` is the
-    // legacy alias.
+    // legacy alias. `webrtc` (WHIP ingest) carries no authored locator either —
+    // its publish endpoint is DERIVED from the id (see {@link whipPublishUrl}).
     case 'bars':
     case 'solid':
     case 'clock':
     case 'timer':
+    case 'webrtc':
     case 'test':
       return undefined;
     default:
@@ -252,10 +254,31 @@ export function sourceLocatorKey(kind: SourceKind): 'url' | 'name' | 'path' | un
   }
 }
 
-/** The body key that carries an output kind's target (mount/path/url/name/connector). */
+/**
+ * The derived WHIP publish endpoint for a `webrtc` source (ADR-T014): a
+ * publisher (OBS, GStreamer, a browser) POSTs its SDP offer here. Relative to
+ * the control-plane origin; the locator is never authored.
+ */
+export function whipPublishUrl(sourceId: string): string {
+  return `/api/v1/whip/${encodeURIComponent(sourceId)}`;
+}
+
+/**
+ * The derived WHEP play endpoint for a `webrtc` output (ADR-0049): a viewer
+ * POSTs its SDP offer here. Relative to the control-plane origin.
+ */
+export function whepPlayUrl(outputId: string): string {
+  return `/api/v1/whep/${encodeURIComponent(outputId)}`;
+}
+
+/**
+ * The body key that carries an output kind's target, or `undefined` when the
+ * target is DERIVED rather than authored (a `webrtc` output's WHEP play URL is
+ * computed from the id — see {@link whepPlayUrl}).
+ */
 export function outputTargetKey(
   kind: OutputKind,
-): 'mount' | 'path' | 'url' | 'name' | 'connector' {
+): 'mount' | 'path' | 'url' | 'name' | 'connector' | undefined {
   switch (kind) {
     case 'rtsp':
       return 'mount';
@@ -266,6 +289,9 @@ export function outputTargetKey(
       return 'name';
     case 'display':
       return 'connector';
+    case 'webrtc':
+      return undefined;
+    // rtmp / srt / whip-push push to an authored url.
     default:
       return 'url';
   }
@@ -280,13 +306,15 @@ export function outputHasCodec(kind: OutputKind): boolean {
 }
 
 function asOutputKind(value: string | undefined): OutputKind {
-  // The config wire kinds use snake_case (`rtsp_server`, `ll_hls`); fold them to
-  // the display kinds the OutputView exposes.
+  // The config wire kinds use snake_case (`rtsp_server`, `ll_hls`,
+  // `whip_push`); fold them to the display kinds the OutputView exposes.
   switch (value) {
     case 'rtsp_server':
       return 'rtsp';
     case 'll_hls':
       return 'll-hls';
+    case 'whip_push':
+      return 'whip-push';
     default:
       return OUTPUT_KINDS.find((k) => k === value) ?? 'rtsp';
   }
@@ -308,13 +336,21 @@ export function toSourceView(record: ResourceRecord): SourceView {
   const raw = stringField(record.body, 'kind');
   const kind = asSourceKind(raw);
   const locatorKey = sourceLocatorKey(kind);
+  // A `webrtc` source has no authored locator: its WHIP publish endpoint is
+  // derived from the id, and that is what the operator hands a publisher.
+  const locator =
+    kind === 'webrtc'
+      ? whipPublishUrl(record.id)
+      : locatorKey !== undefined
+        ? stringField(record.body, locatorKey)
+        : undefined;
   return {
     id: record.id,
     name: record.name,
     kind,
     rawKind: raw ?? kind,
     editable: parseSourceFormKind(raw) !== undefined,
-    locator: locatorKey !== undefined ? stringField(record.body, locatorKey) : undefined,
+    locator,
   };
 }
 
@@ -322,13 +358,22 @@ export function toSourceView(record: ResourceRecord): SourceView {
 export function toOutputView(record: ResourceRecord): OutputView {
   const raw = stringField(record.body, 'kind');
   const kind = asOutputKind(raw);
+  const targetKey = outputTargetKey(kind);
+  // A served `webrtc` output's target is its DERIVED WHEP play URL (from the
+  // id); every other kind reads its authored locator key.
+  const target =
+    kind === 'webrtc'
+      ? whepPlayUrl(record.id)
+      : targetKey !== undefined
+        ? stringField(record.body, targetKey)
+        : undefined;
   return {
     id: record.id,
     name: record.name,
     kind,
     rawKind: raw ?? kind,
     editable: parseOutputFormKind(raw) !== undefined,
-    target: stringField(record.body, outputTargetKey(kind)),
+    target,
     codec: outputHasCodec(kind) ? stringField(record.body, 'codec') : undefined,
   };
 }

@@ -96,6 +96,17 @@ fn out_of_order_window_is_rejected() {
     );
 }
 
+// `AssCapability::detect()` is a COMPILE-TIME capability keyed on the `libass`
+// Cargo feature (libass.rs: `Available` iff built `--features libass`, else
+// `Unavailable`). The two cases are therefore mutually exclusive per build, so
+// each is cfg-gated to the configuration it actually holds in — neither
+// assertion is weakened (rule 19): the libass-OFF assertion still runs
+// unconditionally in the default build, and the libass-ON assertion is the exact
+// dual. This gating is what lets the `multiview-overlay --features libass` CI leg
+// run `cargo test` (not just clippy): without it, the libass-OFF assertion is red
+// by design once the feature is on (#141).
+
+#[cfg(not(feature = "libass"))]
 #[test]
 fn ass_capability_falls_back_to_plain_text_without_libass() {
     // The default build is pure-Rust (no `libass` feature), so ASS rendering is
@@ -105,4 +116,15 @@ fn ass_capability_falls_back_to_plain_text_without_libass() {
     assert_eq!(cap, AssCapability::Unavailable);
     assert!(!cap.is_available());
     assert_eq!(cap.fallback(), SubtitleFallback::PlainText);
+}
+
+#[cfg(feature = "libass")]
+#[test]
+fn ass_capability_is_available_with_libass() {
+    // Built `--features libass`: ASS rendering IS available, so the engine takes
+    // the native libass styling path (the dual of the libass-OFF fallback above).
+    let cap = AssCapability::detect();
+    assert_eq!(cap, AssCapability::Available);
+    assert!(cap.is_available());
+    assert_eq!(cap.fallback(), SubtitleFallback::Libass);
 }

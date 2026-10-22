@@ -123,5 +123,5 @@ fn diff_between_two_revisions_via_store() {
         .unwrap();
     assert_eq!(d.added, vec!["b".to_owned()]);
     assert_eq!(d.changed, vec!["a".to_owned()]);
-    assert!(d.removed.is_empty());
+    assert_eq!(d.removed, Vec::<std::string::String>::new());
 }

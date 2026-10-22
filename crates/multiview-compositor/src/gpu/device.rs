@@ -23,6 +23,23 @@ fn adapter_match_info(info: &wgpu::AdapterInfo) -> AdapterMatchInfo {
     }
 }
 
+/// Whether `adapter`, with `features` enabled, can bind the NV12 output planes
+/// (`r8unorm` Y, `rg8unorm` UV) as write-only storage textures — what the
+/// encode pass (gpu/shaders/encode.wgsl) requires.
+fn supports_nv12_storage_writes(adapter: &wgpu::Adapter, features: wgpu::Features) -> bool {
+    features.contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+        && [wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm]
+            .into_iter()
+            .all(|format| {
+                let caps = adapter.get_texture_format_features(format);
+                caps.allowed_usages
+                    .contains(wgpu::TextureUsages::STORAGE_BINDING)
+                    && caps
+                        .flags
+                        .contains(wgpu::TextureFormatFeatureFlags::STORAGE_WRITE_ONLY)
+            })
+}
+
 /// A headless wgpu device + queue (no surface — the compositor renders into
 /// textures and reads back to NV12).
 #[derive(Debug)]
@@ -87,6 +104,13 @@ impl GpuContext {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                // wgpu 30 adds limit *bucketing*: quantising the adapter's real
+                // limits into coarse buckets to blunt fingerprinting when wgpu is
+                // exposed to UNTRUSTED web content. Multiview is trusted native code
+                // that deliberately requests the adapter's true `limits()` below (a
+                // 4K canvas needs the real `max_texture_dimension_2d`, not a bucketed
+                // floor), so bucketing stays OFF — matching the wgpu-types default.
+                apply_limit_buckets: false,
             }))
             .map_err(|e| Error::NoAdapter(e.to_string()))?,
         };
@@ -101,8 +125,20 @@ impl GpuContext {
         // so the request stays graceful on an adapter that lacks it (the GPU
         // encode path is only selected when a real adapter is present — a
         // software/llvmpipe adapter falls back to the CPU reference compositor).
+        //
+        // An adapter that cannot write both NV12 planes as storage textures
+        // (e.g. a software GL/llvmpipe adapter) would make wgpu PANIC inside
+        // `create_bind_group_layout` (its default uncaptured-error handler), so
+        // it is rejected here with a typed error and the selector takes the CPU
+        // reference path — never a panic (safety rule).
         let required_features =
             wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES & adapter.features();
+        if !supports_nv12_storage_writes(&adapter, required_features) {
+            return Err(Error::NoAdapter(format!(
+                "wgpu adapter {:?} cannot write r8unorm/rg8unorm storage textures (NV12 encode)",
+                adapter.get_info().name
+            )));
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("multiview-compositor device"),

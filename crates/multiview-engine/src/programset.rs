@@ -1,8 +1,8 @@
 //! The **`ProgramSet`** supervisor + N independent output clocks (ADR-0030 §2,
 //! MP-1).
 //!
-//! MP-0 introduced [`MultiviewProgram`](crate::MultiviewProgram): one program's
-//! own [`OutputClock`](crate::OutputClock), [`CompositorDrive`](crate::CompositorDrive),
+//! MP-0 introduced [`MultiviewProgram`]: one program's
+//! own [`OutputClock`], [`CompositorDrive`],
 //! and [`StopSignal`](crate::StopSignal), driving the protected per-tick loop. The
 //! CLI run path drove **one** such program. MP-1 adds the **supervisor** so **N**
 //! programs run concurrently, each on its **own** independent clock.
@@ -12,7 +12,7 @@
 //! * **One shared time *source*, N independent output *clocks*.** Every program
 //!   reads the **same** read-only [`Arc<dyn TimeSource>`](crate::TimeSource) for a
 //!   common monotonic reference, but each owns its **own**
-//!   [`OutputClock`](crate::OutputClock) + [`EngineRuntime`](crate::EngineRuntime)
+//!   [`OutputClock`] + [`EngineRuntime`](crate::EngineRuntime)
 //!   at its own cadence and seed. A 25 fps program and a 60 fps program advance on
 //!   their own tick counters off the one shared reference — a master tick cannot
 //!   serve both without resampling one (violating invariant #3). **There is no
@@ -20,13 +20,13 @@
 //!   invariant #1's "one program stalling never stalls another" **structural**:
 //!   each runtime awaits only its own pacer deadline (`runtime.rs` `run_inner`).
 //! * **`Program` is the supervised actor.** Each [`Program`] runs on its **own**
-//!   `tokio` task and implements [`Actor`](crate::Actor), so the existing
-//!   [`Supervisor`](crate::Supervisor) + [`RestartPolicy`](crate::RestartPolicy)
+//!   `tokio` task and implements [`Actor`], so the existing
+//!   [`Supervisor`] + [`RestartPolicy`]
 //!   restart a *crashed* program with capped backoff while every **other** program
 //!   keeps emitting. Failure is contained to one task.
 //! * **`ProgramSet` is the supervisor/coordinator** — the only thing that knows
 //!   there are many. It owns the shared `Arc<dyn TimeSource>`, the
-//!   [`RestartPolicy`](crate::RestartPolicy), and the `ProgramId → ProgramHandle`
+//!   [`RestartPolicy`], and the `ProgramId → ProgramHandle`
 //!   map. [`ProgramSet::start`] admits + spawns **without touching** other
 //!   programs; [`ProgramSet::stop`] raises **only** that program's
 //!   [`StopSignal`](crate::StopSignal), drains its egress, and joins. No other
@@ -161,7 +161,7 @@ enum Runner<P> {
 
 /// A self-contained, independently-supervised output **program**, ready to run on
 /// one `tokio` task under a [`ProgramSet`]: one independent clock (its own
-/// [`OutputClock`](crate::OutputClock)) reading the set's shared time source.
+/// [`OutputClock`]) reading the set's shared time source.
 ///
 /// A program is either **engine-native multiview** (its own [`MultiviewProgram`] +
 /// isolated [`EnginePublisher`] + bounded drop-oldest egress) or an **external**
@@ -474,7 +474,7 @@ struct ProgramHandle {
 
 /// The **`ProgramSet`** supervisor: owns the `ProgramId → ProgramHandle` map and
 /// the **one** shared read-only [`Arc<dyn TimeSource>`](crate::TimeSource) every
-/// program reads, plus the [`RestartPolicy`](crate::RestartPolicy) the per-program
+/// program reads, plus the [`RestartPolicy`] the per-program
 /// supervisors use (ADR-0030 §2.2).
 ///
 /// `P` is the [`Pacer`] all programs in this set share (production
@@ -499,14 +499,14 @@ pub struct ProgramSet<P> {
 
 impl<P: Pacer + Send + 'static> ProgramSet<P> {
     /// Create an empty program set over a shared time source, using the default
-    /// [`RestartPolicy`](crate::RestartPolicy).
+    /// [`RestartPolicy`].
     #[must_use]
     pub fn new(time: Arc<dyn TimeSource>) -> Self {
         Self::with_policy(time, RestartPolicy::default_policy())
     }
 
     /// Create an empty program set over a shared time source with an explicit
-    /// per-program [`RestartPolicy`](crate::RestartPolicy).
+    /// per-program [`RestartPolicy`].
     #[must_use]
     pub fn with_policy(time: Arc<dyn TimeSource>, policy: RestartPolicy) -> Self {
         Self {

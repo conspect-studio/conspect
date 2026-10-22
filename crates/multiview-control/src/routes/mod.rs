@@ -26,12 +26,16 @@ pub mod account;
 pub mod alarms;
 pub mod audio;
 pub mod audit;
+pub mod cast_sessions;
 pub mod config;
 pub mod devices;
 pub mod discovery;
 pub mod health;
 pub mod inputs;
 pub mod licence;
+pub mod logs;
+pub mod media_players;
+pub mod mesh;
 pub mod outputs;
 pub mod overlays;
 pub mod preview;
@@ -39,8 +43,13 @@ pub mod probes;
 pub mod routing;
 pub mod salvos;
 pub mod sources;
+pub mod support;
 pub mod sync_groups;
+pub mod system;
 pub mod tally;
+pub mod telemetry;
+pub mod whep_output;
+pub mod whip;
 
 /// A `202 Accepted` body returned for an asynchronously-applied command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,11 +145,17 @@ async fn list_layouts(
     principal: Principal,
 ) -> ControlResult<Json<Vec<Layout>>> {
     principal.role.require(Action::Read)?;
+    // Per-object ROW visibility (BOLA, ADR-W005/ADR-W025): a layout is gated by
+    // its OWN id (`get_layout` 403s an out-of-scope id), so the list must drop
+    // rows outside the allowlist — exactly as `list_devices` does. A layout
+    // carries no embedded device_ref, so the row filter alone is complete; it is
+    // a no-op for an unscoped principal.
     let layouts = state
         .repository
         .list_layouts()?
         .into_iter()
         .map(|v| v.layout)
+        .filter(|layout| crate::auth::authorize_object(&principal, &layout.id).is_ok())
         .collect();
     Ok(Json(layouts))
 }
@@ -381,6 +396,116 @@ pub(crate) fn submit_accepted_body(
     }
 }
 
+/// Redact embedded **managed-device id** references from a resource `body` that a
+/// scoped principal is not authorized to see (BOLA visibility, ADR-W005/ADR-W025).
+///
+/// Some config objects carry a managed device id in a *field* rather than being a
+/// device collection: a device-projected source/output via `device_ref`
+/// (ADR-M009), and a sync group's `members[].device` (ADR-M010). The resource
+/// itself is gated by its own id, so an in-scope principal still sees the row —
+/// but an **out-of-scope device id embedded in it would leak the device's
+/// existence**, exactly the enumeration a single-device `GET` would `403`. So for
+/// an object-scoped principal this drops any such reference whose device is
+/// outside the allowlist:
+///
+/// * top-level `body.device_ref` (source/output) — the key is removed.
+/// * each `body.members[].device` (sync group) — the key is removed from that
+///   member object (the member entry and its `offset_ms` stay; only the hidden
+///   device id is dropped).
+///
+/// An **unscoped** principal (`scoped_object_ids: None`, the default
+/// admin/operator/viewer) is a no-op — every reference is shown unchanged. This
+/// is a pure read-side projection on the response body; it never mutates the
+/// stored resource.
+pub(crate) fn redact_out_of_scope_device_refs(
+    principal: &Principal,
+    resource: &mut crate::resource_store::Resource,
+) {
+    redact_device_refs_in_body(principal, &mut resource.body);
+}
+
+/// Redact embedded out-of-scope managed-device id references **in a body
+/// [`serde_json::Value`]** for a scoped principal (BOLA visibility,
+/// ADR-W005/ADR-W025) — the shape-level core of
+/// [`redact_out_of_scope_device_refs`].
+///
+/// Operates directly on a JSON body so it serves both a wrapped
+/// [`Resource`](crate::resource_store::Resource) (the live source/output/
+/// sync-group reads) and a bare body value (an **audit `detail`**, which carries
+/// the full resource body on an Update). Drops, when the referenced device is
+/// outside the allowlist:
+///
+/// * top-level `device_ref` (source/output) — the key is removed.
+/// * each `members[].device` (sync group) — the key is removed from that member.
+///
+/// An **unscoped** principal is a no-op. A `body` that is not a JSON object (or
+/// carries neither key) is left unchanged.
+pub(crate) fn redact_device_refs_in_body(principal: &Principal, body: &mut serde_json::Value) {
+    // Unscoped principals see everything: nothing to redact (fast path).
+    if !principal.is_scoped() {
+        return;
+    }
+    let out_of_scope =
+        |device_id: &str| crate::auth::authorize_object(principal, device_id).is_err();
+
+    // Source/output device-projection link.
+    if let Some(serde_json::Value::String(device_id)) = body.get("device_ref") {
+        if out_of_scope(device_id) {
+            if let Some(map) = body.as_object_mut() {
+                map.remove("device_ref");
+            }
+        }
+    }
+
+    // Sync-group member device ids.
+    if let Some(serde_json::Value::Array(members)) = body.get_mut("members") {
+        for member in members.iter_mut() {
+            let leaks = matches!(
+                member.get("device"),
+                Some(serde_json::Value::String(device_id)) if out_of_scope(device_id)
+            );
+            if leaks {
+                if let Some(member_map) = member.as_object_mut() {
+                    member_map.remove("device");
+                }
+            }
+        }
+    }
+}
+
+/// Deny a request that exposes or mutates a **whole-system** artifact for a
+/// principal scoped on ANY authorization axis (BOLA wholesale-enumeration
+/// defense, ADR-W005 / ADR-W025 / ADR-W026).
+///
+/// Some surfaces span the entire desired-state: the config export and the
+/// support bundle embed *every* device id, `device_ref`, and sync-group member
+/// id in one document, and the config mutations revert-to-start / promote
+/// rewrite the *entire* running / boot document across all objects. Per-field
+/// redaction cannot apply (a scope-filtered config is not a valid runnable
+/// document), and a scoped operator has no business rewriting state for objects
+/// outside its allowlist — so a principal restricted on the object, output, OR
+/// discovery-domain axis is denied outright. Only a principal that can see the
+/// whole system ([`Principal::is_global`]) is allowed; an unscoped
+/// admin/operator/viewer is a no-op.
+///
+/// Keyed off the unified `is_global` predicate rather than a frozen per-axis
+/// check, so a newly-added scope axis is covered automatically.
+///
+/// # Errors
+///
+/// [`ControlError::Forbidden`] if the principal is scoped on any axis.
+pub(crate) fn require_unscoped_for_whole_system(principal: &Principal) -> Result<(), ControlError> {
+    if !principal.is_global() {
+        return Err(ControlError::Forbidden(format!(
+            "principal {:?} is scoped (object, output, or discovery-domain) and may not \
+             access a whole-system artifact (it would disclose or mutate resources outside \
+             its allowlist)",
+            principal.key_id
+        )));
+    }
+    Ok(())
+}
+
 /// The exact operator/portal copy the Conspect startup gate (S1) refuses a NEW
 /// program-output start with at the `block-new-instance` rung (ADR-0050 §5/§6.2).
 /// **Verbatim** — the cli's `BLOCK_NEW_INSTANCE_REASON` and the portal show the
@@ -442,6 +567,10 @@ async fn cmd_swap(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &req.tile)?;
+    // Per-object authz on the SOURCE too (BOLA, SEC-09): a swap binds the source
+    // input onto the tile, so a scoped operator may swap in only sources within
+    // its object allowlist (a missing/out-of-scope id fails closed).
+    crate::auth::authorize_object(&principal, &req.source)?;
     let tile = req.tile.clone();
     let source = req.source.clone();
     let response = submit_accepted(&state, &idem, |op| Command::SwapSource {
@@ -506,6 +635,15 @@ pub(crate) async fn cmd_apply_layout(
     crate::auth::authorize_object(&principal, &req.layout)?;
 
     let layout = req.layout.clone();
+    // ADR-W024 MAJOR-B round 5: hold the config-mutation lock across
+    // resolve→submit→adopt so the persister (same lock) can never compose
+    // mid-apply, and the layout snapshot advances atomically with the engine
+    // submit. The adopted canvas/layout/cells come from the working-layout body
+    // captured here; they are adopted into the snapshot ONLY when the
+    // `ApplyLayout` lands (a shed leaves the snapshot at the prior adopted
+    // layout, so a shed apply-layout never leaks into `active.toml`).
+    let _mutation = state.lock_config_mutation().await;
+    let adopted_body: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
     // Resolution runs INSIDE the fresh-reservation arm (pinned semantics,
     // ADR-W019): a replayed Idempotency-Key answers from the reservation
     // without re-resolving, and a refused resolve releases the key.
@@ -523,29 +661,38 @@ pub(crate) async fn cmd_apply_layout(
                 )),
                 other => other,
             })?;
-        let document = multiview_config::LayoutDocument::from_body(&versioned.layout.body)
-            .map_err(|e| {
-                ControlError::Validation(format!(
-                    "stored layout {:?} does not parse as a {{canvas, layout, cells}} \
-                     document: {e}",
-                    req.layout
-                ))
-            })?;
-        let solved = document.solve_named(&req.layout).map_err(|e| {
-            ControlError::Validation(format!(
-                "stored layout {:?} does not solve: {e}",
-                req.layout
-            ))
-        })?;
-        require_class1_canvas(&state, &req.layout, &document)?;
+        // The ONE resolve machinery (parse + solve + Class-1 pinned-canvas
+        // gate), shared with the config-file watcher (ADR-W019/W020). A `None`
+        // running canvas fails closed there.
+        let resolved = crate::command::resolve_layout_document(
+            &req.layout,
+            &versioned.layout.body,
+            state.running_canvas.as_ref(),
+        )?;
+        // Capture the authored body so a LANDED apply can adopt its
+        // canvas/layout/cells into the snapshot (the resolved form is the
+        // engine's solved layout, not the authored config sections).
+        if let Ok(mut slot) = adopted_body.lock() {
+            *slot = Some(versioned.layout.body.clone());
+        }
         Ok(Command::ApplyLayout {
             op,
             layout: req.layout,
-            document: Some(Box::new(crate::command::ResolvedLayout::new(
-                solved, document,
-            ))),
+            document: Some(Box::new(resolved)),
         })
     })?;
+    // A FRESH landed apply (not a replay) → adopt the layout into the snapshot
+    // (MAJOR-B round 5). A shed never reaches here (`submit_accepted_body`
+    // returns `Err(EngineBusy)`), so a shed apply-layout leaves the snapshot at
+    // the prior adopted layout.
+    if body.kind != "replay" {
+        if let Some(model) = state.boot_model.as_ref() {
+            let captured = adopted_body.lock().ok().and_then(|mut s| s.take());
+            if let Some(layout_body) = captured {
+                adopt_layout_from_body(model, &layout_body);
+            }
+        }
+    }
     // State honestly which per-cell property classes land on screen at the
     // frame boundary vs are carried-but-not-yet-rendered (ADR-W019). A replay
     // body stays undecorated: it answers "did the original land?", it does not
@@ -571,65 +718,59 @@ pub(crate) async fn cmd_apply_layout(
     Ok((StatusCode::ACCEPTED, Json(body)).into_response())
 }
 
-/// ADR-R004 / ADR-W019 Class-1 gate: output geometry + cadence are **pinned**
-/// for the life of the session, so a stored layout authored for a different
-/// canvas cannot apply live (it is a Class-2 parallel-output migration, not
-/// built yet) — refuse it with `422` here, before any `202`.
-///
-/// The comparison is against [`AppState::running_canvas`] — the **immutable**
-/// snapshot captured from the loaded config at seed time — never the mutable
-/// layouts repository (whose working-layout body any operator `PUT` can
-/// rewrite). When no snapshot was seeded the gate **fails closed** (422): a
-/// document-carrying apply must never ride a 202 into a silent drain hold.
-/// Cadence equality is by value (`Fps`/`Rational` cross-multiply in `i128`),
-/// so a non-reduced `50/2` matches a running `25/1`. The engine's
-/// frame-boundary drain keeps its own backstop against the live drive's
-/// canvas.
-fn require_class1_canvas(
-    state: &AppState,
-    id: &str,
-    document: &multiview_config::LayoutDocument,
-) -> ControlResult<()> {
-    let Some(running) = state.running_canvas.as_ref() else {
-        return Err(ControlError::Validation(format!(
-            "layout {id:?} cannot be applied live: the running canvas is unknown to the \
-             control plane (no pinned-canvas snapshot was seeded), so the Class-1 gate \
-             fails closed (ADR-W019)"
-        )));
-    };
-    let new = &document.canvas;
-    if running != new {
-        return Err(ControlError::Validation(format!(
-            "layout {id:?} was authored for canvas {}x{}@{} but the running session's canvas \
-             is pinned at {}x{}@{} — a Class-2 change (output geometry/cadence cannot change \
-             live; ADR-R004)",
-            new.width, new.height, new.fps, running.width, running.height, running.fps
-        )));
+/// Adopt a landed `ApplyLayout`'s canvas/layout/cells into the boot-model
+/// snapshot (ADR-W024 MAJOR-B round 5): the working-layout `body` is the
+/// authored `{canvas, layout, cells}` shape. Each section is deserialized into
+/// its typed form; a section that fails to deserialize (in practice impossible —
+/// the body already validated on the store write) is skipped, leaving the
+/// snapshot's prior adopted value rather than persisting an invalid layout.
+/// Call ONLY while holding the config-mutation lock.
+fn adopt_layout_from_body(model: &crate::boot_model::BootModel, body: &serde_json::Value) {
+    let canvas = body
+        .get("canvas")
+        .and_then(|v| serde_json::from_value::<multiview_config::Canvas>(v.clone()).ok());
+    let layout = body
+        .get("layout")
+        .and_then(|v| serde_json::from_value::<multiview_config::Layout>(v.clone()).ok());
+    let cells = body
+        .get("cells")
+        .and_then(|v| serde_json::from_value::<Vec<multiview_config::Cell>>(v.clone()).ok());
+    if let (Some(canvas), Some(layout), Some(cells)) = (canvas, layout, cells) {
+        model.adopt_layout(canvas, layout, cells);
     }
-    Ok(())
 }
 
 impl axum::extract::FromRequestParts<AppState> for Principal {
     type Rejection = ControlError;
 
-    async fn from_request_parts(
+    fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        // Auth disabled (explicit trusted-network mode): every request is a local
-        // admin, no credential required.
-        if state.auth_disabled {
-            return Ok(Principal::local_admin());
-        }
-        let header = header_value(&parts.headers, header::AUTHORIZATION);
-        // Primary: native API key. If that fails and a JWT validator is
-        // configured, fall back to OAuth2/JWT (the alternative authn path).
-        match state.api_keys.verify_authorization(header.as_deref()) {
-            Ok(principal) => Ok(principal),
-            Err(api_key_err) => state
-                .authenticate_jwt(header.as_deref())
-                .ok_or(api_key_err)?,
-        }
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        // Authentication is synchronous (no I/O), so resolve it now and hand
+        // axum an already-ready future.
+        std::future::ready(authenticate_principal(parts, state))
+    }
+}
+
+/// Resolve the request's [`Principal`] from its headers (synchronous).
+fn authenticate_principal(
+    parts: &axum::http::request::Parts,
+    state: &AppState,
+) -> Result<Principal, ControlError> {
+    // Auth disabled (explicit trusted-network mode): every request is a local
+    // admin, no credential required.
+    if state.auth_disabled {
+        return Ok(Principal::local_admin());
+    }
+    let header = header_value(&parts.headers, header::AUTHORIZATION);
+    // Primary: native API key. If that fails and a JWT validator is
+    // configured, fall back to OAuth2/JWT (the alternative authn path).
+    match state.api_keys.verify_authorization(header.as_deref()) {
+        Ok(principal) => Ok(principal),
+        Err(api_key_err) => state
+            .authenticate_jwt(header.as_deref())
+            .ok_or(api_key_err)?,
     }
 }
 
@@ -700,9 +841,18 @@ fn resource_router() -> Router<AppState> {
                 .put(probes::update_probe)
                 .delete(probes::delete_probe),
         )
-        // Managed-devices CRUD (ADR-M008): the config-as-code device registry,
-        // plus the read-only runtime status snapshot, the bare-verb actions
-        // (ADR-W017), and the declared stream-binding projections (ADR-M009).
+        .merge(device_router())
+}
+
+/// Build the managed-devices surface (ADR-M008/M009/M011/W017): the device
+/// registry CRUD + status + bare-verb actions + stream-binding projections,
+/// ephemeral Cast sessions, mDNS discovery, and presentation-sync groups.
+/// Split from [`resource_router`] so each stays a readable size.
+fn device_router() -> Router<AppState> {
+    // Managed-devices CRUD (ADR-M008): the config-as-code device registry,
+    // plus the read-only runtime status snapshot, the bare-verb actions
+    // (ADR-W017), and the declared stream-binding projections (ADR-M009).
+    Router::new()
         .route("/devices", get(devices::list_devices))
         .route(
             "/devices/{id}",
@@ -728,6 +878,26 @@ fn resource_router() -> Router<AppState> {
             "/devices/{id}/output-targets",
             get(devices::output_targets),
         )
+        // Ephemeral Cast sessions (DEV-D2, ADR-M011): start/list/stop an
+        // ad-hoc cast of a served HLS rendition, save-as-device promotion,
+        // and the receiver-namespace volume verb. Runtime-only — never part
+        // of the devices store, never exported.
+        .route(
+            "/cast/sessions",
+            get(cast_sessions::list_cast_sessions).post(cast_sessions::start_cast_session),
+        )
+        .route(
+            "/cast/sessions/{id}",
+            get(cast_sessions::get_cast_session).delete(cast_sessions::stop_cast_session),
+        )
+        .route(
+            "/cast/sessions/{id}/save",
+            post(cast_sessions::save_cast_session),
+        )
+        .route(
+            "/cast/sessions/{id}/volume",
+            post(cast_sessions::set_cast_volume),
+        )
         // mDNS device discovery (ADR-M008 §6 / ADR-0041): kick a time-bounded
         // browse (202 + device.discovered events) and read the untrusted
         // inventory. Discovery never creates a device — confirm-adopt is the
@@ -752,20 +922,18 @@ fn resource_router() -> Router<AppState> {
         )
 }
 
-/// Build the `/api/v1` resource + command routes (without the realtime or docs
-/// routes, which are wired by [`crate::router()`]).
-pub fn api_router() -> Router<AppState> {
+/// Build the Conspect **account / licensing / telemetry** sub-router: the local
+/// entitlement plane, the local mesh, the telemetry pipe (consent + schema), the
+/// diagnostics snapshot, the account-side audit + pending-actions, and the local
+/// support surface. Split out of [`api_router`] so each stays under the
+/// `too_many_lines` lint, mirroring [`resource_router`]; all control-plane only,
+/// off the engine hot loop (invariant #10).
+///
+/// **Two-pipe separation (ADR-0052 §1):** the licensing heartbeat-status lives
+/// under `/licensing/`; the telemetry consent + schema live under `/telemetry/`.
+/// They are deliberately distinct paths and are **never** co-mingled.
+fn conspect_router() -> Router<AppState> {
     Router::new()
-        .merge(resource_router())
-        .route("/commands/start", post(cmd_start))
-        .route("/commands/stop", post(cmd_stop))
-        .route("/commands/swap", post(cmd_swap))
-        .route("/commands/apply-layout", post(cmd_apply_layout))
-        .route("/alarms", get(alarms::list_alarms))
-        .route("/alarms/{id}/ack", post(alarms::ack_alarm))
-        // Read-only health warnings (SA-0 / ADR-0035): active capability mismatches
-        // (e.g. GPU present but compositing fell back to CPU) with remediation.
-        .route("/health", get(health::list_health))
         // Local licence (Conspect, CONSPECT-1 / ADR-0050): the computed licence
         // resource (enforcement is DATA → always 200), the lease install path
         // (verify + install a presented signed binding), and the salted CBOR
@@ -776,10 +944,88 @@ pub fn api_router() -> Router<AppState> {
         // The read-only heartbeat-status surface (Conspect Hook 4, ADR-0050 §3):
         // the honest local heartbeat status (transport + last/next contact +
         // payload fields). The spec mandates NO mutating endpoint — `get` only.
+        // This is the LICENSING pipe — under `/licensing/`, never `/telemetry/`.
         .route(
             "/licensing/heartbeat-status",
             get(licence::get_heartbeat_status),
         )
+        // Local mesh (Conspect, CONSPECT-3a / ADR-0051): the always-on discovery
+        // + relay status (GET, never an off switch — the spec's locked row), the
+        // relay opt-in toggle (a real persisted PUT), and the untrusted
+        // discovered-peer inventory (GET). Control-plane only; no engine handle
+        // (invariant #10). There is intentionally NO route that disables discovery.
+        .route("/mesh/status", get(mesh::get_status))
+        .route("/mesh/relay", axum::routing::put(mesh::set_relay))
+        .route("/mesh/peers", get(mesh::list_peers))
+        // Telemetry pipe (Conspect, ADR-0052): the opt-in daily-pipe consent
+        // (GET + PUT, off by default, last-writer-wins) and the published schema
+        // (sent + never-sent). Deliberately under `/telemetry/`, never co-mingled
+        // with the licensing heartbeat under `/licensing/` (two-pipe separation).
+        // Consent gates NO local route. Control-plane only (invariant #10).
+        .route(
+            "/telemetry/consent",
+            get(telemetry::get_consent).put(telemetry::set_consent),
+        )
+        .route("/telemetry/schema", get(telemetry::get_schema))
+        // Diagnostics snapshot (Conspect, spec §4.2 / ADR-0053): the one-button
+        // support bundle (logs + engine state, never media) — POST assembles →
+        // 202 {snapshot_id}; GET reads it back by id. Composed by the shared #111
+        // context-pack composer from the consent-independent local retention
+        // buffer + redacted config. Control-plane only (inv #10).
+        .route("/diagnostics/snapshot", post(telemetry::request_snapshot))
+        .route("/diagnostics/{id}", get(telemetry::get_snapshot))
+        // Account-side append-only audit (Conspect §10/§11): cursor-paginated.
+        .route("/account/audit", get(account::list_account_audit))
+        // Pending remote-actions strip + local cancel (local always wins).
+        .route("/actions/pending", get(account::list_pending_actions))
+        .route("/actions/{id}/cancel", post(account::cancel_action))
+        // Local support surface (Conspect §10/§11): tier-derived entitlement
+        // routing, the local ticket store (CS-xxxx, machine-context auto-attach,
+        // reply/close), the previewable redacted media-free context-pack
+        // composer, and local approve/deny of inbound egress data requests.
+        .route("/support/entitlement", get(support::get_entitlement))
+        .route(
+            "/support/tickets",
+            get(support::list_tickets).post(support::raise_ticket),
+        )
+        .route("/support/tickets/{id}", get(support::get_ticket))
+        .route("/support/tickets/{id}/reply", post(support::reply_ticket))
+        .route("/support/tickets/{id}/close", post(support::close_ticket))
+        .route("/support/bundle", post(support::compose))
+        .route("/support/bundle/{id}", get(support::get_bundle))
+        .route(
+            "/support/data-request/{id}/approve",
+            post(support::approve_data_request),
+        )
+        .route(
+            "/support/data-request/{id}/deny",
+            post(support::deny_data_request),
+        )
+}
+
+/// Build the `/api/v1` resource + command routes (without the realtime or docs
+/// routes, which are wired by [`crate::router()`]).
+pub fn api_router() -> Router<AppState> {
+    Router::new()
+        .merge(resource_router())
+        .merge(conspect_router())
+        .route("/commands/start", post(cmd_start))
+        .route("/commands/stop", post(cmd_stop))
+        .route("/commands/swap", post(cmd_swap))
+        .route("/commands/apply-layout", post(cmd_apply_layout))
+        .route("/alarms", get(alarms::list_alarms))
+        .route("/alarms/{id}/ack", post(alarms::ack_alarm))
+        // Read-only structured log tail (ADR-0060): recent buffered records from
+        // the bounded drop-oldest ring, filterable by resource/kind/level/since.
+        .route("/logs", get(logs::list_logs))
+        // Read-only health warnings (SA-0 / ADR-0035): active capability mismatches
+        // (e.g. GPU present but compositing fell back to CPU) with remediation.
+        .route("/health", get(health::list_health))
+        // Read-only system capability + licence surface (ADR-W030): which
+        // codec/compositor backends are available, the compositor class, the
+        // effective build-profile licence, and the NDI attribution. System-global
+        // (no per-object axis) — a viewer may read it.
+        .route("/system/capabilities", get(system::system_capabilities))
         // Salvo operator surface: CRUD + arm/take/cancel.
         .route("/salvos", get(salvos::list_salvos))
         .route(
@@ -793,6 +1039,23 @@ pub fn api_router() -> Router<AppState> {
         .route("/salvos/{id}/cancel", post(salvos::cancel_salvo))
         // Salvo parity (Conspect §11): fire a named salvo through the bus → 202.
         .route("/salvos/{id}/fire", post(account::fire_salvo))
+        // Media-player transport surface (ADR-0057/ADR-0097): read + the
+        // load/cue/play/pause/stop/seek verbs + the vamp-exit arm/take/cancel
+        // triad, each 202 + op id onto the bounded command bus.
+        .route("/media/players", get(media_players::list_players))
+        .route("/media/players/{id}", get(media_players::get_player))
+        .route("/media/players/{id}/load", post(media_players::load_player))
+        .route("/media/players/{id}/cue", post(media_players::cue_player))
+        .route("/media/players/{id}/play", post(media_players::play_player))
+        .route("/media/players/{id}/pause", post(media_players::pause_player))
+        .route("/media/players/{id}/stop", post(media_players::stop_player))
+        .route("/media/players/{id}/seek", post(media_players::seek_player))
+        .route("/media/players/{id}/exit/arm", post(media_players::arm_exit))
+        .route("/media/players/{id}/exit/take", post(media_players::take_exit))
+        .route(
+            "/media/players/{id}/exit/cancel",
+            post(media_players::cancel_exit),
+        )
         // Per-stream crosspoint routing (RT-11): classify (plan) + apply (take).
         .route("/routing/plan", post(routing::plan_route))
         .route("/routing/{kind}/take", post(routing::take_route))
@@ -809,10 +1072,58 @@ pub fn api_router() -> Router<AppState> {
                 .put(tally::put_profile)
                 .delete(tally::delete_profile),
         )
-        // Live preview snapshots (program + per-input JPEG stills).
+        // Live preview snapshots (program + per-input JPEG stills). These are
+        // the JPEG-ladder fallback, NOT WebRTC media signalling — they stay
+        // outside the media-signalling CORS scope (ADR-0048 §9). The WebRTC
+        // media-signalling routes (capabilities + WHIP + WHEP-serve +
+        // preview-WHEP) live in `signalling_router`, which `crate::router` merges
+        // **with its CORS layer** so the allow-list applies only to them.
         .route("/preview/program.jpg", get(preview::program_jpeg))
         .route("/preview/inputs", get(preview::list_input_ids))
         .route("/preview/inputs/{id}", get(preview::input_jpeg))
+        // Read-only change audit log.
+        .route("/audit", get(audit::list_audit))
+        // (The Conspect account / licensing / telemetry / support routes are
+        // merged from `conspect_router()` above.)
+        // Config-as-code export: the live stores rendered as multiview.toml.
+        .route("/config/export", get(config::export_config))
+        // The config-file watch status (ADR-W020): read-only, honest
+        // "not watched" default. A static segment, so it never collides with
+        // the `{target}` capture below (axum prefers static matches).
+        .route("/config/watch-status", get(config::watch_status))
+        // The Boot/Loaded/Running config model (ADR-W024). Static segments, so
+        // they never collide with the `{target}` capture below: the divergence
+        // indicator (read), revert-to-start (Running := Loaded, live), and
+        // promote (write Running to the boot file via the ADR-W020 seam).
+        .route("/config/boot-model", get(config::boot_model_status))
+        .route(
+            "/config/revert-to-start",
+            post(config::revert_to_start),
+        )
+        .route("/config/promote", post(config::promote_to_boot))
+        // Config versioning: history + commit, single revision, diff, rollback.
+        .route(
+            "/config/{target}",
+            get(config::list_history).put(config::commit_revision),
+        )
+        .route("/config/{target}/rev/{revision}", get(config::get_revision))
+        .route("/config/{target}/diff", get(config::diff_revisions))
+        .route(
+            "/config/{target}/rollback",
+            post(config::rollback_revision),
+        )
+}
+
+/// Build the **WebRTC media-signalling** routes (without their CORS layer, which
+/// [`crate::router`] applies). These are the routes ADR-0048 §9 scopes
+/// `webrtc.cors_allow_origins` to: preview transport capabilities, the
+/// preview-WHEP focus routes, WHIP ingest, and WHEP-serve output — the surface a
+/// browser served from a web origin negotiates against. Kept separate from
+/// [`api_router`] so the CORS allow-list applies **only** here.
+pub fn signalling_router() -> Router<AppState> {
+    Router::new()
+        // Preview transport capabilities (WHEP vs the JPEG ladder, ADR-P006).
+        .route("/preview/capabilities", get(preview::capabilities))
         // WHEP focus sessions (sub-second WebRTC preview) per scope: SDP offer
         // in -> 201 + answer SDP + Location; DELETE the resource to release.
         .route("/preview/program/whep", post(preview::program_whep_open))
@@ -830,24 +1141,30 @@ pub fn api_router() -> Router<AppState> {
             "/preview/outputs/{id}/whep/{session_id}",
             axum::routing::delete(preview::output_whep_close),
         )
-        // Read-only change audit log.
-        .route("/audit", get(audit::list_audit))
-        // Account-side append-only audit (Conspect §10/§11): cursor-paginated.
-        .route("/account/audit", get(account::list_account_audit))
-        // Pending remote-actions strip + local cancel (local always wins).
-        .route("/actions/pending", get(account::list_pending_actions))
-        .route("/actions/{id}/cancel", post(account::cancel_action))
-        // Config-as-code export: the live stores rendered as multiview.toml.
-        .route("/config/export", get(config::export_config))
-        // Config versioning: history + commit, single revision, diff, rollback.
+        // WHIP ingest (RFC 9725): a WebRTC contribution publisher POSTs an SDP
+        // offer to the source-derived endpoint -> 201 + answer SDP + Location;
+        // DELETE the session resource to tear it down. PATCH is 405 (vanilla
+        // ICE, no trickle/restart); OPTIONS is the CORS preflight (ADR-T014 §2).
         .route(
-            "/config/{target}",
-            get(config::list_history).put(config::commit_revision),
+            "/whip/{source_id}",
+            post(whip::whip_publish).options(whip::whip_options),
         )
-        .route("/config/{target}/rev/{revision}", get(config::get_revision))
-        .route("/config/{target}/diff", get(config::diff_revisions))
         .route(
-            "/config/{target}/rollback",
-            post(config::rollback_revision),
+            "/whip/{source_id}/sessions/{session_id}",
+            axum::routing::delete(whip::whip_delete).patch(whip::whip_patch),
+        )
+        // WHEP-serve output viewers (ADR-0049 §5.1): a browser POSTs an SDP offer
+        // to the output-derived endpoint -> 201 + answer SDP + Location, then
+        // receives the real encoded program over SRTP; DELETE the session resource
+        // to release the viewer slot. PATCH is 405 (vanilla ICE); OPTIONS is the
+        // CORS preflight. A real-output surface distinct from the preview focus
+        // WHEP routes above.
+        .route(
+            "/whep/{output_id}",
+            post(whep_output::whep_view).options(whep_output::whep_options),
+        )
+        .route(
+            "/whep/{output_id}/sessions/{session_id}",
+            axum::routing::delete(whep_output::whep_delete).patch(whep_output::whep_patch),
         )
 }

@@ -17,6 +17,7 @@ fn output_scoped(outputs: &[&str]) -> Principal {
         role: Role::Operator,
         scoped_object_ids: None,
         scoped_output_ids: Some(outputs.iter().map(|s| (*s).to_owned()).collect()),
+        scoped_discovery_domains: None,
     }
 }
 
@@ -62,6 +63,7 @@ fn output_unscoped_principal_may_access_any_output() {
         role: Role::Admin,
         scoped_object_ids: None,
         scoped_output_ids: None,
+        scoped_discovery_domains: None,
     };
     assert!(authorize_output(&admin, "any-output").is_ok());
     assert!(authorize_output(&admin, "another").is_ok());
@@ -76,6 +78,7 @@ fn output_and_object_scopes_are_independent() {
         role: Role::Operator,
         scoped_object_ids: Some(vec!["layout-1".to_owned()]),
         scoped_output_ids: Some(vec!["out-1".to_owned()]),
+        scoped_discovery_domains: None,
     };
     // Object guard.
     assert!(multiview_control::authorize_object(&p, "layout-1").is_ok());

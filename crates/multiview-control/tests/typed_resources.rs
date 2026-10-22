@@ -245,7 +245,7 @@ fn openapi_mirrors_accept_what_the_config_types_accept() {
                 "on_target": "zero_then_up", "format": "auto", "label": "ON AIR IN" }),
         json!({ "id": "s", "kind": "timer", "target": "date_time", "at": "2026-07-01T09:00:00",
                 "timezone": "UTC", "format": "d_hh_mm_ss" }),
-        json!({ "id": "s", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam", "rtsp": { "transport": "tcp" } }),
+        json!({ "id": "s", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam" }),
         json!({ "id": "s", "kind": "hls", "url": "https://example.com/x.m3u8" }),
         json!({ "id": "s", "kind": "youtube", "url": "https://www.youtube.com/watch?v=abc" }),
         json!({ "id": "s", "kind": "ts", "url": "udp://[ff3e::1]:5000" }),
@@ -273,8 +273,8 @@ fn openapi_mirrors_accept_what_the_config_types_accept() {
     }
 
     let outputs = [
-        json!({ "kind": "rtsp_server", "mount": "/mv", "codec": "h264", "latency_profile": "low" }),
-        json!({ "kind": "ll_hls", "path": "/srv/hls", "codec": "h264", "part_target_ms": 333, "segment_ms": 2000, "gop_ms": 1000 }),
+        json!({ "kind": "rtsp_server", "mount": "/mv", "codec": "h264" }),
+        json!({ "kind": "ll_hls", "path": "/srv/hls", "codec": "h264", "segment_ms": 2000 }),
         json!({ "kind": "hls", "path": "/srv/hls", "codec": "hevc", "segment_ms": 4000 }),
         json!({ "kind": "ndi", "name": "MULTIVIEW" }),
         json!({ "kind": "rtmp", "url": "rtmp://ingest.example/live/k", "codec": "h264" }),
@@ -599,5 +599,329 @@ async fn live_apply_degrades_to_restart_when_the_engine_is_gone() {
         apply_header(&resp),
         "restart",
         "with no engine draining, live apply must degrade to restart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-W018 level 2 — the per-run live-apply capability signal. The header may
+// claim `live` for a kind ONLY when the running engine declared it can ingest
+// that kind at runtime (the binary wires the capability per run path): network
+// /file kinds flip to live on the full-pipeline (ffmpeg) run, stay restart on
+// the software run, and ndi/youtube/aes67 stay restart everywhere.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn network_source_mutations_apply_live_when_the_run_ingests_network_kinds() {
+    // The full-pipeline run path declares network/file kinds live-appliable (a
+    // real ingest spawner is wired into the live-source hub): the header says
+    // `live` and the validated source rides the bus as UpsertSource.
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(multiview_control::LiveSourceCapability::synthetic_and_network())
+    });
+    for (id, body) in [
+        (
+            "cam1",
+            json!({ "id": "cam1", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam1" }),
+        ),
+        (
+            "clip1",
+            json!({ "id": "clip1", "kind": "file", "path": "/media/clip1.ts" }),
+        ),
+        (
+            "feed1",
+            json!({ "id": "feed1", "kind": "hls", "url": "https://[2001:db8::2]/live/master.m3u8" }),
+        ),
+    ] {
+        let resp = send(
+            &h.router,
+            post_json(
+                &format!("/api/v1/sources/{id}"),
+                OPERATOR_TOKEN,
+                &json!({ "name": id, "body": body }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            apply_header(&resp),
+            "live",
+            "a network/file source applies LIVE when the engine ingests it (ADR-W018 level 2): {id}"
+        );
+        let drained = h.commands.try_drain();
+        assert!(
+            drained.iter().any(|c| matches!(
+                c,
+                multiview_control::Command::UpsertSource { source, .. } if source.id == id
+            )),
+            "POST of a live-appliable network source must enqueue UpsertSource for {id}, got {drained:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ndi_youtube_and_aes67_stay_restart_even_when_network_kinds_are_live() {
+    // These kinds need runtime machinery the live spawn path does not provide
+    // (NDI runtime receive, yt-dlp resolution, audio-only AES67) — the header
+    // must stay honest: restart, with no UpsertSource on the bus.
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(multiview_control::LiveSourceCapability::synthetic_and_network())
+    });
+    for (id, body) in [
+        (
+            "ndi1",
+            json!({ "id": "ndi1", "kind": "ndi", "name": "STUDIO (CAM 1)" }),
+        ),
+        (
+            "yt1",
+            json!({ "id": "yt1", "kind": "youtube", "url": "https://www.youtube.com/watch?v=x" }),
+        ),
+        (
+            "a67",
+            json!({ "id": "a67", "kind": "aes67", "sdp": "v=0\r\nc=IN IP6 ff3e::1\r\n" }),
+        ),
+    ] {
+        let resp = send(
+            &h.router,
+            post_json(
+                &format!("/api/v1/sources/{id}"),
+                OPERATOR_TOKEN,
+                &json!({ "name": id, "body": body }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "create {id}");
+        assert_eq!(
+            apply_header(&resp),
+            "restart",
+            "{id}: a kind the engine cannot live-ingest must stay restart"
+        );
+        let drained = h.commands.try_drain();
+        assert!(
+            !drained
+                .iter()
+                .any(|c| matches!(c, multiview_control::Command::UpsertSource { .. })),
+            "no UpsertSource may ride the bus for a non-live kind ({id}), got {drained:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn network_kinds_stay_restart_without_the_engine_capability() {
+    // The software run path declares only synthetic kinds live-appliable (the
+    // hub has no ingest spawner): a network/file mutation stays restart and
+    // nothing rides the bus — the header never claims live for a kind the
+    // running engine cannot ingest.
+    let mut h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/clip1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "Clip", "body": { "id": "clip1", "kind": "file", "path": "/m/c.ts" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        apply_header(&resp),
+        "restart",
+        "without the network capability a file source must stay restart"
+    );
+    let drained = h.commands.try_drain();
+    assert!(
+        !drained
+            .iter()
+            .any(|c| matches!(c, multiview_control::Command::UpsertSource { .. })),
+        "no UpsertSource may ride the bus without the capability, got {drained:?}"
+    );
+}
+
+#[tokio::test]
+async fn synthetic_to_network_kind_change_applies_live_with_network_capability() {
+    // With network kinds live, a bars -> rtsp edit is a LIVE upsert under the
+    // same id (the drain reuses the store; the hub swaps the producer) — not
+    // the remove+restart the synthetic-only build performs.
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(multiview_control::LiveSourceCapability::synthetic_and_network())
+    });
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "Bars", "body": { "id": "cam1", "kind": "bars" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let _ = h.commands.try_drain();
+
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({
+                "name": "Cam 1",
+                "body": { "id": "cam1", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam1" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        apply_header(&resp),
+        "live",
+        "bars -> rtsp with the network capability is a live producer swap"
+    );
+    let drained = h.commands.try_drain();
+    assert!(
+        drained.iter().any(|c| matches!(
+            c,
+            multiview_control::Command::UpsertSource { source, .. } if source.id == "cam1"
+        )),
+        "the kind change must enqueue UpsertSource (store-reuse edit), got {drained:?}"
+    );
+    assert!(
+        !drained
+            .iter()
+            .any(|c| matches!(c, multiview_control::Command::RemoveSource { .. })),
+        "a live-appliable kind change must NOT remove the source, got {drained:?}"
+    );
+}
+
+#[tokio::test]
+async fn live_kind_change_to_a_non_live_kind_stops_the_producer_but_stays_restart() {
+    // rtsp -> ndi with the network capability: the new kind cannot be
+    // live-applied, so the stored doc is restart — but the RUNNING rtsp
+    // producer must stop (a stale picture pretending to be the NDI feed would
+    // be dishonest), so a RemoveSource rides the bus.
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(multiview_control::LiveSourceCapability::synthetic_and_network())
+    });
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            &json!({
+                "name": "Cam 1",
+                "body": { "id": "cam1", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam1" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let _ = h.commands.try_drain();
+
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({ "name": "Cam 1", "body": { "id": "cam1", "kind": "ndi", "name": "CAM 1" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(apply_header(&resp), "restart");
+    let drained = h.commands.try_drain();
+    assert!(
+        drained.iter().any(|c| matches!(
+            c,
+            multiview_control::Command::RemoveSource { id, .. } if id == "cam1"
+        )),
+        "a live->non-live kind change must stop the running producer, got {drained:?}"
+    );
+}
+
+#[tokio::test]
+async fn rist_stays_restart_when_the_engine_build_lacks_the_rist_feature() {
+    // RIST is network media but needs the off-by-default `rist` feature in the
+    // engine build. An ffmpeg-without-rist run wires a real ingest spawner (so
+    // rtsp/hls/etc. flip to live) but a RIST spawn would REFUSE — so the header
+    // must keep RIST on `restart` and nothing rides the bus, never over-claiming
+    // a `live` that ends in a slate tile.
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(
+            multiview_control::LiveSourceCapability::synthetic_and_network().with_rist(false),
+        )
+    });
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/rist1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "RIST", "body": { "id": "rist1", "kind": "rist", "url": "rist://[2001:db8::5]:9001" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        apply_header(&resp),
+        "restart",
+        "a RIST source must stay restart when the engine build lacks the rist feature"
+    );
+    let drained = h.commands.try_drain();
+    assert!(
+        !drained
+            .iter()
+            .any(|c| matches!(c, multiview_control::Command::UpsertSource { .. })),
+        "no UpsertSource may ride the bus for RIST without the rist feature, got {drained:?}"
+    );
+
+    // Sanity: a non-RIST network kind on the SAME (rist=false) capability still
+    // flips to live — only RIST is gated, the rest of the network set is not.
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "Cam", "body": { "id": "cam1", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam1" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        apply_header(&resp),
+        "live",
+        "a non-RIST network kind stays live even when RIST is gated off"
+    );
+}
+
+#[tokio::test]
+async fn rist_applies_live_when_the_engine_build_carries_the_rist_feature() {
+    // With the rist feature compiled into the engine, RIST rides the same
+    // ingest_loop as the other network kinds — the header declares live and the
+    // validated source rides the bus as UpsertSource.
+    let mut h = support::harness_with(|state| {
+        state.with_live_sources(
+            multiview_control::LiveSourceCapability::synthetic_and_network().with_rist(true),
+        )
+    });
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/rist1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "RIST", "body": { "id": "rist1", "kind": "rist", "url": "rist://[2001:db8::5]:9001" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        apply_header(&resp),
+        "live",
+        "a RIST source applies live when the engine build carries the rist feature"
+    );
+    let drained = h.commands.try_drain();
+    assert!(
+        drained.iter().any(|c| matches!(
+            c,
+            multiview_control::Command::UpsertSource { source, .. } if source.id == "rist1"
+        )),
+        "RIST with the rist feature must enqueue UpsertSource, got {drained:?}"
     );
 }

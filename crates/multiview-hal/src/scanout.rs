@@ -499,7 +499,7 @@ mod tests {
         // The feature-off CI build's real probe returns this — it must own
         // nothing, cleanly.
         let inv = ScanoutInventory::default();
-        assert!(inv.cards().is_empty());
+        assert_eq!(inv.cards().len(), 0, "{:?}", inv.cards());
         assert_eq!(inv.owning_device(&ConnectorId::new("DP-1")), None);
         assert_eq!(inv.connected_connectors().count(), 0);
     }
@@ -520,7 +520,7 @@ mod tests {
             "no canonical device to reconcile against -> empty inventory"
         );
         for card in inv.cards() {
-            assert!(!card.card_name().is_empty());
+            assert_ne!(card.card_name(), "");
         }
     }
 

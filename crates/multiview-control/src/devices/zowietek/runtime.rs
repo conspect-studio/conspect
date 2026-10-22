@@ -45,7 +45,9 @@ use multiview_config::Device;
 
 use super::poller::{PollerControl, PollerHandle};
 use crate::devices::broadcaster::DeviceBroadcaster;
+use crate::devices::cast::store::CastSessionStore;
 use crate::devices::driver_registry::DeviceDriverRegistry;
+use crate::state::AckClock;
 
 /// The control-plane handles a [`DevicePollerFactory`] needs to wire a freshly
 /// spawned poller into the running control plane: the broadcaster it publishes
@@ -61,6 +63,15 @@ pub struct PollerWiring {
     /// The driver registry the poller enumerates source/output facets into (read
     /// by the projection routes).
     pub drivers: Arc<DeviceDriverRegistry>,
+    /// The ephemeral cast-session store the cast driver stamps started-at
+    /// into at its LOAD-accept moment (DEV-D3.1). A no-op for ids the store
+    /// does not track (saved cast devices run the same driver but have no
+    /// ephemeral record); other drivers ignore it entirely.
+    pub cast_sessions: Arc<CastSessionStore>,
+    /// The control plane's injectable clock (the same `AckClock` the audit
+    /// log stamps with — Unix nanoseconds by default) the cast driver reads
+    /// the started-at stamp from.
+    pub clock: AckClock,
 }
 
 /// An object-safe seam that spawns a poller actor for one managed device.
@@ -89,6 +100,32 @@ pub struct NoPollerFactory;
 impl DevicePollerFactory for NoPollerFactory {
     fn spawn(&self, _device: &Device, _wiring: &PollerWiring) -> Option<PollerHandle> {
         None
+    }
+}
+
+/// Composes several driver factories into one (DEV-D2): the registry holds a
+/// single factory, so a deployment with more than one live driver (`zowietek`
+/// **and** `cast`) installs a composite whose `spawn` asks each member in
+/// order and takes the **first** one that manages the device. Members decline
+/// by driver kind, so order only matters if two members claim the same driver
+/// — which no build does.
+pub struct CompositePollerFactory {
+    members: Vec<Arc<dyn DevicePollerFactory>>,
+}
+
+impl CompositePollerFactory {
+    /// Build a composite over `members`, asked in order.
+    #[must_use]
+    pub fn new(members: Vec<Arc<dyn DevicePollerFactory>>) -> Self {
+        Self { members }
+    }
+}
+
+impl DevicePollerFactory for CompositePollerFactory {
+    fn spawn(&self, device: &Device, wiring: &PollerWiring) -> Option<PollerHandle> {
+        self.members
+            .iter()
+            .find_map(|member| member.spawn(device, wiring))
     }
 }
 
@@ -242,6 +279,34 @@ impl DevicePollerRegistry {
         }
     }
 
+    /// Stop the poller/session for `device_id` **gracefully** (DEV-D2): like
+    /// [`stop`](DevicePollerRegistry::stop) — tombstone first, then tear the
+    /// task down and await its termination — but instead of aborting
+    /// immediately, the actor gets a `grace` window to **exit voluntarily**
+    /// (the cast actor's [`PollerControl::StopCast`] teardown sends the
+    /// receiver `STOP` that actually clears the TV, then returns). An actor
+    /// that ignores the window is aborted when it elapses, so the call is
+    /// bounded: after it returns no task for this id is running, exactly the
+    /// `stop` post-condition. Dispatch the voluntary-exit command **before**
+    /// calling this (the route does), or the grace window just elapses.
+    pub async fn stop_graceful(&self, device_id: &str, grace: std::time::Duration) {
+        let handle = {
+            let mut guard = self.lock();
+            guard.tombstones.insert(device_id.to_owned());
+            guard.handles.remove(device_id)
+        };
+        if let Some(handle) = handle {
+            let mut task = handle.into_join_handle();
+            // Voluntary-exit join, bounded by the grace window. The join
+            // result is irrelevant (a clean return or a cancellation both mean
+            // "terminated"); what matters is that the task is gone on return.
+            if tokio::time::timeout(grace, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
     /// Clear the tombstone for `device_id` — a **fresh legitimate create** is
     /// beginning. The create route calls this **before** its resource-store
     /// insert; that ordering is what keeps the tombstone sound: any delete's
@@ -292,21 +357,27 @@ pub struct ReqwestPollerFactory {
     /// (1Password, env, file) without this crate depending on a secret store.
     #[allow(clippy::type_complexity)]
     resolve_credentials: Box<dyn Fn(&Device) -> Option<(String, String)> + Send + Sync>,
+    /// The outbound-dial SSRF policy the transport screens each resolved dial IP
+    /// against (SEC-02, CWE-918).
+    dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
 }
 
 #[cfg(feature = "zowietek")]
 impl ReqwestPollerFactory {
-    /// Build a reqwest-backed factory with `timeout` per request and a
+    /// Build a reqwest-backed factory with `timeout` per request, a
     /// `resolve_credentials` closure mapping a device to its `(username,
-    /// password)` (resolved from `auth.secret_ref` by the binary's secret store).
+    /// password)` (resolved from `auth.secret_ref` by the binary's secret store),
+    /// and the outbound-dial SSRF `dial_policy` the transport enforces.
     #[must_use]
     pub fn new(
         timeout: std::time::Duration,
         resolve_credentials: impl Fn(&Device) -> Option<(String, String)> + Send + Sync + 'static,
+        dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
     ) -> Self {
         Self {
             timeout,
             resolve_credentials: Box::new(resolve_credentials),
+            dial_policy,
         }
     }
 }
@@ -327,7 +398,11 @@ impl DevicePollerFactory for ReqwestPollerFactory {
         // resolver; without a credential the device cannot be logged into.
         let (username, password) = (self.resolve_credentials)(device)?;
 
-        let transport = match super::client::ReqwestTransport::new(address, self.timeout) {
+        let transport = match super::client::ReqwestTransport::new(
+            address,
+            self.timeout,
+            Arc::clone(&self.dial_policy),
+        ) {
             Ok(transport) => Arc::new(transport),
             Err(err) => {
                 tracing::warn!(
@@ -423,6 +498,8 @@ mod tests {
         let wiring = PollerWiring {
             broadcaster: crate::devices::DeviceBroadcaster::new(engine, status),
             drivers: Arc::new(crate::devices::DeviceDriverRegistry::new()),
+            cast_sessions: Arc::new(crate::devices::cast::store::CastSessionStore::new()),
+            clock: Arc::new(|| multiview_core::time::MediaTime::from_nanos(0)),
         };
         let dev = device("dev-a");
         assert_eq!(dev.driver, DeviceDriver::Zowietek);
@@ -452,6 +529,8 @@ mod tests {
         let wiring = PollerWiring {
             broadcaster: crate::devices::DeviceBroadcaster::new(engine, status),
             drivers: Arc::new(crate::devices::DeviceDriverRegistry::new()),
+            cast_sessions: Arc::new(crate::devices::cast::store::CastSessionStore::new()),
+            clock: Arc::new(|| multiview_core::time::MediaTime::from_nanos(0)),
         };
         assert!(factory.spawn(&device("dev-a"), &wiring).is_none());
     }

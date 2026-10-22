@@ -46,6 +46,29 @@ if (typeof window !== 'undefined') {
     }
     window.ResizeObserver = ResizeObserverShim;
   }
+
+  // jsdom does not honour the `<a download>` attribute: it treats a programmatic
+  // `anchor.click()` (our file-download helpers — downloadConfigExport, the
+  // DataPage/LicencePage snapshot downloads) as a real navigation and queues a
+  // deferred `navigate()` on a timer. That timer cannot complete ("Not
+  // implemented: navigation") and, when it fires while a Vitest worker is torn
+  // down under host load, aborts the process with a libuv `uv__stream_destroy`
+  // assertion — a flaky "Worker exited unexpectedly" CI failure. A download is a
+  // no-op in jsdom regardless, so cancel the navigating default action for
+  // programmatic download-anchor clicks. The click event still dispatches, so
+  // observers/spies and the helper's own flow are unaffected.
+  HTMLAnchorElement.prototype.click = function click(this: HTMLAnchorElement): void {
+    // Dispatch a real click so download handlers, spies and listeners still
+    // observe it; for a `download` anchor pre-cancel the event so jsdom's
+    // navigating default action (the deferred, worker-aborting navigate()) never
+    // runs. Replicating jsdom's own click() this way avoids holding an unbound
+    // reference to the native prototype method.
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+    if (this.hasAttribute('download')) {
+      event.preventDefault();
+    }
+    this.dispatchEvent(event);
+  };
 }
 
 afterEach(() => {
