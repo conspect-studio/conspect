@@ -26,15 +26,19 @@ proptest! {
         }
     }
 
-    /// v4.0 never panics; any accepted packet had a valid checksum and the sync
-    /// bit set.
+    /// v4.0 never panics; any accepted packet is a full 22-byte v3.1 core +
+    /// enhancement trailer: CHKSUM makes the mod-128 sum of bytes 0..=18 zero
+    /// and VBC/XDATA follow.
     #[test]
     fn v40_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..40)) {
         if let Ok(msg) = tsl::v40::decode(&bytes) {
-            prop_assert_eq!(bytes.len(), 19);
+            prop_assert_eq!(bytes.len(), 22);
             prop_assert_eq!(msg.displays.len(), 1);
-            let sum = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
-            prop_assert_eq!(sum, 0); // body + checksum sums to zero
+            // CHKSUM (byte 18) + the 18 v3.1 bytes: (sum of bytes 0..=18) mod 128 == 0
+            let sum: u32 = bytes[..19].iter().map(|&b| u32::from(b)).sum();
+            prop_assert_eq!(sum % 128, 0);
+            prop_assert_eq!(bytes[19], 0x02); // VBC
+            prop_assert!(bytes[0] & 0x80 != 0); // sync bit
         }
     }
 

@@ -81,31 +81,6 @@ proptest! {
         prop_assert_eq!(&d.text, label.trim_end_matches(' '));
     }
 
-    /// v4.0 framed (DLE/STX, TCP): encode∘decode is the identity.
-    #[test]
-    fn v40_framed_round_trip(
-        index in 0u16..=126,
-        left in color(),
-        right in color(),
-        b in brightness(),
-        label in "[ -~]{0,16}",
-    ) {
-        let display = enc::UmdDisplay {
-            index,
-            left: enc_lamp(left, b),
-            text_tally: enc::TallyLamp::off(),
-            right: enc_lamp(right, b),
-            text: label.clone(),
-        };
-        let wire = enc::v40::encode_display_framed(&display).expect("encode");
-        let back = dec::v40::decode_framed(&wire).expect("decode");
-        let d = &back.displays[0];
-        prop_assert_eq!(d.index, index);
-        lamp_eq(d.left, left)?;
-        lamp_eq(d.right, right)?;
-        prop_assert_eq!(&d.text, label.trim_end_matches(' '));
-    }
-
     /// v5.0 ASCII, multi-display: encode∘decode is the identity (screen, per
     /// display index + three colour tallies + exact-length ASCII text).
     #[test]

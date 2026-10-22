@@ -4,7 +4,8 @@
 //! variable-length displays) and, for TCP/byte-stream transports, the
 //! DLE/STX-framed, byte-stuffed form. See the matching decoder docs in
 //! `multiview-input::tsl::v50` for the full layout. All multi-byte integers are
-//! little-endian.
+//! little-endian. CONTROL bits: 0–1 RH, 2–3 Text, 4–5 LH, 6–7 brightness;
+//! reserved bits 8–14 are sent as `0` and bit 15 (control data) is never set.
 //!
 //! Text is encoded as 7-bit ASCII by default; pass `unicode = true` to encode
 //! every label as UTF-16LE (and set the packet's `FLAGS` Unicode bit). The flag
@@ -25,19 +26,16 @@ pub const FLAG_UNICODE: u8 = 0b0000_0001;
 pub const VERSION: u8 = 0;
 
 /// DLE (Data Link Escape) — opens framing and is the stuffing escape on TCP.
-pub const DLE: u8 = 0x10;
+pub const DLE: u8 = 0xFE;
 
 /// STX (Start of Text) — the second framing byte on TCP/byte-stream.
 pub const STX: u8 = 0x02;
 
-/// ETX (End of Text) — closes a `DLE`-stuffed frame.
-pub const ETX: u8 = 0x03;
+/// Shift to the text tally field (bits 2–3).
+const TEXT_SHIFT: u16 = 2;
 
-/// Shift to the right tally field (bits 2–3).
-const RH_SHIFT: u16 = 2;
-
-/// Shift to the text tally field (bits 4–5).
-const TEXT_SHIFT: u16 = 4;
+/// Shift to the left tally field (bits 4–5).
+const LH_SHIFT: u16 = 4;
 
 /// Shift to the brightness field (bits 6–7).
 const BRIGHTNESS_SHIFT: u16 = 6;
@@ -101,14 +99,16 @@ pub fn encode(message: &UmdMessage, unicode: bool) -> Result<Vec<u8>, TslError> 
 }
 
 /// Encode a v5.0 packet **DLE/STX-framed and byte-stuffed** for a TCP/byte-stream
-/// transport: `DLE STX` + stuffed payload (`0x10` → `0x10 0x10`) + `DLE ETX`.
+/// transport: `DLE STX` (`0xFE 0x02`) followed by the payload with every literal
+/// `0xFE` doubled to `0xFE 0xFE`. There is **no terminator** — the frame length
+/// is known from the PBC field inside the payload.
 ///
 /// # Errors
 ///
 /// As [`encode`].
 pub fn encode_stuffed(message: &UmdMessage, unicode: bool) -> Result<Vec<u8>, TslError> {
     let raw = encode(message, unicode)?;
-    let mut out = Vec::with_capacity(raw.len() + 6);
+    let mut out = Vec::with_capacity(raw.len() + 2);
     out.push(DLE);
     out.push(STX);
     for &b in &raw {
@@ -117,17 +117,16 @@ pub fn encode_stuffed(message: &UmdMessage, unicode: bool) -> Result<Vec<u8>, Ts
             out.push(DLE); // stuff a literal DLE
         }
     }
-    out.push(DLE);
-    out.push(ETX);
     Ok(out)
 }
 
-/// Build the 16-bit control word (tally colours + brightness) for a display.
+/// Build the 16-bit control word (tally colours + brightness) for a display:
+/// bits 0–1 RH, 2–3 Text, 4–5 LH, 6–7 brightness, 8–15 zero.
 fn control_word(display: &UmdDisplay) -> u16 {
     let brightness = brightest(display);
-    u16::from(display.left.color_code())
-        | (u16::from(display.right.color_code()) << RH_SHIFT)
+    u16::from(display.right.color_code())
         | (u16::from(display.text_tally.color_code()) << TEXT_SHIFT)
+        | (u16::from(display.left.color_code()) << LH_SHIFT)
         | (u16::from(brightness.level()) << BRIGHTNESS_SHIFT)
 }
 

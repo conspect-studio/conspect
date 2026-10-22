@@ -1,6 +1,6 @@
 //! The tally **arbiter**: aggregate many tally sources (PGM/PVW/ME/aux/router/
 //! GPI/IS-07) into one resolved per-tile [`TallyState`] under a defined
-//! conflict-resolution policy (broadcast-multiviewer brief §2, ADR-MV001).
+//! conflict-resolution policy (broadcast-multiviewer brief §2, ADR-MV002 + ADR-MV006).
 //!
 //! A facility tallies the *same* element from several independent buses at once:
 //! a production switcher's PGM and PVW, a router crosspoint, a GPI closure, an

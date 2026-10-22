@@ -1,4 +1,4 @@
-//! Tally arbiter + profile + GPIO tests (ADR-MV001): conflict resolution and the
+//! Tally arbiter + profile + GPIO tests (ADR-MV002 + ADR-MV006): conflict resolution and the
 //! bit↔colour / index↔tile mapping are deterministic and correct, the anti-glitch
 //! latch holds and expires, and the GPI/GPO model detects edges — all pure value
 //! machines over an injected `MediaTime`, never blocking.
