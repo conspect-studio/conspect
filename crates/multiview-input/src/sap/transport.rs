@@ -109,10 +109,15 @@ impl SapListener {
     /// [`Error::Ingest`] if the socket cannot be bound.
     // `bind_dual_stack` is synchronous — the dual-stack / SO_REUSEADDR options must
     // be set BEFORE bind, so it cannot use tokio's async `UdpSocket::bind`; `bind`
-    // stays `async` for API stability (every caller, and #103, awaits it, matching
-    // the peer transports and the output `Aes67UdpSender::bind`).
-    #[allow(clippy::unused_async)]
-    pub async fn bind(local: SocketAddr) -> Result<Self> {
+    // still returns a future for API stability (every caller, and #103, awaits it,
+    // matching the peer transports and the output `Aes67UdpSender::bind`), resolved
+    // immediately via `std::future::ready`.
+    pub fn bind(local: SocketAddr) -> impl std::future::Future<Output = Result<Self>> {
+        std::future::ready(Self::bind_now(local))
+    }
+
+    /// Synchronous body of [`Self::bind`].
+    fn bind_now(local: SocketAddr) -> Result<Self> {
         // Dual-stack, SO_REUSEADDR (panel S4): a `[::]` listener also accepts
         // IPv4-mapped SAP, not left to the host `bindv6only` default.
         let socket =
@@ -322,10 +327,15 @@ impl SapAnnouncer {
     /// [`Error::Ingest`] if the socket cannot be bound.
     // `bind_dual_stack` is synchronous — the dual-stack / SO_REUSEADDR options must
     // be set BEFORE bind, so it cannot use tokio's async `UdpSocket::bind`; `bind`
-    // stays `async` for API stability (every caller, and #103, awaits it, matching
-    // the peer transports and the output `Aes67UdpSender::bind`).
-    #[allow(clippy::unused_async)]
-    pub async fn bind(local: SocketAddr) -> Result<Self> {
+    // still returns a future for API stability (every caller, and #103, awaits it,
+    // matching the peer transports and the output `Aes67UdpSender::bind`), resolved
+    // immediately via `std::future::ready`.
+    pub fn bind(local: SocketAddr) -> impl std::future::Future<Output = Result<Self>> {
+        std::future::ready(Self::bind_now(local))
+    }
+
+    /// Synchronous body of [`Self::bind`].
+    fn bind_now(local: SocketAddr) -> Result<Self> {
         // Dual-stack, SO_REUSEADDR (panel S4), mirroring the listener bind.
         let socket = bind_dual_stack(local)
             .map_err(|e| Error::Ingest(format!("sap announcer bind {local}: {e}")))?;

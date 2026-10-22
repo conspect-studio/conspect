@@ -1492,7 +1492,7 @@ mod tests {
     #[test]
     fn par_filter_map_on_empty_input_is_empty() {
         let out = par_filter_map::<u8, u8, _>(&[], |_| Some(1));
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 0);
     }
 
     #[test]

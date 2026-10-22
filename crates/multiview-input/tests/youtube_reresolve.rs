@@ -154,13 +154,18 @@ impl FakeResolver {
 }
 
 impl Resolver for FakeResolver {
-    async fn resolve(&self, _url: &str) -> Result<ResolvedHls, YoutubeError> {
+    fn resolve(
+        &self,
+        _url: &str,
+    ) -> impl std::future::Future<Output = Result<ResolvedHls, YoutubeError>> + Send {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.results
-            .lock()
-            .expect("lock")
-            .pop_front()
-            .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned())))
+        std::future::ready(
+            self.results
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned()))),
+        )
     }
 }
 

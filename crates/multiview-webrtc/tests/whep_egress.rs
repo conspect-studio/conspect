@@ -257,7 +257,7 @@ fn accept_yields_real_ice_dtls_and_created_state() {
     let ta = egress
         .accept(VIDEO_OFFER, PreviewCodec::H264, &media)
         .expect("accept");
-    assert!(!ta.ice_ufrag.is_empty());
+    assert_ne!(ta.ice_ufrag.len(), 0);
     assert_ne!(ta.ice_ufrag, "tEsT", "server mints its own ufrag");
     assert_eq!(ta.fingerprint.algorithm, "sha-256");
     let octets: Vec<&str> = ta.fingerprint.value.split(':').collect();

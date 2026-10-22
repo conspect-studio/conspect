@@ -2783,8 +2783,8 @@ mod tests {
             // A root that does not exist (the off-Linux / no-DRM fallback shape)
             // enumerates nothing and samples nothing — graceful, never a panic.
             let probe = DrmRoot::at(std::path::Path::new("/nonexistent/mv-eng4/drm")).into_probe();
-            assert!(probe.devices().is_empty());
-            assert!(probe.sample_all().is_empty());
+            assert_eq!(probe.devices().len(), 0);
+            assert_eq!(probe.sample_all().len(), 0);
         }
     }
 

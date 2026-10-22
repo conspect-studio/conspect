@@ -226,7 +226,6 @@ impl RtpReceiver {
     /// future ends (clean end-of-stream) if the receiver half is dropped or a
     /// socket error occurs; it is the live, NIC-bound path and is exercised only
     /// by the gated live test.
-    #[must_use]
     pub fn channel_bridge(mut self, capacity: usize) -> (ChannelPacketSource, ReceiveLoop) {
         let (sink, source) = ChannelPacketSource::bounded(capacity);
         let task = async move {

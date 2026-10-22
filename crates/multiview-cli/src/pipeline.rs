@@ -11407,10 +11407,10 @@ mod overlay_clock_tests {
 
     #[test]
     fn no_clock_overlay_yields_an_empty_set() {
-        assert!(analog_clocks_from_config(&[], 1280, 720).is_empty());
+        assert_eq!(analog_clocks_from_config(&[], 1280, 720).len(), 0);
         // A digital clock overlay does NOT request an analog face.
         let digital = clock_overlay(serde_json::json!({ "face": "digital" }));
-        assert!(analog_clocks_from_config(&[digital], 1280, 720).is_empty());
+        assert_eq!(analog_clocks_from_config(&[digital], 1280, 720).len(), 0);
     }
 
     #[test]

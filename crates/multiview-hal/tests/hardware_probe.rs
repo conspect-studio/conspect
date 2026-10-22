@@ -145,7 +145,7 @@ fn probe_resolves_cleanly(kind: BackendKind) {
                 reason,
             }) => {
                 assert_eq!(reported, kind);
-                assert!(!reason.is_empty());
+                assert_ne!(reason.len(), 0);
             }
             Err(other) => panic!("probe must only ever fail as BackendUnavailable, got {other:?}"),
         }

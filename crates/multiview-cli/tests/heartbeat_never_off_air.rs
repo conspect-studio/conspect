@@ -488,29 +488,34 @@ impl ChaosActivateServer {
     }
 }
 impl LicenceServer for ChaosActivateServer {
-    async fn fetch_keys(&self) -> Result<LicensingKeys, HeartbeatError> {
-        Ok(self.kit.keys())
+    fn fetch_keys(
+        &self,
+    ) -> impl std::future::Future<Output = Result<LicensingKeys, HeartbeatError>> + Send {
+        std::future::ready(Ok(self.kit.keys()))
     }
-    async fn fetch_challenge(&self, _org: &str) -> Result<DeviceChallenge, HeartbeatError> {
+    fn fetch_challenge(
+        &self,
+        _org: &str,
+    ) -> impl std::future::Future<Output = Result<DeviceChallenge, HeartbeatError>> + Send {
         // A generously-future nonce (the client reads the real wall clock) + a
         // server-assigned instanceId so `activate_once` can build a real request.
-        Ok(DeviceChallenge::new(
+        std::future::ready(Ok(DeviceChallenge::new(
             "9f3a2b6e1c0e9b41a4c92d7e3b8f10c25e6a7d3f49b0c81e2f5a6d7c8b9e0f1a".to_owned(),
             i64::MAX,
             "ib_chaos_0001".to_owned(),
-        ))
+        )))
     }
-    async fn heartbeat(
+    fn heartbeat(
         &self,
         _org: &str,
         _body: Vec<u8>,
         _idem: &str,
         _pop_header: &str,
-    ) -> Result<HeartbeatResponse, HeartbeatError> {
+    ) -> impl std::future::Future<Output = Result<HeartbeatResponse, HeartbeatError>> + Send {
         // Not exercised on the activate-first path; fail closed if ever reached.
-        Err(HeartbeatError::Transport(
+        std::future::ready(Err(HeartbeatError::Transport(
             "chaos: heartbeat not used".to_owned(),
-        ))
+        )))
     }
     async fn activate(
         &self,

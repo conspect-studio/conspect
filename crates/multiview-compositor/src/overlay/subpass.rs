@@ -548,9 +548,7 @@ impl LinearCanvasBuffer {
     pub fn filled(width: u32, height: u32, background: PremulRgba) -> Self {
         let mut canvas = Self::transparent(width, height);
         let bg = [background.r, background.g, background.b, background.a];
-        for px in &mut canvas.pixels {
-            *px = bg;
-        }
+        canvas.pixels.fill(bg);
         canvas
     }
 
@@ -1480,7 +1478,10 @@ mod dirty_rects_tests {
 
     #[test]
     fn empty_list_has_no_dirty_rects() {
-        assert!(overlay_dirty_rects(&OverlayDrawList::new(), 64, 64).is_empty());
+        assert_eq!(
+            overlay_dirty_rects(&OverlayDrawList::new(), 64, 64).len(),
+            0
+        );
     }
 
     #[test]
@@ -1557,7 +1558,7 @@ mod dirty_rects_tests {
     fn a_fully_offscreen_primitive_yields_no_rect() {
         let mut list = OverlayDrawList::new();
         list.push(rect(-40, -40, 10, 10));
-        assert!(overlay_dirty_rects(&list, 64, 64).is_empty());
+        assert_eq!(overlay_dirty_rects(&list, 64, 64).len(), 0);
     }
 
     #[test]

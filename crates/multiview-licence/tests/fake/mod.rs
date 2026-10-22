@@ -1026,18 +1026,24 @@ impl FakeLicenceServer {
             .lock()
             .expect("poisoned")
             .push(idempotency_key.to_owned());
-        // `fetch_update` decrements only while positive, so the failure fires for
-        // exactly the first N recorded mutations and not after.
-        let took = self
-            .fail_after_recording
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                if n > 0 {
-                    Some(n - 1)
-                } else {
-                    None
-                }
-            })
-            .is_ok();
+        // Decrement only while positive (a compare-exchange loop; the
+        // `try_update` helper is newer than the workspace MSRV), so the failure
+        // fires for exactly the first N recorded mutations and not after.
+        let mut n = self.fail_after_recording.load(Ordering::SeqCst);
+        let took = loop {
+            if n == 0 {
+                break false;
+            }
+            match self.fail_after_recording.compare_exchange_weak(
+                n,
+                n - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => n = actual,
+            }
+        };
         took.then(|| HeartbeatError::Transport("fake lost-response after recording".to_owned()))
     }
 
