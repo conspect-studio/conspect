@@ -516,12 +516,30 @@ impl UnifiedEndpoint {
         buf: &mut [u8],
         local_addr: SocketAddr,
         concrete_candidates: &[SocketAddr],
+        route: impl FnMut(SocketAddr, SocketAddr, &[u8]),
+    ) -> DrainOutcome {
+        Self::drain_inbound_budgeted_with(
+            socket,
+            buf,
+            local_addr,
+            concrete_candidates,
+            MAX_DRAIN_TIME,
+            route,
+        )
+    }
+
+    fn drain_inbound_budgeted_with(
+        socket: &tokio::net::UdpSocket,
+        buf: &mut [u8],
+        local_addr: SocketAddr,
+        concrete_candidates: &[SocketAddr],
+        time_budget: Duration,
         mut route: impl FnMut(SocketAddr, SocketAddr, &[u8]),
     ) -> DrainOutcome {
         let started = Instant::now();
         let mut read_count = 0usize;
         loop {
-            if read_count >= MAX_DATAGRAMS_PER_WAKE || started.elapsed() >= MAX_DRAIN_TIME {
+            if read_count >= MAX_DATAGRAMS_PER_WAKE || started.elapsed() >= time_budget {
                 // Budget hit while the socket may still hold data: break to
                 // pump/yield; the caller re-arms the `select!` (defect #1 fix).
                 return DrainOutcome {
@@ -695,6 +713,27 @@ impl UnifiedEndpoint {
 mod tests {
     use super::*;
     use std::net::{Ipv6Addr, SocketAddrV6, UdpSocket};
+
+    /// Count queued UDP datagrams with Linux's advancing peek cursor. No read
+    /// consumes a datagram; restore the default offset before the real drain.
+    #[cfg(target_os = "linux")]
+    fn queued_datagrams(socket: &tokio::net::UdpSocket) -> std::io::Result<usize> {
+        use std::mem::MaybeUninit;
+
+        let socket = socket2::SockRef::from(socket);
+        crate::transport::local_addr::set_peek_offset(&socket, 0)?;
+        let mut count = 0;
+        let mut payload = [MaybeUninit::uninit(); 5];
+        while count <= MAX_DATAGRAMS_PER_WAKE {
+            match socket.recv_from_with_flags(&mut payload, libc::MSG_PEEK | libc::MSG_DONTWAIT) {
+                Ok(_) => count += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        crate::transport::local_addr::set_peek_offset(&socket, -1)?;
+        Ok(count)
+    }
 
     /// Invariant #10 / round-2 BLOCKER: under a **permanent** inbound flood the
     /// driver's servicing pass (commands + timers + outbound + GC) must keep pace
@@ -887,6 +926,7 @@ mod tests {
         );
         // Sending does not imply that the receive queue already holds a full
         // budget: wait for the *queued* datagrams, not just one readable edge.
+        #[cfg(target_os = "linux")]
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if queued_datagrams(&recv).unwrap() > MAX_DATAGRAMS_PER_WAKE {
@@ -897,6 +937,9 @@ mod tests {
         })
         .await
         .expect("more than one receive budget must be queued before draining");
+        // Register Tokio's readiness before try_io; counting with the raw socket
+        // alone does not arm its reactor. Non-Linux retains the old precondition.
+        recv.readable().await.unwrap();
 
         let mut buf = vec![0u8; RECV_BUFFER];
         let concrete = [local_addr];
@@ -905,11 +948,12 @@ mod tests {
         // reading every queued datagram (and spin forever on a live flood).
         let mut routed = 0usize;
         let started = Instant::now();
-        let outcome = UnifiedEndpoint::drain_inbound_budgeted(
+        let outcome = UnifiedEndpoint::drain_inbound_budgeted_with(
             &recv,
             &mut buf,
             local_addr,
             &concrete,
+            Duration::from_secs(10), // isolate the count cap from host scheduling
             |_src, _dst, _payload| {
                 routed += 1;
             },
@@ -952,6 +996,58 @@ mod tests {
         assert!(
             routed2 > 0 && outcome2.read_count > 0,
             "the next wake drains the datagrams deferred by the budget: {outcome2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_time_budget_defers_queued_datagrams() {
+        let recv = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        recv.set_only_v6(false).unwrap();
+        recv.set_nonblocking(true).unwrap();
+        let bind = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
+        recv.bind(&bind.into()).unwrap();
+        let local_addr = recv.local_addr().unwrap().as_socket().unwrap();
+        crate::transport::local_addr::enable_pktinfo(&recv).unwrap();
+        let recv = tokio::net::UdpSocket::from_std(recv.into()).unwrap();
+        let sender = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            0,
+            0,
+            0,
+        )))
+        .unwrap();
+        sender.send_to(b"first", local_addr).unwrap();
+        sender.send_to(b"second", local_addr).unwrap();
+        recv.readable().await.unwrap();
+
+        let mut buf = vec![0u8; RECV_BUFFER];
+        let concrete = [local_addr];
+        let outcome = UnifiedEndpoint::drain_inbound_budgeted_with(
+            &recv,
+            &mut buf,
+            local_addr,
+            &concrete,
+            Duration::ZERO,
+            |_src, _dst, _payload| {},
+        );
+        assert!(outcome.budget_exhausted, "time budget must stop the drain");
+        assert!(outcome.read_count < MAX_DATAGRAMS_PER_WAKE);
+        let next = UnifiedEndpoint::drain_inbound_budgeted_with(
+            &recv,
+            &mut buf,
+            local_addr,
+            &concrete,
+            Duration::from_secs(10),
+            |_src, _dst, _payload| {},
+        );
+        assert!(
+            next.read_count > 0,
+            "the next wake drains deferred datagrams: {next:?}"
         );
     }
 
