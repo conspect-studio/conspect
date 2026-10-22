@@ -93,7 +93,7 @@ pub use schema::{
     OrientationMechanism, OrientationMode, OrientationTagCapability, Output, OutputFlip,
     OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata, Overlay, Rect,
     RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
-    SourceAuth, SourceKind, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
+    SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -1803,12 +1803,17 @@ fn validate_rist_options(
 ///
 /// Admission-time structural checks only — never the data plane (ADR-0039 §2):
 /// - the stream id is capped at SRT's 512-byte protocol limit;
+/// - `oheadbw_pct` is inside SRT `SRTO_OVERHEADBW`'s `5..=100` percent range;
+/// - `maxbw` is at or above SRT `SRTO_MAXBW`'s `-1` (unlimited) sentinel;
 /// - an `encryption` block must name a real cipher (`key_length != none`) and
 ///   carry a non-empty `passphrase_ref` — the passphrase is a secret-manager
 ///   reference, never a plaintext key in config (ADR-0039 §5).
 ///
 /// Latency is carried as exact milliseconds; the `FFmpeg` `×1000` µs conversion is
-/// the SRT-2 wiring boundary, not a config concern.
+/// the SRT-2 wiring boundary, not a config concern. The two timeouts are `u32`
+/// milliseconds (negatives are unrepresentable; libsrt documents no other range),
+/// and `listener`/`backend` are carried only — none of these is acted on until
+/// the SRT-2 (#58) wiring.
 fn validate_srt_options(owner: &str, opts: &crate::schema::SrtOptions) -> Result<(), ConfigError> {
     if let Some(stream_id) = &opts.stream_id {
         let max = crate::schema::SrtOptions::STREAM_ID_MAX_BYTES;
@@ -1816,6 +1821,22 @@ fn validate_srt_options(owner: &str, opts: &crate::schema::SrtOptions) -> Result
             return Err(ConfigError::Validation(format!(
                 "srt {owner:?}: stream_id is {} bytes, exceeding SRT's {max}-byte limit",
                 stream_id.len()
+            )));
+        }
+    }
+    if let Some(pct) = opts.oheadbw_pct {
+        if !(5..=100).contains(&pct) {
+            return Err(ConfigError::Validation(format!(
+                "srt {owner:?}: oheadbw_pct = {pct} is outside SRT's 5..=100 percent range \
+                 (`SRTO_OVERHEADBW`; libsrt's default is 25)"
+            )));
+        }
+    }
+    if let Some(maxbw) = opts.maxbw {
+        if maxbw < -1 {
+            return Err(ConfigError::Validation(format!(
+                "srt {owner:?}: maxbw = {maxbw} is invalid — SRT `SRTO_MAXBW` is bytes per \
+                 second, `0` means auto/relative to the input rate and `-1` means unlimited"
             )));
         }
     }
