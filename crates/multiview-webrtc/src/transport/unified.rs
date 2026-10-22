@@ -885,8 +885,18 @@ mod tests {
             sent > MAX_DATAGRAMS_PER_WAKE,
             "test precondition: queued {sent} datagrams (> budget {MAX_DATAGRAMS_PER_WAKE})"
         );
-        // Let the kernel enqueue them.
-        recv.readable().await.unwrap();
+        // Sending does not imply that the receive queue already holds a full
+        // budget: wait for the *queued* datagrams, not just one readable edge.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if queued_datagrams(&recv).unwrap() > MAX_DATAGRAMS_PER_WAKE {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("more than one receive budget must be queued before draining");
 
         let mut buf = vec![0u8; RECV_BUFFER];
         let concrete = [local_addr];
