@@ -49,7 +49,7 @@ toolchain.
 
 ### Required: Rust toolchain
 
-The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (stable channel,
+The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (stable `1.99.1`, mirrored in CI;
 edition **2021**), with `rustfmt`, `clippy`, and the Linux/macOS targets preselected.
 Install via [rustup](https://rustup.rs) and the pin is honoured automatically:
 

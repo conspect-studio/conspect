@@ -12,7 +12,7 @@ source of truth. All other docs, the agent-instruction files, and the workspace 
 - **Name:** Multiview — an efficient, hardware-accelerated, Rust live video multiview generator.
 - **Binary / daemon:** `multiview`
 - **Tagline:** Ingest many live sources → composite a templated multiview on the GPU → serve robustly. Built to run great on **commodity hardware**, with **bulletproof continuous output**.
-- **Edition / toolchain:** Rust edition **2021**, pinned via `rust-toolchain.toml` (stable). MSRV documented in the README.
+- **Edition / toolchain:** Rust edition **2021**, pinned via `rust-toolchain.toml` (stable `1.99.1`; CI `dtolnay/rust-toolchain` pins the same version). MSRV documented in the README.
 - **License:** Multiview's own code is **source-available, non-commercial** — the **Multiview Source-Available Non-Commercial License, Version 1.0** (© Aperim Pty Ltd). Free for genuine personal/home/non-commercial use plus three free exceptions; all other (commercial) use needs a paid Commercial License. **Not open source / not free software.** See §7 for the FFmpeg/NDI/codec dependency-linking model.
 - **Platforms:** Linux (x86_64 + aarch64; NVIDIA via Container Toolkit, Intel/AMD via VAAPI) and macOS (Apple Silicon + Intel, native). **No Windows.**
 

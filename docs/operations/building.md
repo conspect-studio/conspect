@@ -43,7 +43,7 @@ system prerequisites below.
 
 ### 2.1 Rust toolchain (all platforms)
 
-The toolchain is **pinned** via `rust-toolchain.toml` (stable, edition 2021). Install
+The toolchain is **pinned** via `rust-toolchain.toml` (stable `1.99.1`, edition 2021; CI pins the same version). Install
 [rustup](https://rustup.rs); it picks up the pinned channel automatically on first build. The MSRV
 is documented in the README.
 

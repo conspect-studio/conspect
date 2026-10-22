@@ -38,7 +38,7 @@ jobs:
           fetch-depth: 0 # full history for changelog generation
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable # matches ci.yml + rust-toolchain.toml (channel = stable)
+        uses: dtolnay/rust-toolchain@1.99.1 # matches ci.yml + rust-toolchain.toml (channel = 1.99.1)
 
       - name: Run release-plz
         uses: release-plz/action@v0.5.130 # v0.5.129
