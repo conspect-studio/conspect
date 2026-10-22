@@ -8,6 +8,7 @@
 )]
 
 use multiview_input::srt::{KeyLength, SrtConfig, SrtError, SrtMode, StreamId};
+use proptest::prelude::*;
 
 #[test]
 fn srt_caller_url_basic() {
@@ -197,4 +198,59 @@ fn srt_validation_requires_host_and_port() {
         ..SrtConfig::default()
     };
     assert!(matches!(cfg2.to_url(), Err(SrtError::Parameter(_))));
+}
+
+/// An encrypted config whose passphrase is exactly `len` ASCII characters.
+fn encrypted_with_passphrase_len(len: usize) -> SrtConfig {
+    SrtConfig {
+        host: "h".to_owned(),
+        port: 9000,
+        key_length: KeyLength::Aes128,
+        passphrase: Some("p".repeat(len)),
+        ..SrtConfig::default()
+    }
+}
+
+#[test]
+fn srt_passphrase_boundary_accepts_80_and_rejects_81() {
+    // libsrt enforces `10..=80` inclusive (`HAICRYPT_SECRET_MAX_SZ = 80`); the
+    // old `10..=79` bound was a verified off-by-one (ADR-0039). 79 and 80 are
+    // both valid; 9 and 81 are both rejected.
+    for (len, valid) in [(9usize, false), (10, true), (79, true), (80, true), (81, false)] {
+        match (valid, encrypted_with_passphrase_len(len).validate()) {
+            (true, Ok(())) => {}
+            (false, Err(SrtError::PassphraseLength(reported))) => assert_eq!(reported, len),
+            (want, got) => panic!("passphrase len {len}: expected valid={want}, got {got:?}"),
+        }
+    }
+}
+
+proptest! {
+    /// The passphrase domain is exactly `10..=80` characters, for every length
+    /// across both boundaries (the off-by-one the audit caught).
+    #[test]
+    fn srt_passphrase_length_property(len in 0usize..=200) {
+        let cfg = encrypted_with_passphrase_len(len);
+        prop_assert_eq!(cfg.validate().is_ok(), (10..=80).contains(&len));
+    }
+
+    /// The stream-id cap is exactly SRT's 512 bytes.
+    #[test]
+    fn srt_stream_id_length_property(len in 0usize..=600) {
+        prop_assert_eq!(
+            StreamId::new("x".repeat(len)).is_ok(),
+            len <= StreamId::MAX_BYTES
+        );
+    }
+
+    /// `pbkeylen` is exactly `{0, 16, 24, 32}`: every byte count outside the
+    /// domain is rejected and every accepted one maps back into the domain.
+    #[test]
+    fn srt_pbkeylen_domain_property(bytes in any::<u8>()) {
+        let parsed = KeyLength::from_bytes(bytes);
+        prop_assert_eq!(parsed.is_ok(), matches!(bytes, 0 | 16 | 24 | 32));
+        if let Ok(key) = parsed {
+            prop_assert!(matches!(key.bytes(), 0 | 16 | 24 | 32));
+        }
+    }
 }
