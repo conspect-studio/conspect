@@ -19,7 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use multiview_cli::config_watch::{spawn as spawn_watch, ConfigWatchHandle, WatchOptions};
+use multiview_cli::config_watch::{
+    spawn as spawn_watch, ConfigWatchHandle, ManualPoll, WatchOptions,
+};
 use multiview_cli::control::command_drain_with_live_sources;
 use multiview_cli::live_sources::{shared_stores, stop_registry, LiveSourceHub};
 use multiview_compositor::blend::LinearRgba;
@@ -103,6 +105,31 @@ fn rig(doc: &str) -> Rig {
 /// spawned — exactly the real boot window between `load_validated` in
 /// `run_run` and `serve_control_plane`'s spawn (ADR-W020 review M2).
 fn rig_with(doc: &str, capacity: usize, boot_window: impl FnOnce(&std::path::Path)) -> Rig {
+    rig_with_options(
+        doc,
+        capacity,
+        boot_window,
+        WatchOptions::default().with_poll_interval(TEST_POLL),
+    )
+}
+
+/// [`rig`] driven by the manual-poll seam: the returned [`ManualPoll`] runs
+/// exactly one watcher poll per `poll_once`, so a test owns the debounce
+/// cadence and never races the wall-clock poll under host load.
+fn rig_manual(doc: &str) -> (Rig, ManualPoll) {
+    let (options, poll) = WatchOptions::default()
+        .with_poll_interval(TEST_POLL)
+        .with_manual_poll();
+    (rig_with_options(doc, 64, |_| {}, options), poll)
+}
+
+/// Shared rig builder: [`rig_with`] with explicit [`WatchOptions`].
+fn rig_with_options(
+    doc: &str,
+    capacity: usize,
+    boot_window: impl FnOnce(&std::path::Path),
+    options: WatchOptions,
+) -> Rig {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("multiview.toml");
     std::fs::write(&path, doc).expect("write boot config");
@@ -127,12 +154,7 @@ fn rig_with(doc: &str, capacity: usize, boot_window: impl FnOnce(&std::path::Pat
 
     boot_window(&path);
 
-    let handle = spawn_watch(
-        path.clone(),
-        config.clone(),
-        state.clone(),
-        WatchOptions::default().with_poll_interval(TEST_POLL),
-    );
+    let handle = spawn_watch(path.clone(), config.clone(), state.clone(), options);
     Rig {
         _dir: dir,
         path,
@@ -477,24 +499,38 @@ async fn an_output_change_reseeds_the_store_and_warns_restart() {
 /// debounce: the watcher acts only on a stable fingerprint).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn editor_multi_writes_settle_to_one_apply() {
-    let r = rig(INITIAL_DOC);
+    let (r, mut poll) = rig_manual(INITIAL_DOC);
+    // Settle the initial pass: the unchanged file crosses the two-poll gate
+    // and is adopted with no apply.
+    drive_polls(&mut poll, 2).await;
+    assert_eq!(
+        applied_count(&r.state),
+        0,
+        "the unchanged file must not apply"
+    );
 
-    // Two quick writes (an editor's truncate+write churn): an intermediate
-    // colour, then the final one, inside a single poll window.
+    // Two writes (an editor's truncate+write churn) with exactly ONE poll in
+    // between: the poll registers the intermediate colour as the candidate,
+    // the second write changes the fingerprint before it can settle. Driven
+    // by manual ticks, so host load cannot stretch the gap past the debounce.
     std::fs::write(&r.path, INITIAL_DOC.replace("#101418", "#202428")).expect("write A");
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    drive_polls(&mut poll, 1).await;
     std::fs::write(
         &r.path,
         format!("{}\n# settled\n", INITIAL_DOC.replace("#101418", "#f0f0f0")),
     )
     .expect("write B");
 
-    assert!(
-        wait_until(SETTLE, || applied_count(&r.state) >= 1).await,
-        "the settled write must apply"
-    );
-    // Let several further polls elapse: no second apply may appear.
-    tokio::time::sleep(TEST_POLL * 6).await;
+    // Poll until the final content settles and applies (two polls suffice;
+    // bounded so a regression fails instead of hanging).
+    let mut polls = 0;
+    while applied_count(&r.state) == 0 && polls < 8 {
+        drive_polls(&mut poll, 1).await;
+        polls += 1;
+    }
+    assert!(applied_count(&r.state) >= 1, "the settled write must apply");
+    // Several further polls: no second apply may appear.
+    drive_polls(&mut poll, 6).await;
     assert_eq!(
         applied_count(&r.state),
         1,
@@ -507,6 +543,17 @@ async fn editor_multi_writes_settle_to_one_apply() {
         "the single apply must carry the FINAL content"
     );
     r.handle.stop();
+}
+
+/// Run `n` manual watcher polls, each awaited to completion.
+async fn drive_polls(poll: &mut ManualPoll, n: usize) {
+    for i in 0..n {
+        assert!(
+            poll.poll_once().await,
+            "the watcher loop exited before poll {} of {n}",
+            i + 1
+        );
+    }
 }
 
 /// An atomic write-temp + rename(2) — the safe-editor idiom — is detected
