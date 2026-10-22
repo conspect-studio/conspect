@@ -127,18 +127,52 @@ async fn wedged_downstream_consumer_does_not_stall_tick_aware_hook() {
         multiview_engine::CooperativePacer,
     );
     let publisher = EnginePublisher::<u64, ()>::new(1);
-    // No receiver polls the state or event lane: a permanently wedged consumer.
-    let outcome = runtime
-        .run_for_with_tick_control(
+    // Keep a receiver alive without draining it: tick one fills the
+    // one-event ring, and every subsequent tick must still publish promptly.
+    let mut wedged_events = publisher.subscribe();
+    publisher.publish_state(0);
+    let consumer_state = publisher.state.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let consumer = std::thread::spawn(move || {
+        let snapshot = consumer_state.latest().expect("initial state exists");
+        ready_tx.send(()).unwrap();
+        // Model MP-1's blocked OS-thread consumer while retaining a state snapshot.
+        release_rx.recv().unwrap();
+        assert_eq!(*snapshot, 0);
+    });
+    ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    // Run the tick loop on a separate OS thread: a synchronous blocked publish
+    // cannot freeze the test thread and evade the wall-clock deadline.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = executor.block_on(runtime.run_for_with_tick_control(
             &publisher,
             &StopSignal::new(),
             50,
             |frame| frame.tick.index,
             |_| Some(()),
             move |_, _| time.advance(Duration::from_nanos(16_666_667)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(outcome.ticks, 50);
-    assert_eq!(runtime.frames_repeated(), 0);
+        ));
+        done_tx
+            .send((outcome.unwrap().ticks, runtime.frames_repeated()))
+            .unwrap();
+    });
+    let result = done_rx.recv_timeout(Duration::from_secs(3));
+    release_tx.send(()).unwrap();
+    consumer.join().unwrap();
+    let (ticks, repeated) = result.expect("50 ticks must finish while consumers are wedged");
+    producer.join().unwrap();
+    assert_eq!(ticks, 50);
+    assert_eq!(repeated, 0);
+    assert_eq!(wedged_events.len(), 50);
+    assert!(matches!(
+        wedged_events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(49))
+    ));
 }
