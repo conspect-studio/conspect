@@ -17,7 +17,7 @@
 )]
 
 use multiview_core::tally::{Brightness, TallyColor};
-use multiview_output::tsl::{self, TallyLamp, TslVersion, UmdDisplay, UmdMessage};
+use multiview_output::tsl::{self, TallyLamp, TslError, TslVersion, UmdDisplay, UmdMessage};
 
 fn lamp(color: TallyColor) -> TallyLamp {
     TallyLamp {
@@ -84,29 +84,101 @@ fn v40_encodes_golden_vector_with_valid_checksum() {
             text: "VTR".to_owned(),
         }],
     };
-    let core = tsl::v40::encode(&msg).expect("v4.0 encode");
-    assert_eq!(core.len(), 19);
-    assert_eq!(core[0], 0x82); // sync + address 2
-    assert_eq!(core[1], 0b01 | (0b10 << 2) | (0b11 << 4) | (0b11 << 6));
-    assert_eq!(&core[2..5], b"VTR");
-    // checksum makes the whole 19-byte sum zero
-    let sum = core.iter().fold(0u8, |a, &b| a.wrapping_add(b));
-    assert_eq!(sum, 0);
+    let packet = tsl::v40::encode(&msg).expect("v4.0 encode");
+    // Byte-identical to the multiview-input decoder's `v40_golden()` vector:
+    // 82 33 56 54 52 [20 ×13] 2F 02 1E 1E. CHKSUM 0x2F makes the mod-128 sum
+    // of bytes 0..=18 zero (849 + 47 = 896 = 7 × 128); XDATA 0x1E packs
+    // LH=red, Txt=amber, RH=green.
+    assert_eq!(
+        packet,
+        [
+            0x82, 0x33, 0x56, 0x54, 0x52, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, //
+            0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x2F, 0x02, 0x1E, 0x1E,
+        ]
+    );
+    let sum: u32 = packet[..19].iter().map(|&b| u32::from(b)).sum();
+    assert_eq!(sum % 128, 0);
 }
 
 #[test]
-fn v40_framed_wraps_in_dle_stx() {
-    let display = UmdDisplay {
-        index: 2,
-        left: lamp(TallyColor::Red),
-        text_tally: lamp(TallyColor::Amber),
-        right: lamp(TallyColor::Green),
-        text: "VTR".to_owned(),
+fn v40_encodes_all_call_and_dim() {
+    // All-call address 0x7F with a dim (level 1) lit lamp. The encoder derives
+    // the CTRL brightness field from the brightest LIT lamp — an all-Off
+    // display would emit the FULL baseline instead, so this uses a lit lamp to
+    // pin the dim path. CHKSUM: (255 + 17 + 16×32) = 784, 784 mod 128 = 16,
+    // 128 − 16 = 112 = 0x70. XDATA: LH=red → 0x10.
+    let mut dim = lamp(TallyColor::Red);
+    dim.brightness = Brightness::new(1);
+    let msg = UmdMessage {
+        version: TslVersion::V40,
+        screen: 0,
+        displays: vec![UmdDisplay {
+            index: 0x7F,
+            left: dim,
+            text_tally: TallyLamp::off(),
+            right: TallyLamp::off(),
+            text: String::new(),
+        }],
     };
-    let framed = tsl::v40::encode_display_framed(&display).expect("framed");
-    assert_eq!(framed[0], tsl::v40::DLE);
-    assert_eq!(framed[1], tsl::v40::STX);
-    assert_eq!(framed.len(), 2 + 19);
+    let packet = tsl::v40::encode(&msg).expect("v4.0 all-call encode");
+    assert_eq!(
+        packet,
+        [
+            0xFF, 0x11, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, //
+            0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70, 0x02, 0x10, 0x10,
+        ]
+    );
+    let sum: u32 = packet[..19].iter().map(|&b| u32::from(b)).sum();
+    assert_eq!(sum % 128, 0);
+}
+
+#[test]
+fn v40_encodes_all_off_as_full_brightness() {
+    // Contract: the CTRL brightness field is the max brightness over LIT
+    // lamps; with none lit it falls back to FULL (CTRL 0x30). Unlit-lamp
+    // brightness is unobservable on the wire — this vector pins the fallback
+    // so a codec writing dim (0x00) for all-Off cannot ship green.
+    // CHKSUM: 255 + 48 + 16×32 = 815, 815 mod 128 = 47, 128 − 47 = 81 = 0x51.
+    let msg = UmdMessage {
+        version: TslVersion::V40,
+        screen: 0,
+        displays: vec![UmdDisplay {
+            index: 0x7F,
+            left: TallyLamp::off(),
+            text_tally: TallyLamp::off(),
+            right: TallyLamp::off(),
+            text: String::new(),
+        }],
+    };
+    let packet = tsl::v40::encode(&msg).expect("v4.0 all-off encode");
+    assert_eq!(
+        packet,
+        [
+            0xFF, 0x30, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, //
+            0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x51, 0x02, 0x00, 0x00,
+        ]
+    );
+    let sum: u32 = packet[..19].iter().map(|&b| u32::from(b)).sum();
+    assert_eq!(sum % 128, 0);
+}
+
+#[test]
+fn v40_rejects_overlong_label() {
+    let msg = UmdMessage {
+        version: TslVersion::V40,
+        screen: 0,
+        displays: vec![UmdDisplay {
+            index: 0,
+            left: TallyLamp::off(),
+            text_tally: TallyLamp::off(),
+            right: TallyLamp::off(),
+            text: "0123456789ABCDEFG".to_owned(), // 17 chars
+        }],
+    };
+    assert!(matches!(
+        tsl::v40::encode(&msg),
+        Err(TslError::LabelTooLong { len: 17, max: 16 })
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +208,9 @@ fn v50_encodes_golden_ascii_vector() {
     assert_eq!(u16::from_le_bytes([packet[4], packet[5]]), 5); // SCREEN
     assert_eq!(u16::from_le_bytes([packet[6], packet[7]]), 0); // INDEX
     let control = u16::from_le_bytes([packet[8], packet[9]]);
-    // L=green(10) R=red(01)<<2 Text=off(00) B=full(11)<<6
-    assert_eq!(control, 0b10 | (0b01 << 2) | (0b11 << 6));
+    // CONTROL: bits 0-1 RH=red(01), bits 2-3 Text=off(00), bits 4-5 LH=green(10),
+    // bits 6-7 brightness=full(11) — the bit order the TSL 5.0 spec prescribes.
+    assert_eq!(control, 0xE1);
     let len = u16::from_le_bytes([packet[10], packet[11]]) as usize;
     assert_eq!(len, 3);
     assert_eq!(&packet[12..15], b"SRC");
@@ -168,7 +241,7 @@ fn v50_stuffed_doubles_dle_and_wraps() {
         version: TslVersion::V50,
         screen: 0,
         displays: vec![UmdDisplay {
-            index: 0x0010, // low byte 0x10 == DLE, forces a stuffing event
+            index: 0x00FE, // low byte 0xFE == DLE, forces a stuffing event
             left: TallyLamp::off(),
             text_tally: TallyLamp::off(),
             right: TallyLamp::off(),
@@ -179,12 +252,13 @@ fn v50_stuffed_doubles_dle_and_wraps() {
     let stuffed = tsl::v50::encode_stuffed(&msg, false).expect("stuffed");
     assert_eq!(stuffed[0], tsl::v50::DLE);
     assert_eq!(stuffed[1], tsl::v50::STX);
-    assert_eq!(stuffed[stuffed.len() - 2], tsl::v50::DLE);
-    assert_eq!(stuffed[stuffed.len() - 1], tsl::v50::ETX);
-    // every literal DLE in the raw payload appears doubled in the stuffed body
+    assert_eq!(stuffed[0], 0xFE);
+    assert_eq!(stuffed[1], 0x02);
+    // v5.0 TCP framing has NO terminator: stuffed = opener + payload only,
+    // and the only inserted bytes are the DLE duplicates.
     let raw_dles = raw.iter().filter(|&&b| b == tsl::v50::DLE).count();
-    // body between the 2-byte opener and 2-byte closer
-    let body = &stuffed[2..stuffed.len() - 2];
+    assert_eq!(stuffed.len(), 2 + raw.len() + raw_dles);
+    let body = &stuffed[2..];
     let body_dles = body.iter().filter(|&&b| b == tsl::v50::DLE).count();
     assert_eq!(body_dles, raw_dles * 2);
 }

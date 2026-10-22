@@ -16,19 +16,24 @@
 //!     TEXT    : LENGTH bytes (ASCII, or UTF-16LE when FLAGS bit 0 is set)
 //! ```
 //!
-//! The 16-bit **CONTROL** word (only the low byte is currently defined):
+//! The 16-bit **CONTROL** word:
 //!
-//! * bits 0–1 — **left** tally colour (`0` off / `1` red / `2` green / `3` amber),
-//! * bits 2–3 — **right** tally colour,
-//! * bits 4–5 — **text** tally colour,
-//! * bits 6–7 — **brightness** (`0..=3`).
+//! * bits 0–1 — **right** tally colour (`0` off / `1` red / `2` green / `3` amber),
+//! * bits 2–3 — **text** tally colour,
+//! * bits 4–5 — **left** tally colour,
+//! * bits 6–7 — **brightness** (`0..=3`),
+//! * bits 8–14 — reserved (send `0`, ignore on receive),
+//! * bit 15 — **control data**: the DMSG carries control (not display) data;
+//!   such DMSGs are skipped by this decoder.
 //!
 //! The maximum packet size is **2048 bytes**; the number of displays is bounded
 //! by that ceiling, not by a fixed count.
 //!
-//! On a **TCP / byte-stream** transport the packet is **DLE/STX byte-stuffed**
-//! (`0x10 0x02` opens a packet; a literal `0x10` in the payload is doubled to
-//! `0x10 0x10`). On **UDP** the packet is sent raw. Use [`decode`] for a raw
+//! On a **TCP / byte-stream** transport the packet is **DLE/STX byte-stuffed**:
+//! `DLE STX` (`0xFE 0x02`) opens a packet and every literal `0xFE` in the
+//! payload is doubled to `0xFE 0xFE`. There is **no terminator** — the frame
+//! length is known from the PBC field, so the stuffing covers the whole
+//! segment. On **UDP** the packet is sent raw. Use [`decode`] for a raw
 //! (UDP) packet and [`decode_stuffed`] to remove the framing/stuffing first.
 
 use multiview_core::tally::Brightness;
@@ -51,19 +56,22 @@ pub const BROADCAST: u16 = 0xFFFF;
 pub const FLAG_UNICODE: u8 = 0b0000_0001;
 
 /// DLE (Data Link Escape) — opens framing and is the stuffing escape on TCP.
-pub const DLE: u8 = 0x10;
+pub const DLE: u8 = 0xFE;
 
 /// STX (Start of Text) — the second framing byte on TCP/byte-stream.
 pub const STX: u8 = 0x02;
 
+/// Bit 15 of the CONTROL word: the DMSG carries control (not display) data.
+const CONTROL_DATA: u16 = 0b1000_0000_0000_0000;
+
 /// Post-shift mask for any 2-bit control field.
 const FIELD_MASK: u16 = 0b11;
 
-/// Shift to the right tally field (bits 2–3).
-const RH_SHIFT: u16 = 2;
+/// Shift to the text tally field (bits 2–3).
+const TEXT_SHIFT: u16 = 2;
 
-/// Shift to the text tally field (bits 4–5).
-const TEXT_SHIFT: u16 = 4;
+/// Shift to the left tally field (bits 4–5).
+const LH_SHIFT: u16 = 4;
 
 /// Shift to the brightness field (bits 6–7).
 const BRIGHTNESS_SHIFT: u16 = 6;
@@ -127,10 +135,21 @@ pub fn decode(bytes: &[u8]) -> Result<UmdMessage, TslError> {
             available: bytes.len().saturating_sub(text_start),
         })?;
 
+        if control & CONTROL_DATA != 0 {
+            // A control-data DMSG: not a display. Skip it entirely — it
+            // produces no [`UmdDisplay`] — and keep scanning. The spec leaves
+            // the control-data body undefined; this decoder assumes it keeps
+            // the INDEX/CONTROL/LENGTH/TEXT layout so the walk stays in sync,
+            // and the length bounds above reject a desync instead of
+            // mis-decoding a display.
+            offset = text_end;
+            continue;
+        }
+
         let brightness = Brightness::new(low_byte((control >> BRIGHTNESS_SHIFT) & FIELD_MASK));
-        let left = lamp(control & FIELD_MASK, brightness)?;
-        let right = lamp((control >> RH_SHIFT) & FIELD_MASK, brightness)?;
+        let right = lamp(control & FIELD_MASK, brightness)?;
         let text_tally = lamp((control >> TEXT_SHIFT) & FIELD_MASK, brightness)?;
+        let left = lamp((control >> LH_SHIFT) & FIELD_MASK, brightness)?;
         let text = decode_text(text_bytes, unicode)?;
 
         displays.push(UmdDisplay {
@@ -144,10 +163,9 @@ pub fn decode(bytes: &[u8]) -> Result<UmdMessage, TslError> {
     }
 
     if displays.is_empty() {
-        return Err(TslError::TooShort {
-            need: 2 + HEADER_AFTER_PBC + DISPLAY_PREFIX,
-            got: bytes.len(),
-        });
+        return Err(TslError::Framing(
+            "v5.0 packet contains no display DMSGs (all skipped or empty)",
+        ));
     }
 
     Ok(UmdMessage {
@@ -159,13 +177,17 @@ pub fn decode(bytes: &[u8]) -> Result<UmdMessage, TslError> {
 
 /// Decode a **DLE/STX-framed, byte-stuffed** (TCP/byte-stream) v5.0 packet.
 ///
-/// Verifies the leading `DLE STX`, then un-stuffs doubled `DLE`s in the payload
-/// before handing the raw packet to [`decode`].
+/// Verifies the leading `DLE STX` (`0xFE 0x02`), then un-stuffs the **entire
+/// remaining segment** — every literal `DLE` in the payload is doubled to
+/// `DLE DLE`. v5.0 defines **no terminator**, and PBC is **not consulted
+/// while un-stuffing**: this is a whole-segment API, so the caller must hand
+/// it exactly one stuffed frame; once un-stuffed, the packet's own PBC check
+/// rejects any trailing bytes.
 ///
 /// # Errors
 ///
-/// * [`TslError::Framing`] if the stream does not open with `DLE STX` or a `DLE`
-///   in the payload is not followed by a valid stuffing/marker byte.
+/// * [`TslError::Framing`] if the segment does not open with `DLE STX`, or a
+///   `DLE` in the payload is followed by anything other than a second `DLE`.
 /// * Any error from [`decode`] on the un-stuffed packet.
 pub fn decode_stuffed(bytes: &[u8]) -> Result<UmdMessage, TslError> {
     let mut it = bytes.iter().copied();
@@ -179,9 +201,13 @@ pub fn decode_stuffed(bytes: &[u8]) -> Result<UmdMessage, TslError> {
             match it.next() {
                 // Stuffed literal DLE.
                 Some(DLE) => raw.push(DLE),
-                // DLE ETX (0x03) terminates a frame; stop accumulating.
-                Some(0x03) => break,
-                _ => return Err(TslError::Framing("v5.0 invalid DLE escape in payload")),
+                // Any other escape (or a dangling trailing DLE) is invalid:
+                // there is no terminator, so a DLE is always doubled.
+                _ => {
+                    return Err(TslError::Framing(
+                        "v5.0 invalid DLE escape in stuffed payload",
+                    ))
+                }
             }
         } else {
             raw.push(b);

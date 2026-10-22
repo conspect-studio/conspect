@@ -1,104 +1,147 @@
 //! TSL UMD **v4.0** decoder.
 //!
-//! v4.0 extends v3.1 with a colour tally palette, a third (text) tally, a screen
-//! byte and a per-display checksum. The **core message** is **19 bytes**:
+//! v4.0 keeps the entire **v3.1 message** and appends **four trailing bytes**:
+//! a **CHKSUM**, a **VBC** (version/length byte) and two **XDATA** colour bytes.
+//! The full message is a fixed **22 bytes**:
 //!
 //! ```text
-//!   byte 0       : 1 A A A A A A A     address byte (sync bit + 7-bit address)
-//!   byte 1       : b b T T R R L L     control byte (VBC)
-//!   bytes 2..18  : 16 × 7-bit ASCII    label (space padded)
-//!   byte 18      : CHKSUM              two's-complement of the byte sum
+//!   bytes 0..=17 : the complete v3.1 message
+//!                  byte 0        : 1 A A A A A A A   address (sync bit + 7-bit address)
+//!                  byte 1        : 0 0 b b T T t2 t1 control byte
+//!                  bytes 2..=17  : 16 × 7-bit ASCII  label (space padded)
+//!   byte 18      : CHKSUM        negated mod-128 sum of bytes 0..=17
+//!   byte 19      : VBC           0 0 0 0 0 0 1 0    version 4.0, 2 XDATA bytes
+//!   byte 20      : XDATA 1       0 r L L T T R R    Display L colours
+//!   byte 21      : XDATA 2       0 r L L T T R R    Display R colours
 //! ```
 //!
-//! The **control byte** packs four 2-bit fields (per the brief's LH / Text / RH
-//! colour tally, `0` = off / `1` = red / `2` = green / `3` = amber):
+//! * **CHKSUM** is computed so that `(sum of bytes 0..=18) mod 128 == 0` — the
+//!   two's complement of the **mod-128** sum of the 18 v3.1 bytes (the spec
+//!   keeps CHKSUM below `0x80` so it can never collide with the address byte's
+//!   sync bit). Verified on decode before anything else is trusted.
+//! * The **control byte** is the v3.1 byte unchanged: bits 0–3 tallies 1–4
+//!   (the four parallel tally outputs per the spec), bits 4–5 brightness.
+//!   This decoder reads bits 0–1 only, as on/off, and does not model them as
+//!   lamps — the colour palette lives in XDATA.
+//! * **VBC** (`0x02`) declares minor version 0 and exactly two XDATA bytes.
+//! * Each **XDATA** byte packs three 2-bit colour fields: bits 1–0 **RH**,
+//!   bits 3–2 **Txt**, bits 5–4 **LH**, with `0` = off / `1` = red / `2` =
+//!   green / `3` = amber. Bit 7 must be `0` and is rejected on receive;
+//!   bit 6 is unspecified (transmitters send `0`) and is never read.
 //!
-//! * bits 0–1 — **left-hand** (LH) tally colour,
-//! * bits 2–3 — **right-hand** (RH) tally colour,
-//! * bits 4–5 — **text** tally colour,
-//! * bits 6–7 — **brightness** (`0..=3`).
+//! A dual-display unit describes both displays in one message (XDATA 1 = left,
+//! XDATA 2 = right); both displays share the one address and the one 16-char
+//! label. This decoder models **one display** per message (see [`decode`]), so
+//! it reads XDATA 1 and the shared label; XDATA 2 is accepted and discarded —
+//! the discard loses only the Display R colours, a documented consequence of
+//! the one-display model, not a framing error.
 //!
-//! The **checksum** is computed so the 8-bit sum of all 19 bytes is zero (i.e.
-//! `CHKSUM = (-sum(byte0..18)) & 0xFF`).
-//!
-//! On a **TCP / byte-stream** transport the message is additionally wrapped in
-//! **DLE/STX** framing (`0x10 0x02 … core …`); UDP carries the bare core. Use
-//! [`decode`] for the bare core (UDP) and [`decode_framed`] to strip the
-//! DLE/STX wrapper first.
+//! Like v3.1, v4.0 defines **no byte-stream framing**: the `0x80` address sync
+//! bit delimits serial messages and UDP carries one message per datagram.
+//! DLE/STX framing starts with v5.0.
 
 use multiview_core::tally::Brightness;
 
 use super::{TallyLamp, TslError, TslVersion, UmdDisplay, UmdMessage};
 
-/// The on-wire length of a bare (UDP) v4.0 core message, in bytes.
-pub const CORE_LEN: usize = 19;
+/// The fixed on-wire length of a v4.0 message, in bytes.
+pub const PACKET_LEN: usize = 22;
+
+/// The length of the embedded v3.1 message (address, control, 16 label bytes).
+pub const V31_LEN: usize = 18;
 
 /// The number of ASCII label bytes in a v4.0 message.
 pub const TEXT_LEN: usize = 16;
 
-/// DLE (Data Link Escape) — the first framing byte on TCP/byte-stream.
-pub const DLE: u8 = 0x10;
+/// CHKSUM modulus: the checksum is computed and validated mod 128 so it
+/// always fits below the address byte's sync bit.
+const CHKSUM_MOD: u32 = 128;
 
-/// STX (Start of Text) — the second framing byte on TCP/byte-stream.
-pub const STX: u8 = 0x02;
+/// The mandatory VBC value for v4.0 display data: minor version 0 (bits 6–4),
+/// two XDATA bytes (bits 3–0), reserved high bit clear.
+const VBC: u8 = 0x02;
 
-/// Bit 7 of the address byte — the sync marker.
+/// Bit 7 of the address byte — the sync marker that opens every message.
 const ADDRESS_SYNC: u8 = 0x80;
 
 /// Mask for the 7-bit display address.
 const ADDRESS_MASK: u8 = 0x7F;
 
-/// Post-shift mask for any 2-bit field of the control byte.
-const FIELD_MASK: u8 = 0b11;
+/// Bit 7 of the control byte, reserved `0` for display data.
+const CTRL_RESERVED_HIGH: u8 = 0x80;
 
-/// Bit shift to the right-hand tally field (bits 2–3).
-const RH_SHIFT: u8 = 2;
+/// Bit 6 of the control byte: set for command (non-display) data.
+const CTRL_COMMAND: u8 = 0x40;
 
-/// Bit shift to the text tally field (bits 4–5).
-const TEXT_SHIFT: u8 = 4;
+/// Shift to the 2-bit brightness field (bits 4–5) of the control byte.
+const CTRL_BRIGHTNESS_SHIFT: u8 = 4;
 
-/// Bit shift to the brightness field (bits 6–7).
-const BRIGHTNESS_SHIFT: u8 = 6;
+/// Mask (post-shift) for the 2-bit brightness field.
+const CTRL_BRIGHTNESS_MASK: u8 = 0b11;
 
-/// Decode a bare (UDP) TSL UMD **v4.0** core message.
+/// Reserved high bits of an XDATA byte (bit 7 must be clear; bit 6 is
+/// unspecified and ignored on receive).
+const XDATA_BIT7: u8 = 0b1000_0000;
+
+/// Shift to the text tally colour field (bits 3–2) of an XDATA byte.
+const XDATA_TEXT_SHIFT: u8 = 2;
+
+/// Shift to the left tally colour field (bits 5–4) of an XDATA byte.
+const XDATA_LH_SHIFT: u8 = 4;
+
+/// Mask (post-shift) for any 2-bit colour field of an XDATA byte.
+const COLOUR_MASK: u8 = 0b11;
+
+/// Decode a single TSL UMD **v4.0** message.
 ///
-/// `bytes` must be exactly [`CORE_LEN`] (19) bytes: address, control, 16 ASCII
-/// label bytes, checksum. The returned [`UmdMessage`] holds exactly one display.
+/// `bytes` must be exactly [`PACKET_LEN`] (22) bytes. The returned
+/// [`UmdMessage`] always holds exactly one [`UmdDisplay`] — index from the
+/// 7-bit address, text from the 16 ASCII bytes, colours from **XDATA 1**
+/// (display L), brightness from the control byte. XDATA 2 (display R) is
+/// validated only for its reserved-high-bit shape and otherwise discarded;
+/// a true dual-display unit whose two displays disagree therefore loses the
+/// right display's colours (see the module docs).
 ///
 /// # Errors
 ///
-/// * [`TslError::TooShort`] / [`TslError::TooLong`] if `bytes.len() != 19`.
-/// * [`TslError::Framing`] if the address byte's sync bit is clear.
-/// * [`TslError::Checksum`] if the trailing checksum does not validate.
+/// * [`TslError::TooShort`] / [`TslError::TooLong`] if `bytes.len() != 22`.
+/// * [`TslError::Framing`] if the address byte's sync bit is clear, the
+///   control byte marks command data or a reserved bit is set, or the VBC
+///   byte is not `0x02`.
+/// * [`TslError::Checksum`] if byte 18 is not the mod-128 complement of the
+///   sum of bytes 0..18.
 pub fn decode(bytes: &[u8]) -> Result<UmdMessage, TslError> {
-    if bytes.len() < CORE_LEN {
+    if bytes.len() < PACKET_LEN {
         return Err(TslError::TooShort {
-            need: CORE_LEN,
+            need: PACKET_LEN,
             got: bytes.len(),
         });
     }
-    if bytes.len() > CORE_LEN {
+    if bytes.len() > PACKET_LEN {
         return Err(TslError::TooLong {
-            max: CORE_LEN,
+            max: PACKET_LEN,
             got: bytes.len(),
         });
     }
 
-    let body = bytes.get(..CORE_LEN - 1).ok_or(TslError::TooShort {
-        need: CORE_LEN,
+    let v31 = bytes.get(..V31_LEN).ok_or(TslError::TooShort {
+        need: PACKET_LEN,
         got: bytes.len(),
     })?;
-    let expected = *bytes.get(CORE_LEN - 1).ok_or(TslError::TooShort {
-        need: CORE_LEN,
+    let checksum = checksum(v31);
+    let wire = *bytes.get(V31_LEN).ok_or(TslError::TooShort {
+        need: PACKET_LEN,
         got: bytes.len(),
     })?;
-    let computed = checksum(body);
-    if computed != expected {
-        return Err(TslError::Checksum { expected, computed });
+    if checksum != wire {
+        return Err(TslError::Checksum {
+            expected: wire,
+            computed: checksum,
+        });
     }
 
-    let address = *body.first().ok_or(TslError::TooShort {
-        need: CORE_LEN,
+    let address = *bytes.first().ok_or(TslError::TooShort {
+        need: PACKET_LEN,
         got: bytes.len(),
     })?;
     if address & ADDRESS_SYNC == 0 {
@@ -108,17 +151,56 @@ pub fn decode(bytes: &[u8]) -> Result<UmdMessage, TslError> {
     }
     let index = u16::from(address & ADDRESS_MASK);
 
-    let control = *body.get(1).ok_or(TslError::TooShort {
-        need: CORE_LEN,
+    let control = *bytes.get(1).ok_or(TslError::TooShort {
+        need: PACKET_LEN,
         got: bytes.len(),
     })?;
-    let brightness = Brightness::new((control >> BRIGHTNESS_SHIFT) & FIELD_MASK);
-    let left = lamp(control & FIELD_MASK, brightness)?;
-    let right = lamp((control >> RH_SHIFT) & FIELD_MASK, brightness)?;
-    let text_tally = lamp((control >> TEXT_SHIFT) & FIELD_MASK, brightness)?;
+    if control & CTRL_RESERVED_HIGH != 0 {
+        return Err(TslError::Framing("v4.0 control byte reserved high bit set"));
+    }
+    if control & CTRL_COMMAND != 0 {
+        return Err(TslError::Framing(
+            "v4.0 control byte marks command data (bit 6); only display data is decoded",
+        ));
+    }
 
-    let text_bytes = body.get(2..CORE_LEN - 1).ok_or(TslError::TooShort {
-        need: CORE_LEN,
+    let vbc = *bytes.get(V31_LEN + 1).ok_or(TslError::TooShort {
+        need: PACKET_LEN,
+        got: bytes.len(),
+    })?;
+    if vbc != VBC {
+        return Err(TslError::Framing(
+            "v4.0 VBC must be 0x02 (minor version 0, 2 XDATA bytes)",
+        ));
+    }
+
+    let xdata1 = *bytes.get(V31_LEN + 2).ok_or(TslError::TooShort {
+        need: PACKET_LEN,
+        got: bytes.len(),
+    })?;
+    if xdata1 & XDATA_BIT7 != 0 {
+        return Err(TslError::Framing("v4.0 XDATA byte 1 reserved high bit set"));
+    }
+    let xdata2 = *bytes.get(V31_LEN + 3).ok_or(TslError::TooShort {
+        need: PACKET_LEN,
+        got: bytes.len(),
+    })?;
+    if xdata2 & XDATA_BIT7 != 0 {
+        return Err(TslError::Framing("v4.0 XDATA byte 2 reserved high bit set"));
+    }
+    // Bit 6 of each XDATA byte is unspecified on receive: masked off above.
+
+    let brightness = Brightness::new((control >> CTRL_BRIGHTNESS_SHIFT) & CTRL_BRIGHTNESS_MASK);
+    // The v3.1 tally bits (bits 0–1, read as on/off) drive the four parallel
+    // tally outputs and are not part of this model's lamps: the colour palette
+    // lives in XDATA. Colours come from XDATA 1 (display L).
+
+    let left = lamp((xdata1 >> XDATA_LH_SHIFT) & COLOUR_MASK, brightness)?;
+    let right = lamp(xdata1 & COLOUR_MASK, brightness)?;
+    let text_tally = lamp((xdata1 >> XDATA_TEXT_SHIFT) & COLOUR_MASK, brightness)?;
+
+    let text_bytes = bytes.get(2..V31_LEN).ok_or(TslError::TooShort {
+        need: PACKET_LEN,
         got: bytes.len(),
     })?;
     let text = decode_ascii(text_bytes);
@@ -136,41 +218,17 @@ pub fn decode(bytes: &[u8]) -> Result<UmdMessage, TslError> {
     })
 }
 
-/// Decode a **DLE/STX-framed** (TCP/byte-stream) v4.0 message.
-///
-/// Strips the leading `DLE STX` and decodes the remaining [`CORE_LEN`] bytes via
-/// [`decode`].
-///
-/// # Errors
-///
-/// * [`TslError::TooShort`] if there are fewer than `2 + CORE_LEN` bytes.
-/// * [`TslError::Framing`] if the first two bytes are not `DLE STX`.
-/// * Any error from [`decode`] on the unwrapped core.
-pub fn decode_framed(bytes: &[u8]) -> Result<UmdMessage, TslError> {
-    let need = 2 + CORE_LEN;
-    if bytes.len() < need {
-        return Err(TslError::TooShort {
-            need,
-            got: bytes.len(),
-        });
-    }
-    let (dle, stx) = (
-        *bytes.first().ok_or(TslError::Framing("missing DLE"))?,
-        *bytes.get(1).ok_or(TslError::Framing("missing STX"))?,
-    );
-    if dle != DLE || stx != STX {
-        return Err(TslError::Framing("v4.0 frame must open with DLE STX"));
-    }
-    let core = bytes.get(2..).ok_or(TslError::Framing("truncated frame"))?;
-    decode(core)
-}
-
-/// The v4.0 checksum: the value that makes the 8-bit sum of `body || checksum`
-/// zero — i.e. `(-sum) mod 256`.
+/// The v4.0 CHKSUM for a full 22-byte message: the value that makes the sum
+/// of the 18 v3.1 bytes plus CHKSUM itself divisible by 128 — i.e. the
+/// two's-complement (mod 128) of the v3.1 byte sum. Always `0..=0x7F`.
 #[must_use]
-pub fn checksum(body: &[u8]) -> u8 {
-    let sum = body.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-    sum.wrapping_neg()
+pub fn checksum(bytes_0_to_18: &[u8]) -> u8 {
+    debug_assert!(bytes_0_to_18.len() >= V31_LEN, "need the 18 v3.1 bytes");
+    let sum = bytes_0_to_18
+        .iter()
+        .take(V31_LEN)
+        .fold(0u32, |acc, &b| acc + u32::from(b));
+    u8::try_from((CHKSUM_MOD - (sum % CHKSUM_MOD)) % CHKSUM_MOD).unwrap_or(0)
 }
 
 /// Decode a 2-bit colour code at the given brightness into a [`TallyLamp`].
@@ -179,7 +237,8 @@ fn lamp(code: u8, brightness: Brightness) -> Result<TallyLamp, TslError> {
         .ok_or(TslError::Framing("v4.0 tally colour code out of range"))
 }
 
-/// Decode a fixed-length 7-bit-ASCII label, trimming trailing space padding.
+/// Decode a fixed-length 7-bit-ASCII label, masking the top bit and trimming
+/// the trailing space padding the protocol uses.
 fn decode_ascii(bytes: &[u8]) -> String {
     let text: String = bytes
         .iter()

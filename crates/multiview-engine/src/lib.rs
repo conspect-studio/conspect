@@ -48,7 +48,8 @@
 //!   [`MediaTime`](multiview_core::time::MediaTime)** — best-effort samplers that
 //!   never block, never `.await`, and so cannot stall the output clock or
 //!   back-pressure the engine (invariants #1 + #10). See [`probe`] and [`alarm`].
-//! * **Tally / salvo operator surface (M11, ADR-MV001).** The [`tally`] arbiter
+//! * **Tally / salvo operator surface (M11; tally: ADR-MV002 + ADR-MV006, salvo/scheduler:
+//!   ADR-MV001).** The [`tally`] arbiter
 //!   aggregates many external tally buses into one resolved per-tile state under a
 //!   configurable profile and conflict policy (with a virtual [`tally::gpio`]
 //!   GPI/GPO model); the [`salvo`] engine commits an atomic batch of changes on

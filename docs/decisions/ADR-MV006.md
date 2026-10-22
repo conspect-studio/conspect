@@ -1,6 +1,6 @@
 # ADR-MV006: Internally-derived tally from switcher bus state — per-tick composition-graph derivation, one arbiter for internal + external facts, and TSL codec spec-reconciliation
 
-- **Status:** Proposed
+- **Status:** Proposed <!-- §4 TSL codec reconciliation landed 2026-10-22 (SW-15/SW-E3); flips to Accepted when the §1–3 derivation/arbiter work lands (SW-E1/E2) -->
 - **Area:** Broadcast Multiviewer
 - **Date:** 2026-06-11
 - **Source briefs:** [production-switcher.md](../research/production-switcher.md) (tally section), [broadcast-multiviewer-features.md](../research/broadcast-multiviewer-features.md) §2
@@ -144,47 +144,69 @@ channel is created.
 ### 4. TSL spec reconciliation — wire-visible fixes before any socket ships
 
 Verified against the official TSL UMD protocol specification (TSL Products' published spec PDF,
-<https://tslproducts.com/wp-content/uploads/Manuals/Control/tsl-umd-protocol.pdf>);
-each deviation below is wire-visible and was confirmed by reading the in-tree codecs:
+<https://tslproducts.com/wp-content/uploads/Manuals/Control/tsl-umd-protocol.pdf>;
+working copy actually read for verification: the TSL Protocol spec PDF as published in TSL's
+asset store, <https://assets.ctfassets.net/vd4y94r5vv/2rcLXZWfZ6eOQ2MgEYa2QE/6b086201c7f1ed01f8ad926f0ef2c4d8/TSL_protocol_spec.pdf>,
+fetched through a text-extraction proxy because the raw PDF is served with a content-type
+the fetcher rejects);
+each deviation below is wire-visible and was confirmed by reading the in-tree codecs before the
+fix. **All six landed 2026-10-22** (SW-15/SW-E3, with golden on-wire vectors — see test posture
+below); each item records the original defect and the landed fix:
 
-1. **v5.0 DLE is `0xFE`, not `0x10`.** The codecs define `DLE: u8 = 0x10`
-   (`multiview-input/src/tsl/v50.rs:54`, `multiview-output/src/tsl/v50.rs:28`); the spec's
-   byte-stream framing is `DLE = 0xFE`, `STX = 0x02`. Every framed v5.0 exchange with a
-   spec-correct peer fails today.
-2. **v5.0 CONTROL bit order is RH(0–1) / Text(2–3) / LH(4–5) / brightness(6–7).** The codecs map
-   bits 0–1→**left**, 2–3→**right**, 4–5→**text** (`multiview-input/src/tsl/v50.rs:131-133`) —
-   against a spec-correct peer all three lamp fields land on the wrong lamps (a three-way field
-   rotation: our left shows the peer's RH, our right the peer's text tally, our text the
-   peer's LH).
-3. **Remove the invented DLE/ETX terminator.** The encoder appends `DLE ETX` after the stuffed
-   payload (`multiview-output/src/tsl/v50.rs:103-121`) and the decoder treats it as a frame
-   terminator (`multiview-input/src/tsl/v50.rs:182`); the spec defines DLE/STX opening +
-   byte-stuffing only — no close sequence.
-4. **Skip DMSGs whose CONTROL bit 15 is set.** Bit 15 flags control data ("not defined in this
-   version" of the spec) — such DMSGs must be skipped, not text-parsed; the decoder's DMSG loop
-   has no bit-15 check.
-5. **v4.0 is rebuilt as v3.1 + CHKSUM(mod-128) + VBC + XDATA.** The repo implements a 19-byte
-   message (address + one packed colour/control byte + 16 ASCII + full-8-bit-sum checksum,
-   `multiview-input/src/tsl/v40.rs`); the spec's v4.0 is the v3.1 18-byte message followed by a
-   mod-128 checksum, a VBC (variable byte count), and 2 XDATA bytes carrying LH(5:4)/Text(3:2)/
-   RH(1:0) colour tally per lamp. The two layouts are mutually undecodable.
-6. **Drop the invented v4.0/v3.1 byte-stream wrapper.** The v4.0 codec carries a DLE/STX
-   (`0x10 0x02`) stream framing the spec does not define for v3.1/v4.0 at all
-   (`multiview-input/src/tsl/v40.rs:40/:43` define `DLE = 0x10`/`STX = 0x02`, stripped by
-   `decode_framed` at `:149`; `multiview-output/src/tsl/v40.rs:19/:22`, emitted by
-   `encode_display_framed` at `:86-90`). Per the spec, serial delimiting for v3.1/v4.0 is the
-   `0x80` address sync bit and UDP carries one message per datagram; the optional stream wrapper
-   exists only in v5.0 (with DLE `0xFE`). Remove the v4.0 `decode_framed`/`encode_display_framed`
-   path — or, if a stream wrapper is deliberately retained for byte-stream deployments, label it
-   explicitly extra-spec and config-gated, never the default.
+1. **v5.0 DLE is `0xFE`, not `0x10` — fixed.** The codecs had defined `DLE: u8 = 0x10`, so every
+   framed v5.0 exchange with a spec-correct peer failed. Both now define the spec's byte-stream
+   framing: `DLE = 0xFE`, `STX = 0x02`
+   (`multiview-input/src/tsl/v50.rs:59`, `multiview-output/src/tsl/v50.rs:29`).
+2. **v5.0 CONTROL bit order is RH(0–1) / Text(2–3) / LH(4–5) / brightness(6–7) — fixed.** The
+   codecs had mapped bits 0–1→**left**, 2–3→**right**, 4–5→**text** — against a spec-correct peer
+   all three lamp fields landed on the wrong lamps (a three-way field rotation: our left showed
+   the peer's RH, our right the peer's text tally, our text the peer's LH). The mapping now
+   follows the spec order; bit 15 (control data) and reserved bits 8–14 are never emitted.
+3. **Remove the invented DLE/ETX terminator — removed.** The encoder had appended `DLE ETX`
+   after the stuffed payload and the decoder treated it as a frame terminator; the spec defines
+   DLE/STX opening + byte-stuffing only — no close sequence. TCP framing is now exactly the
+   spec's: `DLE STX` opener, `0xFE`→`0xFE 0xFE` stuffing, length carried by the PBC; the stuffed
+   length is `2 + payload.len() + payload DLE-count`.
+4. **Skip DMSGs whose CONTROL bit 15 is set — implemented.** Bit 15 flags control data ("not
+   defined in this version" of the spec) — such DMSGs are skipped, not text-parsed; the
+   decoder's DMSG loop now carries the bit-15 check, and a packet whose DMSGs are all
+   skipped/empty is rejected as a framing error.
+5. **v4.0 is rebuilt as v3.1 + CHKSUM(mod-128) + VBC + XDATA — rebuilt.** The repo had
+   implemented a 19-byte message (address + one packed colour/control byte + 16 ASCII +
+   full-8-bit-sum checksum) that the spec's real v4.0 is mutually undecodable with. The
+   landed layout is the spec's 22 bytes: the v3.1 18-byte message (address `0x80+index`,
+   CTRL, 16 ASCII) + CHKSUM + VBC + 2 XDATA bytes. CHKSUM covers **only the 18 v3.1 bytes**:
+   it is the negated mod-128 complement (`(128 − sum%128) % 128`, i.e. bytes 0..=18 sum to
+   `≡ 0 mod 128`) and stays `< 0x80` so it can never collide with the address sync bit.
+   VBC is `0x02` (version 4.0, exactly two XDATA bytes). XDATA bit 7 is 0, bit 6 reserved
+   (masked on receive, 0 on transmit), bits 5-4 LH, 3-2 Text, 1-0 RH; per-lamp colour codes
+   `0=OFF, 1=RED, 2=GREEN, 3=AMBER`. Enhancements apply only to display-data messages
+   (CTRL bit 6 = 0). Layout is documented in the codec header
+   (`multiview-input/src/tsl/v40.rs:4-24`).
+6. **Drop the invented v4.0/v3.1 byte-stream wrapper — deleted.** The v4.0 codec had carried a
+   DLE/STX (`0x10 0x02`) stream framing the spec does not define for v3.1/v4.0 at all
+   (stripped by `decode_framed`, emitted by `encode_display_framed`). Both framed entry
+   points are **deleted** (zero occurrences across both crates); per the spec, serial
+   delimiting for v3.1/v4.0 is the `0x80` address sync bit and UDP carries one message per
+   datagram. The optional stream wrapper exists only in v5.0 (with DLE `0xFE`); if a
+   byte-stream deployment ever needs a v3.1/v4.0 wrapper it must be labelled explicitly
+   extra-spec and config-gated, never the default.
 
-**Test posture (the load-bearing lesson):** the existing encode∘decode round-trip property tests
-pass *today* against the wrong wire format — encoder and decoder share one value model, so
-round-tripping **structurally cannot catch** a shared-model error. The fix ships with **golden
-on-wire byte vectors hand-transcribed from the spec PDF** (decode golden→expected values; encode
-values→golden bytes) as the floor, round-trip property tests retained on top, and the codecs
-mutation-tested (`cargo mutants --in-diff` per the guardrails). These fixes land **before** any
-socket wiring: today the codecs have no I/O, so the wire change costs nothing; after egress ships
+**Test posture (the load-bearing lesson):** the encode∘decode round-trip property tests passed
+*before the fix* against the wrong wire format — encoder and decoder share one value model, so
+round-tripping **structurally cannot catch** a shared-model error. The fix **landed with golden
+on-wire byte vectors hand-derived from the spec PDF's byte-layout rules** — the spec carries no
+worked 22-byte example, so each vector was laid out field-by-field from the layout and its CHKSUM
+recomputed by hand (decode golden→expected values:
+`multiview-input/tests/tsl_decode.rs`; encode values→golden bytes:
+`multiview-output/tests/tsl_encode.rs`; the shared golden vector is byte-identical in both files
+as a cross-model check) as the floor, with round-trip property tests retained on top
+(`multiview-input/tests/tsl_properties.rs`, `multiview-output/tests/tsl_roundtrip.rs`).
+Mutation testing (`cargo mutants --in-diff`) is prescribed by ADR-G002 but **not wired** —
+no CI job or local tooling runs it in this repo today (per the guardrails' own inventory), so
+the golden vectors are the standing evidence, and any future mutation gate applies to these
+codecs unchanged. These fixes landed **before** any
+socket wiring: the codecs have no I/O, so the wire change cost nothing; after egress ships
 it would be a breaking on-air change.
 
 **Ports:** always configurable, with **no normative default** — the spec defines none, and
@@ -195,11 +217,13 @@ ADR-MV002's "default v5.0=40003" wording** (ADR-MV002 itself is not edited): the
 
 ### 5. Doc-drift fix
 
-All four files in `multiview-engine/src/tally/` — `mod.rs`, `arbiter.rs`, `profile.rs`,
-`gpio.rs` (each at line 3) — cite ADR-MV001 for the
-tally surface; correct all four to [ADR-MV002](ADR-MV002.md) + ADR-MV006. The code edit is a
-Lane E item
-in the [production-switcher backlog](../development/production-switcher-backlog.md); recorded
+The files citing ADR-MV001 for the tally surface were, in full: the four files in
+`multiview-engine/src/tally/` — `mod.rs`, `arbiter.rs`, `profile.rs`, `gpio.rs` (each at
+line 3) — plus `multiview-engine/src/lib.rs` (the "Tally / salvo operator surface" module
+bullet, tally half) and `multiview-engine/tests/tally_arbiter.rs` (test header).
+**Fixed 2026-10-22** (SW-15/SW-E3): all six now cite [ADR-MV002](ADR-MV002.md) + ADR-MV006
+for the tally surface (the salvo/scheduler half of the lib.rs bullet keeps ADR-MV001, which
+is its correct citation). Recorded
 here so the drift is not re-propagated by new code citing the old comment.
 
 ## Alternatives considered
@@ -236,8 +260,11 @@ here so the drift is not re-propagated by new code citing the old comment.
 - This ADR supersedes ADR-MV002's ports wording (§4 — MV002 itself is unedited; readers of its
   ports sentence are redirected here); its interop matrix becomes honest before
   the first socket ships. Open question carried from research: whether a newer official spec
-  revision exists than the PDF verified here — to be re-checked when the Lane E codec fix lands
-  (golden vectors are transcribed from the spec revision in hand and dated).
+  revision exists than the PDF verified here — **re-checked 2026-10-22 when the Lane E codec
+  fix landed: none found**; TSL Products' published Protocol V5.0 (issued 19/09/09) remains the
+  current official revision, so the golden vectors (hand-derived from that revision's
+  byte-layout rules and dated) are against the authoritative document. Re-check again before
+  the first socket ships.
 - The multiview red/green/amber tally row of the MVP ([production-switcher.md](../research/production-switcher.md)
   phased plan) is unblocked: arbiter wiring + ingest spawn are MVP; TSL socket egress stays
   post-MVP, now with a spec-correct codec under it. NDI tally return (per-source tally metadata

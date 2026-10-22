@@ -1,6 +1,6 @@
 //! A **virtual GPI/GPO model**: logical general-purpose input/output points with
 //! level and edge semantics, as pure value machines (broadcast-multiviewer brief
-//! §2, ADR-MV001).
+//! §2, ADR-MV002 + ADR-MV006).
 //!
 //! Physical GPI/GPO (relay closures, opto inputs) and their IP-native equivalent
 //! AMWA NMOS IS-07 (event/tally over WebSocket/MQTT) are *transports*; this module

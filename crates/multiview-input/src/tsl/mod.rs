@@ -20,18 +20,22 @@
 //!   bits + a 2-bit brightness), and a fixed **16-char ASCII** label. Carried one
 //!   packet per serial frame or one packet per UDP datagram. No framing, no
 //!   checksum.
-//! * [`v40`] — TSL UMD **v4.0**. Extends v3.1 with a richer control byte giving
-//!   **three** 4-state colour tallies (left / text / right; `0` = off, `1` = red,
-//!   `2` = green, `3` = amber) plus 2-bit brightness, a per-display **checksum**,
-//!   and a screen byte. Still a fixed 16-char ASCII label. On a TCP/byte-stream
-//!   transport it is wrapped in **DLE/STX** framing.
+//! * [`v40`] — TSL UMD **v4.0**. Keeps the complete v3.1 message and appends
+//!   **four bytes**: a mod-128 **CHKSUM**, a **VBC** (version/count byte,
+//!   `0x02`) and two **XDATA** colour bytes packing three 4-state tallies each
+//!   (right / text / left; `0` = off, `1` = red, `2` = green, `3` = amber) plus
+//!   the v3.1 2-bit brightness. Still a fixed 22-byte packet with the 16-char
+//!   ASCII label. **No framing below v5.0**: serial receivers delimit on the
+//!   address byte's sync bit and UDP carries one message per datagram.
 //! * [`v50`] — TSL UMD **v5.0**. Native 16-bit IP protocol: a packet header with
-//!   a 16-bit byte count and screen address, then one or more **variable-length**
-//!   displays, each with a 16-bit index, a 16-bit control word (L / R / Text
-//!   tally + brightness + a UTF-16LE text flag) and a length-prefixed
-//!   **ASCII or UTF-16LE** label. Screen / index `0xFFFF` is the broadcast
-//!   address. **DLE/STX byte-stuffing** is applied on TCP/byte-stream transports
-//!   only (never on UDP).
+//!   a 16-bit byte count (PBC) and screen address, then one or more
+//!   **variable-length** displays, each with a 16-bit index, a 16-bit control
+//!   word (RH / Text / LH tally colours, brightness, and a control-data flag
+//!   whose DMSGs are skipped) and a length-prefixed **ASCII or UTF-16LE**
+//!   label. Screen / index `0xFFFF` is the broadcast address.
+//!   **DLE/STX byte-stuffing** (DLE `0xFE`, no terminator — one stuffed frame
+//!   per segment; PBC is checked after unstuffing)
+//!   is applied on TCP/byte-stream transports only (never on UDP).
 //!
 //! ## Tally mapping
 //!

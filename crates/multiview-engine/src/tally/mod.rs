@@ -1,6 +1,6 @@
 //! The M11 **tally** control surface: aggregate many external tally buses into a
 //! resolved per-tile [`TallyState`](multiview_core::tally::TallyState)
-//! (broadcast-multiviewer brief §2, ADR-MV001).
+//! (broadcast-multiviewer brief §2, ADR-MV002 + ADR-MV006).
 //!
 //! Three pure layers, mirroring the alarm engine's structure:
 //!

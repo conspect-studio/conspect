@@ -1,6 +1,6 @@
 //! The tally **profile**: the configurable bit↔colour and index↔tile mappings
 //! that turn an external tally bus's wire vocabulary into Multiview's per-tile
-//! [`TallyState`] (broadcast-multiviewer brief §2, ADR-MV001).
+//! [`TallyState`] (broadcast-multiviewer brief §2, ADR-MV002 + ADR-MV006).
 //!
 //! An external switcher/router/GPI bus speaks in *its own* numbering: a router
 //! crosspoint index, a GPI pin number, an IS-07 source label. The profile is the
