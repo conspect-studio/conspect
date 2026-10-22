@@ -156,7 +156,7 @@ mod tests {
     fn default_is_empty_and_valid() {
         let cfg = DiscoveryConfig::default();
         assert!(cfg.zowietek_service_type.is_none());
-        assert!(cfg.extra_service_types.is_empty());
+        assert_eq!(cfg.extra_service_types, Vec::<String>::new());
         cfg.validate().expect("the empty section validates");
     }
 

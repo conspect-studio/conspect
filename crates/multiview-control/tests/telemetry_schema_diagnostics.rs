@@ -113,7 +113,7 @@ async fn snapshot_rides_202_then_ready_and_carries_no_media() {
         .as_str()
         .expect("202 returns a snapshot_id")
         .to_owned();
-    assert!(!snapshot_id.is_empty());
+    assert_ne!(snapshot_id, "");
 
     // The bundle is readable by id.
     let path = format!("/api/v1/diagnostics/{snapshot_id}");

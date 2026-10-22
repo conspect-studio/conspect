@@ -208,7 +208,10 @@ fn media_library_and_players_round_trip_in_document() {
 #[test]
 fn media_players_default_empty_when_absent() {
     let doc: MultiviewConfig = serde_json::from_value(base_doc()).unwrap();
-    assert!(doc.media_players.is_empty());
+    assert_eq!(
+        doc.media_players,
+        Vec::<multiview_config::MediaPlayer>::new()
+    );
     assert_eq!(doc.media_library, None);
 }
 

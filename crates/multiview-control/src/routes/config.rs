@@ -980,7 +980,7 @@ pub(crate) async fn promote_to_boot(
     // bank-token + write + confirm happen without a concurrent promote
     // interleaving the watcher's suppression token (C2).
     let _mutation = state.lock_config_mutation().await;
-    let (document, running) = compose_running_config(&state).map_err(&release_and)?;
+    let (document, running) = compose_running_config(&state).map_err(release_and)?;
     let toml = running
         .to_toml()
         .map_err(|e| release_and(ControlError::Repository(format!("TOML render failed: {e}"))))?;
@@ -1027,7 +1027,7 @@ pub(crate) async fn promote_to_boot(
             &principal.key_id,
             "promote running configuration to boot",
         )
-        .map_err(&release_and)?;
+        .map_err(release_and)?;
     state.audit(
         &principal.key_id,
         AuditAction::Command,

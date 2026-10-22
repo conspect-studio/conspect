@@ -666,9 +666,7 @@ impl Coverage {
             // clear so the `0`-means-never sentinel stays sound. O(n), and
             // astronomically rare (≈ 9.7e9 years at 60 fps).
             self.gen = 1;
-            for s in &mut self.stamp {
-                *s = 0;
-            }
+            self.stamp.fill(0);
         }
         if self.stamp.len() < len {
             self.stamp.resize(len, 0);

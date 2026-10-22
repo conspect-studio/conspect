@@ -331,7 +331,7 @@ fn no_metadata_is_empty_plan() {
         orientation: None,
     };
     let plan = out.metadata_plan();
-    assert!(plan.dropped().is_empty());
+    assert_eq!(plan.dropped(), Vec::<(&str, &str)>::new());
     assert!(plan.title.is_none() && plan.service_id.is_none());
 }
 

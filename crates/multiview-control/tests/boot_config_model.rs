@@ -911,9 +911,7 @@ async fn the_running_persister_writes_active_toml_on_audited_changes() {
     recolor_in_a(&r, "#a0a0a0").await;
     assert!(
         wait_until(SETTLE, || {
-            std::fs::read_to_string(&active_path)
-                .ok()
-                .is_some_and(|t| t.contains("#a0a0a0"))
+            std::fs::read_to_string(&active_path).is_ok_and(|t| t.contains("#a0a0a0"))
         })
         .await,
         "the persister must write active.toml carrying the audited change"
@@ -923,9 +921,7 @@ async fn the_running_persister_writes_active_toml_on_audited_changes() {
     recolor_in_a(&r, "#909090").await;
     assert!(
         wait_until(SETTLE, || {
-            std::fs::read_to_string(&active_path)
-                .ok()
-                .is_some_and(|t| t.contains("#909090"))
+            std::fs::read_to_string(&active_path).is_ok_and(|t| t.contains("#909090"))
         })
         .await,
         "the persister must follow subsequent changes"
@@ -1169,8 +1165,7 @@ async fn the_persist_gate_clears_when_a_shed_edit_reverts_to_adopted() {
     // independent of the watcher).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("#101418")))
+            .is_ok_and(|t| t.contains("#101418")))
         .await,
         "the initial adopted state A must persist"
     );
@@ -1221,8 +1216,7 @@ async fn the_persist_gate_clears_when_a_shed_edit_reverts_to_adopted() {
     assert!(
         wait_until(SETTLE, || {
             std::fs::read_to_string(&active_path)
-                .ok()
-                .is_some_and(|t| t.contains("#101418") && !t.contains("#7b7b7b"))
+                .is_ok_and(|t| t.contains("#101418") && !t.contains("#7b7b7b"))
         })
         .await,
         "active.toml must reflect the adopted A (never the shed B) and not be frozen"
@@ -1296,8 +1290,7 @@ async fn a_shed_rest_source_upsert_is_not_persisted_as_adopted() {
     recolor_in_a(&r, "#4d4d4d").await;
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("#4d4d4d")))
+            .is_ok_and(|t| t.contains("#4d4d4d")))
         .await,
         "a later adopted REST mutation must catch the gate up and persist"
     );
@@ -2113,8 +2106,7 @@ async fn shed_delete_then_unrelated_landed_mutation_keeps_the_running_source() {
     // runs it; the shed delete was never adopted) and gain in_c.
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("in_c")))
+            .is_ok_and(|t| t.contains("in_c")))
         .await,
         "active.toml must gain the landed in_c"
     );
@@ -2194,8 +2186,7 @@ async fn shed_apply_layout_does_not_persist_unadopted_layout() {
     // Let the initial adopted layout persist: cell_a→in_a, cell_b→in_b.
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("cell_a")))
+            .is_ok_and(|t| t.contains("cell_a")))
         .await,
         "the initial adopted layout must persist"
     );
@@ -2316,8 +2307,7 @@ async fn a_restart_only_file_watch_change_is_not_persisted_as_adopted() {
     // The initial adopted state persists (the persister's startup write).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("in_a")))
+            .is_ok_and(|t| t.contains("in_a")))
         .await,
         "the initial adopted state persists"
     );
@@ -2448,8 +2438,7 @@ async fn a_runtime_salvo_edit_persists_to_active_toml() {
     // which is seeded from the boot document).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("recall_a")))
+            .is_ok_and(|t| t.contains("recall_a")))
         .await,
         "the boot-seeded salvo must be composed into active.toml"
     );
@@ -2478,8 +2467,7 @@ async fn a_runtime_salvo_edit_persists_to_active_toml() {
     // adopted by construction — no engine command to shed).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("Recall A v2")))
+            .is_ok_and(|t| t.contains("Recall A v2")))
         .await,
         "the runtime salvo edit must persist into active.toml (it is lost on \
          resume otherwise)"
@@ -2501,8 +2489,7 @@ async fn a_runtime_tally_profile_edit_persists_to_active_toml() {
     // The seeded tally profile persists at startup (composed from the store).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("tp1")))
+            .is_ok_and(|t| t.contains("tp1")))
         .await,
         "the boot-seeded tally profile must be composed into active.toml"
     );
@@ -2635,8 +2622,7 @@ async fn a_file_watch_overlay_add_is_adopted_on_an_overlay_capable_run() {
     // The initial adopted state persists (the persister's startup write).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("in_a")))
+            .is_ok_and(|t| t.contains("in_a")))
         .await,
         "the initial adopted state persists"
     );
@@ -2664,8 +2650,7 @@ async fn a_file_watch_overlay_add_is_adopted_on_an_overlay_capable_run() {
     // persister writes it. The persist itself runs on its own debounce timer.
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("ov_clock")))
+            .is_ok_and(|t| t.contains("ov_clock")))
         .await,
         "a live file-watch overlay add must be adopted into active.toml (the \
          watcher must mirror the REST overlay adopt path)"
@@ -2707,8 +2692,7 @@ async fn a_shed_file_watch_overlay_add_is_redelivered_and_adopted_on_retry() {
     // write).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("in_a")))
+            .is_ok_and(|t| t.contains("in_a")))
         .await,
         "the initial adopted state persists"
     );
@@ -2761,8 +2745,7 @@ async fn a_shed_file_watch_overlay_add_is_redelivered_and_adopted_on_retry() {
     drive_polls(&mut poll, 2).await;
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("ov_clock")))
+            .is_ok_and(|t| t.contains("ov_clock")))
         .await,
         "after the bus drains, the retry MUST re-deliver the overlay and adopt it \
          into active.toml — a shed must never silently become a false success"
@@ -2801,8 +2784,7 @@ async fn a_shed_file_watch_overlay_remove_is_redelivered_and_adopted_on_retry() 
     // the persister's startup write).
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| t.contains("ov_clock")))
+            .is_ok_and(|t| t.contains("ov_clock")))
         .await,
         "the boot overlay is adopted at start"
     );
@@ -2850,8 +2832,7 @@ async fn a_shed_file_watch_overlay_remove_is_redelivered_and_adopted_on_retry() 
     drive_polls(&mut poll, 2).await;
     assert!(
         wait_until(SETTLE, || std::fs::read_to_string(&active_path)
-            .ok()
-            .is_some_and(|t| !t.contains("ov_clock")))
+            .is_ok_and(|t| !t.contains("ov_clock")))
         .await,
         "after the bus drains, the retry MUST re-deliver the removal and drop the \
          overlay from active.toml — a shed removal must never silently become a false success"

@@ -176,14 +176,12 @@ where
     // `MULTIVIEW_CONTROL_AUTH=disabled|off|none|0` opens the whole API + WS as a
     // local admin (no token). Secure default: anything else (incl. unset) keeps
     // auth ON. A loud warning is logged whenever it is off.
-    let auth_disabled = std::env::var("MULTIVIEW_CONTROL_AUTH")
-        .ok()
-        .is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "disabled" | "off" | "none" | "false" | "0"
-            )
-        });
+    let auth_disabled = std::env::var("MULTIVIEW_CONTROL_AUTH").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "disabled" | "off" | "none" | "false" | "0"
+        )
+    });
     if auth_disabled {
         tracing::warn!(
             "MULTIVIEW_CONTROL_AUTH disables authentication — the control plane API \

@@ -117,7 +117,7 @@ mod tests {
         assert_eq!(slot.load().overlays().len(), 1);
         let g2 = publish_set(&slot, Vec::new());
         assert_eq!(g2, 2);
-        assert!(slot.load().overlays().is_empty());
+        assert_eq!(slot.load().overlays(), []);
     }
 
     #[test]

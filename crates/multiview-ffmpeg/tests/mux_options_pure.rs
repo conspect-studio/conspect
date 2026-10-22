@@ -42,7 +42,7 @@ fn from_pairs_round_trips_arbitrary_keys() {
 fn empty_options_is_valid_and_empty() {
     let opts = MuxOptions::new();
     assert!(opts.is_empty());
-    assert!(opts.as_pairs().is_empty());
+    assert_eq!(opts.as_pairs(), []);
     // from an empty slice too.
     let from_empty = MuxOptions::from_pairs(&[]).expect("empty slice accepted");
     assert!(from_empty.is_empty());

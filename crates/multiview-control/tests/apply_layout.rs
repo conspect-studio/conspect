@@ -203,7 +203,10 @@ async fn apply_layout_unparseable_body_is_422_before_202() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain(),
+        Vec::<multiview_control::Command>::new()
+    );
 }
 
 #[tokio::test]
@@ -296,7 +299,10 @@ async fn apply_layout_canvas_mismatch_is_422_class2() {
         detail.contains("canvas") || detail.contains("Class-2"),
         "the problem explains the pinned-canvas refusal, got {detail:?}"
     );
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain(),
+        Vec::<multiview_control::Command>::new()
+    );
 }
 
 /// The running session's pinned canvas used across these tests (matches
@@ -394,7 +400,10 @@ async fn apply_layout_canvas_gate_survives_working_layout_rewrite() {
         StatusCode::UNPROCESSABLE_ENTITY,
         "rewriting the working layout must not bypass the pinned-canvas gate"
     );
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain(),
+        Vec::<multiview_control::Command>::new()
+    );
 }
 
 #[tokio::test]
@@ -424,7 +433,10 @@ async fn apply_layout_without_a_running_canvas_fails_closed() {
         detail.contains("running canvas"),
         "the problem names the unknown running canvas, got {detail:?}"
     );
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain(),
+        Vec::<multiview_control::Command>::new()
+    );
 }
 
 #[tokio::test]
@@ -558,7 +570,10 @@ async fn apply_layout_resolve_failure_releases_the_idempotency_key() {
     )
     .await;
     assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain(),
+        Vec::<multiview_control::Command>::new()
+    );
 
     create_layout(&h, "ghost", &absolute_body()).await;
     let retried = send(

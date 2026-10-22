@@ -91,7 +91,7 @@ async fn play_returns_202_and_reaches_the_engine() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body = body_json(resp).await;
     let op = body["operation_id"].as_str().unwrap().to_owned();
-    assert!(!op.is_empty());
+    assert_ne!(op, "");
     assert_eq!(body["kind"], "media_play");
 
     let drained = h.commands.try_drain();
@@ -260,7 +260,10 @@ async fn exit_arm_unknown_player_is_404_and_enqueues_nothing() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain(),
+        Vec::<multiview_control::Command>::new()
+    );
 }
 
 /// A viewer is read-only: it may NOT drive transport or arm an exit (403),
@@ -281,7 +284,10 @@ async fn viewer_may_not_drive_transport_or_arm_exit() {
         );
         assert_eq!(body_json(resp).await["type"], "/problems/forbidden");
     }
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain(),
+        Vec::<multiview_control::Command>::new()
+    );
 }
 
 /// Per-object BOLA: an operator scoped to a single object id (`scoped-layout`)

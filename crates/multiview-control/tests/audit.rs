@@ -50,7 +50,7 @@ fn audit_log_records_and_lists_in_reverse_chronological_order() {
     let only_alpha = log.list(Some("alpha")).unwrap();
     assert_eq!(only_alpha.len(), 2);
     let none = log.list(Some("nonexistent")).unwrap();
-    assert!(none.is_empty());
+    assert_eq!(none, Vec::<multiview_control::AuditEntry>::new());
 }
 
 #[tokio::test]

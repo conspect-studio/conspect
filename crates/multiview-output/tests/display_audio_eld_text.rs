@@ -147,6 +147,12 @@ fn vc4_cards_map_from_the_connector_index() {
         vec!["vc4hdmi0".to_owned(), "vc4hdmi".to_owned()]
     );
     assert_eq!(vc4_card_candidates("HDMI-A-2"), vec!["vc4hdmi1".to_owned()]);
-    assert!(vc4_card_candidates("DP-1").is_empty());
-    assert!(vc4_card_candidates("HDMI-A-").is_empty());
+    assert_eq!(
+        vc4_card_candidates("DP-1"),
+        Vec::<std::string::String>::new()
+    );
+    assert_eq!(
+        vc4_card_candidates("HDMI-A-"),
+        Vec::<std::string::String>::new()
+    );
 }

@@ -2223,11 +2223,16 @@ mod tests {
         );
         // Usable behind the object-safe `LoadSource` seam the CLI injects.
         let dynamic: &dyn LoadSource = &poller;
-        assert!(dynamic.poll().is_empty());
+        assert_eq!(dynamic.poll().len(), 0, "{:?}", dynamic.poll());
         // The default `device_perf` honestly reports no perf signals (so the CLI
         // candidate falls back to the conservative DEFAULT_PERF_CLASS), never a
         // fabricated device.
-        assert!(dynamic.device_perf().is_empty());
+        assert_eq!(
+            dynamic.device_perf().len(),
+            0,
+            "{:?}",
+            dynamic.device_perf()
+        );
     }
 
     #[test]

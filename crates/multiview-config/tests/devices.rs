@@ -381,8 +381,8 @@ members = [{ device = "dev-a" }]
 #[test]
 fn existing_documents_without_devices_parse_with_empty_collections() {
     let cfg = MultiviewConfig::load_from_toml(BASE).expect("base document parses");
-    assert!(cfg.devices.is_empty());
-    assert!(cfg.sync_groups.is_empty());
+    assert_eq!(cfg.devices, Vec::<multiview_config::Device>::new());
+    assert_eq!(cfg.sync_groups, Vec::<multiview_config::SyncGroup>::new());
     cfg.validate().expect("base document validates unchanged");
 }
 

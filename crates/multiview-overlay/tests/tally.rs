@@ -111,7 +111,7 @@ fn only_lit_regions_resolve_to_rects() {
         border.rect_for(TallyRegion::Left).is_none(),
         "an off lamp draws no strip"
     );
-    assert!(border.regions().is_empty());
+    assert_eq!(border.regions(), []);
 }
 
 #[test]

@@ -144,7 +144,10 @@ fn inventory_expires_stale_rows_on_snapshot() {
         already_expired(),
         None,
     ));
-    assert!(inv.snapshot().is_empty());
+    assert_eq!(
+        inv.snapshot(),
+        Vec::<multiview_control::devices::DiscoveredService>::new()
+    );
 }
 
 #[test]

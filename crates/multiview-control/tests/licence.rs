@@ -288,8 +288,11 @@ async fn challenge_export_is_well_formed_cbor() {
     let decoded: multiview_licence::ChallengeFile =
         ciborium::from_reader(bytes.as_slice()).expect("challenge decodes as CBOR");
     // Data minimisation: an un-gathered challenge carries no digests.
-    assert!(decoded.fingerprint_digests.is_empty());
-    assert!(decoded.host_digest.is_empty());
+    assert_eq!(
+        decoded.fingerprint_digests,
+        Vec::<std::string::String>::new()
+    );
+    assert_eq!(decoded.host_digest, "");
 }
 
 #[test]
@@ -350,7 +353,10 @@ async fn installing_a_lease_writes_an_account_audit_entry_end_to_end() {
     });
 
     // No account audit entries before the install.
-    assert!(audit.page(None, None, 100).entries.is_empty());
+    assert_eq!(
+        audit.page(None, None, 100).entries,
+        Vec::<multiview_control::AccountAuditEntry>::new()
+    );
 
     let cbor = binding(&key, "serial-AUDIT01", now, 100)
         .to_cbor()

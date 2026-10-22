@@ -185,7 +185,10 @@ fn receiver_status_with_no_applications_decodes_empty() {
     let InboundMessage::ReceiverStatus(status) = protocol::decode(&frame) else {
         panic!("expected a receiver status");
     };
-    assert!(status.applications.is_empty());
+    assert_eq!(
+        status.applications,
+        Vec::<multiview_control::devices::cast::protocol::ReceiverApplication>::new()
+    );
 }
 
 #[test]

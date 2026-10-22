@@ -75,7 +75,7 @@ fn identical_documents_diff_empty() {
         diff.is_empty(),
         "identical documents must diff empty: {diff:?}"
     );
-    assert!(diff.sources.is_empty());
+    assert_eq!(diff.sources, Vec::<multiview_config::SourceChange>::new());
     assert!(!diff.canvas_signal_changed);
     assert!(!diff.canvas_cosmetic_changed);
     assert!(!diff.layout_changed);
@@ -542,7 +542,7 @@ fn a_cell_rebinding_is_a_layout_change() {
     let diff = ConfigDiff::between(&base(), &next);
     assert!(diff.layout_changed, "a cell rebinding changes the layout");
     assert!(!diff.canvas_signal_changed);
-    assert!(diff.sources.is_empty());
+    assert_eq!(diff.sources, Vec::<multiview_config::SourceChange>::new());
 }
 
 #[test]

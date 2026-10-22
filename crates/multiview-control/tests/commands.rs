@@ -170,7 +170,7 @@ async fn shed_submission_releases_its_idempotency_key_so_a_retry_actually_enqueu
     let op3 = body3["operation_id"]
         .as_str()
         .expect("operation id present");
-    assert!(!op3.is_empty());
+    assert_ne!(op3, "");
 
     let drained2 = h.commands.try_drain();
     assert_eq!(

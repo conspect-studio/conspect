@@ -425,7 +425,7 @@ heads = [
     assert_eq!(salvo.layout.as_deref(), Some("2x2"));
 
     let profile: &TallyProfile = &cfg.tally_profiles[0];
-    assert!(profile.bit_colors.is_empty());
+    assert_eq!(profile.bit_colors, Vec::<multiview_config::BitColor>::new());
 
     let wall: &WallConfig = &cfg.walls[0];
     let core = wall.to_core();

@@ -82,7 +82,10 @@ fn disabled_kinds_are_absent_from_the_model() {
     let canvas = CanvasSize::new(1920, 1080);
     // Default markers draw nothing until enabled.
     let model = SafeAreaMarkers::default().resolve(canvas);
-    assert!(model.rects.is_empty());
+    assert_eq!(
+        model.rects,
+        Vec::<multiview_overlay::safearea::SafeAreaRect>::new()
+    );
     assert!(model.center_cross.is_none());
 }
 

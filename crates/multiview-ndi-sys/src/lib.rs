@@ -430,7 +430,7 @@ mod tests {
         let dirs = default_search_paths();
         assert!(!dirs.is_empty(), "must probe at least one conventional dir");
         let names = runtime_dylib_names();
-        assert!(!names.is_empty());
+        assert_ne!(names.len(), 0, "no candidate names");
         // The runtime is never the unversioned-only name on Linux; a versioned
         // SONAME must be probed so a real install is found.
         #[cfg(not(target_os = "macos"))]
@@ -452,7 +452,7 @@ mod tests {
         let dirs = vec![PathBuf::from("/nonexistent-ndi-dir-xyz")];
         match find_runtime(&dirs) {
             Err(NdiSysError::RuntimeNotFound { searched }) => {
-                assert!(!searched.is_empty());
+                assert_ne!(searched.len(), 0, "nothing searched");
                 assert!(searched
                     .iter()
                     .all(|p| p.starts_with("/nonexistent-ndi-dir-xyz")));
@@ -508,7 +508,7 @@ mod tests {
             NdiSysError::NullApiTable,
         ];
         for v in &variants {
-            assert!(!v.to_string().is_empty());
+            assert_ne!(v.to_string(), "");
         }
     }
 }

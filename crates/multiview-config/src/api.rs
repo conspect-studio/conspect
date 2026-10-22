@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn default_api_section_is_empty_and_valid() {
         let cfg = ApiConfig::default();
-        assert!(cfg.keys.is_empty());
+        assert_eq!(cfg.keys.len(), 0);
         cfg.validate().expect("the empty section validates");
     }
 

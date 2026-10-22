@@ -201,7 +201,7 @@ async fn arm_then_take_returns_202_and_reaches_the_engine() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body = body_json(resp).await;
     let arm_op = body["operation_id"].as_str().unwrap().to_owned();
-    assert!(!arm_op.is_empty());
+    assert_ne!(arm_op, "");
     assert_eq!(body["kind"], "arm_salvo");
 
     // Take.

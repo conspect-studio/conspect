@@ -276,7 +276,7 @@ fn rist_options_default_is_empty() {
     assert!(opts.buffer_ms.is_none());
     assert!(opts.pkt_size.is_none());
     assert!(opts.encryption.is_none());
-    assert!(opts.bonding.is_empty());
+    assert_eq!(opts.bonding, Vec::<multiview_config::RistPeer>::new());
 }
 
 #[test]

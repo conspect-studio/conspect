@@ -51,7 +51,7 @@ fn drops_late_packet_below_release_watermark() {
     assert_eq!(b.push(mt(90), "late"), ReorderOutcome::DroppedLate);
     // It must not appear in any future drain.
     let rest: Vec<&str> = b.drain_ready(mt(i64::MAX)).collect();
-    assert!(rest.is_empty());
+    assert_eq!(rest, Vec::<&str>::new());
 }
 
 #[test]

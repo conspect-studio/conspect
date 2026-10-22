@@ -297,8 +297,8 @@ mod tests {
         // is empty: the LGPL-clean build cannot reach a GPL/proprietary encoder.
         #[cfg(not(feature = "cuda"))]
         {
-            assert!(candidate_encoders(VideoCodec::H264).is_empty());
-            assert!(candidate_encoders(VideoCodec::H265).is_empty());
+            assert_eq!(candidate_encoders(VideoCodec::H264), Vec::<&str>::new());
+            assert_eq!(candidate_encoders(VideoCodec::H265), Vec::<&str>::new());
             assert!(!can_encode(VideoCodec::H264));
             assert!(!can_encode(VideoCodec::H265));
         }
@@ -353,7 +353,7 @@ mod tests {
                 can_encode_audio(codec),
                 "audio codec {codec:?} must be encodable in the default build"
             );
-            assert!(!candidate_audio_encoders(codec).is_empty());
+            assert_ne!(candidate_audio_encoders(codec), Vec::<&str>::new());
         }
     }
 

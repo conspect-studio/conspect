@@ -332,7 +332,7 @@ async fn posted_start_command_correlates_its_realtime_outcome() {
         .as_str()
         .expect("operation_id present")
         .to_owned();
-    assert!(!op.is_empty());
+    assert_ne!(op, "");
 
     // The realtime projection over the same registry stamps the recorded op onto
     // the start's outcome event.

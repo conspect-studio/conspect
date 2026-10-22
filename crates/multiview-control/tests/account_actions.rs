@@ -224,7 +224,10 @@ async fn pending_strip_lists_then_local_cancel_wins() {
 
     // It drops out of the strip, and the underlying store confirms the cancel
     // beat any later execution attempt.
-    assert!(actions.list_pending().is_empty());
+    assert_eq!(
+        actions.list_pending(),
+        Vec::<multiview_control::PendingAction>::new()
+    );
     assert!(matches!(
         actions.mark_executed("act-1"),
         multiview_control::ExecuteOutcome::Cancelled
@@ -310,7 +313,7 @@ async fn fire_named_salvo_returns_202_and_audits() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: Value = body_json(resp).await;
     let action_id = body["action_id"].as_str().expect("an action id");
-    assert!(!action_id.is_empty());
+    assert_ne!(action_id, "");
     assert!(body["queued_at_nanos"].as_i64().is_some());
 
     // The fire reached the engine command bus.

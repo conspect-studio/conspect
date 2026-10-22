@@ -118,7 +118,10 @@ fn mailbox_conflates_state_verbs_to_the_latest() {
         "only the latest state-collapsing verb survives conflation"
     );
     // Drained empty afterwards.
-    assert!(mb.drain().is_empty());
+    assert_eq!(
+        mb.drain(),
+        Vec::<multiview_cli::player::TransportVerb>::new()
+    );
 }
 
 #[test]

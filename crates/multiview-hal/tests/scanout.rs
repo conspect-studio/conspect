@@ -189,5 +189,8 @@ fn empty_inventory_owns_nothing() {
     let inv = ScanoutInventory::new(vec![]);
     assert_eq!(inv.owning_device(&ConnectorId::new("DP-1")), None);
     assert_eq!(inv.connected_connectors().count(), 0);
-    assert!(inv.locality_for(&[ConnectorId::new("DP-1")]).is_empty());
+    assert_eq!(
+        inv.locality_for(&[ConnectorId::new("DP-1")]),
+        Vec::<multiview_hal::DeviceId>::new()
+    );
 }

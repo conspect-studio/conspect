@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn iso639_empty_body_decodes_to_no_entries() {
-        assert!(IsoLanguageDescriptor::decode(&[]).entries.is_empty());
+        assert_eq!(IsoLanguageDescriptor::decode(&[]).entries.len(), 0);
     }
 
     #[test]
