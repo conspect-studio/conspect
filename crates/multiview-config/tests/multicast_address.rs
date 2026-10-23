@@ -132,8 +132,12 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
         if body[0] & 0x0f00 != 0 || body[0] & 0xff > 64 {
             return None;
         }
-        // RFC 3306 §6: only the zero plen and zero prefix encode ff3x::/32.
-        if body[..5].iter().all(|word| *word == 0) {
+        // RFC 3306 §6: zero plen requires zero prefix; only that encoding
+        // belongs to the RFC 4607 SSM range, never to prefix-based ASM.
+        if body[0] & 0xff == 0 {
+            if body[1..5].iter().any(|word| *word != 0) {
+                return None;
+            }
             let id = (u32::from(body[5]) << 16) | u32::from(body[6]);
             return (id >= 0x8000_0000).then_some(MulticastClass::SourceSpecific);
         }
@@ -556,6 +560,72 @@ fn ipv6_prefix_based_groups_are_not_ssm_and_validate_encoding() {
             RejectReason::ReservedBlock,
             "{text}"
         );
+    }
+}
+
+/// Independent literal representatives of every IPv6 flags/plen/rsvd/prefix/
+/// group-ID decision. The property oracle above separately checks combinations.
+#[test]
+fn ipv6_encoding_classes_have_literal_boundaries() {
+    use MulticastClass::{AdminScoped, Routed, SourceSpecific};
+    const CASES: &[(&str, Option<MulticastClass>)] = &[
+        // Outside ff00::/8; non-SSM flags with each supported ASM scope.
+        ("2001:db8::1", None),
+        ("ff05::1", Some(AdminScoped)),
+        ("ff08::1", Some(Routed)),
+        ("ff0e::1", Some(Routed)),
+        ("ff1e::1", Some(Routed)),
+        // Even with flags=3 and a valid dynamic ID, unsupported scopes lose.
+        ("ff30::8000:1", None),
+        ("ff31::8000:1", None),
+        ("ff32::8000:1", None),
+        ("ff33::8000:1", None),
+        ("ff34::8000:1", None),
+        ("ff36::8000:1", None),
+        ("ff37::8000:1", None),
+        ("ff39::8000:1", None),
+        ("ff3a::8000:1", None),
+        ("ff3b::8000:1", None),
+        ("ff3c::8000:1", None),
+        ("ff3d::8000:1", None),
+        ("ff3f::8000:1", None),
+        // Valid SSM encoding: zero rsvd, plen and prefix, dynamic group ID.
+        ("ff35::8000:1", Some(SourceSpecific)),
+        ("ff38::8000:1", Some(SourceSpecific)),
+        ("ff3e::8000:1", Some(SourceSpecific)),
+        // Permanent and IANA-reserved ID slices never become ASM.
+        ("ff3e::", None),
+        ("ff3e::3fff:ffff", None),
+        ("ff3e::4000:1", None),
+        ("ff3e::7fff:ffff", None),
+        // Zero plen with a nonzero network-prefix byte is malformed, not ASM.
+        ("ff3e:0:1::8000:1", None),
+        ("ff3e::1:8000:1", None),
+        ("ff35::1:0:8000:1", None),
+        // Nonzero plen is prefix-based ASM, even if the prefix is zero.
+        ("ff35:1::8000:1", Some(AdminScoped)),
+        ("ff38:40:2001:db8::8000:1", Some(Routed)),
+        ("ff3e:40::8000:1", Some(Routed)),
+        ("ff3e:40:2001:db8::1", Some(Routed)),
+        // rsvd!=0 and plen>64 reject, irrespective of prefix and ID.
+        ("ff3e:100::8000:1", None),
+        ("ff3e:41:2001:db8::8000:1", None),
+        // RFC 7371 ff2 flags are ignored on receipt (not rsvd).
+        ("ff3e:f00::8000:1", Some(SourceSpecific)),
+        ("ff3e:f040:2001:db8::8000:1", Some(Routed)),
+    ];
+    for &(text, expected) in CASES {
+        let addr = ip(text);
+        assert_eq!(classify(addr), expected, "{text}");
+        match expected {
+            Some(class) => assert_eq!(MulticastGroup::try_from(addr).expect(text).class(), class, "{text}"),
+            None => assert!(MulticastGroup::try_from(addr).is_err(), "{text}"),
+        }
+    }
+    for text in ["ff3e:0:1::8000:1", "ff3e::1:8000:1", "ff35::1:0:8000:1"] {
+        let addr = ip(text);
+        assert_eq!(MulticastGroup::try_from(addr).unwrap_err().reason(), RejectReason::ReservedBlock, "{text}");
+        assert!(serde_json::from_str::<MulticastGroup>(&format!("\"{text}\"")).is_err(), "{text}");
     }
 }
 
