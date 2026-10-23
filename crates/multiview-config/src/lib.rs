@@ -1811,10 +1811,16 @@ fn validate_rist_options(
 ///
 /// Latency is carried as exact milliseconds; the `FFmpeg` `×1000` µs conversion is
 /// the SRT-2 wiring boundary, not a config concern. The two timeouts are `u32`
-/// milliseconds (negatives are unrepresentable; libsrt documents no other range),
-/// and `listener`/`backend` are carried only — none of these is acted on until
-/// the SRT-2 (#58) wiring.
+/// milliseconds (negatives are unrepresentable; libsrt documents no other range).
+/// Conflicting `listener`/`mode` combinations are rejected at admission.
 fn validate_srt_options(owner: &str, opts: &crate::schema::SrtOptions) -> Result<(), ConfigError> {
+    if let (Some(mode), Some(listener)) = (opts.mode, opts.listener) {
+        if (mode == crate::schema::SrtMode::Listener) != listener {
+            return Err(ConfigError::Validation(format!(
+                "srt {owner:?}: listener = {listener} conflicts with mode = {mode:?}"
+            )));
+        }
+    }
     if let Some(stream_id) = &opts.stream_id {
         let max = crate::schema::SrtOptions::STREAM_ID_MAX_BYTES;
         if stream_id.len() > max {

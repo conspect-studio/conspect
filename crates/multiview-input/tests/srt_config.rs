@@ -20,7 +20,7 @@ fn srt_caller_url_basic() {
         ..SrtConfig::default()
     };
     let url = cfg.to_url().expect("url");
-    assert_eq!(url, "srt://encoder.example:9000?mode=caller&latency=200");
+    assert_eq!(url, "srt://encoder.example:9000?mode=caller&latency=200000");
 }
 
 #[test]
@@ -31,7 +31,10 @@ fn srt_libav_option_url_golden_table() {
         latency_ms: 200,
         ..SrtConfig::default()
     };
-    assert_eq!(cfg.to_url().unwrap(), "srt://[::1]:9000?mode=caller&latency=200000");
+    assert_eq!(
+        cfg.to_url().unwrap(),
+        "srt://[::1]:9000?mode=caller&latency=200000"
+    );
     cfg.oheadbw_pct = Some(25);
     cfg.maxbw = Some(0);
     cfg.conn_timeout_ms = Some(3000);

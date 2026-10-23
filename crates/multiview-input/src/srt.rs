@@ -42,6 +42,18 @@ pub enum SrtError {
     /// A required connection parameter (host/port) was missing or invalid.
     #[error("srt connection parameter invalid: {0}")]
     Parameter(&'static str),
+
+    /// This backend is not implemented by the Tier-0 `FFmpeg` transport.
+    #[error("srt backend is unsupported until SRT-5")]
+    UnsupportedBackend,
+
+    /// An option has no corresponding `FFmpeg` 8.1.1 SRT URL parameter.
+    #[error("srt option {0} is unsupported by FFmpeg 8.1.1")]
+    UnsupportedOption(&'static str),
+
+    /// A referenced passphrase could not be resolved at socket setup.
+    #[error("srt passphrase reference could not be resolved")]
+    SecretUnavailable,
 }
 
 /// The SRT call mode (which side initiates the handshake).
@@ -185,10 +197,15 @@ pub struct SrtConfig {
     /// **Unit boundary (verified defect, ADR-0039 §3):** libsrt's native API
     /// takes milliseconds, but `FFmpeg`'s `libsrt` `AVOption` `latency=` takes
     /// **microseconds** (`latency=200000` ⇒ 200 ms). [`SrtConfig::to_url`]
-    /// therefore emits the raw millisecond value today; the `×1000` conversion
-    /// belongs at the Tier-0 `FFmpeg` boundary (SRT-2 wiring), never here — the
-    /// model stays in exact milliseconds, never float (invariant #3).
+    /// emits microseconds after an exact `×1000` conversion; the model stays
+    /// in milliseconds, never float (invariant #3).
     pub latency_ms: u32,
+    /// `FFmpeg`'s `oheadbw` percentage (not a time quantity).
+    pub oheadbw_pct: Option<u32>,
+    /// `FFmpeg`'s `maxbw` in bytes per second.
+    pub maxbw: Option<i64>,
+    /// `FFmpeg`'s `connect_timeout` in milliseconds.
+    pub conn_timeout_ms: Option<u32>,
 }
 
 impl Default for SrtConfig {
@@ -201,6 +218,9 @@ impl Default for SrtConfig {
             passphrase: None,
             stream_id: None,
             latency_ms: 120,
+            oheadbw_pct: None,
+            maxbw: None,
+            conn_timeout_ms: None,
         }
     }
 }
@@ -255,12 +275,9 @@ impl SrtConfig {
     /// because the libav demuxer requires it; callers wishing to keep it out of
     /// logs should use [`SrtConfig::to_url_redacted`].
     ///
-    /// **Latency units:** the emitted `latency=` value is the raw
-    /// [`latency_ms`](SrtConfig::latency_ms) millisecond figure, but `FFmpeg`'s
-    /// `libsrt` `AVOption` is in **microseconds** — the caller that hands this
-    /// URL to libav must multiply by `1000` at that boundary (ADR-0039 §3). The
-    /// conversion is deliberately not applied here so the pure model keeps
-    /// libsrt's native millisecond unit; it is fixed as part of the SRT-2 wiring.
+    /// **Latency units:** [`latency_ms`](SrtConfig::latency_ms) stays in
+    /// milliseconds in this model; the emitted libav `latency=` is converted
+    /// exactly to **microseconds** (`×1000`, ADR-0039 §3).
     ///
     /// # Errors
     ///
@@ -284,7 +301,7 @@ impl SrtConfig {
         self.validate()?;
         let mut params: Vec<(&str, String)> = vec![
             ("mode", self.mode.as_libav_token().to_owned()),
-            ("latency", self.latency_ms.to_string()),
+            ("latency", (u64::from(self.latency_ms) * 1000).to_string()),
         ];
         if self.key_length.is_encrypted() {
             params.push(("pbkeylen", self.key_length.bytes().to_string()));
@@ -299,6 +316,15 @@ impl SrtConfig {
         }
         if let Some(sid) = self.stream_id.as_ref() {
             params.push(("streamid", percent_encode(sid.as_str())));
+        }
+        if let Some(pct) = self.oheadbw_pct {
+            params.push(("oheadbw", pct.to_string()));
+        }
+        if let Some(maxbw) = self.maxbw {
+            params.push(("maxbw", maxbw.to_string()));
+        }
+        if let Some(timeout) = self.conn_timeout_ms {
+            params.push(("connect_timeout", timeout.to_string()));
         }
         let query = params
             .iter()

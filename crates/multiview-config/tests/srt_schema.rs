@@ -316,11 +316,14 @@ fn srt_mode_tokens_are_the_libav_mode_tokens() {
 fn srt_listener_and_mode_conflict_is_rejected_at_admission() {
     for (mode, listener) in [("caller", true), ("listener", false), ("rendezvous", true)] {
         let src = srt_source_with_block(&format!("mode = {mode:?}\nlistener = {listener}\n"));
-        let error = src.validate().expect_err("conflicting SRT modes must fail validation");
+        let error = src
+            .validate()
+            .expect_err("conflicting SRT modes must fail validation");
         assert!(error.to_string().contains("listener"), "{error}");
     }
     srt_source_with_block("mode = \"listener\"\nlistener = true\n")
-        .validate().expect("matching mode and listener");
+        .validate()
+        .expect("matching mode and listener");
 }
 
 #[test]
