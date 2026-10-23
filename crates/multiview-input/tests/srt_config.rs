@@ -154,6 +154,26 @@ fn srt_stream_id_encoded_in_url() {
     assert!(url.contains("streamid=%23%21%3A%3Ar%3Dlive%2Ffeed%2Cm%3Dpublish"));
 }
 
+// Mimic libav's query split and ff_urldecode: '+' is a space, %XX is decoded.
+fn decode_query_value(value: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut iter = value.as_bytes().iter().copied();
+    while let Some(byte) = iter.next() {
+        match byte {
+            b'%' => {
+                let hi = iter.next().unwrap();
+                let lo = iter.next().unwrap();
+                let hex =
+                    |digit: u8| u8::try_from(char::from(digit).to_digit(16).unwrap()).unwrap();
+                bytes.push((hex(hi) << 4) | hex(lo));
+            }
+            b'+' => bytes.push(b' '),
+            other => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
 #[test]
 fn srt_query_values_roundtrip_special_bytes_without_exposing_passphrase_in_diagnostics() {
     let passphrase = "secret&+% spaceé";
@@ -167,24 +187,6 @@ fn srt_query_values_roundtrip_special_bytes_without_exposing_passphrase_in_diagn
         ..SrtConfig::default()
     };
     let url = cfg.to_url().unwrap();
-    // Mimic libav's query split and ff_urldecode: '+' is a space, %XX is decoded.
-    fn decode_query_value(value: &str) -> String {
-        let mut bytes = Vec::new();
-        let mut iter = value.as_bytes().iter().copied();
-        while let Some(byte) = iter.next() {
-            match byte {
-                b'%' => {
-                    let hi = iter.next().unwrap();
-                    let lo = iter.next().unwrap();
-                    let hex = |digit: u8| (digit as char).to_digit(16).unwrap() as u8;
-                    bytes.push((hex(hi) << 4) | hex(lo));
-                }
-                b'+' => bytes.push(b' '),
-                other => bytes.push(other),
-            }
-        }
-        String::from_utf8(bytes).unwrap()
-    }
     let query = url.split_once('?').unwrap().1;
     let params: Vec<_> = query
         .split('&')

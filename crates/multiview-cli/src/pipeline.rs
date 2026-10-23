@@ -8688,8 +8688,11 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url }
         | SourceKind::Ts { url }
-        | SourceKind::Srt { url, .. }
         | SourceKind::Rtmp { url } => (url.clone(), true),
+        SourceKind::Srt { url, srt } => match srt_resolved_url(url, srt.as_ref(), false) {
+            Ok(lowered) => (lowered, true),
+            Err(_) => return None,
+        },
         // RIST audio is decoded from the SAME lowered `rist://` URL as its video
         // (the audio peer opens its own libav context). A lowering error (bonding
         // / unresolved PSK) means no audio path — the source rides silence on the

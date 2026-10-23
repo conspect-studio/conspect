@@ -271,8 +271,8 @@ impl SrtConfig {
     /// Build the libav `srt://host:port?...` URL the demuxer opens.
     ///
     /// Validates first, then assembles the query options (`mode`, `latency`,
-    /// `pbkeylen`, `passphrase`, `streamid`). The passphrase is included verbatim
-    /// because the libav demuxer requires it; callers wishing to keep it out of
+    /// `pbkeylen`, `passphrase`, `streamid`). The passphrase is included as a
+    /// percent-encoded query value because the libav demuxer requires it; callers wishing to keep it out of
     /// logs should use [`SrtConfig::to_url_redacted`].
     ///
     /// **Latency units:** [`latency_ms`](SrtConfig::latency_ms) stays in
@@ -315,7 +315,7 @@ impl SrtConfig {
             }
         }
         if let Some(sid) = self.stream_id.as_ref() {
-            params.push(("streamid", percent_encode(sid.as_str())));
+            params.push(("streamid", sid.as_str().to_owned()));
         }
         if let Some(pct) = self.oheadbw_pct {
             params.push(("oheadbw", pct.to_string()));
@@ -328,7 +328,13 @@ impl SrtConfig {
         }
         let query = params
             .iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|(k, v)| {
+                if redact && *k == "passphrase" {
+                    format!("{k}=***")
+                } else {
+                    format!("{k}={}", percent_encode(v))
+                }
+            })
             .collect::<Vec<_>>()
             .join("&");
         // IPv6-first: an IPv6 literal host must be bracketed (`srt://[::1]:port`)
@@ -351,22 +357,21 @@ fn bracket_ipv6_host(host: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(host)
 }
 
-/// Percent-encode the characters that would break an SRT URL query value
-/// (`&`, `=`, `?`, `#`, space, and `%` itself). The SRT-AC stream-id syntax
-/// (`#!::…`) needs `#` encoded.
+/// Strict RFC 3986 query-value encoding: preserve only unreserved ASCII bytes.
+/// Encode every other UTF-8 byte as uppercase `%XX`, including `+` (which
+/// libav's `ff_urldecode` would otherwise turn into a space).
 fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            b'&' | b'=' | b'?' | b'#' | b'%' | b' ' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => {
                 out.push('%');
                 out.push(hex_digit(byte >> 4));
                 out.push(hex_digit(byte & 0x0F));
             }
-            other => match char::from_u32(u32::from(other)) {
-                Some(c) => out.push(c),
-                None => out.push('?'),
-            },
         }
     }
     out
