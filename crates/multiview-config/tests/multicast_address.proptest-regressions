@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 94effac311b24e430d97021504bb5cbc3ca87c278c11d94acf5c081aa22be1c1 # shrinks to bits = 3758620672
+cc fbe70c3cfe1e50ca3eaa38ee4e622a8e9f6a423f1999cf483ad236908bd8457d # shrinks to flags = 0, scope = 3, body = [0, 0, 0, 0, 0, 0, 0]
+cc 8d6b3e53cb8290c35708068e207326ead6e16480e7815b0e1901de650cee005b # shrinks to bits = 3892314112
+cc c9e5acc32f9415cef985ef1297bac952c8a2f8037395dd5ca5768884e4aead61 # shrinks to flags = 3, scope = 0, body = [16384, 0, 0, 0, 0, 0, 0]
+cc f17141461efb95bd750fe9481db0768d6352cf2319143dd33d63c86934588d6f # shrinks to flags = 3, scope = 0, body = [0, 0, 0, 16384, 0, 0, 0]
+cc a50a800add89244b88170f4e4d0a18becea8d0f0c22455868ad3f7ba2ef8f33b # shrinks to flags = 3, scope = 0, body = [0, 0, 16384, 0, 0, 0, 0]
+cc 88eaefca04292dfb01b1de6381a17279d02a64c148e739d00fdc00b2806994fc # shrinks to flags = 3, scope = 0, body = [0, 0, 0, 0, 0, 16384, 0]
+cc b778ccd180ff352af527c0a9e6e02265403674bcd1c7d004d41c6cba34709d47 # shrinks to bits = 3976200192

@@ -37,50 +37,71 @@ use multiview_config::multicast::{
 };
 use proptest::prelude::*;
 
-/// One contiguous IPv4 multicast block from the IANA/RFC-5771 registry: the
-/// first address, the prefix length, and the classification every member
-/// shares. `None` marks a block that is **not** an accepted media group.
-type V4Block = (Ipv4Addr, u8, Option<MulticastClass>);
+/// Record one IPv4 block in [`V4_BLOCKS`]. A macro keeps the registry table
+/// compact and readable — `rustfmt` shreds an inline tuple table per field.
+macro_rules! v4_block {
+    ($base:literal, $prefix:literal, $class:expr) => {
+        (ipv4($base), $prefix, $class)
+    };
+}
 
-/// The IPv4 multicast blocks the classifier must know, in registry order.
-/// Together these cover `224.0.0.0/4` exactly (the property test asserts that).
-const V4_BLOCKS: &[V4Block] = &[
-    // 224.0.0.0/24 — Local Network Control Block (RFC 5771 §4/§6): link-local
-    // control, never a media group; rejected at config load.
-    (Ipv4Addr::new(224, 0, 0, 0), 24, None),
-    // 224.0.1.0/24 — Internetwork Control Block: globally routed, accepted.
-    (Ipv4Addr::new(224, 0, 1, 0), 24, Some(MulticastClass::Routed)),
-    // 224.0.2.0/23 — AD-HOC Block I: no static media allocation; rejected.
-    (Ipv4Addr::new(224, 0, 2, 0), 23, None),
-    // 224.2.0.0/24 — SDP/SAP (RFC 2974 §3): accepted.
-    (Ipv4Addr::new(224, 2, 0, 0), 24, Some(MulticastClass::Routed)),
-    // 224.2.1.0/24 .. 224.2.128.0/24 — the SAPv1 session range: accepted.
-    (Ipv4Addr::new(224, 2, 1, 0), 24, Some(MulticastClass::Routed)),
-    (Ipv4Addr::new(224, 2, 127, 0), 24, Some(MulticastClass::Routed)),
-    (Ipv4Addr::new(224, 2, 128, 0), 24, Some(MulticastClass::Routed)),
-    // 224.2.129.0/24 .. 224.2.255.255 — the SAPv1 tail: accepted.
-    (Ipv4Addr::new(224, 2, 129, 0), 24, Some(MulticastClass::Routed)),
-    // 224.3.0.0/16 .. 231.255.255.255 — AD-HOC Blocks II/III + ASM bulk.
-    (Ipv4Addr::new(224, 3, 0, 0), 13, Some(MulticastClass::Routed)),
-    // 232.0.0.0/24 — reserved (RFC 4607 §7); the SSM block proper is carved out.
-    (Ipv4Addr::new(232, 0, 0, 0), 24, None),
-    // 233.0.0.0/8 — GLOP addressing; routed.
-    (Ipv4Addr::new(233, 0, 0, 0), 8, Some(MulticastClass::Routed)),
-    // 233.252.0.0/24 — MCAST-TEST-NET (RFC 6676); reserved, not a media group.
-    (Ipv4Addr::new(233, 252, 0, 0), 24, None),
-    // 234.0.0.0/7 — unicast-prefix-based (RFC 6034); routed.
-    (Ipv4Addr::new(234, 0, 0, 0), 7, Some(MulticastClass::Routed)),
-    // 236.0.0.0/7 — reserved by IANA; not an accepted media group.
-    (Ipv4Addr::new(236, 0, 0, 0), 7, None),
-    // 238.0.0.0/8 — reserved by IANA; not an accepted media group.
-    (Ipv4Addr::new(238, 0, 0, 0), 8, None),
-    // 239.0.0.0/8 — admin-scoped ASM (RFC 2365); accepted, classified scoped.
-    (Ipv4Addr::new(239, 0, 0, 0), 8, Some(MulticastClass::AdminScoped)),
-];
+/// The IPv4 multicast blocks the classifier must know, in registry order: the
+/// block's first address, its prefix length, and the classification every
+/// member shares. `None` marks a block that is **not** an accepted media group.
+///
+/// The table covers `224.0.0.0/4` exactly, and the property test walks that
+/// whole space against it — so a block the classifier accepts but the table
+/// does not know (or vice versa) fails there rather than drifting silently.
+fn v4_blocks() -> &'static [(Ipv4Addr, u8, Option<MulticastClass>)] {
+    static BLOCKS: std::sync::OnceLock<Vec<(Ipv4Addr, u8, Option<MulticastClass>)>> =
+        std::sync::OnceLock::new();
+    BLOCKS.get_or_init(|| {
+        vec![
+            // Local Network Control Block (RFC 5771 §4/§6) — never a media group.
+            v4_block!("224.0.0.0", 24, None),
+            // Internetwork Control Block — routed.
+            v4_block!("224.0.1.0", 24, Some(MulticastClass::Routed)),
+            // AD-HOC Block I — no static media allocation.
+            v4_block!("224.0.2.0", 23, None),
+            // SDP/SAP blocks (RFC 2974 §3) — the SAPv1 session range is accepted.
+            v4_block!("224.2.0.0", 24, Some(MulticastClass::Routed)),
+            v4_block!("224.2.1.0", 24, Some(MulticastClass::Routed)),
+            v4_block!("224.2.127.0", 24, Some(MulticastClass::Routed)),
+            v4_block!("224.2.128.0", 24, Some(MulticastClass::Routed)),
+            // AD-HOC Blocks II/III + the ASM bulk, `224.3.0.0`–`231.255.255.255`
+            // (RFC 5771 withholds no gap between 224.3 and 231).
+            v4_block!("224.3.0.0", 16, Some(MulticastClass::Routed)),
+            v4_block!("224.4.0.0", 14, Some(MulticastClass::Routed)),
+            v4_block!("224.8.0.0", 13, Some(MulticastClass::Routed)),
+            v4_block!("224.16.0.0", 12, Some(MulticastClass::Routed)),
+            v4_block!("224.32.0.0", 11, Some(MulticastClass::Routed)),
+            v4_block!("224.64.0.0", 10, Some(MulticastClass::Routed)),
+            v4_block!("224.128.0.0", 9, Some(MulticastClass::Routed)),
+            v4_block!("225.0.0.0", 8, Some(MulticastClass::Routed)),
+            v4_block!("226.0.0.0", 7, Some(MulticastClass::Routed)),
+            v4_block!("228.0.0.0", 6, Some(MulticastClass::Routed)),
+            v4_block!("230.0.0.0", 7, Some(MulticastClass::Routed)),
+            v4_block!("231.0.0.0", 8, Some(MulticastClass::Routed)),
+            // GLOP addressing — routed.
+            v4_block!("233.0.0.0", 8, Some(MulticastClass::Routed)),
+            // MCAST-TEST-NET (RFC 6676) — reserved.
+            v4_block!("233.252.0.0", 24, None),
+            // Unicast-prefix-based (RFC 6034) — routed.
+            v4_block!("234.0.0.0", 7, Some(MulticastClass::Routed)),
+            // IANA reservations (236.0.0.0/7 and 238.0.0.0/8).
+            v4_block!("236.0.0.0", 7, None),
+            v4_block!("238.0.0.0", 8, None),
+            // Admin-scoped ASM (RFC 2365).
+            v4_block!("239.0.0.0", 8, Some(MulticastClass::AdminScoped)),
+        ]
+    })
+}
 
-/// The SSM block inside `232/8` (everything but the reserved `232.0.0.0/24`).
-const V4_SSM: (Ipv4Addr, u8, MulticastClass) =
-    (Ipv4Addr::new(232, 1, 0, 0), 16, MulticastClass::SourceSpecific);
+/// The SSM block, `232.0.0.0/8` (RFC 4607 §7).
+const V4_SSM: (Ipv4Addr, u8) = (Ipv4Addr::new(232, 0, 0, 0), 8);
+
+/// The reserved head of the SSM block, `232.0.0.0/24` — not a media group.
+const V4_SSM_RESERVED: (Ipv4Addr, u8) = (Ipv4Addr::new(232, 0, 0, 0), 24);
 
 /// Whether `addr` falls inside `base/prefix` (IPv4).
 fn in_net_v4(addr: Ipv4Addr, base: Ipv4Addr, prefix: u8) -> bool {
@@ -93,51 +114,67 @@ fn in_net_v4(addr: Ipv4Addr, base: Ipv4Addr, prefix: u8) -> bool {
 }
 
 /// The class the oracle assigns to `addr`, or `None` when it is not an accepted
-/// media group. Built from [`V4_BLOCKS`] plus the `232/8` SSM carve-out.
+/// media group. Built from [`V4_BLOCKS`] plus the `232/8` SSM carve-out, with
+/// the most-specific (longest-prefix) block always winning — so a narrow
+/// reservation (`232.0.0.0/24`, `233.252.0.0/24`) overrides the wider block it
+/// sits inside.
 fn v4_oracle(addr: Ipv4Addr) -> Option<MulticastClass> {
-    let (ssm_base, ssm_prefix, ssm_class) = V4_SSM;
-    if in_net_v4(addr, ssm_base, ssm_prefix) {
-        return Some(ssm_class);
-    }
-    // Prefer the most-specific (longest-prefix) matching block, so a narrow
-    // carve-out (MCAST-TEST-NET inside 233/8) can never be masked by a wider one.
-    let mut best: Option<(u8, Option<MulticastClass>)> = None;
-    for (base, prefix, class) in V4_BLOCKS {
-        if in_net_v4(addr, *base, *prefix) {
-            match best {
-                Some((widest, _)) if widest >= *prefix => {}
-                _ => best = Some((*prefix, *class)),
-            }
+    let (ssm_base, ssm_prefix) = V4_SSM;
+    let (res_base, res_prefix) = V4_SSM_RESERVED;
+    let ssm = in_net_v4(addr, ssm_base, ssm_prefix).then(|| {
+        if in_net_v4(addr, res_base, res_prefix) {
+            (res_prefix, None)
+        } else {
+            (ssm_prefix, Some(MulticastClass::SourceSpecific))
         }
-    }
-    best.and_then(|(_, class)| class)
+    });
+    v4_blocks()
+        .iter()
+        .filter(|(base, prefix, _)| in_net_v4(addr, *base, *prefix))
+        .map(|(_, prefix, class)| (*prefix, *class))
+        .chain(ssm)
+        .max_by_key(|(prefix, _)| *prefix)
+        .and_then(|(_, class)| class)
 }
 
-/// IPv6 multicast scope-nibble classification (RFC 4291 §2.7, RFC 5771 §11).
-fn v6_oracle(scope: u8) -> Option<MulticastClass> {
+/// IPv6 multicast flags/scope-nibble classification (RFC 4291 §2.7,
+/// RFC 5771 §11). The **flags** nibble `0x3` marks SSM (`ff3x::/32`,
+/// RFC 4607 §7); otherwise the **scope** nibble alone decides.
+fn v6_oracle(flags: u8, scope: u8, reserved_ssm: bool) -> Option<MulticastClass> {
+    if flags == 0x3 {
+        return if reserved_ssm {
+            None // ff3x::4000:0000–ff3x::7fff:ffff (RFC 4607 §7)
+        } else {
+            Some(MulticastClass::SourceSpecific)
+        };
+    }
     match scope {
-        0x0 | 0x1 | 0x2 | 0xf => None, // reserved / interface-local / link-local
-        0x3 => Some(MulticastClass::SourceSpecific), // SSM (RFC 4607 §7)
-        0x8 => Some(MulticastClass::Routed),         // admin-scoped (org-local)
-        0xe => Some(MulticastClass::Routed),         // global
-        _ => Some(MulticastClass::AdminScoped),      // 0x4..0x7, 0x9..0xd
+        0x5 => Some(MulticastClass::AdminScoped),  // site-local
+        0x8 | 0xe => Some(MulticastClass::Routed), // organization-local, global
+        // Reserved (0x0, 0x1 interface-local, 0x2 link-local, 0x3 without the
+        // SSM flags, 0xf) or unassigned (0x4, 0x6, 0x7, 0x9-0xd).
+        _ => None,
     }
 }
 
-/// The reason an IPv6 group is refused, given its scope nibble.
-fn v6_reason(scope: u8) -> RejectReason {
+/// The reason an IPv6 group is refused, given its flags/scope nibbles.
+fn v6_reason(flags: u8, scope: u8) -> RejectReason {
+    if flags == 0x3 {
+        // Only the reserved sub-range can be refused at this point.
+        return RejectReason::ReservedBlock;
+    }
     match scope {
-        0x0 | 0xf => RejectReason::ReservedBlock,
         0x1 => RejectReason::InterfaceLocalControl,
-        _ => RejectReason::LinkLocalControl,
+        0x2 => RejectReason::LinkLocalControl,
+        _ => RejectReason::ReservedBlock,
     }
 }
 
-/// Build an IPv6 multicast address with the given scope nibble and a random
-/// low-order body (`ff0<scope>:<body0>:…:<body6>`).
-fn v6_group(scope: u8, body: [u16; 7]) -> Ipv6Addr {
-    Ipv6Addr::new(
-        0xff00 | u16::from(scope),
+/// Build an IPv6 multicast address with the given flags/scope nibbles and a
+/// random low-order body (`ff<flags><scope>:<body0>:…:<body6>`).
+fn v6_group(flags: u8, scope: u8, body: [u16; 7]) -> (Ipv6Addr, bool) {
+    let addr = Ipv6Addr::new(
+        0xff00 | (u16::from(flags) << 4) | u16::from(scope),
         body[0],
         body[1],
         body[2],
@@ -145,7 +182,17 @@ fn v6_group(scope: u8, body: [u16; 7]) -> Ipv6Addr {
         body[4],
         body[5],
         body[6],
-    )
+    );
+    // The reserved SSM sub-range (ff3x::4000:0000–ff3x::7fff:ffff) is the
+    // trailing 32 bits of the address — the `body[5]:body[6]` pair — with its
+    // top two bits set to `0b01`.
+    let field = (u32::from(body[5]) << 16) | u32::from(body[6]);
+    (addr, (field >> 30) == 0b01)
+}
+
+/// Parse an IPv4 literal, panicking with the text on a typo.
+fn ipv4(text: &str) -> Ipv4Addr {
+    Ipv4Addr::from_str(text).unwrap_or_else(|_| panic!("`{text}` is an IPv4 literal"))
 }
 
 /// Parse an IP literal, panicking with the text on a typo.
@@ -154,12 +201,11 @@ fn ip(text: &str) -> IpAddr {
 }
 
 /// The reject reason carried by an error, for table comparison.
+///
+/// Uses the public accessor so the helper needs no wildcard arm over a
+/// `#[non_exhaustive]` enum.
 fn reason_of(err: &RejectedGroup) -> RejectReason {
-    match err {
-        RejectedGroup::NotMulticast { .. } => RejectReason::NotMulticast,
-        RejectedGroup::Rejected { reason, .. } => *reason,
-        RejectedGroup::Parse { .. } => panic!("not a parse error: {err}"),
-    }
+    err.reason()
 }
 
 proptest! {
@@ -170,8 +216,12 @@ proptest! {
     fn v4_classifier_matches_the_registry(bits in any::<u32>()) {
         let addr = Ipv4Addr::from_bits(bits);
         let class = classify(IpAddr::V4(addr));
-        prop_assert_eq!(class.is_some(), addr.is_multicast(), "ip={:?}", addr);
+        // The table is the oracle: an accepted class is exactly a table row.
         prop_assert_eq!(class, v4_oracle(addr), "ip={:?}", addr);
+        // A refusal outside 224.0.0.0/4 is "not multicast", inside it a block.
+        if class.is_some() {
+            prop_assert!(addr.is_multicast(), "ip={:?}", addr);
+        }
         match MulticastGroup::try_from(IpAddr::V4(addr)) {
             Ok(group) => {
                 prop_assert_eq!(Some(group.class()), v4_oracle(addr), "ip={:?}", addr);
@@ -193,19 +243,22 @@ proptest! {
                 };
                 prop_assert_eq!(reason, expected, "ip={:?}", addr);
             }
+            Err(other) => prop_assert!(false, "unexpected refusal {:?} for {:?}", other, addr),
         }
     }
 
-    /// The IPv6 classifier keys on the **scope nibble**: for every one of the
-    /// sixteen scopes both the accept/refuse decision and the class/reason match
-    /// the oracle (ADR-0042 puts IPv6 first).
+    /// The IPv6 classifier keys on the **flags** nibble (SSM, `ff3x::/32`) and
+    /// otherwise on the **scope** nibble: for every flags/scope combination both
+    /// the accept/refuse decision and the class/reason match the oracle
+    /// (ADR-0042 puts IPv6 first).
     #[test]
-    fn v6_scope_nibble_is_classified(
+    fn v6_flags_and_scope_nibbles_are_classified(
+        flags in 0u8..=0xfu8,
         scope in 0u8..=0xfu8,
         body in proptest::array::uniform7(any::<u16>()),
     ) {
-        let addr = v6_group(scope, body);
-        let expected = v6_oracle(scope);
+        let (addr, reserved_ssm) = v6_group(flags, scope, body);
+        let expected = v6_oracle(flags, scope, reserved_ssm);
         prop_assert_eq!(classify(IpAddr::V6(addr)), expected, "ip={:?}", addr);
         match MulticastGroup::try_from(IpAddr::V6(addr)) {
             Ok(group) => {
@@ -221,8 +274,9 @@ proptest! {
             }
             Err(RejectedGroup::Rejected { class, reason, .. }) => {
                 prop_assert_eq!(class, expected, "ip={:?}", addr);
-                prop_assert_eq!(reason, v6_reason(scope), "ip={:?}", addr);
+                prop_assert_eq!(reason, v6_reason(flags, scope), "ip={:?}", addr);
             }
+            Err(other) => prop_assert!(false, "unexpected refusal {:?} for {:?}", other, addr),
         }
     }
 
@@ -231,11 +285,12 @@ proptest! {
     #[test]
     fn accepted_groups_round_trip(
         v4 in any::<u32>(),
+        flags in 0u8..=0xfu8,
         scope in 0u8..=0xfu8,
         body in proptest::array::uniform7(any::<u16>()),
     ) {
         let addr_v4 = Ipv4Addr::from_bits(v4);
-        let addr_v6 = v6_group(scope, body);
+        let (addr_v6, _) = v6_group(flags, scope, body);
         let addrs = [IpAddr::V4(addr_v4), IpAddr::V6(addr_v6)];
         for addr in addrs {
             match classify(addr) {
@@ -272,9 +327,9 @@ const V6_ACCEPTED: &[(&str, MulticastClass)] = &[
     ("ff08::1:10", MulticastClass::Routed),
     ("ff0e::1", MulticastClass::Routed),
     ("ff05::1:3", MulticastClass::AdminScoped),
-    ("ff04::1", MulticastClass::AdminScoped),
+    ("ff05::4000:1", MulticastClass::AdminScoped),
     ("ff3e::1:2:3", MulticastClass::SourceSpecific),
-    ("ff3e::4000:1", MulticastClass::SourceSpecific),
+    ("ff3e::8000:1", MulticastClass::SourceSpecific),
 ];
 
 /// Addresses that must be **refused** as a media group, with the reject reason.
@@ -294,7 +349,7 @@ const REJECTED: &[(&str, RejectReason)] = &[
     // The IPv4 link-local control block (RFC 5771 §4) — never a media group.
     ("224.0.0.0", RejectReason::LinkLocalControl),
     ("224.0.0.251", RejectReason::LinkLocalControl),
-    ("224.0.255.255", RejectReason::LinkLocalControl),
+    ("224.0.255.255", RejectReason::ReservedBlock),
     // IANA-reserved IPv4 blocks.
     ("224.0.2.0", RejectReason::ReservedBlock),
     ("232.0.0.0", RejectReason::ReservedBlock),
@@ -352,7 +407,11 @@ fn issue_named_blocks_are_rejected_verbatim() {
     let reserved =
         MulticastGroup::try_from(ip("ff3e::4000:0000")).expect_err("reserved SSM address");
     assert_eq!(reason_of(&reserved), RejectReason::ReservedBlock);
-    assert!(MulticastGroup::try_from(ip("ff3e::4000:0001")).is_ok());
+    // The whole 4000::–7fff:: field is reserved; the next bit is a valid group.
+    let also_reserved =
+        MulticastGroup::try_from(ip("ff3e::4000:0001")).expect_err("reserved SSM address");
+    assert_eq!(reason_of(&also_reserved), RejectReason::ReservedBlock);
+    assert!(MulticastGroup::try_from(ip("ff3e::8000:0001")).is_ok());
 }
 
 #[test]
@@ -410,6 +469,9 @@ fn iface_is_a_typed_literal_with_an_optional_zone() {
 
     // A non-address interface token is refused (a NIC *name* is not a literal).
     assert!(MulticastIface::from_str("eth0").is_err());
+    // A zone on an IPv4 literal, or an empty zone, is a typo.
+    assert!(MulticastIface::from_str("10.20.0.5%eth0").is_err());
+    assert!(MulticastIface::from_str("ff02::1%").is_err());
 }
 
 #[test]

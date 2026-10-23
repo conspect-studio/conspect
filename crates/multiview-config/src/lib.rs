@@ -40,6 +40,7 @@ pub mod grid;
 pub mod layout_doc;
 pub mod limits;
 pub mod media;
+pub mod multicast;
 pub mod origin;
 pub mod placement;
 pub mod probe;
@@ -77,6 +78,10 @@ pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
     MediaPlayerAudio,
+};
+pub use multicast::{
+    classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
+    RejectedGroup,
 };
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
