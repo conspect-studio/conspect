@@ -15414,7 +15414,8 @@
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_events::WarningCode`] (SA-0 catalog).\n\nSerde-equivalent: a unit enum rendered as its `kebab-case` variant name.",
         "enum": [
-          "gpu-present-no-vulkan-adapter"
+          "gpu-present-no-vulkan-adapter",
+          "container-no-host-networking"
         ]
       },
       "WarningSeverityDoc": {
