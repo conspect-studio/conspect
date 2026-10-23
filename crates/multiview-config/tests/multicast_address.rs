@@ -72,11 +72,19 @@ fn v4_oracle(addr: Ipv4Addr) -> Option<MulticastClass> {
 const V4_REGISTRY_ROWS: &[(&str, u8, Option<MulticastClass>)] = &[
     ("224.0.0.0", 24, None),
     ("224.0.1.0", 24, Some(MulticastClass::Routed)),
-    ("224.0.2.0", 16, None),
+    // AD-HOC Block I 224.0.2.0-224.0.255.255, tiled by seven CIDR rows.
+    ("224.0.2.0", 23, Some(MulticastClass::Routed)),
+    ("224.0.4.0", 22, Some(MulticastClass::Routed)),
+    ("224.0.8.0", 21, Some(MulticastClass::Routed)),
+    ("224.0.16.0", 20, Some(MulticastClass::Routed)),
+    ("224.0.32.0", 19, Some(MulticastClass::Routed)),
+    ("224.0.64.0", 18, Some(MulticastClass::Routed)),
+    ("224.0.128.0", 17, Some(MulticastClass::Routed)),
     ("224.1.0.0", 16, None),
     ("224.2.0.0", 16, Some(MulticastClass::Routed)),
     ("224.3.0.0", 16, Some(MulticastClass::Routed)),
     ("224.4.0.0", 16, Some(MulticastClass::Routed)),
+    ("224.252.0.0", 14, Some(MulticastClass::Routed)),
     ("224.0.0.0", 8, None),
     ("225.0.0.0", 8, None),
     ("226.0.0.0", 7, None),
@@ -85,7 +93,8 @@ const V4_REGISTRY_ROWS: &[(&str, u8, Option<MulticastClass>)] = &[
     ("232.0.0.0", 24, None),
     ("233.0.0.0", 8, Some(MulticastClass::Routed)),
     ("233.252.0.0", 24, None),
-    ("234.0.0.0", 7, None),
+    ("234.0.0.0", 8, Some(MulticastClass::Routed)),
+    ("235.0.0.0", 8, None),
     ("236.0.0.0", 7, None),
     ("238.0.0.0", 8, None),
     ("239.0.0.0", 8, Some(MulticastClass::AdminScoped)),
@@ -311,7 +320,9 @@ fn rfc5771_reserved_and_ad_hoc_endpoints() {
         ("224.5.255.255", None),
         ("224.6.0.0", None),
         ("224.6.1.1", None),
-        ("224.255.255.255", None),
+        ("224.251.255.255", None),
+        ("224.252.0.0", Some(MulticastClass::Routed)),
+        ("224.255.255.255", Some(MulticastClass::Routed)),
         ("225.0.0.0", None),
         ("225.1.2.3", None),
         ("231.255.255.255", None),
@@ -319,7 +330,8 @@ fn rfc5771_reserved_and_ad_hoc_endpoints() {
         ("232.0.1.0", Some(MulticastClass::SourceSpecific)),
         ("233.251.255.255", Some(MulticastClass::Routed)),
         ("233.252.0.0", None),
-        ("234.0.0.0", None),
+        ("234.0.0.0", Some(MulticastClass::Routed)),
+        ("235.0.0.0", None),
         ("238.255.255.255", None),
         ("239.0.0.0", Some(MulticastClass::AdminScoped)),
     ];
@@ -408,11 +420,8 @@ const REJECTED: &[(&str, RejectReason)] = &[
     // The IPv4 link-local control block (RFC 5771 §4) — never a media group.
     ("224.0.0.0", RejectReason::LinkLocalControl),
     ("224.0.0.251", RejectReason::LinkLocalControl),
-    // AD-HOC Block I (RFC 5771 §5): the whole `224.0.2.0`–`224.1.255.255`
-    // control range is withheld, and 224.2.x resumes as routed.
-    ("224.0.2.0", RejectReason::ReservedBlock),
-    ("224.0.3.255", RejectReason::ReservedBlock),
-    ("224.0.255.255", RejectReason::ReservedBlock),
+    // IANA RESERVED 224.1/16 is withheld (AD-HOC I 224.0.2.0-224.0.255.255
+    // is allocated and accepted; see `iana_top_level_blocks_first_and_last`).
     ("224.1.0.0", RejectReason::ReservedBlock),
     ("224.1.255.255", RejectReason::ReservedBlock),
     // The reserved 224.5.0.0/16 slice.
@@ -746,4 +755,92 @@ fn packet_counts_are_typed_not_strings() {
     assert_eq!(json, "65536");
     let back: PacketCount = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, packets);
+}
+
+/// Independent literal walk of EVERY top-level block of the IANA IPv4
+/// Multicast Address Space Registry, 224.0.0.0 to 239.255.255.255, in order.
+/// Each entry is `(registry section, first, last, expected)`; the addresses and
+/// decisions are literals, not derived from `V4_BLOCKS` or the lookup.
+/// Registry: <https://www.iana.org/assignments/multicast-addresses>.
+#[test]
+fn iana_top_level_blocks_first_and_last() {
+    use MulticastClass::{AdminScoped, Routed, SourceSpecific};
+    const WALK: &[(&str, &str, &str, Option<MulticastClass>)] = &[
+        // "Local Network Control Block" 224.0.0.0-224.0.0.255: link-local control.
+        ("Local Network Control", "224.0.0.0", "224.0.0.255", None),
+        // "Internetwork Control Block" 224.0.1.0-224.0.1.255.
+        (
+            "Internetwork Control",
+            "224.0.1.0",
+            "224.0.1.255",
+            Some(Routed),
+        ),
+        // "AD-HOC Block I" 224.0.2.0-224.0.255.255 (allocated, registered groups).
+        ("AD-HOC I", "224.0.2.0", "224.0.255.255", Some(Routed)),
+        // "RESERVED" 224.1.0.0-224.1.255.255.
+        ("RESERVED 224.1/16", "224.1.0.0", "224.1.255.255", None),
+        // "SDP/SAP Block" 224.2.0.0-224.2.255.255.
+        ("SDP/SAP", "224.2.0.0", "224.2.255.255", Some(Routed)),
+        // "AD-HOC Block II" 224.3.0.0-224.4.255.255.
+        ("AD-HOC II", "224.3.0.0", "224.4.255.255", Some(Routed)),
+        // "RESERVED" 224.5.0.0-224.251.255.255.
+        (
+            "RESERVED 224.5-224.251",
+            "224.5.0.0",
+            "224.251.255.255",
+            None,
+        ),
+        // "DIS Transient Groups" 224.252.0.0-224.255.255.255 (224.252/14).
+        (
+            "DIS Transient",
+            "224.252.0.0",
+            "224.255.255.255",
+            Some(Routed),
+        ),
+        // "RESERVED" 225.0.0.0-231.255.255.255.
+        ("RESERVED 225-231", "225.0.0.0", "231.255.255.255", None),
+        // "Source-Specific Multicast Block" 232.0.0.0/8; 232.0.0.0-232.0.0.255 reserved.
+        ("SSM reserved head", "232.0.0.0", "232.0.0.255", None),
+        ("SSM", "232.0.1.0", "232.255.255.255", Some(SourceSpecific)),
+        // "GLOP Block" 233.0.0.0-233.251.255.255.
+        ("GLOP", "233.0.0.0", "233.251.255.255", Some(Routed)),
+        // "AD-HOC Block III" 233.252.0.0-233.255.255.255; MCAST-TEST-NET 233.252.0/24.
+        ("MCAST-TEST-NET", "233.252.0.0", "233.252.0.255", None),
+        ("AD-HOC III", "233.252.1.0", "233.255.255.255", Some(Routed)),
+        // "Unicast-Prefix-based IPv4 Multicast Addresses" 234.0.0.0/8 (RFC 6034).
+        (
+            "Unicast-prefix-based",
+            "234.0.0.0",
+            "234.255.255.255",
+            Some(Routed),
+        ),
+        // "Scoped Multicast Ranges": 235.0.0.0-238.255.255.255 Reserved.
+        ("RESERVED 235-238", "235.0.0.0", "238.255.255.255", None),
+        // "Scoped Multicast Ranges": 239.0.0.0/8 Organization-Local Scope.
+        (
+            "Admin-scoped",
+            "239.0.0.0",
+            "239.255.255.255",
+            Some(AdminScoped),
+        ),
+    ];
+    // Contiguity: each block starts right after the previous one ends.
+    let mut next: u32 = Ipv4Addr::new(224, 0, 0, 0).to_bits();
+    for &(name, first, last, expected) in WALK {
+        let (f, l): (Ipv4Addr, Ipv4Addr) =
+            (first.parse().expect("lit"), last.parse().expect("lit"));
+        assert_eq!(f.to_bits(), next, "{name}: walk must be contiguous");
+        next = l.to_bits().wrapping_add(1);
+        for text in [first, last] {
+            assert_eq!(classify(ip(text)), expected, "{name}: {text}");
+        }
+        // Interior probe of every block (midpoint).
+        let mid = Ipv4Addr::from_bits(f.to_bits() + (l.to_bits() - f.to_bits()) / 2);
+        assert_eq!(
+            classify(IpAddr::V4(mid)),
+            expected,
+            "{name}: midpoint {mid}"
+        );
+    }
+    assert_eq!(next, 0, "walk ends at 239.255.255.255");
 }
