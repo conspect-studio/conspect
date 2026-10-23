@@ -1,5 +1,9 @@
 //! Startup advisory for multicast configured inside a container without host networking.
-use std::{fs, net::IpAddr, path::Path};
+use std::{
+    fs,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
 use multiview_config::{MultiviewConfig, Output, SourceKind};
 
@@ -100,6 +104,11 @@ fn multicast_host(host: &str) -> bool {
     let cleaned = host.trim_start_matches('@').trim_matches(['[', ']']);
     cleaned.parse::<IpAddr>().is_ok_and(|ip| ip.is_multicast())
 }
+fn aes67_multicast(group_port: &str) -> bool {
+    group_port
+        .parse::<SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_multicast())
+}
 fn url_multicast(url: &str) -> bool {
     let Some((_, rest)) = url.split_once("://") else {
         return false;
@@ -127,10 +136,10 @@ fn url_multicast(url: &str) -> bool {
 pub fn config_uses_multicast(config: &MultiviewConfig) -> bool {
     config.sources.iter().any(|s| match &s.kind {
         SourceKind::Ts { url } => url_multicast(url),
-        SourceKind::Aes67 { multicast, .. } => multicast.as_deref().is_some_and(url_multicast),
+        SourceKind::Aes67 { multicast, .. } => multicast.as_deref().is_some_and(aes67_multicast),
         _ => false,
     }) || config.outputs.iter().any(|o| match o {
-        Output::Aes67 { multicast, .. } => url_multicast(multicast),
+        Output::Aes67 { multicast, .. } => aes67_multicast(multicast),
         _ => false,
     })
 }

@@ -56,8 +56,9 @@ fn aes67_bare_ipv6_and_ipv4_multicast_warn_once_on_bridge() {
         ..Default::default()
     };
     for group in ["[ff3e::1]:5004", "239.1.2.3:5004"] {
-        let mut config = MultiviewConfig::load_from_toml(include_str!("../../../examples/pip.toml"))
-            .expect("example config parses");
+        let mut config =
+            MultiviewConfig::load_from_toml(include_str!("../../../examples/pip.toml"))
+                .expect("example config parses");
         config.sources[0].kind = SourceKind::Aes67 {
             sdp: "m=audio 5004 RTP/AVP 98".to_owned(),
             session_id: None,
@@ -81,7 +82,11 @@ fn aes67_bare_ipv6_and_ipv4_multicast_warn_once_on_bridge() {
             && has_container_bridge_networking(&env)
             && config_uses_multicast(&config))
         .then_some(NetworkMismatchView);
-        assert_eq!(emit_network_warnings(&publisher, mismatch, 123), 1, "{group}");
+        assert_eq!(
+            emit_network_warnings(&publisher, mismatch, 123),
+            1,
+            "{group}"
+        );
         assert!(subscriber.try_recv().is_ok(), "{group}");
         assert!(subscriber.try_recv().is_err(), "no duplicate for {group}");
     }
