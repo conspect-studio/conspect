@@ -424,6 +424,196 @@ const fn rist_hex_digit(nibble: u8) -> char {
     }
 }
 
+/// The SRT call mode — which side initiates the handshake.
+///
+/// A serializable projection of `multiview-input`'s `srt::SrtMode` (the config
+/// crate sits below the input crate, so the token is mirrored, never shared).
+/// Tokens are the libav `mode=` values; absent ⇒ libav's own default (`caller`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SrtMode {
+    /// Caller: actively connects to a listener at a known address (the default).
+    #[default]
+    Caller,
+    /// Listener: binds and waits for an incoming caller.
+    Listener,
+    /// Rendezvous: both peers connect simultaneously (NAT traversal).
+    Rendezvous,
+}
+
+impl SrtMode {
+    /// The libav `mode=` option token for this mode.
+    #[must_use]
+    pub const fn as_libav_token(self) -> &'static str {
+        match self {
+            Self::Caller => "caller",
+            Self::Listener => "listener",
+            Self::Rendezvous => "rendezvous",
+        }
+    }
+}
+
+/// The SRT `AES` key length (`pbkeylen`), as configured.
+///
+/// A serializable projection of `multiview-input`'s `srt::KeyLength`. The
+/// protocol domain is exactly `{0, 16, 24, 32}` bytes (no encryption / `AES-128`
+/// / `AES-192` / `AES-256`); any other value is unrepresentable here and so
+/// rejected at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SrtKeyLength {
+    /// No encryption (`pbkeylen=0`).
+    #[default]
+    None,
+    /// `AES-128` (`pbkeylen=16`).
+    Aes128,
+    /// `AES-192` (`pbkeylen=24`).
+    Aes192,
+    /// `AES-256` (`pbkeylen=32`).
+    Aes256,
+}
+
+impl SrtKeyLength {
+    /// The key length in bytes (`0`, `16`, `24`, `32`) — the SRT `pbkeylen`.
+    #[must_use]
+    pub const fn bytes(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Aes128 => 16,
+            Self::Aes192 => 24,
+            Self::Aes256 => 32,
+        }
+    }
+}
+
+/// SRT encryption: the `AES` key length plus a **secret-manager reference**
+/// (never a plaintext passphrase).
+///
+/// Mirrors [`RistEncryption`]: the passphrase is held as a
+/// [`secret_ref`](SrtEncryption::passphrase_ref) resolved at run time (the
+/// [`SourceAuth`] pattern) and only ever materializes in the in-memory
+/// `srt://…?passphrase=…` `AVIO` URL passed to libav. libsrt's
+/// `SRTO_PASSPHRASE` is write-only; config-as-code round-trips the reference
+/// only (ADR-0039 §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SrtEncryption {
+    /// `AES` key length (`aes128` / `aes192` / `aes256`) — the `pbkeylen`.
+    pub key_length: SrtKeyLength,
+    /// Reference to the SRT passphrase (e.g. `op://Servers/feed/srt-passphrase`
+    /// or `env:SRT_PASSPHRASE`). Resolved at run time; NEVER stored or logged in
+    /// plaintext. libsrt requires 10..=80 characters once resolved.
+    pub passphrase_ref: String,
+}
+
+/// The SRT implementation backend (ADR-0039 §2 `backend`; research §9
+/// `{ Ffmpeg | Native }`).
+///
+/// Tier-0 is `FFmpeg`'s `libsrt` `srt://` protocol (the license-clean default);
+/// Tier-1 is the pure-Rust `srt-tokio` seam behind the off-by-default `srt`
+/// feature (listener multiplexing + link statistics). The token is carried and
+/// validated here only — **nothing selects a backend at run time yet**; that is
+/// the SRT-2 wiring (#58). Canonical serde tokens are `snake_case` (`ffmpeg` /
+/// `native`); the `docs/io/inputs.md` §2.4 vocabulary (`libav` / `srt-tokio`)
+/// is accepted as an alias and canonicalizes on export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SrtBackend {
+    /// Tier-0: `FFmpeg`'s `libsrt` `srt://` protocol. `libav` is the
+    /// `docs/io/inputs.md` alias.
+    #[serde(alias = "libav")]
+    Ffmpeg,
+    /// Tier-1: the pure-Rust `srt-tokio` seam. `srt-tokio` is the
+    /// `docs/io/inputs.md` alias.
+    #[serde(alias = "srt-tokio")]
+    Native,
+}
+
+/// SRT-specific connection options (input or output), typed rather than a raw
+/// opaque `srt://?…` query (ADR-0039 §2, mirroring the RIST/multicast typed-config
+/// precedent).
+///
+/// A serializable projection of `multiview-input`'s `srt::SrtConfig` **and** the
+/// full SRT-0 option list (ADR-0039 §2 / `srt-transport-backlog.md` SRT-0):
+/// `mode`, `latency_ms`, `encryption`, `stream_id`, `listener`, `oheadbw_pct`,
+/// `maxbw`, the peer-idle/connect timeouts, and `backend`. All fields are
+/// optional with serde `skip_serializing_if`, so an existing
+/// `{ kind = "srt", url }` document parses and re-serializes **byte-identical**
+/// (purely additive — no schema version bump).
+///
+/// The lower-to-`SrtConfig`/URL step and any effect on bytes on the wire are
+/// **deferred**: the SRT-2 wiring (#58) assembles the libav URL (and owns the
+/// ms→µs `×1000`), while the Tier-1 (`srt-tokio`) backend is a later,
+/// feature-gated slice. This slice defines and validates the config surface
+/// only — no run-path behaviour changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SrtOptions {
+    /// The call mode. Absent ⇒ libav's default (`caller`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SrtMode>,
+    /// The receive latency in **milliseconds** (libsrt's native unit).
+    ///
+    /// `FFmpeg`'s `libsrt` `AVOption` `latency=` is in **microseconds**, so the
+    /// Tier-0 boundary multiplies by `1000` when it lowers this value (the
+    /// verified 1000× defect is fixed in the SRT-2 wiring, not here). Never a
+    /// float — exact milliseconds only (invariant #3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u32>,
+    /// `AES` encryption: the key length plus a passphrase **reference** (never a
+    /// plaintext passphrase).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<SrtEncryption>,
+    /// The SRT Access Control stream id. Capped at SRT's 512-byte protocol limit
+    /// ([`SrtOptions::STREAM_ID_MAX_BYTES`]); the typed `#!::` grammar is SRT-1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+    /// The legacy boolean listener switch (libav's `listener=` `AVOption`,
+    /// default `false`). Absent ⇒ libav's default. Prefer
+    /// [`mode`](SrtOptions::mode) `= "listener"`; the two name the same SRT
+    /// handshake side and the SRT-2 wiring (#58) decides precedence. Carried as
+    /// an `Option` so an explicit `false` is distinguishable from absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listener: Option<bool>,
+    /// Overhead bandwidth as a **percentage** of the input rate (SRT
+    /// `SRTO_OVERHEADBW`, the libav `oheadbw=` `AVOption`). libsrt's default is
+    /// `25`; the protocol range is `5..=100` (validated). It applies only when
+    /// [`maxbw`](SrtOptions::maxbw) is `0` (bandwidth relative to the input
+    /// rate). Always an exact integer — never a float.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oheadbw_pct: Option<u32>,
+    /// Maximum bandwidth in **bytes per second** (SRT `SRTO_MAXBW`, the libav
+    /// `maxbw=` `AVOption`). `0` ⇒ auto/relative to the input rate (then
+    /// [`oheadbw_pct`](SrtOptions::oheadbw_pct) applies); `-1` ⇒ unlimited;
+    /// below `-1` is rejected. Exact integer bytes/sec — never a float.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maxbw: Option<i64>,
+    /// Peer-idle timeout in **milliseconds** (SRT `SRTO_PEERIDLETIMEO`, the libav
+    /// `peer_idle_timeout=` `AVOption`). libsrt's default is `5000`; the timeout
+    /// is the dead-peer trigger feeding the reconnect ladder (inv #2). Units are
+    /// milliseconds on both libsrt and the `FFmpeg` path (no conversion).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_idle_timeout_ms: Option<u32>,
+    /// Connect-attempt timeout in **milliseconds** (SRT `SRTO_CONNTIMEO`, the
+    /// libav `connect_timeout=` `AVOption`). libsrt's default is `3000`. Unlike
+    /// `latency`, this stays milliseconds on the `FFmpeg` path too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_timeout_ms: Option<u32>,
+    /// Which implementation carries the SRT bytes (Tier-0 `ffmpeg` / Tier-1
+    /// `native`). Absent ⇒ auto-select, decided by the SRT-2 (#58) wiring; this
+    /// field is carried and validated, never acted on, in this slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SrtBackend>,
+}
+
+impl SrtOptions {
+    /// SRT's maximum stream-id length in bytes (the protocol cap).
+    pub const STREAM_ID_MAX_BYTES: usize = 512;
+}
+
 /// Reference-only credential pointer for a source (never plaintext).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -566,9 +756,22 @@ pub enum SourceKind {
         url: String,
     },
     /// SRT input.
+    ///
+    /// The bare `url` is the legacy, still-valid form: with no `srt` block the
+    /// ingest path is byte-identical to today's passthrough. The optional typed
+    /// [`SrtOptions`] add mode/latency/encryption/stream-id plus the remaining
+    /// SRT-0 options (listener, overhead/max bandwidth, timeouts, backend)
+    /// without changing it (ADR-0039 §2). None of them is wired on the run path
+    /// yet — that is SRT-2 (#58).
     Srt {
-        /// Source URL.
+        /// Source URL (`srt://host:port`, IPv6-first: bracket IPv6 literals).
         url: String,
+        /// Optional typed SRT options: mode, latency, `AES` encryption via a
+        /// passphrase reference, stream id, listener, `oheadbw_pct`, `maxbw`,
+        /// the peer-idle/connect timeouts, and `backend`. Runtime wiring is
+        /// deferred to SRT-2 (#58).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        srt: Option<SrtOptions>,
     },
     /// RIST (Reliable Internet Stream Transport, VSF `TR-06`) input — the
     /// open-standard sibling of SRT (ADR-0095). Single-link Simple/Main Profile
@@ -1599,12 +1802,15 @@ pub enum Output {
         orientation: Option<OutputOrientation>,
     },
     /// SRT push.
+    ///
+    /// Like the SRT source, the bare `url` is the legacy, still-valid form; the
+    /// optional typed [`SrtOptions`] are purely additive (ADR-0039 §2).
     Srt {
         /// Stable operator id (ADR-0034 / RT-12). Absent ⇒ derived from
         /// [`Output::label`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        /// Destination URL.
+        /// Destination URL (`srt://host:port`, IPv6-first: bracket IPv6 literals).
         url: String,
         /// Video codec.
         codec: String,
@@ -1628,6 +1834,12 @@ pub enum Output {
         /// rotation tag (MPEG-TS/RTSP/NDI).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orientation: Option<OutputOrientation>,
+        /// Optional typed SRT options: mode, latency, `AES` encryption via a
+        /// passphrase reference, stream id, listener, `oheadbw_pct`, `maxbw`,
+        /// the peer-idle/connect timeouts, and `backend`. Runtime wiring is
+        /// deferred to SRT-2 (#58).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        srt: Option<SrtOptions>,
     },
     /// RIST push — the open-standard sibling of the SRT push (ADR-0095). A
     /// `PushProtocol::Rist` (`mpegts` muxer) consuming the **same** encoded

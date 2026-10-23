@@ -98,6 +98,8 @@ pub mod loudness_telemetry;
 /// consent-independent [`multiview_telemetry::retention::RetentionStore`].
 /// Independent of telemetry consent.
 pub mod metrics_retention;
+/// Startup multicast/container network advisory detector (ADR-0040).
+pub mod network_warn;
 /// The `multiview node` display-node subcommand (DEV-B5 / ADR-0045): the
 /// software bootstrap — node config parse/validate, the keypair-bound
 /// enrollment request + display pairing code, the node clock-mode policy, and

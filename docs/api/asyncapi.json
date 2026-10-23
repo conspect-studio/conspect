@@ -2195,7 +2195,8 @@
           "gpu-present-no-vulkan-adapter",
           "config-file-invalid",
           "config-file-requires-restart",
-          "config-file-apply-incomplete"
+          "config-file-apply-incomplete",
+          "container-no-host-networking"
         ],
         "type": "string"
       },

@@ -76,7 +76,7 @@ use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 #[cfg(feature = "rist")]
 use multiview_config::{lower_rist_url, RistOptions};
-use multiview_config::{MultiviewConfig, Output, Source, SourceKind};
+use multiview_config::{MultiviewConfig, Output, Source, SourceKind, SrtBackend, SrtOptions};
 use multiview_control::EngineStateSnapshot;
 use multiview_core::frame::FrameMeta;
 use multiview_core::layout::{Cell, Layout};
@@ -93,6 +93,7 @@ use multiview_ffmpeg::{
     DecodedVideoFrame, EncodedPacket, ScaleSpec, Scaler, StreamCodecParameters, StreamVideoDecoder,
 };
 use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+use multiview_input::srt::{KeyLength, SrtConfig, SrtError, SrtMode, StreamId};
 #[cfg(all(feature = "ndi", any(feature = "ndi-bindings", test)))]
 use multiview_output::ndi::NdiOutput;
 use multiview_output::sink::{
@@ -7103,6 +7104,144 @@ fn rist_resolved_url(
     lower_rist_url(base_url, opts, resolved.as_deref(), redact)
 }
 
+/// Lower typed SRT options to the `FFmpeg` 8.1.1 `libsrt` protocol URL. This is
+/// control-plane setup only; the output clock never waits for this work (#1/#10).
+/// Unknown backend and unsupported peer-idle timeout fail closed, not ignored.
+#[allow(clippy::too_many_lines)] // URL assembly keeps option precedence and redaction together.
+fn srt_resolved_url(
+    base_url: &str,
+    srt: Option<&SrtOptions>,
+    redact: bool,
+) -> Result<String, SrtError> {
+    let Some(opts) = srt else {
+        return Ok(if redact {
+            redact_srt_url(base_url)
+        } else {
+            base_url.to_owned()
+        });
+    };
+    if matches!(opts.backend, Some(backend) if backend != SrtBackend::Ffmpeg) {
+        return Err(SrtError::UnsupportedBackend);
+    }
+    // FFmpeg 8.1.1 libavformat/libsrt.c has no peer_idle_timeout AVOption.
+    if opts.peer_idle_timeout_ms.is_some() {
+        return Err(SrtError::UnsupportedOption("peer_idle_timeout_ms"));
+    }
+    let (authority, old_query) = base_url.split_once('?').unwrap_or((base_url, ""));
+    let host_port = authority
+        .strip_prefix("srt://")
+        .ok_or(SrtError::Parameter("scheme is not srt"))?;
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or(SrtError::Parameter("port is missing"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| SrtError::Parameter("port is invalid"))?;
+    let mode = if let Some(mode) = opts.mode {
+        SrtMode::from_token(mode.as_libav_token())?
+    } else if opts.listener == Some(true) {
+        SrtMode::Listener
+    } else {
+        SrtMode::Caller
+    };
+    if opts
+        .listener
+        .is_some_and(|listener| (mode == SrtMode::Listener) != listener)
+    {
+        return Err(SrtError::Parameter("listener and mode conflict"));
+    }
+    let (key_length, passphrase) = if let Some(enc) = &opts.encryption {
+        let reference = enc
+            .passphrase_ref
+            .strip_prefix("env:")
+            .ok_or(SrtError::SecretUnavailable)?;
+        let secret = std::env::var(reference).map_err(|_| SrtError::SecretUnavailable)?;
+        (KeyLength::from_bytes(enc.key_length.bytes())?, Some(secret))
+    } else {
+        (KeyLength::None, None)
+    };
+    let config = SrtConfig {
+        mode,
+        host: host.to_owned(),
+        port,
+        key_length,
+        passphrase,
+        stream_id: opts
+            .stream_id
+            .as_ref()
+            .map(|id| StreamId::new(id.clone()))
+            .transpose()?,
+        latency_ms: opts.latency_ms.unwrap_or(120),
+        oheadbw_pct: opts.oheadbw_pct,
+        maxbw: opts.maxbw,
+        conn_timeout_ms: opts.conn_timeout_ms,
+    };
+    let assembled = if redact {
+        config.to_url_redacted()?
+    } else {
+        config.to_url()?
+    };
+    // Only explicitly configured options override libav/legacy URL defaults.
+    // `SrtConfig` always emits mode and latency, but absent typed fields must
+    // preserve the previous URL and libav defaults (including an empty block).
+    let (base, query) = assembled
+        .split_once('?')
+        .ok_or(SrtError::Parameter("missing query"))?;
+    let selected = query
+        .split('&')
+        .filter(|pair| {
+            (!pair.starts_with("mode=") || opts.mode.is_some() || opts.listener.is_some())
+                && (!pair.starts_with("latency=") || opts.latency_ms.is_some())
+        })
+        .collect::<Vec<_>>();
+    let mut lowered = base.to_owned();
+    if !selected.is_empty() {
+        lowered.push('?');
+        lowered.push_str(&selected.join("&"));
+    }
+    // Preserve other legacy query parameters, while typed keys take precedence.
+    // Do not leak a legacy passphrase into a diagnostic URL either.
+    for pair in old_query.split('&').filter(|part| !part.is_empty()) {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        if (opts.mode.is_some() || opts.listener.is_some()) && key == "mode"
+            || opts.latency_ms.is_some() && key == "latency"
+            || (opts.encryption.is_some() && ["pbkeylen", "passphrase"].contains(&key))
+            || (opts.stream_id.is_some() && key == "streamid")
+            || (opts.oheadbw_pct.is_some() && key == "oheadbw")
+            || (opts.maxbw.is_some() && key == "maxbw")
+            || (opts.conn_timeout_ms.is_some() && key == "connect_timeout")
+        {
+            continue;
+        }
+        lowered.push(if lowered.contains('?') { '&' } else { '?' });
+        if redact && key == "passphrase" {
+            lowered.push_str("passphrase=***");
+        } else {
+            lowered.push_str(pair);
+        }
+    }
+    Ok(lowered)
+}
+
+/// Mask any passphrase already present in an opaque legacy URL for diagnostics.
+fn redact_srt_url(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    let redacted = query
+        .split('&')
+        .map(|pair| {
+            if pair.starts_with("passphrase=") {
+                "passphrase=***"
+            } else {
+                pair
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{redacted}")
+}
+
 /// Build the `RunnableOutput::Push` for an `Output::Rist` (RIST-3): lower the
 /// typed options (resolving the PSK) to the `AVIO` URL the libav `mpegts` muxer
 /// opens over `rist://`, fed the SAME encoded packets as every other push
@@ -7365,8 +7504,28 @@ fn build_outputs(
             Output::Rtmp { url, .. } => {
                 runnable.push(build_push_output(output, PushProtocol::Rtmp, url, "rtmp"));
             }
-            Output::Srt { url, .. } => {
-                runnable.push(build_push_output(output, PushProtocol::Srt, url, "srt"));
+            Output::Srt { url, srt, .. } => {
+                let lowered = srt_resolved_url(url, srt.as_ref(), false).map_err(|err| {
+                    PipelineError::Output {
+                        kind: "srt",
+                        reason: err.to_string(),
+                    }
+                })?;
+                let redacted = srt_resolved_url(url, srt.as_ref(), true).map_err(|err| {
+                    PipelineError::Output {
+                        kind: "srt",
+                        reason: err.to_string(),
+                    }
+                })?;
+                tracing::info!(transport = "srt", url = %redacted, "wiring srt push output");
+                let (meta, matrix) = output_mux_meta(output);
+                runnable.push(RunnableOutput::Push {
+                    id: output.id(),
+                    sink: PacketMuxSink::push(PushProtocol::Srt, lowered)
+                        .with_output_metadata(meta, matrix),
+                    label: "srt",
+                    url: redacted,
+                });
             }
             // RIST push (ADR-0095): the open-standard sibling of the SRT push.
             // The typed options lower to the `rist://…?…` AVIO URL (the PSK
@@ -8155,8 +8314,22 @@ fn ingest_plan_for(
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url }
         | SourceKind::Ts { url }
-        | SourceKind::Srt { url }
         | SourceKind::Rtmp { url } => (SourceLocation::Url(url.clone()), true),
+        SourceKind::Srt { url, srt } => {
+            let lowered = srt_resolved_url(url, srt.as_ref(), false).map_err(|err| {
+                PipelineError::Ingest {
+                    id: source.id.clone(),
+                    reason: err.to_string(),
+                }
+            })?;
+            let redacted =
+                srt_resolved_url(url, srt.as_ref(), true).map_err(|err| PipelineError::Ingest {
+                    id: source.id.clone(),
+                    reason: err.to_string(),
+                })?;
+            tracing::info!(transport = "srt", url = %redacted, "wiring srt ingest");
+            (SourceLocation::Url(lowered), true)
+        }
         // RIST ingest (ADR-0095): the open-standard sibling of SRT. The typed
         // options lower to the `rist://…?…` AVIO URL (PSK resolved from its
         // secret_ref); it then rides the SAME libav demuxer + supervised
@@ -8515,8 +8688,11 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url }
         | SourceKind::Ts { url }
-        | SourceKind::Srt { url }
         | SourceKind::Rtmp { url } => (url.clone(), true),
+        SourceKind::Srt { url, srt } => match srt_resolved_url(url, srt.as_ref(), false) {
+            Ok(lowered) => (lowered, true),
+            Err(_) => return None,
+        },
         // RIST audio is decoded from the SAME lowered `rist://` URL as its video
         // (the audio peer opens its own libav context). A lowering error (bonding
         // / unresolved PSK) means no audio path — the source rides silence on the
@@ -12862,6 +13038,153 @@ buffer_ms = 700
             .filter(|r| matches!(r, RunnableOutput::Push { label, .. } if *label == "rist"))
             .count();
         assert_eq!(push_count, 1, "exactly one rist push runnable is built");
+    }
+}
+
+#[cfg(test)]
+mod srt_wiring_tests {
+    use super::{
+        audio_ingest_plan_for, build_outputs, ingest_plan_for, srt_resolved_url, PipelineError,
+        RunnableOutput, SourceLocation,
+    };
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::{Output, Source};
+    use multiview_core::time::Rational;
+    use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+    use multiview_input::srt::SrtError;
+    use std::sync::Arc;
+
+    #[test]
+    fn srt_url_only_is_byte_identical_and_typed_options_are_lowered() {
+        let base = "srt://[::1]:9000?transtype=live";
+        assert_eq!(srt_resolved_url(base, None, false).unwrap(), base);
+        let empty = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(srt_resolved_url(base, Some(&empty), false).unwrap(), base);
+        let opts = serde_json::from_value(serde_json::json!({
+            "mode": "listener", "latency_ms": 200, "stream_id": "#!::r=live",
+            "oheadbw_pct": 25, "maxbw": 0, "conn_timeout_ms": 3000,
+        }))
+        .unwrap();
+        assert_eq!(srt_resolved_url(base, Some(&opts), false).unwrap(),
+            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
+    }
+
+    #[test]
+    fn srt_audio_plan_uses_the_same_lowered_url_as_video() {
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-av", "kind": "srt", "url": "srt://[::1]:9000?transtype=live",
+            "srt": {"mode": "listener", "latency_ms": 200, "stream_id": "#!::r=live"}
+        }))
+        .unwrap();
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let video = ingest_plan_for(
+            &source,
+            320,
+            180,
+            store,
+            CanvasColor::default(),
+            Rational::new(30, 1),
+        )
+        .unwrap();
+        let SourceLocation::Url(video_url) = video.location else {
+            panic!("SRT video must use a URL")
+        };
+        let audio = audio_ingest_plan_for(&source).expect("SRT must have an audio plan");
+        assert_eq!(audio.location, video_url);
+        assert!(audio.live);
+        assert!(audio.location.contains("latency=200000"));
+    }
+
+    #[test]
+    fn srt_ingest_and_push_wiring_redacts_secret() {
+        let secret_var = "SRT_58_TEST_SECRET";
+        std::env::set_var(secret_var, "some-password-123");
+        let options = serde_json::json!({"latency_ms": 200, "encryption": {
+            "key_length": "aes256", "passphrase_ref": format!("env:{secret_var}") }});
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-in", "kind": "srt", "url": "srt://[::1]:9000", "srt": options
+        }))
+        .unwrap();
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let plan = ingest_plan_for(
+            &source,
+            320,
+            180,
+            store,
+            CanvasColor::default(),
+            Rational::new(30, 1),
+        )
+        .unwrap();
+        let SourceLocation::Url(url) = plan.location else {
+            panic!("SRT must be a URL")
+        };
+        assert!(url.contains("latency=200000"));
+        assert!(url.contains("pbkeylen=32&passphrase=some-password-123"));
+        let output: Output = serde_json::from_value(serde_json::json!({
+            "kind": "srt", "id": "srt-out", "url": "srt://[::1]:9000", "codec": "h264", "srt": options
+        })).unwrap();
+        let epoch = multiview_output::SharedEpoch::default();
+        #[cfg(feature = "webrtc-native")]
+        let sinks = std::collections::HashMap::new();
+        let built = build_outputs(
+            &[output],
+            &epoch,
+            #[cfg(feature = "webrtc-native")]
+            &sinks,
+            None,
+            Rational::new(30, 1),
+        )
+        .unwrap();
+        let RunnableOutput::Push { url, .. } = &built.packet[0] else {
+            panic!("SRT push must run")
+        };
+        assert!(url.contains("passphrase=***"), "{url}");
+        assert!(!url.contains("some-password-123"));
+        std::env::remove_var(secret_var);
+    }
+
+    #[test]
+    fn unsupported_srt_backend_and_peer_timeout_fail_closed() {
+        let base = "srt://[::1]:9000";
+        for options in [
+            serde_json::json!({"backend": "native"}),
+            serde_json::json!({"peer_idle_timeout_ms": 5000}),
+        ] {
+            let opts = serde_json::from_value(options).unwrap();
+            let err = srt_resolved_url(base, Some(&opts), false).unwrap_err();
+            assert!(matches!(
+                err,
+                SrtError::UnsupportedBackend | SrtError::UnsupportedOption(_)
+            ));
+        }
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-in", "kind": "srt", "url": base, "srt": {"backend": "native"}
+        }))
+        .unwrap();
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        assert!(matches!(
+            ingest_plan_for(
+                &source,
+                320,
+                180,
+                store,
+                CanvasColor::default(),
+                Rational::new(30, 1)
+            ),
+            Err(PipelineError::Ingest { .. })
+        ));
     }
 }
 

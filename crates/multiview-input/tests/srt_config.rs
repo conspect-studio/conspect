@@ -8,6 +8,7 @@
 )]
 
 use multiview_input::srt::{KeyLength, SrtConfig, SrtError, SrtMode, StreamId};
+use proptest::prelude::*;
 
 #[test]
 fn srt_caller_url_basic() {
@@ -19,7 +20,26 @@ fn srt_caller_url_basic() {
         ..SrtConfig::default()
     };
     let url = cfg.to_url().expect("url");
-    assert_eq!(url, "srt://encoder.example:9000?mode=caller&latency=200");
+    assert_eq!(url, "srt://encoder.example:9000?mode=caller&latency=200000");
+}
+
+#[test]
+fn srt_libav_option_url_golden_table() {
+    let mut cfg = SrtConfig {
+        host: "::1".to_owned(),
+        port: 9000,
+        latency_ms: 200,
+        ..SrtConfig::default()
+    };
+    assert_eq!(
+        cfg.to_url().unwrap(),
+        "srt://[::1]:9000?mode=caller&latency=200000"
+    );
+    cfg.oheadbw_pct = Some(25);
+    cfg.maxbw = Some(0);
+    cfg.conn_timeout_ms = Some(3000);
+    cfg.stream_id = Some(StreamId::new("publish&live").unwrap());
+    assert_eq!(cfg.to_url().unwrap(), "srt://[::1]:9000?mode=caller&latency=200000&streamid=publish%26live&oheadbw=25&maxbw=0&connect_timeout=3000");
 }
 
 #[test]
@@ -130,9 +150,62 @@ fn srt_stream_id_encoded_in_url() {
         ..SrtConfig::default()
     };
     let url = cfg.to_url().unwrap();
-    // The '#', '=' and ',' that would break the query must be percent-encoded;
-    // '#' -> %23, '=' -> %3D. The comma is left (valid in a query value).
-    assert!(url.contains("streamid=%23!::r%3Dlive/feed,m%3Dpublish"));
+    // RFC 3986: every non-unreserved byte of the value's UTF-8 encoding is
+    // `%XX` — `#` -> %23, `!` -> %21, `:` -> %3A, `=` -> %3D, `/` -> %2F,
+    // `,` -> %2C — so percent-decoding the `streamid=` value returns the
+    // original stream id exactly (the srt_ac property test round-trips it).
+    assert!(url.contains("streamid=%23%21%3A%3Ar%3Dlive%2Ffeed%2Cm%3Dpublish"));
+}
+
+// Mimic libav's query split and ff_urldecode: '+' is a space, %XX is decoded.
+fn decode_query_value(value: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut iter = value.as_bytes().iter().copied();
+    while let Some(byte) = iter.next() {
+        match byte {
+            b'%' => {
+                let hi = iter.next().unwrap();
+                let lo = iter.next().unwrap();
+                let hex =
+                    |digit: u8| u8::try_from(char::from(digit).to_digit(16).unwrap()).unwrap();
+                bytes.push((hex(hi) << 4) | hex(lo));
+            }
+            b'+' => bytes.push(b' '),
+            other => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn srt_query_values_roundtrip_special_bytes_without_exposing_passphrase_in_diagnostics() {
+    let passphrase = "secret&+% spaceé";
+    let stream_id = "#!::r=été+live&x%";
+    let cfg = SrtConfig {
+        host: "host".to_owned(),
+        port: 9000,
+        key_length: KeyLength::Aes128,
+        passphrase: Some(passphrase.to_owned()),
+        stream_id: Some(StreamId::new(stream_id).unwrap()),
+        ..SrtConfig::default()
+    };
+    let url = cfg.to_url().unwrap();
+    let query = url.split_once('?').unwrap().1;
+    let params: Vec<_> = query
+        .split('&')
+        .map(|part| part.split_once('=').unwrap())
+        .collect();
+    for (name, original) in [("passphrase", passphrase), ("streamid", stream_id)] {
+        let encoded = params.iter().find(|(key, _)| *key == name).unwrap().1;
+        assert_eq!(decode_query_value(encoded), original);
+        assert!(!encoded.contains('+'), "literal '+' is decoded as a space");
+    }
+    assert!(url.contains("passphrase=secret%26%2B%25%20space%C3%A9"));
+    assert!(url.contains("streamid=%23%21%3A%3Ar%3D%C3%A9t%C3%A9%2Blive%26x%25"));
+    let diagnostic = cfg.to_url_redacted().unwrap();
+    assert!(diagnostic.contains("passphrase=***"));
+    assert!(!diagnostic.contains(passphrase));
+    assert!(!diagnostic.contains("secret%26%2B%25%20space%C3%A9"));
 }
 
 #[test]
@@ -197,4 +270,65 @@ fn srt_validation_requires_host_and_port() {
         ..SrtConfig::default()
     };
     assert!(matches!(cfg2.to_url(), Err(SrtError::Parameter(_))));
+}
+
+/// An encrypted config whose passphrase is exactly `len` ASCII characters.
+fn encrypted_with_passphrase_len(len: usize) -> SrtConfig {
+    SrtConfig {
+        host: "h".to_owned(),
+        port: 9000,
+        key_length: KeyLength::Aes128,
+        passphrase: Some("p".repeat(len)),
+        ..SrtConfig::default()
+    }
+}
+
+#[test]
+fn srt_passphrase_boundary_accepts_80_and_rejects_81() {
+    // libsrt enforces `10..=80` inclusive (`HAICRYPT_SECRET_MAX_SZ = 80`); the
+    // old `10..=79` bound was a verified off-by-one (ADR-0039). 79 and 80 are
+    // both valid; 9 and 81 are both rejected.
+    for (len, valid) in [
+        (9usize, false),
+        (10, true),
+        (79, true),
+        (80, true),
+        (81, false),
+    ] {
+        match (valid, encrypted_with_passphrase_len(len).validate()) {
+            (true, Ok(())) => {}
+            (false, Err(SrtError::PassphraseLength(reported))) => assert_eq!(reported, len),
+            (want, got) => panic!("passphrase len {len}: expected valid={want}, got {got:?}"),
+        }
+    }
+}
+
+proptest! {
+    /// The passphrase domain is exactly `10..=80` characters, for every length
+    /// across both boundaries (the off-by-one the audit caught).
+    #[test]
+    fn srt_passphrase_length_property(len in 0usize..=200) {
+        let cfg = encrypted_with_passphrase_len(len);
+        prop_assert_eq!(cfg.validate().is_ok(), (10..=80).contains(&len));
+    }
+
+    /// The stream-id cap is exactly SRT's 512 bytes.
+    #[test]
+    fn srt_stream_id_length_property(len in 0usize..=600) {
+        prop_assert_eq!(
+            StreamId::new("x".repeat(len)).is_ok(),
+            len <= StreamId::MAX_BYTES
+        );
+    }
+
+    /// `pbkeylen` is exactly `{0, 16, 24, 32}`: every byte count outside the
+    /// domain is rejected and every accepted one maps back into the domain.
+    #[test]
+    fn srt_pbkeylen_domain_property(bytes in any::<u8>()) {
+        let parsed = KeyLength::from_bytes(bytes);
+        prop_assert_eq!(parsed.is_ok(), matches!(bytes, 0 | 16 | 24 | 32));
+        if let Ok(key) = parsed {
+            prop_assert!(matches!(key.bytes(), 0 | 16 | 24 | 32));
+        }
+    }
 }

@@ -786,6 +786,23 @@ async fn run_pipeline_until_ctrl_c(
         );
     }
 
+    // MC-6 (ADR-0040): multicast networking is advisory, detected during startup
+    // before the output clock is constructed and published via the drop-oldest lane.
+    {
+        let env = multiview_cli::network_warn::current_environment();
+        let mismatch = (multiview_cli::network_warn::in_container(&env)
+            && multiview_cli::network_warn::has_container_bridge_networking(&env)
+            && multiview_cli::network_warn::config_uses_multicast(config))
+        .then_some(multiview_control::NetworkMismatchView);
+        let since_nanos = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        )
+        .unwrap_or(i64::MAX);
+        let _ = multiview_control::emit_network_warnings(publisher.as_ref(), mismatch, since_nanos);
+    }
+
     // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
     // program (id "main") through it — behaviour-identical to today (one program,
     // the same drive/stop/publisher/preview/drain). See `drive_main_program_in_set`.

@@ -26,6 +26,36 @@ use multiview_events::{Event, HealthWarning, WarningCode, WarningSeverity};
 
 use crate::warning_store::WarningRepository;
 
+/// Container without host networking while multicast is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkMismatchView;
+
+/// Emit the startup multicast networking advisory via the bounded publisher.
+pub fn emit_network_warnings<S>(
+    publisher: &EnginePublisher<S, Event>,
+    mismatch: Option<NetworkMismatchView>,
+    since_nanos: i64,
+) -> usize {
+    if mismatch.is_none() {
+        return 0;
+    }
+    let warning = HealthWarning {
+        code: WarningCode::ContainerNoHostNetworking,
+        severity: WarningSeverity::Warning,
+        subsystem: "network".to_owned(),
+        message: "Multicast is configured inside a container without host networking; multicast traffic may not reach the LAN.".to_owned(),
+        remediation: "Use host networking or a multicast-capable L2 network (for example macvlan); cloud container networks may not provide LAN multicast.".to_owned(),
+        since: since_nanos,
+        active: true,
+    };
+    tracing::warn!(
+        code = warning.code.as_str(),
+        "container multicast networking advisory"
+    );
+    publisher.publish_event(Event::HealthWarningRaised(warning));
+    1
+}
+
 /// A control-owned, dependency-light view of the SA-0 composite MISMATCH.
 ///
 /// The build site (the CLI) computes the both-halves cross-check with

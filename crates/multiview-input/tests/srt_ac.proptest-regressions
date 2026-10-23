@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d0b3bad3012987e740de3fe526cff13597c012e28ce8026d7dd67327ceca884c # shrinks to user = "", resource = "", host = "", session = "", mode = "request", ty = "stream", ext_key = "user_a", ext_val = "é"
