@@ -150,7 +150,10 @@ fn srt_stream_id_encoded_in_url() {
         ..SrtConfig::default()
     };
     let url = cfg.to_url().unwrap();
-    // RFC 3986 unreserved bytes are the only bytes passed through unchanged.
+    // RFC 3986: every non-unreserved byte of the value's UTF-8 encoding is
+    // `%XX` — `#` -> %23, `!` -> %21, `:` -> %3A, `=` -> %3D, `/` -> %2F,
+    // `,` -> %2C — so percent-decoding the `streamid=` value returns the
+    // original stream id exactly (the srt_ac property test round-trips it).
     assert!(url.contains("streamid=%23%21%3A%3Ar%3Dlive%2Ffeed%2Cm%3Dpublish"));
 }
 

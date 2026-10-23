@@ -115,8 +115,8 @@ fn srt_ac_string_round_trip() {
     assert!(text.contains("user_x=9"));
 }
 
-/// The typed params flow through `StreamId` and `SrtConfig::to_url` with `#`
-/// kept escaped in the URL query.
+/// The typed params flow through `StreamId` and `SrtConfig::to_url` with every
+/// non-unreserved byte percent-escaped (RFC 3986), `#` included.
 #[test]
 fn srt_ac_round_trips_through_to_url_with_hash_escaped() {
     let params: StreamIdParams = "#!::r=cam1,m=publish".try_into().expect("parse");
@@ -132,8 +132,13 @@ fn srt_ac_round_trips_through_to_url_with_hash_escaped() {
         ..SrtConfig::default()
     };
     let url = cfg.to_url().expect("url");
-    // `#` stays escaped (`%23`); the raw `#` must never appear in the URL.
-    assert!(url.contains("streamid=%23!::r%3Dcam1,m%3Dpublish"), "{url}");
+    // RFC 3986: only unreserved bytes (`ALPHA`/`DIGIT`/`-`/`.`/`_`/`~`) stay
+    // literal; `#`, `!`, `:`, `=` and `,` all become `%XX`. The raw `#` must
+    // never appear in the URL.
+    assert!(
+        url.contains("streamid=%23%21%3A%3Ar%3Dcam1%2Cm%3Dpublish"),
+        "{url}"
+    );
     assert!(!url.contains('#'), "{url}");
 
     // And back: the rendered stream id parses to the same typed value.
@@ -141,20 +146,87 @@ fn srt_ac_round_trips_through_to_url_with_hash_escaped() {
     assert_eq!(back, params);
 }
 
+/// Regression (cross-vendor review): the grammar accepts any UTF-8 value, so
+/// the URL encoder must percent-encode every non-unreserved byte of the
+/// value's UTF-8 encoding (RFC 3986). `#!::r=café` must round-trip: decoding
+/// the `streamid=` query value returns the original string, never the
+/// per-byte mojibake `cafÃ©` (one Latin-1 code point per UTF-8 byte).
+#[test]
+fn srt_ac_url_round_trip_preserves_utf8_values() {
+    let params: StreamIdParams = "#!::r=café".try_into().expect("parse");
+    let sid: StreamId = (&params).try_into().expect("stream id");
+    let cfg = SrtConfig {
+        host: "encoder.example".to_owned(),
+        port: 9000,
+        stream_id: Some(sid),
+        ..SrtConfig::default()
+    };
+    let url = cfg.to_url().expect("url");
+    // `é` is UTF-8 `C3 A9`; strict percent-encoding emits one `%XX` per byte.
+    assert!(url.contains("streamid=%23%21%3A%3Ar%3Dcaf%C3%A9"), "{url}");
+    assert!(!url.contains('Ã'), "{url}");
+
+    let raw = streamid_query_value(&url).expect("streamid query value");
+    assert_eq!(percent_decode(raw).as_deref(), Some("#!::r=café"));
+}
+
+/// Extract the raw (still percent-encoded) `streamid=` query value from a
+/// [`SrtConfig::to_url`] URL. Under RFC 3986 encoding the value can never
+/// contain a literal `&` or `=`, so splitting on `&` is unambiguous.
+fn streamid_query_value(url: &str) -> Option<&str> {
+    let query = url.split_once('?')?.1;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("streamid="))
+}
+
+/// Percent-decode a query value back into the string it encoded: `%XX`
+/// triplets become their bytes, everything else passes through; the result
+/// must be valid UTF-8, because the encoder only ever encodes a UTF-8
+/// string's bytes.
+fn percent_decode(value: &str) -> Option<String> {
+    fn hex_val(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex_val(*bytes.get(i + 1)?)?;
+            let lo = hex_val(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 // Property: parse → render → parse is the identity for valid reserved keys
-// plus namespaced extensions. (Plain comment: rustdoc does not document macro
-// invocations.)
+// plus namespaced extensions, and parse → `to_url()` → percent-decode the
+// `streamid=` query value is the identity too (RFC 3986 percent-encoding of
+// every non-unreserved byte), for ASCII and Unicode values alike — `é` (2
+// UTF-8 bytes), `中` (3) and `😀` (4) exercise every sequence length.
+// (Plain comment: rustdoc does not document macro invocations.)
 proptest::proptest! {
     #[test]
     fn srt_ac_prop_round_trip(
-        user in "[a-zA-Z0-9_-]{0,12}",
-        resource in "[a-zA-Z0-9_-]{0,12}",
+        user in "[a-zA-Z0-9_é中😀-]{0,12}",
+        resource in "[a-zA-Z0-9_é中😀-]{0,12}",
         host in "[a-zA-Z0-9_.-]{0,12}",
-        session in "[a-zA-Z0-9_-]{0,12}",
+        session in "[a-zA-Z0-9_é中😀-]{0,12}",
         mode in proptest::sample::select(vec!["request", "publish", "bidirectional"]),
         ty in proptest::sample::select(vec!["stream", "file", "auth"]),
         ext_key in proptest::sample::select(vec!["user_a", "user_b", "multiview_tile", "multiview_x"]),
-        ext_val in "[a-zA-Z0-9_-]{0,12}",
+        ext_val in "[a-zA-Z0-9_é中😀-]{0,12}",
     ) {
         let src = format!(
             "#!::u={user},r={resource},h={host},s={session},t={ty},m={mode},{ext_key}={ext_val}"
@@ -163,6 +235,24 @@ proptest::proptest! {
         let text = params.to_stream_id_string().expect("render");
         let back: StreamIdParams = text.as_str().try_into().expect("re-parse");
         prop_assert_eq!(params.mode().as_token(), mode);
+
+        // URL round-trip: the `streamid=` query value, percent-decoded, is
+        // the exact rendered stream id.
+        let sid: StreamId = (&params).try_into().expect("stream id");
+        let cfg = SrtConfig {
+            host: "encoder.example".to_owned(),
+            port: 9000,
+            stream_id: Some(sid),
+            ..SrtConfig::default()
+        };
+        let url = cfg.to_url().expect("url");
+        let raw = streamid_query_value(&url).expect("streamid query value");
+        let decoded = percent_decode(raw).expect("decodable streamid value");
+        prop_assert_eq!(decoded, text);
+        // And the stream id never leaks raw URL metacharacters.
+        prop_assert!(!raw.contains('&'));
+        prop_assert!(!raw.contains('#'));
+
         prop_assert_eq!(params, back);
     }
 }
