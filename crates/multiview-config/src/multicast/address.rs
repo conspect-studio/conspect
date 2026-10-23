@@ -14,8 +14,9 @@
 //!   the assigned multicast scopes — site-local (`ff05::/16`), organization-local
 //!   (`ff08::/16`), or global (`ff0e::/16`).
 //! * IPv4 (legacy peer): the IANA/RFC-5771 blocks minus the control and reserved
-//!   slices — in practice `224.0.1.0/24`, the `224.2.x` SAP blocks, the ASM
-//!   bulk, `232/8` (SSM), `233/8`, `234/7`, and the admin-scoped `239/8`.
+//!   slices — in practice `224.0.1.0/24`, `224.2/16` (SDP/SAP), `224.3/16`
+//!   and `224.4/16` (AD-HOC II), `232/8` (SSM), `233/8` (GLOP/AD-HOC III),
+//!   and admin-scoped `239/8`.
 //!
 //! ## What is refused (and why)
 //!
@@ -27,9 +28,10 @@
 //! * [`RejectReason::ReservedBlock`] — blocks IANA has never allocated for a
 //!   media group: `232.0.0.0/24` (the reserved head of the SSM block,
 //!   RFC 4607 §7), `233.252.0.0/24` (`MCAST-TEST-NET`, RFC 6676), the AD-HOC
-//!   control block `224.0.2.0/16`, the reserved `224.5.0.0/16` and the
-//!   `236/8`/`238/8` ASM reservations, the IPv6 reserved scopes `0x0`, `0x3`,
-//!   and `0xf` (plus the unassigned scopes), and `ff3x::4000:0000`.
+//!   control block `224.0.2.0/16`, the reserved `224.5.0.0`–`231.255.255.255`
+//!   and `234.0.0.0`–`238.255.255.255`, the IPv6 reserved scopes `0x0`, `0x3`,
+//!   and `0xf` (plus unsupported and unassigned scopes), and
+//!   `ff3x::4000:0000`.
 //! * [`RejectReason::NotMulticast`] — anything outside `224.0.0.0/4` and
 //!   `ff00::/8` (unicast, loopback, the unspecified address, IPv4-mapped forms).
 //!
@@ -43,20 +45,19 @@
 //!
 //! The IPv4 registry is data ([`V4_BLOCKS`]) rather than control flow, and
 //! `classify_v4` is a longest-prefix lookup over it. The integration test reads
-//! the **same** table, so there is no second hand-written oracle to drift from
-//! the implementation — a new row is a one-line change in one place. The IPv6
+//! the **same** table to verify lookup behavior, while independent literal
+//! RFC-5771 endpoint expectations pin the table's contents. The IPv6
 //! side is small enough (a flags nibble and a scope nibble) to stay a `match`,
 //! with a property test over all 256 nibble pairs.
 //!
 //! ## The deliberate IPv6 conservatism
 //!
-//! The IPv6 scopes `0x4`, `0x6`, `0x7`, and `0x9`–`0xd` are unassigned as media
-//! scopes, and scope `0x3` is the reserved slot the old IPv4-style realm-local
-//! assignment used (SSM is carried by the **flags** nibble `0x3` instead). They
-//! are refused rather than waved through: an admin-scoped group belongs in
-//! site-local `ff05::/16` or organization-local `ff08::/16`, so a group in an
-//! unassigned nibble is a typo, and admitting it would defeat the point of
-//! validating the address at config load.
+//! RFC 7346 assigns scope `0x3` as realm-local (for specified network
+//! technologies) and `0x4` as admin-local; this media classifier conservatively
+//! declines both, since its supported media scopes are site-local (`0x5`),
+//! organization-local (`0x8`) and global (`0xe`). Scopes `0x6`, `0x7`, and
+//! `0x9`–`0xd` are unassigned. The **flags** nibble `0x3` identifies SSM but
+//! does not override any of these scope restrictions.
 //!
 //! IPv6 is first-class here: `ff02::1%eth0`-style zone-qualified literals are
 //! the [`MulticastIface`] form, and an IPv4-mapped IPv6 address
@@ -335,8 +336,8 @@ pub enum MulticastClass {
     /// Admin-scoped ASM — IPv4 `239/8` (RFC 2365), IPv6 site-local `ff05::/16`.
     /// The preferred in-plant ASM range.
     AdminScoped,
-    /// Globally routed group — the ASM bulk, IPv4 `224.0.1.x`/`224.2.x`/`233/8`/
-    /// `234/7`, IPv6 organization-local (`ff08`) and global (`ff0e`).
+    /// Routed group — IPv4 `224.0.1.x`/`224.2.x`/`224.3.x`/`224.4.x`/`233/8`,
+    /// IPv6 organization-local (`ff08`) and global (`ff0e`).
     Routed,
 }
 
@@ -477,52 +478,45 @@ pub type V4Block = (u32, u8, Option<MulticastClass>);
 /// [`classify_v4`] *and* `tests/multicast_address.rs` read (the test imports
 /// this, so there is no second hand-written table to drift).
 ///
-/// Derived from the IANA IPv4 Multicast Address Space Registry / RFC 5771. The
-/// withheld blocks are the local-network control `/24`, the AD-HOC block
-/// (control-reserved), the reserved `224.5.0.0/16`, IANA-reserved slices inside
-/// the SSM `232/8` and GLOP `233/8` blocks, and the `236/8`/`238/8` ASM
-/// reservations. `239/8` is the RFC 2365 admin-scoped block.
+/// Derived from the IANA IPv4 Multicast Address Space Registry / RFC 5771 §3.
+/// Each block below cites its registry designation; reserved blocks are never
+/// usable media groups. `239/8` is the RFC 2365 admin-scoped block.
 pub const V4_BLOCKS: &[V4Block] = &[
-    // Local Network Control Block (RFC 5771 §4/§6) — never a media group.
+    // RFC 5771 §3/§4: Local Network Control, 224.0.0.0–224.0.0.255.
     (0xe0_00_00_00, 24, None),
-    // Internetwork Control Block — routed.
+    // RFC 5771 §3/§5: Internetwork Control, 224.0.1.0–224.0.1.255.
     (0xe0_00_01_00, 24, Some(MulticastClass::Routed)),
-    // AD-HOC Block I: `224.0.2.0`–`224.1.255.255`, held for experimental and
-    // vendor control use — never a media group.
+    // RFC 5771 §3/§6: AD-HOC I, 224.0.2.0–224.0.255.255;
+    // RFC 5771 §3: reserved, 224.1.0.0–224.1.255.255.
     (0xe0_00_02_00, 16, None),
     (0xe0_01_00_00, 16, None),
-    // The rest of AD-HOC Block I, `224.2.0.0`–`224.2.255.255`: routed.
+    // RFC 5771 §3/§7: SDP/SAP, 224.2.0.0–224.2.255.255.
     (0xe0_02_00_00, 16, Some(MulticastClass::Routed)),
-    // AD-HOC Blocks II/III tail, `224.3.0.0`–`224.4.255.255`.
-    (0xe0_03_00_00, 15, Some(MulticastClass::Routed)),
-    // 224.5.0.0/16 is reserved by IANA.
-    (0xe0_05_00_00, 16, None),
-    // The ASM bulk, `224.6.0.0`–`231.255.255.255`.
-    (0xe0_06_00_00, 15, Some(MulticastClass::Routed)),
-    (0xe0_08_00_00, 13, Some(MulticastClass::Routed)),
-    (0xe0_10_00_00, 12, Some(MulticastClass::Routed)),
-    (0xe0_20_00_00, 11, Some(MulticastClass::Routed)),
-    (0xe0_40_00_00, 10, Some(MulticastClass::Routed)),
-    (0xe0_80_00_00, 9, Some(MulticastClass::Routed)),
-    (0xe1_00_00_00, 8, Some(MulticastClass::Routed)),
-    (0xe2_00_00_00, 7, Some(MulticastClass::Routed)),
-    (0xe4_00_00_00, 6, Some(MulticastClass::Routed)),
-    (0xe8_00_00_00, 5, Some(MulticastClass::Routed)),
-    // Source-specific multicast, `232/8` (RFC 4607 §7) ...
+    // RFC 5771 §3/§6: AD-HOC II, 224.3.0.0–224.4.255.255.
+    // Separate aligned /16s: 224.3.0.0/15 would also include 224.2/16.
+    (0xe0_03_00_00, 16, Some(MulticastClass::Routed)),
+    (0xe0_04_00_00, 16, Some(MulticastClass::Routed)),
+    // RFC 5771 §3 / IANA registry: 224.5.0.0–224.255.255.255 RESERVED.
+    (0xe0_00_00_00, 8, None),
+    // RFC 5771 §3 / IANA registry: 225.0.0.0–231.255.255.255 RESERVED.
+    (0xe1_00_00_00, 8, None),
+    (0xe2_00_00_00, 7, None),
+    (0xe4_00_00_00, 6, None),
+    (0xe8_00_00_00, 5, None),
+    // RFC 5771 §3/§8: SSM, 232.0.0.0–232.255.255.255.
     (0xe8_00_00_00, 8, Some(MulticastClass::SourceSpecific)),
-    // ... minus its reserved head `232.0.0.0/24`.
+    // IANA SSM reserved head, 232.0.0.0–232.0.0.255 (RFC 4607 §7).
     (0xe8_00_00_00, 24, None),
-    // GLOP addressing, `233/8` (RFC 3180) ...
+    // RFC 5771 §3/§9: GLOP, 233.0.0.0–233.251.255.255;
+    // RFC 5771 §3/§9.2: AD-HOC III, 233.252.0.0–233.255.255.255.
     (0xe9_00_00_00, 8, Some(MulticastClass::Routed)),
-    // ... minus MCAST-TEST-NET `233.252.0.0/24` (RFC 6676).
+    // RFC 5771 §9.2: MCAST-TEST-NET, 233.252.0.0–233.252.0.255.
     (0xe9_fc_00_00, 24, None),
-    // Unicast-prefix-based, `234/7`–`235/8` (RFC 6034).
-    (0xea_00_00_00, 7, Some(MulticastClass::Routed)),
-    (0xeb_00_00_00, 8, Some(MulticastClass::Routed)),
-    // IANA-reserved ASM slices.
+    // RFC 5771 §3 / IANA registry: 234.0.0.0–238.255.255.255 RESERVED.
+    (0xea_00_00_00, 7, None),
     (0xec_00_00_00, 7, None),
     (0xee_00_00_00, 8, None),
-    // Admin-scoped ASM, `239/8` (RFC 2365).
+    // RFC 5771 §3/§10: admin-scoped, 239.0.0.0–239.255.255.255.
     (0xef_00_00_00, 8, Some(MulticastClass::AdminScoped)),
 ];
 
@@ -554,14 +548,14 @@ fn in_net_v4_bits(bits: u32, base: u32, prefix: u8) -> bool {
 /// The RFC-4291 §2.7 IPv6 classifier, keyed on the **flags** nibble (SSM) and
 /// otherwise the **scope** nibble.
 ///
-/// The flags nibble `0x3` marks source-specific multicast (`ff3x::/32`,
-/// RFC 4607 §7) and is checked **first**: it is what makes `ff3e::1` SSM even
-/// though its scope (`0xe`) is global. Everything else is a pure function of the
-/// scope: site-local (`0x5`) is the admin-scoped media scope,
+/// The scope is validated **before** the SSM flag: RFC 4291 §2.7 / RFC 7346
+/// do not let `ff3x` override an interface-local, link-local or reserved scope.
+/// The flags nibble `0x3` then marks SSM (`ff3x::/32`, RFC 4607 §7).
+/// Otherwise site-local (`0x5`) is the admin-scoped media scope,
 /// organization-local (`0x8`) and global (`0xe`) are routed, and every other
-/// nibble — the reserved `0x0`/`0x3`/`0xf`, interface-local (`0x1`),
-/// link-local (`0x2`), and the unassigned `0x4`/`0x6`/`0x7`/`0x9`–`0xd` — is
-/// refused.
+/// nibble — reserved `0x0`/`0xf`, interface-local (`0x1`), link-local (`0x2`),
+/// unsupported realm-local (`0x3`)/admin-local (`0x4`), and unassigned
+/// `0x6`/`0x7`/`0x9`–`0xd` — is refused.
 fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     if !addr.is_multicast() {
         return None;
@@ -573,14 +567,18 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     let [_, nibbles, ..] = addr.octets();
     let flags = nibbles >> 4;
     let scope = nibbles & 0x0f;
+    // RFC 4291 §2.7 / RFC 7346: an SSM flag never legitimizes a
+    // prohibited or unassigned scope (including ff30, ff31, ff32).
+    if !matches!(scope, 0x5 | 0x8 | 0xe) {
+        return None;
+    }
     if flags == 0x3 {
         return Some(MulticastClass::SourceSpecific);
     }
     // Only the scopes the standards name are media groups: site-local (0x5),
     // organization-local (0x8), and global (0xe). Every other nibble is either
-    // reserved — scope 0x0, the interface-local 0x1 and link-local 0x2 control
-    // scopes, scope 0x3 without the SSM flags, the reserved 0xf — or unassigned
-    // (0x4, 0x6, 0x7, 0x9–0xd), so a group in one of them is a typo.
+    // reserved (0x0/0xf), local control (0x1/0x2), unsupported realm-local
+    // (0x3)/admin-local (0x4), or unassigned (0x6/0x7/0x9–0xd).
     match scope {
         0x5 => Some(MulticastClass::AdminScoped),
         0x8 | 0xe => Some(MulticastClass::Routed),
@@ -619,18 +617,12 @@ fn reason_for(addr: IpAddr) -> RejectReason {
         IpAddr::V6(v6) => {
             if v6.is_multicast() {
                 let [_, nibbles, ..] = v6.octets();
-                let flags = nibbles >> 4;
                 let scope = nibbles & 0x0f;
-                if flags == 0x3 {
-                    // Either the reserved SSM sub-range or a non-media scope;
-                    // a usable SSM group would have been accepted already.
-                    RejectReason::ReservedBlock
-                } else {
-                    match scope {
-                        0x1 => RejectReason::InterfaceLocalControl,
-                        0x2 => RejectReason::LinkLocalControl,
-                        _ => RejectReason::ReservedBlock,
-                    }
+                // The reason is scope-specific even when the SSM flag is set.
+                match scope {
+                    0x1 => RejectReason::InterfaceLocalControl,
+                    0x2 => RejectReason::LinkLocalControl,
+                    _ => RejectReason::ReservedBlock,
                 }
             } else {
                 RejectReason::NotMulticast

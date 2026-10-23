@@ -119,8 +119,8 @@ fn v4_registry_table_matches_iana() {
 }
 
 /// IPv6 multicast flags/scope-nibble classification (RFC 4291 §2.7,
-/// RFC 5771 §11). The **flags** nibble `0x3` marks SSM (`ff3x::/32`,
-/// RFC 4607 §7); otherwise the **scope** nibble alone decides.
+/// RFC 7346 §2). Scope is checked first; the **flags** nibble `0x3` marks
+/// SSM (`ff3x::/32`, RFC 4607 §7) only in a supported media scope.
 fn v6_oracle(flags: u8, scope: u8, reserved_ssm: bool) -> Option<MulticastClass> {
     // RFC 4291 §2.7 and RFC 7346: flags do not override the scope.
     if !matches!(scope, 0x5 | 0x8 | 0xe) {
@@ -136,8 +136,8 @@ fn v6_oracle(flags: u8, scope: u8, reserved_ssm: bool) -> Option<MulticastClass>
     match scope {
         0x5 => Some(MulticastClass::AdminScoped),  // site-local
         0x8 | 0xe => Some(MulticastClass::Routed), // organization-local, global
-        // Reserved (0x0, 0x1 interface-local, 0x2 link-local, 0x3 without the
-        // SSM flags, 0xf) or unassigned (0x4, 0x6, 0x7, 0x9-0xd).
+        // Reserved (0x0/0xf), local control (0x1/0x2), unsupported realm-/
+        // admin-local (0x3/0x4), or unassigned (0x6/0x7/0x9-0xd).
         _ => None,
     }
 }
@@ -340,11 +340,20 @@ fn rfc4291_ssm_flags_cannot_override_prohibited_scope() {
     ] {
         let addr = ip(text);
         assert_eq!(classify(addr), None, "{text}");
-        assert_eq!(MulticastGroup::try_from(addr).expect_err(text).reason(), reason);
+        assert_eq!(
+            MulticastGroup::try_from(addr).expect_err(text).reason(),
+            reason
+        );
         assert!(serde_json::from_str::<MulticastGroup>(&format!("\"{text}\"")).is_err());
     }
-    assert_eq!(classify(ip("ff35::1234")), Some(MulticastClass::SourceSpecific));
-    assert_eq!(classify(ip("ff3e::1234")), Some(MulticastClass::SourceSpecific));
+    assert_eq!(
+        classify(ip("ff35::1234")),
+        Some(MulticastClass::SourceSpecific)
+    );
+    assert_eq!(
+        classify(ip("ff3e::1234")),
+        Some(MulticastClass::SourceSpecific)
+    );
 }
 
 // ---------------------------------------------------------------------------
