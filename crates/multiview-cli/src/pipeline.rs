@@ -13041,8 +13041,8 @@ buffer_ms = 700
 #[cfg(test)]
 mod srt_wiring_tests {
     use super::{
-        build_outputs, ingest_plan_for, srt_resolved_url, PipelineError, RunnableOutput,
-        SourceLocation,
+        audio_ingest_plan_for, build_outputs, ingest_plan_for, srt_resolved_url, PipelineError,
+        RunnableOutput, SourceLocation,
     };
     use multiview_compositor::pipeline::CanvasColor;
     use multiview_config::{Output, Source};
@@ -13063,7 +13063,37 @@ mod srt_wiring_tests {
         }))
         .unwrap();
         assert_eq!(srt_resolved_url(base, Some(&opts), false).unwrap(),
-            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23!::r%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
+            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
+    }
+
+    #[test]
+    fn srt_audio_plan_uses_the_same_lowered_url_as_video() {
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-av", "kind": "srt", "url": "srt://[::1]:9000?transtype=live",
+            "srt": {"mode": "listener", "latency_ms": 200, "stream_id": "#!::r=live"}
+        }))
+        .unwrap();
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let video = ingest_plan_for(
+            &source,
+            320,
+            180,
+            store,
+            CanvasColor::default(),
+            Rational::new(30, 1),
+        )
+        .unwrap();
+        let SourceLocation::Url(video_url) = video.location else {
+            panic!("SRT video must use a URL")
+        };
+        let audio = audio_ingest_plan_for(&source).expect("SRT must have an audio plan");
+        assert_eq!(audio.location, video_url);
+        assert!(audio.live);
+        assert!(audio.location.contains("latency=200000"));
     }
 
     #[test]

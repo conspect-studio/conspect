@@ -150,9 +150,57 @@ fn srt_stream_id_encoded_in_url() {
         ..SrtConfig::default()
     };
     let url = cfg.to_url().unwrap();
-    // The '#', '=' and ',' that would break the query must be percent-encoded;
-    // '#' -> %23, '=' -> %3D. The comma is left (valid in a query value).
-    assert!(url.contains("streamid=%23!::r%3Dlive/feed,m%3Dpublish"));
+    // RFC 3986 unreserved bytes are the only bytes passed through unchanged.
+    assert!(url.contains("streamid=%23%21%3A%3Ar%3Dlive%2Ffeed%2Cm%3Dpublish"));
+}
+
+#[test]
+fn srt_query_values_roundtrip_special_bytes_without_exposing_passphrase_in_diagnostics() {
+    let passphrase = "secret&+% spaceé";
+    let stream_id = "#!::r=été+live&x%";
+    let cfg = SrtConfig {
+        host: "host".to_owned(),
+        port: 9000,
+        key_length: KeyLength::Aes128,
+        passphrase: Some(passphrase.to_owned()),
+        stream_id: Some(StreamId::new(stream_id).unwrap()),
+        ..SrtConfig::default()
+    };
+    let url = cfg.to_url().unwrap();
+    // Mimic libav's query split and ff_urldecode: '+' is a space, %XX is decoded.
+    fn decode_query_value(value: &str) -> String {
+        let mut bytes = Vec::new();
+        let mut iter = value.as_bytes().iter().copied();
+        while let Some(byte) = iter.next() {
+            match byte {
+                b'%' => {
+                    let hi = iter.next().unwrap();
+                    let lo = iter.next().unwrap();
+                    let hex = |digit: u8| (digit as char).to_digit(16).unwrap() as u8;
+                    bytes.push((hex(hi) << 4) | hex(lo));
+                }
+                b'+' => bytes.push(b' '),
+                other => bytes.push(other),
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+    let query = url.split_once('?').unwrap().1;
+    let params: Vec<_> = query
+        .split('&')
+        .map(|part| part.split_once('=').unwrap())
+        .collect();
+    for (name, original) in [("passphrase", passphrase), ("streamid", stream_id)] {
+        let encoded = params.iter().find(|(key, _)| *key == name).unwrap().1;
+        assert_eq!(decode_query_value(encoded), original);
+        assert!(!encoded.contains('+'), "literal '+' is decoded as a space");
+    }
+    assert!(url.contains("passphrase=secret%26%2B%25%20space%C3%A9"));
+    assert!(url.contains("streamid=%23%21%3A%3Ar%3D%C3%A9t%C3%A9%2Blive%26x%25"));
+    let diagnostic = cfg.to_url_redacted().unwrap();
+    assert!(diagnostic.contains("passphrase=***"));
+    assert!(!diagnostic.contains(passphrase));
+    assert!(!diagnostic.contains("secret%26%2B%25%20space%C3%A9"));
 }
 
 #[test]
