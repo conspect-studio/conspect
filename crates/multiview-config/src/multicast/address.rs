@@ -550,7 +550,8 @@ fn in_net_v4_bits(bits: u32, base: u32, prefix: u8) -> bool {
 ///
 /// The scope is validated **before** the SSM flag: RFC 4291 §2.7 / RFC 7346
 /// do not let `ff3x` override an interface-local, link-local or reserved scope.
-/// The flags nibble `0x3` then marks SSM (`ff3x::/32`, RFC 4607 §7).
+/// Flags `0x3` with a zero plen and prefix mark SSM (`ff3x::/32`,
+/// RFC 3306 §6 / RFC 4607 §1); other valid prefix-based groups use their scope.
 /// Otherwise site-local (`0x5`) is the admin-scoped media scope,
 /// organization-local (`0x8`) and global (`0xe`) are routed, and every other
 /// nibble — reserved `0x0`/`0xf`, interface-local (`0x1`), link-local (`0x2`),
@@ -558,10 +559,6 @@ fn in_net_v4_bits(bits: u32, base: u32, prefix: u8) -> bool {
 /// `0x6`/`0x7`/`0x9`–`0xd` — is refused.
 fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     if !addr.is_multicast() {
-        return None;
-    }
-    if is_reserved_ssm_subrange(addr) {
-        // FF3X::4000:0000–FF3X::7FFF:FFFF is withheld from SSM (RFC 4607 §7).
         return None;
     }
     let [_, nibbles, ..] = addr.octets();
@@ -573,7 +570,19 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
         return None;
     }
     if flags == 0x3 {
-        return Some(MulticastClass::SourceSpecific);
+        // RFC 3306 §4 as updated by RFC 7371 §4.1: the low four bits of
+        // octet 2 are reserved and must be zero, and plen cannot exceed 64.
+        // RFC 7371 §3/§4.1 requires ignoring ff2 (the high four bits) on
+        // receipt; do not treat it as part of the reserved field.
+        let octets = addr.octets();
+        if octets[2] & 0x0f != 0 || octets[3] > 64 {
+            return None;
+        }
+        // RFC 3306 §6 and RFC 4607 §1: only zero plen and zero network
+        // prefix denote ff3x::/32 SSM. Prefix-based groups are ASM.
+        if octets[2..12].iter().all(|byte| *byte == 0) {
+            return (!is_reserved_ssm_group_id(addr)).then_some(MulticastClass::SourceSpecific);
+        }
     }
     // Only the scopes the standards name are media groups: site-local (0x5),
     // organization-local (0x8), and global (0xe). Every other nibble is either
@@ -586,18 +595,15 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     }
 }
 
-/// The reserved head of the IPv6 SSM block: `ff3x::4000:0000` through
-/// `ff3x::7fff:ffff` (RFC 4607 §7 / the IANA SSM registry), i.e. a flags nibble
-/// of `0x3` whose trailing 32-bit field has its two top bits set to `0b01`.
-fn is_reserved_ssm_subrange(addr: Ipv6Addr) -> bool {
-    let [_, nibbles, .., b12, b13, b14, b15] = addr.octets();
-    if (nibbles >> 4) != 0x3 {
-        return false;
-    }
-    // In `ff3x::4000:0000` notation the reserved field is the trailing 32 bits
-    // (`::4000:0000`–`::7fff:ffff`), i.e. address octets 12..16.
-    let field = u32::from_be_bytes([b12, b13, b14, b15]);
-    (field >> 30) == 0b01
+/// RFC 4607 §1 and RFC 3307 §§4.1–4.3: SSM group IDs `0–0x3fff_ffff`
+/// belong to permanent addresses (P=T=0), `0x4000_0000–0x7fff_ffff`
+/// are permanent IDs reserved for IANA (including the null ID), and only
+/// `0x8000_0000–0xffff_ffff` are available for dynamic SSM allocation.
+/// See <https://www.rfc-editor.org/rfc/rfc4607#section-1> and
+/// <https://www.rfc-editor.org/rfc/rfc3307#section-4>.
+fn is_reserved_ssm_group_id(addr: Ipv6Addr) -> bool {
+    let [.., b12, b13, b14, b15] = addr.octets();
+    u32::from_be_bytes([b12, b13, b14, b15]) < 0x8000_0000
 }
 
 /// The [`RejectReason`] for an address that [`classify`] refused.

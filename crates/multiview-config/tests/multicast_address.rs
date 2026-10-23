@@ -119,20 +119,21 @@ fn v4_registry_table_matches_iana() {
 }
 
 /// IPv6 multicast flags/scope-nibble classification (RFC 4291 §2.7,
-/// RFC 7346 §2). Scope is checked first; the **flags** nibble `0x3` marks
-/// SSM (`ff3x::/32`, RFC 4607 §7) only in a supported media scope.
+/// RFC 7346 §2). Scope is checked first; flags `0x3` with zero plen and
+/// prefix mark SSM (`ff3x::/32`, RFC 3306 §6 / RFC 4607 §1).
 fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
     // RFC 4291 §2.7 and RFC 7346: flags do not override the scope.
     if !matches!(scope, 0x5 | 0x8 | 0xe) {
         return None;
     }
     if flags == 0x3 {
-        // RFC 3306 §4 / RFC 7371 §4.1: ff2/rsvd must be zero and plen <= 64.
-        if body[0] & 0xff00 != 0 || body[0] & 0xff > 64 {
+        // RFC 3306 §4 / RFC 7371 §4.1: rsvd must be zero and plen <= 64;
+        // ff2 flag bits are ignored on receipt.
+        if body[0] & 0x0f00 != 0 || body[0] & 0xff > 64 {
             return None;
         }
         // RFC 3306 §6: only the zero plen and zero prefix encode ff3x::/32.
-        if flags == 0x3 && body[..5].iter().all(|word| *word == 0) {
+        if body[..5].iter().all(|word| *word == 0) {
             let id = (u32::from(body[5]) << 16) | u32::from(body[6]);
             return (id >= 0x8000_0000).then_some(MulticastClass::SourceSpecific);
         }
@@ -158,7 +159,7 @@ fn v6_reason(_flags: u8, scope: u8) -> RejectReason {
 /// Build an IPv6 multicast address with the given flags/scope nibbles and a
 /// random low-order body (`ff<flags><scope>:<body0>:…:<body6>`).
 fn v6_group(flags: u8, scope: u8, body: [u16; 7]) -> Ipv6Addr {
-    let addr = Ipv6Addr::new(
+    Ipv6Addr::new(
         0xff00 | (u16::from(flags) << 4) | u16::from(scope),
         body[0],
         body[1],
@@ -167,8 +168,7 @@ fn v6_group(flags: u8, scope: u8, body: [u16; 7]) -> Ipv6Addr {
         body[4],
         body[5],
         body[6],
-    );
-    addr
+    )
 }
 
 /// Parse an IP literal, panicking with the text on a typo.
@@ -504,17 +504,32 @@ fn issue_named_blocks_are_rejected_verbatim() {
 fn ipv6_ssm_group_id_allocation_boundaries() {
     // RFC 3307 §§4.1–4.3, RFC 4607 §1: permanent IDs cannot be SSM.
     for text in [
-        "ff3e::", "ff3e::1", "ff3e::3fff:ffff", "ff3e::4000:0000",
-        "ff3e::4000:0001", "ff3e::7fff:ffff",
+        "ff3e::",
+        "ff3e::1",
+        "ff3e::3fff:ffff",
+        "ff3e::4000:0000",
+        "ff3e::4000:0001",
+        "ff3e::7fff:ffff",
     ] {
         assert_eq!(classify(ip(text)), None, "{text}");
-        assert_eq!(MulticastGroup::try_from(ip(text)).unwrap_err().reason(), RejectReason::ReservedBlock, "{text}");
-        assert!(serde_json::from_str::<MulticastGroup>(&format!("\"{text}\"")).is_err(), "{text}");
+        assert_eq!(
+            MulticastGroup::try_from(ip(text)).unwrap_err().reason(),
+            RejectReason::ReservedBlock,
+            "{text}"
+        );
+        assert!(
+            serde_json::from_str::<MulticastGroup>(&format!("\"{text}\"")).is_err(),
+            "{text}"
+        );
     }
     for text in ["ff3e::8000:0000", "ff3e::ffff:ffff"] {
         let group = MulticastGroup::try_from(ip(text)).expect(text);
         assert_eq!(group.class(), MulticastClass::SourceSpecific, "{text}");
-        assert_eq!(group.validate(&[]), Some(RejectReason::SourcesRequired), "{text}");
+        assert_eq!(
+            group.validate(&[]),
+            Some(RejectReason::SourcesRequired),
+            "{text}"
+        );
         assert_eq!(group.validate(&[ip("2001:db8::1")]), None, "{text}");
     }
 }
@@ -536,7 +551,11 @@ fn ipv6_prefix_based_groups_are_not_ssm_and_validate_encoding() {
         "ff3e:0140:2001:db8::8000:1", // reserved field != 0
     ] {
         assert_eq!(classify(ip(text)), None, "{text}");
-        assert_eq!(MulticastGroup::try_from(ip(text)).unwrap_err().reason(), RejectReason::ReservedBlock, "{text}");
+        assert_eq!(
+            MulticastGroup::try_from(ip(text)).unwrap_err().reason(),
+            RejectReason::ReservedBlock,
+            "{text}"
+        );
     }
 }
 
