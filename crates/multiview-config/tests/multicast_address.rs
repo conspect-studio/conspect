@@ -663,19 +663,20 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ffde::1", None), // R=1 unsupported.
         ("ffee::1", None), // P=1, T=0 with X=R=1.
         ("fffe::1", None), // R=1 embedded-RP, unsupported.
-        // Even with flags=3 and a valid dynamic ID, unsupported scopes lose.
+        // Even with flags=3 and a valid dynamic ID, prohibited scopes lose;
+        // scopes 0x3-0xd are accepted per RFC 4291 §2.7 / RFC 7346 (round 6).
         ("ff30::8000:1", None),
         ("ff31::8000:1", None),
         ("ff32::8000:1", None),
-        ("ff33::8000:1", None),
-        ("ff34::8000:1", None),
-        ("ff36::8000:1", None),
-        ("ff37::8000:1", None),
-        ("ff39::8000:1", None),
-        ("ff3a::8000:1", None),
-        ("ff3b::8000:1", None),
-        ("ff3c::8000:1", None),
-        ("ff3d::8000:1", None),
+        ("ff33::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff34::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff36::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff37::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff39::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff3a::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff3b::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff3c::8000:1", Some(MulticastClass::SourceSpecific)),
+        ("ff3d::8000:1", Some(MulticastClass::SourceSpecific)),
         ("ff3f::8000:1", None),
         // Valid SSM encoding: zero rsvd, plen and prefix, dynamic group ID.
         ("ff35::8000:1", Some(SourceSpecific)),
@@ -1032,22 +1033,19 @@ fn neighbours_of_permanent_groups_stay_media_groups() {
 // literals so permanent-ID rules do not interfere. These supersede the earlier
 // "refuse realm-local/admin-local/unassigned scopes" expectations.
 // ---------------------------------------------------------------------------
-fn assert_scope(text: &str, expected: Option<(MulticastClass, ())>, reason: RejectReason) {
+fn assert_scope(text: &str, expected: Option<MulticastClass>, reason: RejectReason) {
     let addr = ip(text);
     let json = format!("\"{text}\"");
-    match expected {
-        Some((class, ())) => {
-            assert_eq!(classify(addr), Some(class), "{text}");
-            assert_eq!(MulticastGroup::try_from(addr).expect(text).class(), class);
-            let back: MulticastGroup = serde_json::from_str(&json).expect(text);
-            assert_eq!(back.addr(), addr, "{text}");
-        }
-        None => {
-            assert_eq!(classify(addr), None, "{text}");
-            let err = MulticastGroup::try_from(addr).expect_err(text);
-            assert_eq!(reason_of(&err), reason, "{text}");
-            assert!(serde_json::from_str::<MulticastGroup>(&json).is_err());
-        }
+    if let Some(class) = expected {
+        assert_eq!(classify(addr), Some(class), "{text}");
+        assert_eq!(MulticastGroup::try_from(addr).expect(text).class(), class);
+        let back: MulticastGroup = serde_json::from_str(&json).expect(text);
+        assert_eq!(back.addr(), addr, "{text}");
+    } else {
+        assert_eq!(classify(addr), None, "{text}");
+        let err = MulticastGroup::try_from(addr).expect_err(text);
+        assert_eq!(reason_of(&err), reason, "{text}");
+        assert!(serde_json::from_str::<MulticastGroup>(&json).is_err());
     }
 }
 
@@ -1067,7 +1065,7 @@ fn scope_2_link_local_is_rejected() {
 fn scope_3_realm_local_is_admin_scoped() {
     assert_scope(
         "ff13::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1075,7 +1073,7 @@ fn scope_3_realm_local_is_admin_scoped() {
 fn scope_4_admin_local_is_admin_scoped() {
     assert_scope(
         "ff14::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1083,7 +1081,7 @@ fn scope_4_admin_local_is_admin_scoped() {
 fn scope_5_site_local_is_admin_scoped() {
     assert_scope(
         "ff15::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1091,7 +1089,7 @@ fn scope_5_site_local_is_admin_scoped() {
 fn scope_6_unassigned_is_admin_scoped() {
     assert_scope(
         "ff16::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1099,7 +1097,7 @@ fn scope_6_unassigned_is_admin_scoped() {
 fn scope_7_unassigned_is_admin_scoped() {
     assert_scope(
         "ff17::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1107,7 +1105,7 @@ fn scope_7_unassigned_is_admin_scoped() {
 fn scope_8_organization_local_is_routed() {
     assert_scope(
         "ff18::1234",
-        Some((MulticastClass::Routed, ())),
+        Some(MulticastClass::Routed),
         RejectReason::ReservedBlock,
     );
 }
@@ -1115,7 +1113,7 @@ fn scope_8_organization_local_is_routed() {
 fn scope_9_unassigned_is_admin_scoped() {
     assert_scope(
         "ff19::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1123,7 +1121,7 @@ fn scope_9_unassigned_is_admin_scoped() {
 fn scope_a_unassigned_is_admin_scoped() {
     assert_scope(
         "ff1a::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1131,7 +1129,7 @@ fn scope_a_unassigned_is_admin_scoped() {
 fn scope_b_unassigned_is_admin_scoped() {
     assert_scope(
         "ff1b::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1139,7 +1137,7 @@ fn scope_b_unassigned_is_admin_scoped() {
 fn scope_c_unassigned_is_admin_scoped() {
     assert_scope(
         "ff1c::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1147,7 +1145,7 @@ fn scope_c_unassigned_is_admin_scoped() {
 fn scope_d_unassigned_is_admin_scoped() {
     assert_scope(
         "ff1d::1234",
-        Some((MulticastClass::AdminScoped, ())),
+        Some(MulticastClass::AdminScoped),
         RejectReason::ReservedBlock,
     );
 }
@@ -1155,7 +1153,7 @@ fn scope_d_unassigned_is_admin_scoped() {
 fn scope_e_global_is_routed() {
     assert_scope(
         "ff1e::1234",
-        Some((MulticastClass::Routed, ())),
+        Some(MulticastClass::Routed),
         RejectReason::ReservedBlock,
     );
 }

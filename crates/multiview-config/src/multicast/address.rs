@@ -11,8 +11,9 @@
 //!
 //! * IPv6 (primary, ADR-0042): a `ff00::/8` group whose flags nibble marks
 //!   source-specific multicast (`ff3x::/32`, SSM) or whose scope nibble is one of
-//!   the assigned multicast scopes — site-local (`ff05::/16`), organization-local
-//!   (`ff08::/16`), or global (`ff0e::/16`).
+//!   any scope from realm-local (`0x3`) to global (`0xe`): admin-scoped
+//!   (`0x3`–`0x7`, `0x9`–`0xd`), organization-local (`ff08::/16`) or global
+//!   (`ff0e::/16`).
 //! * IPv4 (legacy peer): the IANA/RFC-5771 blocks minus the control and reserved
 //!   slices — in practice `224.0.1.0/24` (internetwork control), AD-HOC I
 //!   `224.0.2.0`–`224.0.255.255`, `224.2/16` (SDP/SAP), `224.3/16` and `224.4/16`
@@ -30,8 +31,8 @@
 //!   media group: `232.0.0.0/24` (the reserved head of the SSM block,
 //!   RFC 4607 §7), `233.252.0.0/24` (`MCAST-TEST-NET`, RFC 6676), the IANA
 //!   reserved `224.1/16`, `224.5.0.0`–`224.251.255.255`,
-//!   `225.0.0.0`–`231.255.255.255` and `235.0.0.0`–`238.255.255.255`, the IPv6 reserved scopes `0x0`, `0x3`,
-//!   and `0xf` (plus unsupported and unassigned scopes), and
+//!   `225.0.0.0`–`231.255.255.255` and `235.0.0.0`–`238.255.255.255`, the IPv6 reserved scopes `0x0`
+//!   and `0xf`, and
 //!   `ff3x::4000:0000`.
 //! * [`RejectReason::NotMulticast`] — anything outside `224.0.0.0/4` and
 //!   `ff00::/8` (unicast, loopback, the unspecified address, IPv4-mapped forms).
@@ -51,14 +52,18 @@
 //! side is small enough (a flags nibble and a scope nibble) to stay a `match`,
 //! with a property test over all 256 nibble pairs.
 //!
-//! ## The deliberate IPv6 conservatism
+//! ## The IPv6 scope decision
 //!
-//! RFC 7346 assigns scope `0x3` as realm-local (for specified network
-//! technologies) and `0x4` as admin-local; this media classifier conservatively
-//! declines both, since its supported media scopes are site-local (`0x5`),
-//! organization-local (`0x8`) and global (`0xe`). Scopes `0x6`, `0x7`, and
-//! `0x9`–`0xd` are unassigned. The **flags** nibble `0x3` identifies SSM but
-//! does not override any of these scope restrictions.
+//! Per RFC 4291 §2.7 and RFC 7346 §2: `0x0` and `0xf` are reserved, `0x1`
+//! interface-local and `0x2` link-local are refused (not routable for media).
+//! `0x3` realm-local (RFC 7346), `0x4` admin-local, and `0x5` site-local are
+//! accepted as [`MulticastClass::AdminScoped`]. `0x8` organization-local and
+//! `0xe` global are routed. Scopes `0x6`, `0x7`, `0x9`–`0xd` are unassigned,
+//! and RFC 4291 §2.7 says unassigned scopes "are available for administrators
+//! to define additional multicast regions", so they are accepted as
+//! admin-scoped. The **flags** nibble `0x3` identifies SSM but does not
+//! override the scope rules, and permanent-group and SSM-ID rules apply at
+//! every accepted scope.
 //!
 //! IPv6 is first-class here: `ff02::1%eth0`-style zone-qualified literals are
 //! the [`MulticastIface`] form, and an IPv4-mapped IPv6 address
@@ -334,7 +339,7 @@ pub enum MulticastClass {
     /// Source-specific multicast — IPv4 `232/8`, IPv6 `ff3x::/32`. Requires a
     /// non-empty source list (`MLDv2` `INCLUDE` / `IGMPv3`).
     SourceSpecific,
-    /// Admin-scoped ASM — IPv4 `239/8` (RFC 2365), IPv6 site-local `ff05::/16`.
+    /// Admin-scoped ASM — IPv4 `239/8` (RFC 2365), IPv6 scopes `0x3`–`0x7` and `0x9`–`0xd` (e.g. site-local `ff05::/16`).
     /// The preferred in-plant ASM range.
     AdminScoped,
     /// Routed group — IPv4 `224.0.1.x`/`224.2.x`/`224.3.x`/`224.4.x`/`233/8`,
@@ -574,11 +579,11 @@ fn in_net_v4_bits(bits: u32, base: u32, prefix: u8) -> bool {
 /// Flags `0x3` or `0xb` with zero plen and prefix mark SSM (`ff3x::/32`
 /// or `ffbx::/32`, RFC 3306 §6 / RFC 7371 §4.1.2); other valid
 /// prefix-based groups use their scope. Embedded-RP flags are unsupported.
-/// Otherwise site-local (`0x5`) is the admin-scoped media scope,
-/// organization-local (`0x8`) and global (`0xe`) are routed, and every other
-/// nibble — reserved `0x0`/`0xf`, interface-local (`0x1`), link-local (`0x2`),
-/// unsupported realm-local (`0x3`)/admin-local (`0x4`), and unassigned
-/// `0x6`/`0x7`/`0x9`–`0xd` — is refused.
+/// Otherwise organization-local (`0x8`) and global (`0xe`) are routed; realm-
+/// local (`0x3`), admin-local (`0x4`), site-local (`0x5`) and the unassigned
+/// `0x6`/`0x7`/`0x9`–`0xd` (administrator-defined regions, RFC 4291 §2.7) are
+/// admin-scoped; reserved `0x0`/`0xf`, interface-local (`0x1`) and link-local
+/// (`0x2`) are refused.
 fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     if !addr.is_multicast() {
         return None;
@@ -588,7 +593,7 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     let scope = nibbles & 0x0f;
     // RFC 4291 §2.7 / RFC 7346: an SSM flag never legitimizes a
     // prohibited or unassigned scope (including ff30, ff31, ff32).
-    if !matches!(scope, 0x5 | 0x8 | 0xe) {
+    if !(0x3..=0xe).contains(&scope) {
         return None;
     }
     // RFC 3306 §4 / RFC 7371 §4.1: decide *every* flag nibble. X
@@ -622,18 +627,16 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
         }
         // A valid nonzero plen denotes prefix-based ASM, regardless of ID.
     }
-    // Only the scopes the standards name are media groups: site-local (0x5),
-    // organization-local (0x8), and global (0xe). Every other nibble is either
-    // reserved (0x0/0xf), local control (0x1/0x2), unsupported realm-local
-    // (0x3)/admin-local (0x4), or unassigned (0x6/0x7/0x9–0xd).
+    // Scopes 0x3..=0xe are media scopes (RFC 4291 §2.7, RFC 7346 §2); only
+    // reserved (0x0/0xf) and local control (0x1/0x2) were refused above.
     // IANA IPv6 Multicast Address Space: permanently assigned (T=0) group IDs
     // are protocol groups at every scope, never media (RFC 4291 §2.7).
     if flags.trailing_zeros() >= 3 && is_permanent_group_v6(addr, scope) {
         return None;
     }
     match scope {
-        0x5 => Some(MulticastClass::AdminScoped),
         0x8 | 0xe => Some(MulticastClass::Routed),
+        0x3..=0x7 | 0x9..=0xd => Some(MulticastClass::AdminScoped),
         _ => None,
     }
 }
@@ -720,7 +723,7 @@ fn reason_for(addr: IpAddr) -> RejectReason {
                 match scope {
                     0x1 => RejectReason::InterfaceLocalControl,
                     0x2 => RejectReason::LinkLocalControl,
-                    0x5 | 0x8 | 0xe
+                    0x3..=0xe
                         if flags.trailing_zeros() >= 3 && is_permanent_group_v6(v6, scope) =>
                     {
                         RejectReason::PermanentGroup
