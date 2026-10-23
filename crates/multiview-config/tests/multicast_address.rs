@@ -1250,112 +1250,112 @@ fn ipv6_embedded_rp_groups_are_asm_and_malformed_ones_rejected() {
     }
 }
 
+// (flags, probe, decision, RFC clause)
+const FLAGS_TABLE: [(u8, &str, Option<MulticastClass>, &str); 16] = [
+    (
+        0x0,
+        "ff0e::1:2:3",
+        Some(MulticastClass::Routed),
+        "RFC 4291 §2.7: permanent ASM",
+    ),
+    (
+        0x1,
+        "ff1e::1",
+        Some(MulticastClass::Routed),
+        "RFC 4291 §2.7: T=1 transient ASM",
+    ),
+    (
+        0x2,
+        "ff2e::1",
+        None,
+        "RFC 3306 §4/7371 §4.1: P=1 requires T=1",
+    ),
+    (
+        0x3,
+        "ff3e::8000:1",
+        Some(MulticastClass::SourceSpecific),
+        "RFC 3306 §6/4607: plen 0 SSM",
+    ),
+    (
+        0x4,
+        "ff4e:140:2001:470::1",
+        None,
+        "RFC 3956 §3/7371 §4.2: R=1 requires P=T=1",
+    ),
+    (
+        0x5,
+        "ff5e:140:2001:470::1",
+        None,
+        "RFC 3956 §3/7371 §4.2: R=1 requires P=1",
+    ),
+    (
+        0x6,
+        "ff6e:140:2001:470::1",
+        None,
+        "RFC 3956 §3/7371 §4.2: R=1 requires T=1",
+    ),
+    (
+        0x7,
+        "ff7e:140:2001:470::1",
+        Some(MulticastClass::Routed),
+        "RFC 3956 §3: embedded-RP ASM",
+    ),
+    (
+        0x8,
+        "ff8e::1:2:3",
+        Some(MulticastClass::Routed),
+        "RFC 7371 §2: X ignored, permanent ASM",
+    ),
+    (
+        0x9,
+        "ff9e::1",
+        Some(MulticastClass::Routed),
+        "RFC 7371 §2: X ignored, transient ASM",
+    ),
+    (
+        0xa,
+        "ffae::1",
+        None,
+        "RFC 7371 §4.1: P=1 requires T=1 (X set)",
+    ),
+    (
+        0xb,
+        "ffbe::8000:1",
+        Some(MulticastClass::SourceSpecific),
+        "RFC 7371 §4.1.2: ffbx::/32 SSM",
+    ),
+    (
+        0xc,
+        "ffce:140:2001:470::1",
+        None,
+        "RFC 7371 §4.2: R=1 requires P=T=1",
+    ),
+    (
+        0xd,
+        "ffde:140:2001:470::1",
+        None,
+        "RFC 7371 §4.2: R=1 requires P=T=1",
+    ),
+    (
+        0xe,
+        "ffee:140:2001:470::1",
+        None,
+        "RFC 7371 §4.2: R=1 requires P=T=1",
+    ),
+    (
+        0xf,
+        "fffe:140:2001:470::1",
+        Some(MulticastClass::Routed),
+        "RFC 7371 §4.2: fff0::/12 embedded-RP",
+    ),
+];
+
 /// Closing audit: one literal row per IPv6 flags nibble (X R P T bits per
 /// RFC 7371 §2/§4), probed with a scope-0xe group whose body is valid for the
 /// nibble's encoding. Never derived from production code.
 #[test]
 fn ipv6_flags_nibble_decision_table() {
-    use MulticastClass::{Routed, SourceSpecific};
-    // (flags, probe, decision, RFC clause)
-    const TABLE: [(u8, &str, Option<MulticastClass>, &str); 16] = [
-        (
-            0x0,
-            "ff0e::1:2:3",
-            Some(Routed),
-            "RFC 4291 §2.7: permanent ASM",
-        ),
-        (
-            0x1,
-            "ff1e::1",
-            Some(Routed),
-            "RFC 4291 §2.7: T=1 transient ASM",
-        ),
-        (
-            0x2,
-            "ff2e::1",
-            None,
-            "RFC 3306 §4/7371 §4.1: P=1 requires T=1",
-        ),
-        (
-            0x3,
-            "ff3e::8000:1",
-            Some(SourceSpecific),
-            "RFC 3306 §6/4607: plen 0 SSM",
-        ),
-        (
-            0x4,
-            "ff4e:140:2001:470::1",
-            None,
-            "RFC 3956 §3/7371 §4.2: R=1 requires P=T=1",
-        ),
-        (
-            0x5,
-            "ff5e:140:2001:470::1",
-            None,
-            "RFC 3956 §3/7371 §4.2: R=1 requires P=1",
-        ),
-        (
-            0x6,
-            "ff6e:140:2001:470::1",
-            None,
-            "RFC 3956 §3/7371 §4.2: R=1 requires T=1",
-        ),
-        (
-            0x7,
-            "ff7e:140:2001:470::1",
-            Some(Routed),
-            "RFC 3956 §3: embedded-RP ASM",
-        ),
-        (
-            0x8,
-            "ff8e::1:2:3",
-            Some(Routed),
-            "RFC 7371 §2: X ignored, permanent ASM",
-        ),
-        (
-            0x9,
-            "ff9e::1",
-            Some(Routed),
-            "RFC 7371 §2: X ignored, transient ASM",
-        ),
-        (
-            0xa,
-            "ffae::1",
-            None,
-            "RFC 7371 §4.1: P=1 requires T=1 (X set)",
-        ),
-        (
-            0xb,
-            "ffbe::8000:1",
-            Some(SourceSpecific),
-            "RFC 7371 §4.1.2: ffbx::/32 SSM",
-        ),
-        (
-            0xc,
-            "ffce:140:2001:470::1",
-            None,
-            "RFC 7371 §4.2: R=1 requires P=T=1",
-        ),
-        (
-            0xd,
-            "ffde:140:2001:470::1",
-            None,
-            "RFC 7371 §4.2: R=1 requires P=T=1",
-        ),
-        (
-            0xe,
-            "ffee:140:2001:470::1",
-            None,
-            "RFC 7371 §4.2: R=1 requires P=T=1",
-        ),
-        (
-            0xf,
-            "fffe:140:2001:470::1",
-            Some(Routed),
-            "RFC 7371 §4.2: fff0::/12 embedded-RP",
-        ),
-    ];
-    for (flags, text, decision, clause) in TABLE {
+    for (flags, text, decision, clause) in FLAGS_TABLE {
         let addr = ip(text);
         let IpAddr::V6(v6) = addr else {
             panic!("{text}")

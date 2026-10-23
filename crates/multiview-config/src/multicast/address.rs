@@ -578,7 +578,7 @@ fn in_net_v4_bits(bits: u32, base: u32, prefix: u8) -> bool {
 /// do not let `ff3x` override an interface-local, link-local or reserved scope.
 /// Flags `0x3` or `0xb` with zero plen and prefix mark SSM (`ff3x::/32`
 /// or `ffbx::/32`, RFC 3306 §6 / RFC 7371 §4.1.2); other valid
-/// prefix-based groups use their scope. Embedded-RP flags are unsupported.
+/// prefix-based groups use their scope. Valid embedded-RP groups (RFC 3956) are ordinary ASM.
 /// Otherwise organization-local (`0x8`) and global (`0xe`) are routed; realm-
 /// local (`0x3`), admin-local (`0x4`), site-local (`0x5`) and the unassigned
 /// `0x6`/`0x7`/`0x9`–`0xd` (administrator-defined regions, RFC 4291 §2.7) are
@@ -596,15 +596,26 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     if !(0x3..=0xe).contains(&scope) {
         return None;
     }
-    // RFC 3306 §4 / RFC 7371 §4.1: decide *every* flag nibble. X
-    // is independent; R marks embedded-RP (RFC 3956), unsupported here.
-    // P=1,T=0 is invalid even with X/R set. Only 3/b are prefix-based
-    // forms whose zero-plen encoding can denote SSM.
+    // RFC 7371 §3: flag bits are separate bits. Decide *every* nibble
+    // (X R P T): P=1 requires T=1 (RFC 3306 §4), so 0x2/0x6/0xa/0xe are
+    // invalid; R=1 requires P=T=1 (RFC 3956 §3, RFC 7371 §4.2), so only
+    // 0x7/0xf are embedded-RP; 0x3/0xb are prefix-based/SSM; the rest are
+    // ordinary ASM.
     let prefix_based = match flags {
         0x0 | 0x1 | 0x8 | 0x9 => false, // ordinary ASM (X may be set)
         0x3 | 0xb => true,              // prefix-based or SSM (X may be set)
-        // Remaining flags: P=1,T=0 is invalid; R=1 needs embedded-RP
-        // handling, which is unsupported. Also defensive for future values.
+        0x7 | 0xf => {
+            // RFC 3956 §3: octet 2 low nibble is the RIID (0 invalid), plen
+            // is 1..=64. A receiver needs no embedded-RP support: it is a
+            // normal ASM group of its scope (T=1, so no permanent-ID rules).
+            let octets = addr.octets();
+            let riid = octets[2] & 0x0f;
+            if riid == 0 || octets[3] == 0 || octets[3] > 64 {
+                return None;
+            }
+            false
+        }
+        // R=1 without P and T, or P=1 without T: invalid.
         _ => return None,
     };
     if prefix_based {
