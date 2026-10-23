@@ -25,10 +25,10 @@ fn srt_ac_parses_reserved_keys() {
     let params: StreamIdParams = "#!::u=alice,r=cam1,h=ingest.example,s=sess1,t=stream,m=publish"
         .try_into()
         .expect("parse");
-    assert_eq!(params.user().as_deref(), Some("alice"));
-    assert_eq!(params.resource().as_deref(), Some("cam1"));
-    assert_eq!(params.host().as_deref(), Some("ingest.example"));
-    assert_eq!(params.session().as_deref(), Some("sess1"));
+    assert_eq!(params.user(), Some("alice"));
+    assert_eq!(params.resource(), Some("cam1"));
+    assert_eq!(params.host(), Some("ingest.example"));
+    assert_eq!(params.session(), Some("sess1"));
     assert_eq!(params.stream_type(), Some(SrtAcType::Stream));
     assert_eq!(params.mode(), SrtAcMode::Publish);
     assert!(params.extensions().is_empty());
@@ -51,10 +51,16 @@ fn srt_ac_parses_namespaced_extensions_and_rejects_bare_custom_keys() {
     let params: StreamIdParams = "#!::r=cam1,user_extra=1,multiview_tile=3"
         .try_into()
         .expect("parse");
-    assert_eq!(params.resource().as_deref(), Some("cam1"));
-    assert_eq!(params.extensions().get("user_extra").map(String::as_str), Some("1"));
+    assert_eq!(params.resource(), Some("cam1"));
     assert_eq!(
-        params.extensions().get("multiview_tile").map(String::as_str),
+        params.extensions().get("user_extra").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        params
+            .extensions()
+            .get("multiview_tile")
+            .map(String::as_str),
         Some("3")
     );
 
@@ -74,13 +80,13 @@ fn srt_ac_parses_namespaced_extensions_and_rejects_bare_custom_keys() {
 #[test]
 fn srt_ac_rejects_unparseable_ids() {
     for bad in [
-        "r=cam1",               // missing `#!::` prefix
-        "#!r=cam1",             // wrong prefix
-        "#!::r",                // no `=`
-        "#!::=cam1",             // empty key
-        "#!::r=cam1,r=cam2",     // duplicate key
-        "#!::m=send",            // unknown mode token
-        "#!::t=video",           // unknown type token
+        "r=cam1",            // missing `#!::` prefix
+        "#!r=cam1",          // wrong prefix
+        "#!::r",             // no `=`
+        "#!::=cam1",         // empty key
+        "#!::r=cam1,r=cam2", // duplicate key
+        "#!::m=send",        // unknown mode token
+        "#!::t=video",       // unknown type token
     ] {
         let err = StreamIdParams::try_from(bad).expect_err("must reject");
         assert!(
@@ -135,8 +141,9 @@ fn srt_ac_round_trips_through_to_url_with_hash_escaped() {
     assert_eq!(back, params);
 }
 
-/// Property: parse → render → parse is the identity for valid reserved keys
-/// plus namespaced extensions.
+// Property: parse → render → parse is the identity for valid reserved keys
+// plus namespaced extensions. (Plain comment: rustdoc does not document macro
+// invocations.)
 proptest::proptest! {
     #[test]
     fn srt_ac_prop_round_trip(
@@ -155,7 +162,7 @@ proptest::proptest! {
         let params: StreamIdParams = src.as_str().try_into().expect("valid grammar");
         let text = params.to_stream_id_string().expect("render");
         let back: StreamIdParams = text.as_str().try_into().expect("re-parse");
-        prop_assert_eq!(params, back);
         prop_assert_eq!(params.mode().as_token(), mode);
+        prop_assert_eq!(params, back);
     }
 }
