@@ -791,7 +791,7 @@ async fn run_pipeline_until_ctrl_c(
     {
         let env = multiview_cli::network_warn::current_environment();
         let mismatch = (multiview_cli::network_warn::in_container(&env)
-            && !multiview_cli::network_warn::has_host_networking(&env)
+            && multiview_cli::network_warn::has_container_bridge_networking(&env)
             && multiview_cli::network_warn::config_uses_multicast(config))
         .then_some(multiview_control::NetworkMismatchView);
         let since_nanos = i64::try_from(

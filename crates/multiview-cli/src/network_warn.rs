@@ -21,11 +21,11 @@ pub struct NetworkEnvironment<'a> {
     pub codespaces: bool,
     /// Remote Containers variable presence.
     pub remote_containers: bool,
-    /// Current network namespace inode.
+    /// Current network namespace inode (diagnostic only; not a host-network signal).
     pub self_netns_inode: Option<u64>,
-    /// PID 1 network namespace inode.
+    /// PID 1 network namespace inode (PID 1 may be the container's init).
     pub pid1_netns_inode: Option<u64>,
-    /// Local IPv4 addresses.
+    /// Local non-loopback IPv4 and IPv6 addresses, when readable.
     pub ipv4_addresses: Option<&'a [IpAddr]>,
 }
 
@@ -48,30 +48,52 @@ pub fn in_container(env: &NetworkEnvironment<'_>) -> bool {
         || env.remote_containers
 }
 
-/// Heuristic true when container network namespace appears isolated from PID 1 or uses Docker bridge.
-#[must_use]
-pub fn has_host_networking(env: &NetworkEnvironment<'_>) -> bool {
-    if let (Some(current), Some(pid1)) = (env.self_netns_inode, env.pid1_netns_inode) {
-        if current == pid1 {
-            return true;
+fn is_default_bridge_address(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let octets = v.octets();
+            (octets[0] == 172 && octets[1] == 17) || (octets[0] == 10 && octets[1] == 88)
         }
+        IpAddr::V6(v) => v.octets()[0] == 0xfd,
     }
+}
+
+/// Whether the visible addresses are exclusively known container-bridge addresses.
+/// Unreadable, empty, or loopback-only lists are unknown, not evidence of a bridge.
+#[must_use]
+pub fn has_container_bridge_networking(env: &NetworkEnvironment<'_>) -> bool {
     let Some(addresses) = env.ipv4_addresses else {
         return false;
     };
-    let docker_bridge = addresses
-        .iter()
-        .any(|ip| matches!(ip, IpAddr::V4(v) if v.octets()[0] == 172 && v.octets()[1] == 17));
-    let has_other_address = addresses
-        .iter()
-        .any(|ip| !matches!(ip, IpAddr::V4(v) if v.octets()[0] == 172 && v.octets()[1] == 17));
-    if docker_bridge && !has_other_address {
+    addresses.iter().any(is_default_bridge_address)
+        && addresses.iter().all(|ip| {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local())
+                || is_default_bridge_address(ip)
+        })
+}
+
+/// Heuristic host-network classification from visible non-loopback addresses.
+///
+/// Matching PID 1's network namespace does *not* prove host networking: PID 1
+/// usually lives inside the same container. Only known default bridge addresses
+/// (Docker 172.17/16, Podman 10.88/16, default Docker IPv6 ULA `fd00::/8`)
+/// indicate isolation. Other addresses suggest host networking, but custom
+/// bridges can use any subnet and a host can itself use these bridge ranges;
+/// neither namespace identity nor addresses can prove the topology. Unreadable
+/// or empty address lists remain unknown: the caller must not warn for those.
+#[must_use]
+pub fn has_host_networking(env: &NetworkEnvironment<'_>) -> bool {
+    let Some(addresses) = env.ipv4_addresses else {
         return false;
-    }
-    if let (Some(current), Some(pid1)) = (env.self_netns_inode, env.pid1_netns_inode) {
-        return current == pid1;
-    }
-    !docker_bridge || has_other_address
+    };
+    addresses.iter().any(|ip| {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return false;
+        }
+        !is_default_bridge_address(ip) && !matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local())
+    })
 }
 
 fn multicast_host(host: &str) -> bool {
@@ -204,9 +226,14 @@ mod tests {
         };
         assert!(in_container(&env));
         assert!(!has_host_networking(&env));
+        let real_ips = [
+            "192.168.1.24".parse().unwrap(),
+            "10.10.3.15".parse().unwrap(),
+        ];
         let host = NetworkEnvironment {
             self_netns_inode: Some(3),
             pid1_netns_inode: Some(3),
+            ipv4_addresses: Some(&real_ips),
             ..Default::default()
         };
         assert!(has_host_networking(&host));

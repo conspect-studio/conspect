@@ -1,5 +1,8 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
 use multiview_cli::network_warn::{
-    config_uses_multicast, has_host_networking, in_container, NetworkEnvironment,
+    config_uses_multicast, has_container_bridge_networking, has_host_networking, in_container,
+    NetworkEnvironment,
 };
 use multiview_config::{MultiviewConfig, SourceKind};
 use multiview_control::{emit_network_warnings, EngineStateSnapshot, NetworkMismatchView};
@@ -18,7 +21,7 @@ fn warning_count(env: &NetworkEnvironment<'_>, multicast: bool) -> usize {
     let publisher: EnginePublisher<EngineStateSnapshot, Event> = EnginePublisher::new(8);
     let mut subscriber = publisher.subscribe();
     let mismatch = (in_container(env)
-        && !has_host_networking(env)
+        && has_container_bridge_networking(env)
         && config_uses_multicast(&config))
     .then_some(NetworkMismatchView);
     let emitted = emit_network_warnings(&publisher, mismatch, 123);
@@ -46,7 +49,10 @@ fn equal_pid1_inodes_in_a_bridge_container_still_warn_once_for_multicast() {
 
 #[test]
 fn host_network_container_with_real_interfaces_does_not_warn() {
-    let addresses = ["192.168.1.24".parse().unwrap(), "10.10.3.15".parse().unwrap()];
+    let addresses = [
+        "192.168.1.24".parse().unwrap(),
+        "10.10.3.15".parse().unwrap(),
+    ];
     let env = NetworkEnvironment {
         dockerenv: true,
         self_netns_inode: Some(5),
