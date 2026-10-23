@@ -404,6 +404,8 @@ pub enum WarningCode {
     /// link's quality recovers — a transient blip self-clears (never latched).
     /// Remediation: investigate the network path (loss/RTT) or raise `buffer_ms`.
     RistLinkLoss,
+    /// A container is configured for multicast without host networking. Latched at startup.
+    ContainerNoHostNetworking,
 }
 
 /// Which end of a RIST link a [`RistLinkStats`] sample describes.
@@ -535,6 +537,7 @@ impl WarningCode {
             Self::ConfigFileRequiresRestart => "config-file-requires-restart",
             Self::ConfigFileApplyIncomplete => "config-file-apply-incomplete",
             Self::RistLinkLoss => "rist-link-loss",
+            Self::ContainerNoHostNetworking => "container-no-host-networking",
         }
     }
 }

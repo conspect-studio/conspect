@@ -36,6 +36,26 @@ fn warning(active: bool) -> HealthWarning {
 }
 
 #[tokio::test]
+async fn emit_network_helper_surfaces_warning_and_none_is_silent() {
+    use multiview_control::{emit_network_warnings, NetworkMismatchView};
+    let h = harness();
+    let mut sub = h.engine.subscribe();
+    assert_eq!(emit_network_warnings(&h.engine, None, 10), 0);
+    assert_eq!(
+        emit_network_warnings(&h.engine, Some(NetworkMismatchView), 11),
+        1
+    );
+    assert_eq!(
+        warning_ingest_step(&mut sub, h.warnings.as_ref()).await,
+        WarningIngestStep::Applied
+    );
+    let resp = send(&h.router, get("/api/v1/health", VIEWER_TOKEN)).await;
+    let arr = body_json(resp).await;
+    assert_eq!(arr[0]["code"], "container-no-host-networking");
+    assert_eq!(arr[0]["since"], 11);
+}
+
+#[tokio::test]
 async fn emit_helper_publishes_a_latched_warning_that_ingests_and_surfaces() {
     // The build-site emit seam: the helper publishes the catalog warning through
     // the engine's drop-oldest publisher (inv #10). It rides the Alerts topic,

@@ -584,6 +584,8 @@ pub enum WarningSeverityDoc {
 pub enum WarningCodeDoc {
     /// A GPU is present but the compositor resolved a software/CPU adapter.
     GpuPresentNoVulkanAdapter,
+    /// Multicast is configured inside a container without host networking.
+    ContainerNoHostNetworking,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).
