@@ -24,6 +24,22 @@ fn srt_caller_url_basic() {
 }
 
 #[test]
+fn srt_libav_option_url_golden_table() {
+    let mut cfg = SrtConfig {
+        host: "::1".to_owned(),
+        port: 9000,
+        latency_ms: 200,
+        ..SrtConfig::default()
+    };
+    assert_eq!(cfg.to_url().unwrap(), "srt://[::1]:9000?mode=caller&latency=200000");
+    cfg.oheadbw_pct = Some(25);
+    cfg.maxbw = Some(0);
+    cfg.conn_timeout_ms = Some(3000);
+    cfg.stream_id = Some(StreamId::new("publish&live").unwrap());
+    assert_eq!(cfg.to_url().unwrap(), "srt://[::1]:9000?mode=caller&latency=200000&streamid=publish%26live&oheadbw=25&maxbw=0&connect_timeout=3000");
+}
+
+#[test]
 fn srt_modes_roundtrip() {
     for mode in [SrtMode::Caller, SrtMode::Listener, SrtMode::Rendezvous] {
         assert_eq!(SrtMode::from_token(mode.as_libav_token()).unwrap(), mode);

@@ -12866,6 +12866,71 @@ buffer_ms = 700
 }
 
 #[cfg(test)]
+mod srt_wiring_tests {
+    use std::sync::Arc;
+    use multiview_compositor::pipeline::CanvasColor;
+    use multiview_config::{Output, Source};
+    use multiview_core::time::Rational;
+    use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+    use super::{build_outputs, ingest_plan_for, srt_resolved_url, PipelineError, RunnableOutput, SourceLocation};
+
+    #[test]
+    fn srt_url_only_is_byte_identical_and_typed_options_are_lowered() {
+        let base = "srt://[::1]:9000?transtype=live";
+        assert_eq!(srt_resolved_url(base, None, false).unwrap(), base);
+        let opts = serde_json::from_value(serde_json::json!({
+            "mode": "listener", "latency_ms": 200, "stream_id": "#!::r=live",
+            "oheadbw_pct": 25, "maxbw": 0, "conn_timeout_ms": 3000,
+        })).unwrap();
+        assert_eq!(srt_resolved_url(base, Some(&opts), false).unwrap(),
+            "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23!::r%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
+    }
+
+    #[test]
+    fn srt_ingest_and_push_wiring_redacts_secret() {
+        let secret_var = "SRT_58_TEST_SECRET";
+        std::env::set_var(secret_var, "some-password-123");
+        let options = serde_json::json!({"latency_ms": 200, "encryption": {
+            "key_length": "aes256", "passphrase_ref": format!("env:{secret_var}") }});
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-in", "kind": "srt", "url": "srt://[::1]:9000", "srt": options
+        })).unwrap();
+        let store = Arc::new(TileStore::new(source.id.clone(), TileThresholds::default(), NoSignalPolicy::HoldForever));
+        let plan = ingest_plan_for(&source, 320, 180, store, CanvasColor::default(), Rational::new(30, 1)).unwrap();
+        let SourceLocation::Url(url) = plan.location else { panic!("SRT must be a URL") };
+        assert!(url.contains("latency=200000"));
+        assert!(url.contains("pbkeylen=32&passphrase=some-password-123"));
+        let output: Output = serde_json::from_value(serde_json::json!({
+            "kind": "srt", "id": "srt-out", "url": "srt://[::1]:9000", "codec": "h264", "srt": options
+        })).unwrap();
+        let epoch = multiview_output::SharedEpoch::default();
+        #[cfg(feature = "webrtc-native")]
+        let sinks = std::collections::HashMap::new();
+        let built = build_outputs(&[output], &epoch,
+            #[cfg(feature = "webrtc-native")] &sinks,
+            None, Rational::new(30, 1)).unwrap();
+        let RunnableOutput::Push { url, sink: _, .. } = &built.packet[0] else { panic!("SRT push must run") };
+        assert!(url.contains("passphrase=***"), "{url}");
+        assert!(!url.contains("some-password-123"));
+        std::env::remove_var(secret_var);
+    }
+
+    #[test]
+    fn unsupported_srt_backend_and_peer_timeout_fail_closed() {
+        let base = "srt://[::1]:9000";
+        for options in [serde_json::json!({"backend": "native"}), serde_json::json!({"peer_idle_timeout_ms": 5000})] {
+            let opts = serde_json::from_value(options).unwrap();
+            assert!(srt_resolved_url(base, Some(&opts), false).is_err());
+        }
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-in", "kind": "srt", "url": base, "srt": {"backend": "native"}
+        })).unwrap();
+        let store = Arc::new(TileStore::new(source.id.clone(), TileThresholds::default(), NoSignalPolicy::HoldForever));
+        assert!(matches!(ingest_plan_for(&source, 320, 180, store, CanvasColor::default(), Rational::new(30, 1)), Err(PipelineError::Ingest { .. })));
+    }
+}
+
+#[cfg(test)]
 mod eng2_timeline_tests {
     //! ENG-2: the ingest publish timeline must be the *normalized* one — raw
     //! source-tick PTS unwrapped onto a monotonic nanosecond timeline (invariant

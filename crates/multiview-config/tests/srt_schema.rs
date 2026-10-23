@@ -313,6 +313,17 @@ fn srt_mode_tokens_are_the_libav_mode_tokens() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn srt_listener_and_mode_conflict_is_rejected_at_admission() {
+    for (mode, listener) in [("caller", true), ("listener", false), ("rendezvous", true)] {
+        let src = srt_source_with_block(&format!("mode = {mode:?}\nlistener = {listener}\n"));
+        let error = src.validate().expect_err("conflicting SRT modes must fail validation");
+        assert!(error.to_string().contains("listener"), "{error}");
+    }
+    srt_source_with_block("mode = \"listener\"\nlistener = true\n")
+        .validate().expect("matching mode and listener");
+}
+
+#[test]
 fn srt_stream_id_at_the_512_byte_cap_accepted() {
     let id = "x".repeat(SrtOptions::STREAM_ID_MAX_BYTES);
     let src = srt_source_with_block(&format!("stream_id = {id:?}\n"));
