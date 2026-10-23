@@ -132,7 +132,10 @@ fn v4_registry_table_matches_iana() {
 /// prefix mark SSM (`ff3x::/32`, RFC 3306 §6 / RFC 4607 §1).
 fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
     // RFC 4291 §2.7 and RFC 7346: flags do not override the scope.
-    if !matches!(scope, 0x5 | 0x8 | 0xe) {
+    // Requirement change (review round 6): RFC 4291 §2.7 leaves unassigned
+    // scopes to administrators and RFC 7346 assigns 0x3/0x4, so 0x3-0xe are
+    // media scopes; only 0x0, 0x1, 0x2 and 0xf are refused.
+    if !(0x3..=0xe).contains(&scope) {
         return None;
     }
     // RFC 3306 §4 / RFC 7371 §4.1: P set without T is invalid,
@@ -160,10 +163,10 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
         return None;
     }
     match scope {
-        0x5 => Some(MulticastClass::AdminScoped),  // site-local
         0x8 | 0xe => Some(MulticastClass::Routed), // organization-local, global
-        // Reserved (0x0/0xf), local control (0x1/0x2), unsupported realm-/
-        // admin-local (0x3/0x4), or unassigned (0x6/0x7/0x9-0xd).
+        // realm-/admin-/site-local and administrator-defined unassigned scopes.
+        0x3..=0x7 | 0x9..=0xd => Some(MulticastClass::AdminScoped),
+        // Reserved (0x0/0xf) and local control (0x1/0x2).
         _ => None,
     }
 }
@@ -174,7 +177,7 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
 /// the production table.
 fn v6_is_permanent(flags: u8, scope: u8, body: [u16; 7]) -> bool {
     // Permanent (T=0), non-prefix, non-embedded-RP encodings only.
-    if flags & 0x7 != 0 || !matches!(scope, 0x5 | 0x8 | 0xe) {
+    if flags & 0x7 != 0 || !(0x3..=0xe).contains(&scope) {
         return false;
     }
     if body[..4].iter().all(|w| *w == 0) && body[4] == 0x0db8 {
@@ -1021,4 +1024,170 @@ fn neighbours_of_permanent_groups_stay_media_groups() {
     ] {
         assert_media(text);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round 6 (review requirement change): the complete IPv6 scope decision per
+// RFC 4291 §2.7 and RFC 7346 §2, for every scope nibble. Transient (T=1)
+// literals so permanent-ID rules do not interfere. These supersede the earlier
+// "refuse realm-local/admin-local/unassigned scopes" expectations.
+// ---------------------------------------------------------------------------
+fn assert_scope(text: &str, expected: Option<(MulticastClass, ())>, reason: RejectReason) {
+    let addr = ip(text);
+    let json = format!("\"{text}\"");
+    match expected {
+        Some((class, ())) => {
+            assert_eq!(classify(addr), Some(class), "{text}");
+            assert_eq!(MulticastGroup::try_from(addr).expect(text).class(), class);
+            let back: MulticastGroup = serde_json::from_str(&json).expect(text);
+            assert_eq!(back.addr(), addr, "{text}");
+        }
+        None => {
+            assert_eq!(classify(addr), None, "{text}");
+            let err = MulticastGroup::try_from(addr).expect_err(text);
+            assert_eq!(reason_of(&err), reason, "{text}");
+            assert!(serde_json::from_str::<MulticastGroup>(&json).is_err());
+        }
+    }
+}
+
+#[test]
+fn scope_0_reserved_is_rejected() {
+    assert_scope("ff10::1234", None, RejectReason::ReservedBlock);
+}
+#[test]
+fn scope_1_interface_local_is_rejected() {
+    assert_scope("ff11::1234", None, RejectReason::InterfaceLocalControl);
+}
+#[test]
+fn scope_2_link_local_is_rejected() {
+    assert_scope("ff12::1234", None, RejectReason::LinkLocalControl);
+}
+#[test]
+fn scope_3_realm_local_is_admin_scoped() {
+    assert_scope(
+        "ff13::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_4_admin_local_is_admin_scoped() {
+    assert_scope(
+        "ff14::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_5_site_local_is_admin_scoped() {
+    assert_scope(
+        "ff15::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_6_unassigned_is_admin_scoped() {
+    assert_scope(
+        "ff16::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_7_unassigned_is_admin_scoped() {
+    assert_scope(
+        "ff17::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_8_organization_local_is_routed() {
+    assert_scope(
+        "ff18::1234",
+        Some((MulticastClass::Routed, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_9_unassigned_is_admin_scoped() {
+    assert_scope(
+        "ff19::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_a_unassigned_is_admin_scoped() {
+    assert_scope(
+        "ff1a::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_b_unassigned_is_admin_scoped() {
+    assert_scope(
+        "ff1b::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_c_unassigned_is_admin_scoped() {
+    assert_scope(
+        "ff1c::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_d_unassigned_is_admin_scoped() {
+    assert_scope(
+        "ff1d::1234",
+        Some((MulticastClass::AdminScoped, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_e_global_is_routed() {
+    assert_scope(
+        "ff1e::1234",
+        Some((MulticastClass::Routed, ())),
+        RejectReason::ReservedBlock,
+    );
+}
+#[test]
+fn scope_f_reserved_is_rejected() {
+    assert_scope("ff1f::1234", None, RejectReason::ReservedBlock);
+}
+
+#[test]
+fn newly_accepted_scopes_keep_permanent_and_ssm_rules() {
+    // Reserved all-zero ID and well-known protocol groups stay refused.
+    for text in [
+        "ff03::",
+        "ff04::",
+        "ff06::",
+        "ff0d::",
+        "ff04::fb",
+        "ff03::101",
+        "ff0a::2:0",
+    ] {
+        assert_permanent(text);
+    }
+    // ff05::2 site-local-only row does not leak to other scopes.
+    assert_media("ff04::2");
+    // SSM at a newly accepted scope: allocatable ID accepted, reserved refused.
+    assert_eq!(
+        classify(ip("ff34::8000:1")),
+        Some(MulticastClass::SourceSpecific)
+    );
+    assert_eq!(classify(ip("ff34::1234")), None);
+    assert_eq!(
+        classify(ip("ff3a::8000:1")),
+        Some(MulticastClass::SourceSpecific)
+    );
 }
