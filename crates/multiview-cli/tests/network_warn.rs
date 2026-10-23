@@ -1,23 +1,80 @@
-use multiview_cli::network_warn::{has_host_networking, in_container, NetworkEnvironment};
+use multiview_cli::network_warn::{
+    config_uses_multicast, has_host_networking, in_container, NetworkEnvironment,
+};
+use multiview_config::{MultiviewConfig, SourceKind};
+use multiview_control::{emit_network_warnings, EngineStateSnapshot, NetworkMismatchView};
+use multiview_engine::EnginePublisher;
+use multiview_events::Event;
 use std::net::IpAddr;
 
-#[test]
-fn container_without_host_net_is_recognized_but_host_net_is_not_a_mismatch() {
-    let bridge: [IpAddr; 1] = ["172.17.0.2".parse().unwrap()];
-    let isolated = NetworkEnvironment {
-        dockerenv: true,
-        ipv4_addresses: Some(&bridge),
-        ..Default::default()
-    };
-    assert!(in_container(&isolated));
-    assert!(!has_host_networking(&isolated));
+fn warning_count(env: &NetworkEnvironment<'_>, multicast: bool) -> usize {
+    let mut config = MultiviewConfig::load_from_toml(include_str!("../../../examples/pip.toml"))
+        .expect("example config parses");
+    if multicast {
+        config.sources[0].kind = SourceKind::Ts {
+            url: "udp://@239.1.2.3:5000".to_owned(),
+        };
+    }
+    let publisher: EnginePublisher<EngineStateSnapshot, Event> = EnginePublisher::new(8);
+    let mut subscriber = publisher.subscribe();
+    let mismatch = (in_container(env)
+        && !has_host_networking(env)
+        && config_uses_multicast(&config))
+    .then_some(NetworkMismatchView);
+    let emitted = emit_network_warnings(&publisher, mismatch, 123);
+    let received = usize::from(subscriber.try_recv().is_ok());
+    assert_eq!(received, emitted, "exactly the emitted events are received");
+    assert!(subscriber.try_recv().is_err(), "no duplicate warning");
+    emitted
+}
 
-    let shared = NetworkEnvironment {
+#[test]
+fn equal_pid1_inodes_in_a_bridge_container_still_warn_once_for_multicast() {
+    let bridge: [IpAddr; 1] = ["172.17.0.2".parse().unwrap()];
+    let env = NetworkEnvironment {
         dockerenv: true,
         self_netns_inode: Some(5),
         pid1_netns_inode: Some(5),
         ipv4_addresses: Some(&bridge),
         ..Default::default()
     };
-    assert!(has_host_networking(&shared));
+    assert!(in_container(&env));
+    assert!(!has_host_networking(&env));
+    assert_eq!(warning_count(&env, true), 1);
+    assert_eq!(warning_count(&env, false), 0);
+}
+
+#[test]
+fn host_network_container_with_real_interfaces_does_not_warn() {
+    let addresses = ["192.168.1.24".parse().unwrap(), "10.10.3.15".parse().unwrap()];
+    let env = NetworkEnvironment {
+        dockerenv: true,
+        self_netns_inode: Some(5),
+        pid1_netns_inode: Some(5),
+        ipv4_addresses: Some(&addresses),
+        ..Default::default()
+    };
+    assert!(in_container(&env));
+    assert!(has_host_networking(&env));
+    assert_eq!(warning_count(&env, true), 0);
+}
+
+#[test]
+fn podman_and_ipv6_bridge_only_containers_warn_but_unknown_never_warns() {
+    for address in ["10.88.0.12", "fd00::abcd"] {
+        let addresses = [address.parse().unwrap()];
+        let env = NetworkEnvironment {
+            containerenv: true,
+            ipv4_addresses: Some(&addresses),
+            ..Default::default()
+        };
+        assert!(!has_host_networking(&env), "{address}");
+        assert_eq!(warning_count(&env, true), 1, "{address}");
+    }
+    assert_eq!(warning_count(&NetworkEnvironment::default(), true), 0);
+    let unreadable = NetworkEnvironment {
+        dockerenv: true,
+        ..Default::default()
+    };
+    assert_eq!(warning_count(&unreadable, true), 0);
 }
