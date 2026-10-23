@@ -128,10 +128,10 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
     }
     // RFC 3306 §4 / RFC 7371 §4.1: P set without T is invalid,
     // regardless of the independent X and R flags.
-    if flags & 0x3 == 0x2 {
+    if flags & 0x4 != 0 || flags & 0x3 == 0x2 {
         return None;
     }
-    if flags == 0x3 {
+    if flags & 0x7 == 0x3 {
         // RFC 3306 §4 / RFC 7371 §4.1: rsvd must be zero and plen <= 64;
         // ff2 flag bits are ignored on receipt.
         if body[0] & 0x0f00 != 0 || body[0] & 0xff > 64 {
@@ -584,15 +584,18 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ff4e::1", Some(Routed)),
         ("ff5e::1", Some(Routed)),
         ("ff6e::1", None), // P=1, T=0 (also R=1).
-        ("ff7e::1", Some(Routed)),
+        ("ff7e::1", None), // R=1 embedded-RP, unsupported.
         ("ff8e::1", Some(Routed)),
         ("ff9e::1", Some(Routed)),
         ("ffae::1", None), // P=1, T=0 with X=1.
-        ("ffbe::1", Some(Routed)),
+        ("ffbe::1", None), // RFC 7371 §4.1.2: X does not suppress SSM ID reservation.
+        ("ffbe::8000:1", Some(SourceSpecific)),
+        ("ffbe:40:2001:db8::1", Some(Routed)),
+        ("ffbe:0:1::8000:1", None),
         ("ffce::1", Some(Routed)),
         ("ffde::1", Some(Routed)),
         ("ffee::1", None), // P=1, T=0 with X=R=1.
-        ("fffe::1", Some(Routed)),
+        ("fffe::1", None), // R=1 embedded-RP, unsupported.
         // Even with flags=3 and a valid dynamic ID, unsupported scopes lose.
         ("ff30::8000:1", None),
         ("ff31::8000:1", None),
@@ -630,7 +633,10 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ff3e:41:2001:db8::8000:1", None),
         // RFC 7371 ff2 flags are ignored on receipt (not rsvd).
         ("ff3e:f000::8000:1", Some(SourceSpecific)),
+        ("ffbe:f000::8000:1", Some(SourceSpecific)),
         ("ff3e:f040:2001:db8::8000:1", Some(Routed)),
+        ("ff7e:40:2001:db8::8000:1", None),
+        ("fffe:40:2001:db8::8000:1", None),
     ];
     for &(text, expected) in CASES {
         let addr = ip(text);
