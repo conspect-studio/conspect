@@ -334,7 +334,9 @@ impl SrtAcType {
 /// keys must be namespaced (`user_*` or `multiview_*` with a nonempty suffix);
 /// bare keys — single letters especially — are rejected as unparseable, which
 /// a listener surfaces as [`SrtRejection::BadRequest`] (1400). Round-trips
-/// through [`StreamId`] and [`SrtConfig::to_url`] with `#` kept percent-escaped.
+/// through [`StreamId`] and [`SrtConfig::to_url`] with every non-unreserved
+/// byte percent-escaped (RFC 3986), so Unicode values survive the URL
+/// round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StreamIdParams {
     /// The `u` (user) value.
@@ -730,20 +732,29 @@ fn bracket_ipv6_host(host: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(host)
 }
 
-/// Strict RFC 3986 query-value encoding: preserve only unreserved ASCII bytes.
-/// Encode every other UTF-8 byte as uppercase `%XX`, including `+` (which
-/// libav's `ff_urldecode` would otherwise turn into a space).
+/// Percent-encode a URL query value per strict RFC 3986: every byte of the
+/// value's UTF-8 encoding that is not an *unreserved* character
+/// (`ALPHA` / `DIGIT` / `-` / `.` / `_` / `~`) is emitted as uppercase `%XX`,
+/// including `+` (which libav's `ff_urldecode` would otherwise turn into a
+/// space).
+///
+/// The encoder works on bytes, never on `char`s: a multi-byte UTF-8 sequence
+/// becomes one `%XX` per byte (`é` → `%C3%A9`), so any RFC 3986
+/// percent-decoder recovers the original string exactly. Mapping bytes to
+/// chars instead would turn each byte of a multi-byte sequence into its own
+/// Latin-1 code point and corrupt the value (`café` → `cafÃ©`).
 fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
+    for &byte in value.as_bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                // Unreserved bytes are all ASCII, so the conversion is exact.
                 out.push(char::from(byte));
             }
-            _ => {
+            other => {
                 out.push('%');
-                out.push(hex_digit(byte >> 4));
-                out.push(hex_digit(byte & 0x0F));
+                out.push(hex_digit(other >> 4));
+                out.push(hex_digit(other & 0x0F));
             }
         }
     }
