@@ -156,6 +156,9 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
             return (id >= 0x8000_0000).then_some(MulticastClass::SourceSpecific);
         }
     }
+    if v6_is_permanent(flags, scope, body) {
+        return None;
+    }
     match scope {
         0x5 => Some(MulticastClass::AdminScoped),  // site-local
         0x8 | 0xe => Some(MulticastClass::Routed), // organization-local, global
@@ -165,8 +168,53 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
     }
 }
 
+/// Independent hand-typed oracle for the IANA IPv6 "Variable Scope" permanent
+/// group IDs (plus the site-local-only rows): inclusive `(lo, hi)` pairs of the
+/// low 32 bits of `ff0X:0:0:0:0:0:<id>`. Typed from the registry, not read from
+/// the production table.
+fn v6_is_permanent(flags: u8, scope: u8, body: [u16; 7]) -> bool {
+    // Permanent (T=0), non-prefix, non-embedded-RP encodings only.
+    if flags & 0x7 != 0 || !matches!(scope, 0x5 | 0x8 | 0xe) {
+        return false;
+    }
+    if body[..4].iter().all(|w| *w == 0) && body[4] == 0x0db8 {
+        return true; // FF0X:0:0:0:0:DB8::/96 documentation (RFC 6676)
+    }
+    if body[..5].iter().any(|w| *w != 0) {
+        return false;
+    }
+    let id = (u32::from(body[5]) << 16) | u32::from(body[6]);
+    let variable: [(u32, u32); 17] = [
+        (0x0, 0x0),
+        (0xc, 0xc),
+        (0xfa, 0xfe),
+        (0x100, 0x178),
+        (0x181, 0x184),
+        (0x18c, 0x18c),
+        (0x201, 0x202),
+        (0x204, 0x206),
+        (0x2c0, 0x2ff),
+        (0x300, 0x300),
+        (0x400, 0x4ff),
+        (0x3486, 0x3486),
+        (0x6496, 0x64b5),
+        (0xbac0, 0xbac0),
+        (0x1_1000, 0x1_13ff),
+        (0x2_0000, 0x4_ffff),
+        (0xb_0000, 0xb_ffff),
+    ];
+    if variable.iter().any(|(lo, hi)| (*lo..=*hi).contains(&id)) {
+        return true;
+    }
+    // Site-local-only rows: ff05::2 all routers, ff05::1:3-1:5.
+    scope == 0x5 && (id == 0x2 || (0x1_0003..=0x1_0005).contains(&id))
+}
+
 /// The reason an IPv6 group is refused, given its flags/scope nibbles.
-fn v6_reason(_flags: u8, scope: u8) -> RejectReason {
+fn v6_reason(flags: u8, scope: u8, body: [u16; 7]) -> RejectReason {
+    if v6_is_permanent(flags, scope, body) {
+        return RejectReason::PermanentGroup;
+    }
     match scope {
         0x1 => RejectReason::InterfaceLocalControl,
         0x2 => RejectReason::LinkLocalControl,
@@ -271,7 +319,7 @@ proptest! {
             }
             Err(RejectedGroup::Rejected { class, reason, .. }) => {
                 prop_assert_eq!(class, expected, "ip={:?}", addr);
-                prop_assert_eq!(reason, v6_reason(flags, scope), "ip={:?}", addr);
+                prop_assert_eq!(reason, v6_reason(flags, scope, body), "ip={:?}", addr);
             }
             Err(other) => prop_assert!(false, "unexpected refusal {:?} for {:?}", other, addr),
         }
@@ -397,7 +445,7 @@ const V4_ACCEPTED: &[(&str, MulticastClass)] = &[
 const V6_ACCEPTED: &[(&str, MulticastClass)] = &[
     ("ff08::1:10", MulticastClass::Routed),
     ("ff0e::1", MulticastClass::Routed),
-    ("ff05::1:3", MulticastClass::AdminScoped),
+    ("ff05::1:100", MulticastClass::AdminScoped),
     ("ff05::4000:1", MulticastClass::AdminScoped),
     ("ff3e::8000:2", MulticastClass::SourceSpecific),
     ("ff3e::8000:1", MulticastClass::SourceSpecific),
@@ -417,6 +465,10 @@ const REJECTED: &[(&str, RejectReason)] = &[
     ("ff01::1234", RejectReason::InterfaceLocalControl),
     ("ff02::1", RejectReason::LinkLocalControl),
     ("ff02::fb", RejectReason::LinkLocalControl),
+    // IANA permanent variable-scope group IDs at the media scopes.
+    ("ff05::", RejectReason::PermanentGroup),
+    ("ff08::", RejectReason::PermanentGroup),
+    ("ff0e::", RejectReason::PermanentGroup),
     // The IPv4 link-local control block (RFC 5771 §4) — never a media group.
     ("224.0.0.0", RejectReason::LinkLocalControl),
     ("224.0.0.251", RejectReason::LinkLocalControl),
@@ -847,4 +899,126 @@ fn iana_top_level_blocks_first_and_last() {
         Ipv4Addr::new(240, 0, 0, 0).to_bits(),
         "walk ends at 239.255.255.255"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 5: IANA IPv6 Multicast Address Space registry, "Variable Scope" and
+// "Site-Local Scope" permanent assignments (RFC 4291 §2.7, RFC 3307).
+// Literals typed from the registry; independent of the production table.
+// ---------------------------------------------------------------------------
+fn assert_permanent(text: &str) {
+    let err = MulticastGroup::try_from(ip(text))
+        .expect_err(&format!("{text} is a permanent group, not a media group"));
+    assert_eq!(reason_of(&err), RejectReason::PermanentGroup, "{text}");
+    assert_eq!(classify(ip(text)), None, "{text}");
+    let json = format!("\"{text}\"");
+    assert!(
+        serde_json::from_str::<MulticastGroup>(&json).is_err(),
+        "{text} must not deserialize"
+    );
+}
+
+fn assert_media(text: &str) {
+    assert!(MulticastGroup::try_from(ip(text)).is_ok(), "{text}");
+    let json = format!("\"{text}\"");
+    assert!(
+        serde_json::from_str::<MulticastGroup>(&json).is_ok(),
+        "{text}"
+    );
+}
+
+#[test]
+fn reserved_all_zero_group_id_is_rejected_at_every_media_scope() {
+    // RFC 4291 §2.7: "FF0x:0:0:0:0:0:0:0 Reserved Multicast Address".
+    for text in ["ff05::", "ff08::", "ff0e::", "ff05:0:0:0:0:0:0:0"] {
+        assert_permanent(text);
+    }
+}
+
+#[test]
+fn reserved_zero_id_with_x_flag_is_rejected_but_transient_is_not() {
+    assert_permanent("ff85::"); // X=1, T=0: still permanent
+    assert_permanent("ff8e::");
+    assert_media("ff1e::"); // T=1 keeps the round-3 rule
+}
+
+#[test]
+fn all_routers_is_rejected_at_site_local_only() {
+    // IANA site-local registry: FF05::2 All Routers (RFC 4291 §2.7.1).
+    assert_permanent("ff05::2");
+    // Not registered at organization/global scope.
+    assert_media("ff08::2");
+    assert_media("ff0e::2");
+}
+
+#[test]
+fn mdns_ntp_ssdp_matter_groups_are_rejected_at_each_scope() {
+    for scope in ["ff05", "ff08", "ff0e"] {
+        assert_permanent(&format!("{scope}::fb")); // mDNSv6, RFC 6762
+        assert_permanent(&format!("{scope}::101")); // NTP, RFC 5905
+        assert_permanent(&format!("{scope}::c")); // SSDP
+        assert_permanent(&format!("{scope}::fa")); // Matter
+    }
+}
+
+#[test]
+fn well_known_protocol_group_classes_are_rejected() {
+    for text in [
+        "ff0e::fc",      // ALL_MPL_FORWARDERS, RFC 7731
+        "ff0e::fd",      // All CoAP Nodes, RFC 7252
+        "ff0e::fe",      // All CoRE RDs, RFC 9176
+        "ff0e::100",     // VMTP managers
+        "ff08::178",     // IFD Service, end of the 100-178 run
+        "ff0e::181",     // PTP-primary
+        "ff0e::184",     // PTP-alternate3
+        "ff0e::18c",     // All ACs, RFC 5415
+        "ff0e::201",     // rwho
+        "ff0e::206",     // multicast chat
+        "ff0e::2c0",     // Garmin Marine
+        "ff0e::2ff",     // Garmin Marine end
+        "ff0e::300",     // Mbus/IPv6, RFC 3259
+        "ff0e::400",     // Cell Broadcast Encapsulation
+        "ff0e::4ff",     // Civic Telemetry
+        "ff0e::3486",    // IFSF Heartbeat
+        "ff0e::6496",    // ISO 25750
+        "ff0e::64b5",    // ISO 25750 end
+        "ff0e::bac0",    // BACnet
+        "ff0e::1:1000",  // SLPv2, RFC 3111 (/118)
+        "ff0e::1:13ff",  // SLPv2 end
+        "ff0e::2:0",     // Multimedia conference calls
+        "ff0e::2:7ffe",  // SAPv1
+        "ff0e::2:8000",  // SAP dynamic
+        "ff0e::3:ffff",  // DALI
+        "ff0e::4:0",     // KNX
+        "ff08::b:0",     // Bitcoin SV
+        "ff0e::b:ffff",  // Bitcoin SV end
+        "ff0e::db8:0:1", // documentation, RFC 6676
+        "ff05::1:3",     // All_DHCP_Servers, RFC 9915 (site-local)
+        "ff05::1:4",     // deprecated (site-local)
+        "ff05::1:5",     // SL-MANET-ROUTERS, RFC 6621
+    ] {
+        assert_permanent(text);
+    }
+}
+
+#[test]
+fn neighbours_of_permanent_groups_stay_media_groups() {
+    for text in [
+        "ff0e::1",
+        "ff05::1",
+        "ff08::1:10",
+        "ff0e::1:1400",
+        "ff0e::6495",
+        "ff0e::64b6",
+        "ff0e::bac1",
+        "ff0e::5:0",
+        "ff0e::c:0",
+        "ff0e:0:0:0:1::fb", // non-zero middle bits are not the permanent group
+        "ff05::1:6",
+        "ff1e::fb", // T=1 transient: round-3 rules
+        "ff1e::101",
+        "ff3e::8000:fb", // SSM keeps its own rules
+    ] {
+        assert_media(text);
+    }
 }

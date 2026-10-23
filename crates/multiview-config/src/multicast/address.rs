@@ -360,6 +360,10 @@ pub enum RejectReason {
     /// A block IANA has not allocated for media (reserved control slices, the
     /// IPv6 reserved scopes, the reserved SSM heads).
     ReservedBlock,
+    /// An IPv6 permanent (T=0) group ID IANA assigned to a protocol or
+    /// reserved (`ff0X::` all-zero ID, RFC 4291 §2.7; mDNS, NTP, ...), never
+    /// a media group at any scope.
+    PermanentGroup,
     /// A source-specific (`232/8`, `ff3x::/32`) group configured with no
     /// sources.
     SourcesRequired,
@@ -378,6 +382,9 @@ impl fmt::Display for RejectReason {
                 "interface-local control block (ff01::/16) is not a media group"
             }
             Self::ReservedBlock => "reserved block, not allocated for media",
+            Self::PermanentGroup => {
+                "IANA permanently assigned or reserved IPv6 group ID is not a media group"
+            }
             Self::SourcesRequired => "a source-specific (232/8, ff3x::/32) group requires sources",
             Self::Parse => "not a valid address literal",
         })
