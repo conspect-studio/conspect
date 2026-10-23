@@ -140,10 +140,22 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
     }
     // RFC 3306 §4 / RFC 7371 §4.1: P set without T is invalid,
     // regardless of the independent X and R flags.
-    if flags & 0x4 != 0 || flags & 0x3 == 0x2 {
+    if flags & 0x3 == 0x2 {
         return None;
     }
-    if flags & 0x7 == 0x3 {
+    // RFC 3956 / RFC 7371 §4.2: R=1 needs P=T=1 (0x7/0xf). Then the low
+    // nibble of octet 2 is the RIID (1..=15) and plen is 1..=64. ff2 is
+    // ignored on receipt. The group is an ordinary ASM group of its scope.
+    if flags & 0x4 != 0 {
+        if flags & 0x7 != 0x7 {
+            return None;
+        }
+        let riid = (body[0] >> 8) & 0x0f;
+        let plen = body[0] & 0xff;
+        if riid == 0 || plen == 0 || plen > 64 {
+            return None;
+        }
+    } else if flags & 0x7 == 0x3 {
         // RFC 3306 §4 / RFC 7371 §4.1: rsvd must be zero and plen <= 64;
         // ff2 flag bits are ignored on receipt.
         if body[0] & 0x0f00 != 0 || body[0] & 0xff > 64 {
@@ -1188,4 +1200,175 @@ fn newly_accepted_scopes_keep_permanent_and_ssm_rules() {
         classify(ip("ff3a::8000:1")),
         Some(MulticastClass::SourceSpecific)
     );
+}
+
+/// Regression (review round 7): a valid global embedded-RP ASM group is a
+/// normal ASM group to a receiving host (RFC 3956 §3, RFC 7371 §4.2).
+#[test]
+fn ipv6_embedded_rp_groups_are_asm_and_malformed_ones_rejected() {
+    use MulticastClass::{AdminScoped, Routed};
+    // Valid: R=P=T=1 (0x7, and 0xf with X), RIID 1..=15, plen 1..=64.
+    for (text, class) in [
+        ("ff7e:140:2001:470:1234:5678:8000:1", Routed), // reviewer's address
+        ("ff7e:140:2001:470:1234:5678:8000:0", Routed),
+        ("ff7e:f01:2001:470::1", Routed), // RIID 15, plen 1
+        ("ff75:140:2001:470::1", AdminScoped),
+        ("ff78:140:2001:470::1", Routed),
+        ("fffe:140:2001:470::1", Routed), // X=1: fff0::/12 is embedded-RP
+        ("ff7e:f140:2001:470::1", Routed), // ff2 ignored on receipt
+    ] {
+        let group = MulticastGroup::try_from(ip(text)).expect(text);
+        assert_eq!(group.class(), class, "{text}");
+        assert!(!group.requires_sources(), "{text}");
+        assert_eq!(group.validate(&[]), None, "{text}");
+    }
+    // Malformed: R=1 without P and/or T, plen 0 / >64, RIID 0.
+    for text in [
+        "ff4e:140:2001:470::1",
+        "ff5e:140:2001:470::1",
+        "ff6e:140:2001:470::1",
+        "ffce:140:2001:470::1",
+        "ffde:140:2001:470::1",
+        "ffee:140:2001:470::1",
+        "ff7e:100:2001:470::1",
+        "ff7e:141:2001:470::1",
+        "ff7e:1ff:2001:470::1",
+        "ff7e:040:2001:470::1",
+        "ff7e:f040:2001:470::1",
+        "fffe:040:2001:470::1",
+    ] {
+        assert_eq!(classify(ip(text)), None, "{text}");
+        assert!(MulticastGroup::try_from(ip(text)).is_err(), "{text}");
+    }
+    // Scope still gates: embedded-RP at link-local / reserved scope.
+    for text in [
+        "ff72:140:2001:470::1",
+        "ff71:140:2001:470::1",
+        "ff7f:140:2001:470::1",
+    ] {
+        assert_eq!(classify(ip(text)), None, "{text}");
+    }
+}
+
+/// Closing audit: one literal row per IPv6 flags nibble (X R P T bits per
+/// RFC 7371 §2/§4), probed with a scope-0xe group whose body is valid for the
+/// nibble's encoding. Never derived from production code.
+#[test]
+fn ipv6_flags_nibble_decision_table() {
+    use MulticastClass::{Routed, SourceSpecific};
+    // (flags, probe, decision, RFC clause)
+    const TABLE: [(u8, &str, Option<MulticastClass>, &str); 16] = [
+        (
+            0x0,
+            "ff0e::1:2:3",
+            Some(Routed),
+            "RFC 4291 §2.7: permanent ASM",
+        ),
+        (
+            0x1,
+            "ff1e::1",
+            Some(Routed),
+            "RFC 4291 §2.7: T=1 transient ASM",
+        ),
+        (
+            0x2,
+            "ff2e::1",
+            None,
+            "RFC 3306 §4/7371 §4.1: P=1 requires T=1",
+        ),
+        (
+            0x3,
+            "ff3e::8000:1",
+            Some(SourceSpecific),
+            "RFC 3306 §6/4607: plen 0 SSM",
+        ),
+        (
+            0x4,
+            "ff4e:140:2001:470::1",
+            None,
+            "RFC 3956 §3/7371 §4.2: R=1 requires P=T=1",
+        ),
+        (
+            0x5,
+            "ff5e:140:2001:470::1",
+            None,
+            "RFC 3956 §3/7371 §4.2: R=1 requires P=1",
+        ),
+        (
+            0x6,
+            "ff6e:140:2001:470::1",
+            None,
+            "RFC 3956 §3/7371 §4.2: R=1 requires T=1",
+        ),
+        (
+            0x7,
+            "ff7e:140:2001:470::1",
+            Some(Routed),
+            "RFC 3956 §3: embedded-RP ASM",
+        ),
+        (
+            0x8,
+            "ff8e::1:2:3",
+            Some(Routed),
+            "RFC 7371 §2: X ignored, permanent ASM",
+        ),
+        (
+            0x9,
+            "ff9e::1",
+            Some(Routed),
+            "RFC 7371 §2: X ignored, transient ASM",
+        ),
+        (
+            0xa,
+            "ffae::1",
+            None,
+            "RFC 7371 §4.1: P=1 requires T=1 (X set)",
+        ),
+        (
+            0xb,
+            "ffbe::8000:1",
+            Some(SourceSpecific),
+            "RFC 7371 §4.1.2: ffbx::/32 SSM",
+        ),
+        (
+            0xc,
+            "ffce:140:2001:470::1",
+            None,
+            "RFC 7371 §4.2: R=1 requires P=T=1",
+        ),
+        (
+            0xd,
+            "ffde:140:2001:470::1",
+            None,
+            "RFC 7371 §4.2: R=1 requires P=T=1",
+        ),
+        (
+            0xe,
+            "ffee:140:2001:470::1",
+            None,
+            "RFC 7371 §4.2: R=1 requires P=T=1",
+        ),
+        (
+            0xf,
+            "fffe:140:2001:470::1",
+            Some(Routed),
+            "RFC 7371 §4.2: fff0::/12 embedded-RP",
+        ),
+    ];
+    for (flags, text, decision, clause) in TABLE {
+        let addr = ip(text);
+        let IpAddr::V6(v6) = addr else {
+            panic!("{text}")
+        };
+        assert_eq!(
+            v6.octets()[1] >> 4,
+            flags,
+            "{text} probe has its row's nibble"
+        );
+        assert_eq!(
+            classify(addr),
+            decision,
+            "flags {flags:#x} {text}: {clause}"
+        );
+    }
 }
