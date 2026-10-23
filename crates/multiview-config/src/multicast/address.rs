@@ -626,11 +626,64 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     // organization-local (0x8), and global (0xe). Every other nibble is either
     // reserved (0x0/0xf), local control (0x1/0x2), unsupported realm-local
     // (0x3)/admin-local (0x4), or unassigned (0x6/0x7/0x9–0xd).
+    // IANA IPv6 Multicast Address Space: permanently assigned (T=0) group IDs
+    // are protocol groups at every scope, never media (RFC 4291 §2.7).
+    if flags.trailing_zeros() >= 3 && is_permanent_group_v6(addr, scope) {
+        return None;
+    }
     match scope {
         0x5 => Some(MulticastClass::AdminScoped),
         0x8 | 0xe => Some(MulticastClass::Routed),
         _ => None,
     }
+}
+
+/// Inclusive low-32-bit group-ID ranges of `ff0X:0:0:0:0:0:<id>` the IANA
+/// registry's "Variable Scope Multicast Addresses" table assigns or reserves
+/// for every scope. `0x0` is "Reserved Multicast Address" (RFC 4291 §2.7);
+/// `0xfb` mDNSv6 (RFC 6762); `0x101` NTP (RFC 5905); the rest are the
+/// registered protocol rows and "variable scope allocation" blocks.
+const V6_PERMANENT_IDS: &[(u32, u32)] = &[
+    (0x0, 0x0),
+    (0xc, 0xc),
+    (0xfa, 0xfe),
+    (0x100, 0x178),
+    (0x181, 0x184),
+    (0x18c, 0x18c),
+    (0x201, 0x202),
+    (0x204, 0x206),
+    (0x2c0, 0x2ff),
+    (0x300, 0x300),
+    (0x400, 0x4ff),
+    (0x3486, 0x3486),
+    (0x6496, 0x64b5),
+    (0xbac0, 0xbac0),
+    (0x1_1000, 0x1_13ff), // SLPv2 ff0X::1:1000/118, RFC 3111
+    (0x2_0000, 0x4_ffff), // SAP 2:x, DALI 3:x, KNX 4:x
+    (0xb_0000, 0xb_ffff), // Bitcoin SV node groups
+];
+
+/// Whether a T=0, non-prefix `addr` carries a permanently assigned or
+/// reserved group ID at `scope`.
+fn is_permanent_group_v6(addr: Ipv6Addr, scope: u8) -> bool {
+    let seg = addr.segments();
+    // ff0X:0:0:0:0:db8::/96 documentation addresses (RFC 6676).
+    if seg[1..5] == [0, 0, 0, 0] && seg[5] == 0x0db8 {
+        return true;
+    }
+    if seg[1..6] != [0, 0, 0, 0, 0] {
+        return false;
+    }
+    let id = (u32::from(seg[6]) << 16) | u32::from(seg[7]);
+    if V6_PERMANENT_IDS
+        .iter()
+        .any(|(lo, hi)| (*lo..=*hi).contains(&id))
+    {
+        return true;
+    }
+    // Site-local-only rows: ff05::2 All Routers (RFC 4291 §2.7.1),
+    // ff05::1:3-1:5 DHCP servers / deprecated / SL-MANET-ROUTERS.
+    scope == 0x5 && (id == 0x2 || (0x1_0003..=0x1_0005).contains(&id))
 }
 
 /// RFC 4607 §1 and RFC 3307 §§4.1–4.3: SSM group IDs `0–0x3fff_ffff`
@@ -663,9 +716,15 @@ fn reason_for(addr: IpAddr) -> RejectReason {
                 let [_, nibbles, ..] = v6.octets();
                 let scope = nibbles & 0x0f;
                 // The reason is scope-specific even when the SSM flag is set.
+                let flags = nibbles >> 4;
                 match scope {
                     0x1 => RejectReason::InterfaceLocalControl,
                     0x2 => RejectReason::LinkLocalControl,
+                    0x5 | 0x8 | 0xe
+                        if flags.trailing_zeros() >= 3 && is_permanent_group_v6(v6, scope) =>
+                    {
+                        RejectReason::PermanentGroup
+                    }
                     _ => RejectReason::ReservedBlock,
                 }
             } else {
