@@ -14,9 +14,10 @@
 //!   the assigned multicast scopes — site-local (`ff05::/16`), organization-local
 //!   (`ff08::/16`), or global (`ff0e::/16`).
 //! * IPv4 (legacy peer): the IANA/RFC-5771 blocks minus the control and reserved
-//!   slices — in practice `224.0.1.0/24`, `224.2/16` (SDP/SAP), `224.3/16`
-//!   and `224.4/16` (AD-HOC II), `232/8` (SSM), `233/8` (GLOP/AD-HOC III),
-//!   and admin-scoped `239/8`.
+//!   slices — in practice `224.0.1.0/24` (internetwork control), AD-HOC I
+//!   `224.0.2.0`–`224.0.255.255`, `224.2/16` (SDP/SAP), `224.3/16` and `224.4/16`
+//!   (AD-HOC II), DIS `224.252/14`, `232/8` (SSM), `233/8` (GLOP/AD-HOC III),
+//!   unicast-prefix-based `234/8` (RFC 6034), and admin-scoped `239/8`.
 //!
 //! ## What is refused (and why)
 //!
@@ -27,9 +28,9 @@
 //!   `ff01::/16` (RFC 4291 §2.7).
 //! * [`RejectReason::ReservedBlock`] — blocks IANA has never allocated for a
 //!   media group: `232.0.0.0/24` (the reserved head of the SSM block,
-//!   RFC 4607 §7), `233.252.0.0/24` (`MCAST-TEST-NET`, RFC 6676), the AD-HOC
-//!   control block `224.0.2.0/16`, the reserved `224.5.0.0`–`231.255.255.255`
-//!   and `234.0.0.0`–`238.255.255.255`, the IPv6 reserved scopes `0x0`, `0x3`,
+//!   RFC 4607 §7), `233.252.0.0/24` (`MCAST-TEST-NET`, RFC 6676), the IANA
+//!   reserved `224.1/16`, `224.5.0.0`–`224.251.255.255`,
+//!   `225.0.0.0`–`231.255.255.255` and `235.0.0.0`–`238.255.255.255`, the IPv6 reserved scopes `0x0`, `0x3`,
 //!   and `0xf` (plus unsupported and unassigned scopes), and
 //!   `ff3x::4000:0000`.
 //! * [`RejectReason::NotMulticast`] — anything outside `224.0.0.0/4` and
@@ -486,9 +487,16 @@ pub const V4_BLOCKS: &[V4Block] = &[
     (0xe0_00_00_00, 24, None),
     // RFC 5771 §3/§5: Internetwork Control, 224.0.1.0–224.0.1.255.
     (0xe0_00_01_00, 24, Some(MulticastClass::Routed)),
-    // RFC 5771 §3/§6: AD-HOC I, 224.0.2.0–224.0.255.255;
-    // RFC 5771 §3: reserved, 224.1.0.0–224.1.255.255.
-    (0xe0_00_02_00, 16, None),
+    // IANA "AD-HOC Block I", 224.0.2.0–224.0.255.255 (allocated; registered
+    // groups), tiled exactly by these seven CIDR rows.
+    (0xe0_00_02_00, 23, Some(MulticastClass::Routed)),
+    (0xe0_00_04_00, 22, Some(MulticastClass::Routed)),
+    (0xe0_00_08_00, 21, Some(MulticastClass::Routed)),
+    (0xe0_00_10_00, 20, Some(MulticastClass::Routed)),
+    (0xe0_00_20_00, 19, Some(MulticastClass::Routed)),
+    (0xe0_00_40_00, 18, Some(MulticastClass::Routed)),
+    (0xe0_00_80_00, 17, Some(MulticastClass::Routed)),
+    // IANA "RESERVED", 224.1.0.0–224.1.255.255.
     (0xe0_01_00_00, 16, None),
     // RFC 5771 §3/§7: SDP/SAP, 224.2.0.0–224.2.255.255.
     (0xe0_02_00_00, 16, Some(MulticastClass::Routed)),
@@ -496,8 +504,11 @@ pub const V4_BLOCKS: &[V4Block] = &[
     // Separate aligned /16s: 224.3.0.0/15 would also include 224.2/16.
     (0xe0_03_00_00, 16, Some(MulticastClass::Routed)),
     (0xe0_04_00_00, 16, Some(MulticastClass::Routed)),
-    // RFC 5771 §3 / IANA registry: 224.5.0.0–224.255.255.255 RESERVED.
+    // IANA "RESERVED", 224.5.0.0–224.251.255.255 (the /8 backstop; the
+    // allocated rows above are narrower).
     (0xe0_00_00_00, 8, None),
+    // IANA "DIS Transient Groups", 224.252.0.0–224.255.255.255 (224.252/14).
+    (0xe0_fc_00_00, 14, Some(MulticastClass::Routed)),
     // RFC 5771 §3 / IANA registry: 225.0.0.0–231.255.255.255 RESERVED.
     (0xe1_00_00_00, 8, None),
     (0xe2_00_00_00, 7, None),
@@ -512,8 +523,11 @@ pub const V4_BLOCKS: &[V4Block] = &[
     (0xe9_00_00_00, 8, Some(MulticastClass::Routed)),
     // RFC 5771 §9.2: MCAST-TEST-NET, 233.252.0.0–233.252.0.255.
     (0xe9_fc_00_00, 24, None),
-    // RFC 5771 §3 / IANA registry: 234.0.0.0–238.255.255.255 RESERVED.
-    (0xea_00_00_00, 7, None),
+    // IANA "Unicast-Prefix-based IPv4 Multicast Addresses" (RFC 6034),
+    // 234.0.0.0–234.255.255.255.
+    (0xea_00_00_00, 8, Some(MulticastClass::Routed)),
+    // IANA "Scoped Multicast Ranges": 235.0.0.0–238.255.255.255 Reserved.
+    (0xeb_00_00_00, 8, None),
     (0xec_00_00_00, 7, None),
     (0xee_00_00_00, 8, None),
     // RFC 5771 §3/§10: admin-scoped, 239.0.0.0–239.255.255.255.

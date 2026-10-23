@@ -842,5 +842,9 @@ fn iana_top_level_blocks_first_and_last() {
             "{name}: midpoint {mid}"
         );
     }
-    assert_eq!(next, 0, "walk ends at 239.255.255.255");
+    assert_eq!(
+        next,
+        Ipv4Addr::new(240, 0, 0, 0).to_bits(),
+        "walk ends at 239.255.255.255"
+    );
 }
