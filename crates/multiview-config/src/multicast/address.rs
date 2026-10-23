@@ -550,8 +550,9 @@ fn in_net_v4_bits(bits: u32, base: u32, prefix: u8) -> bool {
 ///
 /// The scope is validated **before** the SSM flag: RFC 4291 §2.7 / RFC 7346
 /// do not let `ff3x` override an interface-local, link-local or reserved scope.
-/// Flags `0x3` with a zero plen and prefix mark SSM (`ff3x::/32`,
-/// RFC 3306 §6 / RFC 4607 §1); other valid prefix-based groups use their scope.
+/// Flags `0x3` or `0xb` with zero plen and prefix mark SSM (`ff3x::/32`
+/// or `ffbx::/32`, RFC 3306 §6 / RFC 7371 §4.1.2); other valid
+/// prefix-based groups use their scope. Embedded-RP flags are unsupported.
 /// Otherwise site-local (`0x5`) is the admin-scoped media scope,
 /// organization-local (`0x8`) and global (`0xe`) are routed, and every other
 /// nibble — reserved `0x0`/`0xf`, interface-local (`0x1`), link-local (`0x2`),
@@ -569,7 +570,18 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
     if !matches!(scope, 0x5 | 0x8 | 0xe) {
         return None;
     }
-    if flags == 0x3 {
+    // RFC 3306 §4 / RFC 7371 §4.1: decide *every* flag nibble. X
+    // is independent; R marks embedded-RP (RFC 3956), unsupported here.
+    // P=1,T=0 is invalid even with X/R set. Only 3/b are prefix-based
+    // forms whose zero-plen encoding can denote SSM.
+    let prefix_based = match flags {
+        0x0 | 0x1 | 0x8 | 0x9 => false, // ordinary ASM (X may be set)
+        0x3 | 0xb => true,              // prefix-based or SSM (X may be set)
+        // Remaining flags: P=1,T=0 is invalid; R=1 needs embedded-RP
+        // handling, which is unsupported. Also defensive for future values.
+        _ => return None,
+    };
+    if prefix_based {
         // RFC 3306 §4 as updated by RFC 7371 §4.1: the low four bits of
         // octet 2 are reserved and must be zero, and plen cannot exceed 64.
         // RFC 7371 §3/§4.1 requires ignoring ff2 (the high four bits) on
@@ -578,11 +590,16 @@ fn classify_v6(addr: Ipv6Addr) -> Option<MulticastClass> {
         if octets[2] & 0x0f != 0 || octets[3] > 64 {
             return None;
         }
-        // RFC 3306 §6 and RFC 4607 §1: only zero plen and zero network
-        // prefix denote ff3x::/32 SSM. Prefix-based groups are ASM.
-        if octets[2..12].iter().all(|byte| *byte == 0) {
+        // RFC 3306 §6 / RFC 4607 §1: plen=0 is exclusively the SSM
+        // encoding, which also requires every network-prefix byte to be
+        // zero. A malformed zero-plen prefix cannot fall through as ASM.
+        if octets[3] == 0 {
+            if octets[4..12].iter().any(|byte| *byte != 0) {
+                return None;
+            }
             return (!is_reserved_ssm_group_id(addr)).then_some(MulticastClass::SourceSpecific);
         }
+        // A valid nonzero plen denotes prefix-based ASM, regardless of ID.
     }
     // Only the scopes the standards name are media groups: site-local (0x5),
     // organization-local (0x8), and global (0xe). Every other nibble is either

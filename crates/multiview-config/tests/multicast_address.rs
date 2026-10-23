@@ -139,7 +139,7 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
         }
         // RFC 3306 §6: zero plen requires zero prefix; only that encoding
         // belongs to the RFC 4607 SSM range, never to prefix-based ASM.
-        if body[0] & 0xff == 0 {
+        if body[0].to_be_bytes()[1] == 0 {
             if body[1..5].iter().any(|word| *word != 0) {
                 return None;
             }
@@ -581,8 +581,8 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ff0e::1", Some(Routed)),
         ("ff1e::1", Some(Routed)),
         ("ff2e::1", None), // P=1, T=0 violates RFC 3306 §4.
-        ("ff4e::1", Some(Routed)),
-        ("ff5e::1", Some(Routed)),
+        ("ff4e::1", None), // R=1 unsupported.
+        ("ff5e::1", None), // R=1 unsupported.
         ("ff6e::1", None), // P=1, T=0 (also R=1).
         ("ff7e::1", None), // R=1 embedded-RP, unsupported.
         ("ff8e::1", Some(Routed)),
@@ -590,10 +590,13 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ffae::1", None), // P=1, T=0 with X=1.
         ("ffbe::1", None), // RFC 7371 §4.1.2: X does not suppress SSM ID reservation.
         ("ffbe::8000:1", Some(SourceSpecific)),
+        ("ffbe::7fff:ffff", None),
+        ("ffbe::ffff:ffff", Some(SourceSpecific)),
+        ("ffbe::8000:2", Some(SourceSpecific)),
         ("ffbe:40:2001:db8::1", Some(Routed)),
         ("ffbe:0:1::8000:1", None),
-        ("ffce::1", Some(Routed)),
-        ("ffde::1", Some(Routed)),
+        ("ffce::1", None), // R=1 unsupported.
+        ("ffde::1", None), // R=1 unsupported.
         ("ffee::1", None), // P=1, T=0 with X=R=1.
         ("fffe::1", None), // R=1 embedded-RP, unsupported.
         // Even with flags=3 and a valid dynamic ID, unsupported scopes lose.
@@ -630,10 +633,13 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ff3e:40:2001:db8::1", Some(Routed)),
         // rsvd!=0 and plen>64 reject, irrespective of prefix and ID.
         ("ff3e:100::8000:1", None),
+        ("ffbe:100::8000:1", None),
         ("ff3e:41:2001:db8::8000:1", None),
+        ("ffbe:41:2001:db8::8000:1", None),
         // RFC 7371 ff2 flags are ignored on receipt (not rsvd).
         ("ff3e:f000::8000:1", Some(SourceSpecific)),
         ("ffbe:f000::8000:1", Some(SourceSpecific)),
+        ("ffbe:f000::1", None),
         ("ff3e:f040:2001:db8::8000:1", Some(Routed)),
         ("ff7e:40:2001:db8::8000:1", None),
         ("fffe:40:2001:db8::8000:1", None),
@@ -642,14 +648,30 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         let addr = ip(text);
         assert_eq!(classify(addr), expected, "{text}");
         match expected {
-            Some(class) => assert_eq!(MulticastGroup::try_from(addr).expect(text).class(), class, "{text}"),
+            Some(class) => assert_eq!(
+                MulticastGroup::try_from(addr).expect(text).class(),
+                class,
+                "{text}"
+            ),
             None => assert!(MulticastGroup::try_from(addr).is_err(), "{text}"),
         }
     }
-    for text in ["ff3e:0:1::8000:1", "ff3e::1:8000:1", "ff35::1:0:8000:1"] {
+    for text in [
+        "ff3e:0:1::8000:1",
+        "ff3e::1:8000:1",
+        "ff35::1:0:8000:1",
+        "ffbe:0:1::8000:1",
+    ] {
         let addr = ip(text);
-        assert_eq!(MulticastGroup::try_from(addr).unwrap_err().reason(), RejectReason::ReservedBlock, "{text}");
-        assert!(serde_json::from_str::<MulticastGroup>(&format!("\"{text}\"")).is_err(), "{text}");
+        assert_eq!(
+            MulticastGroup::try_from(addr).unwrap_err().reason(),
+            RejectReason::ReservedBlock,
+            "{text}"
+        );
+        assert!(
+            serde_json::from_str::<MulticastGroup>(&format!("\"{text}\"")).is_err(),
+            "{text}"
+        );
     }
 }
 
