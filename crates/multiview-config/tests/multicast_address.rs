@@ -126,6 +126,11 @@ fn v6_oracle(flags: u8, scope: u8, body: [u16; 7]) -> Option<MulticastClass> {
     if !matches!(scope, 0x5 | 0x8 | 0xe) {
         return None;
     }
+    // RFC 3306 §4 / RFC 7371 §4.1: P set without T is invalid,
+    // regardless of the independent X and R flags.
+    if flags & 0x3 == 0x2 {
+        return None;
+    }
     if flags == 0x3 {
         // RFC 3306 §4 / RFC 7371 §4.1: rsvd must be zero and plen <= 64;
         // ff2 flag bits are ignored on receipt.
@@ -575,6 +580,19 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ff08::1", Some(Routed)),
         ("ff0e::1", Some(Routed)),
         ("ff1e::1", Some(Routed)),
+        ("ff2e::1", None), // P=1, T=0 violates RFC 3306 §4.
+        ("ff4e::1", Some(Routed)),
+        ("ff5e::1", Some(Routed)),
+        ("ff6e::1", None), // P=1, T=0 (also R=1).
+        ("ff7e::1", Some(Routed)),
+        ("ff8e::1", Some(Routed)),
+        ("ff9e::1", Some(Routed)),
+        ("ffae::1", None), // P=1, T=0 with X=1.
+        ("ffbe::1", Some(Routed)),
+        ("ffce::1", Some(Routed)),
+        ("ffde::1", Some(Routed)),
+        ("ffee::1", None), // P=1, T=0 with X=R=1.
+        ("fffe::1", Some(Routed)),
         // Even with flags=3 and a valid dynamic ID, unsupported scopes lose.
         ("ff30::8000:1", None),
         ("ff31::8000:1", None),
@@ -611,7 +629,7 @@ fn ipv6_encoding_classes_have_literal_boundaries() {
         ("ff3e:100::8000:1", None),
         ("ff3e:41:2001:db8::8000:1", None),
         // RFC 7371 ff2 flags are ignored on receipt (not rsvd).
-        ("ff3e:f00::8000:1", Some(SourceSpecific)),
+        ("ff3e:f000::8000:1", Some(SourceSpecific)),
         ("ff3e:f040:2001:db8::8000:1", Some(Routed)),
     ];
     for &(text, expected) in CASES {
