@@ -33,108 +33,94 @@ use std::str::FromStr;
 
 use multiview_config::multicast::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
-    RejectedGroup,
+    RejectedGroup, V4_BLOCKS,
 };
 use proptest::prelude::*;
 
-/// Record one IPv4 block in [`V4_BLOCKS`]. A macro keeps the registry table
-/// compact and readable — `rustfmt` shreds an inline tuple table per field.
-macro_rules! v4_block {
-    ($base:literal, $prefix:literal, $class:expr) => {
-        (ipv4($base), $prefix, $class)
-    };
-}
-
-/// The IPv4 multicast blocks the classifier must know, in registry order: the
-/// block's first address, its prefix length, and the classification every
-/// member shares. `None` marks a block that is **not** an accepted media group.
-///
-/// The table covers `224.0.0.0/4` exactly, and the property test walks that
-/// whole space against it — so a block the classifier accepts but the table
-/// does not know (or vice versa) fails there rather than drifting silently.
-fn v4_blocks() -> &'static [(Ipv4Addr, u8, Option<MulticastClass>)] {
-    static BLOCKS: std::sync::OnceLock<Vec<(Ipv4Addr, u8, Option<MulticastClass>)>> =
-        std::sync::OnceLock::new();
-    BLOCKS.get_or_init(|| {
-        vec![
-            // Local Network Control Block (RFC 5771 §4/§6) — never a media group.
-            v4_block!("224.0.0.0", 24, None),
-            // Internetwork Control Block — routed.
-            v4_block!("224.0.1.0", 24, Some(MulticastClass::Routed)),
-            // AD-HOC Block I — no static media allocation.
-            v4_block!("224.0.2.0", 23, None),
-            // SDP/SAP blocks (RFC 2974 §3) — the SAPv1 session range is accepted.
-            v4_block!("224.2.0.0", 24, Some(MulticastClass::Routed)),
-            v4_block!("224.2.1.0", 24, Some(MulticastClass::Routed)),
-            v4_block!("224.2.127.0", 24, Some(MulticastClass::Routed)),
-            v4_block!("224.2.128.0", 24, Some(MulticastClass::Routed)),
-            // AD-HOC Blocks II/III + the ASM bulk, `224.3.0.0`–`231.255.255.255`
-            // (RFC 5771 withholds no gap between 224.3 and 231).
-            v4_block!("224.3.0.0", 16, Some(MulticastClass::Routed)),
-            v4_block!("224.4.0.0", 14, Some(MulticastClass::Routed)),
-            v4_block!("224.8.0.0", 13, Some(MulticastClass::Routed)),
-            v4_block!("224.16.0.0", 12, Some(MulticastClass::Routed)),
-            v4_block!("224.32.0.0", 11, Some(MulticastClass::Routed)),
-            v4_block!("224.64.0.0", 10, Some(MulticastClass::Routed)),
-            v4_block!("224.128.0.0", 9, Some(MulticastClass::Routed)),
-            v4_block!("225.0.0.0", 8, Some(MulticastClass::Routed)),
-            v4_block!("226.0.0.0", 7, Some(MulticastClass::Routed)),
-            v4_block!("228.0.0.0", 6, Some(MulticastClass::Routed)),
-            v4_block!("230.0.0.0", 7, Some(MulticastClass::Routed)),
-            v4_block!("231.0.0.0", 8, Some(MulticastClass::Routed)),
-            // GLOP addressing — routed.
-            v4_block!("233.0.0.0", 8, Some(MulticastClass::Routed)),
-            // MCAST-TEST-NET (RFC 6676) — reserved.
-            v4_block!("233.252.0.0", 24, None),
-            // Unicast-prefix-based (RFC 6034) — routed.
-            v4_block!("234.0.0.0", 7, Some(MulticastClass::Routed)),
-            // IANA reservations (236.0.0.0/7 and 238.0.0.0/8).
-            v4_block!("236.0.0.0", 7, None),
-            v4_block!("238.0.0.0", 8, None),
-            // Admin-scoped ASM (RFC 2365).
-            v4_block!("239.0.0.0", 8, Some(MulticastClass::AdminScoped)),
-        ]
-    })
-}
-
-/// The SSM block, `232.0.0.0/8` (RFC 4607 §7).
-const V4_SSM: (Ipv4Addr, u8) = (Ipv4Addr::new(232, 0, 0, 0), 8);
-
-/// The reserved head of the SSM block, `232.0.0.0/24` — not a media group.
-const V4_SSM_RESERVED: (Ipv4Addr, u8) = (Ipv4Addr::new(232, 0, 0, 0), 24);
-
-/// Whether `addr` falls inside `base/prefix` (IPv4).
-fn in_net_v4(addr: Ipv4Addr, base: Ipv4Addr, prefix: u8) -> bool {
+/// Whether `addr` falls inside `base/prefix` (IPv4), with the base as a `u32`.
+fn in_net_v4_bits(addr: Ipv4Addr, base: u32, prefix: u8) -> bool {
     let mask = if prefix == 0 {
         0
     } else {
         u32::MAX << (32 - u32::from(prefix))
     };
-    (addr.to_bits() & mask) == (base.to_bits() & mask)
+    (addr.to_bits() & mask) == (base & mask)
 }
 
 /// The class the oracle assigns to `addr`, or `None` when it is not an accepted
-/// media group. Built from [`V4_BLOCKS`] plus the `232/8` SSM carve-out, with
-/// the most-specific (longest-prefix) block always winning — so a narrow
-/// reservation (`232.0.0.0/24`, `233.252.0.0/24`) overrides the wider block it
-/// sits inside.
+/// media group — a longest-prefix lookup over the **production** registry table
+/// ([`V4_BLOCKS`]).
+///
+/// Reading the implementation's own table is deliberate: the table is the spec
+/// ([`MulticastGroup`] documents it as the single source of truth), so this test
+/// pins that `classify` *implements* the table, and the table's content is
+/// pinned separately by [`V4_REGISTRY_ROWS`] and the table-driven accept/reject
+/// cases. A hand-written second table is what drifted here, repeatedly.
 fn v4_oracle(addr: Ipv4Addr) -> Option<MulticastClass> {
-    let (ssm_base, ssm_prefix) = V4_SSM;
-    let (res_base, res_prefix) = V4_SSM_RESERVED;
-    let ssm = in_net_v4(addr, ssm_base, ssm_prefix).then(|| {
-        if in_net_v4(addr, res_base, res_prefix) {
-            (res_prefix, None)
-        } else {
-            (ssm_prefix, Some(MulticastClass::SourceSpecific))
-        }
-    });
-    v4_blocks()
+    V4_BLOCKS
         .iter()
-        .filter(|(base, prefix, _)| in_net_v4(addr, *base, *prefix))
-        .map(|(_, prefix, class)| (*prefix, *class))
-        .chain(ssm)
-        .max_by_key(|(prefix, _)| *prefix)
-        .and_then(|(_, class)| class)
+        .filter(|(base, prefix, _)| in_net_v4_bits(addr, *base, *prefix))
+        .max_by_key(|(_, prefix, _)| *prefix)
+        .and_then(|(_, _, class)| *class)
+}
+
+/// The blocks the registry table must contain, exactly as the IANA IPv4
+/// Multicast Address Space Registry / RFC 5771 defines them. Each row is
+/// `(prefix, class, first, last-equivalent probe)` and is asserted against
+/// [`V4_BLOCKS`] below, so a silently dropped or re-classified block fails a
+/// named test rather than drifting.
+const V4_REGISTRY_ROWS: &[(&str, u8, Option<MulticastClass>)] = &[
+    ("224.0.0.0", 24, None),
+    ("224.0.1.0", 24, Some(MulticastClass::Routed)),
+    ("224.0.2.0", 16, None),
+    ("224.2.0.0", 16, Some(MulticastClass::Routed)),
+    ("224.3.0.0", 15, Some(MulticastClass::Routed)),
+    ("224.5.0.0", 16, None),
+    ("224.6.0.0", 15, Some(MulticastClass::Routed)),
+    ("224.8.0.0", 13, Some(MulticastClass::Routed)),
+    ("224.16.0.0", 12, Some(MulticastClass::Routed)),
+    ("224.32.0.0", 11, Some(MulticastClass::Routed)),
+    ("224.64.0.0", 10, Some(MulticastClass::Routed)),
+    ("224.128.0.0", 9, Some(MulticastClass::Routed)),
+    ("225.0.0.0", 8, Some(MulticastClass::Routed)),
+    ("226.0.0.0", 7, Some(MulticastClass::Routed)),
+    ("228.0.0.0", 6, Some(MulticastClass::Routed)),
+    ("232.0.0.0", 8, Some(MulticastClass::SourceSpecific)),
+    ("232.0.0.0", 24, None),
+    ("233.0.0.0", 8, Some(MulticastClass::Routed)),
+    ("233.252.0.0", 24, None),
+    ("234.0.0.0", 7, Some(MulticastClass::Routed)),
+    ("235.0.0.0", 8, Some(MulticastClass::Routed)),
+    ("236.0.0.0", 7, None),
+    ("238.0.0.0", 8, None),
+    ("239.0.0.0", 8, Some(MulticastClass::AdminScoped)),
+];
+
+/// The registry table carries exactly the IANA rows, with their classes.
+#[test]
+fn v4_registry_table_matches_iana() {
+    for (base, prefix, class) in V4_REGISTRY_ROWS {
+        let base: Ipv4Addr = base.parse().expect("literal");
+        assert!(
+            V4_BLOCKS.contains(&(base.to_bits(), *prefix, *class)),
+            "registry table is missing {base}/{prefix} => {class:?}"
+        );
+    }
+    // ... and no extra row beyond the table-driven boundary probes: the rows
+    // are the accepted entries plus the reserved carve-outs.
+    assert_eq!(
+        V4_REGISTRY_ROWS.len(),
+        V4_BLOCKS
+            .iter()
+            .filter(|(base, prefix, class)| {
+                V4_REGISTRY_ROWS.iter().any(|(b, p, c)| {
+                    let b: Ipv4Addr = b.parse().expect("literal");
+                    b.to_bits() == *base && *p == *prefix && *c == *class
+                })
+            })
+            .count(),
+        "the registry table has a row V4_REGISTRY_ROWS does not name"
+    );
 }
 
 /// IPv6 multicast flags/scope-nibble classification (RFC 4291 §2.7,
@@ -190,11 +176,6 @@ fn v6_group(flags: u8, scope: u8, body: [u16; 7]) -> (Ipv6Addr, bool) {
     (addr, (field >> 30) == 0b01)
 }
 
-/// Parse an IPv4 literal, panicking with the text on a typo.
-fn ipv4(text: &str) -> Ipv4Addr {
-    Ipv4Addr::from_str(text).unwrap_or_else(|_| panic!("`{text}` is an IPv4 literal"))
-}
-
 /// Parse an IP literal, panicking with the text on a typo.
 fn ip(text: &str) -> IpAddr {
     IpAddr::from_str(text).unwrap_or_else(|_| panic!("`{text}` is an IP literal"))
@@ -236,7 +217,10 @@ proptest! {
             Err(RejectedGroup::Rejected { class, reason, .. }) => {
                 prop_assert!(addr.is_multicast(), "ip={:?}", addr);
                 prop_assert_eq!(class, v4_oracle(addr), "ip={:?}", addr);
-                let expected = if addr.octets()[0] == 224 && addr.octets()[1] == 0 {
+                // Only `224.0.0.0/24` is the *link-local control* block; the
+                // rest of the refused multicast space is a reservation.
+                let [a, b, c, _] = addr.octets();
+                let expected = if a == 224 && b == 0 && c == 0 {
                     RejectReason::LinkLocalControl
                 } else {
                     RejectReason::ReservedBlock
@@ -349,15 +333,51 @@ const REJECTED: &[(&str, RejectReason)] = &[
     // The IPv4 link-local control block (RFC 5771 §4) — never a media group.
     ("224.0.0.0", RejectReason::LinkLocalControl),
     ("224.0.0.251", RejectReason::LinkLocalControl),
-    ("224.0.255.255", RejectReason::ReservedBlock),
-    // IANA-reserved IPv4 blocks.
+    // AD-HOC Block I (RFC 5771 §5): the whole `224.0.2.0`–`224.1.255.255`
+    // control range is withheld, and 224.2.x resumes as routed.
     ("224.0.2.0", RejectReason::ReservedBlock),
+    ("224.0.3.255", RejectReason::ReservedBlock),
+    ("224.0.255.255", RejectReason::ReservedBlock),
+    ("224.1.0.0", RejectReason::ReservedBlock),
+    ("224.1.255.255", RejectReason::ReservedBlock),
+    // The reserved 224.5.0.0/16 slice.
+    ("224.5.0.1", RejectReason::ReservedBlock),
+    // IANA-reserved IPv4 blocks.
     ("232.0.0.0", RejectReason::ReservedBlock),
     ("232.0.0.1", RejectReason::ReservedBlock),
     ("233.252.0.1", RejectReason::ReservedBlock),
     ("236.0.0.1", RejectReason::ReservedBlock),
     ("238.0.0.1", RejectReason::ReservedBlock),
 ];
+
+/// The classifier is **exhaustively** correct over the whole `224.0.0.0/4`
+/// multicast space — all 2^28 addresses, not a sample.
+///
+/// `#[ignore]`d because it is the slow, deterministic proof rather than the
+/// per-push check: the property test above samples the same space and is what
+/// runs by default. Run it when the RFC-5771 table changes:
+///
+/// ```text
+/// cargo test -p multiview-config --test multicast_address -- --ignored exhaustive
+/// ```
+#[test]
+#[ignore = "exhaustive 2^28 sweep (minutes in debug); run when the RFC-5771 table changes"]
+fn exhaustive_v4_multicast_sweep_matches_the_registry() {
+    let mut checked: u64 = 0;
+    for first in 224u8..=239 {
+        for second in 0u8..=0xff {
+            for third in 0u8..=0xff {
+                for fourth in 0u8..=0xff {
+                    let addr = Ipv4Addr::new(first, second, third, fourth);
+                    assert_eq!(classify(IpAddr::V4(addr)), v4_oracle(addr), "{addr}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    // 224.0.0.0/4 spans sixteen /8s.
+    assert_eq!(checked, 16 * (1 << 24), "the 224/4 space is 2^28 addresses");
+}
 
 #[test]
 fn accepted_ipv4_blocks_classify() {

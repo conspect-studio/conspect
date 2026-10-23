@@ -17,5 +17,5 @@ pub mod address;
 
 pub use address::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
-    RejectedGroup,
+    RejectedGroup, V4Block, V4_BLOCKS,
 };
