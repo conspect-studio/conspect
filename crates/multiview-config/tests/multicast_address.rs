@@ -73,24 +73,19 @@ const V4_REGISTRY_ROWS: &[(&str, u8, Option<MulticastClass>)] = &[
     ("224.0.0.0", 24, None),
     ("224.0.1.0", 24, Some(MulticastClass::Routed)),
     ("224.0.2.0", 16, None),
+    ("224.1.0.0", 16, None),
     ("224.2.0.0", 16, Some(MulticastClass::Routed)),
-    ("224.3.0.0", 15, Some(MulticastClass::Routed)),
-    ("224.5.0.0", 16, None),
-    ("224.6.0.0", 15, Some(MulticastClass::Routed)),
-    ("224.8.0.0", 13, Some(MulticastClass::Routed)),
-    ("224.16.0.0", 12, Some(MulticastClass::Routed)),
-    ("224.32.0.0", 11, Some(MulticastClass::Routed)),
-    ("224.64.0.0", 10, Some(MulticastClass::Routed)),
-    ("224.128.0.0", 9, Some(MulticastClass::Routed)),
-    ("225.0.0.0", 8, Some(MulticastClass::Routed)),
-    ("226.0.0.0", 7, Some(MulticastClass::Routed)),
-    ("228.0.0.0", 6, Some(MulticastClass::Routed)),
+    ("224.3.0.0", 16, Some(MulticastClass::Routed)),
+    ("224.4.0.0", 16, Some(MulticastClass::Routed)),
+    ("224.0.0.0", 8, None),
+    ("225.0.0.0", 8, None),
+    ("226.0.0.0", 7, None),
+    ("228.0.0.0", 6, None),
     ("232.0.0.0", 8, Some(MulticastClass::SourceSpecific)),
     ("232.0.0.0", 24, None),
     ("233.0.0.0", 8, Some(MulticastClass::Routed)),
     ("233.252.0.0", 24, None),
-    ("234.0.0.0", 7, Some(MulticastClass::Routed)),
-    ("235.0.0.0", 8, Some(MulticastClass::Routed)),
+    ("234.0.0.0", 7, None),
     ("236.0.0.0", 7, None),
     ("238.0.0.0", 8, None),
     ("239.0.0.0", 8, Some(MulticastClass::AdminScoped)),
@@ -127,6 +122,10 @@ fn v4_registry_table_matches_iana() {
 /// RFC 5771 §11). The **flags** nibble `0x3` marks SSM (`ff3x::/32`,
 /// RFC 4607 §7); otherwise the **scope** nibble alone decides.
 fn v6_oracle(flags: u8, scope: u8, reserved_ssm: bool) -> Option<MulticastClass> {
+    // RFC 4291 §2.7 and RFC 7346: flags do not override the scope.
+    if !matches!(scope, 0x5 | 0x8 | 0xe) {
+        return None;
+    }
     if flags == 0x3 {
         return if reserved_ssm {
             None // ff3x::4000:0000–ff3x::7fff:ffff (RFC 4607 §7)
@@ -144,11 +143,7 @@ fn v6_oracle(flags: u8, scope: u8, reserved_ssm: bool) -> Option<MulticastClass>
 }
 
 /// The reason an IPv6 group is refused, given its flags/scope nibbles.
-fn v6_reason(flags: u8, scope: u8) -> RejectReason {
-    if flags == 0x3 {
-        // Only the reserved sub-range can be refused at this point.
-        return RejectReason::ReservedBlock;
-    }
+fn v6_reason(_flags: u8, scope: u8) -> RejectReason {
     match scope {
         0x1 => RejectReason::InterfaceLocalControl,
         0x2 => RejectReason::LinkLocalControl,
@@ -290,6 +285,69 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// Independent RFC 5771 §3 / IANA endpoint oracle: literal addresses and
+// outcomes, deliberately not derived from V4_BLOCKS or the lookup algorithm.
+// ---------------------------------------------------------------------------
+#[test]
+fn rfc5771_reserved_and_ad_hoc_endpoints() {
+    const ENDPOINTS: &[(&str, Option<MulticastClass>)] = &[
+        ("224.2.0.0", Some(MulticastClass::Routed)),
+        ("224.2.255.255", Some(MulticastClass::Routed)),
+        ("224.3.0.0", Some(MulticastClass::Routed)),
+        ("224.3.255.255", Some(MulticastClass::Routed)),
+        ("224.4.0.0", Some(MulticastClass::Routed)),
+        ("224.4.0.1", Some(MulticastClass::Routed)),
+        ("224.4.255.255", Some(MulticastClass::Routed)),
+        ("224.5.0.0", None),
+        ("224.5.255.255", None),
+        ("224.6.0.0", None),
+        ("224.6.1.1", None),
+        ("224.255.255.255", None),
+        ("225.0.0.0", None),
+        ("225.1.2.3", None),
+        ("231.255.255.255", None),
+        ("232.0.0.0", None),
+        ("232.0.1.0", Some(MulticastClass::SourceSpecific)),
+        ("233.251.255.255", Some(MulticastClass::Routed)),
+        ("233.252.0.0", None),
+        ("234.0.0.0", None),
+        ("238.255.255.255", None),
+        ("239.0.0.0", Some(MulticastClass::AdminScoped)),
+    ];
+    for &(text, expected) in ENDPOINTS {
+        let addr = ip(text);
+        assert_eq!(classify(addr), expected, "RFC 5771 §3: {text}");
+        match expected {
+            Some(class) => assert_eq!(MulticastGroup::try_from(addr).expect(text).class(), class),
+            None => assert_eq!(
+                MulticastGroup::try_from(addr).expect_err(text).reason(),
+                RejectReason::ReservedBlock,
+                "{text}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn rfc4291_ssm_flags_cannot_override_prohibited_scope() {
+    // RFC 4291 §2.7 + RFC 7346: multicast scope remains meaningful for SSM.
+    for (text, reason) in [
+        ("ff30::1234", RejectReason::ReservedBlock),
+        ("ff31::1234", RejectReason::InterfaceLocalControl),
+        ("ff32::1234", RejectReason::LinkLocalControl),
+        ("ff33::1234", RejectReason::ReservedBlock),
+        ("ff3f::1234", RejectReason::ReservedBlock),
+    ] {
+        let addr = ip(text);
+        assert_eq!(classify(addr), None, "{text}");
+        assert_eq!(MulticastGroup::try_from(addr).expect_err(text).reason(), reason);
+        assert!(serde_json::from_str::<MulticastGroup>(&format!("\"{text}\"")).is_err());
+    }
+    assert_eq!(classify(ip("ff35::1234")), Some(MulticastClass::SourceSpecific));
+    assert_eq!(classify(ip("ff3e::1234")), Some(MulticastClass::SourceSpecific));
+}
+
+// ---------------------------------------------------------------------------
 // Table-driven acceptance: the exact blocks the issue names.
 // ---------------------------------------------------------------------------
 
@@ -300,7 +358,6 @@ const V4_ACCEPTED: &[(&str, MulticastClass)] = &[
     ("239.192.0.1", MulticastClass::AdminScoped),
     ("224.0.1.1", MulticastClass::Routed),
     ("224.2.127.254", MulticastClass::Routed),
-    ("231.255.255.255", MulticastClass::Routed),
     ("233.1.2.3", MulticastClass::Routed),
     ("232.1.2.3", MulticastClass::SourceSpecific),
     ("232.255.255.255", MulticastClass::SourceSpecific),
