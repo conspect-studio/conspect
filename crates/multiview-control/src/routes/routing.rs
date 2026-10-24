@@ -50,8 +50,15 @@ use crate::state::AppState;
 ///   discrete-track layout comparison when the inventory is absent);
 /// * `coerce` — the operator confirms a down/up-mix to the destination's pinned
 ///   layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);
-/// * `primed` — whether the video target source is warm (absent ⇒ assumed primed).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// * `primed` — whether the video target source is warm (absent ⇒ assumed primed);
+/// * `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒
+///   unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4);
+/// * `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute
+///   keeps the strip routed and preserves its gain for an exact unmute.
+///
+/// The audio fields are ignored for non-audio targets. Not `Eq` because
+/// `gain_db` is a float.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RouteTakeRequest {
     /// The destination the take re-points.
@@ -69,6 +76,13 @@ pub struct RouteTakeRequest {
     /// Optional video-target priming hint (absent ⇒ assumed primed).
     #[serde(default)]
     pub primed: Option<bool>,
+    /// Optional audio contribution gain in dB (absent ⇒ unity, `0.0`).
+    #[serde(default)]
+    pub gain_db: Option<f32>,
+    /// Optional audio mute for the take (absent ⇒ unmuted). Mute keeps the
+    /// strip routed and preserves its gain for an exact unmute.
+    #[serde(default)]
+    pub mute: Option<bool>,
 }
 
 /// The `200` body of a hot (Class-1 / Reset-lite) `/routing/{kind}/take`.
@@ -168,6 +182,16 @@ pub(crate) async fn take_route(
     // (a missing/out-of-scope id fails closed).
     crate::auth::authorize_object(&principal, &req.source.input_id)?;
 
+    // A non-finite audio gain would poison the mixer's strip gain, so the
+    // boundary fails it closed (RFC 9457 validation problem) before any submit.
+    if let Some(gain_db) = req.gain_db {
+        if !gain_db.is_finite() {
+            return Err(ControlError::Validation(format!(
+                "gain_db must be finite (got {gain_db})"
+            )));
+        }
+    }
+
     // Classify against the destination's pinned params (inv #11: surfaced first).
     let plan = classify_request(&state, &req);
 
@@ -175,8 +199,12 @@ pub(crate) async fn take_route(
     // non-blocking (idempotency + shed-503 via `submit_accepted`).
     let source = req.source.clone();
     let target = req.target.clone();
+    // The audio take's gain/mute ride the command (ADR-0059 §4: no more
+    // hardcoded `0.0`/`false`); absent ⇒ unity/unmuted.
+    let gain_db = req.gain_db.unwrap_or(0.0);
+    let mute = req.mute.unwrap_or(false);
     let response = submit_accepted(&state, &idem, |op| {
-        build_route_command(op, &target, &source)
+        build_route_command(op, &target, &source, gain_db, mute)
     })?;
     state.audit(
         &principal.key_id,
@@ -222,7 +250,17 @@ async fn accepted_operation_id(response: Response) -> Result<String, ControlErro
 
 /// Build the `Command::Route*` a crosspoint take submits, desugaring the target +
 /// source into the matching per-stream route command (ADR-0034 / RT-11).
-fn build_route_command(op: OperationId, target: &RouteTarget, source: &StreamRef) -> Command {
+///
+/// `gain_db`/`mute` are the take's audio contribution settings (ADR-0059 §4) and
+/// are carried only by the audio commands; the video/subtitle commands have no
+/// such fields.
+fn build_route_command(
+    op: OperationId,
+    target: &RouteTarget,
+    source: &StreamRef,
+    gain_db: f32,
+    mute: bool,
+) -> Command {
     match target {
         RouteTarget::VideoCell { cell } => Command::RouteVideo {
             op,
@@ -233,15 +271,15 @@ fn build_route_command(op: OperationId, target: &RouteTarget, source: &StreamRef
             op,
             target: channel.clone(),
             source: source.clone(),
-            gain_db: 0.0,
-            mute: false,
+            gain_db,
+            mute,
         },
         RouteTarget::AudioDiscreteTrack { track, .. } => Command::RouteAudio {
             op,
             target: track.clone(),
             source: source.clone(),
-            gain_db: 0.0,
-            mute: false,
+            gain_db,
+            mute,
         },
         RouteTarget::SubtitleLayer { layer } => Command::RouteSubtitle {
             op,

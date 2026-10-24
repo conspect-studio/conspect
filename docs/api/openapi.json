@@ -13239,7 +13239,7 @@
       },
       "RouteTakeRequest": {
         "type": "object",
-        "description": "The body of a `POST /routing/plan` or `/routing/{kind}/take` request.\n\nCarries the destination + source, plus optional classifier hints used when the\nengine snapshot does not (yet) carry the source inventory or the destination's\npinned params (so a plan/take is classifiable before the first probe):\n\n* `source_channels` — the source audio track's channel count (used for the\n  discrete-track layout comparison when the inventory is absent);\n* `coerce` — the operator confirms a down/up-mix to the destination's pinned\n  layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);\n* `primed` — whether the video target source is warm (absent ⇒ assumed primed).",
+        "description": "The body of a `POST /routing/plan` or `/routing/{kind}/take` request.\n\nCarries the destination + source, plus optional classifier hints used when the\nengine snapshot does not (yet) carry the source inventory or the destination's\npinned params (so a plan/take is classifiable before the first probe):\n\n* `source_channels` — the source audio track's channel count (used for the\n  discrete-track layout comparison when the inventory is absent);\n* `coerce` — the operator confirms a down/up-mix to the destination's pinned\n  layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);\n* `primed` — whether the video target source is warm (absent ⇒ assumed primed);\n* `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒\n  unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4);\n* `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute\n  keeps the strip routed and preserves its gain for an exact unmute.\n\nThe audio fields are ignored for non-audio targets. Not `Eq` because\n`gain_db` is a float.",
         "required": [
           "target",
           "source"
@@ -13248,6 +13248,21 @@
           "coerce": {
             "type": "boolean",
             "description": "Optional operator-confirmed coercion to the pinned layout."
+          },
+          "gain_db": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Optional audio contribution gain in dB (absent ⇒ unity, `0.0`)."
+          },
+          "mute": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Optional audio mute for the take (absent ⇒ unmuted). Mute keeps the\nstrip routed and preserves its gain for an exact unmute."
           },
           "primed": {
             "type": [

@@ -298,9 +298,7 @@ fn route_audio_honours_gain_and_mute_without_unrouting() {
         gain_db,
         mute,
     };
-    let tone = || {
-        AudioBlock::from_interleaved(format, vec![0.8_f32; 4096 * 2]).unwrap()
-    };
+    let tone = || AudioBlock::from_interleaved(format, vec![0.8_f32; 4096 * 2]).unwrap();
     let mut applier = RouteApplier::new(&resolution);
 
     // -6.0206 dB ≈ 0.5 linear, unmuted: the applied route sets the strip gain.

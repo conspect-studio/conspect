@@ -11,7 +11,9 @@
 //!
 //! * **video** → [`CompositorDrive::rebind_cell`] (RT-6),
 //! * **audio** → [`ProgramBus::repoint_crossfade`] (RT-8a / RT-9, cross-fade by
-//!   default for a pop-free breakaway),
+//!   default for a pop-free breakaway), then the intent's `gain_db`/`mute` are
+//!   honoured on the channel's strip — a **gain-preserving** mute that never
+//!   unroutes the channel (ADR-0059 §4),
 //! * **subtitle** → [`SubtitleLayer::repoint`] (RT-10a).
 //!
 //! Because `multiview-control` depends on `multiview-engine` (not the reverse),
@@ -166,6 +168,16 @@ fn language_matches(have: &str, want: &str) -> bool {
     // ISO-639-2/B vs -1 (3-letter vs 2-letter) common pairs share a prefix only
     // for some languages, so also accept a 2↔3 letter prefix relationship.
     h == w || h.starts_with(&w) || w.starts_with(&h)
+}
+
+/// Convert a program-bus contribution gain in **dB** (the `RouteIntent::Audio`
+/// wire form) to the linear factor the mixer multiplies by: `10^(dB/20)`.
+///
+/// `0.0` dB is unity; the conversion is total and finite for any finite input
+/// (a `-inf` dB, i.e. a hard mute, is expressed by the intent's `mute` flag, not
+/// by an infinite gain).
+fn db_to_linear(db: f32) -> f64 {
+    10.0_f64.powf(f64::from(db) / 20.0)
 }
 
 /// The pre-resolved binding context a [`RouteApplier`] consults to turn a
@@ -372,7 +384,16 @@ impl<'a> RouteApplier<'a> {
     /// Apply the **audio** routes in `batch` onto `bus`, coalesced to one
     /// effective re-point per target (the last route per target wins). Re-points
     /// the bus channel's `Arc<AudioStore>` with an equal-power cross-fade over
-    /// `ramp_frames` (RT-9 pop-avoidance; `ramp_frames == 0` is a hard cut).
+    /// `ramp_frames` (RT-9 pop-avoidance; `ramp_frames == 0` is a hard cut) and
+    /// then honours the intent's `gain_db` (converted to a linear route gain)
+    /// and `mute` (ADR-0059 §4).
+    ///
+    /// Mute is applied through the bus's **gain-preserving per-strip mute** —
+    /// the strip stays routed and keeps its gain, so an unmute restores it
+    /// exactly; it is never an unroute. The order matters: the re-point is taken
+    /// first (so the outgoing cross-fade strip fades from the channel's *old*
+    /// gain), then the new gain and mute are set on the channel.
+    ///
     /// Returns the number of targets actually re-pointed.
     ///
     /// # Errors
@@ -385,18 +406,29 @@ impl<'a> RouteApplier<'a> {
         batch: &[RouteIntent],
         ramp_frames: usize,
     ) -> Result<usize> {
-        let mut last_per_target: HashMap<&str, &StreamRef> = HashMap::new();
+        // Coalesce: keep only the LAST audio route per target — together with
+        // that route's gain/mute, so the surviving intent is applied whole.
+        let mut last_per_target: HashMap<&str, (&StreamRef, f32, bool)> = HashMap::new();
         let mut order: Vec<&str> = Vec::new();
         for intent in batch {
-            if let RouteIntent::Audio { target, source, .. } = intent {
-                if last_per_target.insert(target.as_str(), source).is_none() {
+            if let RouteIntent::Audio {
+                target,
+                source,
+                gain_db,
+                mute,
+            } = intent
+            {
+                if last_per_target
+                    .insert(target.as_str(), (source, *gain_db, *mute))
+                    .is_none()
+                {
                     order.push(target.as_str());
                 }
             }
         }
         let mut applied = 0usize;
         for target in order {
-            let Some(source) = last_per_target.get(target) else {
+            let Some((source, gain_db, mute)) = last_per_target.get(target) else {
                 continue;
             };
             self.validate_audio_ref(source)?;
@@ -418,6 +450,9 @@ impl<'a> RouteApplier<'a> {
                 .repoint_crossfade(point, Arc::clone(store), ramp_frames)
                 .map_err(|e| Error::Route(format!("audio bus re-point failed: {e}")))?;
             debug_assert!(matches!(tier, SwitchTier::ClickFree | SwitchTier::SoftStep));
+            // Honour the route's gain and mute on the (already routed) channel.
+            bus.set_gain(point, db_to_linear(*gain_db));
+            bus.set_muted(point, *mute);
             applied += 1;
         }
         Ok(applied)

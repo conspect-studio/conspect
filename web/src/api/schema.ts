@@ -4670,11 +4670,28 @@ export interface components {
          *       discrete-track layout comparison when the inventory is absent);
          *     * `coerce` — the operator confirms a down/up-mix to the destination's pinned
          *       layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);
-         *     * `primed` — whether the video target source is warm (absent ⇒ assumed primed).
+         *     * `primed` — whether the video target source is warm (absent ⇒ assumed primed);
+         *     * `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒
+         *       unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4);
+         *     * `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute
+         *       keeps the strip routed and preserves its gain for an exact unmute.
+         *
+         *     The audio fields are ignored for non-audio targets. Not `Eq` because
+         *     `gain_db` is a float.
          */
         RouteTakeRequest: {
             /** @description Optional operator-confirmed coercion to the pinned layout. */
             coerce?: boolean;
+            /**
+             * Format: float
+             * @description Optional audio contribution gain in dB (absent ⇒ unity, `0.0`).
+             */
+            gain_db?: number | null;
+            /**
+             * @description Optional audio mute for the take (absent ⇒ unmuted). Mute keeps the
+             *     strip routed and preserves its gain for an exact unmute.
+             */
+            mute?: boolean | null;
             /** @description Optional video-target priming hint (absent ⇒ assumed primed). */
             primed?: boolean | null;
             /** @description The source elementary stream feeding the destination. */
