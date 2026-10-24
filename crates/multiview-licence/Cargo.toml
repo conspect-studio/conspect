@@ -58,14 +58,17 @@ ciborium = "0.2.2"
 # pure-Rust crypto + `tokio` (the loop's sleep), never a socket of its own.
 #
 # `p256` (RustCrypto): ECDSA-P256/SHA-256 verification of the well-known
-# intermediate-key attestations against the pinned root (D1). Its closure
-# (`ecdsa`, `elliptic-curve`, `sec1`, `primeorder`, `rfc6979`, `sha2`, `hmac`,
-# `der`, `spki`, `crypto-bigint`, `ff`, `group`, `base16ct`, `generic-array`,
-# `typenum`, `zeroize`, `subtle`, `const-oid`) is entirely `MIT`/`Apache-2.0`/
-# `BSD-3-Clause`/`BSD-1-Clause`, all on the deny.toml allowlist (verified with
-# `cargo metadata`). Verification-only — no key generation, no RNG in non-test
-# code. Default features disabled; only `ecdsa` (verify) is enabled.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"], optional = true }
+# intermediate-key attestations against the pinned root (D1). 0.14 (not 0.13):
+# 0.13 → `elliptic-curve` 0.13 pulls `crypto-bigint` 0.5.x, which RUSTSEC-2026-0387
+# flags for non-constant-time arithmetic with no fixed 0.5.x; 0.14 pulls
+# `crypto-bigint` >= 0.7.6 (#126). Its closure (`ecdsa`, `elliptic-curve`, `sec1`,
+# `primeorder`, `primefield`, `rfc6979`, `sha2`, `hmac`, `der`, `crypto-bigint`,
+# `ff`, `group`, `wnaf`, `base16ct`, `hybrid-array`, `typenum`, `signature`,
+# `zeroize`, `subtle`, `const-oid`, `ctutils`, `cmov`, `cpubits`) is entirely
+# `MIT`/`Apache-2.0`/`BSD-3-Clause`, all on the deny.toml allowlist (verified with
+# `cargo tree -f '{p} {l}'`). Verification-only — no key generation, no RNG in
+# non-test code. Default features disabled; only `ecdsa` (verify) is enabled.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"], optional = true }
 # STANDARD-base64 (RFC 4648 §4) decode of `leaseBytes` + base64url decode of the
 # well-known key material/signatures (D3). `MIT OR Apache-2.0`, deny-clean, pure
 # Rust, no native deps.
@@ -112,7 +115,7 @@ getrandom = { version = "0.4", default-features = false, features = ["sys_rng"] 
 # fabricating a fake root-attested keyset, and `ed25519-dalek/rand_core` signs the
 # fake server lease. `tokio` macros/rt drive the async loop test deterministically.
 # Dev-only: the non-test library has no signer.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "sync"] }
 
 [features]

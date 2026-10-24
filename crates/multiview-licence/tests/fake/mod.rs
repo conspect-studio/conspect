@@ -30,13 +30,10 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey as EdKey};
-// ed25519-dalek 3.x uses `signature` 3.0 while `p256` 0.13 still uses `signature`
-// 2.2.0, so their two `Signer` traits are DISTINCT types: the ed25519 `Signer as _`
-// above no longer covers a p256 key. Import p256's own re-exported `signature::Signer`
-// (2.2.0) for `SigningKey::sign` below. Both are `use … as _`, and each `.sign()`
-// resolves by its receiver type (ed25519 vs p256 key), so there is no ambiguity.
-// `Signature` is `P256Sig` (ADR-I010).
-use p256::ecdsa::signature::Signer as _;
+// `p256` 0.14 (`ecdsa` 0.17) and ed25519-dalek 3.x share ONE `signature` 3.0
+// crate, so the ed25519 `Signer as _` import above also brings `SigningKey::sign`
+// for the p256 root key into scope; each `.sign()` resolves by its receiver type
+// (ed25519 vs p256 key). `Signature` is `P256Sig` (ADR-I010).
 use p256::ecdsa::{Signature as P256Sig, SigningKey as P256Key};
 
 use ed25519_dalek::{Verifier as _, VerifyingKey as EdVerifyingKey};
@@ -124,7 +121,7 @@ impl FabricatedKeyset {
 
     pub fn pinned_root(&self) -> PinnedRoot {
         let vk = p256::ecdsa::VerifyingKey::from(&self.root);
-        PinnedRoot::from_sec1_bytes(vk.to_encoded_point(false).as_bytes()).expect("fab root parse")
+        PinnedRoot::from_sec1_bytes(vk.to_sec1_point(false).as_bytes()).expect("fab root parse")
     }
 
     fn root_sign(&self, msg: &[u8]) -> String {
@@ -196,7 +193,7 @@ impl FabricatedKeyset {
         let rev_sig = self.root_sign(&rev_pre);
         let root_pub = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             p256::ecdsa::VerifyingKey::from(&self.root)
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes(),
         );
         let json = serde_json::json!({
@@ -252,7 +249,7 @@ impl FabricatedKeyset {
         let rev_sig = self.root_sign(&rev_pre);
         let root_pub = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             p256::ecdsa::VerifyingKey::from(&self.root)
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes(),
         );
 
