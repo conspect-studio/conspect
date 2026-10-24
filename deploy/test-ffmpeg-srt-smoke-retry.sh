@@ -19,13 +19,16 @@ cat > "$work/prefix/bin/ffmpeg" <<'SHIM'
 set -euo pipefail
 for arg in "$@"; do
   case "$arg" in
-    *mode=listener*) printf '%s\n' "$arg" >> "$SMOKE_TRACE/listeners" ;;
+    *mode=listener*)
+      printf '%s\n' "$arg" >> "$SMOKE_TRACE/listeners"
+      # Delaying the listener's bind makes the first caller depend on readiness.
+      if [[ "$SMOKE_MODE" == slow ]]; then sleep 5; fi
+      ;;
     *mode=caller*)
       printf '%s\n' "$arg" >> "$SMOKE_TRACE/callers"
       if [[ ! -e "$SMOKE_TRACE/first-caller" ]]; then
         touch "$SMOKE_TRACE/first-caller"
         case "$SMOKE_MODE" in
-          slow) sleep 8 ;;
           fail) exit 1 ;;
         esac
       fi
@@ -41,7 +44,7 @@ for mode in slow fail; do
     FF_PREFIX="$work/prefix" bash "$script_dir/ffmpeg-build.sh" --smoke-srt
   if [[ "$mode" == slow ]]; then
     if [[ "$(wc -l < "$work/$mode/callers")" -ne 1 ]]; then
-      echo 'slow startup must succeed on its first caller attempt' >&2
+      echo "slow startup must succeed on its first caller attempt (callers: $(wc -l < "$work/$mode/callers"))" >&2
       exit 1
     fi
   else
