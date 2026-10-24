@@ -214,6 +214,62 @@ async fn take_rejects_a_gain_db_that_overflows_f32() {
 }
 
 #[tokio::test]
+async fn take_rejects_a_gain_db_outside_the_supported_range() {
+    // Cross-vendor review finding (SW-13b): `10000` dB is finite, so a
+    // finiteness-only check accepted it, but `10^(10000/20)` overflows to `+inf`;
+    // once a mute envelope settles, `inf * 0 = NaN` poisons the whole program
+    // mix instead of going silent. The take boundary must reject any gain
+    // outside the documented supported range before a command reaches the engine.
+    for gain_db in [10_000.0_f64, -1_000.0_f64] {
+        let mut h = harness();
+        let body = json!({
+            "target": { "kind": "audio_program_bus", "channel": "prog" },
+            "source": { "input_id": "cam-b", "kind": { "kind": "audio" }, "selector": { "by": "best" } },
+            "gain_db": gain_db,
+            "mute": true
+        });
+        let resp = send(
+            &h.router,
+            post_json("/api/v1/routing/audio/take", OPERATOR_TOKEN, &body),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "gain_db = {gain_db} is outside the supported range and must be a 422"
+        );
+        assert!(
+            h.commands.try_drain().is_empty(),
+            "a rejected take (gain_db = {gain_db}) must not enqueue a command"
+        );
+    }
+}
+
+#[tokio::test]
+async fn take_accepts_the_supported_gain_range_endpoints() {
+    // The supported range is inclusive: both endpoints are valid takes.
+    for gain_db in [-96.0_f64, 24.0_f64] {
+        let mut h = harness();
+        let body = json!({
+            "target": { "kind": "audio_program_bus", "channel": "prog" },
+            "source": { "input_id": "cam-b", "kind": { "kind": "audio" }, "selector": { "by": "best" } },
+            "gain_db": gain_db
+        });
+        let resp = send(
+            &h.router,
+            post_json("/api/v1/routing/audio/take", OPERATOR_TOKEN, &body),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "gain_db = {gain_db} is the supported range endpoint and must be accepted"
+        );
+        assert_eq!(h.commands.try_drain().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn take_is_idempotent_under_a_repeated_key() {
     let mut h = harness();
     let key = "rt11-take-key";
