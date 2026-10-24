@@ -109,7 +109,10 @@ smoke_srt() (
 
   # Each caller needs its own listener: a failed/slow caller can consume the
   # listener's only accept, and retrying against that listener cannot recover.
-  for attempt in 1 2 3 4 5; do
+  # Under heavy shared-host load, SRT connect/close occasionally stalled despite
+  # a confirmed UDP bind; its precise cause was not established. Keep retries as
+  # a bounded backstop, not a substitute for waiting until the listener binds.
+  for attempt in 1 2 3; do
     # Avoid the Linux ephemeral-port range (typically starting at 32768).
     port=$((20000 + RANDOM % 10000))
     while [[ "${port}" == "${previous_port}" ]]; do port=$((20000 + RANDOM % 10000)); done
