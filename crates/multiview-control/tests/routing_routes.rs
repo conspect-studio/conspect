@@ -123,6 +123,97 @@ async fn take_class2_returns_202_with_operation_id() {
 }
 
 #[tokio::test]
+async fn take_audio_carries_gain_and_mute_into_the_command() {
+    // ADR-0059 §4: the REST take stops hardcoding `gain_db: 0.0, mute: false` —
+    // the operator's values ride the `RouteAudio` command to the engine.
+    let mut h = harness();
+    let body = json!({
+        "target": { "kind": "audio_program_bus", "channel": "prog" },
+        "source": { "input_id": "cam-b", "kind": { "kind": "audio" }, "selector": { "by": "best" } },
+        "gain_db": -6.0,
+        "mute": true
+    });
+    let resp = send(
+        &h.router,
+        post_json("/api/v1/routing/audio/take", OPERATOR_TOKEN, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let drained = h.commands.try_drain();
+    assert_eq!(drained.len(), 1, "a take submits exactly one route command");
+    match &drained[0] {
+        multiview_control::Command::RouteAudio {
+            target,
+            gain_db,
+            mute,
+            ..
+        } => {
+            assert_eq!(target, "prog");
+            assert!(
+                (gain_db - -6.0).abs() < 1e-6,
+                "the take must carry the operator's gain_db (got {gain_db})"
+            );
+            assert!(*mute, "the take must carry the operator's mute");
+        }
+        other => panic!("expected RouteAudio, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn take_audio_defaults_gain_and_mute_when_absent() {
+    // Back-compat: a take that omits the audio gain/mute fields is unity/unmuted.
+    let mut h = harness();
+    let body = json!({
+        "target": { "kind": "audio_program_bus", "channel": "prog" },
+        "source": { "input_id": "cam-b", "kind": { "kind": "audio" }, "selector": { "by": "best" } }
+    });
+    let resp = send(
+        &h.router,
+        post_json("/api/v1/routing/audio/take", OPERATOR_TOKEN, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let drained = h.commands.try_drain();
+    assert_eq!(drained.len(), 1);
+    match &drained[0] {
+        multiview_control::Command::RouteAudio { gain_db, mute, .. } => {
+            assert_eq!(*gain_db, 0.0);
+            assert!(!*mute);
+        }
+        other => panic!("expected RouteAudio, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn take_rejects_a_gain_db_that_overflows_f32() {
+    // A gain_db beyond the f32 range becomes a non-finite route gain, which
+    // would poison the mixer; the boundary fails it closed (client error)
+    // before it reaches the engine.
+    let mut h = harness();
+    let body = json!({
+        "target": { "kind": "audio_program_bus", "channel": "prog" },
+        "source": { "input_id": "cam-b", "kind": { "kind": "audio" }, "selector": { "by": "best" } },
+        "gain_db": 1e39
+    });
+    let resp = send(
+        &h.router,
+        post_json("/api/v1/routing/audio/take", OPERATOR_TOKEN, &body),
+    )
+    .await;
+    assert!(
+        resp.status().is_client_error(),
+        "a non-finite route gain is a client error (got {})",
+        resp.status()
+    );
+    assert!(
+        h.commands.try_drain().is_empty(),
+        "a rejected take must not enqueue a command"
+    );
+}
+
+#[tokio::test]
 async fn take_is_idempotent_under_a_repeated_key() {
     let mut h = harness();
     let key = "rt11-take-key";

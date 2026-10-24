@@ -259,6 +259,105 @@ fn route_audio_applies_repointing_the_bus_channel() {
 }
 
 // ---------------------------------------------------------------------------
+// (a) AUDIO route honours `gain_db` / `mute` (ADR-0059 §4): the applied route
+// carries its gain onto the strip and a mute silences it WITHOUT unrouting it,
+// preserving the gain for unmute.
+// ---------------------------------------------------------------------------
+
+/// Peak absolute sample in a block.
+fn peak(block: &AudioBlock) -> f32 {
+    block
+        .interleaved()
+        .iter()
+        .fold(0.0_f32, |m, s| m.max(s.abs()))
+}
+
+#[test]
+fn route_audio_honours_gain_and_mute_without_unrouting() {
+    let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+    let fps = Rational::FPS_50;
+    let mut bus = ProgramBus::new(format, fps);
+    let store = Arc::new(AudioStore::new(format, 8192));
+    let point = bus.add_source("prog", Arc::clone(&store), 1.0);
+
+    let mut inventories = HashMap::new();
+    inventories.insert(
+        "cam-b".to_owned(),
+        StreamInventory::from_streams(vec![audio_stream("eng", 2, 300)]).with_input_id("cam-b"),
+    );
+    let mut resolution = RouteResolution::new(inventories);
+    resolution.set_audio_store(
+        &StreamRef::best("cam-b", StreamKind::Audio),
+        Arc::clone(&store),
+    );
+    resolution.set_audio_channel("prog", point);
+
+    let route = |gain_db: f32, mute: bool| RouteIntent::Audio {
+        target: "prog".to_owned(),
+        source: StreamRef::best("cam-b", StreamKind::Audio),
+        gain_db,
+        mute,
+    };
+    let tone = || {
+        AudioBlock::from_interleaved(format, vec![0.8_f32; 4096 * 2]).unwrap()
+    };
+    let mut applier = RouteApplier::new(&resolution);
+
+    // -6.0206 dB ≈ 0.5 linear, unmuted: the applied route sets the strip gain.
+    applier
+        .apply_audio(&mut bus, &[route(-6.0206, false)], 0)
+        .expect("audio route applies");
+    assert!(
+        (bus.program_gain(point).unwrap() - 0.5).abs() < 1e-3,
+        "gain_db must be applied as a linear route gain (got {:?})",
+        bus.program_gain(point)
+    );
+    assert!(!bus.is_muted(point));
+
+    // Fresh tone, then a tick: the contribution is scaled by the applied gain.
+    store.publish(&tone()).unwrap();
+    let scaled = bus.tick();
+    assert!(
+        (peak(&scaled) - 0.4).abs() < 0.02,
+        "the applied gain scales the bus contribution (got peak {})",
+        peak(&scaled)
+    );
+
+    // Mute the same route: still routed, gain preserved, bus goes silent once
+    // the anti-click envelope has settled (the mute ramp is ≤ one tick).
+    applier
+        .apply_audio(&mut bus, &[route(-6.0206, true)], 0)
+        .expect("muted audio route applies");
+    assert!(bus.is_muted(point), "mute keeps the strip routed");
+    assert!(
+        (bus.program_gain(point).unwrap() - 0.5).abs() < 1e-3,
+        "mute preserves the prior gain for unmute (got {:?})",
+        bus.program_gain(point)
+    );
+    store.publish(&tone()).unwrap();
+    let _ = bus.tick(); // the anti-click envelope (480 frames < 960)
+    let muted = bus.tick();
+    assert!(
+        peak(&muted) < 1e-6,
+        "a muted route contributes silence (got peak {})",
+        peak(&muted)
+    );
+
+    // Unmute restores the prior gain (the mute never destroyed it).
+    applier
+        .apply_audio(&mut bus, &[route(-6.0206, false)], 0)
+        .expect("unmuted audio route applies");
+    store.publish(&tone()).unwrap();
+    let _ = bus.tick();
+    let restored = bus.tick();
+    assert!(
+        (peak(&restored) - 0.4).abs() < 0.02,
+        "unmute restores the prior gain (got peak {})",
+        peak(&restored)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (a) SUBTITLE route applies through the drain (the layer samples the new cue).
 // ---------------------------------------------------------------------------
 

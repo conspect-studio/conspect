@@ -9,7 +9,7 @@
     clippy::indexing_slicing
 )]
 
-use multiview_audio::mixer::{Mixer, RoutePoint};
+use multiview_audio::mixer::{Mixer, RoutePoint, DEFAULT_MUTE_FRAMES};
 use multiview_audio::{AudioBlock, AudioError, AudioFormat, ChannelLayout};
 
 const FS: u32 = 48_000;
@@ -51,6 +51,81 @@ fn route_gain_scales_contribution() {
     let a = mixer.add_input("a");
     mixer.route_to_program(a, 0.5);
     mixer.submit(a, stereo_block(0.4, 0.4, 2)).unwrap();
+    let bus = mixer.mix_program().unwrap();
+    approx::assert_abs_diff_eq!(bus.interleaved()[0], 0.2, epsilon = 1e-6);
+}
+
+/// The `SetGain` path (ADR-0059 §4) sets the steady program-route gain without
+/// disturbing the route or the mute state: a -6 dB route (~0.5012) halves the
+/// contribution.
+#[test]
+fn set_gain_scales_the_program_contribution() {
+    let mut mixer = Mixer::new(AudioFormat::new(FS, ChannelLayout::Stereo));
+    let a = mixer.add_input("a");
+    mixer.route_to_program(a, 1.0);
+    mixer.set_gain(a, 0.5);
+    approx::assert_abs_diff_eq!(mixer.program_gain(a).unwrap(), 0.5, epsilon = 1e-12);
+
+    mixer.submit(a, stereo_block(0.4, 0.4, 2)).unwrap();
+    let bus = mixer.mix_program().unwrap();
+    approx::assert_abs_diff_eq!(bus.interleaved()[0], 0.2, epsilon = 1e-6);
+}
+
+/// `SetMute` silences a strip **without unrouting it**: the route and the steady
+/// gain survive, the strip's discrete track is untouched, and the transition is
+/// the anti-click envelope (frame 0 is still at full gain, then it settles to
+/// exact silence) — never a hard step.
+#[test]
+fn mute_silences_without_unrouting_and_preserves_gain() {
+    let mut mixer = Mixer::new(AudioFormat::new(FS, ChannelLayout::Stereo));
+    let a = mixer.add_input("a");
+    mixer.route_to_program(a, 0.5);
+    mixer.submit(a, stereo_block(0.4, -0.4, 4)).unwrap();
+
+    mixer.set_muted(a, true);
+    assert_eq!(mixer.is_muted(a), Some(true));
+    // Mute must not touch the route or the steady gain (mute ≠ unroute).
+    approx::assert_abs_diff_eq!(mixer.program_gain(a).unwrap(), 0.5, epsilon = 1e-12);
+    assert!(mixer.discrete_track(a).is_some(), "the strip stays live");
+
+    // Anti-click: the first frame of the transition is still at full gain.
+    let first = mixer.mix_program().unwrap();
+    approx::assert_abs_diff_eq!(first.interleaved()[0], 0.2, epsilon = 1e-6);
+
+    // Once the envelope settles the muted strip contributes exact silence —
+    // and the bus length is unchanged (the strip is still routed).
+    mixer.advance_ramps(DEFAULT_MUTE_FRAMES);
+    let muted = mixer.mix_program().unwrap();
+    assert_eq!(muted.frame_count(), 4, "a muted strip stays routed");
+    assert!(
+        muted.interleaved().iter().all(|s| s.abs() < 1e-9),
+        "a muted strip contributes silence"
+    );
+}
+
+/// Unmute restores the **exact prior gain** without re-routing: nothing in
+/// between re-supplied a gain, so the contribution returns to `0.4 × 0.5`.
+#[test]
+fn unmute_restores_the_prior_gain() {
+    let mut mixer = Mixer::new(AudioFormat::new(FS, ChannelLayout::Stereo));
+    let a = mixer.add_input("a");
+    mixer.route_to_program(a, 0.5);
+    mixer.submit(a, stereo_block(0.4, 0.4, 2)).unwrap();
+
+    mixer.set_muted(a, true);
+    mixer.advance_ramps(DEFAULT_MUTE_FRAMES);
+    assert!(mixer
+        .mix_program()
+        .unwrap()
+        .interleaved()
+        .iter()
+        .all(|s| s.abs() < 1e-9));
+
+    mixer.set_muted(a, false);
+    assert_eq!(mixer.is_muted(a), Some(false));
+    approx::assert_abs_diff_eq!(mixer.program_gain(a).unwrap(), 0.5, epsilon = 1e-12);
+
+    mixer.advance_ramps(DEFAULT_MUTE_FRAMES);
     let bus = mixer.mix_program().unwrap();
     approx::assert_abs_diff_eq!(bus.interleaved()[0], 0.2, epsilon = 1e-6);
 }
