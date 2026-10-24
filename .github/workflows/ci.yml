@@ -764,6 +764,13 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+      # The opt-in WebRTC native closure (str0m ICE/DTLS/SRTP + its crypto
+      # backend, reqwest, the ffmpeg bindings) handles DTLS secret key material,
+      # so its advisories and licenses are gated too (#127). Resolution only —
+      # no compile, so no FFmpeg/system libs are needed. Do NOT widen this to
+      # --all-features: that pulls the opt-in GPL codecs by design.
+      - name: cargo deny (webrtc-native closure)
+        run: cargo deny --features multiview-cli/webrtc-native check
 
   # ── release-artifact feature guard (task #109) ───────────────────────────────
   # A test-only Cargo feature (multiview-control's `_test-seams`, the config-watch
