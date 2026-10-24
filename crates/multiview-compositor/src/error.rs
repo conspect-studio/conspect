@@ -79,6 +79,11 @@ pub enum Error {
     #[error("GPU limit exceeded: {0}")]
     GpuLimit(String),
 
+    /// Alpha tiles need the CPU compositor until the GPU alpha kernel ships.
+    #[cfg(feature = "wgpu")]
+    #[error("GPU alpha tiles require CPU fallback")]
+    GpuAlphaUnsupported,
+
     /// A bundled OFL font failed to load into the overlay text engine's font
     /// database (corrupt embedded asset or an unparseable face).
     #[cfg(feature = "overlay")]

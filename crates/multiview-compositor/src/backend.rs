@@ -466,7 +466,12 @@ impl RunBackend {
         match self {
             Self::Cpu(cpu) => cpu.composite(canvas_w, canvas_h, canvas, background, tiles),
             #[cfg(feature = "wgpu")]
-            Self::Gpu(gpu) => gpu.composite(canvas_w, canvas_h, canvas, background, tiles),
+            Self::Gpu(gpu) => match gpu.composite(canvas_w, canvas_h, canvas, background, tiles) {
+                Err(crate::error::Error::GpuAlphaUnsupported) => {
+                    crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)
+                }
+                result => result,
+            },
         }
     }
 

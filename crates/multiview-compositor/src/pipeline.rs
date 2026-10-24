@@ -174,6 +174,9 @@ pub struct Nv12Image {
     height: u32,
     y_plane: Vec<u8>,
     uv_plane: Vec<u8>,
+    /// Full-resolution straight-alpha bytes only for alpha media.
+    alpha_plane: Option<Vec<u8>>,
+    alpha_return: Option<Arc<AlphaPlanePool>>,
     /// The resolved color of these samples.
     color: ColorInfo,
     /// Optional return path for CPU-compositor output planes. Images built by
@@ -191,6 +194,8 @@ impl Clone for Nv12Image {
             height: self.height,
             y_plane: self.y_plane.clone(),
             uv_plane: self.uv_plane.clone(),
+            alpha_plane: self.alpha_plane.clone(),
+            alpha_return: None,
             color: self.color,
             plane_return: None,
         }
@@ -203,6 +208,7 @@ impl PartialEq for Nv12Image {
             && self.height == other.height
             && self.y_plane == other.y_plane
             && self.uv_plane == other.uv_plane
+            && self.alpha_plane == other.alpha_plane
             && self.color == other.color
     }
 }
@@ -211,12 +217,59 @@ impl Eq for Nv12Image {}
 
 impl Drop for Nv12Image {
     fn drop(&mut self) {
+        if let (Some(alpha), Some(pool)) = (self.alpha_plane.take(), self.alpha_return.take()) {
+            pool.give_back(alpha);
+        }
         let Some(return_to) = self.plane_return.take() else {
             return;
         };
         let y = core::mem::take(&mut self.y_plane);
         let uv = core::mem::take(&mut self.uv_plane);
         return_to.give_back(y, uv);
+    }
+}
+
+/// Bounded reusable alpha storage for media/graphics fills. Opaque frames do
+/// not acquire a buffer. This pool retains at most one returned plane.
+#[derive(Debug, Default)]
+pub struct AlphaPlanePool {
+    spare: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl AlphaPlanePool {
+    /// Attach a full-resolution straight-alpha plane to an NV12 image.
+    ///
+    /// # Errors
+    /// Returns [`Error::Geometry`] when the alpha plane does not match the image.
+    pub fn attach(self: &Arc<Self>, mut image: Nv12Image, alpha: &[u8]) -> Result<Nv12Image> {
+        let expected = image.y_plane.len();
+        if alpha.len() != expected {
+            return Err(Error::Geometry(format!(
+                "alpha plane length {} != expected {expected}",
+                alpha.len()
+            )));
+        }
+        let mut spare = self
+            .spare
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut plane = spare.take().unwrap_or_default();
+        drop(spare);
+        plane.resize(expected, 0);
+        plane.copy_from_slice(alpha);
+        image.alpha_plane = Some(plane);
+        image.alpha_return = Some(Arc::clone(self));
+        Ok(image)
+    }
+
+    fn give_back(&self, plane: Vec<u8>) {
+        let mut spare = self
+            .spare
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if spare.is_none() {
+            *spare = Some(plane);
+        }
     }
 }
 
@@ -295,6 +348,8 @@ impl Nv12Image {
             height,
             y_plane,
             uv_plane,
+            alpha_plane: None,
+            alpha_return: None,
             color,
             plane_return: None,
         })
@@ -346,6 +401,8 @@ impl Nv12Image {
             height,
             y_plane,
             uv_plane,
+            alpha_plane: None,
+            alpha_return: None,
             color,
             plane_return: None,
         })
@@ -457,6 +514,12 @@ impl Nv12Image {
         &self.y_plane
     }
 
+    /// Borrow the optional full-resolution straight-alpha plane.
+    #[must_use]
+    pub fn alpha_plane(&self) -> Option<&[u8]> {
+        self.alpha_plane.as_deref()
+    }
+
     /// Borrow the interleaved Cb/Cr plane.
     #[must_use]
     pub fn uv_plane(&self) -> &[u8] {
@@ -486,6 +549,21 @@ impl Nv12Image {
         let cr = *self.uv_plane.get(uv_index + 1)?;
         Some((y, cb, cr))
     }
+}
+
+/// Read straight alpha at the source pixel, or treat an opaque image as one.
+fn tile_alpha(image: &Nv12Image, x: u32, y: u32) -> f32 {
+    let Some(alpha) = image.alpha_plane() else {
+        return 1.0;
+    };
+    let index = usize::try_from(y)
+        .ok()
+        .zip(usize::try_from(image.width).ok())
+        .and_then(|(row, width)| row.checked_mul(width))
+        .and_then(|base| base.checked_add(usize::try_from(x).ok()?));
+    index
+        .and_then(|i| alpha.get(i))
+        .map_or(1.0, |&a| f32::from(a) / 255.0)
 }
 
 /// One tile in the reference composite: a source image, the **destination
@@ -1293,7 +1371,7 @@ fn composite_band_reference(
                     r: lin[0],
                     g: lin[1],
                     b: lin[2],
-                    a: tile.opacity.clamp(0.0, 1.0),
+                    a: tile.opacity.clamp(0.0, 1.0) * tile_alpha(tile.image, sx, sy),
                 }
                 .premultiplied();
                 acc = over(src, acc);
@@ -1572,7 +1650,7 @@ fn fold_tile_into_band(
                     r: lin[0],
                     g: lin[1],
                     b: lin[2],
-                    a: opacity,
+                    a: opacity * tile_alpha(tile.image, src_x, src_y),
                 }
                 .premultiplied();
                 // The accumulator destination: the resident value if this pixel
