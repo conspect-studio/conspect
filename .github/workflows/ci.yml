@@ -636,6 +636,14 @@ jobs:
             exit 1
           fi
           echo "OK: all pinned-FFmpeg runtime deps resolve on this runner"
+      - name: clippy multiview-audio --features ffmpeg
+        # Lint the real libav decode/resample integration and its test targets
+        # against the same pinned LGPL FFmpeg build used in production.
+        run: cargo clippy --locked -p multiview-audio --features ffmpeg --all-targets -- -D warnings
+      - name: test multiview-audio --features ffmpeg
+        # Committed MOV/pcm_s16le fixtures need only the pinned build's demuxer
+        # and decoder: no second system FFmpeg CLI or unavailable WAV demuxer.
+        run: cargo test --locked -p multiview-audio --features ffmpeg
       - name: test multiview-cli --features ffmpeg,aes67 (aes67 lib tests)
         # Runs the aes67 cli lib unit tests (RX resolve/plan + non-48kHz reject,
         # TX build + zero-ptime reject, stable ssrc + same-group collision reject,
