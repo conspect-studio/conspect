@@ -58,12 +58,10 @@ assert_features() {
     case "${kind}" in
       protocols)
         # SRT is bidirectional. RTSP and HLS are *demuxers*, not protocols.
-        for name in srt; do
-          if [ "$(printf '%s\n' "${listing}" | awk -v n="${name}" '$1 == n { count++ } END { print count+0 }')" -ne 2 ]; then
-            echo "ffmpeg-build: missing input/output protocol ${name}" >&2
-            return 1
-          fi
-        done
+        if [ "$(printf '%s\n' "${listing}" | awk '$1 == "srt" { count++ } END { print count+0 }')" -ne 2 ]; then
+          echo "ffmpeg-build: missing input/output protocol srt" >&2
+          return 1
+        fi
         ;;
       demuxers)
         for name in rtsp hls wav f32le s16le s24le; do
@@ -162,13 +160,14 @@ CONFIGURE_ARGS=(
   --enable-shared --disable-static --enable-version3
   --disable-doc --disable-ffplay --disable-debug --disable-autodetect
   # ffprobe is KEPT (invariant #8: verify output with ffprobe); ffplay dropped.
-  --enable-decoder=h264,hevc,av1,vp9,mpeg2video,mjpeg,ffv1,aac,opus,mp2,ac3,pcm_s16le
-  --enable-encoder=mpeg2video,ffv1,mjpeg,rawvideo,aac,libopus,mp2,flac,pcm_s16le
+  --enable-decoder=h264,hevc,av1,vp9,mpeg2video,mjpeg,ffv1,aac,opus,mp2,ac3,pcm_s16le,pcm_s24le,pcm_f32le,flac
+  --enable-encoder=mpeg2video,ffv1,mjpeg,rawvideo,aac,libopus,mp2,flac,pcm_s16le,pcm_s24le,pcm_f32le
   --enable-parser=h264,hevc,av1,vp9,aac,opus,mpegaudio,mpegvideo
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata,aac_adtstoasc,null
-  --enable-demuxer=mpegts,hls,mov,flv,rtsp,rtp,sdp,aac,matroska,h264,hevc,data
-  --enable-muxer=mpegts,mp4,mov,flv,rtsp,rtp,adts,data
-  --enable-protocol=file,pipe,tcp,udp,rtp,rtsp,rtmp,hls,https,tls,crypto,data,srt
+  --enable-demuxer=mpegts,hls,mov,flv,rtsp,rtp,sdp,aac,matroska,h264,hevc,data,wav,pcm_f32le,pcm_s16le,pcm_s24le,flac
+  --enable-muxer=mpegts,mp4,mov,flv,rtsp,rtp,adts,data,wav,pcm_f32le,pcm_s16le,pcm_s24le,flac
+  # RTSP/HLS are demuxers (RTSP also a muxer); libsrt is the SRT URL protocol.
+  --enable-protocol=file,pipe,tcp,udp,rtp,rtmp,http,https,tls,crypto,data,libsrt
   --enable-filter=scale,format,aformat,aresample,anull,null,fps,setpts,asetpts
   --enable-swscale --enable-swresample --enable-avfilter
   --enable-libopus --enable-libsrt --enable-gnutls
@@ -261,14 +260,27 @@ export PKG_CONFIG_PATH="${FF_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 echo "ffmpeg-build: ./configure ${CONFIGURE_ARGS[*]}"
 ./configure "${CONFIGURE_ARGS[@]}"
+# FFmpeg accepts unknown names in --enable-protocol=... silently. Check the
+# resolved components now (before the expensive compile) as well as the final
+# CLI below. The URL scheme srt is implemented by CONFIG_LIBSRT_PROTOCOL.
+for component in LIBSRT_PROTOCOL RTSP_DEMUXER HLS_DEMUXER WAV_DEMUXER \
+                 PCM_F32LE_DEMUXER PCM_S16LE_DEMUXER PCM_S24LE_DEMUXER \
+                 WAV_MUXER PCM_F32LE_MUXER PCM_S16LE_MUXER PCM_S24LE_MUXER; do
+  if ! awk -v n="CONFIG_${component}" '$1 == "#define" && $2 == n && $3 == "1" { found=1 } END { exit !found }' config_components.h; then
+    echo "ffmpeg-build: requested ${component} was not enabled by configure" >&2
+    exit 5
+  fi
+done
 make -j"$(nproc)"
 make install
 
 # -----------------------------------------------------------------------------
-# 5. Assert the FFmpeg 8.1.1 soname landed (libavcodec.so.62, NOT .61). A layout
-#    or version drift fails the BUILD here, not the deploy.
+# 5. Assert actual installed features (configure flags alone do not prove they
+#    survived dependency resolution) and the FFmpeg 8.1.1 sonames. Fail the BUILD
+#    here rather than shipping an unusable image.
 # -----------------------------------------------------------------------------
 test -e "${FF_PREFIX}/lib/libavcodec.so.62"
 test -e "${FF_PREFIX}/lib/libavutil.so.60"
 test -e "${FF_PREFIX}/lib/libavformat.so.62"
+assert_features
 echo "ffmpeg-build: OK — FFmpeg ${FFMPEG_VERSION} installed to ${FF_PREFIX} (libavcodec.so.62)."
