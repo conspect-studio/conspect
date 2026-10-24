@@ -98,6 +98,18 @@ struct OverlayResources {
     images: wgpu::Texture,
 }
 
+/// Reject alpha before any GPU allocation or submission. The run backend
+/// catches this typed error and composites the frame on the CPU instead.
+///
+/// # Errors
+/// Returns [`Error::GpuAlphaUnsupported`] for any tile with an alpha plane.
+pub fn reject_alpha_tiles(tiles: &[Tile<'_>]) -> Result<()> {
+    if tiles.iter().any(|tile| tile.image.alpha_plane().is_some()) {
+        return Err(Error::GpuAlphaUnsupported);
+    }
+    Ok(())
+}
+
 impl GpuCompositor {
     /// Build a GPU compositor, acquiring a headless device and compiling both
     /// pipelines.
@@ -669,6 +681,7 @@ impl GpuCompositor {
         background: LinearRgba,
         tiles: &[Tile<'_>],
     ) -> Result<()> {
+        reject_alpha_tiles(tiles)?;
         require_even_positive(canvas_w, canvas_h, "canvas")?;
         let tile_count = u32::try_from(tiles.len())
             .map_err(|_| Error::GpuLimit(format!("tile count {} overflows u32", tiles.len())))?;
