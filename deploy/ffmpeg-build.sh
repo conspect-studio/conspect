@@ -84,10 +84,73 @@ assert_features() {
   echo "ffmpeg-build: required protocols, demuxers and muxers present."
 }
 
-if [ "${1:-}" = "--assert-features" ]; then
-  assert_features
-  exit
-fi
+# Exercise actual SRT transport, not merely ffmpeg -protocols membership. This
+# runs in the image builder for every licensing/hardware variant, without access
+# to any network other than loopback.
+smoke_srt() (
+  local ffmpeg="${FF_PREFIX}/bin/ffmpeg" host port work tmp_root listener_pid pushed=0
+  tmp_root="$(realpath -- "${TMPDIR:-/tmp}")"
+  work="$(mktemp -d "${tmp_root}/ffmpeg-srt-smoke.XXXXXXXX")"
+  # The only path removed below is this mktemp directory under the verified root.
+  if [[ "$(realpath -- "${work}")" != "${tmp_root}/ffmpeg-srt-smoke."* ]]; then
+    echo 'ffmpeg-build: unexpected SRT smoke directory' >&2
+    return 1
+  fi
+  trap 'if [[ -n "${listener_pid:-}" ]]; then kill "${listener_pid}" 2>/dev/null || :; wait "${listener_pid}" 2>/dev/null || :; fi; rm -rf -- "${work}"' EXIT
+
+  # Some builders disable IPv6 loopback; only those fall back to IPv4.
+  host='[::1]'
+  if ! grep -q '^00000000000000000000000000000001 ' /proc/net/if_inet6 2>/dev/null; then
+    host='127.0.0.1'
+    echo 'ffmpeg-build: IPv6 loopback unavailable; using 127.0.0.1' >&2
+  fi
+  # Avoid the Linux ephemeral-port range (typically starting at 32768).
+  port=$((20000 + RANDOM % 10000))
+  printf 'Multiview FFmpeg SRT loopback smoke: 8.1.1\n' > "${work}/in.bin"
+
+  # File-transfer mode drains buffered bytes on close; live mode can discard a
+  # short smoke payload when the sender exits before SRT's default latency.
+  LD_LIBRARY_PATH="${FF_PREFIX}/lib:${LD_LIBRARY_PATH:-}" timeout -k 2s 20s \
+    "${ffmpeg}" -hide_banner -loglevel error -nostdin -y \
+    -f data -i "srt://${host}:${port}?mode=listener&transtype=file" \
+    -map 0 -c copy -f data "${work}/out.bin" > "${work}/listener.log" 2>&1 &
+  listener_pid=$!
+  # Allow the listener to bind before dialing; retry startup races only.
+  for _ in 1 2 3 4 5; do
+    if LD_LIBRARY_PATH="${FF_PREFIX}/lib:${LD_LIBRARY_PATH:-}" timeout -k 2s 5s \
+      "${ffmpeg}" -hide_banner -loglevel error -nostdin \
+      -f data -i "${work}/in.bin" -map 0 -c copy -f data \
+      "srt://${host}:${port}?mode=caller&transtype=file" > "${work}/caller.log" 2>&1; then
+      pushed=1
+      break
+    fi
+    if ! kill -0 "${listener_pid}" 2>/dev/null; then break; fi
+    sleep 0.2
+  done
+  if [ "${pushed}" -ne 1 ]; then
+    echo 'ffmpeg-build: SRT caller failed' >&2
+    cat "${work}/listener.log" "${work}/caller.log" >&2
+    return 1
+  fi
+  if ! wait "${listener_pid}"; then
+    listener_pid=''
+    echo 'ffmpeg-build: SRT listener failed or timed out' >&2
+    cat "${work}/listener.log" "${work}/caller.log" >&2
+    return 1
+  fi
+  listener_pid=''
+  if ! cmp -s "${work}/in.bin" "${work}/out.bin"; then
+    echo 'ffmpeg-build: SRT loopback payload mismatch' >&2
+    cat "${work}/listener.log" "${work}/caller.log" >&2
+    return 1
+  fi
+  echo "ffmpeg-build: SRT loopback push+ingest PASS (${host})."
+)
+
+case "${1:-}" in
+  --assert-features) assert_features; exit ;;
+  --smoke-srt) smoke_srt; exit ;;
+esac
 
 if [ -z "${FFMPEG_SHA256:-}" ] || [ "${FFMPEG_SHA256}" = "TODO-pin" ]; then
   echo "ffmpeg-build: FFMPEG_SHA256 is not pinned — refusing to build unverified source." >&2
