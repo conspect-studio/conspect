@@ -833,7 +833,7 @@ fn foreign_root() -> multiview_licence::heartbeat::PinnedRoot {
     use p256::ecdsa::{SigningKey, VerifyingKey};
     let sk = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
     let vk = VerifyingKey::from(&sk);
-    multiview_licence::heartbeat::PinnedRoot::from_sec1_bytes(vk.to_encoded_point(false).as_bytes())
+    multiview_licence::heartbeat::PinnedRoot::from_sec1_bytes(vk.to_sec1_point(false).as_bytes())
         .unwrap()
 }
 

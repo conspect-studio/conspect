@@ -168,7 +168,7 @@ tempfile = "3"
 # All already in the workspace graph behind `heartbeat` (deny-clean, no new crate);
 # dev-only — the cli's non-test code has no signer/RNG.
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 serde_json = { workspace = true }
 # Property tests for the pure media-player transport state machine (ADR-0057 /
