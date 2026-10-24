@@ -349,7 +349,9 @@ pub struct MultiviewConfig {
     /// switcher domain (`mix_effects`, `downstream_keyers`, `aux_buses`,
     /// `transitions`, `wipe_patterns`, `compositions`); this crate currently
     /// models the block's **presence**, which is what makes program audio
-    /// default-on (ADR-0059 §8). Absent ⇒ no switcher is declared.
+    /// default-on (ADR-0059 §8) — and carries every unmodelled switcher field
+    /// verbatim (see [`SwitcherConfig`]) so an ADR-M012-authored block
+    /// round-trips losslessly until then. Absent ⇒ no switcher is declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switcher: Option<SwitcherConfig>,
     /// The per-stream decoupled-routing crosspoint table (ADR-0034 / RT-4): the
