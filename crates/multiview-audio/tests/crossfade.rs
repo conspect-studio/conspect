@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use multiview_audio::format::{AudioBlock, AudioFormat, ChannelLayout};
-use multiview_audio::mixer::{GainRamp, Mixer};
+use multiview_audio::mixer::{GainRamp, Mixer, DEFAULT_MUTE_FRAMES};
 use multiview_audio::program::{ApplyClass, ProgramBus, SwitchTier};
 use multiview_audio::store::AudioStore;
 use multiview_core::time::Rational;
@@ -145,6 +145,44 @@ fn equal_power_identity_holds_at_every_frame() {
 // ---------------------------------------------------------------------------
 // Bus-level: the equal-power cross-fade breakaway.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn muting_and_unmuting_during_long_crossfade_affects_every_channel_strip() {
+    let fmt = stereo();
+    let mut bus = ProgramBus::new(fmt, Rational::new(100, 1)); // 480 frames/tick
+    let old = Arc::new(AudioStore::new(fmt, 16_000));
+    let new = Arc::new(AudioStore::new(fmt, 16_000));
+    let tone = || AudioBlock::from_interleaved(fmt, vec![0.5; 12_000 * 2]).unwrap();
+    old.publish(&tone()).unwrap();
+    new.publish(&tone()).unwrap();
+    let point = bus.add_source("program", Arc::clone(&old), 0.8);
+    let before = bus.tick();
+    assert!((before.interleaved()[0] - 0.4).abs() < 1e-6);
+
+    bus.repoint_crossfade(point, Arc::clone(&new), 4_800)
+        .unwrap();
+    new.publish(&tone()).unwrap(); // repoint seeks to the live edge
+    bus.set_muted(point, true);
+    assert_eq!(bus.program_gain(point), Some(0.8));
+    let mut output = Vec::new();
+    for _ in 0..4 {
+        output.extend(bus.tick().interleaved().iter().step_by(2).copied());
+    }
+    assert!(
+        output[DEFAULT_MUTE_FRAMES..].iter().all(|&sample| sample == 0.0),
+        "every sample after the 480-frame mute envelope must be silent, even while the 4800-frame crossfade continues"
+    );
+    let seam_step = (output[0] - before.interleaved().last().copied().unwrap()).abs();
+    let max_step = output.windows(2).map(|w| (w[1] - w[0]).abs()).fold(seam_step, f32::max);
+    assert!(max_step < 5e-3, "mute ramp must not click: {max_step}");
+
+    // Unmuting while the outgoing strip is still present restores both strips,
+    // without changing the channel's steady program gain.
+    bus.set_muted(point, false);
+    assert_eq!(bus.program_gain(point), Some(0.8));
+    let reopened = bus.tick();
+    assert!(reopened.interleaved().iter().any(|&sample| sample > 0.4));
+}
 
 /// (a) NO CLICK + (b) NO DIP + (c) NO OVER-PEAK: a ~10 ms equal-power cross-fade
 /// from source A (+0.5 DC) to source B (+0.5 DC) across a TICK BLOCK has no

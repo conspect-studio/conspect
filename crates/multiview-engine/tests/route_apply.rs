@@ -363,6 +363,57 @@ fn route_audio_honours_gain_and_mute_without_unrouting() {
     );
 }
 
+#[test]
+fn route_audio_mute_silences_outgoing_crossfade_strip_after_short_envelope() {
+    let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+    let mut bus = ProgramBus::new(format, Rational::new(100, 1));
+    let old = Arc::new(AudioStore::new(format, 16_000));
+    let incoming = Arc::new(AudioStore::new(format, 16_000));
+    let tone = || AudioBlock::from_interleaved(format, vec![0.5_f32; 12_000 * 2]).unwrap();
+    old.publish(&tone()).unwrap();
+    incoming.publish(&tone()).unwrap();
+    let point = bus.add_source("prog", Arc::clone(&old), 0.8);
+    let previous = bus.tick();
+
+    let mut inventories = HashMap::new();
+    inventories.insert(
+        "cam-b".to_owned(),
+        StreamInventory::from_streams(vec![audio_stream("eng", 2, 300)]).with_input_id("cam-b"),
+    );
+    let mut resolution = RouteResolution::new(inventories);
+    resolution.set_audio_store(
+        &StreamRef::best("cam-b", StreamKind::Audio),
+        Arc::clone(&incoming),
+    );
+    resolution.set_audio_channel("prog", point);
+    let mut applier = RouteApplier::new(&resolution);
+    let route = |mute| RouteIntent::Audio {
+        target: "prog".to_owned(),
+        source: StreamRef::best("cam-b", StreamKind::Audio),
+        gain_db: -1.9382, // 0.8 linear
+        mute,
+    };
+    applier.apply_audio(&mut bus, &[route(true)], 4_800).unwrap();
+    incoming.publish(&tone()).unwrap(); // repoint seeks the live edge
+    let mut samples = Vec::new();
+    for _ in 0..4 {
+        samples.extend(bus.tick().interleaved().iter().step_by(2).copied());
+    }
+    assert!(
+        samples[480..].iter().all(|&sample| sample == 0.0),
+        "route mute must silence every outgoing crossfade sample after the 480-frame envelope"
+    );
+    let seam = (samples[0] - previous.interleaved().last().copied().unwrap()).abs();
+    let max_step = samples.windows(2).map(|w| (w[1] - w[0]).abs()).fold(seam, f32::max);
+    assert!(max_step < 5e-3, "mute envelope must not introduce a click: {max_step}");
+
+    // A subsequent route unmute must reopen all remaining crossfade strips.
+    applier.apply_audio(&mut bus, &[route(false)], 0).unwrap();
+    assert!((bus.program_gain(point).unwrap() - 0.8).abs() < 1e-3);
+    let reopened = bus.tick();
+    assert!(peak(&reopened) > 0.4);
+}
+
 /// The `AudioRoute` fixture for the out-of-range-gain regressions.
 fn overflow_route(gain_db: f32, mute: bool) -> RouteIntent {
     RouteIntent::Audio {
