@@ -34,6 +34,7 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use multiview_audio::decode::AudioFileDecoder;
 use multiview_audio::store::{audio_decode_loop, AudioStore};
 use multiview_audio::{AudioFormat, ChannelLayout};
 
@@ -105,6 +106,12 @@ fn decode_loop_fills_store_then_silence_past_eof() {
     let dir = tempfile::tempdir().unwrap();
     // 0.5 s of a clearly-non-silent tone (48_000 * 0.5 = 24_000 frames).
     let wav = encode_to_wav(dir.path(), &sine_interleaved(0.5, 0.5));
+    let mut decoder = AudioFileDecoder::open(&wav, ChannelLayout::Stereo)
+        .expect("fixture must be readable by the pinned libav demuxer");
+    assert!(
+        decoder.next_block().expect("decode fixture").is_some(),
+        "fixture must contain decodable audio"
+    );
 
     // The decoder is opened *inside* the loop on the worker thread (the libav
     // context is not `Send`); the spawn carries only the `Send` path + layout,
