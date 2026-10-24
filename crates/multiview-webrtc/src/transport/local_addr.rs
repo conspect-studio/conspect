@@ -64,6 +64,8 @@ pub fn resolve_local_destination(arrival: SocketAddr, candidates: &[SocketAddr])
     candidates.first().copied().unwrap_or(arrival)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use unix::set_peek_offset;
 #[cfg(unix)]
 pub(crate) use unix::{enable_pktinfo, recv_from_with_local};
 
@@ -168,6 +170,29 @@ mod unix {
         {
             std::mem::size_of::<std::os::raw::c_long>()
         }
+    }
+
+    /// Advance Linux's peek cursor past each datagram without consuming it.
+    /// Test-only: the inbound budget test counts actual queued datagrams before
+    /// allowing a single-wake drain to run.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_peek_offset(socket: &Socket, offset: libc::c_int) -> io::Result<()> {
+        let optlen = socklen(std::mem::size_of_val(&offset))?;
+        // SAFETY: the borrowed socket fd stays open throughout the call; the
+        // offset points to an initialized c_int of exactly optlen bytes.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEEK_OFF,
+                std::ptr::addr_of!(offset).cast(),
+                optlen,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Ask the kernel to deliver the datagram's destination address as ancillary
