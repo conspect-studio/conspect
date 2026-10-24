@@ -47,6 +47,7 @@ pub mod program;
 pub mod routing;
 pub mod salvo;
 pub mod schema;
+pub mod switcher;
 pub mod sync_group;
 pub mod tally;
 pub mod timer;
@@ -95,6 +96,7 @@ pub use schema::{
     RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
     SourceAuth, SourceKind,
 };
+pub use switcher::SwitcherConfig;
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
 pub use timer::{
@@ -343,6 +345,13 @@ pub struct MultiviewConfig {
     /// that consumes these routes is `multiview-audio` + the engine (AUD-3/AUD-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioRouting>,
+    /// The production-switcher config root (ADR-M012 §1). SW-17 lands the typed
+    /// switcher domain (`mix_effects`, `downstream_keyers`, `aux_buses`,
+    /// `transitions`, `wipe_patterns`, `compositions`); this crate currently
+    /// models the block's **presence**, which is what makes program audio
+    /// default-on (ADR-0059 §8). Absent ⇒ no switcher is declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switcher: Option<SwitcherConfig>,
     /// The per-stream decoupled-routing crosspoint table (ADR-0034 / RT-4): the
     /// broadcast router/multiviewer model where inputs, layouts and outputs are
     /// independent resources wired by per-stream crosspoints. **Absent ⇒ the
@@ -451,6 +460,21 @@ impl MultiviewConfig {
     /// Returns [`ConfigError::JsonSerialize`] if serialization fails.
     pub fn to_json(&self) -> Result<String, ConfigError> {
         serde_json::to_string_pretty(self).map_err(|e| ConfigError::JsonSerialize(e.to_string()))
+    }
+
+    /// Whether this document declares **program audio** (ADR-0059 §8).
+    ///
+    /// Program audio is config-declared: it is on when the document carries an
+    /// ADR-R005 `[audio]` routing block, or a `[switcher]` block (a switcher
+    /// without program audio is not a switcher). A document declaring neither is
+    /// silent unless `multiview run --program-audio` overrides it — the absent ⇒
+    /// off default the byte-identical-when-off guarantee rides.
+    ///
+    /// This is the single predicate the run path consults; when SW-17 lands the
+    /// typed `[switcher]` domain the presence test here is unchanged.
+    #[must_use]
+    pub fn declares_program_audio(&self) -> bool {
+        self.audio.is_some() || self.switcher.is_some()
     }
 
     /// Validate every semantic invariant this crate owns.

@@ -133,8 +133,8 @@ pub struct ConfigDiff {
     /// when the pinned signal did not change).
     pub layout_changed: bool,
     /// Every other changed section, by its authored TOML name (`outputs`,
-    /// `overlays`, `probes`, `audio`, `control`, `placement`, `salvos`,
-    /// `tally_profiles`, `walls`, `devices`, `sync_groups`, `routing`,
+    /// `overlays`, `probes`, `audio`, `switcher`, `control`, `placement`,
+    /// `salvos`, `tally_profiles`, `walls`, `devices`, `sync_groups`, `routing`,
     /// `discovery`, `timing`, `webrtc`, `schema_version`). Sorted + deduplicated.
     pub changed_sections: BTreeSet<&'static str>,
 }
@@ -171,6 +171,7 @@ impl ConfigDiff {
             api: running_api,
             placement: running_placement,
             audio: running_audio,
+            switcher: running_switcher,
             routing: running_routing,
             discovery: running_discovery,
             timing: running_timing,
@@ -197,6 +198,7 @@ impl ConfigDiff {
             api: next_api,
             placement: next_placement,
             audio: next_audio,
+            switcher: next_switcher,
             routing: next_routing,
             discovery: next_discovery,
             timing: next_timing,
@@ -226,7 +228,7 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 19] = [
+        let sectioned: [(&'static str, bool); 20] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
@@ -243,6 +245,11 @@ impl ConfigDiff {
             ("overlays", running_overlays != next_overlays),
             ("probes", running_probes != next_probes),
             ("audio", running_audio != next_audio),
+            // The switcher root (ADR-M012): a change to the declared switcher is
+            // restart-class here (the typed domain and its live-apply classes land
+            // with SW-17/SW-18). `[switcher]` presence also flips program audio
+            // (ADR-0059 §8), so it is surfaced rather than silently dropped.
+            ("switcher", running_switcher != next_switcher),
             ("control", running_control != next_control),
             // Config-declared API keys (ADR-W026). A changed section: keys are
             // registered at startup, and a live re-registration path (file-watch

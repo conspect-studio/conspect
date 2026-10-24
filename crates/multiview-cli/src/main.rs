@@ -279,8 +279,16 @@ async fn run_pipeline(
         pipeline = pipeline.with_subtitles(track);
     }
     if args.program_audio {
-        tracing::info!("program audio enabled: muxing an AAC program-audio stream");
+        // The legacy override (ADR-0059 §8): `Pipeline::build` already enabled
+        // program audio for a config that declares it, so this force-turns it on
+        // for a document declaring neither.
+        tracing::info!("--program-audio override: muxing an AAC program-audio stream");
         pipeline.enable_program_audio();
+    } else if pipeline.has_program_audio() {
+        tracing::info!(
+            "program audio enabled by config (an `[audio]` or `[switcher]` block): \
+             muxing an AAC program-audio stream"
+        );
     }
     let cadence = pipeline.cadence();
     tracing::info!(
@@ -919,8 +927,13 @@ async fn run_pipeline(
             "--subtitles needs the `ffmpeg`+`overlay` features (full pipeline); ignoring"
         );
     }
-    if args.program_audio {
-        tracing::warn!("--program-audio needs the `ffmpeg` feature (full pipeline); ignoring");
+    if args.program_audio || config.declares_program_audio() {
+        // Never silently skip declared audio: this build has no libav path, so a
+        // config carrying `[audio]`/`[switcher]` (or the override flag) must say so.
+        tracing::warn!(
+            "program audio (config-declared or `--program-audio`) needs the `ffmpeg` \
+             feature (full pipeline); ignoring"
+        );
     }
     // Conspect S1 startup gate: gate the NEW engine build on the published ladder
     // level (refuse at the block-new-instance rung).

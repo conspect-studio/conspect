@@ -2118,6 +2118,15 @@ struct EmbeddedCcRoute {
     store: Arc<crate::captions::CueStore>,
 }
 
+/// The canonical **program-audio encode config** (AUD-4): 48 kHz stereo AAC at
+/// 128 kbps. One constructor shared by the config-declared default
+/// ([`Pipeline::build`] via `MultiviewConfig::declares_program_audio`, ADR-0059
+/// §8) and the legacy `--program-audio` override
+/// ([`Pipeline::enable_program_audio`]), so the two paths can never drift.
+fn program_audio_encode_config() -> multiview_output::AudioEncodeConfig {
+    multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000)
+}
+
 impl Pipeline {
     /// Build the pipeline from an already-validated configuration.
     ///
@@ -2387,10 +2396,14 @@ impl Pipeline {
             cadence,
             gop,
             bit_rate: 4_000_000,
-            // AUD-4: video-only until the program-audio path is wired through
-            // drive_streaming (subsequent slice); `None` keeps the muxer
-            // single-stream so the existing run output is unchanged.
-            audio: None,
+            // ADR-0059 §8 (SW-13a): program audio is config-declared. An
+            // `[audio]` routing block or a `[switcher]` block makes it
+            // default-on; `None` (a document declaring neither, with no
+            // `--program-audio` override) keeps the muxer single-stream so the
+            // run output is byte-identical to the pre-feature video-only path.
+            audio: config
+                .declares_program_audio()
+                .then(program_audio_encode_config),
             // NVENC device-affinity pin (Tier-2 P1a): `None` until the admission
             // pick threads the chosen ordinal in (separate integration); behaviour
             // is unchanged from before the seam existed.
@@ -2719,9 +2732,15 @@ impl Pipeline {
     /// builds a [`multiview_audio::program::ProgramBus`] from the same cadence and
     /// mixes one block per tick, the [`ProgramEncoder`] gains a second (AAC)
     /// elementary stream, and every mux sink registers a video **and** audio
-    /// stream. Default OFF — with this never called, `encode_cfg.audio` stays
-    /// `None` and the run is byte-identical to the video-only path (no bus, no
-    /// audio packets, `run_av` delegates to the old single-stream `run`).
+    /// stream.
+    ///
+    /// **Config-declared since SW-13a** (ADR-0059 §8): [`Pipeline::build`] already
+    /// calls this for a document carrying an `[audio]` routing block or a
+    /// `[switcher]` block, so this method is the **legacy `--program-audio`
+    /// override** — it turns audio on for a document that declares neither. With
+    /// neither block and no override, `encode_cfg.audio` stays `None` and the run
+    /// is byte-identical to the video-only path (no bus, no audio packets,
+    /// `run_av` delegates to the old single-stream `run`).
     ///
     /// The program bus mixes the **real decoded audio** of every audio-bearing
     /// source (AUD-2): a per-source decode thread resamples each source's audio to
@@ -2732,7 +2751,7 @@ impl Pipeline {
     /// contributes silence. The AAC encoder runs at 48 kHz stereo / 128 kbps (the
     /// canonical program format).
     pub fn enable_program_audio(&mut self) {
-        self.encode_cfg.audio = Some(multiview_output::AudioEncodeConfig::aac(48_000, 2, 128_000));
+        self.encode_cfg.audio = Some(program_audio_encode_config());
     }
 
     /// Whether this run carries **program audio** (`enable_program_audio` was
@@ -2747,12 +2766,14 @@ impl Pipeline {
     /// program audio (#103).
     ///
     /// The ST 2110-30 RX publishes into, and the TX taps, the **program-audio
-    /// bus** — which only exists when `enable_program_audio` was called (the
-    /// `--program-audio` invocation). Without it the RX would be spawned to
-    /// nowhere and the TX would multicast silence, both silently. Rather than go
-    /// on air doing neither, refuse the run with a clear message. A no-op when the
-    /// config declares no AES67 endpoint (empty plans/handles) or when program
-    /// audio is on, so non-AES67 and correctly-configured runs are unaffected.
+    /// bus** — which only exists when the run carries program audio (an `[audio]`
+    /// or `[switcher]` block declares it, or `--program-audio` overrides a
+    /// document declaring neither; ADR-0059 §8). Without it the RX would be
+    /// spawned to nowhere and the TX would multicast silence, both silently.
+    /// Rather than go on air doing neither, refuse the run with a clear message. A
+    /// no-op when the config declares no AES67 endpoint (empty plans/handles) or
+    /// when program audio is on, so non-AES67 and correctly-configured runs are
+    /// unaffected.
     ///
     /// # Errors
     ///
@@ -2767,8 +2788,9 @@ impl Pipeline {
         }
         Err(PipelineError::Config(
             multiview_config::ConfigError::Validation(
-                "an AES67 / ST 2110-30 source or output requires program audio: run \
-                 with `--program-audio` (the ST 2110-30 RX/TX only exists on the \
+                "an AES67 / ST 2110-30 source or output requires program audio: \
+                 declare an `[audio]` (or `[switcher]`) block, or run with \
+                 `--program-audio` (the ST 2110-30 RX/TX only exists on the \
                  program-audio bus)"
                     .to_owned(),
             ),
@@ -14500,6 +14522,15 @@ segment_ms = 1000
             "the stores map must hold the registry's store Arc (decode-once ownership)"
         );
     }
+}
+
+#[cfg(test)]
+mod program_audio_declared_tests {
+    //! SW-13a (ADR-0059 §8): the run path enables program audio from config.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
 
     /// SW-13a (ADR-0059 §8): a minimal valid single-source document, optionally
     /// carrying an `[audio]` and/or `[switcher]` block — the presence of either

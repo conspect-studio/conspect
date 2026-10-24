@@ -134,10 +134,12 @@ pub struct RunArgs {
 
     /// Mux a **program-audio** elementary stream alongside the video (AUD-4): the
     /// output container gains a second (AAC) stream carrying the mixed program
-    /// bus. Default OFF — without this flag the output is video-only and
-    /// byte-identical to before. The program audio is silence until per-source
-    /// audio decode is wired (a later slice), but it is a real AAC stream.
-    /// Requires the `ffmpeg` feature; ignored otherwise.
+    /// bus. Program audio is **config-declared** (ADR-0059 §8): a document
+    /// carrying an `[audio]` routing block or a `[switcher]` block enables it
+    /// already, so this flag is the legacy **override** that turns it on for a
+    /// document declaring neither. Without either block and without this flag the
+    /// output is video-only and byte-identical to before. Requires the `ffmpeg`
+    /// feature; ignored otherwise.
     #[arg(long)]
     pub program_audio: bool,
 }
