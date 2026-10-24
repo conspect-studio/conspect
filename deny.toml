@@ -39,15 +39,14 @@ private = { ignore = true }
 #
 # The off-by-default `native` feature (multiview-webrtc; cli `webrtc-native`)
 # pulls `str0m` (the native ICE/DTLS/SRTP WebRTC stack — `MIT OR Apache-2.0`) and its
-# sans-IO crypto closure (`str0m-rust-crypto`, `dimpl`, the RustCrypto crates,
-# and `aws-lc-rs`/`aws-lc-sys` for the elliptic-curve / DTLS-cert primitives).
-# Every crate in that closure resolves to a license already on this allowlist —
-# `MIT`, `Apache-2.0`, `ISC`, and `BSD-3-Clause` (`aws-lc-sys` is the union of
-# all four). NOTE: this str0m 0.16.x line uses `aws-lc-rs`, NOT `ring`, for its
-# pure-Rust crypto backend. Because `[graph] all-features = false`, cargo-deny
-# scans only the default (str0m-free) build, so none of these appear in the
-# scanned graph today; they are listed here so a future `--all-features` scan
-# (or moving the feature on) is already license-clean with no surprise additions.
+# crypto closure (`str0m-aws-lc-rs`, `dimpl`, `rcgen`, and `aws-lc-rs`/`aws-lc-sys`
+# for SRTP, DTLS ECDHE/ECDSA and the DTLS cert; #127 moved it off the RustCrypto
+# `p256` 0.13 backend, RUSTSEC-2026-0387). Every str0m crate resolves to a license
+# already on this allowlist — `MIT`, `Apache-2.0`, `ISC`, and `BSD-3-Clause`
+# (`aws-lc-sys` is the union of all four). `[graph] all-features = false` keeps
+# the plain `cargo deny check` on the default (str0m-free) build; CI runs a second
+# `cargo deny --features multiview-cli/webrtc-native check` leg over this closure,
+# which is why the two per-crate `exceptions` below exist.
 #
 # The off-by-default `net` feature of the dev-only `xtask` crate (the
 # `soak-iptv` iptv-org test-source selection tool, IPTV-SOAK) pulls a small
@@ -83,6 +82,18 @@ allow = [
   "Unicode-3.0",
   "Unicode-DFS-2016",
   "CC0-1.0",
+]
+# Per-crate exceptions, scoped to ONE crate each (never added to `allow`), for
+# the opt-in `webrtc-native` closure that CI's second deny leg scans (#127):
+# - `ffmpeg-next` / `ffmpeg-sys-next`: WTFPL, a permissive no-copyleft licence
+#   for the FFmpeg bindings behind the opt-in `ffmpeg` feature (ADR-0031,
+#   docs/research/ffmpeg-strategy.md §2). FFmpeg itself stays LGPL-linked.
+# - `webpki-roots`: CDLA-Permissive-2.0 (Mozilla CA bundle data, permissive),
+#   reached through every `reqwest` rustls-tls feature (ADR-I006).
+exceptions = [
+  { crate = "ffmpeg-next", allow = ["WTFPL"] },
+  { crate = "ffmpeg-sys-next", allow = ["WTFPL"] },
+  { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]
