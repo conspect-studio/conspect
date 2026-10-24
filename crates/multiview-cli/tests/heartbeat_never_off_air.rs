@@ -402,7 +402,7 @@ impl FabRoot {
     }
     fn pinned_root(&self) -> PinnedRoot {
         let vk = p256::ecdsa::VerifyingKey::from(&self.root);
-        PinnedRoot::from_sec1_bytes(vk.to_encoded_point(false).as_bytes()).expect("fab root parse")
+        PinnedRoot::from_sec1_bytes(vk.to_sec1_point(false).as_bytes()).expect("fab root parse")
     }
     fn root_sign(&self, msg: &[u8]) -> String {
         use p256::ecdsa::signature::Signer as _;
@@ -426,7 +426,7 @@ impl FabRoot {
         let rev_sig = self.root_sign(&rev_pre);
         let root_pub = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             p256::ecdsa::VerifyingKey::from(&self.root)
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes(),
         );
         let intermediate_pub = base64::engine::general_purpose::URL_SAFE_NO_PAD

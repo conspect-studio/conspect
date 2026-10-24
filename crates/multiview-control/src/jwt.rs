@@ -215,7 +215,12 @@ impl JwtValidator {
         };
         mac.update(signing_input.as_bytes());
         let expected_sig = mac.finalize().into_bytes();
-        if !bool::from(expected_sig.ct_eq(&signature)) {
+        // Compare as slices (`subtle`'s `[u8]` impl: length short-circuit, then
+        // constant-time over the bytes — the same impl this always resolved to).
+        // Explicit because `hybrid-array`'s own `ConstantTimeEq` impl (enabled by
+        // feature unification once `p256` 0.14 / `elliptic-curve` 0.14 is in the
+        // graph, #126) would otherwise be picked and reject the `Vec` argument.
+        if !bool::from(expected_sig.as_slice().ct_eq(signature.as_slice())) {
             return Err(JwtError::BadSignature);
         }
 

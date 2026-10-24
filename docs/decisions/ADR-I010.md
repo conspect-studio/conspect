@@ -92,6 +92,15 @@ ambiguity. **No version unification is attempted**: p256 and ed25519-dalek legit
 one `signature` version would require downgrading ed25519-dalek or a p256 major bump — out of scope and
 unnecessary.
 
+> **Update (#126):** `p256` moved to 0.14 (`ecdsa` 0.17 / `elliptic-curve` 0.14) to clear
+> RUSTSEC-2026-0387 (`crypto-bigint` < 0.7.6). p256 now shares `signature` 3.0 with ed25519-dalek, so the
+> explicit `p256::ecdsa::signature::Signer` import in the licence `fake` signer is gone (the ed25519
+> `Signer` covers both). Verification semantics are unchanged: same SEC1 parsing, same raw r||s
+> `Signature::from_slice` (rejects zero/out-of-range scalars), same SHA-256 digest, and P-256 still
+> accepts high-S (`NORMALIZE_S = false`). The pinned live fixture verifies without being re-signed. The
+> old `p256` 0.13 stack remains only in the opt-in `webrtc-native` closure (`str0m`/`dimpl`), which
+> is outside the `cargo deny` graph.
+
 ### 4. MSRV 1.82 → 1.85
 
 `ed25519-dalek` 3.0 + `curve25519-dalek` 5.0 are edition-2024 (rust-version 1.85) and are default deps,
