@@ -14500,6 +14500,97 @@ segment_ms = 1000
             "the stores map must hold the registry's store Arc (decode-once ownership)"
         );
     }
+
+    /// SW-13a (ADR-0059 §8): a minimal valid single-source document, optionally
+    /// carrying an `[audio]` and/or `[switcher]` block — the presence of either
+    /// declares program audio.
+    fn program_audio_declaration_config(blocks: &str) -> multiview_config::MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 640
+height = 360
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+kind = "hls"
+path = "/tmp/sw13a-declared.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+{blocks}"##
+        );
+        let config =
+            multiview_config::MultiviewConfig::load_from_toml(&doc).expect("test config parses");
+        config.validate().expect("test config validates");
+        config
+    }
+
+    #[test]
+    fn program_audio_is_off_without_a_declaring_block_and_no_flag() {
+        // The byte-identical-when-off default: no `[audio]`, no `[switcher]`, no
+        // `--program-audio` ⇒ the build carries no program audio, so it takes the
+        // same single-stream video path it took before this feature existed.
+        let config = program_audio_declaration_config("");
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        assert!(
+            !pipeline.has_program_audio(),
+            "a document declaring neither block and no `--program-audio` must stay \
+             video-only (absent ⇒ off, byte-identical to today)"
+        );
+    }
+
+    #[test]
+    fn an_audio_block_declares_program_audio_at_build() {
+        let config = program_audio_declaration_config("[audio]\nsample_rate_hz = 48000\n");
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        assert!(
+            pipeline.has_program_audio(),
+            "an `[audio]` routing block must enable program audio at build (ADR-0059 §8)"
+        );
+    }
+
+    #[test]
+    fn a_switcher_block_declares_program_audio_at_build() {
+        let config = program_audio_declaration_config("[switcher]\n");
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        assert!(
+            pipeline.has_program_audio(),
+            "a `[switcher]` block must default program audio on (ADR-0059 §8)"
+        );
+    }
+
+    #[test]
+    fn the_program_audio_flag_still_overrides_a_silent_config() {
+        let config = program_audio_declaration_config("");
+        let mut pipeline = Pipeline::build(&config).expect("pipeline builds");
+        assert!(
+            !pipeline.has_program_audio(),
+            "precondition: the config declares no program audio"
+        );
+        // The legacy CLI override path (`multiview run --program-audio`).
+        pipeline.enable_program_audio();
+        assert!(
+            pipeline.has_program_audio(),
+            "`--program-audio` must still enable program audio on a config that \
+             declares neither block"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "aes67"))]
