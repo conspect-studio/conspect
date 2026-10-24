@@ -456,7 +456,10 @@ fn route_audio_clamps_an_out_of_range_gain_to_the_supported_maximum() {
     // `+24.0 dB` ⇒ 10^(24/20) ≈ 15.849 linear — the documented supported maximum.
     let max_linear = 10.0_f64.powf(24.0 / 20.0);
     let gain = bus.program_gain(point).unwrap();
-    assert!(gain.is_finite(), "the applied gain must be finite (got {gain})");
+    assert!(
+        gain.is_finite(),
+        "the applied gain must be finite (got {gain})"
+    );
     assert!(
         gain <= max_linear + 1e-9,
         "an out-of-range gain_db must clamp to the supported maximum (got {gain}, max {max_linear})"

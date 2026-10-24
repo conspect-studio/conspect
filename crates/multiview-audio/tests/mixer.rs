@@ -9,7 +9,7 @@
     clippy::indexing_slicing
 )]
 
-use multiview_audio::mixer::{Mixer, RoutePoint, DEFAULT_MUTE_FRAMES};
+use multiview_audio::mixer::{GainRamp, Mixer, RoutePoint, DEFAULT_MUTE_FRAMES};
 use multiview_audio::{AudioBlock, AudioError, AudioFormat, ChannelLayout};
 
 const FS: u32 = 48_000;
@@ -21,6 +21,12 @@ fn stereo_block(left: f32, right: f32, frames: usize) -> AudioBlock {
         samples.push(right);
     }
     AudioBlock::from_interleaved(AudioFormat::new(FS, ChannelLayout::Stereo), samples).unwrap()
+}
+
+/// `f32::max`/`f32::min` ignore a `NaN` operand, so a peak computed with them
+/// can report `0.0` for an all-`NaN` block — check finiteness explicitly.
+fn all_finite(block: &AudioBlock) -> bool {
+    block.interleaved().iter().all(|s| s.is_finite())
 }
 
 /// A mixer with two inputs routed to the program bus at unit gain sums the
@@ -234,4 +240,76 @@ fn ragged_block_rejected() {
     )
     .unwrap_err();
     assert!(matches!(err, AudioError::RaggedBlock { .. }));
+}
+
+/// An over-range (non-finite) route gain is sanitised at the mixer boundary, so
+/// muting that strip yields **exact silence** rather than the `inf · 0 = NaN`
+/// that would otherwise poison the whole program bus (#105).
+#[test]
+fn an_overflowing_route_gain_cannot_poison_a_muted_mix() {
+    let mut mixer = Mixer::new(AudioFormat::new(FS, ChannelLayout::Stereo));
+    let a = mixer.add_input("a");
+    mixer.route_to_program(a, f64::INFINITY);
+
+    let stored = mixer.program_gain(a).unwrap();
+    assert!(
+        stored.is_finite(),
+        "a stored program gain must always be finite (got {stored})"
+    );
+
+    mixer.submit(a, stereo_block(0.8, 0.8, 4)).unwrap();
+    mixer.set_muted(a, true);
+
+    let transition = mixer.mix_program().unwrap();
+    assert!(
+        all_finite(&transition),
+        "an over-range route gain must never yield a non-finite program sample"
+    );
+
+    mixer.advance_ramps(DEFAULT_MUTE_FRAMES);
+    let muted = mixer.mix_program().unwrap();
+    assert!(all_finite(&muted));
+    assert!(
+        muted.interleaved().iter().all(|s| s.abs() < 1e-9),
+        "a muted strip with a sanitised gain contributes exact silence"
+    );
+}
+
+/// A `NaN` gain fails safe to silence (`0.0`) — never to loud unity — and a
+/// non-finite [`GainRamp`] endpoint is sanitised the same way, so neither can
+/// poison the per-sample mix (#105).
+#[test]
+fn non_finite_gains_fail_safe_to_silence() {
+    let mut mixer = Mixer::new(AudioFormat::new(FS, ChannelLayout::Stereo));
+    let a = mixer.add_input("a");
+    mixer.route_to_program(a, 1.0);
+    mixer.set_gain(a, f64::NAN);
+    approx::assert_abs_diff_eq!(mixer.program_gain(a).unwrap(), 0.0, epsilon = 1e-12);
+
+    mixer.submit(a, stereo_block(0.5, 0.5, 4)).unwrap();
+    let silent = mixer.mix_program().unwrap();
+    assert!(all_finite(&silent));
+    assert!(
+        silent.interleaved().iter().all(|s| s.abs() < 1e-9),
+        "a NaN gain must fail safe to silence"
+    );
+
+    // A `NaN`/`inf` ramp endpoint must not poison the envelope or its settle.
+    mixer.set_gain(a, 1.0);
+    mixer.set_gain_ramp(
+        a,
+        GainRamp {
+            from: f64::INFINITY,
+            to: f64::NAN,
+            frames_total: 4,
+            frames_done: 0,
+        },
+    );
+    let ramped = mixer.mix_program().unwrap();
+    assert!(all_finite(&ramped), "a non-finite ramp must stay finite");
+
+    mixer.advance_ramps(4);
+    let settled = mixer.program_gain(a).unwrap();
+    assert!(settled.is_finite(), "the ramp settle must stay finite");
+    approx::assert_abs_diff_eq!(settled, 0.0, epsilon = 1e-12);
 }

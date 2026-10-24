@@ -23,6 +23,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use multiview_config::audio::{route_gain_db_in_range, MAX_ROUTE_GAIN_DB, MIN_ROUTE_GAIN_DB};
 use multiview_config::routing::StreamRef;
 use multiview_core::stream::{
     StableStreamId, StreamDescriptor, StreamDetail, StreamInventory, StreamKind,
@@ -52,7 +53,13 @@ use crate::state::AppState;
 ///   layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);
 /// * `primed` — whether the video target source is warm (absent ⇒ assumed primed);
 /// * `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒
-///   unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4);
+///   unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4).
+///   Must be finite and within the documented supported range `-96.0 ..= 24.0`
+///   dB (`MIN_ROUTE_GAIN_DB ..= MAX_ROUTE_GAIN_DB` in `multiview-config`):
+///   anything outside it is rejected here with a `422` (and never enqueued)
+///   because an unbounded gain overflows the mixer's linear conversion
+///   (`10^(10000/20)` is `inf`, and `inf × 0` on a muted strip is `NaN`, which
+///   would contaminate the whole program mix);
 /// * `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute
 ///   keeps the strip routed and preserves its gain for an exact unmute.
 ///
@@ -76,7 +83,9 @@ pub struct RouteTakeRequest {
     /// Optional video-target priming hint (absent ⇒ assumed primed).
     #[serde(default)]
     pub primed: Option<bool>,
-    /// Optional audio contribution gain in dB (absent ⇒ unity, `0.0`).
+    /// Optional audio contribution gain in dB (absent ⇒ unity, `0.0`). Must be
+    /// finite and within `-96.0 ..= 24.0` dB; outside that range the take is
+    /// rejected with `422` and no command is enqueued.
     #[serde(default)]
     pub gain_db: Option<f32>,
     /// Optional audio mute for the take (absent ⇒ unmuted). Mute keeps the
@@ -182,12 +191,21 @@ pub(crate) async fn take_route(
     // (a missing/out-of-scope id fails closed).
     crate::auth::authorize_object(&principal, &req.source.input_id)?;
 
-    // A non-finite audio gain would poison the mixer's strip gain, so the
-    // boundary fails it closed (RFC 9457 validation problem) before any submit.
+    // A non-finite or out-of-range audio gain would poison the mixer's strip
+    // gain, so the boundary fails it closed (RFC 9457 validation problem) before
+    // any submit — no command is enqueued. The upper bound matters as much as
+    // finiteness: a large-but-finite dB value converts to an infinite linear
+    // gain, and `inf × 0` on a muted strip is `NaN`, which would contaminate the
+    // whole program mix. The engine clamps as well (defence in depth).
     if let Some(gain_db) = req.gain_db {
         if !gain_db.is_finite() {
             return Err(ControlError::Validation(format!(
                 "gain_db must be finite (got {gain_db})"
+            )));
+        }
+        if !route_gain_db_in_range(gain_db) {
+            return Err(ControlError::Validation(format!(
+                "gain_db {gain_db} is outside the supported range {MIN_ROUTE_GAIN_DB}..={MAX_ROUTE_GAIN_DB} dB"
             )));
         }
     }

@@ -9001,7 +9001,7 @@
           "gain_db": {
             "type": "number",
             "format": "float",
-            "description": "Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite)."
+            "description": "Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite and\nwithin `-96.0 ..= 24.0` dB — the documented supported route-gain range)."
           },
           "include_in_program_bus": {
             "type": "boolean",
@@ -13239,7 +13239,7 @@
       },
       "RouteTakeRequest": {
         "type": "object",
-        "description": "The body of a `POST /routing/plan` or `/routing/{kind}/take` request.\n\nCarries the destination + source, plus optional classifier hints used when the\nengine snapshot does not (yet) carry the source inventory or the destination's\npinned params (so a plan/take is classifiable before the first probe):\n\n* `source_channels` — the source audio track's channel count (used for the\n  discrete-track layout comparison when the inventory is absent);\n* `coerce` — the operator confirms a down/up-mix to the destination's pinned\n  layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);\n* `primed` — whether the video target source is warm (absent ⇒ assumed primed);\n* `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒\n  unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4);\n* `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute\n  keeps the strip routed and preserves its gain for an exact unmute.\n\nThe audio fields are ignored for non-audio targets. Not `Eq` because\n`gain_db` is a float.",
+        "description": "The body of a `POST /routing/plan` or `/routing/{kind}/take` request.\n\nCarries the destination + source, plus optional classifier hints used when the\nengine snapshot does not (yet) carry the source inventory or the destination's\npinned params (so a plan/take is classifiable before the first probe):\n\n* `source_channels` — the source audio track's channel count (used for the\n  discrete-track layout comparison when the inventory is absent);\n* `coerce` — the operator confirms a down/up-mix to the destination's pinned\n  layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);\n* `primed` — whether the video target source is warm (absent ⇒ assumed primed);\n* `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒\n  unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4).\n  Must be finite and within the documented supported range `-96.0 ..= 24.0`\n  dB (`MIN_ROUTE_GAIN_DB ..= MAX_ROUTE_GAIN_DB` in `multiview-config`):\n  anything outside it is rejected here with a `422` (and never enqueued)\n  because an unbounded gain overflows the mixer's linear conversion\n  (`10^(10000/20)` is `inf`, and `inf × 0` on a muted strip is `NaN`, which\n  would contaminate the whole program mix);\n* `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute\n  keeps the strip routed and preserves its gain for an exact unmute.\n\nThe audio fields are ignored for non-audio targets. Not `Eq` because\n`gain_db` is a float.",
         "required": [
           "target",
           "source"
@@ -13255,7 +13255,7 @@
               "null"
             ],
             "format": "float",
-            "description": "Optional audio contribution gain in dB (absent ⇒ unity, `0.0`)."
+            "description": "Optional audio contribution gain in dB (absent ⇒ unity, `0.0`). Must be\nfinite and within `-96.0 ..= 24.0` dB; outside that range the take is\nrejected with `422` and no command is enqueued."
           },
           "mute": {
             "type": [

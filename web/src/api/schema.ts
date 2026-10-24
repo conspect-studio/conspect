@@ -2530,7 +2530,8 @@ export interface components {
             channels: components["schemas"]["AudioChannelsDoc"];
             /**
              * Format: float
-             * @description Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite).
+             * @description Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite and
+             *     within `-96.0 ..= 24.0` dB — the documented supported route-gain range).
              */
             gain_db?: number;
             /** @description Whether this input contributes to the mixed program bus. */
@@ -4672,7 +4673,13 @@ export interface components {
          *       layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);
          *     * `primed` — whether the video target source is warm (absent ⇒ assumed primed);
          *     * `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒
-         *       unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4);
+         *       unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4).
+         *       Must be finite and within the documented supported range `-96.0 ..= 24.0`
+         *       dB (`MIN_ROUTE_GAIN_DB ..= MAX_ROUTE_GAIN_DB` in `multiview-config`):
+         *       anything outside it is rejected here with a `422` (and never enqueued)
+         *       because an unbounded gain overflows the mixer's linear conversion
+         *       (`10^(10000/20)` is `inf`, and `inf × 0` on a muted strip is `NaN`, which
+         *       would contaminate the whole program mix);
          *     * `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute
          *       keeps the strip routed and preserves its gain for an exact unmute.
          *

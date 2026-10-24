@@ -68,7 +68,10 @@ pub enum RouteIntent {
         target: String,
         /// The source elementary stream feeding the target.
         source: StreamRef,
-        /// Program-bus contribution gain in dB (`0.0` ⇒ unity).
+        /// Program-bus contribution gain in dB (`0.0` ⇒ unity). Expected within
+        /// the supported `-96.0 ..= 24.0` dB range; the apply clamps anything
+        /// else (including a `NaN`, which fails safe to silence) so a bad value
+        /// can never reach the mixer as a non-finite linear gain.
         gain_db: f32,
         /// Whether the source contributes silence (still routed).
         mute: bool,
@@ -173,11 +176,20 @@ fn language_matches(have: &str, want: &str) -> bool {
 /// Convert a program-bus contribution gain in **dB** (the `RouteIntent::Audio`
 /// wire form) to the linear factor the mixer multiplies by: `10^(dB/20)`.
 ///
-/// `0.0` dB is unity; the conversion is total and finite for any finite input
-/// (a `-inf` dB, i.e. a hard mute, is expressed by the intent's `mute` flag, not
-/// by an infinite gain).
+/// `0.0` dB is unity; a hard mute is expressed by the intent's `mute` flag, not
+/// by an infinite gain. The dB argument is clamped into the supported
+/// `-96.0 ..= 24.0` dB range
+/// ([`clamp_route_gain_db`](multiview_config::audio::clamp_route_gain_db))
+/// **before** the exponentiation, so the result is always finite and
+/// non-negative whatever the caller passes: a finite out-of-range value clamps
+/// to the nearest endpoint, `±inf` clamps too, and a `NaN` fails safe to the
+/// minimum — silence, never a loud unity. Without the clamp a large-but-finite
+/// dB such as `10000.0` converts to `inf`, and `inf × 0` on a muted strip is
+/// `NaN`, which would contaminate the whole program mix. The mixer guards a
+/// linear gain it is handed directly as well (defence in depth).
 fn db_to_linear(db: f32) -> f64 {
-    10.0_f64.powf(f64::from(db) / 20.0)
+    let clamped = multiview_config::audio::clamp_route_gain_db(db);
+    10.0_f64.powf(f64::from(clamped) / 20.0)
 }
 
 /// The pre-resolved binding context a [`RouteApplier`] consults to turn a
@@ -385,8 +397,9 @@ impl<'a> RouteApplier<'a> {
     /// effective re-point per target (the last route per target wins). Re-points
     /// the bus channel's `Arc<AudioStore>` with an equal-power cross-fade over
     /// `ramp_frames` (RT-9 pop-avoidance; `ramp_frames == 0` is a hard cut) and
-    /// then honours the intent's `gain_db` (converted to a linear route gain)
-    /// and `mute` (ADR-0059 §4).
+    /// then honours the intent's `gain_db` (converted to a linear route gain,
+    /// clamped into the supported `-96.0 ..= 24.0` dB range first so the
+    /// conversion is always finite) and `mute` (ADR-0059 §4).
     ///
     /// Mute is applied through the bus's **gain-preserving per-strip mute** —
     /// the strip stays routed and keeps its gain, so an unmute restores it
