@@ -393,7 +393,9 @@ fn route_audio_mute_silences_outgoing_crossfade_strip_after_short_envelope() {
         gain_db: -1.9382, // 0.8 linear
         mute,
     };
-    applier.apply_audio(&mut bus, &[route(true)], 4_800).unwrap();
+    applier
+        .apply_audio(&mut bus, &[route(true)], 4_800)
+        .unwrap();
     incoming.publish(&tone()).unwrap(); // repoint seeks the live edge
     let mut samples = Vec::new();
     for _ in 0..4 {
@@ -404,11 +406,18 @@ fn route_audio_mute_silences_outgoing_crossfade_strip_after_short_envelope() {
         "route mute must silence every outgoing crossfade sample after the 480-frame envelope"
     );
     let seam = (samples[0] - previous.interleaved().last().copied().unwrap()).abs();
-    let max_step = samples.windows(2).map(|w| (w[1] - w[0]).abs()).fold(seam, f32::max);
-    assert!(max_step < 5e-3, "mute envelope must not introduce a click: {max_step}");
+    let max_step = samples
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(seam, f32::max);
+    assert!(
+        max_step < 5e-3,
+        "mute envelope must not introduce a click: {max_step}"
+    );
 
     // A subsequent route unmute must reopen all remaining crossfade strips.
     applier.apply_audio(&mut bus, &[route(false)], 0).unwrap();
+    incoming.publish(&tone()).unwrap(); // a new route take seeks the live edge again
     assert!((bus.program_gain(point).unwrap() - 0.8).abs() < 1e-3);
     let reopened = bus.tick();
     assert!(peak(&reopened) > 0.4);

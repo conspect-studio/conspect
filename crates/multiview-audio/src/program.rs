@@ -132,9 +132,10 @@ pub struct ProgramBus {
     /// Outgoing strips that are fading out during a cross-fade (RT-9). Each is a
     /// temporary route reading the *old* store at a declining (`cos`) ramp; once
     /// its ramp completes it is reclaimed from the mixer and dropped from
-    /// `routes`. Tracked here so [`mix`](ProgramBus::mix) can retire it on the
-    /// tick the ramp finishes.
-    fading_out: Vec<RoutePoint>,
+    /// `routes`. Each entry pairs the channel with its outgoing strip so mute
+    /// applies to every contribution, and [`mix`](ProgramBus::mix) retires the
+    /// strip on the tick its ramp finishes.
+    fading_out: Vec<(RoutePoint, RoutePoint)>,
     format: AudioFormat,
 }
 
@@ -277,7 +278,7 @@ impl ProgramBus {
         self.mixer
             .set_gain_ramp(out_point, GainRamp::down(ramp_frames));
         self.routes.push((out_point, old_store));
-        self.fading_out.push(out_point);
+        self.fading_out.push((point, out_point));
         // The outgoing strip inherits the channel's mute envelope: re-pointing a
         // muted channel must stay silent across the cross-fade rather than leak
         // the old source's audio (mute ≠ unroute, ADR-0059 §4).
@@ -317,10 +318,17 @@ impl ProgramBus {
     /// Mute or unmute a bus channel's program contribution **without unrouting
     /// it** (ADR-0059 §4, "mute ≠ unroute"): the channel's steady gain is
     /// preserved, so an unmute restores it exactly, and the change rides the
-    /// mixer's short equal-power anti-click envelope. A no-op for an unknown
+    /// mixer's short equal-power anti-click envelope. Every outgoing cross-fade
+    /// strip still feeding this channel receives the same mute transition; an
+    /// unmute restores each strip's own preserved gain. A no-op for an unknown
     /// point.
     pub fn set_muted(&mut self, point: RoutePoint, muted: bool) {
         self.mixer.set_muted(point, muted);
+        for &(channel, outgoing) in &self.fading_out {
+            if channel == point {
+                self.mixer.set_muted(outgoing, muted);
+            }
+        }
     }
 
     /// Whether a bus channel's program contribution is muted. `false` for an
@@ -454,7 +462,7 @@ impl ProgramBus {
             fading_out,
             ..
         } = self;
-        fading_out.retain(|&out_point| {
+        fading_out.retain(|&(_, out_point)| {
             if mixer.gain_ramp(out_point).is_some() {
                 return true; // still fading
             }

@@ -173,7 +173,10 @@ fn muting_and_unmuting_during_long_crossfade_affects_every_channel_strip() {
         "every sample after the 480-frame mute envelope must be silent, even while the 4800-frame crossfade continues"
     );
     let seam_step = (output[0] - before.interleaved().last().copied().unwrap()).abs();
-    let max_step = output.windows(2).map(|w| (w[1] - w[0]).abs()).fold(seam_step, f32::max);
+    let max_step = output
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(seam_step, f32::max);
     assert!(max_step < 5e-3, "mute ramp must not click: {max_step}");
 
     // Unmuting while the outgoing strip is still present restores both strips,
