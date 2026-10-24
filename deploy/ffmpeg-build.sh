@@ -49,6 +49,48 @@ FF_PREFIX="${FF_PREFIX:-/opt/multiview-ffmpeg}"
 NVCODEC_COMMIT="${NVCODEC_COMMIT:-e844e5b26f46bb77479f063029595293aa8f812d}"
 TARGETARCH="${TARGETARCH:-amd64}"
 
+# Run this independently in the image builder AND after installation, so a
+# cached build cannot publish an FFmpeg lacking the promised input/output IO.
+assert_features() {
+  local ffmpeg="${FF_PREFIX}/bin/ffmpeg" listing kind name
+  for kind in protocols demuxers muxers; do
+    listing="$(LD_LIBRARY_PATH="${FF_PREFIX}/lib:${LD_LIBRARY_PATH:-}" "${ffmpeg}" -hide_banner "-${kind}")"
+    case "${kind}" in
+      protocols)
+        # SRT is bidirectional. RTSP and HLS are *demuxers*, not protocols.
+        for name in srt; do
+          if [ "$(printf '%s\n' "${listing}" | awk -v n="${name}" '$1 == n { count++ } END { print count+0 }')" -ne 2 ]; then
+            echo "ffmpeg-build: missing input/output protocol ${name}" >&2
+            return 1
+          fi
+        done
+        ;;
+      demuxers)
+        for name in rtsp hls wav f32le s16le s24le; do
+          if ! printf '%s\n' "${listing}" | awk -v n="${name}" '$1 == "D" { split($2, aliases, ","); for (i in aliases) if (aliases[i] == n) found=1 } END { exit !found }'; then
+            echo "ffmpeg-build: missing demuxer ${name}" >&2
+            return 1
+          fi
+        done
+        ;;
+      muxers)
+        for name in rtsp mpegts mp4 wav f32le s16le s24le; do
+          if ! printf '%s\n' "${listing}" | awk -v n="${name}" '$1 == "E" { split($2, aliases, ","); for (i in aliases) if (aliases[i] == n) found=1 } END { exit !found }'; then
+            echo "ffmpeg-build: missing muxer ${name}" >&2
+            return 1
+          fi
+        done
+        ;;
+    esac
+  done
+  echo "ffmpeg-build: required protocols, demuxers and muxers present."
+}
+
+if [ "${1:-}" = "--assert-features" ]; then
+  assert_features
+  exit
+fi
+
 if [ -z "${FFMPEG_SHA256:-}" ] || [ "${FFMPEG_SHA256}" = "TODO-pin" ]; then
   echo "ffmpeg-build: FFMPEG_SHA256 is not pinned — refusing to build unverified source." >&2
   echo "ffmpeg-build: set --build-arg FFMPEG_SHA256=<sha256 of ffmpeg-${FFMPEG_VERSION}.tar.xz>." >&2
