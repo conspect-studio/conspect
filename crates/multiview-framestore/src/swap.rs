@@ -125,6 +125,8 @@ mod hook {
         HeadSnapshot,
         /// `claim` holds the write lock of slot `.0`.
         SlotLocked(u16),
+        /// A `load` attempt failed and will retry.
+        LoadRetry,
     }
 
     type Hook = Box<dyn FnMut(Point)>;
@@ -511,6 +513,7 @@ impl<P: Clone> SwapCell<P> {
             if let Some(value) = self.read_tagged(head) {
                 return value;
             }
+            test_hook!(hook::Point::LoadRetry);
             core::hint::spin_loop();
         }
     }
@@ -737,9 +740,20 @@ mod chaos {
         assert_eq!(gen_of(head) + 1, cell.next_gen.load(Ordering::Acquire));
     }
 
-    /// Per-load latency budget while a publisher is parked: below one output
-    /// tick (16.7 ms at 60 fps), with headroom for a loaded CI host.
-    const LOAD_BUDGET: Duration = Duration::from_millis(10);
+    /// Load latency budget (99th percentile) while a publisher is parked: far
+    /// below one output tick (16.7 ms at 60 fps). A percentile, not the max,
+    /// because one sample can include an OS preemption of the reader itself;
+    /// "never waits on the parked publisher" is asserted structurally (zero
+    /// retries) and by the 2 s no-stall bound on every load.
+    const LOAD_P99_BUDGET: Duration = Duration::from_millis(1);
+    /// No single load may take this long (a stall behind A would be unbounded).
+    const LOAD_MAX: Duration = Duration::from_secs(2);
+
+    fn p99(mut samples: Vec<Duration>) -> Duration {
+        samples.sort_unstable();
+        let i = samples.len().saturating_sub(1) * 99 / 100;
+        samples.get(i).copied().unwrap_or_default()
+    }
 
     type Tagged = Arc<SwapCell<Arc<(u8, u64)>>>;
 
@@ -750,30 +764,61 @@ mod chaos {
         cell: &Tagged,
         stop: &Arc<AtomicBool>,
         first: mpsc::Sender<u64>,
-    ) -> thread::JoinHandle<(Duration, u64, u64)> {
+    ) -> thread::JoinHandle<(Vec<Duration>, u64)> {
         let cell = Arc::clone(cell);
         let stop = Arc::clone(stop);
         thread::spawn(move || {
-            let mut worst = Duration::ZERO;
+            let mut samples = Vec::new();
             let mut last = 0u64;
-            let mut loads = 0u64;
             loop {
                 let t = Instant::now();
                 let v = cell.load();
-                worst = worst.max(t.elapsed());
+                samples.push(t.elapsed());
                 let (who, n) = *v;
                 assert_eq!(who, 2, "only B's values are installed, got {v:?}");
                 assert!(n >= last, "regressed: {n} < {last}");
                 last = n;
-                if loads == 0 {
+                if samples.len() == 1 {
                     first.send(n).unwrap();
                 }
-                loads += 1;
                 if stop.load(Ordering::Acquire) {
-                    return (worst, loads, last);
+                    return (samples, last);
                 }
             }
         })
+    }
+
+    /// With publisher A parked inside a slot lock and no publish running,
+    /// every load on this thread succeeds on its first attempt (no spinning)
+    /// and returns B's value `(2, 1)`.
+    fn assert_loads_never_retry_while_quiet(cell: &Tagged) {
+        // Structural check on this thread, A still parked, no publish running:
+        // every load succeeds on its first attempt (no spinning at all).
+        let retries = Arc::new(AtomicU64::new(0));
+        {
+            let retries = Arc::clone(&retries);
+            hook::set(move |point| {
+                if point == hook::Point::LoadRetry {
+                    retries.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        let mut quiet = Vec::new();
+        for _ in 0..10_000 {
+            let t = Instant::now();
+            assert_eq!(*cell.load(), (2, 1));
+            quiet.push(t.elapsed());
+        }
+        assert_eq!(
+            retries.load(Ordering::Relaxed),
+            0,
+            "a load retried with no publish in flight: it waited on parked A"
+        );
+        let quiet_p99 = p99(quiet);
+        assert!(
+            quiet_p99 < LOAD_P99_BUDGET,
+            "load p99 {quiet_p99:?} while A was parked (budget {LOAD_P99_BUDGET:?})"
+        );
     }
 
     /// Round-3 #133 finding (reviewer interleaving), made deterministic with
@@ -781,7 +826,8 @@ mod chaos {
     /// pauses; publisher B publishes (into slot 1, which becomes the head); A
     /// resumes, takes a slot's write lock and is parked there indefinitely.
     /// Readers must keep returning at once: the newest installed value, never
-    /// a foreign one, never regressing, each load within [`LOAD_BUDGET`].
+    /// a foreign one, never regressing, with no retry and a p99 within
+    /// [`LOAD_P99_BUDGET`].
     #[test]
     fn readers_never_wait_on_a_publisher_parked_in_a_slot_lock() {
         // Values are (publisher, n): 0 = initial, 1 = A, 2 = B.
@@ -855,6 +901,8 @@ mod chaos {
             );
         }
         assert_eq!(firsts, vec![1, 1], "readers return B's (newest) value");
+
+        assert_loads_never_retry_while_quiet(&cell);
         assert_ne!(
             a_idx,
             idx_of(cell.head.load(Ordering::Acquire)),
@@ -868,12 +916,14 @@ mod chaos {
         assert_eq!(*cell.load(), (2, 1000));
         stop.store(true, Ordering::Release);
         for r in readers {
-            let (worst, loads, last) = r.join().expect("reader panicked");
-            assert!(loads > 0);
+            let (samples, last) = r.join().expect("reader panicked");
             assert!(last <= 1000);
+            let worst = samples.iter().copied().max().unwrap_or_default();
+            assert!(worst < LOAD_MAX, "a load stalled for {worst:?}");
+            let p = p99(samples);
             assert!(
-                worst < LOAD_BUDGET,
-                "a load took {worst:?} while A was parked (budget {LOAD_BUDGET:?})"
+                p < LOAD_P99_BUDGET,
+                "load p99 {p:?} while A was parked (budget {LOAD_P99_BUDGET:?})"
             );
         }
 
