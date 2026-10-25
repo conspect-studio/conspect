@@ -65,3 +65,35 @@ describe('followOperation', () => {
     expect(last?.description).toContain('st-3');
   });
 });
+
+describe('followOperation correlation scope (CorrKey::for_command)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    for (const item of toasts()) dismissToast(item.id);
+    vi.useRealTimers();
+  });
+
+  it('a correlated command (arm_salvo) shows its outcome', async () => {
+    const accepted = trackAccepted({ operation_id: 'cc-1', kind: 'arm_salvo' });
+    followOperation(accepted, 'Arm');
+    await act(async () => {
+      resolveOperationEnvelope(env('cc-1', 'salvo.armed'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(toasts()[1]?.title).toContain('Arm');
+  });
+
+  it.each(['apply_layout', 'set_tally_override', 'media_load', 'media_seek', 'route_video'])(
+    'an uncorrelated command (%s) only toasts acceptance, never a timeout',
+    async (kind) => {
+      const accepted = trackAccepted({ operation_id: `uc-${kind}`, kind });
+      followOperation(accepted, 'Cmd');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(toasts().map((x) => x.title)).toEqual(['Command accepted']);
+    },
+  );
+});
