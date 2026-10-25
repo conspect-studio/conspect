@@ -266,6 +266,7 @@ async fn set_mode_command_dispatches_convergence() {
     poller
         .handle_control(PollerControl::SetMode {
             mode: "decoder".to_owned(),
+            operation_id: None,
         })
         .await;
 
@@ -608,5 +609,98 @@ async fn adopt_with_a_spare_index_and_desired_decoder_makes_zero_mutating_calls(
     assert!(
         mutating.is_empty(),
         "automatic convergence must not mutate a spare-index device: {mutating:?}"
+    );
+}
+
+/// Two set-modes queued back to back (a legacy encoder switch, then an
+/// acknowledged index-scoped decoder switch): each terminal `device.mode`
+/// outcome carries ITS OWN operation id, never the other's.
+#[tokio::test]
+async fn interleaved_set_modes_each_publish_their_own_operation_id() {
+    use multiview_events::ModePhase;
+    let (engine, broadcaster, status, drivers) = harness();
+    let mut sub = engine.subscribe();
+    let transport = ScriptedTransport::new();
+    transport.push("system", login_ok());
+    transport.push(
+        "venc",
+        ScriptedReply::json(
+            json!({ "rsp": "succeed", "status": "00000", "data": { "workmode": "decoder" } }),
+        ),
+    );
+    transport.push_opt(
+        "system",
+        "get_workmode_id",
+        ScriptedReply::json(
+            json!({ "rsp": "succeed", "status": "00000", "data": { "workmode_id": 0 } }),
+        ),
+    );
+    transport.push_opt(
+        "system",
+        "change_workmode",
+        ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000" })),
+    );
+    transport.push_opt(
+        "system",
+        "get_workmode_id",
+        ScriptedReply::json(
+            json!({ "rsp": "succeed", "status": "00000", "data": { "workmode_id": 1 } }),
+        ),
+    );
+    transport.push_opt(
+        "streamplay",
+        "streamplay_get_all",
+        ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000", "data": [
+            {"index": 2, "name": "p", "switch": 1, "streamplay_status": "playing", "url": "rtsp://x/a"},
+            {"index": 3, "name": "s", "switch": 0, "streamplay_status": "idle", "url": "rtsp://x/b"}
+        ] })),
+    );
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport.clone()),
+        broadcaster,
+        Arc::clone(&drivers),
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(3));
+    let mut poller = ZowietekPoller::new(
+        "dev-a",
+        driver,
+        Arc::clone(&status),
+        "[fd00:db8::1]",
+        PollerConfig::test_fast(),
+    );
+    assert_eq!(poller.adopt_step().await, PollerStep::Online);
+    while sub.try_recv().is_ok() {}
+
+    poller
+        .handle_control(PollerControl::SetMode {
+            mode: "encoder".to_owned(),
+            operation_id: Some("op-encoder".to_owned()),
+        })
+        .await;
+    poller
+        .handle_control(PollerControl::SetMode {
+            mode: "decoder".to_owned(),
+            operation_id: Some("op-decoder".to_owned()),
+        })
+        .await;
+
+    let mut terminal = Vec::new();
+    while let Ok(evt) = sub.try_recv() {
+        if let Event::DeviceMode(m) = &*evt.event {
+            if m.phase != ModePhase::Started {
+                terminal.push((m.mode.clone(), m.operation_id.clone()));
+            }
+        }
+    }
+    assert_eq!(
+        terminal,
+        vec![
+            ("encoder".to_owned(), Some("op-encoder".to_owned())),
+            ("decoder".to_owned(), Some("op-decoder".to_owned())),
+        ],
+        "each outcome echoes its own operation id"
     );
 }

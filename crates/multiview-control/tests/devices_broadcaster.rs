@@ -40,7 +40,7 @@ async fn resume_after_gap_replays_lifecycle_losslessly() {
 
     // Three lifecycle events the operator must never lose.
     let s_adopt = broadcaster.adopted("dev-a", multiview_config::DeviceDriver::Zowietek, None);
-    let _s_mode = broadcaster.mode_started("dev-a", "encoder");
+    let _s_mode = broadcaster.mode_started("dev-a", "encoder", None);
     let s_removed = broadcaster.removed("dev-a");
     assert!(s_removed > s_adopt);
 

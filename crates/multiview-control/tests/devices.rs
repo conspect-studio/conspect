@@ -755,7 +755,6 @@ mod plan_take {
     use multiview_control::devices::{
         DevicePollerFactory, DevicePollerRegistry, PollerHandle, PollerWiring, ZowietekPoller,
     };
-    use multiview_control::realtime::{CorrKey, CorrRegistry};
 
     fn ok(data: &serde_json::Value) -> ScriptedReply {
         ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000", "data": data }))
@@ -821,7 +820,10 @@ mod plan_take {
 
     async fn running_harness(
         transport: &ScriptedTransport,
-    ) -> (support::Harness, Arc<CorrRegistry>) {
+    ) -> (
+        support::Harness,
+        Arc<multiview_control::realtime::CorrRegistry>,
+    ) {
         let registry = Arc::new(DevicePollerRegistry::with_factory(Arc::new(Factory(
             transport.clone(),
         ))));
@@ -950,7 +952,6 @@ mod plan_take {
 
     #[tokio::test]
     async fn a_rejected_dispatch_leaves_no_correlation_behind() {
-        use multiview_events::{DeviceMode, Event, ImpactClass, ModePhase};
         // A poller is "running" but its control channel is full, so dispatch is
         // rejected: the 202 stands, yet the op must not stay correlated.
         struct Wedged;
@@ -988,26 +989,32 @@ mod plan_take {
         .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        // A later, unrelated terminal device.mode event must not be attributed
-        // to the rejected operation.
-        let later = Event::DeviceMode(DeviceMode {
-            device_id: "dev-foyer".to_owned(),
-            mode: "decoder".to_owned(),
-            phase: ModePhase::Finished,
-            impact: ImpactClass::Class2,
-            detail: None,
-        });
-        let key = CorrKey::for_event(&later).unwrap();
-        assert!(
-            corr.resolve(&key, 9_999).is_none(),
-            "a rejected dispatch must not leave its op in the correlation queue"
-        );
+        // A later, unrelated terminal device.mode event (no operation id: e.g.
+        // an adopt/reconnect convergence) must not be attributed to the
+        // rejected operation — correlation is by the id the event carries.
+        let mut session = multiview_control::SessionStream::new(h.engine.subscribe(), "s", None)
+            .with_corr_registry(corr);
+        h.engine.publish_event(multiview_events::Event::DeviceMode(
+            multiview_events::DeviceMode {
+                device_id: "dev-foyer".to_owned(),
+                mode: "decoder".to_owned(),
+                phase: multiview_events::ModePhase::Finished,
+                impact: multiview_events::ImpactClass::Class2,
+                detail: None,
+                operation_id: None,
+                failure_stage: None,
+            },
+        ));
+        let delta = session.next_delta().await.unwrap().expect("delivered");
+        assert_eq!(delta.envelope.corr, None, "not attributed to a rejected op");
     }
 
     #[tokio::test]
     async fn acked_apply_dispatches_and_correlates_the_outcome() {
         let transport = scripted();
         let (h, corr) = running_harness(&transport).await;
+        let mut session = multiview_control::SessionStream::new(h.engine.subscribe(), "s", None)
+            .with_corr_registry(corr);
 
         let resp = send(
             &h.router,
@@ -1037,15 +1044,24 @@ mod plan_take {
                 .any(|r| r.body.get("opt") == Some(&json!("streamplay_switch"))),
             "the acked apply dispatched the index-scoped switch"
         );
-        // The outcome (Finished/Failed) is correlated to this operation id.
-        let op = corr
-            .resolve(
-                &CorrKey::DeviceMode {
-                    device_id: "dev-foyer".to_owned(),
-                },
-                u64::MAX,
-            )
-            .expect("a device.mode outcome correlation was recorded");
-        assert_eq!(op.as_str(), body["operation_id"].as_str().unwrap());
+        // The terminal outcome carries this operation's id end-to-end.
+        let want = body["operation_id"].as_str().unwrap().to_owned();
+        let mut corrs = Vec::new();
+        for _ in 0..10 {
+            let Ok(Ok(Some(delta))) =
+                tokio::time::timeout(Duration::from_millis(500), session.next_delta()).await
+            else {
+                break;
+            };
+            if let multiview_events::Event::DeviceMode(m) = &delta.envelope.payload {
+                if m.phase != multiview_events::ModePhase::Started {
+                    corrs.push(delta.envelope.corr.clone());
+                }
+            }
+            if !corrs.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(corrs, vec![Some(want)], "terminal outcome echoes the op id");
     }
 }

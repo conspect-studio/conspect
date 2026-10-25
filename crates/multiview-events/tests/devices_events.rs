@@ -264,6 +264,8 @@ fn device_lifecycle_variants_roundtrip_under_v1_envelope() {
                      NO_SIGNAL; no Multiview outputs are affected"
                         .to_owned(),
                 ),
+                operation_id: None,
+                failure_stage: None,
             }),
             "device.mode",
         ),
@@ -328,6 +330,8 @@ fn device_mode_declares_its_impact() {
         phase: ModePhase::Started,
         impact: ImpactClass::Device,
         detail: Some("device restarts its pipeline".to_owned()),
+        operation_id: None,
+        failure_stage: None,
     });
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(

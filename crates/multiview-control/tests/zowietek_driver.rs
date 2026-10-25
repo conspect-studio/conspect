@@ -1265,3 +1265,121 @@ fn the_protocol_models_render_exactly_the_grounding_table() {
         assert_eq!(render(opt), ((*path).to_owned(), body.clone()), "{opt}");
     }
 }
+
+// ---- Round 6 (#55): truthful outcomes — what changed, and which operation ----
+
+fn failed_event(
+    sub: &mut multiview_engine::EventSubscription<Event>,
+) -> multiview_events::DeviceMode {
+    use multiview_events::ModePhase;
+    let mut failed: Vec<_> = mode_events(sub)
+        .into_iter()
+        .filter(|m| m.phase == ModePhase::Failed)
+        .collect();
+    assert_eq!(failed.len(), 1, "exactly one Failed outcome: {failed:?}");
+    failed.remove(0)
+}
+
+#[tokio::test]
+async fn a_partial_apply_reports_the_workmode_change_that_already_happened() {
+    use multiview_events::FailureStage;
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("system", "change_workmode", ack());
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    transport.push_opt(
+        "streamplay",
+        "streamplay_switch",
+        ScriptedReply::json(json!({"rsp":"failed","status":"00004"})),
+    );
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+
+    driver
+        .converge_indexed_with_op(Some("op-1"))
+        .await
+        .expect_err("slot activation fails");
+
+    let failed = failed_event(&mut sub);
+    assert_eq!(failed.failure_stage, Some(FailureStage::WorkmodeChanged));
+    let detail = failed.detail.unwrap_or_default();
+    assert!(
+        detail.contains("workmode changed to decoder; slot activation failed"),
+        "{detail:?}"
+    );
+    assert!(!detail.contains("not applied"), "{detail:?}");
+    assert_eq!(failed.operation_id.as_deref(), Some("op-1"));
+}
+
+#[tokio::test]
+async fn refusals_and_unconfirmed_changes_report_their_exact_stage() {
+    use multiview_events::FailureStage;
+    // Refused before any mutation.
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    let (driver, mut sub) = adopted_with_events(&transport, Some(99)).await;
+    driver
+        .converge_indexed_with_op(Some("op-r"))
+        .await
+        .expect_err("refused");
+    let failed = failed_event(&mut sub);
+    assert_eq!(failed.failure_stage, Some(FailureStage::Unchanged));
+    assert_eq!(failed.operation_id.as_deref(), Some("op-r"));
+
+    // change_workmode acked but the re-read still says encoder.
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("system", "change_workmode", ack());
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+    driver
+        .converge_indexed_with_op(Some("op-u"))
+        .await
+        .expect_err("unconfirmed");
+    let failed = failed_event(&mut sub);
+    assert_eq!(
+        failed.failure_stage,
+        Some(FailureStage::WorkmodeUnconfirmed)
+    );
+
+    // Already a decoder, slot switch fails: nothing changed.
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    transport.push_opt(
+        "streamplay",
+        "streamplay_switch",
+        ScriptedReply::json(json!({"rsp":"failed","status":"00004"})),
+    );
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+    driver
+        .converge_indexed_with_op(None)
+        .await
+        .expect_err("switch fails");
+    let failed = failed_event(&mut sub);
+    assert_eq!(failed.failure_stage, Some(FailureStage::Unchanged));
+    assert_eq!(failed.operation_id, None, "no op ⇒ none carried");
+}
+
+#[tokio::test]
+async fn every_mode_event_of_an_operation_carries_its_operation_id() {
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    transport.push_opt("streamplay", "streamplay_switch", ack());
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+    driver
+        .converge_indexed_with_op(Some("op-ok"))
+        .await
+        .expect("ok");
+    let events = mode_events(&mut sub);
+    assert!(events.len() >= 2, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|m| m.operation_id.as_deref() == Some("op-ok")),
+        "{events:?}"
+    );
+}

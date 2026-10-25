@@ -362,24 +362,42 @@ async fn posted_start_command_correlates_its_realtime_outcome() {
     assert_eq!(parsed["t"], "output.status");
 }
 
-/// A terminal `device.mode` outcome (Finished or Failed) correlates by device;
-/// the Started declaration does not consume the correlation (#55).
-#[test]
-fn device_mode_terminal_outcomes_map_to_the_device_key() {
+/// `device.mode` outcomes correlate by the operation id the event itself
+/// carries (end-to-end), never by queue order: two interleaved operations each
+/// resolve to their own id, and an event carrying no id (or a stale/unrelated
+/// one nobody recorded) stamps nothing wrong.
+#[tokio::test]
+async fn device_mode_outcomes_echo_their_own_carried_operation_id() {
     use multiview_events::{DeviceMode, ImpactClass, ModePhase};
-    let event = |phase| {
+    let engine: Arc<Publisher> = Arc::new(EnginePublisher::new(64));
+    let registry = Arc::new(CorrRegistry::new(64));
+    let sub = engine.subscribe();
+    let mut session = SessionStream::new(sub, "sess-mode", None).with_corr_registry(registry);
+    let event = |mode: &str, op: Option<&str>| {
         Event::DeviceMode(DeviceMode {
             device_id: "dev-a".to_owned(),
-            mode: "decoder".to_owned(),
-            phase,
+            mode: mode.to_owned(),
+            phase: ModePhase::Finished,
             impact: ImpactClass::Class2,
             detail: None,
+            operation_id: op.map(str::to_owned),
+            failure_stage: None,
         })
     };
-    let key = Some(CorrKey::DeviceMode {
-        device_id: "dev-a".to_owned(),
-    });
-    assert_eq!(CorrKey::for_event(&event(ModePhase::Failed)), key);
-    assert_eq!(CorrKey::for_event(&event(ModePhase::Finished)), key);
-    assert_eq!(CorrKey::for_event(&event(ModePhase::Started)), None);
+    engine.publish_event(event("encoder", Some("op-encoder")));
+    engine.publish_event(event("decoder", Some("op-decoder")));
+    engine.publish_event(event("decoder", None));
+    let mut corrs = Vec::new();
+    for _ in 0..3 {
+        let delta = session.next_delta().await.unwrap().expect("delivered");
+        corrs.push(delta.envelope.corr.clone());
+    }
+    assert_eq!(
+        corrs,
+        vec![
+            Some("op-encoder".to_owned()),
+            Some("op-decoder".to_owned()),
+            None
+        ]
+    );
 }
