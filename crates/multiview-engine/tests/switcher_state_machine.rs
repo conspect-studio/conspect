@@ -175,6 +175,18 @@ proptest! {
 }
 
 #[test]
+fn repeated_terminal_tbar_completes_and_flips_exactly_once() {
+    let mut state = configured();
+    let first = state.tbar(u16::MAX, tick(1)).unwrap();
+    let second = state.tbar(u16::MAX, tick(2)).unwrap();
+    assert!(first.started && first.completed);
+    assert!(!second.started && !second.completed);
+    assert_eq!(state.completion_count(), 1);
+    assert_eq!(state.program(), &source("b"));
+    assert_eq!(state.preview(), &source("a"));
+}
+
+#[test]
 fn terminal_tbar_completes_manual_take_once() {
     let mut state = configured();
     state.tbar(12345, tick(2)).unwrap();
@@ -271,6 +283,7 @@ enum Cmd {
     Cut,
     Abort,
     Tbar(u16),
+    RepeatTerminalTbar,
     Advance(u8),
     Arm(bool, bool),
     SetPreview(u8),
@@ -294,6 +307,7 @@ impl ReferenceStateMachine for Reference {
             Just(Cmd::Cut),
             Just(Cmd::Abort),
             any::<u16>().prop_map(Cmd::Tbar),
+            Just(Cmd::RepeatTerminalTbar),
             (0u8..12).prop_map(Cmd::Advance),
             (any::<bool>(), any::<bool>()).prop_map(|(b, k)| Cmd::Arm(b, k)),
             (0u8..3).prop_map(Cmd::SetPreview),
@@ -346,6 +360,17 @@ impl StateMachineTest for Test {
             Cmd::Cut => sut.machine.cut().ok(),
             Cmd::Abort => Some(sut.machine.abort()),
             Cmd::Tbar(position) => sut.machine.tbar(position, tick(sut.tick)).ok(),
+            Cmd::RepeatTerminalTbar => {
+                let first = sut.machine.tbar(u16::MAX, tick(sut.tick)).ok();
+                if first.is_some() {
+                    let second = sut.machine.tbar(u16::MAX, tick(sut.tick));
+                    assert!(
+                        matches!(second, Ok(projection) if !projection.completed),
+                        "repeated terminal T-bar completed twice or returned an error"
+                    );
+                }
+                first
+            }
             Cmd::Advance(n) => {
                 sut.tick += u64::from(n);
                 Some(sut.machine.sample(tick(sut.tick)))
@@ -408,6 +433,10 @@ impl StateMachineTest for Test {
         if let Some(output) = result {
             assert!(output.progress.numerator() <= output.progress.denominator());
             if output.completed {
+                assert!(
+                    sut.was_in_flight || output.started,
+                    "a completion must close an active or newly started take: {transition:?}"
+                );
                 sut.completions += 1;
                 assert!(!sut.machine.is_in_flight());
             }
