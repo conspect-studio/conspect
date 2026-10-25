@@ -657,3 +657,155 @@ async fn indexed_convergence_applies_the_grounded_index_scoped_switch() {
         "device.mode (Class-2) was published for the indexed switch"
     );
 }
+
+// ---- Review fixes (#55): grounded workmode transition + activity grounding --
+
+/// A `{"rsp":"succeed","status":"00000","data":…}` reply.
+fn ok_data(data: serde_json::Value) -> ScriptedReply {
+    ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000", "data": data }))
+}
+
+fn workmode_id_reply(id: u32) -> ScriptedReply {
+    ok_data(json!({ "workmode_id": id }))
+}
+
+fn spare_table_reply() -> ScriptedReply {
+    ok_data(json!([
+        {"index": 2, "name": "production", "switch": 1, "streamplay_status": "playing",
+         "url": "rtsp://[fd00:db8::42]:8554/main/av"},
+        {"index": 3, "name": "spare", "switch": 0, "streamplay_status": "idle",
+         "url": "rtsp://[fd00:db8::42]:8554/sub/av"}
+    ]))
+}
+
+/// An adopted encoder-mode driver with spare index 3 over `transport`.
+async fn adopted_encoder(transport: &ScriptedTransport) -> ZowietekDriver<ScriptedTransport> {
+    let (_engine, broadcaster, drivers) = harness();
+    transport.push("system", login_ok());
+    transport.push("venc", ok_data(json!({ "workmode": "encoder" })));
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport.clone()),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(3));
+    driver.probe_and_adopt().await.expect("adopt ok");
+    driver
+}
+
+#[tokio::test]
+async fn indexed_convergence_changes_workmode_before_activating_the_slot() {
+    let transport = ScriptedTransport::new();
+    // get_workmode_id → encoder, change_workmode ack, get_workmode_id → decoder.
+    transport.push("workmode", workmode_id_reply(0));
+    transport.push(
+        "workmode",
+        ScriptedReply::json(json!({"rsp":"succeed","status":"00000"})),
+    );
+    transport.push("workmode", workmode_id_reply(1));
+    transport.push("streamplay", spare_table_reply());
+    transport.push(
+        "streamplay",
+        ScriptedReply::json(json!({"rsp":"succeed","status":"00000"})),
+    );
+    let driver = adopted_encoder(&transport).await;
+
+    driver
+        .converge_indexed()
+        .await
+        .expect("encoder -> decoder converges");
+
+    assert_eq!(
+        transport.request_count("workmode"),
+        3,
+        "read, change, re-read"
+    );
+    assert_eq!(
+        transport.last_request().unwrap().body,
+        json!({"group":"streamplay","opt":"streamplay_switch","data":{"index":3,"switch":1}}),
+        "slot activation is the LAST step, after the confirmed workmode change"
+    );
+    assert_eq!(
+        driver.workmode(),
+        Some(multiview_control::devices::zowietek::WorkMode::Decoder)
+    );
+}
+
+#[tokio::test]
+async fn indexed_convergence_skips_the_workmode_change_when_already_decoder() {
+    let transport = ScriptedTransport::new();
+    transport.push("workmode", workmode_id_reply(1));
+    transport.push("streamplay", spare_table_reply());
+    transport.push(
+        "streamplay",
+        ScriptedReply::json(json!({"rsp":"succeed","status":"00000"})),
+    );
+    let driver = adopted_encoder(&transport).await;
+
+    driver
+        .converge_indexed()
+        .await
+        .expect("already decoder converges");
+
+    assert_eq!(
+        transport.request_count("workmode"),
+        1,
+        "only the get_workmode_id read; no change_workmode"
+    );
+}
+
+#[tokio::test]
+async fn an_unreflected_change_workmode_fails_without_caching_decoder() {
+    let transport = ScriptedTransport::new();
+    transport.push("workmode", workmode_id_reply(0));
+    transport.push(
+        "workmode",
+        ScriptedReply::json(json!({"rsp":"succeed","status":"00000"})),
+    );
+    transport.push("workmode", workmode_id_reply(0)); // ack'd but still encoder
+    transport.push("streamplay", spare_table_reply());
+    let driver = adopted_encoder(&transport).await;
+
+    let err = driver
+        .converge_indexed()
+        .await
+        .expect_err("an acknowledged-but-unreflected change must fail");
+
+    assert!(!err.to_string().is_empty());
+    assert_eq!(
+        transport.request_count("streamplay"),
+        0,
+        "no slot activation unless the device is confirmed in decoder mode"
+    );
+    assert_eq!(
+        driver.workmode(),
+        Some(multiview_control::devices::zowietek::WorkMode::Encoder),
+        "Decoder is never cached when the device did not change"
+    );
+}
+
+#[test]
+fn indexed_plan_refuses_when_the_configured_rows_activity_is_unknown() {
+    let (_engine, broadcaster, drivers) = harness();
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(ScriptedTransport::new()),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(3));
+    // Legacy shape: no switch flags, so activity is not grounded.
+    let table = DecodeTable::parse(&json!({"entries": [{"index": 3, "proto": "rtsp"}]}));
+
+    let plan = driver.plan_decode_convergence(&table);
+
+    assert!(
+        plan.is_err(),
+        "unknown activity must be refused, not treated as inactive: {plan:?}"
+    );
+}
