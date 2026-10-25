@@ -361,3 +361,43 @@ async fn posted_start_command_correlates_its_realtime_outcome() {
     assert_eq!(parsed["corr"], op, "the JSON envelope carries corr == op");
     assert_eq!(parsed["t"], "output.status");
 }
+
+/// `device.mode` outcomes correlate by the operation id the event itself
+/// carries (end-to-end), never by queue order: two interleaved operations each
+/// resolve to their own id, and an event carrying no id (or a stale/unrelated
+/// one nobody recorded) stamps nothing wrong.
+#[tokio::test]
+async fn device_mode_outcomes_echo_their_own_carried_operation_id() {
+    use multiview_events::{DeviceMode, ImpactClass, ModePhase};
+    let engine: Arc<Publisher> = Arc::new(EnginePublisher::new(64));
+    let registry = Arc::new(CorrRegistry::new(64));
+    let sub = engine.subscribe();
+    let mut session = SessionStream::new(sub, "sess-mode", None).with_corr_registry(registry);
+    let event = |mode: &str, op: Option<&str>| {
+        Event::DeviceMode(DeviceMode {
+            device_id: "dev-a".to_owned(),
+            mode: mode.to_owned(),
+            phase: ModePhase::Finished,
+            impact: ImpactClass::Class2,
+            detail: None,
+            operation_id: op.map(str::to_owned),
+            failure_stage: None,
+        })
+    };
+    engine.publish_event(event("encoder", Some("op-encoder")));
+    engine.publish_event(event("decoder", Some("op-decoder")));
+    engine.publish_event(event("decoder", None));
+    let mut corrs = Vec::new();
+    for _ in 0..3 {
+        let delta = session.next_delta().await.unwrap().expect("delivered");
+        corrs.push(delta.envelope.corr.clone());
+    }
+    assert_eq!(
+        corrs,
+        vec![
+            Some("op-encoder".to_owned()),
+            Some("op-decoder".to_owned()),
+            None
+        ]
+    );
+}

@@ -114,7 +114,7 @@ async fn truncated_and_garbage_bodies_are_errors_not_hangs() {
     let err = read_frame(&mut read_half)
         .await
         .expect_err("a truncated frame body is an error");
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 
     // A full-length body that is not a CastMessage protobuf is a decode
     // error — tolerated as a dead channel, never a panic.
@@ -131,6 +131,6 @@ async fn truncated_and_garbage_bodies_are_errors_not_hangs() {
     let err = read_frame(&mut read_half)
         .await
         .expect_err("a non-protobuf body is an error");
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
     drop(client);
 }

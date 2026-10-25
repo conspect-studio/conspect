@@ -914,7 +914,7 @@ impl<C: CastConnector + 'static> CastSessionActor<C> {
                 }
                 false
             }
-            PollerControl::SetMode { ref mode } => {
+            PollerControl::SetMode { ref mode, .. } => {
                 tracing::debug!(
                     device = %self.device_id,
                     mode = %mode,

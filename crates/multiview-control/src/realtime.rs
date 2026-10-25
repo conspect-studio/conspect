@@ -1191,9 +1191,15 @@ impl SessionStream {
         // reuse a consumed correlation. Non-command events stay uncorrelated. The
         // registry lock is control-plane-only and never touches the engine hot
         // loop (invariant #10).
-        let corr = self.corr.as_ref().and_then(|registry| {
-            CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
-        });
+        let corr = match &event {
+            // A `device.mode` outcome carries the operation id of the set-mode it
+            // answers (end-to-end): echo it directly. No registry, no queue — an
+            // event with no id (adopt/reconnect convergence) stays uncorrelated.
+            Event::DeviceMode(mode) => mode.operation_id.clone().map(OperationId::from_string),
+            _ => self.corr.as_ref().and_then(|registry| {
+                CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
+            }),
+        };
         let mut envelope = Envelope::new(
             topic,
             seq,
@@ -2417,6 +2423,8 @@ mod topic_routing_tests {
                 phase: ModePhase::Finished,
                 impact: ImpactClass::Device,
                 detail: None,
+                operation_id: None,
+                failure_stage: None,
             }),
             Event::DeviceError(DeviceError {
                 device_id: "dev-a".to_owned(),

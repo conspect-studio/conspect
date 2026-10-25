@@ -604,6 +604,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/devices/{id}/set-mode/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/devices/{id}/set-mode/plan` — classify a `set-mode` without
+         *     applying it (role: read; zero wire calls). A Class-2 plan must be echoed as
+         *     `ack_impact` on the apply.
+         */
+        post: operations["plan_set_mode_route"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/devices/{id}/source-candidates": {
         parameters: {
             query?: never;
@@ -3165,6 +3186,13 @@ export interface components {
             /** @description Stable device id; may be omitted (the path id is injected). */
             id?: string | null;
             reconnect?: null | components["schemas"]["ReconnectPolicyDoc"];
+            /**
+             * Format: int32
+             * @description The explicit spare decode index targeted by an index-scoped `zowietek`
+             *     decoder convergence (issue #55). Absent ⇒ the driver never guesses an
+             *     index and refuses rather than disrupt an unknown decode.
+             */
+            spare_decode_index?: number | null;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::DeviceDriver`] (ADR-M008): the
@@ -4824,8 +4852,32 @@ export interface components {
              */
             operation_id: string;
         };
+        /**
+         * @description The non-mutating `POST /devices/{id}/set-mode/plan` response: the impact
+         *     class and statement a `set-mode` apply would incur, with zero device calls
+         *     (inv #11, the routing plan/take pattern).
+         */
+        SetModePlan: {
+            /** @description The human-readable impact statement. */
+            detail: string;
+            /** @description The impact class: `c2` (index-scoped, disruptive) or `dev`. */
+            impact: string;
+            /**
+             * Format: int32
+             * @description The configured spare decode index an apply would activate, if any.
+             */
+            index?: number | null;
+            /** @description Whether the apply must echo `ack_impact` (true for Class-2). */
+            requires_ack: boolean;
+        };
         /** @description The `POST /api/v1/devices/{id}/set-mode` request body. */
         SetModeRequest: {
+            /**
+             * @description The impact class the caller acknowledges, echoed from
+             *     `POST /devices/{id}/set-mode/plan`. Required (`c2`) when the plan reports
+             *     `requires_ack`; otherwise the apply is refused with `409` and the impact.
+             */
+            ack_impact?: string | null;
             /** @description The desired converged work mode (driver vocabulary, e.g. `encoder`). */
             mode: string;
         };
@@ -7231,6 +7283,60 @@ export interface operations {
                 };
             };
             /** @description Not authorized to change the mode. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No device with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    plan_set_mode_route: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Device id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetModeRequest"];
+            };
+        };
+        responses: {
+            /** @description The impact the apply would incur; nothing was dispatched. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetModePlan"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized. */
             403: {
                 headers: {
                     [name: string]: unknown;

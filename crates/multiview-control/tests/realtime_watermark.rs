@@ -74,6 +74,8 @@ fn device_mode(device_id: &str, mode: &str) -> Event {
         phase: ModePhase::Finished,
         impact: ImpactClass::Device,
         detail: None,
+        operation_id: None,
+        failure_stage: None,
     })
 }
 

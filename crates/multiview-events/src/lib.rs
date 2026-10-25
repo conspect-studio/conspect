@@ -45,10 +45,10 @@ pub use event::{
     AuthzScope, CastSessionRemoved, CastSessionStarted, ClockQuality, ClockSource, DeviceAdopted,
     DeviceCapabilities, DeviceDiscovered, DeviceError, DeviceMode, DeviceRemoved, DeviceState,
     DeviceStatus, DeviceStreamRole, DeviceStreamStatus, DeviceSync, DeviceSyncSummary, Event,
-    GpuMetrics, GpuVendor, HealthWarning, ImpactClass, InputConnection, InputStreams, JobProgress,
-    LifecycleState, MediaPlayerEvent, MediaPlayerState, ModePhase, OutputRunState, OutputStatus,
-    RistLinkRole, RistLinkStats, SalvoEvent, SalvoPhase, ShedLoad, ShedReason, ShedScope,
-    SyncCapability, SyncChange, SyncGroupSkew, SystemMetrics, TallyEvent, TallyTarget,
+    FailureStage, GpuMetrics, GpuVendor, HealthWarning, ImpactClass, InputConnection, InputStreams,
+    JobProgress, LifecycleState, MediaPlayerEvent, MediaPlayerState, ModePhase, OutputRunState,
+    OutputStatus, RistLinkRole, RistLinkStats, SalvoEvent, SalvoPhase, ShedLoad, ShedReason,
+    ShedScope, SyncCapability, SyncChange, SyncGroupSkew, SystemMetrics, TallyEvent, TallyTarget,
     TileSnapshotEntry, TileState, TilesSnapshot, TimingStatus, WarningCode, WarningSeverity,
 };
 pub use ordering::{Accepted, TopicCursor};

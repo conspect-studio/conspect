@@ -687,6 +687,10 @@ mod scripted {
         requests: Vec<ScriptedRequest>,
         /// Per-module reply cursor.
         cursor: HashMap<String, usize>,
+        /// Per-`(module, opt)` FIFO of scripted replies; consulted before the
+        /// per-module queue, so a test can script a reply for one exact wire
+        /// call regardless of the order other calls to the module interleave.
+        opt_replies: HashMap<(String, String), std::collections::VecDeque<ScriptedReply>>,
     }
 
     /// A scripted transport mock: queue replies per module, then drive the
@@ -720,10 +724,50 @@ mod scripted {
                 .push(reply);
         }
 
+        /// Queue `reply` for the next request to `module` whose body `opt` is
+        /// `opt` (taking precedence over the per-module queue).
+        pub fn push_opt(&self, module: &str, opt: &str, reply: ScriptedReply) {
+            self.lock()
+                .opt_replies
+                .entry((module.to_owned(), opt.to_owned()))
+                .or_default()
+                .push_back(reply);
+        }
+
+        /// How many requests were recorded for `module` carrying body `opt`.
+        #[must_use]
+        pub fn request_count_opt(&self, module: &str, opt: &str) -> usize {
+            self.lock()
+                .requests
+                .iter()
+                .filter(|r| {
+                    r.module == module && r.body.get("opt").and_then(Value::as_str) == Some(opt)
+                })
+                .count()
+        }
+
+        /// The COMPLETE outgoing wire of every request, in order: the endpoint
+        /// path (`/<module>`) plus the full JSON body.
+        #[must_use]
+        pub fn wire(&self) -> Vec<(String, Value)> {
+            self.lock()
+                .requests
+                .iter()
+                .map(|r| (format!("/{}", r.module), r.body.clone()))
+                .collect()
+        }
+
         /// The most recent recorded request, if any.
         #[must_use]
         pub fn last_request(&self) -> Option<ScriptedRequest> {
             self.lock().requests.last().cloned()
+        }
+
+        /// Every recorded request, in the order issued (for wire-order and
+        /// no-mutation assertions).
+        #[must_use]
+        pub fn requests(&self) -> Vec<ScriptedRequest> {
+            self.lock().requests.clone()
         }
 
         /// How many requests were recorded for `module`.
@@ -766,7 +810,21 @@ mod scripted {
         fn take(&self, request: ScriptedRequest) -> ScriptedReply {
             let mut inner = self.lock();
             let module = request.module.clone();
+            let opt = request
+                .body
+                .get("opt")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             inner.requests.push(request);
+            if let Some(opt) = opt {
+                if let Some(reply) = inner
+                    .opt_replies
+                    .get_mut(&(module.clone(), opt))
+                    .and_then(std::collections::VecDeque::pop_front)
+                {
+                    return reply;
+                }
+            }
             let idx = inner.cursor.entry(module.clone()).or_insert(0);
             let cursor = *idx;
             *idx += 1;

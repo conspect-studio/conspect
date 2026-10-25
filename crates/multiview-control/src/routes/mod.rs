@@ -864,6 +864,10 @@ fn device_router() -> Router<AppState> {
         .route("/devices/{id}/status", get(devices::get_device_status))
         .route("/devices/{id}/probe", post(devices::probe_device))
         .route("/devices/{id}/set-mode", post(devices::set_mode))
+        .route(
+            "/devices/{id}/set-mode/plan",
+            post(devices::plan_set_mode_route),
+        )
         .route("/devices/{id}/reboot", post(devices::reboot_device))
         .route("/devices/{id}/identify", post(devices::identify_device))
         .route(

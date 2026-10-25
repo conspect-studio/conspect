@@ -1721,6 +1721,11 @@ pub struct DeviceBodyDoc {
     /// The desired converged work mode (driver vocabulary, e.g. `decoder`).
     #[serde(default)]
     pub desired_mode: Option<String>,
+    /// The explicit spare decode index targeted by an index-scoped `zowietek`
+    /// decoder convergence (issue #55). Absent ⇒ the driver never guesses an
+    /// index and refuses rather than disrupt an unknown decode.
+    #[serde(default)]
+    pub spare_decode_index: Option<u32>,
     /// The lowercase X.733 severity raised when the device stays offline
     /// (`warning`/`minor`/`major`/`critical`); absent disables the alarm.
     #[serde(default)]

@@ -474,6 +474,83 @@ pub(crate) async fn probe_device(
 pub struct SetModeRequest {
     /// The desired converged work mode (driver vocabulary, e.g. `encoder`).
     pub mode: String,
+    /// The impact class the caller acknowledges, echoed from
+    /// `POST /devices/{id}/set-mode/plan`. Required (`c2`) when the plan reports
+    /// `requires_ack`; otherwise the apply is refused with `409` and the impact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_impact: Option<String>,
+}
+
+/// The non-mutating `POST /devices/{id}/set-mode/plan` response: the impact
+/// class and statement a `set-mode` apply would incur, with zero device calls
+/// (inv #11, the routing plan/take pattern).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SetModePlan {
+    /// The impact class: `c2` (index-scoped, disruptive) or `dev`.
+    pub impact: String,
+    /// The human-readable impact statement.
+    pub detail: String,
+    /// The configured spare decode index an apply would activate, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    /// Whether the apply must echo `ack_impact` (true for Class-2).
+    pub requires_ack: bool,
+}
+
+/// Plan a `set-mode`: pure (config only, no wire call).
+fn plan_set_mode(device: &VersionedResource, id: &str, mode: &str) -> SetModePlan {
+    let spare_decode_index =
+        serde_json::from_value::<multiview_config::Device>(device.resource.body.clone())
+            .ok()
+            .filter(|device| {
+                device.driver == multiview_config::DeviceDriver::Zowietek && mode == "decoder"
+            })
+            .and_then(|device| device.spare_decode_index);
+    SetModePlan {
+        impact: spare_decode_index.map_or("dev", |_| "c2").to_owned(),
+        detail: spare_decode_index.map_or_else(
+            || crate::devices::broadcaster::mode_impact_detail(id, mode),
+            |index| crate::devices::broadcaster::indexed_switch_impact_detail(id, index, mode),
+        ),
+        index: spare_decode_index,
+        requires_ack: spare_decode_index.is_some(),
+    }
+}
+
+/// `POST /api/v1/devices/{id}/set-mode/plan` — classify a `set-mode` without
+/// applying it (role: read; zero wire calls). A Class-2 plan must be echoed as
+/// `ack_impact` on the apply.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/devices/{id}/set-mode/plan",
+        tag = "devices",
+        params(("id" = String, Path, description = "Device id.")),
+        request_body = SetModeRequest,
+        responses(
+            (status = 200, description = "The impact the apply would incur; nothing was dispatched.", body = SetModePlan),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized.", body = crate::problem::Problem),
+            (status = 404, description = "No device with that id.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn plan_set_mode_route(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+    Json(request): Json<SetModeRequest>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Read)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let device = require_device(&state, &id)?;
+    Ok((
+        StatusCode::OK,
+        Json(plan_set_mode(&device, &id, &request.mode)),
+    )
+        .into_response())
 }
 
 /// The `202 Accepted` body for `set-mode`: the operation id, the **declared**
@@ -532,7 +609,17 @@ pub(crate) async fn set_mode(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
+    // Plan first (inv #11): a Class-2 apply must echo the planned impact, else
+    // it is refused BEFORE reserving an operation or dispatching anything.
+    let plan = plan_set_mode(&device, &id, &request.mode);
+    if plan.requires_ack && request.ack_impact.as_deref() != Some(plan.impact.as_str()) {
+        return Err(ControlError::Conflict(format!(
+            "set-mode {:?} on device {id} is {} impact and was not acknowledged; \
+             POST /devices/{id}/set-mode/plan, then retry with ack_impact={:?}: {}",
+            request.mode, plan.impact, plan.impact, plan.detail
+        )));
+    }
     let op = reserve_operation(&state, &idem);
     state.audit(
         &principal.key_id,
@@ -555,6 +642,10 @@ pub(crate) async fn set_mode(
         &id,
         crate::devices::PollerControl::SetMode {
             mode: request.mode.clone(),
+            // The operation id travels with the command and comes back on every
+            // device.mode the driver publishes: correlation is end-to-end, never
+            // queue order.
+            operation_id: Some(op.to_string()),
         },
     );
     if !dispatched {
@@ -566,14 +657,10 @@ pub(crate) async fn set_mode(
              desired_mode converges when a poller next adopts"
         );
     }
-    // The declared DEV-class impact is the SAME statement the driver's
-    // `ModeConvergence::Switch` plan declares (both derive it from
-    // `mode_impact_detail`), so the API surfaces exactly what the driver will do
-    // — ADR-M009: the impact is declared BEFORE apply.
     let body = SetModeAccepted {
         operation_id: op.to_string(),
-        impact: "dev".to_owned(),
-        detail: crate::devices::broadcaster::mode_impact_detail(&id, &request.mode),
+        impact: plan.impact,
+        detail: plan.detail,
     };
     Ok((StatusCode::ACCEPTED, Json(body)).into_response())
 }
