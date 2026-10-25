@@ -166,6 +166,23 @@ export interface CommandRequest {
 }
 
 /**
+ * A fresh RFC 4122 v4 UUID. `crypto.randomUUID` only exists in secure contexts, so
+ * over plain HTTP on a non-loopback host it is undefined; fall back to building
+ * one from `crypto.getRandomValues` (never `Math.random`).
+ */
+export function newIdempotencyKey(): string {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
  * The single place every 202 command request is sent: mints the default
  * `crypto.randomUUID` `Idempotency-Key` (an explicit `options.idempotencyKey`
  * wins) and applies the JSON body, if any. Returns the raw response so callers
@@ -177,7 +194,7 @@ export async function sendCommand(
   options: RequestOptions = {},
   request: CommandRequest = {},
 ): Promise<Response> {
-  const idempotencyKey = options.idempotencyKey ?? crypto.randomUUID();
+  const idempotencyKey = options.idempotencyKey ?? newIdempotencyKey();
   const hasBody = request.body !== undefined;
   const response = await fetch(apiUrl(options, path), {
     method: request.method ?? 'POST',

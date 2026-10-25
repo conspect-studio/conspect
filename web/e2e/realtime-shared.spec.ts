@@ -35,6 +35,18 @@ test("all realtime hooks share exactly one WebSocket", async ({ page }) => {
 test("one socket across the whole session, including /audio and every realtime route", async ({ page }) => {
   let routed = 0;
   await page.route("**/api/v1/**", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/v1/preview/capabilities*", (route) =>
+    route.fulfill({
+      json: {
+        webrtc: false,
+        scopes: {
+          program: { whep: false, fidelity: null },
+          inputs: { whep: false },
+          outputs: { whep: false },
+        },
+      },
+    }),
+  );
   await page.route("**/api/v1/auth/status*", (route) =>
     route.fulfill({ json: { auth_required: false, authenticated: true } }),
   );
