@@ -67,6 +67,105 @@ fn manual_override_abort_and_midflight_cut() {
 }
 
 #[test]
+fn resting_tbar_does_not_block_auto() {
+    let mut state = configured();
+    state
+        .set_transition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(8).unwrap(),
+        })
+        .unwrap();
+    assert_eq!(state.tbar(0, tick(10)).unwrap().progress, Progress::ZERO);
+    assert!(!state.is_in_flight());
+    assert!(state.auto(tick(10)).unwrap().started);
+    assert!(state.sample(tick(18)).completed);
+    assert_eq!(state.program(), &source("b"));
+}
+
+#[test]
+fn auto_resumes_manual_position_and_completes_at_proportional_tick() {
+    let mut state = configured();
+    state
+        .set_transition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(10).unwrap(),
+        })
+        .unwrap();
+    let manual = state.tbar(32768, tick(100)).unwrap();
+    assert!(manual.started);
+    let resumed = state.auto(tick(100)).unwrap();
+    assert!(!resumed.started);
+    assert!(!resumed.completed);
+    assert_eq!(resumed.progress, manual.progress);
+    assert!(!state.sample(tick(104)).completed);
+    assert!(state.sample(tick(105)).completed);
+    assert_eq!(state.completion_count(), 1);
+    assert_eq!(state.program(), &source("b"));
+    assert!(!state.sample(tick(106)).completed);
+}
+
+#[test]
+fn terminal_tbar_completes_manual_take_once() {
+    let mut state = configured();
+    state.tbar(12345, tick(2)).unwrap();
+    let completed = state.tbar(u16::MAX, tick(3)).unwrap();
+    assert!(completed.completed);
+    assert!(!completed.started);
+    assert!(!state.is_in_flight());
+    assert_eq!(state.completion_count(), 1);
+    assert_eq!(state.program(), &source("b"));
+    assert!(!state.tbar(u16::MAX, tick(4)).unwrap().completed);
+}
+
+#[test]
+fn configuration_is_rejected_during_auto_and_applies_after_completion() {
+    let mut state = configured();
+    let initial = TransitionDescriptor::Mix {
+        rate: FrameCount::try_from(4).unwrap(),
+    };
+    let next = TransitionDescriptor::Mix {
+        rate: FrameCount::try_from(7).unwrap(),
+    };
+    state.set_transition(initial.clone()).unwrap();
+    state.auto(tick(10)).unwrap();
+    let keys = ArmedSet::default().with_key(1);
+    assert_eq!(state.arm(keys.clone()), Err(SwitcherError::InFlight));
+    assert_eq!(state.set_transition(next.clone()), Err(SwitcherError::InFlight));
+    assert_eq!(state.set_preview(source("c")), Err(SwitcherError::InFlight));
+    assert_eq!(state.armed(), &ArmedSet::default().with_background());
+    assert_eq!(state.transition(), &initial);
+    assert_eq!(state.preview(), &source("b"));
+    assert!(state.sample(tick(14)).completed);
+    assert_eq!(state.arm(keys.clone()), Ok(()));
+    assert_eq!(state.set_transition(next.clone()), Ok(()));
+    assert_eq!(state.set_preview(source("c")), Ok(()));
+    assert_eq!(state.armed(), &keys);
+    assert_eq!(state.transition(), &next);
+    assert_eq!(state.preview(), &source("c"));
+    assert!(state.auto(tick(20)).unwrap().started);
+    assert!(state.sample(tick(27)).completed);
+    assert_eq!(state.keys_on_air(), &[true, true]);
+}
+
+#[test]
+fn configuration_is_rejected_during_manual_and_applies_after_completion() {
+    let mut state = configured();
+    state.tbar(12000, tick(1)).unwrap();
+    let keys = ArmedSet::default().with_key(1);
+    let next = TransitionDescriptor::Mix {
+        rate: FrameCount::try_from(3).unwrap(),
+    };
+    assert_eq!(state.arm(keys.clone()), Err(SwitcherError::InFlight));
+    assert_eq!(state.set_transition(next.clone()), Err(SwitcherError::InFlight));
+    assert_eq!(state.set_preview(source("c")), Err(SwitcherError::InFlight));
+    assert!(state.tbar(u16::MAX, tick(2)).unwrap().completed);
+    assert_eq!(state.arm(keys.clone()), Ok(()));
+    assert_eq!(state.set_transition(next.clone()), Ok(()));
+    assert_eq!(state.set_preview(source("c")), Ok(()));
+    assert_eq!(state.armed(), &keys);
+    assert_eq!(state.transition(), &next);
+    assert_eq!(state.preview(), &source("c"));
+}
+
+#[test]
 fn key_only_and_flip_flop_off_and_punch() {
     let mut state = configured();
     state.arm(ArmedSet::default().with_key(1)).unwrap();
