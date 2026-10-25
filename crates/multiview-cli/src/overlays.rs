@@ -221,7 +221,7 @@ pub struct OverlayBaker {
     /// The Conspect tile-watermark seam (S3, ADR-0050 §5): when present and the
     /// published ladder level is at a watermark rung, the bake appends the corner
     /// watermark to the draw list. `None` (the default) never watermarks. The
-    /// read is a single wait-free `arc_swap` load off the hot loop — it cannot
+    /// read is a single `SwapCell` load off the hot loop — it cannot
     /// pace or stall the output clock (invariant #1). Carries the canvas geometry
     /// the corner mark is anchored to.
     watermark: Option<WatermarkPlacement>,
@@ -330,7 +330,7 @@ impl OverlayBaker {
     /// Attach the Conspect tile-watermark seam (S3, ADR-0050 §5): when `signal` is
     /// at a watermark rung, every bake appends a corner watermark anchored to the
     /// `canvas_width × canvas_height` canvas. The decision is a single wait-free
-    /// `arc_swap` load per baked frame, off the hot loop — it cannot pace or stall
+    /// `SwapCell` load per baked frame, off the hot loop — it cannot pace or stall
     /// the output clock (invariant #1). The watermark marks the composited
     /// multiview canvas only (the tiles); a 1:1 pass-through program is never
     /// composited through this bake, so it is never marked (the spec's "tiles
@@ -530,7 +530,7 @@ impl OverlayBaker {
         // The Conspect enforcement tile watermark (S3, ADR-0050 §5): when the
         // published ladder level is at a watermark rung, append the corner mark
         // to the composited multiview canvas. Drawn LAST so it sits on top of the
-        // tile chrome. The decision is a single wait-free `arc_swap` load — no
+        // tile chrome. The decision is a single `SwapCell` load — no
         // lock, no allocation — off the hot loop, so it cannot pace or stall the
         // output clock (invariant #1). It rides the existing overlay sub-pass like
         // every other primitive (region-limited bake, ADR-0023).

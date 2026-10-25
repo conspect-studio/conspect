@@ -13,7 +13,7 @@
 //! * bounds **one origin's** share ([`SapSessionTable::with_limits`]'s
 //!   `per_origin_cap`) and the **whole table** (`capacity`), always
 //!   **drop-oldest, never grow** (bounded memory, inv #10);
-//! * publishes a newest-wins snapshot via the wait-free `ArcSwap` read-copy-update
+//! * publishes a newest-wins snapshot via the `SwapCell` read-copy-update
 //!   pattern ([`SapSessionTable::inventory`]) — the reader never blocks the
 //!   writer and nothing here can pace or back-pressure the engine (inv #1/#10).
 //!
@@ -27,9 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-
 use super::packet::{SapMessageType, SapPacket};
+use multiview_framestore::SwapCell;
 
 /// Default maximum number of discovered sessions retained across all sources.
 pub const DEFAULT_SESSION_CAPACITY: usize = 256;
@@ -106,10 +105,10 @@ pub enum ObserveOutcome {
 /// the engine (inv #10).
 #[derive(Debug)]
 pub struct SapSessionTable {
-    sessions: ArcSwap<Vec<DiscoveredSession>>,
+    sessions: SwapCell<Arc<Vec<DiscoveredSession>>>,
     /// Serializes **writers** ([`observe`](Self::observe) / [`purge`](Self::purge))
     /// so their load → clone → mutate → store is atomic against each other.
-    /// `ArcSwap` publishes atomically but does not make the whole read-modify-write
+    /// `SwapCell` publishes atomically but does not make the whole read-modify-write
     /// atomic, so without this two concurrent writers (a dual-stack v4 + v6
     /// listener sharing one table via `with_table`; the purge tick) could each
     /// clone the same snapshot and the second store would clobber the first,
@@ -139,7 +138,7 @@ impl SapSessionTable {
     #[must_use]
     pub fn with_limits(capacity: usize, per_origin_cap: usize) -> Self {
         Self {
-            sessions: ArcSwap::from_pointee(Vec::new()),
+            sessions: SwapCell::from_pointee(Vec::new()),
             write: Mutex::new(()),
             capacity: capacity.max(1),
             per_origin_cap: per_origin_cap.max(1),
@@ -241,7 +240,7 @@ impl SapSessionTable {
     /// published `Arc`; the reader never blocks a writer).
     #[must_use]
     pub fn inventory(&self) -> Arc<Vec<DiscoveredSession>> {
-        self.sessions.load_full()
+        self.sessions.load()
     }
 
     /// The number of sessions currently tracked.

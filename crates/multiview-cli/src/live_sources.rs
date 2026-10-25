@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 use multiview_core::time::Rational;
 use multiview_framestore::TileStore;
@@ -119,19 +118,20 @@ pub fn register_stop(registry: &StopRegistry, id: &str, flag: &Arc<AtomicBool>) 
 /// The shared, live-updatable preview store map (`id → TileStore`) the
 /// [`CliPreviewProvider`](crate::preview::CliPreviewProvider) reads.
 ///
-/// An `ArcSwap` over an immutable map: readers (`input_jpeg`/`input_ids`, on
+/// An `SwapCell` over an immutable map: readers (`input_jpeg`/`input_ids`, on
 /// request tasks) take a wait-free snapshot; the hub worker RCUs a clone on
 /// add/remove (rare, operator-paced — never on the output-clock thread).
-pub type SharedStores = Arc<ArcSwap<HashMap<String, Arc<TileStore<Nv12Image>>>>>;
+pub type SharedStores =
+    Arc<multiview_framestore::SwapCell<Arc<HashMap<String, Arc<TileStore<Nv12Image>>>>>>;
 
 /// Wrap an initial preview store map (the startup sources) as [`SharedStores`].
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 // reason: the map is immediately stored inside the concrete `SharedStores`
-// alias (an `ArcSwap` over the default-hasher `HashMap`), so generalizing the
+// alias (a `SwapCell` over the default-hasher `HashMap`), so generalizing the
 // parameter's hasher cannot be honoured and would only mislead callers.
 pub fn shared_stores(initial: HashMap<String, Arc<TileStore<Nv12Image>>>) -> SharedStores {
-    Arc::new(ArcSwap::from_pointee(initial))
+    Arc::new(multiview_framestore::SwapCell::from_pointee(initial))
 }
 
 /// Everything the hub needs to spawn a **synthetic** producer (ADR-0027): the

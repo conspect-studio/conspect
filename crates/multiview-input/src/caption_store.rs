@@ -13,14 +13,14 @@
 //! The store is generic over an opaque payload `C`; the caller supplies each
 //! cue's `[start, end)` window explicitly, so this module needs no caption type
 //! and stays pure + testable without the `ffmpeg` feature. It is lock-free
-//! (`ArcSwap`, read-copy-update): the writer never blocks the reader and the
+//! (`SwapCell`, read-copy-update; not arc-swap, vorner/arc-swap#210, #134): the writer never blocks the reader and the
 //! reader never blocks the writer — nothing here can pace or back-pressure the
 //! engine, which never touches this store (invariants #1/#10).
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use multiview_core::time::MediaTime;
+use multiview_framestore::SwapCell;
 
 /// Default number of cues retained. Captions are sparse (seconds apart), so a
 /// small window comfortably covers the read-ahead between decode and display.
@@ -38,7 +38,7 @@ struct Entry<C> {
 /// source. Cheap to clone-on-write because cues are sparse.
 #[derive(Debug)]
 pub struct CaptionCueStore<C> {
-    entries: ArcSwap<Vec<Entry<C>>>,
+    entries: SwapCell<Arc<Vec<Entry<C>>>>,
     capacity: usize,
 }
 
@@ -53,7 +53,7 @@ impl<C: Clone> CaptionCueStore<C> {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: ArcSwap::from_pointee(Vec::new()),
+            entries: SwapCell::from_pointee(Vec::new()),
             capacity: capacity.max(1),
         }
     }

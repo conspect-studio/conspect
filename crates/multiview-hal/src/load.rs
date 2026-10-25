@@ -618,7 +618,7 @@ pub trait LoadProbe {
 ///
 /// This is the runtime abstraction ADR-0017 §2 describes: the engine owns a
 /// dedicated blocking thread that drives `poll()` at ~1-4 Hz and publishes the
-/// resulting `Vec<DeviceLoad>` into a wait-free snapshot (`arc_swap`, owned by
+/// resulting `Vec<DeviceLoad>` into a wait-free snapshot (`SwapCell`, owned by
 /// `multiview-engine`) plus the telemetry gauges. The poller itself holds only the
 /// probe and the configured cadence — it does **no** I/O, spawns **no** thread,
 /// and never blocks the engine; the engine decides when to call `poll`. Keeping

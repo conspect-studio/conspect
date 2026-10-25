@@ -292,7 +292,7 @@ impl SlotReader {
     /// Load the latest NV12 frame, or `None` if none is available yet.
     fn load(&self) -> Option<Arc<Nv12Image>> {
         match self {
-            Self::Program(slot) => slot.load_full(),
+            Self::Program(slot) => slot.load(),
             Self::Input { stores, id, clock } => {
                 let stores = stores.load();
                 let store = stores.get(id)?;

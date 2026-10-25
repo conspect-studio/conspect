@@ -317,7 +317,7 @@ async fn run_capturing(
         // Wait until the run has published at least one composited frame.
         let mut before = None;
         for _ in 0..2_000 {
-            if let Some(f) = slot.load_full() {
+            if let Some(f) = slot.load() {
                 before = Some(f);
                 break;
             }
@@ -327,14 +327,14 @@ async fn run_capturing(
         // clear of the take (the run paces to wall-clock, so ~1.5 s wall ≈ media
         // 1.5 s — within the 0..8 s cue window).
         tokio::time::sleep(Duration::from_millis(1_500)).await;
-        let before = slot.load_full().or(before).expect("a before frame");
+        let before = slot.load().or(before).expect("a before frame");
 
         // Submit the route command on the production bus.
         commands.try_submit(command).expect("submit route command");
 
         // Let the drain apply it and several composited frames roll past the seam.
         tokio::time::sleep(Duration::from_millis(1_500)).await;
-        let after = slot.load_full().expect("an after frame");
+        let after = slot.load().expect("an after frame");
 
         stop_for_relay.stop();
         Captured { before, after }

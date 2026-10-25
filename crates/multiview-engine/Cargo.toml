@@ -12,7 +12,6 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-arc-swap = "1.9.1"
 multiview-core = { workspace = true }
 multiview-hal = { workspace = true }
 multiview-framestore = { workspace = true }

@@ -17,8 +17,6 @@
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-
 /// One published overlay working set: a monotonic generation plus the full
 /// set (working-config order). Immutable once published — the drain publishes
 /// a fresh `Arc` per applied change.
@@ -44,16 +42,16 @@ impl OverlaySet {
 
 /// The lock-free slot carrying the live overlay working set from the
 /// frame-boundary drain (the single writer) to the bake consumer (the
-/// reader). Wait-free on both sides ([`ArcSwap`]); bounded by construction
+/// reader). Wait-free on both sides ([`SwapCell`](multiview_framestore::SwapCell)); bounded by construction
 /// (exactly one set is ever held).
-pub type OverlayApplySlot = Arc<ArcSwap<OverlaySet>>;
+pub type OverlayApplySlot = Arc<multiview_framestore::SwapCell<Arc<OverlaySet>>>;
 
 /// Seed a slot with the boot config's overlay set (generation `0`), so the
 /// consumer's boot-derived render state and the slot agree before any
 /// command arrives.
 #[must_use]
 pub fn overlay_apply_slot(overlays: Vec<multiview_config::Overlay>) -> OverlayApplySlot {
-    Arc::new(ArcSwap::from_pointee(OverlaySet {
+    Arc::new(multiview_framestore::SwapCell::from_pointee(OverlaySet {
         generation: 0,
         overlays,
     }))

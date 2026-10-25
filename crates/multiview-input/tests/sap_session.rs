@@ -200,7 +200,7 @@ fn purge_threshold_is_ten_periods_when_that_exceeds_one_hour() {
 fn concurrent_observers_do_not_lose_sessions() {
     // P2-F2: observe() is a load -> clone -> mutate -> store read-modify-write.
     // A `with_table`-shared table is written by multiple concurrent tasks (a
-    // dual-stack v4 + v6 listener; the purge tick). ArcSwap makes the STORE
+    // dual-stack v4 + v6 listener; the purge tick). SwapCell makes the STORE
     // atomic, not the whole RMW: two writers can each clone the SAME snapshot and
     // the second store clobbers the first, silently losing a session. Hammer one
     // shared table from many threads with wholly-distinct sessions and assert

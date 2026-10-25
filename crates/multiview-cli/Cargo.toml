@@ -40,7 +40,6 @@ multiview-licence = { workspace = true }
 # preset); it stays in the CI-green default build, control-plane-only, never able
 # to back-pressure the engine (invariant #10).
 multiview-mesh = { workspace = true }
-arc-swap = "1.9.1"
 multiview-telemetry = { workspace = true }
 multiview-compositor = { workspace = true }
 multiview-framestore = { workspace = true }

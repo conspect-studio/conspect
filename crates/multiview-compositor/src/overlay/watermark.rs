@@ -9,7 +9,7 @@
 //! convenience* — it rides the existing overlay sub-pass
 //! ([`crate::overlay::subpass`]) that bakes off the hot loop, never the tick
 //! path. Whether to draw it is decided upstream from a pre-derived ladder flag
-//! (an `arc_swap`'d `EnforcementLevel` the cli updates off-thread); this module
+//! (a `SwapCell`-held `EnforcementLevel` the cli updates off-thread); this module
 //! only renders the mark when asked. Drawing it degrades nothing about the
 //! program timing — the canvas still emits one valid frame per tick.
 //!

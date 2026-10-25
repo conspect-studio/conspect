@@ -283,3 +283,41 @@ fn load_never_returns_a_value_published_into_another_slot() {
     assert_eq!(a.load().map(|v| (v.owner, v.counter)), Some((0, PUBLISHES)));
     assert_eq!(b.load().map(|v| (v.owner, v.counter)), Some((1, PUBLISHES)));
 }
+
+#[test]
+fn swap_cell_never_returns_a_value_stored_into_another_cell_of_another_type() {
+    // #134: the public `SwapCell` replaces arc-swap for every slot in the
+    // process (the cli's `Arc<SwapCell<..>>` aliases included). Two cells of
+    // DIFFERENT payload types but the same allocation size, stored in
+    // lock-step: under arc-swap's process-global debt list a load on `a`
+    // could return `b`'s `Arc` (type confusion). `a` must only ever return
+    // its own values.
+    use multiview_framestore::SwapCell;
+    const STORES: u64 = 500_000;
+    let a: Arc<SwapCell<Arc<(u64, u64)>>> = Arc::new(SwapCell::from_pointee((0, 0)));
+    let b: Arc<SwapCell<Arc<[u8; 16]>>> = Arc::new(SwapCell::from_pointee([0xFF; 16]));
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (a, done) = (Arc::clone(&a), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut prev = 0;
+                while !done.load(Ordering::Acquire) {
+                    let v = a.load();
+                    assert_eq!(v.0, v.1, "cell `a` returned a foreign value");
+                    assert!(v.0 >= prev, "value regressed: {} < {prev}", v.0);
+                    prev = v.0;
+                }
+            })
+        })
+        .collect();
+    for n in 1..=STORES {
+        a.store(Arc::new((n, n)));
+        b.store(Arc::new([0xFF; 16]));
+    }
+    done.store(true, Ordering::Release);
+    for r in readers {
+        r.join().expect("reader thread panicked");
+    }
+    assert_eq!(*a.load(), (STORES, STORES));
+}

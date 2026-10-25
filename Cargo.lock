@@ -148,15 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arc-swap"
-version = "1.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2942,9 +2933,9 @@ name = "multiview-audio"
 version = "0.1.0"
 dependencies = [
  "approx",
- "arc-swap",
  "multiview-core",
  "multiview-ffmpeg",
+ "multiview-framestore",
  "proptest",
  "serde",
  "tempfile",
@@ -2957,7 +2948,6 @@ name = "multiview-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "base64 0.22.1",
  "clap",
  "ed25519-dalek",
@@ -3106,7 +3096,6 @@ dependencies = [
 name = "multiview-engine"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "multiview-audio",
  "multiview-compositor",
  "multiview-config",
@@ -3189,7 +3178,6 @@ dependencies = [
 name = "multiview-input"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "miniz_oxide",
  "multiview-core",
  "multiview-ffmpeg",
@@ -3301,10 +3289,10 @@ dependencies = [
 name = "multiview-overlay"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "chrono",
  "chrono-tz",
  "multiview-core",
+ "multiview-framestore",
  "proptest",
  "serde",
  "serde_json",

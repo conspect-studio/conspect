@@ -724,3 +724,52 @@ fn read_never_returns_samples_published_into_another_store() {
         assert!(samples > 0, "reader observed no published window");
     }
 }
+
+/// Invariants #1/#10 soak for the `SwapCell`-backed window (#134): with more
+/// hot readers than the publisher can out-schedule, every replace publish
+/// still returns (the publisher never waits on a reader), and the newest
+/// window is readable as soon as its publish returns. The structural
+/// "never waits on a parked reader" proof is `multiview-framestore`'s
+/// `swap::chaos` suite, which this store inherits; this checks the store
+/// wiring under real oversubscription.
+#[test]
+fn publisher_completes_under_oversubscribed_readers() {
+    const PUBLISHES: i64 = 10_000;
+    const FRAMES: usize = 960;
+    let store = Arc::new(AudioStore::new(stereo(), FRAMES * 4));
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..16)
+        .map(|_| {
+            let (s, stop) = (Arc::clone(&store), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Gap-free under contention: always exactly FRAMES frames.
+                    s.seek_to(0);
+                    assert_eq!(s.read(FRAMES).frame_count(), FRAMES);
+                }
+            })
+        })
+        .collect();
+    let mut w = vec![0.0_f32; FRAMES * 2];
+    let started = std::time::Instant::now();
+    for n in 1..=PUBLISHES {
+        w.fill(n as f32);
+        store.publish_window(n * FRAMES as i64, &w).unwrap();
+    }
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        r.join().expect("reader thread panicked");
+    }
+    // A sanity bound for the whole loop, not a latency budget.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "{PUBLISHES} publishes took {elapsed:?}"
+    );
+    store.seek_to(PUBLISHES * FRAMES as i64);
+    let last = store.read(FRAMES);
+    assert!(
+        last.interleaved().iter().all(|&s| s == PUBLISHES as f32),
+        "the newest window is not visible after its publish returned"
+    );
+}

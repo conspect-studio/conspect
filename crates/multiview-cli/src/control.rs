@@ -1135,7 +1135,7 @@ pub fn command_drain_with_live_overlays(
 /// [`SubtitleRouteHandle`](crate::captions::SubtitleRouteHandle) (RT-10b) — the
 /// run applies it at the next sample boundary via the engine
 /// [`SubtitleLayer::repoint`](multiview_overlay::SubtitleLayer). Reading the slot
-/// is a lock-free `ArcSwapOption` load and publishing a re-point is wait-free +
+/// is a `SwapCell` load and publishing a re-point is wait-free +
 /// bounded drop-oldest, so neither can pace or stall the output clock
 /// (invariants #1/#10).
 ///
@@ -1154,7 +1154,9 @@ pub fn command_drain_with_seams(
     commands: CommandReceiver,
     config: MultiviewConfig,
     publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
-    subtitle_route: Arc<arc_swap::ArcSwapOption<crate::captions::SubtitleRouteHandle>>,
+    subtitle_route: Arc<
+        multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>,
+    >,
     overlays: crate::live_overlays::OverlayApplySlot,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<
@@ -1252,7 +1254,9 @@ pub struct CommandDrain {
     /// software-engine path (no subtitle rendering) — a `RouteSubtitle` is then a
     /// logged held action.
     #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
-    subtitle_route: Option<Arc<arc_swap::ArcSwapOption<crate::captions::SubtitleRouteHandle>>>,
+    subtitle_route: Option<
+        Arc<multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>>,
+    >,
     /// The live-source producer seam (ADR-W018), when wired
     /// ([`command_drain_with_live_sources`] / [`command_drain_with_seams`]): the
     /// bounded, non-blocking handle to the off-thread
@@ -1353,7 +1357,9 @@ impl CommandDrain {
     #[must_use]
     fn with_subtitle_route(
         mut self,
-        subtitle_route: Arc<arc_swap::ArcSwapOption<crate::captions::SubtitleRouteHandle>>,
+        subtitle_route: Arc<
+            multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>,
+        >,
     ) -> Self {
         self.subtitle_route = Some(subtitle_route);
         self
@@ -2184,7 +2190,7 @@ impl CommandDrain {
             );
             return;
         };
-        let Some(handle) = slot.load_full() else {
+        let Some(handle) = slot.load() else {
             // The run has not yet published its live handle (it does so at drive
             // start); a route arriving in that tiny window is held, not panicked on.
             tracing::warn!(

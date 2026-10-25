@@ -14,7 +14,6 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwapOption;
 use multiview_audio::format::AudioBlock;
 use multiview_compositor::pipeline::Nv12Image;
 use multiview_control::PreviewProvider;
@@ -27,12 +26,12 @@ use crate::live_sources::SharedStores;
 /// The wait-free slot the engine loop publishes the latest composited program
 /// frame into (throttled to the preview rate). Cloned into both the engine
 /// (writer) and the provider (reader); neither blocks the other.
-pub type ProgramSlot = Arc<ArcSwapOption<Nv12Image>>;
+pub type ProgramSlot = Arc<multiview_framestore::SwapCell<Option<Arc<Nv12Image>>>>;
 
 /// Create an empty program slot (no frame published yet).
 #[must_use]
 pub fn program_slot() -> ProgramSlot {
-    Arc::new(ArcSwapOption::empty())
+    Arc::new(multiview_framestore::SwapCell::empty())
 }
 
 /// The ring depth of the program-audio preview slot — a handful of blocks
@@ -150,7 +149,7 @@ impl CliPreviewProvider {
 
 impl PreviewProvider for CliPreviewProvider {
     fn program_jpeg(&self, quality: u8) -> Option<Vec<u8>> {
-        let frame = self.program.load_full()?;
+        let frame = self.program.load()?;
         self.encode(&frame, quality)
     }
 

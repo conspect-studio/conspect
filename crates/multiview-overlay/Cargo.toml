@@ -13,7 +13,8 @@ publish = false
 
 [dependencies]
 multiview-core = { workspace = true }
-arc-swap = "1.9.1"
+# `SwapCell` for the subtitle re-point cell (replaces arc-swap, vorner/arc-swap#210, #134).
+multiview-framestore = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 serde = { workspace = true }

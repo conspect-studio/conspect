@@ -657,7 +657,7 @@ async fn run_pipeline_until_ctrl_c(
         .await?;
         // Thread the run's live subtitle re-point seam (RT-10b) into the drain so a
         // `RouteSubtitle` (RT-11) reaches the running pipeline's layer. The slot is
-        // shared (lock-free `ArcSwapOption`); the run publishes its handle into it at
+        // shared (`SwapCell`); the run publishes its handle into it at
         // drive start, and the drain reads it wait-free (inv #1/#10). Only under
         // `overlay` (without it the run renders no subtitles, so there is no layer).
         // The live overlay seam (ADR-W022) rides the same variant; the
@@ -715,7 +715,7 @@ async fn run_pipeline_until_ctrl_c(
     );
 
     // GPU-5c: the live adaptive-placement execution loop. On a MULTI-GPU host it
-    // polls per-GPU load (the `LoadPoller → arc_swap` snapshot), observes the
+    // polls per-GPU load (the `LoadPoller → SwapCell` snapshot), observes the
     // `PlacementController` one control tick (recording the placement counters),
     // and emits a `ShedLoad` when a sustained overload cannot be cured by
     // migrating — activating GPU-5b's inert controller. It runs entirely off the

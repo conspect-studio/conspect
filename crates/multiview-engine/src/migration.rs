@@ -46,7 +46,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwap;
+use multiview_framestore::SwapCell;
 use multiview_hal::load::{DeviceId, DeviceLoad};
 use multiview_hal::select::{
     select_device, GpuCandidate, Pins, PipelineDemand, PlacementPolicy, RejectReason,
@@ -66,12 +66,13 @@ use crate::runtime::Pacer;
 /// An off-hot-path poll thread (the CLI's `LoadSource` poller) calls
 /// [`LoadSnapshot::publish`] at the bounded poll cadence; the control tick reads
 /// the newest snapshot wait-free via [`LoadSnapshot::load`]. It is a single
-/// [`arc_swap::ArcSwap`] slot — newest-wins, no lock, no channel into the engine
+/// [`SwapCell`] slot (never a foreign snapshot, vorner/arc-swap#210, #134) —
+/// newest-wins, the publisher never waits on a reader, no channel into the engine
 /// — so a slow/absent poller can never stall the engine (invariant #10): the
 /// reader just sees the last published snapshot (or the empty seed).
 #[derive(Debug)]
 pub struct LoadSnapshot {
-    inner: ArcSwap<Vec<DeviceLoad>>,
+    inner: SwapCell<Arc<Vec<DeviceLoad>>>,
 }
 
 impl LoadSnapshot {
@@ -79,7 +80,7 @@ impl LoadSnapshot {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: ArcSwap::from_pointee(Vec::new()),
+            inner: SwapCell::from_pointee(Vec::new()),
         }
     }
 
@@ -91,7 +92,7 @@ impl LoadSnapshot {
     /// Read the newest published snapshot, wait-free.
     #[must_use]
     pub fn load(&self) -> Arc<Vec<DeviceLoad>> {
-        self.inner.load_full()
+        self.inner.load()
     }
 }
 
