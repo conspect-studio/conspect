@@ -37,12 +37,16 @@ base64 = "0.22.1"
 # Native WebRTC (ICE/DTLS/SRTP) stack — OPTIONAL, pulled in ONLY by `native`.
 # str0m is sans-IO (`MIT OR Apache-2.0`), pinned EXACTLY to =0.16.2 (ADR-0048 §3,
 # a tightening of multiview-preview's caret requirement; lockfile-resolved to the
-# same version). `default-features = false, features = ["rust-crypto"]` selects
-# the RustCrypto SRTP provider whose DTLS impl (`dimpl`) transitively links
-# `aws-lc-rs` (`ISC AND (Apache-2.0 OR ISC)` — allowlisted) for the cert / EC
-# primitives. The default + pure builds never link it; cargo-deny scans the
-# default build only (`all-features = false`), so the gate stays clean.
-str0m = { version = "=0.16.2", default-features = false, features = ["rust-crypto"], optional = true }
+# same version). `default-features = false, features = ["aws-lc-rs"]` selects
+# the aws-lc-rs crypto provider (`str0m-aws-lc-rs` → `dimpl/aws-lc-rs`) for SRTP,
+# DTLS ECDHE/ECDSA and the self-signed DTLS cert. aws-lc-rs was ALREADY linked
+# under the former `rust-crypto` backend (dimpl's `rcgen` feature forces it), so
+# this adds no native code; it DROPS the RustCrypto `p256`/`p384` 0.13 →
+# `crypto-bigint` 0.5 path (RUSTSEC-2026-0387, non-constant-time arithmetic on
+# DTLS secrets; #127). Do NOT go back to `rust-crypto` until dimpl /
+# str0m-rust-crypto move to `p256` 0.14. The default + pure builds never link
+# str0m; CI's cargo-deny `webrtc-native` leg gates this closure.
+str0m = { version = "=0.16.2", default-features = false, features = ["aws-lc-rs"], optional = true }
 # The dual-stack UDP socket bind (`[::]`, `IPV6_V6ONLY=false`; ADR-0042/§4) — the
 # std `UdpSocket` cannot set `IPV6_V6ONLY`. `socket2` (`MIT OR Apache-2.0`,
 # allowlisted, already in the workspace graph transitively via tokio/hyper) gives

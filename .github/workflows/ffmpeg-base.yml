@@ -118,7 +118,8 @@ jobs:
           # FFMPEG_VERSION drives the build; the SHA/GPG/NVCODEC pins live in the
           # Dockerfile.ffmpeg ARGs (defaults). FF_HWACCEL + FF_LICENSE select the
           # flavour. The build verifies GPG + SHA-256 and enforces the LGPL/
-          # nonfree guardrail.
+          # nonfree guardrail. Dockerfile.ffmpeg checks installed srt, rtsp/hls,
+          # WAV and raw-PCM features in every matrix leg before any image push.
           build-args: |
             FFMPEG_VERSION=${{ env.FFMPEG_VERSION }}
             FF_HWACCEL=${{ matrix.hwaccel }}

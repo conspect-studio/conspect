@@ -95,6 +95,11 @@ RUN chmod 0755 /usr/local/bin/ffmpeg-build.sh \
     FF_PREFIX=/opt/multiview-ffmpeg \
     /usr/local/bin/ffmpeg-build.sh
 
+# Independently assert the installed CLI's real IO capabilities on every variant.
+RUN FF_PREFIX=/opt/multiview-ffmpeg /usr/local/bin/ffmpeg-build.sh --assert-features
+# Prove a real SRT push+ingest roundtrip; no external network is needed.
+RUN FF_PREFIX=/opt/multiview-ffmpeg /usr/local/bin/ffmpeg-build.sh --smoke-srt
+
 # -----------------------------------------------------------------------------
 # Stage: export — the published image content. A minimal scratch layer carrying
 # ONLY /opt/multiview-ffmpeg, so the app Dockerfiles `COPY --from=ffmpeg

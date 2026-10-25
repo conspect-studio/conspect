@@ -115,7 +115,8 @@ unconditional: the RTP clock for Opus is always 48 000 regardless of the coded b
 ### 2.1 Stack: str0m 0.16.2, pinned, sans-IO
 
 - **str0m `=0.16.2`** (`MIT OR Apache-2.0`; sans-IO; `default-features = false,
-  features = ["rust-crypto"]`) — **tightening** `multiview-preview`'s caret `"0.16.2"`
+  features = ["aws-lc-rs"]`; was `rust-crypto` until #127 — RUSTSEC-2026-0387, see ADR-0048 §3)
+  — **tightening** `multiview-preview`'s caret `"0.16.2"`
   requirement (`crates/multiview-preview/Cargo.toml`, lockfile-resolved) to an exact `=0.16.2`
   pin; the crypto closure is already allowlisted in
   `deny.toml` (aws-lc-rs via `dimpl` — note: 0.16.x uses aws-lc-rs, not ring). MSRV 1.81 ≤
