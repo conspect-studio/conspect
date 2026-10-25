@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use multiview_config::routing::{StreamRef, StreamSelector};
-use multiview_config::MultiviewConfig;
+use multiview_config::{ConfigError, MultiviewConfig, ProgramKind};
 use multiview_core::stream::StreamKind;
 use proptest::prelude::*;
 
@@ -154,6 +154,49 @@ fn implicit_output_routing_requires_main_program() {
     cfg.programs = vec![named];
     let err = cfg.validate().unwrap_err().to_string();
     assert!(err.contains("main") && err.contains("program"), "{err}");
+}
+
+#[test]
+fn declared_main_must_match_top_level_canvas_cadence() {
+    let mut cfg = load_legacy();
+    cfg.canvas.fps = "25/1".parse().unwrap();
+    let mut main = cfg.effective_programs().remove(0);
+    let ProgramKind::Multiview { canvas, .. } = &mut main.kind;
+    canvas.fps = "50/1".parse().unwrap();
+    cfg.programs = vec![main];
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::ProgramMismatch { field: "canvas", .. })
+    ));
+}
+
+#[test]
+fn declared_main_must_match_top_level_cells_and_outputs() {
+    let mut cfg = load_legacy();
+    let mut main = cfg.effective_programs().remove(0);
+    let ProgramKind::Multiview { cells, .. } = &mut main.kind;
+    cells[0].id = "different_cell".to_owned();
+    cfg.programs = vec![main];
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::ProgramMismatch { field: "cells", .. })
+    ));
+
+    let mut cfg = load_legacy();
+    let mut main = cfg.effective_programs().remove(0);
+    main.outputs.clear();
+    cfg.programs = vec![main];
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::ProgramMismatch { field: "outputs", .. })
+    ));
+}
+
+#[test]
+fn identical_declared_main_is_accepted() {
+    let mut cfg = load_legacy();
+    cfg.programs = cfg.effective_programs();
+    cfg.validate().unwrap();
 }
 
 #[test]
