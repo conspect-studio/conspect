@@ -230,7 +230,7 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 20] = [
+        let sectioned: [(&'static str, bool); 21] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
