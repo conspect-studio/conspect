@@ -1043,12 +1043,7 @@ async fn every_indexed_refusal_publishes_a_failed_outcome_with_the_typed_reason(
     ]));
     // (label, index, table, expected reason fragment)
     let cases: Vec<(&str, Option<u32>, Option<ScriptedReply>, &str)> = vec![
-        (
-            "no-index",
-            None,
-            None,
-            "no configured spare decode index",
-        ),
+        ("no-index", None, None, "no configured spare decode index"),
         (
             "active",
             Some(3),
@@ -1089,7 +1084,11 @@ async fn every_indexed_refusal_publishes_a_failed_outcome_with_the_typed_reason(
             .iter()
             .filter(|m| m.phase == ModePhase::Failed)
             .collect();
-        assert_eq!(failed.len(), 1, "{label}: exactly one Failed outcome: {events:?}");
+        assert_eq!(
+            failed.len(),
+            1,
+            "{label}: exactly one Failed outcome: {events:?}"
+        );
         let detail = failed[0].detail.as_deref().unwrap_or_default();
         assert!(
             detail.contains(reason),

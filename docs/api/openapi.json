@@ -1964,6 +1964,78 @@
         }
       }
     },
+    "/api/v1/devices/{id}/set-mode/plan": {
+      "post": {
+        "tags": [
+          "devices"
+        ],
+        "summary": "`POST /api/v1/devices/{id}/set-mode/plan` — classify a `set-mode` without\napplying it (role: read; zero wire calls). A Class-2 plan must be echoed as\n`ack_impact` on the apply.",
+        "operationId": "plan_set_mode_route",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Device id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The impact the apply would incur; nothing was dispatched.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetModePlan"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No device with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/devices/{id}/source-candidates": {
       "get": {
         "tags": [
@@ -13589,6 +13661,38 @@
           }
         }
       },
+      "SetModePlan": {
+        "type": "object",
+        "description": "The non-mutating `POST /devices/{id}/set-mode/plan` response: the impact\nclass and statement a `set-mode` apply would incur, with zero device calls\n(inv #11, the routing plan/take pattern).",
+        "required": [
+          "impact",
+          "detail",
+          "requires_ack"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "The human-readable impact statement."
+          },
+          "impact": {
+            "type": "string",
+            "description": "The impact class: `c2` (index-scoped, disruptive) or `dev`."
+          },
+          "index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The configured spare decode index an apply would activate, if any.",
+            "minimum": 0
+          },
+          "requires_ack": {
+            "type": "boolean",
+            "description": "Whether the apply must echo `ack_impact` (true for Class-2)."
+          }
+        }
+      },
       "SetModeRequest": {
         "type": "object",
         "description": "The `POST /api/v1/devices/{id}/set-mode` request body.",
@@ -13596,6 +13700,13 @@
           "mode"
         ],
         "properties": {
+          "ack_impact": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The impact class the caller acknowledges, echoed from\n`POST /devices/{id}/set-mode/plan`. Required (`c2`) when the plan reports\n`requires_ack`; otherwise the apply is refused with `409` and the impact."
+          },
           "mode": {
             "type": "string",
             "description": "The desired converged work mode (driver vocabulary, e.g. `encoder`)."

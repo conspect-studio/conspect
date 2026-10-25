@@ -829,12 +829,10 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         .await;
         match result {
             Ok(Some(WorkMode::Decoder)) => Ok(()),
-            Ok(observed) => {
-                Err(ConvergenceError::WorkmodeNotReflected {
-                    device_id: self.device_id.clone(),
-                    observed: observed.map_or("unknown", WorkMode::as_str).to_owned(),
-                })
-            }
+            Ok(observed) => Err(ConvergenceError::WorkmodeNotReflected {
+                device_id: self.device_id.clone(),
+                observed: observed.map_or("unknown", WorkMode::as_str).to_owned(),
+            }),
             Err(err) => {
                 self.publish_failure(&err);
                 Err(err.into())

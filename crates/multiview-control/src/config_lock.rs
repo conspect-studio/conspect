@@ -90,6 +90,7 @@ fn is_operational_or_recovery(path: &str) -> bool {
         || p.ends_with("/identify")
         || p.ends_with("/test-pattern")
         || p.ends_with("/set-mode")
+        || p.ends_with("/set-mode/plan")
         || p == "/tally/override"
         || p.starts_with("/routing/")
     {

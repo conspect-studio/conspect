@@ -757,7 +757,7 @@ mod plan_take {
     };
     use multiview_control::realtime::{CorrKey, CorrRegistry};
 
-    fn ok(data: serde_json::Value) -> ScriptedReply {
+    fn ok(data: &serde_json::Value) -> ScriptedReply {
         ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000", "data": data }))
     }
 
@@ -795,13 +795,13 @@ mod plan_take {
 
     fn scripted() -> ScriptedTransport {
         let t = ScriptedTransport::new();
-        t.push("system", ok(json!({ "uuid": "u", "type": 0 })));
-        t.push("venc", ok(json!({ "workmode": "encoder" })));
+        t.push("system", ok(&json!({ "uuid": "u", "type": 0 })));
+        t.push("venc", ok(&json!({ "workmode": "encoder" })));
         // Convergence: get_workmode_id (already decoder), table, switch ack.
-        t.push("workmode", ok(json!({ "workmode_id": 1 })));
+        t.push("workmode", ok(&json!({ "workmode_id": 1 })));
         t.push(
             "streamplay",
-            ok(json!([
+            ok(&json!([
                 {"index": 2, "name": "p", "switch": 1, "streamplay_status": "playing",
                  "url": "rtsp://x/a"},
                 {"index": 3, "name": "s", "switch": 0, "streamplay_status": "idle",
@@ -863,10 +863,17 @@ mod plan_take {
         let body = body_json(resp).await;
         assert_eq!(body["impact"], "c2", "{body}");
         assert_eq!(body["requires_ack"], true, "{body}");
-        assert!(body["detail"].as_str().unwrap().contains("index 3"), "{body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains("index 3"),
+            "{body}"
+        );
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(transport.requests().len(), before, "plan makes no wire call");
+        assert_eq!(
+            transport.requests().len(),
+            before,
+            "plan makes no wire call"
+        );
     }
 
     #[tokio::test]
@@ -892,7 +899,10 @@ mod plan_take {
         let h = harness();
         let resp = send(
             &h.router,
-            post("/api/v1/devices/nope/set-mode/plan", &json!({ "mode": "decoder" })),
+            post(
+                "/api/v1/devices/nope/set-mode/plan",
+                &json!({ "mode": "decoder" }),
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

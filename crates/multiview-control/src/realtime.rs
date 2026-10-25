@@ -118,6 +118,13 @@ pub enum CorrKey {
     /// and the window's seq fence keeps an earlier scan's stragglers from ever
     /// being stamped with a newer scan's id.
     Discovery,
+    /// A device's terminal `device.mode` outcome (`Finished` or `Failed`) — the
+    /// outcome of an acknowledged index-scoped `set-mode` apply (issue #55). The
+    /// consume-once pending lane, keyed by device id.
+    DeviceMode {
+        /// The registry device id converging.
+        device_id: String,
+    },
 }
 
 impl CorrKey {
@@ -256,6 +263,17 @@ impl CorrKey {
             // The running scan's rows correlate via the windowed Discovery key
             // (recorded at scan start, seq-fenced).
             Event::DeviceDiscovered(_) => Some(Self::Discovery),
+            // Only the terminal phases are outcomes; `Started` is the declaration.
+            Event::DeviceMode(e)
+                if matches!(
+                    e.phase,
+                    multiview_events::ModePhase::Finished | multiview_events::ModePhase::Failed
+                ) =>
+            {
+                Some(Self::DeviceMode {
+                    device_id: e.device_id.clone(),
+                })
+            }
             // A media-player lifecycle transition projects to the same key its
             // originating command produced (ADR-0097 §6, ADR-RT008): the player
             // id + the discrete transport state it entered.
