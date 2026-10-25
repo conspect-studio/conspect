@@ -15,7 +15,10 @@
 use std::sync::Arc;
 
 use multiview_control::devices::zowietek::client::{ScriptedReply, ScriptedTransport};
-use multiview_control::devices::zowietek::{ModeConvergence, ZowietekDriver};
+use multiview_control::devices::zowietek::protocol::DecodeTable;
+use multiview_control::devices::zowietek::{
+    ConvergenceError, ConvergenceUngrounded, ModeConvergence, ZowietekDriver,
+};
 use multiview_control::devices::{DeviceBroadcaster, DeviceDriverRegistry, DeviceStatusRegistry};
 use multiview_engine::EnginePublisher;
 use multiview_events::{DeviceState, Event};
@@ -370,5 +373,287 @@ async fn converging_to_the_current_mode_is_a_noop_plan() {
     assert!(
         matches!(plan, ModeConvergence::AlreadyConverged { .. }),
         "converging to the current mode is a no-op plan, not a needless restart"
+    );
+}
+
+// ---- Index-scoped convergence (DEV-A4 / upstream #140) ---------------------
+//
+// The grounded protocol is index-scoped and the decoder is **single-active**:
+// activating one index is the sole active decode and implicitly stops whatever
+// was playing. Convergence therefore targets an explicit *spare* index and
+// declares Class-2 disruption before apply (invariant #11); without a
+// configured index the driver refuses fail-safe rather than guessing.
+
+/// The grounded `streamplay_get_all` fixture: production is active on index 2,
+/// the configured spare is index 3.
+fn grounded_decode_table() -> DecodeTable {
+    DecodeTable::parse(&json!([
+        {"index": 2, "name": "production", "switch": 1, "streamplay_status": "playing",
+         "url": "rtsp://[fd00:db8::42]:8554/main/av"},
+        {"index": 3, "name": "spare", "switch": 0, "streamplay_status": "idle",
+         "url": "rtsp://[fd00:db8::42]:8554/sub/av"}
+    ]))
+}
+
+#[test]
+fn indexed_convergence_plan_picks_only_the_configured_spare_index() {
+    let (_engine, broadcaster, drivers) = harness();
+    let transport = ScriptedTransport::new();
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(3));
+
+    let plan = driver
+        .plan_decode_convergence(&grounded_decode_table())
+        .expect("a configured spare index grounds the plan");
+
+    assert!(
+        matches!(
+            plan,
+            ModeConvergence::IndexedSwitch {
+                index: 3,
+                active_index: Some(2),
+                ..
+            }
+        ),
+        "the plan targets the configured spare index and reports the active one: {plan:?}"
+    );
+    let detail = plan.declared_impact();
+    assert!(
+        detail.contains("index 3"),
+        "the declared impact names the spare index: {detail:?}"
+    );
+    assert!(
+        detail.contains("single-active") || detail.contains("sole active"),
+        "the declared impact states the decoder is single-active: {detail:?}"
+    );
+    assert!(
+        plan.restarts_device(),
+        "an index-scoped switch is a real (disruptive) switch"
+    );
+}
+
+#[test]
+fn indexed_convergence_refuses_without_a_configured_spare_index() {
+    let (_engine, broadcaster, drivers) = harness();
+    let transport = ScriptedTransport::new();
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    );
+
+    let err = driver
+        .plan_decode_convergence(&grounded_decode_table())
+        .expect_err("no configured index ⇒ fail-safe refusal, never a guess");
+    assert!(
+        matches!(err, ConvergenceUngrounded::NoConfiguredIndex { ref device_id } if device_id == "dev-a"),
+        "the refusal names the device and the missing index: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("spare"),
+        "the refusal is operator-legible: {err}"
+    );
+}
+
+#[test]
+fn indexed_convergence_refuses_the_active_index() {
+    let (_engine, broadcaster, drivers) = harness();
+    let transport = ScriptedTransport::new();
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(2)); // the active index — never the active one
+
+    let err = driver
+        .plan_decode_convergence(&grounded_decode_table())
+        .expect_err("the active index is never chosen as the spare");
+    assert!(
+        matches!(
+            err,
+            ConvergenceUngrounded::ConfiguredIndexActive { index: 2, .. }
+        ),
+        "the refusal identifies the active index: {err:?}"
+    );
+}
+
+#[test]
+fn indexed_convergence_refuses_an_absent_index() {
+    let (_engine, broadcaster, drivers) = harness();
+    let transport = ScriptedTransport::new();
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(9));
+
+    let err = driver
+        .plan_decode_convergence(&grounded_decode_table())
+        .expect_err("an index the device does not report is not a spare");
+    assert!(
+        matches!(
+            err,
+            ConvergenceUngrounded::ConfiguredIndexAbsent { index: 9, .. }
+        ),
+        "the refusal identifies the absent index: {err:?}"
+    );
+}
+
+#[test]
+fn a_device_without_a_spare_index_keeps_the_legacy_convergence_plan() {
+    let (_engine, broadcaster, drivers) = harness();
+    let transport = ScriptedTransport::new();
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    );
+    assert_eq!(driver.convergence_index(), None);
+
+    // Behaviour is unchanged: the legacy close-before-open plan is still what a
+    // device without a configured spare index gets.
+    assert!(matches!(
+        driver.plan_mode_convergence("decoder"),
+        ModeConvergence::Switch { .. }
+    ));
+}
+
+#[tokio::test]
+async fn indexed_convergence_refuses_before_touching_the_wire_without_an_index() {
+    let (_engine, broadcaster, drivers) = harness();
+    let transport = ScriptedTransport::new();
+    transport.push("system", login_ok());
+    transport.push(
+        "venc",
+        ScriptedReply::json(
+            json!({ "rsp": "succeed", "status": "00000", "data": { "workmode": "encoder" } }),
+        ),
+    );
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport.clone()),
+        broadcaster,
+        Arc::clone(&drivers),
+        "admin",
+        "admin",
+    );
+    driver.probe_and_adopt().await.expect("adopt ok");
+    let before = transport.request_count("streamplay");
+
+    let err = driver
+        .converge_indexed()
+        .await
+        .expect_err("no configured index ⇒ fail-safe refusal");
+    assert!(
+        matches!(err, ConvergenceError::Ungrounded(_)),
+        "the refusal surfaces as a typed ungrounded convergence error: {err:?}"
+    );
+    assert_eq!(
+        transport.request_count("streamplay"),
+        before,
+        "the refusal happens BEFORE any wire I/O (no decode-table read, no switch)"
+    );
+}
+
+#[tokio::test]
+async fn indexed_convergence_applies_the_grounded_index_scoped_switch() {
+    let (engine, broadcaster, drivers) = harness();
+    let mut sub = engine.subscribe();
+    let transport = ScriptedTransport::new();
+    transport.push("system", login_ok());
+    transport.push(
+        "venc",
+        ScriptedReply::json(
+            json!({ "rsp": "succeed", "status": "00000", "data": { "workmode": "encoder" } }),
+        ),
+    );
+    // 1) the grounded decode-table read (`streamplay_get_all`), then
+    // 2) the grounded index-scoped switch ack.
+    transport.push(
+        "streamplay",
+        ScriptedReply::json(json!({
+            "rsp": "succeed", "status": "00000",
+            "data": [
+                {"index": 2, "name": "production", "switch": 1, "streamplay_status": "playing",
+                 "url": "rtsp://[fd00:db8::42]:8554/main/av"},
+                {"index": 3, "name": "spare", "switch": 0, "streamplay_status": "idle",
+                 "url": "rtsp://[fd00:db8::42]:8554/sub/av"}
+            ]
+        })),
+    );
+    transport.push(
+        "streamplay",
+        ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000" })),
+    );
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport.clone()),
+        broadcaster,
+        Arc::clone(&drivers),
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(3));
+    driver.probe_and_adopt().await.expect("adopt ok");
+
+    driver
+        .converge_indexed()
+        .await
+        .expect("indexed convergence succeeds");
+
+    let last = transport.last_request().expect("a switch was issued");
+    assert_eq!(
+        last.body,
+        json!({
+            "group": "streamplay",
+            "opt": "streamplay_switch",
+            "data": {"index": 3, "switch": 1}
+        }),
+        "the applied switch is the grounded index-scoped shape (spare index only)"
+    );
+
+    // The Class-2 disruption is declared BEFORE apply (invariant #11).
+    let mut saw_indexed = false;
+    while let Ok(evt) = sub.try_recv() {
+        if let Event::DeviceMode(m) = &*evt.event {
+            assert_eq!(m.device_id, "dev-a");
+            assert_eq!(m.mode, "decoder");
+            assert_eq!(
+                m.impact,
+                multiview_events::ImpactClass::Class2,
+                "an index-scoped switch is Class-2 (it stops whatever was playing)"
+            );
+            let detail = m.detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("index 3"),
+                "the declared detail names the spare index: {detail:?}"
+            );
+            saw_indexed = true;
+        }
+    }
+    assert!(
+        saw_indexed,
+        "device.mode (Class-2) was published for the indexed switch"
     );
 }

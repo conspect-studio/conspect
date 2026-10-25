@@ -663,3 +663,80 @@ async fn seed_device(h: &support::Harness, id: &str) {
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED, "seed device {id}");
 }
+
+/// Seed a `zowietek` decoder that has an explicit spare decode index — the
+/// grounded index-scoped convergence path (DEV-A4 / upstream #140).
+async fn seed_indexed_device(h: &support::Harness, id: &str, spare_decode_index: u32) {
+    let body = json!({
+        "name": id,
+        "body": {
+            "id": id,
+            "driver": "zowietek",
+            "address": "http://[fd00:db8::42]",
+            "spare_decode_index": spare_decode_index
+        }
+    });
+    let resp = send(
+        &h.router,
+        post_json(&format!("/api/v1/devices/{id}"), OPERATOR_TOKEN, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "seed device {id}");
+}
+
+#[tokio::test]
+async fn set_mode_declares_class2_index_scoped_disruption_before_apply() {
+    let h = harness();
+    seed_indexed_device(&h, "dev-foyer", 3).await;
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/devices/dev-foyer/set-mode",
+            OPERATOR_TOKEN,
+            &json!({ "mode": "decoder" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert!(
+        body["operation_id"].as_str().is_some(),
+        "set-mode returns an operation id: {body}"
+    );
+    // An index-scoped switch activates the spare as the decoder's sole active
+    // index and stops whatever was playing: Class-2, declared BEFORE apply.
+    assert_eq!(
+        body["impact"], "c2",
+        "a spare-index decoder switch declares Class-2 disruption: {body}"
+    );
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("index 3"),
+        "the declared impact names the configured spare index: {body}"
+    );
+    assert!(
+        detail.contains("single-active") || detail.contains("sole active"),
+        "the declared impact states the single-active disruption: {body}"
+    );
+}
+
+#[tokio::test]
+async fn set_mode_without_a_spare_index_keeps_the_dev_impact() {
+    let h = harness();
+    seed_device(&h, "dev-foyer").await;
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/devices/dev-foyer/set-mode",
+            OPERATOR_TOKEN,
+            &json!({ "mode": "decoder" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["impact"], "dev",
+        "no configured spare index ⇒ unchanged DEV-class declaration: {body}"
+    );
+}
