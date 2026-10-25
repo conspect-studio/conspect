@@ -13,6 +13,11 @@
 //!   (gap-free; the mixer never stalls waiting for an input).
 //! - The program bus is hard-limited to the `[-1.0, 1.0]` sample domain so it
 //!   never overflows.
+//! - Every program-route gain is sanitised at the mixer boundary (see the
+//!   private `sanitize_program_gain` helper): a `NaN` fails safe to silence and
+//!   anything outside `[0.0, MAX_PROGRAM_GAIN]` clamps, so a non-finite gain can
+//!   never poison the bus (an `inf` gain on a muted strip would otherwise mix as
+//!   `inf · 0 = NaN`).
 use crate::error::{AudioError, Result};
 use crate::format::{AudioBlock, AudioFormat};
 
@@ -121,11 +126,46 @@ fn ratio(frame: usize, total: usize) -> f64 {
     f / t
 }
 
+/// The default length of a per-strip **mute/unmute** anti-click envelope, in
+/// frames (~10 ms at 48 kHz — ADR-0059 §4, the same established ramp length as
+/// [`loopdeck::DEFAULT_CROSSFADE_FRAMES`](crate::loopdeck::DEFAULT_CROSSFADE_FRAMES)).
+/// A mute is a separate multiplicative envelope, so this ramp never folds into
+/// the strip's steady `program_gain`.
+pub const DEFAULT_MUTE_FRAMES: usize = 480;
+
 /// Clamp an envelope gain to the `[-1.0, 1.0]` `f32` linear-gain domain (the
 /// equal-power taper stays well within this; the clamp is belt-and-braces).
 #[allow(clippy::as_conversions, clippy::cast_possible_truncation)] // reason: value is clamped to [-1,1]; f64->f32 narrowing is exact-enough and bounded.
 fn clamp_gain(v: f64) -> f32 {
     v.clamp(-1.0, 1.0) as f32
+}
+
+/// The largest linear **program-route** gain the mixer will apply —
+/// `10^(24/20)`, the linear equivalent of the documented `+24.0 dB` ceiling of
+/// the supported route-gain range (`-96.0 ..= 24.0 dB`).
+///
+/// `multiview-audio` sits at the leaf of the dependency graph (it cannot import
+/// `multiview-config`, which owns the canonical dB constants), so this linear
+/// ceiling is restated here as the mixer's own self-contained backstop against a
+/// gain that reaches it from any caller.
+pub const MAX_PROGRAM_GAIN: f64 = 15.848_931_924_611_133;
+
+/// Sanitise a linear program-route gain at the mixer boundary so a bad value can
+/// never reach the accumulator.
+///
+/// A `NaN` gain (the `inf · 0` product a mute of an over-range route used to
+/// produce) fails safe to `0.0` — **silence**, never a loud unity — and `±inf`
+/// or any finite value outside `[0.0, MAX_PROGRAM_GAIN]` clamps into that
+/// range. The lower bound is `0.0` rather than the `10^(-96/20)` floor of the
+/// dB range on purpose: a caller handing in a linear `0.0` means *exact
+/// silence* and must never be clamped **up** to an audible −96 dB.
+#[must_use]
+fn sanitize_program_gain(gain: f64) -> f64 {
+    if gain.is_nan() {
+        0.0
+    } else {
+        gain.clamp(0.0, MAX_PROGRAM_GAIN)
+    }
 }
 
 /// A handle to a routing endpoint: a **generation-tagged** input-slot index.
@@ -181,6 +221,13 @@ impl RoutePoint {
 /// One input strip: its identifier, program-route gain, the latest submitted
 /// block (if any this tick), and an optional per-sample [`GainRamp`] for a
 /// pop-free cross-fade.
+///
+/// Mute is deliberately **not** modelled by unrouting the strip or by ramping
+/// `program_gain` to zero: both are lossy (an unroute forces the caller to
+/// re-supply the gain on re-entry; a ramp-to-zero folds its endpoint into the
+/// steady gain). Instead `muted`/`mute_gain`/`mute_ramp` form a **separate
+/// multiplicative envelope** (ADR-0059 §4), so the steady `program_gain`
+/// survives a mute and unmute restores it exactly.
 #[derive(Debug)]
 struct InputStrip {
     id: String,
@@ -191,6 +238,26 @@ struct InputStrip {
     /// effective gain at frame `n` of a mix is `program_gain · ramp.envelope_at(
     /// ramp.frames_done + n)`, so the envelope moves *within* the tick block.
     gain_ramp: Option<GainRamp>,
+    /// The steady mute intent (the operator's `SetMute`). Never folded into
+    /// `program_gain`.
+    muted: bool,
+    /// The settled mute envelope: `1.0` when open, `0.0` when muted. Effective
+    /// gain = `program_gain · crossfade_env · mute_env`.
+    mute_gain: f64,
+    /// An in-flight anti-click transition of the mute envelope
+    /// ([`DEFAULT_MUTE_FRAMES`]). Its endpoint settles into
+    /// [`mute_gain`](Self::mute_gain), never into `program_gain`.
+    mute_ramp: Option<GainRamp>,
+}
+
+impl InputStrip {
+    /// The strip's current mute-envelope value: the in-flight ramp's position
+    /// when one is running, else the settled [`mute_gain`](Self::mute_gain).
+    fn current_mute_gain(&self) -> f64 {
+        self.mute_ramp.map_or(self.mute_gain, |ramp| {
+            f64::from(ramp.envelope_at(ramp.frames_done))
+        })
+    }
 }
 
 /// A program-bus + discrete-track mixer over a fixed working [`AudioFormat`].
@@ -275,6 +342,9 @@ impl Mixer {
             routed_to_program: false,
             latest: None,
             gain_ramp: None,
+            muted: false,
+            mute_gain: 1.0,
+            mute_ramp: None,
         };
         // Reuse a reclaimed slot when one is free; its generation was already
         // bumped on removal, so the new handle is distinct from the freed one.
@@ -345,11 +415,14 @@ impl Mixer {
     }
 
     /// Route an input to the program bus at linear `gain`. Calling again
-    /// updates the gain. A no-op (but not an error) for an unknown input — use
-    /// only handles returned by [`Mixer::add_input`].
+    /// updates the gain. The gain is sanitised
+    /// (via `sanitize_program_gain`: a `NaN` fails safe to silence, anything
+    /// outside `[0.0, 15.85]` clamps), so a bad value can never reach the mix.
+    /// A no-op (but not an error) for an unknown input — use only handles
+    /// returned by [`Mixer::add_input`].
     pub fn route_to_program(&mut self, point: RoutePoint, gain: f64) {
         if let Some(strip) = self.strip_mut(point) {
-            strip.program_gain = gain;
+            strip.program_gain = sanitize_program_gain(gain);
             strip.routed_to_program = true;
         }
     }
@@ -361,13 +434,99 @@ impl Mixer {
         }
     }
 
+    /// Set an input's steady program-route gain (linear) — the `SetGain` half
+    /// of ADR-0059 §4. The route and the mute state are left untouched (a gain
+    /// change is not a route change and not an unmute). The gain is sanitised
+    /// the same way as [`route_to_program`](Self::route_to_program), so
+    /// [`program_gain`](Self::program_gain) always reads back a finite value. A
+    /// no-op for an unknown input.
+    pub fn set_gain(&mut self, point: RoutePoint, gain: f64) {
+        if let Some(strip) = self.strip_mut(point) {
+            strip.program_gain = sanitize_program_gain(gain);
+        }
+    }
+
+    /// Mute or unmute an input's **program-bus contribution without unrouting
+    /// it** (the `SetMute` half of ADR-0059 §4, "mute ≠ unroute").
+    ///
+    /// The steady [`program_gain`](Self::program_gain) is never touched — mute
+    /// is a separate multiplicative envelope — so the gain survives a mute and
+    /// an unmute restores it **exactly**, with no re-supplied gain and no
+    /// re-route. The change moves through a short equal-power anti-click
+    /// envelope ([`DEFAULT_MUTE_FRAMES`]) rather than stepping, so a mute never
+    /// clicks; the envelope's endpoint settles into the strip's mute gain, not
+    /// into `program_gain` (unlike the cross-fade ramp's endpoint settle).
+    ///
+    /// A no-op for an unknown input, and idempotent when the strip is already
+    /// in the requested state (so a repeated `SetMute` does not restart the
+    /// envelope).
+    pub fn set_muted(&mut self, point: RoutePoint, muted: bool) {
+        let Some(strip) = self.strip_mut(point) else {
+            return;
+        };
+        if strip.muted == muted {
+            return;
+        }
+        strip.muted = muted;
+        let from = strip.current_mute_gain();
+        let to = if muted { 0.0 } else { 1.0 };
+        strip.mute_ramp = Some(GainRamp {
+            from,
+            to,
+            frames_total: DEFAULT_MUTE_FRAMES,
+            frames_done: 0,
+        });
+    }
+
+    /// Put an input into the muted state **immediately** (settled envelope, no
+    /// anti-click ramp). Only for a strip that has not yet contributed audio —
+    /// the initial state of a route declared `mute = true` — where there is no
+    /// prior signal to click against and a ramp would leak the opening samples.
+    /// The steady gain is untouched, so a later unmute restores it exactly.
+    pub(crate) fn start_muted(&mut self, point: RoutePoint) {
+        if let Some(strip) = self.strip_mut(point) {
+            strip.muted = true;
+            strip.mute_gain = 0.0;
+            strip.mute_ramp = None;
+        }
+    }
+
+    /// Whether an input's program contribution is muted (the steady operator
+    /// intent, not the in-flight envelope value). `None` for an unknown input.
+    #[must_use]
+    pub fn is_muted(&self, point: RoutePoint) -> Option<bool> {
+        self.strip(point).map(|s| s.muted)
+    }
+
+    /// Copy the mute state + envelope of the strip at `from` onto the strip at
+    /// `to` — a cross-fade's temporary **outgoing** strip inherits the muted
+    /// channel's mute, so re-pointing a muted channel stays silent across the
+    /// cross-fade instead of leaking the old source's audio. A no-op when either
+    /// handle is unknown.
+    pub(crate) fn copy_mute_state(&mut self, from: RoutePoint, to: RoutePoint) {
+        let Some((muted, mute_gain, mute_ramp)) = self
+            .strip(from)
+            .map(|s| (s.muted, s.mute_gain, s.mute_ramp))
+        else {
+            return;
+        };
+        if let Some(strip) = self.strip_mut(to) {
+            strip.muted = muted;
+            strip.mute_gain = mute_gain;
+            strip.mute_ramp = mute_ramp;
+        }
+    }
+
     /// Attach a per-sample [`GainRamp`] to an input's program contribution
     /// (RT-9). While present the strip's gain follows the ramp envelope
     /// per-sample inside [`mix_program`](Self::mix_program), advanced once per
     /// tick by [`advance_ramps`](Self::advance_ramps). A no-op for an unknown
     /// input. Pass a fresh ramp (`frames_done == 0`); calling again replaces any
-    /// in-flight ramp.
-    pub fn set_gain_ramp(&mut self, point: RoutePoint, ramp: GainRamp) {
+    /// in-flight ramp. Both endpoints are sanitised like any other program gain,
+    /// so a non-finite ramp cannot poison the per-sample envelope.
+    pub fn set_gain_ramp(&mut self, point: RoutePoint, mut ramp: GainRamp) {
+        ramp.from = sanitize_program_gain(ramp.from);
+        ramp.to = sanitize_program_gain(ramp.to);
         if let Some(strip) = self.strip_mut(point) {
             strip.gain_ramp = Some(ramp);
         }
@@ -400,8 +559,21 @@ impl Mixer {
                 if ramp.is_complete() {
                     // Settle the steady gain at the ramp's endpoint and retire it
                     // so future ticks are a plain scalar (no per-sample cost).
-                    strip.program_gain *= f64::from(ramp.envelope_at(ramp.frames_total));
+                    strip.program_gain = sanitize_program_gain(
+                        strip.program_gain * f64::from(ramp.envelope_at(ramp.frames_total)),
+                    );
                     strip.gain_ramp = None;
+                }
+            }
+            // The mute envelope settles into its OWN field, never into
+            // `program_gain` (ADR-0059 §4). That is exactly what makes unmute
+            // restore the prior gain instead of zeroing it the way a
+            // ramp-to-zero on `program_gain` would.
+            if let Some(ramp) = strip.mute_ramp.as_mut() {
+                ramp.frames_done = ramp.frames_done.saturating_add(frames);
+                if ramp.is_complete() {
+                    strip.mute_gain = f64::from(ramp.envelope_at(ramp.frames_total));
+                    strip.mute_ramp = None;
                 }
             }
         }
@@ -467,6 +639,11 @@ impl Mixer {
     /// give a click-free, constant-power cross-fade. This is read-only over the
     /// ramp state; advance it with [`advance_ramps`](Self::advance_ramps) once the
     /// mix is taken.
+    ///
+    /// A strip's **mute** envelope multiplies in the same way
+    /// (`program_gain · crossfade_env · mute_env`), so a `SetMute` transition is
+    /// click-free too — and, because the mute envelope is separate, a muted strip
+    /// keeps its steady `program_gain` for an exact unmute (ADR-0059 §4).
     #[must_use]
     pub fn mix_program(&self) -> Option<AudioBlock> {
         let channels = self.format.channel_count();
@@ -495,41 +672,52 @@ impl Mixer {
                 continue; // dropout => contributes silence
             };
             let src = block.interleaved();
-            match strip.gain_ramp {
+            let gain_ramp = strip.gain_ramp;
+            let mute_ramp = strip.mute_ramp;
+            if gain_ramp.is_none() && mute_ramp.is_none() {
                 // Steady gain: one scalar across the whole block (the common,
-                // no-cross-fade path — unchanged behaviour).
-                None => {
-                    let gain = strip.program_gain;
-                    for (dst, &s) in acc.iter_mut().zip(src.iter()) {
-                        *dst += gain * f64::from(s);
-                    }
+                // no-cross-fade, no-mute-transition path — unchanged behaviour).
+                // The mute envelope is a plain multiplicative factor here. The
+                // product is sanitised as the last line of defence: an `inf`
+                // steady gain muted by a `0.0` would otherwise be `inf · 0 =
+                // NaN`, which `clamp_sample` (and `f64::clamp`) would then
+                // propagate to the whole bus instead of silencing it.
+                let gain = sanitize_program_gain(strip.program_gain * strip.mute_gain);
+                for (dst, &s) in acc.iter_mut().zip(src.iter()) {
+                    *dst += gain * f64::from(s);
                 }
-                // In-flight ramp: a PER-SAMPLE envelope. The gain is recomputed
-                // each frame from the ramp's running position, so it moves
-                // smoothly across the block (and, via `frames_done`, across the
-                // tick boundary) instead of stepping once per tick.
-                Some(ramp) => {
-                    let base = strip.program_gain;
-                    // Iterate whole frames; each frame applies one envelope value
-                    // to all of its channels (a gain envelope is per-frame, not
-                    // per-channel). Bounds come from the shorter of acc/src so no
-                    // index can go out of range.
-                    let block_frames = src.len() / channels;
-                    let dst_frames = acc.len() / channels;
-                    let n = block_frames.min(dst_frames);
-                    for frame in 0..n {
-                        let env =
-                            f64::from(ramp.envelope_at(ramp.frames_done.saturating_add(frame)));
-                        let gain = base * env;
-                        let off = frame * channels;
-                        if let (Some(dst), Some(s)) = (
-                            acc.get_mut(off..off.saturating_add(channels)),
-                            src.get(off..off.saturating_add(channels)),
-                        ) {
-                            for (d, &sv) in dst.iter_mut().zip(s.iter()) {
-                                *d += gain * f64::from(sv);
-                            }
-                        }
+                continue;
+            }
+            // In-flight envelope(s): a PER-SAMPLE gain. The effective gain is
+            // `program_gain · crossfade_env · mute_env`, recomputed each frame
+            // from the ramps' running positions, so it moves smoothly across the
+            // block (and, via `frames_done`, across the tick boundary) instead
+            // of stepping once per tick.
+            let base = strip.program_gain;
+            // Iterate whole frames; each frame applies one envelope value to all
+            // of its channels (a gain envelope is per-frame, not per-channel).
+            // Bounds come from the shorter of acc/src so no index can go out of
+            // range.
+            let block_frames = src.len() / channels;
+            let dst_frames = acc.len() / channels;
+            let n = block_frames.min(dst_frames);
+            for frame in 0..n {
+                let crossfade = gain_ramp.map_or(1.0, |ramp| {
+                    f64::from(ramp.envelope_at(ramp.frames_done.saturating_add(frame)))
+                });
+                let mute = mute_ramp.map_or(strip.mute_gain, |ramp| {
+                    f64::from(ramp.envelope_at(ramp.frames_done.saturating_add(frame)))
+                });
+                // Sanitised like the steady path — the envelope factors are
+                // already finite `[0, 1]`, so this is a straight backstop.
+                let gain = sanitize_program_gain(base * crossfade * mute);
+                let off = frame * channels;
+                if let (Some(dst), Some(s)) = (
+                    acc.get_mut(off..off.saturating_add(channels)),
+                    src.get(off..off.saturating_add(channels)),
+                ) {
+                    for (d, &sv) in dst.iter_mut().zip(s.iter()) {
+                        *d += gain * f64::from(sv);
                     }
                 }
             }

@@ -259,6 +259,285 @@ fn route_audio_applies_repointing_the_bus_channel() {
 }
 
 // ---------------------------------------------------------------------------
+// (a) AUDIO route honours `gain_db` / `mute` (ADR-0059 §4): the applied route
+// carries its gain onto the strip and a mute silences it WITHOUT unrouting it,
+// preserving the gain for unmute.
+// ---------------------------------------------------------------------------
+
+/// Peak absolute sample in a block.
+fn peak(block: &AudioBlock) -> f32 {
+    block
+        .interleaved()
+        .iter()
+        .fold(0.0_f32, |m, s| m.max(s.abs()))
+}
+
+/// Whether every sample in the block is finite (no `NaN`, no `±inf`).
+///
+/// `peak` alone cannot see a poisoned block: `f32::max` ignores a `NaN`
+/// operand, so an all-`NaN` program mix would still report a peak of `0.0`.
+fn all_finite(block: &AudioBlock) -> bool {
+    block.interleaved().iter().all(|s| s.is_finite())
+}
+
+#[test]
+fn route_audio_honours_gain_and_mute_without_unrouting() {
+    let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+    let fps = Rational::FPS_50;
+    let mut bus = ProgramBus::new(format, fps);
+    let store = Arc::new(AudioStore::new(format, 8192));
+    let point = bus.add_source("prog", Arc::clone(&store), 1.0);
+
+    let mut inventories = HashMap::new();
+    inventories.insert(
+        "cam-b".to_owned(),
+        StreamInventory::from_streams(vec![audio_stream("eng", 2, 300)]).with_input_id("cam-b"),
+    );
+    let mut resolution = RouteResolution::new(inventories);
+    resolution.set_audio_store(
+        &StreamRef::best("cam-b", StreamKind::Audio),
+        Arc::clone(&store),
+    );
+    resolution.set_audio_channel("prog", point);
+
+    let route = |gain_db: f32, mute: bool| RouteIntent::Audio {
+        target: "prog".to_owned(),
+        source: StreamRef::best("cam-b", StreamKind::Audio),
+        gain_db,
+        mute,
+    };
+    let tone = || AudioBlock::from_interleaved(format, vec![0.8_f32; 4096 * 2]).unwrap();
+    let mut applier = RouteApplier::new(&resolution);
+
+    // -6.0206 dB ≈ 0.5 linear, unmuted: the applied route sets the strip gain.
+    applier
+        .apply_audio(&mut bus, &[route(-6.0206, false)], 0)
+        .expect("audio route applies");
+    assert!(
+        (bus.program_gain(point).unwrap() - 0.5).abs() < 1e-3,
+        "gain_db must be applied as a linear route gain (got {:?})",
+        bus.program_gain(point)
+    );
+    assert!(!bus.is_muted(point));
+
+    // Fresh tone, then a tick: the contribution is scaled by the applied gain.
+    store.publish(&tone()).unwrap();
+    let scaled = bus.tick();
+    assert!(
+        (peak(&scaled) - 0.4).abs() < 0.02,
+        "the applied gain scales the bus contribution (got peak {})",
+        peak(&scaled)
+    );
+
+    // Mute the same route: still routed, gain preserved, bus goes silent once
+    // the anti-click envelope has settled (the mute ramp is ≤ one tick).
+    applier
+        .apply_audio(&mut bus, &[route(-6.0206, true)], 0)
+        .expect("muted audio route applies");
+    assert!(bus.is_muted(point), "mute keeps the strip routed");
+    assert!(
+        (bus.program_gain(point).unwrap() - 0.5).abs() < 1e-3,
+        "mute preserves the prior gain for unmute (got {:?})",
+        bus.program_gain(point)
+    );
+    store.publish(&tone()).unwrap();
+    let _ = bus.tick(); // the anti-click envelope (480 frames < 960)
+    let muted = bus.tick();
+    assert!(
+        peak(&muted) < 1e-6,
+        "a muted route contributes silence (got peak {})",
+        peak(&muted)
+    );
+
+    // Unmute restores the prior gain (the mute never destroyed it).
+    applier
+        .apply_audio(&mut bus, &[route(-6.0206, false)], 0)
+        .expect("unmuted audio route applies");
+    store.publish(&tone()).unwrap();
+    let _ = bus.tick();
+    let restored = bus.tick();
+    assert!(
+        (peak(&restored) - 0.4).abs() < 0.02,
+        "unmute restores the prior gain (got peak {})",
+        peak(&restored)
+    );
+}
+
+#[test]
+fn route_audio_mute_silences_outgoing_crossfade_strip_after_short_envelope() {
+    let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+    let mut bus = ProgramBus::new(format, Rational::new(100, 1));
+    let old = Arc::new(AudioStore::new(format, 16_000));
+    let incoming = Arc::new(AudioStore::new(format, 16_000));
+    let tone = || AudioBlock::from_interleaved(format, vec![0.5_f32; 12_000 * 2]).unwrap();
+    old.publish(&tone()).unwrap();
+    incoming.publish(&tone()).unwrap();
+    let point = bus.add_source("prog", Arc::clone(&old), 0.8);
+    let previous = bus.tick();
+
+    let mut inventories = HashMap::new();
+    inventories.insert(
+        "cam-b".to_owned(),
+        StreamInventory::from_streams(vec![audio_stream("eng", 2, 300)]).with_input_id("cam-b"),
+    );
+    let mut resolution = RouteResolution::new(inventories);
+    resolution.set_audio_store(
+        &StreamRef::best("cam-b", StreamKind::Audio),
+        Arc::clone(&incoming),
+    );
+    resolution.set_audio_channel("prog", point);
+    let mut applier = RouteApplier::new(&resolution);
+    let route = |mute| RouteIntent::Audio {
+        target: "prog".to_owned(),
+        source: StreamRef::best("cam-b", StreamKind::Audio),
+        gain_db: -1.9382, // 0.8 linear
+        mute,
+    };
+    applier
+        .apply_audio(&mut bus, &[route(true)], 4_800)
+        .unwrap();
+    incoming.publish(&tone()).unwrap(); // repoint seeks the live edge
+    let mut samples = Vec::new();
+    for _ in 0..4 {
+        samples.extend(bus.tick().interleaved().iter().step_by(2).copied());
+    }
+    assert!(
+        samples[480..].iter().all(|&sample| sample == 0.0),
+        "route mute must silence every outgoing crossfade sample after the 480-frame envelope"
+    );
+    let seam = (samples[0] - previous.interleaved().last().copied().unwrap()).abs();
+    let max_step = samples
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(seam, f32::max);
+    assert!(
+        max_step < 5e-3,
+        "mute envelope must not introduce a click: {max_step}"
+    );
+
+    // A subsequent route unmute must reopen all remaining crossfade strips.
+    applier.apply_audio(&mut bus, &[route(false)], 0).unwrap();
+    incoming.publish(&tone()).unwrap(); // a new route take seeks the live edge again
+    assert!((bus.program_gain(point).unwrap() - 0.8).abs() < 1e-3);
+    let reopened = bus.tick();
+    assert!(peak(&reopened) > 0.4);
+}
+
+/// The `AudioRoute` fixture for the out-of-range-gain regressions.
+fn overflow_route(gain_db: f32, mute: bool) -> RouteIntent {
+    RouteIntent::Audio {
+        target: "prog".to_owned(),
+        source: StreamRef::best("cam-b", StreamKind::Audio),
+        gain_db,
+        mute,
+    }
+}
+
+#[test]
+fn route_audio_never_lets_an_out_of_range_gain_poison_a_muted_mix() {
+    // Cross-vendor review finding (SW-13b): `gain_db = 10000` is finite, so it
+    // passed the old finiteness-only guard, yet `10^(10000/20)` overflows to
+    // `+inf`; once the mute envelope settles, `inf * 0 = NaN` and the whole
+    // program mix goes `NaN` instead of silent. Defence in depth: the apply path
+    // must clamp a bad gain to the supported range whatever the caller sent.
+    let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+    let fps = Rational::FPS_50;
+    let mut bus = ProgramBus::new(format, fps);
+    let store = Arc::new(AudioStore::new(format, 8192));
+    let point = bus.add_source("prog", Arc::clone(&store), 1.0);
+
+    let mut inventories = HashMap::new();
+    inventories.insert(
+        "cam-b".to_owned(),
+        StreamInventory::from_streams(vec![audio_stream("eng", 2, 300)]).with_input_id("cam-b"),
+    );
+    let mut resolution = RouteResolution::new(inventories);
+    resolution.set_audio_store(
+        &StreamRef::best("cam-b", StreamKind::Audio),
+        Arc::clone(&store),
+    );
+    resolution.set_audio_channel("prog", point);
+
+    let mut applier = RouteApplier::new(&resolution);
+    applier
+        .apply_audio(&mut bus, &[overflow_route(10_000.0, true)], 0)
+        .expect("an out-of-range audio route still applies (clamped)");
+
+    store
+        .publish(&AudioBlock::from_interleaved(format, vec![0.8_f32; 4096 * 2]).unwrap())
+        .unwrap();
+    let _ = bus.tick(); // settle the anti-click mute envelope
+    let muted = bus.tick();
+    assert!(
+        all_finite(&muted),
+        "a bad route gain must never yield a non-finite program sample"
+    );
+    assert!(
+        peak(&muted) < 1e-6,
+        "the muted strip must stay exactly silent (got peak {})",
+        peak(&muted)
+    );
+
+    // A finite gain is stored, so the strip math can never produce `inf * 0`.
+    let gain = bus.program_gain(point).expect("the strip stays routed");
+    assert!(
+        gain.is_finite(),
+        "an out-of-range gain_db must not store a non-finite linear gain (got {gain})"
+    );
+}
+
+#[test]
+fn route_audio_clamps_an_out_of_range_gain_to_the_supported_maximum() {
+    // The unmuted half of the same finding: a finite-but-absurd `gain_db` must
+    // clamp to the documented supported maximum, never reach the mixer as `inf`.
+    let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+    let fps = Rational::FPS_50;
+    let mut bus = ProgramBus::new(format, fps);
+    let store = Arc::new(AudioStore::new(format, 8192));
+    let point = bus.add_source("prog", Arc::clone(&store), 1.0);
+
+    let mut inventories = HashMap::new();
+    inventories.insert(
+        "cam-b".to_owned(),
+        StreamInventory::from_streams(vec![audio_stream("eng", 2, 300)]).with_input_id("cam-b"),
+    );
+    let mut resolution = RouteResolution::new(inventories);
+    resolution.set_audio_store(
+        &StreamRef::best("cam-b", StreamKind::Audio),
+        Arc::clone(&store),
+    );
+    resolution.set_audio_channel("prog", point);
+
+    let mut applier = RouteApplier::new(&resolution);
+    applier
+        .apply_audio(&mut bus, &[overflow_route(10_000.0, false)], 0)
+        .expect("an out-of-range audio route still applies (clamped)");
+
+    // `+24.0 dB` ⇒ 10^(24/20) ≈ 15.849 linear — the documented supported maximum.
+    let max_linear = 10.0_f64.powf(24.0 / 20.0);
+    let gain = bus.program_gain(point).unwrap();
+    assert!(
+        gain.is_finite(),
+        "the applied gain must be finite (got {gain})"
+    );
+    assert!(
+        gain <= max_linear + 1e-9,
+        "an out-of-range gain_db must clamp to the supported maximum (got {gain}, max {max_linear})"
+    );
+
+    store
+        .publish(&AudioBlock::from_interleaved(format, vec![0.8_f32; 4096 * 2]).unwrap())
+        .unwrap();
+    let out = bus.tick();
+    assert!(all_finite(&out), "the program mix must stay finite");
+    assert!(
+        peak(&out) <= 1.0,
+        "the program mix is still clamped to full scale (got peak {})",
+        peak(&out)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (a) SUBTITLE route applies through the drain (the layer samples the new cue).
 // ---------------------------------------------------------------------------
 

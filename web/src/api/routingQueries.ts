@@ -10,6 +10,7 @@
 import { useMutation } from '@tanstack/react-query';
 import type { UseMutationResult } from '@tanstack/react-query';
 
+import { newIdempotencyKey } from './operations';
 import { planRoute, takeRoute } from './routing';
 import type {
   OperationApiError,
@@ -66,7 +67,7 @@ export interface TakeRouteVars {
 
 /** A fresh idempotency key for a take (a random UUID per attempt). */
 function freshIdempotencyKey(): string {
-  return crypto.randomUUID();
+  return newIdempotencyKey();
 }
 
 /** Apply a take, minting a fresh `Idempotency-Key`. */

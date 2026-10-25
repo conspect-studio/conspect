@@ -48,6 +48,7 @@ pub mod program;
 pub mod routing;
 pub mod salvo;
 pub mod schema;
+pub mod switcher;
 pub mod sync_group;
 pub mod tally;
 pub mod timer;
@@ -100,6 +101,7 @@ pub use schema::{
     RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
     SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
+pub use switcher::SwitcherConfig;
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
 pub use timer::{
@@ -291,6 +293,10 @@ pub struct MultiviewConfig {
     /// Output sinks/servers.
     #[serde(default)]
     pub outputs: Vec<Output>,
+    /// Declared programs. An absent or empty list desugars to the legacy main
+    /// multiview program; multi-program execution is reserved for MP-7.
+    #[serde(default)]
+    pub programs: Vec<ProgramSpec>,
     /// Content-aware fault probes (black/freeze/silence/loudness), per cell.
     #[serde(default)]
     pub probes: Vec<Probe>,
@@ -348,6 +354,15 @@ pub struct MultiviewConfig {
     /// that consumes these routes is `multiview-audio` + the engine (AUD-3/AUD-4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioRouting>,
+    /// The production-switcher config root (ADR-M012 §1). SW-17 lands the typed
+    /// switcher domain (`mix_effects`, `downstream_keyers`, `aux_buses`,
+    /// `transitions`, `wipe_patterns`, `compositions`); this crate currently
+    /// models the block's **presence**, which is what makes program audio
+    /// default-on (ADR-0059 §8) — and carries every unmodelled switcher field
+    /// verbatim (see [`SwitcherConfig`]) so an ADR-M012-authored block
+    /// round-trips losslessly until then. Absent ⇒ no switcher is declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switcher: Option<SwitcherConfig>,
     /// The per-stream decoupled-routing crosspoint table (ADR-0034 / RT-4): the
     /// broadcast router/multiviewer model where inputs, layouts and outputs are
     /// independent resources wired by per-stream crosspoints. **Absent ⇒ the
@@ -458,6 +473,21 @@ impl MultiviewConfig {
         serde_json::to_string_pretty(self).map_err(|e| ConfigError::JsonSerialize(e.to_string()))
     }
 
+    /// Whether this document declares **program audio** (ADR-0059 §8).
+    ///
+    /// Program audio is config-declared: it is on when the document carries an
+    /// ADR-R005 `[audio]` routing block, or a `[switcher]` block (a switcher
+    /// without program audio is not a switcher). A document declaring neither is
+    /// silent unless `multiview run --program-audio` overrides it — the absent ⇒
+    /// off default the byte-identical-when-off guarantee rides.
+    ///
+    /// This is the single predicate the run path consults; when SW-17 lands the
+    /// typed `[switcher]` domain the presence test here is unchanged.
+    #[must_use]
+    pub fn declares_program_audio(&self) -> bool {
+        self.audio.is_some() || self.switcher.is_some()
+    }
+
     /// Validate every semantic invariant this crate owns.
     ///
     /// Enforces, in addition to [`multiview_core::layout::Layout::validate`] on the
@@ -501,6 +531,7 @@ impl MultiviewConfig {
         self.validate_sources()?;
         self.validate_cell_bindings()?;
         self.validate_outputs()?;
+        self.validate_programs()?;
         self.validate_audio()?;
         self.validate_probes()?;
         self.validate_tally_profiles()?;
@@ -1049,6 +1080,84 @@ impl MultiviewConfig {
         Ok(())
     }
 
+    /// Return the declared programs, or the implicit legacy main program when
+    /// no `programs` block was supplied. This is the single desugar consumed by
+    /// the CLI; explicit declarations remain unchanged.
+    #[must_use]
+    pub fn effective_programs(&self) -> Vec<ProgramSpec> {
+        if self.programs.is_empty() {
+            vec![ProgramSpec::main_multiview(
+                self.canvas.clone(),
+                self.layout.clone(),
+                self.cells.clone(),
+                self.overlays.clone(),
+                self.outputs.clone(),
+            )]
+        } else {
+            self.programs.clone()
+        }
+    }
+
+    /// Refresh the payload of the sole declared multiview program from the
+    /// legacy top-level sections without changing its identity or metadata.
+    /// The implicit main program has no declaration to refresh.
+    pub fn refresh_single_program(&mut self) {
+        if let [program] = self.programs.as_mut_slice() {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &mut program.kind;
+            canvas.clone_from(&self.canvas);
+            layout.clone_from(&self.layout);
+            cells.clone_from(&self.cells);
+            overlays.clone_from(&self.overlays);
+            program.outputs.clone_from(&self.outputs);
+        }
+    }
+
+    fn validate_programs(&self) -> Result<(), ConfigError> {
+        let mut ids = HashSet::new();
+        for program in self.effective_programs() {
+            if !ids.insert(program.id.clone()) {
+                return Err(ConfigError::Validation("duplicate program id".to_owned()));
+            }
+        }
+
+        // Until the CLI admits multiple independently built programs, the
+        // declared spec must describe exactly the legacy block that drives its
+        // clock, layout, and sinks. Metadata and id do not affect that shape.
+        for program in &self.programs {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &program.kind;
+            let mismatch = if canvas != &self.canvas {
+                Some("canvas")
+            } else if layout != &self.layout {
+                Some("layout")
+            } else if cells != &self.cells {
+                Some("cells")
+            } else if overlays != &self.overlays {
+                Some("overlays")
+            } else if program.outputs != self.outputs {
+                Some("outputs")
+            } else {
+                None
+            };
+            if let Some(field) = mismatch {
+                return Err(ConfigError::ProgramMismatch {
+                    program: program.id.to_string(),
+                    field,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Ensure outputs are sane (at least one; each with a non-empty codec where a
     /// codec applies; a non-empty, unique stable id — ADR-0034 / RT-12).
     ///
@@ -1199,13 +1308,17 @@ impl MultiviewConfig {
             }
         }
 
-        // OUTPUT: each declared output → an output crosspoint on the single
-        // "main" program (until ADR-0030's ProgramSet lands), addressed by the
-        // output's stable id (explicit operator id, or the derived label — RT-12).
+        // OUTPUT: each output targets the sole declared program, or the implicit
+        // legacy main program. N>1 admission remains the responsibility of MP-7.
+        let program = self
+            .programs
+            .first()
+            .filter(|_| self.programs.len() == 1)
+            .map_or(MAIN_PROGRAM, |spec| spec.id.as_str());
         for output in &self.outputs {
             table.output.push(OutputCrosspoint {
                 output: output.id(),
-                program: MAIN_PROGRAM.to_owned(),
+                program: program.to_owned(),
             });
         }
 
@@ -1225,11 +1338,27 @@ impl MultiviewConfig {
     /// checked for **consistency** with the legacy cell-bindings: a video
     /// crosspoint may not contradict a `[[cells]]` binding of the same cell
     /// (mirroring ADR-0030's rejection of an inconsistent both-populated
-    /// document). An absent table desugars and is trivially consistent.
+    /// document). Without an explicit table, only check that desugared output
+    /// crosspoints name a declared program; legacy audio routes may mix into
+    /// the same program bus.
     fn validate_routing(&self) -> Result<(), ConfigError> {
-        let Some(table) = &self.routing else {
+        let table = self.routing_table();
+        if self.routing.is_none() {
+            for xp in &table.output {
+                if !self.programs.is_empty()
+                    && !self
+                        .programs
+                        .iter()
+                        .any(|program| program.id.as_str() == xp.program)
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "output crosspoint for {:?} references undeclared program {:?}",
+                        xp.output, xp.program
+                    )));
+                }
+            }
             return Ok(());
-        };
+        }
 
         let tracks = self.selectable_tracks();
         let output_ids = self.output_ids();
@@ -1239,6 +1368,12 @@ impl MultiviewConfig {
             tracks: tracks.iter().copied().collect(),
             layers: self.subtitle_layers(),
             outputs: output_ids.iter().map(String::as_str).collect(),
+            programs: self
+                .programs
+                .iter()
+                .map(|program| program.id.as_str())
+                .chain(self.programs.is_empty().then_some(ProgramId::MAIN))
+                .collect(),
         };
         table.validate(&refs)?;
 

@@ -188,6 +188,99 @@ async fn program_audio_produces_a_dual_stream_container() {
     );
 }
 
+/// SW-13a **byte-identical-when-off**: a document declaring **neither** an
+/// `[audio]` nor a `[switcher]` block, run with no `--program-audio` override,
+/// carries no program audio — the produced container is the single-stream
+/// video-only artifact (exactly one video stream, NO audio stream) the run
+/// produced before program audio became config-declared.
+#[tokio::test]
+async fn a_config_declaring_no_program_audio_stays_video_only() {
+    const TICKS: u64 = 30; // 1.2 s @ 25 fps — short but enough to ffprobe.
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = dir.path().join("out");
+    let playlist = out_dir.join("index.m3u8");
+    let toml = config_text(&playlist);
+
+    let config = MultiviewConfig::load_from_toml(&toml).expect("parse config");
+    config.validate().expect("config validates");
+
+    let mut pipeline = Pipeline::build(&config).expect("build real pipeline");
+    assert!(
+        !pipeline.has_program_audio(),
+        "a document with no `[audio]`/`[switcher]` block and no flag declares no \
+         program audio"
+    );
+    let report = pipeline
+        .run_for(TICKS)
+        .await
+        .expect("bounded real run without program audio");
+
+    assert_eq!(report.frames, TICKS, "N ticks must produce N frames");
+    assert!(
+        !report.faltered,
+        "the video-only run must not falter the output"
+    );
+
+    let program = out_dir.join("program.ts");
+    assert!(program.exists(), "no program.ts written");
+    assert_eq!(
+        ffprobe_stream_count(&program, "v"),
+        1,
+        "the video-only container must carry exactly one video stream"
+    );
+    assert_eq!(
+        ffprobe_stream_count(&program, "a"),
+        0,
+        "a config declaring no program audio must mux NO audio stream \
+         (byte-identical to the pre-feature video-only output)"
+    );
+}
+
+/// SW-13a headline: a document carrying an `[audio]` routing block enables
+/// program audio **without** `--program-audio` (no `Pipeline::enable_program_audio`
+/// call) — the build reads the declaration from config (ADR-0059 §8).
+#[tokio::test]
+async fn an_audio_block_enables_program_audio_without_the_flag() {
+    const TICKS: u64 = 30; // 1.2 s @ 25 fps — short but enough to ffprobe.
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out_dir = dir.path().join("out");
+    let playlist = out_dir.join("index.m3u8");
+    let toml = format!(
+        "{}\n[audio]\nsample_rate_hz = 48000\n",
+        config_text(&playlist)
+    );
+
+    let config = MultiviewConfig::load_from_toml(&toml).expect("parse config");
+    config.validate().expect("config validates");
+
+    // No `enable_program_audio()`: the config declaration alone must opt in.
+    let mut pipeline = Pipeline::build(&config).expect("build real pipeline");
+    assert!(
+        pipeline.has_program_audio(),
+        "an `[audio]` block must enable program audio at build"
+    );
+    let report = pipeline
+        .run_for(TICKS)
+        .await
+        .expect("bounded real run with config-declared program audio");
+
+    assert_eq!(report.frames, TICKS, "N ticks must produce N frames");
+    let program = out_dir.join("program.ts");
+    assert!(program.exists(), "no program.ts written");
+    assert_eq!(
+        ffprobe_stream_count(&program, "v"),
+        1,
+        "config-declared program audio must still carry exactly one video stream"
+    );
+    assert_eq!(
+        ffprobe_stream_count(&program, "a"),
+        1,
+        "the config-declared program audio must be muxed as an AAC audio stream"
+    );
+}
+
 /// Whether the `ffmpeg` CLI is available (used only to build the deterministic
 /// fixture clip + decode the output audio for the RMS proof; never on the data
 /// plane). Mirrors the gate in `multiview-audio`'s `decode_thread.rs`.

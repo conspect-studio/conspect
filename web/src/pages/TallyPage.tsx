@@ -57,6 +57,7 @@ import {
 } from '../components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 const COLORS: readonly TallyColor[] = ['Off', 'Red', 'Green', 'Amber'];
 
@@ -137,7 +138,7 @@ export function TallyPage(): JSX.Element {
         : ({ action: 'clear', target } as const);
     override.mutate(vars, {
       onSuccess: (accepted): void => {
-        toast({
+        followOperation(accepted, t`Tally override`, {
           title: action === 'set' ? t`Override accepted` : t`Override cleared`,
           description: `${t`Operation id`}: ${accepted.operation_id}`,
         });

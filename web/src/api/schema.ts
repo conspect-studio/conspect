@@ -2551,7 +2551,8 @@ export interface components {
             channels: components["schemas"]["AudioChannelsDoc"];
             /**
              * Format: float
-             * @description Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite).
+             * @description Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite and
+             *     within `-96.0 ..= 24.0` dB — the documented supported route-gain range).
              */
             gain_db?: number;
             /** @description Whether this input contributes to the mixed program bus. */
@@ -4698,11 +4699,34 @@ export interface components {
          *       discrete-track layout comparison when the inventory is absent);
          *     * `coerce` — the operator confirms a down/up-mix to the destination's pinned
          *       layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);
-         *     * `primed` — whether the video target source is warm (absent ⇒ assumed primed).
+         *     * `primed` — whether the video target source is warm (absent ⇒ assumed primed);
+         *     * `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒
+         *       unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4).
+         *       Must be finite and within the documented supported range `-96.0 ..= 24.0`
+         *       dB (`MIN_ROUTE_GAIN_DB ..= MAX_ROUTE_GAIN_DB` in `multiview-config`):
+         *       anything outside it is rejected here with a `422` (and never enqueued)
+         *       because an unbounded gain overflows the mixer's linear conversion
+         *       (`10^(10000/20)` is `inf`, and `inf × 0` on a muted strip is `NaN`, which
+         *       would contaminate the whole program mix);
+         *     * `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute
+         *       keeps the strip routed and preserves its gain for an exact unmute.
+         *
+         *     The audio fields are ignored for non-audio targets. Not `Eq` because
+         *     `gain_db` is a float.
          */
         RouteTakeRequest: {
             /** @description Optional operator-confirmed coercion to the pinned layout. */
             coerce?: boolean;
+            /**
+             * Format: float
+             * @description Optional audio contribution gain in dB (absent ⇒ unity, `0.0`).
+             */
+            gain_db?: number | null;
+            /**
+             * @description Optional audio mute for the take (absent ⇒ unmuted). Mute keeps the
+             *     strip routed and preserves its gain for an exact unmute.
+             */
+            mute?: boolean | null;
             /** @description Optional video-target priming hint (absent ⇒ assumed primed). */
             primed?: boolean | null;
             /** @description The source elementary stream feeding the destination. */

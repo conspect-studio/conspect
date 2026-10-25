@@ -11,8 +11,9 @@
 //! is de-duplicated rather than enqueuing the command twice. [`IdempotencyStore`]
 //! remembers the [`OperationId`] minted for a key so a replay returns the
 //! original id.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::extract::FromRequestParts;
 use axum::http::header;
@@ -160,48 +161,160 @@ pub enum Reservation {
     Replay(OperationId),
 }
 
+/// Default retention of an idempotency key (24 h): long enough for any realistic
+/// client retry window, short enough that routine per-action keys (ADR-W021 §6)
+/// cannot accumulate forever.
+pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Default cap on retained idempotency keys. At the cap the oldest key is evicted
+/// first, so memory is bounded regardless of submission rate.
+pub const DEFAULT_IDEMPOTENCY_CAPACITY: usize = 100_000;
+
+#[derive(Debug)]
+struct Entry {
+    op: OperationId,
+    /// When the key was first recorded; the TTL runs from here.
+    at: Instant,
+    /// Insertion sequence: the key into the oldest-first order index.
+    seq: u64,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    seen: HashMap<String, Entry>,
+    /// Insertion order (`seq` -> key), oldest first, for O(log n) eviction.
+    order: BTreeMap<u64, String>,
+    next_seq: u64,
+}
+
+impl Inner {
+    fn remove(&mut self, key: &str) {
+        if let Some(entry) = self.seen.remove(key) {
+            self.order.remove(&entry.seq);
+        }
+    }
+
+    /// Drop expired keys (oldest first) so the map never holds dead entries.
+    fn sweep(&mut self, now: Instant, ttl: Duration) {
+        while let Some((&seq, key)) = self.order.iter().next() {
+            let expired = self
+                .seen
+                .get(key)
+                .is_none_or(|e| now.saturating_duration_since(e.at) >= ttl);
+            if !expired {
+                break;
+            }
+            let key = key.clone();
+            self.order.remove(&seq);
+            self.seen.remove(&key);
+        }
+    }
+}
+
 /// An in-memory store mapping `Idempotency-Key` values to the operation id that
 /// was minted for the first request bearing that key.
 ///
 /// A retried start/stop/swap with the same key returns the original
 /// [`OperationId`] ([`Reservation::Replay`]) so the engine is never asked to
-/// apply the command twice. The store is a plain `Mutex<HashMap>` — it is **not**
-/// on the engine's data plane (control-only state), so guarding it with a lock
-/// cannot back-pressure the engine.
-#[derive(Debug, Default)]
+/// apply the command twice. Retention is **bounded** (ADR-W021 §6): a key lives
+/// for a TTL ([`DEFAULT_IDEMPOTENCY_TTL`]) after which it is treated as new, and
+/// the store holds at most a capacity of keys ([`DEFAULT_IDEMPOTENCY_CAPACITY`]),
+/// evicting the oldest first. Eviction is lazy, on insert/lookup, so no
+/// background task is needed. The store is a plain `Mutex` — it is **not** on the
+/// engine's data plane (control-only state), so guarding it with a lock cannot
+/// back-pressure the engine.
+#[derive(Debug)]
 pub struct IdempotencyStore {
-    seen: Mutex<HashMap<String, OperationId>>,
+    inner: Mutex<Inner>,
+    ttl: Duration,
+    capacity: usize,
+}
+
+impl Default for IdempotencyStore {
+    fn default() -> Self {
+        Self::with_limits(DEFAULT_IDEMPOTENCY_TTL, DEFAULT_IDEMPOTENCY_CAPACITY)
+    }
 }
 
 impl IdempotencyStore {
-    /// A fresh, empty store.
+    /// A fresh, empty store with the default TTL and capacity.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Reserve an operation id for `key`.
-    ///
-    /// If `key` is `None`, every call is [`Reservation::Fresh`] (no dedupe). If
-    /// `key` was seen before, returns [`Reservation::Replay`] with the original
-    /// id; otherwise records and returns a [`Reservation::Fresh`] id.
+    /// A fresh store with an explicit `ttl` and `capacity` (min 1).
     #[must_use]
-    pub fn reserve(&self, key: Option<&str>) -> Reservation {
-        let Some(key) = key else {
-            return Reservation::Fresh(OperationId::new());
-        };
+    pub fn with_limits(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            ttl,
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// The number of keys currently retained (expired keys not yet swept count).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock().seen.len()
+    }
+
+    /// Whether no keys are retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A poisoned lock cannot corrupt correctness here (control-only state);
         // recover the guard so a prior panic in another request does not wedge
         // the whole control plane.
-        let mut guard = match self.seen.lock() {
+        match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Reserve an operation id for `key`.
+    ///
+    /// If `key` is `None`, every call is [`Reservation::Fresh`] (no dedupe). If
+    /// `key` was seen within the TTL, returns [`Reservation::Replay`] with the
+    /// original id; otherwise records and returns a [`Reservation::Fresh`] id.
+    #[must_use]
+    pub fn reserve(&self, key: Option<&str>) -> Reservation {
+        self.reserve_at(key, Instant::now())
+    }
+
+    fn reserve_at(&self, key: Option<&str>, now: Instant) -> Reservation {
+        let Some(key) = key else {
+            return Reservation::Fresh(OperationId::new());
         };
-        if let Some(existing) = guard.get(key) {
-            return Reservation::Replay(existing.clone());
+        let mut guard = self.lock();
+        guard.sweep(now, self.ttl);
+        if let Some(existing) = guard.seen.get(key) {
+            if now.saturating_duration_since(existing.at) < self.ttl {
+                return Reservation::Replay(existing.op.clone());
+            }
+            guard.remove(key);
+        }
+        while guard.seen.len() >= self.capacity {
+            let Some((_, oldest)) = guard.order.pop_first() else {
+                break;
+            };
+            guard.seen.remove(&oldest);
         }
         let op = OperationId::new();
-        guard.insert(key.to_owned(), op.clone());
+        let seq = guard.next_seq;
+        guard.next_seq = seq.wrapping_add(1);
+        guard.order.insert(seq, key.to_owned());
+        guard.seen.insert(
+            key.to_owned(),
+            Entry {
+                op: op.clone(),
+                at: now,
+                seq,
+            },
+        );
         Reservation::Fresh(op)
     }
 
@@ -223,11 +336,8 @@ impl IdempotencyStore {
         let Some(key) = key else {
             return;
         };
-        let mut guard = match self.seen.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if guard.get(key) == Some(op) {
+        let mut guard = self.lock();
+        if guard.seen.get(key).is_some_and(|e| e.op == *op) {
             guard.remove(key);
         }
     }
@@ -247,12 +357,11 @@ impl IdempotencyStore {
         let Some(key) = key else {
             return;
         };
-        let mut guard = match self.seen.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if guard.get(key) == Some(from) {
-            guard.insert(key.to_owned(), to);
+        let mut guard = self.lock();
+        if let Some(entry) = guard.seen.get_mut(key) {
+            if entry.op == *from {
+                entry.op = to;
+            }
         }
     }
 }
@@ -260,6 +369,8 @@ impl IdempotencyStore {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use std::time::{Duration, Instant};
 
     use super::{IdempotencyStore, Reservation, Version};
 
@@ -342,5 +453,107 @@ mod tests {
             matches!(store.reserve(key), Reservation::Replay(replayed) if replayed == live_op),
             "the live reservation survives a stale release"
         );
+    }
+
+    #[test]
+    fn capacity_cap_holds_under_ten_times_inserts() {
+        let cap = 50;
+        let store = IdempotencyStore::with_limits(Duration::from_secs(3600), cap);
+        let now = Instant::now();
+        for i in 0..cap * 10 {
+            let _ = store.reserve_at(Some(&format!("k{i}")), now);
+            assert!(store.len() <= cap, "entry count must never exceed the cap");
+        }
+        assert_eq!(store.len(), cap, "memory stays bounded at the cap");
+    }
+
+    #[test]
+    fn eviction_is_oldest_first() {
+        let now = Instant::now();
+        let store = IdempotencyStore::with_limits(Duration::from_secs(3600), 3);
+        for k in ["a", "b", "c"] {
+            let _ = store.reserve_at(Some(k), now);
+        }
+        let _ = store.reserve_at(Some("d"), now);
+        assert!(matches!(
+            store.reserve_at(Some("b"), now),
+            Reservation::Replay(_)
+        ));
+        assert!(matches!(
+            store.reserve_at(Some("c"), now),
+            Reservation::Replay(_)
+        ));
+        assert!(matches!(
+            store.reserve_at(Some("d"), now),
+            Reservation::Replay(_)
+        ));
+        assert!(
+            matches!(store.reserve_at(Some("a"), now), Reservation::Fresh(_)),
+            "the oldest key was evicted and is treated as new"
+        );
+    }
+
+    #[test]
+    fn an_expired_key_is_treated_as_new() {
+        let ttl = Duration::from_secs(60);
+        let store = IdempotencyStore::with_limits(ttl, 100);
+        let t0 = Instant::now();
+        let Reservation::Fresh(first) = store.reserve_at(Some("k"), t0) else {
+            panic!("fresh");
+        };
+        let Reservation::Fresh(second) =
+            store.reserve_at(Some("k"), t0 + ttl + Duration::from_secs(1))
+        else {
+            panic!("an expired key must reserve Fresh again");
+        };
+        assert_ne!(first, second, "expiry mints a new operation id");
+        assert_eq!(store.len(), 1, "the expired entry was replaced, not leaked");
+    }
+
+    #[test]
+    fn within_the_ttl_a_replay_returns_the_original_acceptance() {
+        let ttl = Duration::from_secs(60);
+        let store = IdempotencyStore::with_limits(ttl, 100);
+        let t0 = Instant::now();
+        let Reservation::Fresh(op) = store.reserve_at(Some("k"), t0) else {
+            panic!("fresh");
+        };
+        for secs in [1, 30, 59] {
+            assert!(
+                matches!(
+                    store.reserve_at(Some("k"), t0 + Duration::from_secs(secs)),
+                    Reservation::Replay(ref r) if *r == op
+                ),
+                "replay at +{secs}s must return the original op, not re-execute"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_entries_are_swept_on_insert() {
+        let ttl = Duration::from_secs(60);
+        let store = IdempotencyStore::with_limits(ttl, 1000);
+        let t0 = Instant::now();
+        for i in 0..100 {
+            let _ = store.reserve_at(Some(&format!("k{i}")), t0);
+        }
+        assert_eq!(store.len(), 100);
+        let _ = store.reserve_at(Some("late"), t0 + ttl + Duration::from_secs(1));
+        assert_eq!(store.len(), 1, "expired keys are evicted lazily on insert");
+    }
+
+    #[test]
+    fn release_and_rebind_keep_the_store_consistent() {
+        let store = IdempotencyStore::with_limits(Duration::from_secs(3600), 2);
+        let now = Instant::now();
+        let Reservation::Fresh(a) = store.reserve_at(Some("a"), now) else {
+            panic!("fresh");
+        };
+        store.release(Some("a"), &a);
+        assert_eq!(store.len(), 0);
+        for k in ["x", "y", "z"] {
+            let _ = store.reserve_at(Some(k), now);
+        }
+        assert_eq!(store.len(), 2);
     }
 }

@@ -629,6 +629,9 @@ pub async fn persist_running_now(state: &AppState) -> ControlResult<()> {
     config.canvas = canvas;
     config.layout = layout;
     config.cells = cells;
+    // The adopted layout/overlays may differ from the requested live stores.
+    // Resynchronize the sole declared program without changing its metadata.
+    config.refresh_single_program();
     config.validate().map_err(|e| {
         ControlError::Validation(format!("the adopted running config does not validate: {e}"))
     })?;

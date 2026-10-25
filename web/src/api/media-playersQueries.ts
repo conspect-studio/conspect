@@ -26,7 +26,7 @@ import {
   takeMediaPlayerExit,
 } from './media-players';
 import type {
-  AcceptedBody,
+  AcceptedOperation,
   MediaPlayer,
   OperationApiError,
   RequestOptions,
@@ -97,9 +97,9 @@ export type TransportAction = TransportVars['action'];
  */
 export function useMediaPlayerTransport(
   context: MediaPlayerContext = {},
-): UseMutationResult<AcceptedBody, OperationApiError, TransportVars> {
-  return useMutation<AcceptedBody, OperationApiError, TransportVars>({
-    mutationFn: (vars): Promise<AcceptedBody> => {
+): UseMutationResult<AcceptedOperation, OperationApiError, TransportVars> {
+  return useMutation<AcceptedOperation, OperationApiError, TransportVars>({
+    mutationFn: (vars): Promise<AcceptedOperation> => {
       const base = options(context);
       switch (vars.action) {
         case 'load':

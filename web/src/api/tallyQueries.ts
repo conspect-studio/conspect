@@ -25,7 +25,7 @@ import {
   setOverride,
 } from './tally';
 import type {
-  AcceptedBody,
+  AcceptedOperation,
   OperationApiError,
   RequestOptions,
   TallyColor,
@@ -149,10 +149,10 @@ export type OverrideVars =
  */
 export function useTallyOverride(
   context: TallyContext = {},
-): UseMutationResult<AcceptedBody, OperationApiError, OverrideVars> {
+): UseMutationResult<AcceptedOperation, OperationApiError, OverrideVars> {
   const queryClient = useQueryClient();
-  return useMutation<AcceptedBody, OperationApiError, OverrideVars>({
-    mutationFn: (vars): Promise<AcceptedBody> => {
+  return useMutation<AcceptedOperation, OperationApiError, OverrideVars>({
+    mutationFn: (vars): Promise<AcceptedOperation> => {
       const base = options(context);
       return vars.action === 'set'
         ? setOverride(vars.target, vars.color, base)

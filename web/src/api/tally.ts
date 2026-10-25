@@ -19,8 +19,9 @@ import {
   buildHeaders,
   OperationApiError,
   readProblem,
+  submitOperation,
 } from './operations';
-import type { AcceptedBody, RequestOptions } from './operations';
+import type { AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** One resolved tally entry (target + lamp state). */
@@ -44,7 +45,7 @@ export interface ProfileWithEtag {
 }
 
 export { OperationApiError } from './operations';
-export type { AcceptedBody, RequestOptions } from './operations';
+export type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -56,14 +57,6 @@ function isTallyEntry(value: unknown): value is TallyEntry {
 
 function isProfile(value: unknown): value is TallyProfile {
   return isRecord(value) && typeof value.id === 'string';
-}
-
-function isAcceptedBody(value: unknown): value is AcceptedBody {
-  return (
-    isRecord(value) &&
-    typeof value.operation_id === 'string' &&
-    typeof value.kind === 'string'
-  );
 }
 
 /** List resolved tally state (`GET /api/v1/tally`). */
@@ -162,20 +155,8 @@ async function submitOverride(
   method: 'PUT' | 'DELETE',
   payload: Record<string, unknown>,
   options: RequestOptions,
-): Promise<AcceptedBody> {
-  const response = await fetch(apiUrl(options, '/api/v1/tally/override'), {
-    method,
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    throw await readProblem(response);
-  }
-  const body: unknown = await response.json();
-  if (!isAcceptedBody(body)) {
-    throw new OperationApiError('The server returned an unexpected command body.');
-  }
-  return body;
+): Promise<AcceptedOperation> {
+  return submitOperation('/api/v1/tally/override', options, { method, body: payload });
 }
 
 /** Force a target's lamp (`PUT /api/v1/tally/override` -> 202 + op id). */
@@ -183,7 +164,7 @@ export function setOverride(
   target: TallyTarget,
   color: TallyColor,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOverride('PUT', { target, color }, options);
 }
 
@@ -191,6 +172,6 @@ export function setOverride(
 export function clearOverride(
   target: TallyTarget,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOverride('DELETE', { target }, options);
 }

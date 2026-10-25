@@ -91,6 +91,7 @@ import {
   TabsTrigger,
 } from '../components/ui/tabs';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** The continuity statement (§11): shown on every device, always. */
 function ContinuityNote(): JSX.Element {
@@ -738,7 +739,7 @@ export function DeviceDetailPage(): JSX.Element {
                       onClick={(): void => {
                         measureSyncGroup(group.id)
                           .then((accepted): void => {
-                            toast({
+                            followOperation(accepted, t`Skew measurement`, {
                               title: t`Measurement running`,
                               description: t`Operation ${accepted.operation_id}; the result arrives on the realtime stream.`,
                             });
@@ -905,7 +906,7 @@ export function DeviceDetailPage(): JSX.Element {
               onClick={(): void => {
                 rebootDevice(deviceId)
                   .then((accepted): void => {
-                    toast({
+                    followOperation(accepted, t`Reboot`, {
                       title: t`Reboot accepted`,
                       description: t`Operation ${accepted.operation_id}; the outcome arrives on the realtime stream.`,
                     });
@@ -973,7 +974,7 @@ export function DeviceDetailPage(): JSX.Element {
               onClick={(): void => {
                 setDeviceMode(deviceId, activeModeChoice)
                   .then((accepted): void => {
-                    toast({
+                    followOperation(accepted, t`Mode change`, {
                       title: t`Mode change accepted`,
                       description: `${accepted.detail} (${accepted.operation_id})`,
                     });

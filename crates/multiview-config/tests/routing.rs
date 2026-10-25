@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use multiview_config::routing::{StreamRef, StreamSelector};
-use multiview_config::MultiviewConfig;
+use multiview_config::{ConfigError, MultiviewConfig, ProgramKind};
 use multiview_core::stream::StreamKind;
 use proptest::prelude::*;
 
@@ -113,6 +113,147 @@ name = "MV PROGRAM"
 
 fn load_legacy() -> MultiviewConfig {
     MultiviewConfig::load_from_toml(LEGACY_BASE).expect("legacy base parses")
+}
+
+#[test]
+fn output_crosspoint_rejects_undeclared_program() {
+    let mut cfg = load_legacy();
+    let mut routing = cfg.routing_table();
+    routing.output[0].program = "missing".to_owned();
+    cfg.routing = Some(routing);
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("missing") && err.contains("program"), "{err}");
+}
+
+#[test]
+fn declared_program_crosspoint_validates_and_round_trips() {
+    let mut cfg = load_legacy();
+    let mut named = cfg.effective_programs().remove(0);
+    named.id = "aux".try_into().unwrap();
+    cfg.programs = vec![named];
+    let mut routing = cfg.routing_table();
+    for output in &mut routing.output {
+        output.program = "aux".to_owned();
+    }
+    cfg.routing = Some(routing);
+    cfg.validate().unwrap();
+    let encoded = toml::to_string(&cfg).unwrap();
+    let decoded = MultiviewConfig::load_from_toml(&encoded).unwrap();
+    assert_eq!(decoded.programs, cfg.programs);
+    decoded.validate().unwrap();
+    let json = serde_json::to_string(&cfg).unwrap();
+    let decoded: MultiviewConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.programs, cfg.programs);
+}
+
+#[test]
+fn explicit_output_routing_defaults_to_main_and_rejects_undeclared_program() {
+    let mut cfg = load_legacy();
+    let mut named = cfg.effective_programs().remove(0);
+    named.id = "aux".try_into().unwrap();
+    cfg.programs = vec![named];
+    let output = cfg.outputs[0].id();
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    value["routing"] = serde_json::json!({"output": [{"output": output}]});
+    let cfg: MultiviewConfig = serde_json::from_value(value).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("main") && err.contains("program"), "{err}");
+}
+
+#[test]
+fn declared_main_must_match_top_level_canvas_cadence() {
+    let mut cfg = load_legacy();
+    cfg.canvas.fps = "25/1".parse().unwrap();
+    let mut main = cfg.effective_programs().remove(0);
+    let ProgramKind::Multiview { canvas, .. } = &mut main.kind else {
+        panic!("implicit main must be multiview")
+    };
+    canvas.fps = "50/1".parse().unwrap();
+    cfg.programs = vec![main];
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::ProgramMismatch {
+            field: "canvas",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn declared_main_must_match_top_level_cells_and_outputs() {
+    let mut cfg = load_legacy();
+    let mut main = cfg.effective_programs().remove(0);
+    let ProgramKind::Multiview { cells, .. } = &mut main.kind else {
+        panic!("implicit main must be multiview")
+    };
+    cells[0].id = "different_cell".to_owned();
+    cfg.programs = vec![main];
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::ProgramMismatch { field: "cells", .. })
+    ));
+
+    let mut cfg = load_legacy();
+    let mut main = cfg.effective_programs().remove(0);
+    main.outputs.clear();
+    cfg.programs = vec![main];
+    assert!(matches!(
+        cfg.validate(),
+        Err(ConfigError::ProgramMismatch {
+            field: "outputs",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn identical_declared_main_is_accepted() {
+    let mut cfg = load_legacy();
+    cfg.programs = cfg.effective_programs();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn lone_aux_program_without_explicit_routing_desugars_to_aux() {
+    let mut cfg = load_legacy();
+    let mut aux = cfg.effective_programs().remove(0);
+    aux.id = "aux".try_into().unwrap();
+    cfg.programs = vec![aux];
+    cfg.validate().expect("an aux-only program validates");
+    assert!(cfg
+        .routing_table()
+        .output
+        .iter()
+        .all(|crosspoint| crosspoint.program == "aux"));
+}
+
+#[test]
+fn duplicate_program_ids_are_rejected() {
+    let mut cfg = load_legacy();
+    let main = cfg.effective_programs().remove(0);
+    cfg.programs = vec![main.clone(), main];
+    assert!(cfg
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate program"));
+}
+
+#[test]
+fn legacy_multiple_untargeted_program_bus_routes_validate() {
+    let legacy = LEGACY_BASE.replace("target_track = \"cam_a\"\n", "");
+    let cfg = MultiviewConfig::load_from_toml(&legacy).expect("legacy routes parse");
+    assert!(cfg.routing.is_none());
+    assert_eq!(cfg.audio.as_ref().unwrap().routes.len(), 2);
+    assert!(cfg
+        .audio
+        .as_ref()
+        .unwrap()
+        .routes
+        .iter()
+        .all(|route| { route.include_in_program_bus && route.target_track.is_none() }));
+    cfg.validate()
+        .expect("multiple untargeted legacy program-bus routes validate");
 }
 
 #[test]
@@ -245,6 +386,24 @@ fn build_legacy(n: u8, perm: &[usize]) -> String {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// An absent programs block and its explicit desugared form solve alike.
+    #[test]
+    fn absent_and_desugared_programs_solve_identically(
+        perm in (1usize..6).prop_flat_map(|n| {
+            Just((0..n).collect::<Vec<_>>()).prop_shuffle()
+        }),
+    ) {
+        let doc = build_legacy(u8::try_from(perm.len()).unwrap(), &perm);
+        let implicit = MultiviewConfig::load_from_toml(&doc).unwrap();
+        let mut explicit = implicit.clone();
+        explicit.programs = implicit.effective_programs();
+        prop_assert!(implicit.validate().is_ok());
+        prop_assert!(explicit.validate().is_ok());
+        prop_assert_eq!(implicit.effective_programs(), explicit.effective_programs());
+        prop_assert_eq!(implicit.solve_layout().unwrap(), explicit.solve_layout().unwrap());
+        prop_assert_eq!(implicit.routing_table(), explicit.routing_table());
+    }
 
     /// THE load-bearing property: a legacy doc and its desugared v3 routing
     /// table solve to identical cell→input video routing, for a random binding.

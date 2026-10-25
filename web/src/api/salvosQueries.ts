@@ -26,7 +26,7 @@ import {
   takeSalvo,
 } from './salvos';
 import type {
-  AcceptedBody,
+  AcceptedOperation,
   OperationApiError,
   RequestOptions,
   Salvo,
@@ -134,9 +134,9 @@ export interface SalvoOperationVars {
 /** Arm / take / cancel a salvo, returning the `202` operation id body. */
 export function useSalvoOperation(
   context: SalvoContext = {},
-): UseMutationResult<AcceptedBody, OperationApiError, SalvoOperationVars> {
-  return useMutation<AcceptedBody, OperationApiError, SalvoOperationVars>({
-    mutationFn: ({ id, action }): Promise<AcceptedBody> => {
+): UseMutationResult<AcceptedOperation, OperationApiError, SalvoOperationVars> {
+  return useMutation<AcceptedOperation, OperationApiError, SalvoOperationVars>({
+    mutationFn: ({ id, action }): Promise<AcceptedOperation> => {
       const base = options(context);
       switch (action) {
         case 'arm':

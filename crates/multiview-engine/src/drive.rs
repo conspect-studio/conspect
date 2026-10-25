@@ -152,6 +152,10 @@ pub struct CompositorDrive<T> {
     /// monomorphic over [`Nv12Image`]); a non-`Nv12Image` drive simply never
     /// borrows it.
     scratch: RefCell<ComposeScratch>,
+    /// Synchronous, non-blocking per-tick placement resolver; defaults to the
+    /// existing single-scene placement derivation.
+    render_plan_resolver: RenderPlanResolver,
+    switcher_tick_state: SwitcherTickState,
 }
 
 impl<T> CompositorDrive<T> {
@@ -185,6 +189,8 @@ impl<T> CompositorDrive<T> {
             background,
             backend: RunBackend::cpu(),
             scratch: RefCell::new(ComposeScratch::default()),
+            render_plan_resolver: default_render_plan_resolver,
+            switcher_tick_state: SwitcherTickState,
         })
     }
 
@@ -201,6 +207,20 @@ impl<T> CompositorDrive<T> {
     #[must_use]
     pub fn scratch_reservations(&self) -> u64 {
         self.scratch.borrow().reservations
+    }
+
+    /// Inject a synchronous resolver for the current scene and tick. The resolver
+    /// receives pooled placements and must not block, await, or retain them.
+    /// Its output indexes the sampled images in the scene's draw order.
+    #[must_use]
+    pub fn with_render_plan_resolver(mut self, resolver: RenderPlanResolver) -> Self {
+        self.render_plan_resolver = resolver;
+        self
+    }
+
+    /// Replace the per-tick resolver at a frame boundary.
+    pub fn set_render_plan_resolver(&mut self, resolver: RenderPlanResolver) {
+        self.render_plan_resolver = resolver;
     }
 
     /// Attach the cell ids (in `layout.cells` order) so cells can be addressed by
@@ -470,8 +490,7 @@ impl CompositorDrive<Nv12Image> {
         let mut source_states: HashMap<String, SourceState> = HashMap::new();
 
         // Draw order: ascending z (lower z first / bottom). Sort cell indices.
-        order.extend(0..cell_count);
-        order.sort_by_key(|&i| self.layout.cells.get(i).map_or(i32::MIN, |c| c.z));
+        self.sort_draw_order(order);
 
         for &i in order.iter() {
             let Some(cell) = self.layout.cells.get(i) else {
@@ -481,17 +500,11 @@ impl CompositorDrive<Nv12Image> {
             if let Some(source) = &cell.source {
                 source_states.insert(source.clone(), state);
             }
-            let (dst_x, dst_y, dst_w, dst_h) = cell_dst_rect(cell, canvas.width, canvas.height);
             held.push(image);
-            placements.push(Placement {
-                image_index: held.len().saturating_sub(1),
-                dst_x,
-                dst_y,
-                dst_w,
-                dst_h,
-                opacity: cell.opacity,
-            });
         }
+        // Resolve geometry/opacity from the scene, switcher state and this tick.
+        // The resolver writes into the pooled buffer and cannot await a consumer.
+        self.resolve_placements(order, tick, placements);
 
         // Borrow the held images for the compositor's `Tile` slice. This slice is
         // a per-tick local, NOT pooled: a `Tile<'_>` borrows into the pooled
@@ -548,6 +561,41 @@ impl CompositorDrive<Nv12Image> {
             canvas: canvas_image,
             source_states,
         })
+    }
+
+    /// Run only the per-tick render-plan stage of [`CompositorDrive::compose`]
+    /// (draw-order sort + injected resolver) on the pooled scratch, and hand the
+    /// resolved placements to `inspect`. This is the same code path `compose`
+    /// takes, without sampling or compositing, so the resolver's steady-state
+    /// allocation behaviour can be measured in isolation.
+    pub fn resolve_render_plan<R>(&self, tick: Tick, inspect: impl FnOnce(&[Placement]) -> R) -> R {
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.begin(self.layout.cells.len());
+        let ComposeScratch {
+            placements, order, ..
+        } = &mut *scratch;
+        self.sort_draw_order(order);
+        self.resolve_placements(order, tick, placements);
+        inspect(placements)
+    }
+
+    /// Fill the pooled `order` with cell indices in ascending z (stable).
+    fn sort_draw_order(&self, order: &mut Vec<usize>) {
+        order.extend(0..self.layout.cells.len());
+        order.sort_by_key(|&i| self.layout.cells.get(i).map_or(i32::MIN, |c| c.z));
+    }
+
+    /// Invoke the injected resolver into the pooled placements buffer.
+    fn resolve_placements(&self, order: &[usize], tick: Tick, placements: &mut Vec<Placement>) {
+        (self.render_plan_resolver)(
+            &SceneStates {
+                layout: &self.layout,
+                order,
+            },
+            &self.switcher_tick_state,
+            tick,
+            placements,
+        );
     }
 
     /// Sample one cell's image and state without blocking: the bound source's
@@ -639,18 +687,64 @@ struct SlateCache {
     builds: u64,
 }
 
-/// Internal: a resolved tile placement referencing an entry in the `held` vec.
-struct Placement {
-    image_index: usize,
-    dst_x: u32,
-    dst_y: u32,
+/// Input scene and draw order for the per-tick render-plan resolver.
+pub struct SceneStates<'a> {
+    /// The active program scene.
+    pub layout: &'a Layout,
+    /// Layout cell indices in ascending z-order. Image indices address this order.
+    pub order: &'a [usize],
+}
+
+/// Placeholder for the switcher state consumed by the render-plan resolver.
+/// Future switcher stages can add state without changing its function signature.
+#[derive(Debug, Clone, Default)]
+pub struct SwitcherTickState;
+
+/// Synchronous placement resolver. Its output buffer belongs to the drive's
+/// scratch pool and is cleared each tick before the resolver runs.
+pub type RenderPlanResolver =
+    for<'a> fn(&SceneStates<'a>, &SwitcherTickState, Tick, &mut Vec<Placement>);
+
+/// Default single-scene resolver: preserves the previous sorted cell placements.
+fn default_render_plan_resolver(
+    scenes: &SceneStates<'_>,
+    _switcher: &SwitcherTickState,
+    _tick: Tick,
+    placements: &mut Vec<Placement>,
+) {
+    let canvas = &scenes.layout.canvas;
+    for (image_index, &cell_index) in scenes.order.iter().enumerate() {
+        let Some(cell) = scenes.layout.cells.get(cell_index) else {
+            continue;
+        };
+        let (dst_x, dst_y, dst_w, dst_h) = cell_dst_rect(cell, canvas.width, canvas.height);
+        placements.push(Placement {
+            image_index,
+            dst_x,
+            dst_y,
+            dst_w,
+            dst_h,
+            opacity: cell.opacity,
+        });
+    }
+}
+
+/// A resolved tile placement referencing an entry in the sampled image vector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    /// Index in the sampled images, ordered by ascending scene z-order.
+    pub image_index: usize,
+    /// Destination x coordinate on the canvas.
+    pub dst_x: u32,
+    /// Destination y coordinate on the canvas.
+    pub dst_y: u32,
     /// The cell's pixel width on the canvas (the destination the source scales
     /// into; scale-at-composite).
-    dst_w: u32,
+    pub dst_w: u32,
     /// The cell's pixel height on the canvas.
-    dst_h: u32,
+    pub dst_h: u32,
     /// The cell's per-tile opacity (straight alpha), carried to the compositor.
-    opacity: f32,
+    pub opacity: f32,
 }
 
 /// The per-tick resolve **scratch pool**: reusable buffers cleared-and-refilled
