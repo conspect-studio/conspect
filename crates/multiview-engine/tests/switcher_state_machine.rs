@@ -274,9 +274,11 @@ fn parked_lever_returning_to_bottom_does_not_abort_an_independent_auto() {
     assert!(state.tbar(u16::MAX, tick(1)).unwrap().completed);
     assert_eq!(state.program(), &source("b"));
     assert!(state.auto(tick(10)).unwrap().started);
+    // The parked lever is ignored, so it must report the active AUTO (1/5),
+    // not reset the transition to zero for this frame.
     assert_eq!(
         state.tbar(40000, tick(11)).unwrap().progress,
-        Progress::ZERO
+        Progress::new(1, FrameCount::try_from(5).unwrap())
     );
     let returned = state.tbar(0, tick(12)).unwrap();
     assert_eq!(
@@ -289,6 +291,114 @@ fn parked_lever_returning_to_bottom_does_not_abort_an_independent_auto() {
     assert!(state.sample(tick(15)).completed);
     assert_eq!(state.program(), &source("a"));
     assert_eq!(state.completion_count(), 2);
+}
+
+#[test]
+fn parked_nonzero_lever_reports_independent_auto_progress_and_completion() {
+    let mut state = configured();
+    state
+        .set_transition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(5).unwrap(),
+        })
+        .unwrap();
+    assert!(state.tbar(u16::MAX, tick(1)).unwrap().completed);
+    assert!(state.auto(tick(10)).unwrap().started);
+    assert_eq!(
+        state.tbar(40000, tick(11)).unwrap(),
+        SwitcherProjection {
+            progress: Progress::new(1, FrameCount::try_from(5).unwrap()),
+            started: false,
+            completed: false,
+        }
+    );
+    assert!(state.is_in_flight());
+    assert_eq!(state.program(), &source("b"));
+    // The completion tick is reported even when the parked lever moves first.
+    assert_eq!(
+        state.tbar(41000, tick(15)).unwrap(),
+        SwitcherProjection {
+            progress: Progress::COMPLETE,
+            started: false,
+            completed: true,
+        }
+    );
+    assert!(!state.is_in_flight());
+    assert_eq!(state.program(), &source("a"));
+    assert_eq!(state.completion_count(), 2);
+    assert!(!state.sample(tick(16)).completed);
+    assert_eq!(state.completion_count(), 2);
+}
+
+proptest! {
+    /// Ignored inputs are invisible: output == sample(tick), and the state
+    /// after the ignored input equals the state after a plain sample.
+    #[test]
+    fn ignored_inputs_are_invisible_output_equals_sample(
+        prefix in proptest::collection::vec((0u8..6, any::<u16>(), 0u8..6), 0..16),
+        parked in proptest::collection::vec((0u8..7, 1u16..=u16::MAX, 0u8..6), 1..32),
+        rate in 2u32..12,
+    ) {
+        let mut state = configured();
+        state
+            .set_transition(TransitionDescriptor::Mix {
+                rate: FrameCount::try_from(rate).unwrap(),
+            })
+            .unwrap();
+        let mut now = 0u64;
+        for (kind, value, advance) in prefix {
+            now += u64::from(advance);
+            let _ = match kind {
+                0 => state.auto(tick(now)),
+                1 => state.cut(),
+                2 => Ok(state.abort()),
+                3 => state.tbar(value, tick(now)),
+                4 => Ok(state.punch(source("c"))),
+                _ => Ok(state.sample(tick(now))),
+            };
+        }
+        if !state.is_in_flight() {
+            let _ = state.set_transition(TransitionDescriptor::Mix {
+                rate: FrameCount::try_from(rate).unwrap(),
+            });
+        }
+        // A terminal lever either completes the take or is already parked;
+        // either way the lever is now out of sync until it returns to zero.
+        let _ = state.tbar(u16::MAX, tick(now));
+        for (kind, value, advance) in parked {
+            now += u64::from(advance);
+            let ignored = match kind {
+                // Nonzero lever while parked: always ignored.
+                0..=2 => Some(Cmd2::Tbar(value)),
+                // Re-sent AUTO during an AUTO flight (only AUTO can be in flight
+                // while the lever is parked): ignored.
+                3 if state.is_in_flight() => Some(Cmd2::Auto),
+                _ => None,
+            };
+            if let Some(cmd) = ignored {
+                let mut expected_state = state.clone();
+                let expected = expected_state.sample(tick(now));
+                let output = match cmd {
+                    Cmd2::Tbar(v) => state.tbar(v, tick(now)).unwrap(),
+                    Cmd2::Auto => state.auto(tick(now)).unwrap(),
+                };
+                prop_assert_eq!(output, expected, "ignored {:?} at tick {}", cmd, now);
+                prop_assert_eq!(format!("{state:?}"), format!("{expected_state:?}"));
+                continue;
+            }
+            let _ = match kind {
+                3 => state.auto(tick(now)),
+                4 => state.cut(),
+                5 => Ok(state.abort()),
+                _ => Ok(state.sample(tick(now))),
+            };
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Cmd2 {
+    Tbar(u16),
+    Auto,
 }
 
 #[test]
@@ -586,6 +696,14 @@ impl ReferenceStateMachine for Reference {
                 state.lever_out_of_sync = true;
                 state.flight = None;
             }
+            // Ignored inputs are invisible: a parked lever behaves as a sample.
+            Cmd::Tbar(_) | Cmd::RepeatTerminalTbar => {
+                if matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
+                {
+                    state.flight = None;
+                    state.lever_out_of_sync = state.last_manual_position != 0;
+                }
+            }
             Cmd::Cut | Cmd::Abort | Cmd::Punch(_) => {
                 state.flight = None;
                 state.lever_out_of_sync = state.last_manual_position != 0;
@@ -637,22 +755,21 @@ struct Sut {
     last_manual_position: u16,
 }
 impl Sut {
-    fn check_projection(&mut self, transition: &Cmd, output: SwitcherProjection, parked: bool) {
-        if parked {
+    fn check_projection(
+        &mut self,
+        transition: &Cmd,
+        output: SwitcherProjection,
+        parked: Option<(SwitcherProjection, String)>,
+    ) {
+        if let Some((expected, expected_state)) = parked {
+            // Ignored inputs are invisible: a parked lever reports exactly
+            // what sample(tick) would have, including an AUTO's progress.
             assert!(
                 !output.started,
                 "started while lever out of sync: {transition:?}"
             );
-            assert_eq!(
-                output.progress,
-                Progress::ZERO,
-                "parked lever moved: {transition:?}"
-            );
-            assert!(
-                !output.started && !output.completed,
-                "parked lever triggered take: {transition:?}"
-            );
-            assert_eq!(self.machine.is_in_flight(), self.was_in_flight);
+            assert_eq!(output, expected, "parked lever was visible: {transition:?}");
+            assert_eq!(format!("{:?}", self.machine), expected_state);
         }
         assert!(output.progress.numerator() <= output.progress.denominator());
         if output.completed {
@@ -725,6 +842,11 @@ impl StateMachineTest for Test {
     fn apply(mut sut: Sut, _model: &Model, transition: Cmd) -> Sut {
         let parked_manual =
             sut.lever_out_of_sync && matches!(transition, Cmd::Tbar(position) if position != 0);
+        let parked_expected = parked_manual.then(|| {
+            let mut clone = sut.machine.clone();
+            let expected = clone.sample(tick(sut.tick));
+            (expected, format!("{clone:?}"))
+        });
         let result = match transition {
             Cmd::Auto => sut.machine.auto(tick(sut.tick)).ok(),
             Cmd::Cut => sut.machine.cut().ok(),
@@ -801,7 +923,7 @@ impl StateMachineTest for Test {
             Cmd::Punch(n) => Some(sut.machine.punch(source(&format!("p{n}")))),
         };
         if let Some(output) = result {
-            sut.check_projection(&transition, output, parked_manual);
+            sut.check_projection(&transition, output, parked_expected);
         }
         sut.previous = (sut.machine.program().clone(), sut.machine.preview().clone());
         sut.was_in_flight = sut.machine.is_in_flight();
