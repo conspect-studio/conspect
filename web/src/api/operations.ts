@@ -138,9 +138,10 @@ export async function submitOperation(
   path: string,
   options: RequestOptions = {},
 ): Promise<AcceptedBody> {
+  const idempotencyKey = options.idempotencyKey ?? crypto.randomUUID();
   const response = await fetch(apiUrl(options, path), {
     method: 'POST',
-    headers: buildHeaders(options, false),
+    headers: buildHeaders({ ...options, idempotencyKey }, false),
   });
   if (!response.ok) {
     throw await readProblem(response);

@@ -23,7 +23,10 @@ class FakeWebSocket {
     // no-op
   }
   emit(frame: Record<string, unknown>): void {
-    this.onmessage?.({ data: JSON.stringify({ v: 1, ts: 1, ...frame }) } as MessageEvent<unknown>);
+    const event = new MessageEvent<unknown>("message", {
+      data: JSON.stringify({ v: 1, ts: 1, ...frame }),
+    });
+    this.onmessage?.(event);
   }
 }
 
@@ -31,7 +34,7 @@ async function socket(index = 0): Promise<FakeWebSocket> {
   await vi.waitFor(() => {
     expect(FakeWebSocket.instances.length).toBeGreaterThan(index);
   });
-  return FakeWebSocket.instances[index] as FakeWebSocket;
+  return FakeWebSocket.instances[index]!;
 }
 
 describe("shared realtime service", () => {
@@ -76,13 +79,16 @@ describe("shared realtime service", () => {
   it("keeps a resubscribed topic listener after an earlier one unsubscribes", async () => {
     const a = vi.fn();
     const b = vi.fn();
+    const keeper = subscribeRealtime("alerts", vi.fn());
     const offA = subscribeRealtime("system", a);
     const ws = await socket();
     offA();
     const offB = subscribeRealtime("system", b);
     ws.emit({ t: "x", topic: "system", seq: 1, data: {} });
     expect(b).toHaveBeenCalledTimes(1);
+    expect(a).not.toHaveBeenCalled();
     offB();
+    keeper();
   });
 
   it("resumes with the last seq on reconnect and tells every listener to refetch on a gap", async () => {
