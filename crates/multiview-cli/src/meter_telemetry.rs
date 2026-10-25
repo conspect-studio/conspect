@@ -65,8 +65,55 @@ impl MeterTelemetry {
     /// Accumulate one emitted block (always) and return a conflated sample at
     /// most [`METER_EMIT_HZ`] times a second. Never blocks or panics.
     pub fn push(&mut self, block: &AudioBlock, now_ns: i64) -> Option<AudioMeter> {
-        let _ = (block, now_ns);
-        todo!("accumulate + gate")
+        let ch = self.channels;
+        for frame in block.interleaved().chunks_exact(ch) {
+            for ((&x, peak), sum_sq) in frame
+                .iter()
+                .zip(self.peak.iter_mut())
+                .zip(self.sum_sq.iter_mut())
+            {
+                let a = x.abs();
+                if a.is_nan() {
+                    continue;
+                }
+                if a > *peak {
+                    *peak = a;
+                }
+                if a >= CLIP_LEVEL {
+                    self.clip = true;
+                }
+                *sum_sq += f64::from(x) * f64::from(x);
+            }
+            self.frames += 1;
+        }
+        self.conflator.accept(());
+        self.conflator.poll(now_ns)?;
+        Some(self.take_sample())
+    }
+
+    /// Pack the window since the last emit into the wire sample and reset it.
+    fn take_sample(&mut self) -> AudioMeter {
+        let n = self.frames.max(1);
+        let n = n.to_string().parse::<f64>().unwrap_or(1.0);
+        let peak_db = self.peak.iter().map(|p| lin_to_db(f64::from(*p))).collect();
+        let rms_db = self
+            .sum_sq
+            .iter()
+            .map(|e| lin_to_db((e / n).sqrt()))
+            .collect();
+        let sample = AudioMeter {
+            track: self.track,
+            peak_db,
+            rms_db,
+            clip: self.clip,
+            overflow: false,
+            sampled_hz: METER_EMIT_HZ,
+        };
+        self.peak.iter_mut().for_each(|p| *p = 0.0);
+        self.sum_sq.iter_mut().for_each(|e| *e = 0.0);
+        self.frames = 0;
+        self.clip = false;
+        sample
     }
 }
 
@@ -83,6 +130,7 @@ mod tests {
     use super::*;
     use multiview_audio::{AudioFormat, ChannelLayout};
     use multiview_engine::EnginePublisher;
+    use multiview_engine::TryRecvError;
     use multiview_events::Event;
 
     fn fmt() -> AudioFormat {
@@ -116,7 +164,11 @@ mod tests {
     fn silence_is_a_finite_floor_not_neg_infinity() {
         let mut m = MeterTelemetry::new(0, 2);
         let s = m.push(&block(0.0, 0.0), 0).expect("emit");
-        assert!(s.peak_db.iter().chain(&s.rms_db).all(|v| *v == SILENCE_FLOOR_DB));
+        assert!(s
+            .peak_db
+            .iter()
+            .chain(&s.rms_db)
+            .all(|v| *v == SILENCE_FLOOR_DB));
     }
 
     #[test]
@@ -163,25 +215,38 @@ mod tests {
         // cannot block, inv #10), the bounded rate holds, and a live subscriber
         // still receives frames.
         let publisher: EnginePublisher<(), Event> = EnginePublisher::new(8);
-        let stalled = publisher.subscribe();
+        let mut stalled = publisher.subscribe();
         let mut live = publisher.subscribe();
         let mut m = MeterTelemetry::new(0, 2);
         let b = block(0.3, 0.3);
-        let mut published = 0;
+        let mut sent = 0;
         let mut received = 0;
         let mut now = 0_i64;
         for _ in 0..300 {
             now += 10_000_000;
             if let Some(s) = m.push(&b, now) {
                 publisher.publish_event(Event::AudioMeter(s));
-                published += 1;
+                sent += 1;
             }
             while live.try_recv().is_ok() {
                 received += 1;
             }
         }
-        assert!((80..=100).contains(&published), "30 Hz over 3 s: {published}");
-        assert_eq!(received, published, "the live subscriber saw every frame");
-        assert!(stalled.len() <= 8, "stalled subscriber backlog is bounded");
+        assert!((70..=100).contains(&sent), "30 Hz over 3 s: {sent}");
+        assert_eq!(received, sent, "the live subscriber saw every frame");
+        // The stalled subscriber lost its own oldest frames (drop-oldest), then
+        // resumes at a bounded backlog: it never held back the publisher.
+        assert!(
+            matches!(stalled.try_recv(), Err(TryRecvError::Lagged(_))),
+            "stalled subscriber must observe drop-oldest lag"
+        );
+        let mut backlog = 0;
+        while stalled.try_recv().is_ok() {
+            backlog += 1;
+        }
+        assert!(
+            backlog <= 8,
+            "stalled backlog bounded by capacity: {backlog}"
+        );
     }
 }

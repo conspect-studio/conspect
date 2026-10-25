@@ -4685,6 +4685,10 @@ fn consumer_main(
     // loop (this is the bake-consumer thread). The epoch is the consumer start;
     // the conflator only ever sees a non-decreasing `now_ns`.
     let loudness_epoch = Instant::now();
+    // Program-bus peak/RMS meter (`audio.meter`, ~30 Hz conflated; AUD-8 / SW-14),
+    // built lazily from the first emitted block's channel count. Same thread and
+    // same non-blocking drop-oldest publisher as the loudness lane (inv #10).
+    let mut audio_meter: Option<crate::meter_telemetry::MeterTelemetry> = None;
     // Track which sinks are still live (their receiver has not hung up) so a sink
     // that ended early does not wedge or repeatedly error the consumer.
     let mut live: Vec<bool> = vec![true; sink_txs.len()];
@@ -4747,6 +4751,12 @@ fn consumer_main(
                 let now_ns = i64::try_from(now_ns).unwrap_or(i64::MAX);
                 if let Some(sample) = meter.push(&block, gain_f32, now_ns) {
                     publisher.publish_event(Event::AudioLoudness(sample));
+                }
+                let peak_rms = audio_meter.get_or_insert_with(|| {
+                    crate::meter_telemetry::MeterTelemetry::new(0, block.format().channel_count())
+                });
+                if let Some(sample) = peak_rms.push(&block, now_ns) {
+                    publisher.publish_event(Event::AudioMeter(sample));
                 }
             }
             // DEV-B4: the display heads hear the SAME post-loudnorm program
