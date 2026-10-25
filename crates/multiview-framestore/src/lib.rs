@@ -18,10 +18,11 @@
 //!
 //! ## Invariants upheld here
 //!
-//! * **Reader never stalls / never tears**: reads clone an [`Arc`](std::sync::Arc)
-//!   out of a pointer-swap cell whose only critical section is that clone
-//!   (`swap` module; arc-swap was dropped here for vorner/arc-swap#210, #133).
-//!   No `unsafe`.
+//! * **Publisher never waits on a reader, reader never blocks, never tears**:
+//!   reads clone an [`Arc`](std::sync::Arc) out of a tagged slot ring (`swap`
+//!   module) that a publish can always write without waiting, even while a
+//!   reader is descheduled mid-read. arc-swap was dropped here for
+//!   vorner/arc-swap#210 (#133). No `unsafe`.
 //! * **Bounded memory** — single slot, newest wins; a fast source overwrites,
 //!   a slow source is held.
 //! * **Deterministic timing** — "now" is *injected* as a

@@ -9,12 +9,13 @@
 //! lets the flip loop decide "is there anything newer than what I last
 //! committed?" without consuming or comparing payloads.
 //!
-//! The publisher side is one atomic counter bump plus one pointer swap under
-//! the slot's lock. The sink thread holds that lock only for one `Arc` clone,
-//! never across a flip. So the publish is bounded by a pointer-sized critical
-//! section whether the sink is alive, slow, wedged or gone. The engine never
-//! waits on the sink here (#133: the slot no longer uses arc-swap, which could
-//! hand this reader another mailbox's frame; see vorner/arc-swap#210).
+//! The publisher side is one atomic counter bump plus a slot write that never
+//! waits on the sink thread. That holds whether the sink is alive, slow,
+//! wedged, gone, or descheduled in the middle of a read: a slot the sink is
+//! inside is skipped, never waited for. The sink's read never blocks either.
+//! The engine never waits on the sink here (#133: the slot no longer uses
+//! arc-swap, which could hand this reader another mailbox's frame; see
+//! vorner/arc-swap#210).
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,9 +79,9 @@ impl<F> FramePublisher<F> {
     /// Publish `frame`, overwriting any unconsumed previous frame (newest
     /// wins). Returns the sequence number assigned to this publish.
     ///
-    /// Non-blocking: one atomic counter bump plus one pointer swap whose
-    /// critical section the sink can hold only for an `Arc` clone. Never waits
-    /// on the sink thread's state.
+    /// Never waits on the sink thread, in any state (including descheduled
+    /// mid-read): one atomic counter bump plus a slot write that skips any slot
+    /// the sink is inside.
     pub fn publish(&self, frame: F) -> u64 {
         let seq = self.counter.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         self.slot.publish(Stamped { seq, frame });

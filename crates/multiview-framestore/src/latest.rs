@@ -18,11 +18,14 @@
 //!
 //! ## Storage, and why it is not `arc-swap` (#133)
 //!
-//! The value lives in a crate-private `SwapCell` (the `swap` module): a
-//! `std::sync::RwLock<Option<Arc<T>>>` whose critical sections are one pointer
-//! clone (read) or one pointer swap (publish). Nothing allocates, frees, runs a
-//! destructor or does I/O under the lock. The replaced value is dropped after
-//! the lock is released. See the `swap` module docs for the full bound.
+//! The value lives in a crate-private `SwapCell` (the `swap` module): a small
+//! ring of `std::sync::RwLock` slots plus one atomic, generation-tagged head
+//! index. A publish writes into a slot it can `try_write` (skipping any slot a
+//! reader is inside, and growing the ring if all are) and then advances the
+//! head, so **a publish never waits on a reader**, even one the OS has
+//! descheduled mid-read. A load `try_read`s the head's slot and accepts it only
+//! if its generation tag matches; it never blocks on a lock. Nothing is
+//! dropped under a lock. See the `swap` module docs for the full argument.
 //!
 //! The slot used `arc_swap::ArcSwapOption` until #133. arc-swap 1.9.2's default
 //! (hybrid) strategy can make `load_full` on one instance return an `Arc`
@@ -44,13 +47,17 @@
 //! * **Never foreign.** [`LatestSlot::load`] returns exactly the `Arc` most
 //!   recently stored into *this* slot. There is no reclamation state shared
 //!   between slots.
-//! * **Newest-wins.** All publishes and loads are totally ordered by the
-//!   slot's lock. A load returns the value of the last publish ordered before
-//!   it.
-//! * **Never regresses.** A single reader's successive loads are ordered
-//!   by program order and the lock's release/acquire chain. So with a single
-//!   writer, a reader can never get a value older than one it has already
-//!   returned, on x86 or `AArch64`.
+//! * **Newest-wins, never lost.** A publish becomes visible when it advances
+//!   the head (`fetch_max` on one atomic). A load returns the value the head
+//!   names when it reads it. The head's value is never overwritten, so the
+//!   newest value stays readable with no follow-up publish.
+//! * **Never regresses.** A single reader's successive loads read the head
+//!   atomic in program order, and coherence of one atomic location means it
+//!   never moves backwards. So with a single writer, a reader can never get a
+//!   value older than one it has already returned, on x86 or `AArch64`.
+//! * **Progress.** Publish never waits on a reader (wait-free with respect to
+//!   readers). Load never blocks on a lock and retries only when a publisher
+//!   made progress (lock-free).
 //!
 //! These properties are exercised under stress by `tests/concurrency.rs`
 //! (`reader_never_observes_a_regression_in_sequence`,
@@ -64,7 +71,8 @@ use crate::swap::SwapCell;
 /// `T`.
 ///
 /// Publishing overwrites any previous value (newest wins). Reading clones the
-/// current [`Arc<T>`]; its only critical section is that clone. A monotonically increasing **sequence
+/// current [`Arc<T>`] and never blocks; publishing never waits on a reader.
+/// A monotonically increasing **sequence
 /// number** is stamped on every publish so a reader can cheaply detect whether
 /// a newer value has appeared since it last looked (used by the concurrency
 /// test to assert "never older-than-seen").
@@ -115,7 +123,7 @@ impl<T> LatestSlot<T> {
         // Stamp the sequence first, then store the value. Two independent facts:
         //
         // 1. Newest-wins and no-regression for the *value* itself rest on the
-        //    slot's lock order (see the module-level "Ordering guarantee"
+        //    slot's atomic head (see the module-level "Ordering guarantee"
         //    docs), NOT on this seq counter. Cloning the `Arc` on load is what
         //    rules out tearing.
         // 2. The seq counter is a cheap staleness signal for callers that hold a
@@ -123,18 +131,19 @@ impl<T> LatestSlot<T> {
         //    payloads (see [`LatestSlot::sequence`]). Stamping before the store
         //    means a reader that has *observed this value* and then reads the
         //    counter sees a number >= `next`. The `AcqRel` fetch_add is
-        //    sequenced before the lock release that publishes the value, and a
-        //    reader's lock acquire synchronizes with that release.
+        //    sequenced before the release RMW on the head that publishes the
+        //    value, and a reader's acquire load of the head synchronizes with
+        //    it.
         let next = self.seq.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        // The previous value (if any) is dropped after the lock is released.
+        // The previous value (if any) is dropped outside any lock.
         self.slot.store(Some(value));
         next
     }
 
     /// Load the latest value, if any, as a cloned [`Arc<T>`].
     ///
-    /// Never waits on another party's progress: the critical section is one
-    /// `Arc` clone. Returns [`None`] only when nothing has ever been published
+    /// Never blocks on a lock (lock-free; see the module docs). The only
+    /// critical section is one `Arc` clone. Returns [`None`] only when nothing has ever been published
     /// (or the slot was explicitly [cleared](LatestSlot::take)).
     #[must_use]
     pub fn load(&self) -> Option<Arc<T>> {

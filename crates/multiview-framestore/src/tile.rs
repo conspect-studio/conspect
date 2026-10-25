@@ -220,9 +220,10 @@ pub struct TileStore<T> {
     /// A bounded, media-time-ordered ring of recently-published frames, used by
     /// [`read_at`](TileStore::read_at) to latch the frame nearest-but-not-after
     /// the output clock's instant (streaming-gotchas §1). Stored as a snapshot
-    /// in a [`SwapCell`] whose only critical sections are a pointer clone or a
-    /// pointer swap, so the reader never waits on the writer's copy (invariant
-    /// #1; the copy runs outside the lock, see #133): the writer copies the (≤ [`RING_CAPACITY`]) ring,
+    /// in a [`SwapCell`], whose publish never waits on a reader and whose
+    /// load never blocks, so neither side waits on the other or on the
+    /// writer's copy (invariant #1; the copy runs outside any lock, see #133):
+    /// the writer copies the (≤ [`RING_CAPACITY`]) ring,
     /// appends, drops the oldest beyond capacity, and atomically swaps it in.
     ///
     /// The publish is O(capacity) copy-on-write **by design** (ADR-T009): that is

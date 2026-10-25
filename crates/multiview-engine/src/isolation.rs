@@ -6,12 +6,12 @@
 //!
 //! * **Latest-state slot** ([`LatestState`]): a single-slot, newest-wins cell
 //!   backed by `multiview-framestore`'s [`LatestSlot`]. The publisher's
-//!   [`LatestState::publish`] is one pointer swap under the slot's lock. A
-//!   reader holds that lock only for one `Arc` clone, never across its own
-//!   work. So the publisher's wait is bounded by a pointer-sized critical
-//!   section, whatever the consumers do. Nothing allocates, frees or does I/O
-//!   under the lock (#133, ADR-T002 addendum). A consumer that never reads
-//!   simply misses intermediate snapshots; it can never make the publisher wait.
+//!   [`LatestState::publish`] never waits on a reader: it writes into a slot
+//!   it can claim without blocking (skipping any slot a reader is inside, even
+//!   one descheduled mid-read) and advances one atomic head. Readers never
+//!   block either. Nothing is dropped under a lock (#133, ADR-T002 addendum). A
+//!   consumer that never reads simply misses intermediate snapshots; it can
+//!   never make the publisher wait.
 //! * **Event stream** ([`EventStream`] / [`EventSubscription`]): a fixed-capacity
 //!   ring built on [`tokio::sync::broadcast`]. The publisher's
 //!   [`EventStream::publish`] calls `broadcast::Sender::send`, which **never
@@ -51,9 +51,8 @@ pub use tokio::sync::broadcast::error::TryRecvError;
 ///
 /// This realizes `tokio::sync::watch`-style "newest-wins" semantics over the
 /// same [`LatestSlot`] primitive `multiview-framestore` uses for invariant #2.
-/// The publish side never waits on consumer progress: one pointer swap under a
-/// lock that readers hold only for an `Arc` clone, with **no `.await`** (see
-/// the module docs for the bound).
+/// The publish side never waits on a consumer, however it is scheduled, and
+/// has **no `.await`** (see the module docs).
 #[derive(Debug)]
 pub struct LatestState<T> {
     slot: Arc<LatestSlot<T>>,
@@ -84,7 +83,7 @@ impl<T> LatestState<T> {
 
     /// Publish the newest state, overwriting any previous value.
     ///
-    /// **Non-blocking**: one pointer swap (bounded; see the module docs).
+    /// **Never waits on a reader** (see the module docs).
     /// Returns the assigned monotonic
     /// sequence number. The engine calls this on the output clock and is
     /// guaranteed it cannot stall here — no consumer can block it.
@@ -94,7 +93,7 @@ impl<T> LatestState<T> {
 
     /// Publish an already-`Arc`-wrapped value, avoiding a second allocation.
     ///
-    /// **Non-blocking** (see [`LatestState::publish`]). Returns the assigned
+    /// **Never waits on a reader** (see [`LatestState::publish`]). Returns the assigned
     /// monotonic sequence number.
     pub fn publish_arc(&self, value: Arc<T>) -> u64 {
         self.slot.publish_arc(value)
@@ -315,7 +314,8 @@ impl<T> EventSubscription<T> {
 /// The runtime holds one of these and calls [`EnginePublisher::publish_state`]
 /// and [`EnginePublisher::publish_event`] once per tick. Both publish paths are
 /// physically incapable of being blocked
-/// by a consumer (invariant #10): the state slot is a wait-free atomic store and
+/// by a consumer (invariant #10): the state slot's publish never waits on a
+/// reader and
 /// the event stream is a `broadcast::Sender::send` that never blocks on slow
 /// receivers.
 #[derive(Debug)]
