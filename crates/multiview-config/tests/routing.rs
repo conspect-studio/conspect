@@ -126,6 +126,49 @@ fn output_crosspoint_rejects_undeclared_program() {
 }
 
 #[test]
+fn declared_program_crosspoint_validates_and_round_trips() {
+    let mut cfg = load_legacy();
+    let mut named = cfg.effective_programs().remove(0);
+    named.id = "aux".try_into().unwrap();
+    cfg.programs = vec![named];
+    let mut routing = cfg.routing_table();
+    for output in &mut routing.output {
+        output.program = "aux".to_owned();
+    }
+    cfg.routing = Some(routing);
+    cfg.validate().unwrap();
+    let encoded = toml::to_string(&cfg).unwrap();
+    let decoded = MultiviewConfig::load_from_toml(&encoded).unwrap();
+    assert_eq!(decoded.programs, cfg.programs);
+    decoded.validate().unwrap();
+    let json = serde_json::to_string(&cfg).unwrap();
+    let decoded: MultiviewConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.programs, cfg.programs);
+}
+
+#[test]
+fn implicit_output_routing_requires_main_program() {
+    let mut cfg = load_legacy();
+    let mut named = cfg.effective_programs().remove(0);
+    named.id = "aux".try_into().unwrap();
+    cfg.programs = vec![named];
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("main") && err.contains("program"), "{err}");
+}
+
+#[test]
+fn duplicate_program_ids_are_rejected() {
+    let mut cfg = load_legacy();
+    let main = cfg.effective_programs().remove(0);
+    cfg.programs = vec![main.clone(), main];
+    assert!(cfg
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate program"));
+}
+
+#[test]
 fn legacy_base_validates_and_has_no_explicit_routing() {
     let cfg = load_legacy();
     cfg.validate().expect("legacy base validates");

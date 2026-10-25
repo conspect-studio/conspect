@@ -444,10 +444,10 @@ impl RoutingTable {
     fn validate_output(&self, refs: &RoutingRefs<'_>) -> Result<(), ConfigError> {
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.output.len());
         for xp in &self.output {
-            if xp.program.is_empty() {
+            if !refs.programs.contains(xp.program.as_str()) {
                 return Err(ConfigError::Validation(format!(
-                    "output crosspoint for {:?} has an empty program",
-                    xp.output
+                    "output crosspoint for {:?} references undeclared program {:?}",
+                    xp.output, xp.program
                 )));
             }
             if !refs.outputs.contains(xp.output.as_str()) {
@@ -485,4 +485,6 @@ pub struct RoutingRefs<'a> {
     /// Declared output ids ([`crate::Output::id`] — explicit operator id, or the
     /// derived label).
     pub outputs: HashSet<&'a str>,
+    /// Declared program ids, or the implicit main id for legacy documents.
+    pub programs: HashSet<&'a str>,
 }

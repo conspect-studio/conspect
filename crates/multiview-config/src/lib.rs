@@ -288,6 +288,10 @@ pub struct MultiviewConfig {
     /// Output sinks/servers.
     #[serde(default)]
     pub outputs: Vec<Output>,
+    /// Declared programs. An absent or empty list desugars to the legacy main
+    /// multiview program; multi-program execution is reserved for MP-7.
+    #[serde(default)]
+    pub programs: Vec<ProgramSpec>,
     /// Content-aware fault probes (black/freeze/silence/loudness), per cell.
     #[serde(default)]
     pub probes: Vec<Probe>,
@@ -522,6 +526,7 @@ impl MultiviewConfig {
         self.validate_sources()?;
         self.validate_cell_bindings()?;
         self.validate_outputs()?;
+        self.validate_programs()?;
         self.validate_audio()?;
         self.validate_probes()?;
         self.validate_tally_profiles()?;
@@ -1070,6 +1075,34 @@ impl MultiviewConfig {
         Ok(())
     }
 
+    /// Return the declared programs, or the implicit legacy main program when
+    /// no `programs` block was supplied. This is the single desugar consumed by
+    /// the CLI; explicit declarations remain unchanged.
+    #[must_use]
+    pub fn effective_programs(&self) -> Vec<ProgramSpec> {
+        if self.programs.is_empty() {
+            vec![ProgramSpec::main_multiview(
+                self.canvas.clone(),
+                self.layout.clone(),
+                self.cells.clone(),
+                self.overlays.clone(),
+                self.outputs.clone(),
+            )]
+        } else {
+            self.programs.clone()
+        }
+    }
+
+    fn validate_programs(&self) -> Result<(), ConfigError> {
+        let mut ids = HashSet::new();
+        for program in self.effective_programs() {
+            if !ids.insert(program.id) {
+                return Err(ConfigError::Validation("duplicate program id".to_owned()));
+            }
+        }
+        Ok(())
+    }
+
     /// Ensure outputs are sane (at least one; each with a non-empty codec where a
     /// codec applies; a non-empty, unique stable id — ADR-0034 / RT-12).
     ///
@@ -1246,11 +1279,10 @@ impl MultiviewConfig {
     /// checked for **consistency** with the legacy cell-bindings: a video
     /// crosspoint may not contradict a `[[cells]]` binding of the same cell
     /// (mirroring ADR-0030's rejection of an inconsistent both-populated
-    /// document). An absent table desugars and is trivially consistent.
+    /// document). An absent table desugars and is validated too, so its implicit
+    /// output→main crosspoints cannot name an undeclared program.
     fn validate_routing(&self) -> Result<(), ConfigError> {
-        let Some(table) = &self.routing else {
-            return Ok(());
-        };
+        let table = self.routing_table();
 
         let tracks = self.selectable_tracks();
         let output_ids = self.output_ids();
@@ -1260,6 +1292,12 @@ impl MultiviewConfig {
             tracks: tracks.iter().copied().collect(),
             layers: self.subtitle_layers(),
             outputs: output_ids.iter().map(String::as_str).collect(),
+            programs: self
+                .programs
+                .iter()
+                .map(|program| program.id.as_str())
+                .chain(self.programs.is_empty().then_some(ProgramId::MAIN))
+                .collect(),
         };
         table.validate(&refs)?;
 

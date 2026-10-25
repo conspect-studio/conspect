@@ -161,6 +161,7 @@ impl ConfigDiff {
             cells: running_cells,
             overlays: running_overlays,
             outputs: running_outputs,
+            programs: running_programs,
             probes: running_probes,
             tally_profiles: running_tally_profiles,
             salvos: running_salvos,
@@ -188,6 +189,7 @@ impl ConfigDiff {
             cells: next_cells,
             overlays: next_overlays,
             outputs: next_outputs,
+            programs: next_programs,
             probes: next_probes,
             tally_profiles: next_tally_profiles,
             salvos: next_salvos,
@@ -234,6 +236,7 @@ impl ConfigDiff {
                 running_schema_version != next_schema_version,
             ),
             ("outputs", running_outputs != next_outputs),
+            ("programs", running_programs != next_programs),
             // Order-sensitive (`Vec` compares by position): a pure overlay
             // REORDER sets this so the file-watch overlay apply (`apply_overlay_
             // changes`) still reseeds the store to the new declaration order — the

@@ -2473,19 +2473,23 @@ impl Pipeline {
         // and simply ride an empty map (inv #10 — never on the hot loop).
         let inventories = build_input_inventories(config);
 
-        // Desugar the legacy single-program config into one implicit `"main"`
-        // `Multiview` program (ADR-0030 §6 / MP-0). The run path is driven through
-        // one `MultiviewProgram` built from this spec; carrying the raw config
-        // block (not the solved layout) keeps the spec the authentic config-derived
-        // program identity the engine consumes. No `programs:` schema root yet
-        // (MP-5) — this is the single-program desugaring, used by the run path.
-        let program_spec = multiview_config::ProgramSpec::main_multiview(
-            config.canvas.clone(),
-            config.layout.clone(),
-            config.cells.clone(),
-            config.overlays.clone(),
-            config.outputs.clone(),
-        );
+        // MP-5 desugars an absent programs block to the legacy main program.
+        // MP-7 owns admission and runtime wiring for N>1; this pipeline still
+        // drives just one program.
+        let mut programs = config.effective_programs().into_iter();
+        let program_spec = programs.next().ok_or_else(|| {
+            PipelineError::Config(multiview_config::ConfigError::Validation(
+                "at least one program must be declared".to_owned(),
+            ))
+        })?;
+        if programs.next().is_some() {
+            return Err(PipelineError::Config(
+                multiview_config::ConfigError::Validation(
+                    "multiple programs require MP-7 admission; CLI currently runs one program"
+                        .to_owned(),
+                ),
+            ));
+        }
 
         Ok(Self {
             layout,
@@ -14476,6 +14480,21 @@ segment_ms = 1000
             "cell_pixel_size must decode at the per-axis supremum across ALL binding \
              cells (ADR-0030 §3), not the first-found cell {first:?}"
         );
+    }
+
+    #[test]
+    fn pipeline_build_consumes_program_desugaring_but_rejects_multiple_programs() {
+        let config = two_cells_one_source_config();
+        let implicit = Pipeline::build(&config).expect("legacy main program builds");
+        let mut explicit = config.clone();
+        explicit.programs = config.effective_programs();
+        let declared = Pipeline::build(&explicit).expect("explicit main program builds");
+        assert_eq!(implicit.program_spec, declared.program_spec);
+
+        explicit.programs.push(explicit.programs[0].clone());
+        explicit.programs[1].id = "aux".try_into().unwrap();
+        let err = Pipeline::build(&explicit).err().expect("N>1 awaits MP-7");
+        assert!(err.to_string().contains("MP-7"), "{err}");
     }
 
     #[test]
