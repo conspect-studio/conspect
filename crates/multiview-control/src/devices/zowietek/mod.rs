@@ -217,6 +217,19 @@ pub enum ConvergenceUngrounded {
         /// The decode index the device reported as active, if any.
         active_index: Option<u32>,
     },
+    /// The decode table could not be read (e.g. the device answers no table in
+    /// its current workmode). The configured index cannot be validated, so no
+    /// mutating call — in particular no `change_workmode` — is made.
+    #[error(
+        "device {device_id} did not return a readable decode table ({reason}); refusing to \
+         change workmode or switch an index that cannot be validated"
+    )]
+    DecodeTableUnreadable {
+        /// The device whose decode table could not be read.
+        device_id: String,
+        /// Why the read failed.
+        reason: String,
+    },
 }
 
 /// A failure to converge a device's decode target.
@@ -680,28 +693,42 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         }
 
         let session = self.session_clone()?;
-        // Decoder workmode first (grounded `get_workmode_id` /
-        // `change_workmode`): the decode table rejects in encoder workmode, and
-        // a slot activation is never a workmode change.
-        self.ensure_decoder_workmode(&session).await?;
-        // The grounded decode-table read: a bare `opt:"streamplay"` returns an
-        // empty `data` (upstream #140 correction 1).
-        let table = DecodeTable::parse(
-            &self
-                .client
-                .get_info(
-                    &session,
-                    protocol::STREAMPLAY_GROUP,
-                    protocol::STREAMPLAY_GET_ALL,
-                    Value::Null,
-                )
-                .await?,
-        );
+        // Validate EVERYTHING before the first mutating call (no refusal may
+        // follow a device mutation): read the grounded decode table
+        // (`streamplay_get_all`; a bare `opt:"streamplay"` returns an empty
+        // `data`) in the device's CURRENT workmode and check the configured
+        // index. A table that cannot be read cannot be validated ⇒ refuse
+        // without `change_workmode`.
+        let raw = self
+            .client
+            .get_info(
+                &session,
+                protocol::STREAMPLAY_GROUP,
+                protocol::STREAMPLAY_GET_ALL,
+                Value::Null,
+            )
+            .await
+            .map_err(|err| ConvergenceUngrounded::DecodeTableUnreadable {
+                device_id: self.device_id.clone(),
+                reason: err.to_string(),
+            })?;
+        if !raw.is_array() && raw.get("entries").is_none() {
+            return Err(ConvergenceUngrounded::DecodeTableUnreadable {
+                device_id: self.device_id.clone(),
+                reason: "reply carried no decode table".to_owned(),
+            }
+            .into());
+        }
+        let table = DecodeTable::parse(&raw);
         let plan = self.plan_decode_convergence(&table)?;
         let ModeConvergence::IndexedSwitch { index, .. } = plan else {
             // `plan_decode_convergence` only ever plans an indexed switch.
             return Ok(());
         };
+        // Only now — every refusal passed — may the device be mutated: the
+        // decoder workmode first (grounded `change_workmode`, confirmed by a
+        // re-read), then the slot switch.
+        self.ensure_decoder_workmode(&session).await?;
 
         // Surface the Class-2 (controlled-reset) disruption before applying.
         let mode = WorkMode::Decoder.as_str();

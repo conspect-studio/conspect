@@ -785,9 +785,8 @@ async fn an_unreflected_change_workmode_fails_without_caching_decoder() {
         matches!(err, ConvergenceError::WorkmodeNotReflected { .. }),
         "{err:?}"
     );
-    assert_eq!(
-        transport.request_count("streamplay"),
-        0,
+    assert!(
+        !wire_opts(&transport).contains(&"streamplay_switch".to_owned()),
         "no slot activation unless the device is confirmed in decoder mode"
     );
     assert_eq!(
@@ -935,8 +934,8 @@ async fn happy_path_validates_then_changes_workmode_then_confirms_then_switches(
     assert_eq!(
         opts,
         [
-            "get_workmode_id",
             "streamplay_get_all",
+            "get_workmode_id",
             "change_workmode",
             "get_workmode_id",
             "streamplay_switch"
