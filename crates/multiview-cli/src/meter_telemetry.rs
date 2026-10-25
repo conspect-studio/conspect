@@ -103,6 +103,7 @@ impl MeterTelemetry {
             .collect();
         let sample = AudioMeter {
             track: self.track,
+            input_id: None,
             peak_db,
             rms_db,
             clip: self.clip,
@@ -114,6 +115,33 @@ impl MeterTelemetry {
         self.frames = 0;
         self.clip = false;
         sample
+    }
+}
+
+/// Maximum distinct per-input tracks metered (bounded memory; excess inputs are
+/// simply not metered, never an error on the audio path).
+pub const MAX_INPUT_TRACKS: usize = 64;
+
+/// Per-input peak/RMS meters: one [`MeterTelemetry`] per routed source, keyed by
+/// source id, with a stable track index (`1..`, first-seen order; `0` is the
+/// program bus).
+#[derive(Debug, Default)]
+pub struct InputMeters {
+    meters: Vec<(String, MeterTelemetry)>,
+}
+
+impl InputMeters {
+    /// An empty set; meters are created on first sight of each input id.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Meter every input's discrete block and return the samples due this call
+    /// (each input is independently conflated to [`METER_EMIT_HZ`]).
+    pub fn push(&mut self, tracks: &[(&str, &AudioBlock)], now_ns: i64) -> Vec<AudioMeter> {
+        let _ = (tracks, now_ns, MAX_INPUT_TRACKS, &mut self.meters);
+        Vec::new()
     }
 }
 
@@ -248,5 +276,42 @@ mod tests {
             backlog <= 8,
             "stalled backlog bounded by capacity: {backlog}"
         );
+    }
+
+    #[test]
+    fn per_input_meters_have_stable_tracks_ids_and_own_levels() {
+        let loud = block(0.5, 0.5);
+        let quiet = block(0.05, 0.05);
+        let mut im = InputMeters::new();
+        let out = im.push(&[("cam_a", &loud), ("cam_b", &quiet)], 0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            (out[0].track, out[0].input_id.as_deref()),
+            (1, Some("cam_a"))
+        );
+        assert_eq!(
+            (out[1].track, out[1].input_id.as_deref()),
+            (2, Some("cam_b"))
+        );
+        assert!((out[0].peak_db[0] - (-6.02)).abs() < 0.05);
+        assert!((out[1].peak_db[0] - (-26.02)).abs() < 0.05);
+        // Same ids on a later call keep their track index; the rate is bounded.
+        let again = im.push(&[("cam_a", &loud), ("cam_b", &quiet)], 5_000_000);
+        assert!(again.is_empty(), "inside the 30 Hz window nothing is due");
+        let later = im.push(&[("cam_b", &quiet), ("cam_a", &loud)], 100_000_000);
+        let mut tracks: Vec<_> = later.iter().map(|m| m.track).collect();
+        tracks.sort_unstable();
+        assert_eq!(tracks, vec![1, 2]);
+    }
+
+    #[test]
+    fn per_input_meters_are_bounded() {
+        let b = block(0.1, 0.1);
+        let ids: Vec<String> = (0..MAX_INPUT_TRACKS + 10)
+            .map(|i| format!("in{i}"))
+            .collect();
+        let tracks: Vec<(&str, &AudioBlock)> = ids.iter().map(|i| (i.as_str(), &b)).collect();
+        let mut im = InputMeters::new();
+        assert_eq!(im.push(&tracks, 0).len(), MAX_INPUT_TRACKS);
     }
 }

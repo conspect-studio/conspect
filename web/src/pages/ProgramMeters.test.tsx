@@ -25,6 +25,7 @@ describe('parseAudioMeter', () => {
   it('parses a wire frame and rejects malformed ones', () => {
     const wire = { track: 0, peak_db: [-6], rms_db: [-12], clip: true, overflow: false, sampled_hz: 30 };
     expect(parseAudioMeter(wire)?.clip).toBe(true);
+    expect(parseAudioMeter({ ...wire, track: 2, input_id: 'cam' })?.input_id).toBe('cam');
     expect(parseAudioMeter({ ...wire, peak_db: 'x' })).toBeUndefined();
     expect(parseAudioMeter({ ...wire, rms_db: [null] })).toBeUndefined();
     expect(parseAudioMeter(null)).toBeUndefined();
@@ -42,12 +43,12 @@ describe('meterFillPercent', () => {
 
 describe('ProgramMetersView', () => {
   it('shows a waiting state before any frame', () => {
-    renderWithProviders(<ProgramMetersView status="open" current={undefined} />);
+    renderWithProviders(<ProgramMetersView status="open" current={undefined} inputs={[]} />);
     expect(screen.getByText(/waiting for meter/i)).toBeInTheDocument();
   });
 
   it('renders per-channel peak and RMS dBFS values from a frame', () => {
-    renderWithProviders(<ProgramMetersView status="open" current={frame()} />);
+    renderWithProviders(<ProgramMetersView status="open" current={frame()} inputs={[]} />);
     expect(screen.getByTestId('meter-peak-0')).toHaveTextContent('-6.0');
     expect(screen.getByTestId('meter-peak-1')).toHaveTextContent('-20.5');
     expect(screen.getByTestId('meter-rms-0')).toHaveTextContent('-12.0');
@@ -56,7 +57,61 @@ describe('ProgramMetersView', () => {
   });
 
   it('flags clipping with text, not colour alone', () => {
-    renderWithProviders(<ProgramMetersView status="open" current={frame({ clip: true })} />);
+    renderWithProviders(<ProgramMetersView status="open" current={frame({ clip: true })} inputs={[]} />);
     expect(screen.getByText(/clip/i)).toBeInTheDocument();
+  });
+});
+
+describe('ProgramMetersView loudness + per-input', () => {
+  const loudness = {
+    program: 0,
+    momentary: -22.5,
+    short_term: -23.2,
+    integrated: -23.0,
+    lra: 5.4,
+    true_peak_dbtp: -3.1,
+    target_lufs: -23,
+    ceiling_dbtp: -1.5,
+    tolerance_lu: 1,
+    sampled_hz: 10,
+  };
+
+  it('renders LUFS (M/S/I), LRA and dBTP from a mocked loudness frame', () => {
+    renderWithProviders(
+      <ProgramMetersView status="open" current={frame()} inputs={[]} loudness={loudness} />,
+    );
+    expect(screen.getByTestId('meter-lufs-m')).toHaveTextContent('-22.5');
+    expect(screen.getByTestId('meter-lufs-s')).toHaveTextContent('-23.2');
+    expect(screen.getByTestId('meter-lufs-i')).toHaveTextContent('-23.0');
+    expect(screen.getByTestId('meter-lra')).toHaveTextContent('5.4');
+    expect(screen.getByTestId('meter-dbtp')).toHaveTextContent('-3.1');
+  });
+
+  it('shows dashes for absent loudness fields, never a fabricated number', () => {
+    renderWithProviders(
+      <ProgramMetersView
+        status="open"
+        current={frame()}
+        inputs={[]}
+        loudness={{ ...loudness, momentary: undefined, integrated: undefined }}
+      />,
+    );
+    expect(screen.getByTestId('meter-lufs-m')).toHaveTextContent('—');
+    expect(screen.getByTestId('meter-lufs-i')).toHaveTextContent('—');
+  });
+
+  it('renders one meter row per input track with its source id', () => {
+    renderWithProviders(
+      <ProgramMetersView
+        status="open"
+        current={frame()}
+        inputs={[
+          frame({ track: 1, input_id: 'cam_a', peak_db: [-10, -11] }),
+          frame({ track: 2, input_id: 'cam_b', peak_db: [-30, -31] }),
+        ]}
+      />,
+    );
+    expect(screen.getByTestId('input-meter-cam_a')).toHaveTextContent('-10.0');
+    expect(screen.getByTestId('input-meter-cam_b')).toHaveTextContent('-30.0');
   });
 });

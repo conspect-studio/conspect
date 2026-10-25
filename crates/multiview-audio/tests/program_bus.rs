@@ -152,3 +152,33 @@ fn repoint_of_a_nonexistent_point_is_a_clean_error_no_panic() {
         "repointing an unknown point must be an UnknownInput error, got {err:?}"
     );
 }
+
+#[test]
+fn input_tracks_expose_each_routed_sources_discrete_block_after_a_tick() {
+    let fmt = AudioFormat::new(48_000, ChannelLayout::Stereo);
+    let mut bus = ProgramBus::new(fmt, Rational::new(25, 1));
+    assert!(
+        bus.input_tracks().is_empty(),
+        "nothing before the first mix"
+    );
+    let loud = Arc::new(AudioStore::new(fmt, 48_000));
+    let quiet = Arc::new(AudioStore::new(fmt, 48_000));
+    loud.publish(&AudioBlock::from_interleaved(fmt, vec![0.5; 2 * 4800]).unwrap())
+        .unwrap();
+    quiet
+        .publish(&AudioBlock::from_interleaved(fmt, vec![0.1; 2 * 4800]).unwrap())
+        .unwrap();
+    bus.add_source("loud", loud, 1.0);
+    bus.add_source("quiet", quiet, 1.0);
+    let program = bus.tick();
+    let tracks = bus.input_tracks();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].0, "loud");
+    assert_eq!(tracks[1].0, "quiet");
+    assert_eq!(tracks[0].1.frame_count(), program.frame_count());
+    assert!(
+        (tracks[0].1.interleaved()[0] - 0.5).abs() < 1e-6,
+        "pre-mix, unaltered"
+    );
+    assert!((tracks[1].1.interleaved()[0] - 0.1).abs() < 1e-6);
+}

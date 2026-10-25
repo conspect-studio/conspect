@@ -297,6 +297,16 @@ impl ProgramBus {
         self.mixer.live_input_count()
     }
 
+    /// The discrete (pre-mix, unaltered) block each routed source contributed to
+    /// the **last** mix, as `(source id, block)`, in route order. Read-only; the
+    /// per-input meter tap (AUD-8 / SW-14) reads this after each tick. Empty
+    /// before the first mix.
+    #[must_use]
+    pub fn input_tracks(&self) -> Vec<(&str, &AudioBlock)> {
+        let _ = &self.routes;
+        Vec::new()
+    }
+
     /// Mix one output tick of program audio.
     ///
     /// Advances the [`SampleClock`] by one tick to

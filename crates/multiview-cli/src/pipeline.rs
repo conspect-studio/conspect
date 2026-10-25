@@ -2811,6 +2811,21 @@ impl Pipeline {
     /// sink fails. Input exhaustion is **not** an error: a source past its last
     /// frame holds its last-good frame, so the output keeps emitting on cadence.
     pub async fn run_for(&mut self, max_ticks: u64) -> Result<PipelineReport, PipelineError> {
+        let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
+        self.run_for_publishing(max_ticks, &publisher).await
+    }
+
+    /// Like [`Pipeline::run_for`], but the engine's outbound `publisher` is
+    /// supplied by the caller so a test (or tool) can subscribe to the realtime
+    /// events (e.g. `audio.meter`) the bake consumer pushes during the run.
+    ///
+    /// # Errors
+    /// See [`Pipeline::run_for`].
+    pub async fn run_for_publishing(
+        &mut self,
+        max_ticks: u64,
+        publisher: &EnginePublisher<EngineStateSnapshot, Event>,
+    ) -> Result<PipelineReport, PipelineError> {
         let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
         let stop = StopSignal::new();
         // Offline render: block-for-exact so every tick is encoded (exact N). The
@@ -2820,9 +2835,6 @@ impl Pipeline {
             runners: self.build_sink_runners(false),
             hot_tick_observer: None,
         };
-        // Offline render serves no UI: a throwaway publisher/preview + no-op
-        // control hook.
-        let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
         let preview = crate::preview::program_slot();
         let out = self
             .drive_streaming(
@@ -2831,7 +2843,7 @@ impl Pipeline {
                 &stop,
                 Some(max_ticks),
                 plan,
-                &publisher,
+                publisher,
                 &preview,
                 |_: &mut CompositorDrive<Nv12Image>| {},
             )

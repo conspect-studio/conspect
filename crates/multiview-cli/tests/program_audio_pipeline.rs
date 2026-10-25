@@ -541,3 +541,98 @@ async fn bars_source_program_audio_is_a_1khz_tone() {
         "bars program audio dominant frequency {hz} Hz must be the ~1 kHz line-up tone"
     );
 }
+
+/// #101 (AUD-8 / SW-14) end-to-end: a real pipeline run with program audio
+/// publishes bounded-rate `audio.meter` frames (program bus + per-input) onto the
+/// engine's event stream that the server's realtime hub subscribes to, while a
+/// subscriber that NEVER reads (stalled, tiny drop-oldest ring) cannot delay the
+/// output clock: the run still produces exactly N frames for N ticks and does not
+/// falter (inv #1 / #10).
+#[tokio::test]
+async fn audio_meter_frames_are_bounded_rate_and_a_stalled_subscriber_never_delays_ticks() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use multiview_engine::{EnginePublisher, TryRecvError};
+    use multiview_events::Event;
+
+    const TICKS: u64 = 50; // 2.0 s @ 25 fps.
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let playlist = dir.path().join("out").join("index.m3u8");
+    let config =
+        MultiviewConfig::load_from_toml(&bars_source_config_text(&playlist)).expect("parse config");
+    config.validate().expect("config validates");
+    let mut pipeline = Pipeline::build(&config).expect("build real pipeline");
+    pipeline.enable_program_audio();
+
+    // Tiny ring so the stalled subscriber is guaranteed to lag (drop-oldest).
+    let publisher: EnginePublisher<multiview_control::EngineStateSnapshot, Event> =
+        EnginePublisher::new(16);
+    let mut stalled = publisher.subscribe();
+    let mut live = publisher.subscribe();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_rx = Arc::clone(&done);
+    let drain = tokio::spawn(async move {
+        let mut program = 0_u32;
+        let mut input = 0_u32;
+        let mut input_ids: Vec<String> = Vec::new();
+        loop {
+            match live.try_recv() {
+                Ok(ev) => {
+                    if let Event::AudioMeter(m) = &*ev.event {
+                        if m.track == 0 {
+                            program += 1;
+                        } else {
+                            input += 1;
+                            if let Some(id) = &m.input_id {
+                                if !input_ids.contains(id) {
+                                    input_ids.push(id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(_) => {
+                    if done_rx.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        }
+        (program, input, input_ids)
+    });
+
+    let report = pipeline
+        .run_for_publishing(TICKS, &publisher)
+        .await
+        .expect("bounded run");
+    done.store(true, Ordering::Release);
+    let (program, input, input_ids) = drain.await.expect("drain task");
+
+    assert_eq!(
+        report.frames, TICKS,
+        "a stalled subscriber must not drop ticks"
+    );
+    assert!(
+        !report.faltered,
+        "a stalled subscriber must not falter output"
+    );
+    // ~30 Hz conflated over ~2 s => at most ~62; far fewer than a per-block flood.
+    assert!(
+        (15..=65).contains(&program),
+        "program-bus meter frames should be bounded (~<=30 Hz), got {program}"
+    );
+    assert!(input > 0, "per-input meter frames must be emitted");
+    assert_eq!(
+        input_ids,
+        vec!["in_a".to_owned()],
+        "per-input frames carry the source id"
+    );
+    assert!(
+        matches!(stalled.try_recv(), Err(TryRecvError::Lagged(_))),
+        "the stalled subscriber loses its own frames (drop-oldest)"
+    );
+}
