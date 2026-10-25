@@ -274,15 +274,50 @@ fn parked_lever_returning_to_bottom_does_not_abort_an_independent_auto() {
     assert!(state.tbar(u16::MAX, tick(1)).unwrap().completed);
     assert_eq!(state.program(), &source("b"));
     assert!(state.auto(tick(10)).unwrap().started);
-    assert_eq!(state.tbar(40000, tick(11)).unwrap().progress, Progress::ZERO);
+    assert_eq!(
+        state.tbar(40000, tick(11)).unwrap().progress,
+        Progress::ZERO
+    );
     let returned = state.tbar(0, tick(12)).unwrap();
-    assert_eq!(returned.progress, Progress::new(2, FrameCount::try_from(5).unwrap()));
+    assert_eq!(
+        returned.progress,
+        Progress::new(2, FrameCount::try_from(5).unwrap())
+    );
     assert!(!returned.started && !returned.completed);
     assert!(state.is_in_flight());
     assert_eq!(state.program(), &source("b"));
     assert!(state.sample(tick(15)).completed);
     assert_eq!(state.program(), &source("a"));
     assert_eq!(state.completion_count(), 2);
+}
+
+#[test]
+fn parked_lever_return_after_cut_or_punch_preserves_independent_auto() {
+    for ending in ["cut", "punch"] {
+        let mut state = configured();
+        state
+            .set_transition(TransitionDescriptor::Mix {
+                rate: FrameCount::try_from(5).unwrap(),
+            })
+            .unwrap();
+        state.tbar(30000, tick(1)).unwrap();
+        if ending == "cut" {
+            assert!(state.cut().unwrap().completed);
+        } else {
+            assert!(state.punch(source("c")).completed);
+        }
+        let program = state.program().clone();
+        assert!(state.auto(tick(10)).unwrap().started);
+        assert_eq!(
+            state.tbar(0, tick(12)).unwrap().progress,
+            Progress::new(2, FrameCount::try_from(5).unwrap())
+        );
+        assert!(state.is_in_flight(), "ending={ending}");
+        assert_eq!(state.program(), &program);
+        assert!(state.sample(tick(15)).completed);
+        assert_eq!(state.completion_count(), 2);
+        assert_ne!(state.program(), &program);
+    }
 }
 
 #[test]
@@ -442,9 +477,8 @@ impl ReferenceStateMachine for Reference {
                 let parked = state.lever_out_of_sync;
                 state.last_manual_position = 0;
                 state.lever_out_of_sync = false;
-                if !parked {
-                    state.flight = None;
-                } else if matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
+                if !parked
+                    || matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
                 {
                     state.flight = None;
                 }

@@ -274,21 +274,22 @@ impl SwitcherState {
     }
 
     /// Set the absolute u16 T-bar position; duplicates do not advance progress.
-    /// Manual input overrides any AUTO ramp; position zero cancels the flight.
-    /// After a take ends above zero, nonzero input is ignored until zero re-arms it.
+    /// Manual input overrides any AUTO ramp; an in-sync zero cancels the flight.
+    /// After a take ends above zero, lever input is inert until zero re-arms it.
     ///
     /// # Errors
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
-    pub fn tbar(
-        &mut self,
-        position: u16,
-        _tick: Tick,
-    ) -> Result<SwitcherProjection, SwitcherError> {
+    pub fn tbar(&mut self, position: u16, tick: Tick) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
         if position == 0 {
+            let parked = self.lever_out_of_sync;
             self.last_manual_position = 0;
             self.lever_out_of_sync = false;
-            return Ok(self.abort());
+            return Ok(if parked {
+                self.sample(tick)
+            } else {
+                self.abort()
+            });
         }
         if self.lever_out_of_sync {
             return Ok(SwitcherProjection::idle());
