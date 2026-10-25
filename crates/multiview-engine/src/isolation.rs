@@ -5,12 +5,13 @@
 //! *physically incapable* of being blocked by any consumer:
 //!
 //! * **Latest-state slot** ([`LatestState`]): a single-slot, newest-wins cell
-//!   backed by [`arc_swap::ArcSwapOption`] (the same primitive
-//!   `multiview-framestore` uses). The publisher's [`LatestState::publish`] is a
-//!   single atomic `store` — **wait-free**: it acquires no lock, never spins on
-//!   a reader, and cannot be made to wait by any number of concurrent readers. A
-//!   consumer that never reads simply misses intermediate snapshots; it can
-//!   never make the publisher wait.
+//!   backed by `multiview-framestore`'s [`LatestSlot`]. The publisher's
+//!   [`LatestState::publish`] is one pointer swap under the slot's lock. A
+//!   reader holds that lock only for one `Arc` clone, never across its own
+//!   work. So the publisher's wait is bounded by a pointer-sized critical
+//!   section, whatever the consumers do. Nothing allocates, frees or does I/O
+//!   under the lock (#133, ADR-T002 addendum). A consumer that never reads
+//!   simply misses intermediate snapshots; it can never make the publisher wait.
 //! * **Event stream** ([`EventStream`] / [`EventSubscription`]): a fixed-capacity
 //!   ring built on [`tokio::sync::broadcast`]. The publisher's
 //!   [`EventStream::publish`] calls `broadcast::Sender::send`, which **never
@@ -41,7 +42,7 @@ use tokio::sync::broadcast;
 pub use tokio::sync::broadcast::error::RecvError;
 pub use tokio::sync::broadcast::error::TryRecvError;
 
-/// A latest-state publisher: a lock-free, newest-wins single slot.
+/// A latest-state publisher: a non-blocking, newest-wins single slot.
 ///
 /// The engine publishes a snapshot (e.g. the current set of tile states, the
 /// degradation level) every tick or every few ticks; a control/preview consumer
@@ -49,9 +50,10 @@ pub use tokio::sync::broadcast::error::TryRecvError;
 /// — it just observes a more recent snapshot when it next reads.
 ///
 /// This realizes `tokio::sync::watch`-style "newest-wins" semantics over the
-/// same lock-free [`arc_swap::ArcSwapOption`] primitive `multiview-framestore`
-/// uses. The publish side is **wait-free**: a single atomic store with **no
-/// `.await`**, **no lock**, and no observation of consumer progress.
+/// same [`LatestSlot`] primitive `multiview-framestore` uses for invariant #2.
+/// The publish side never waits on consumer progress: one pointer swap under a
+/// lock that readers hold only for an `Arc` clone, with **no `.await`** (see
+/// the module docs for the bound).
 #[derive(Debug)]
 pub struct LatestState<T> {
     slot: Arc<LatestSlot<T>>,
@@ -82,7 +84,8 @@ impl<T> LatestState<T> {
 
     /// Publish the newest state, overwriting any previous value.
     ///
-    /// **Wait-free**: a single atomic store. Returns the assigned monotonic
+    /// **Non-blocking**: one pointer swap (bounded; see the module docs).
+    /// Returns the assigned monotonic
     /// sequence number. The engine calls this on the output clock and is
     /// guaranteed it cannot stall here — no consumer can block it.
     pub fn publish(&self, value: T) -> u64 {
@@ -91,7 +94,7 @@ impl<T> LatestState<T> {
 
     /// Publish an already-`Arc`-wrapped value, avoiding a second allocation.
     ///
-    /// **Wait-free** (see [`LatestState::publish`]). Returns the assigned
+    /// **Non-blocking** (see [`LatestState::publish`]). Returns the assigned
     /// monotonic sequence number.
     pub fn publish_arc(&self, value: Arc<T>) -> u64 {
         self.slot.publish_arc(value)

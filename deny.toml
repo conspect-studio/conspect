@@ -86,6 +86,13 @@ allow = [
 ]
 
 [bans]
+# arc-swap (all versions through 1.9.3): its default hybrid strategy can make
+# `load`/`load_full` on one instance return an `Arc` that was stored into
+# ANOTHER instance (process-global debt list keyed by raw address; upstream
+# https://github.com/vorner/arc-swap/issues/210, open, no RustSec advisory
+# yet). `multiview-framestore` (the invariant-#2 slot) no longer uses it (#133,
+# ADR-T002 addendum). Remaining users are listed in that addendum. New uses on
+# the data plane must not use `DefaultStrategy`.
 multiple-versions = "warn"
 # Deny real `version = "*"` wildcards on registry crates, but exempt
 # intra-workspace `path` dependencies: the `multiview-*` crates depend on each
