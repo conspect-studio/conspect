@@ -834,11 +834,15 @@ async fn declared_program_survives_output_and_cell_mutations(program_id: &str) {
     boot.programs[0].id = program_id.try_into().expect("valid program id");
     boot.programs[0].display_name = Some("Operator program".to_owned());
     boot.programs[0].autostart = false;
-    let mut routing = boot.routing_table();
-    for output in &mut routing.output {
-        output.program = program_id.to_owned();
+    boot.programs[0].on_loss = multiview_config::FailoverSlate::Black;
+    if program_id != "main" {
+        let mut routing = boot.routing_table();
+        routing.video.clear();
+        for output in &mut routing.output {
+            program_id.clone_into(&mut output.program);
+        }
+        boot.routing = Some(routing);
     }
-    boot.routing = Some(routing);
     boot.validate().expect("declared program validates");
     let r = rig(&boot.to_toml().expect("declared program renders"));
 
@@ -908,8 +912,15 @@ async fn assert_declared_program_exports_and_persists(
     exported.validate().expect("export validates");
     assert_eq!(exported.programs.len(), 1, "retain declared program");
     assert_eq!(exported.programs[0].id.as_str(), program_id);
-    assert_eq!(exported.programs[0].display_name.as_deref(), Some("Operator program"));
+    assert_eq!(
+        exported.programs[0].display_name.as_deref(),
+        Some("Operator program")
+    );
     assert!(!exported.programs[0].autostart);
+    assert_eq!(
+        exported.programs[0].on_loss,
+        multiview_config::FailoverSlate::Black
+    );
     assert_eq!(exported.programs[0].outputs, exported.outputs);
     assert_eq!(exported.outputs.len(), 2, "export new output");
     assert_eq!(
@@ -931,8 +942,15 @@ async fn assert_declared_program_exports_and_persists(
     active.validate().expect("active validates");
     assert_eq!(active.programs.len(), 1, "persist declared program");
     assert_eq!(active.programs[0].id.as_str(), program_id);
-    assert_eq!(active.programs[0].display_name.as_deref(), Some("Operator program"));
+    assert_eq!(
+        active.programs[0].display_name.as_deref(),
+        Some("Operator program")
+    );
     assert!(!active.programs[0].autostart);
+    assert_eq!(
+        active.programs[0].on_loss,
+        multiview_config::FailoverSlate::Black
+    );
     assert_eq!(active.programs[0].outputs, active.outputs);
     assert_eq!(active.outputs.len(), 2, "persist new output");
 }

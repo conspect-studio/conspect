@@ -2758,6 +2758,12 @@ impl Pipeline {
         self.encode_cfg.audio = Some(program_audio_encode_config());
     }
 
+    /// Identity of the sole admitted program (implicit main or declared).
+    #[must_use]
+    pub fn program_id(&self) -> &multiview_config::ProgramId {
+        &self.program_spec.id
+    }
+
     /// Whether this run carries **program audio** (`enable_program_audio` was
     /// called): the bake consumer mixes + encodes a program-audio stream. The
     /// binary checks this to decide whether to wire a WHEP program-audio tap.

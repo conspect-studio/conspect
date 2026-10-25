@@ -147,11 +147,15 @@ fn declared_program_crosspoint_validates_and_round_trips() {
 }
 
 #[test]
-fn implicit_output_routing_requires_main_program() {
+fn explicit_output_routing_defaults_to_main_and_rejects_undeclared_program() {
     let mut cfg = load_legacy();
     let mut named = cfg.effective_programs().remove(0);
     named.id = "aux".try_into().unwrap();
     cfg.programs = vec![named];
+    let output = cfg.outputs[0].id();
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    value["routing"] = serde_json::json!({"output": [{"output": output}]});
+    let cfg: MultiviewConfig = serde_json::from_value(value).unwrap();
     let err = cfg.validate().unwrap_err().to_string();
     assert!(err.contains("main") && err.contains("program"), "{err}");
 }

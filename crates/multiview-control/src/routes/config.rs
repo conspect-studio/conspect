@@ -404,7 +404,7 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     // against the declared sources (the `PUT /api/v1/audio-routing` check
     // intentionally defers).
     insert_store_backed_sections(doc, state)?;
-    refresh_declared_main(doc)?;
+    refresh_declared_program(doc)?;
     // The composition is returned with secrets INTACT. The redaction for the
     // outward-facing export happens in `compose_export_document`; the Running
     // snapshot (`compose_running_config`) keeps the real credentials so a
@@ -412,37 +412,44 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     Ok(document)
 }
 
-/// While MP-5 runs N=1, a declared main multiview program mirrors the
-/// store-composed legacy sections. Never replace non-main or multi-program
-/// declarations: validation must still reject those unsupported shapes.
-fn refresh_declared_main(
+/// While MP-5 runs N=1, synchronize the declared program with the live
+/// sections. Preserve the authored metadata and leave N>1 to validation.
+fn refresh_declared_program(
     doc: &mut serde_json::Map<String, serde_json::Value>,
 ) -> ControlResult<()> {
-    let declared_main = matches!(
-        doc.get("programs")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|programs| programs.as_slice().first().filter(|_| programs.len() == 1)),
-        Some(program) if program.get("id").and_then(serde_json::Value::as_str) == Some("main")
-            && program.get("kind").and_then(serde_json::Value::as_str) == Some("multiview")
-    );
-    if declared_main {
-        let composed: multiview_config::MultiviewConfig =
-            serde_json::from_value(serde_json::Value::Object(doc.clone())).map_err(|error| {
-                ControlError::Validation(format!(
-                    "the composed main program cannot be read: {error}"
-                ))
-            })?;
-        let main = multiview_config::ProgramSpec::main_multiview(
-            composed.canvas,
-            composed.layout,
-            composed.cells,
-            composed.overlays,
-            composed.outputs,
-        );
-        let program = serde_json::to_value(main).map_err(|error| {
-            ControlError::Repository(format!("serializing the composed main program: {error}"))
+    if !matches!(doc.get("programs"), Some(serde_json::Value::Array(programs)) if programs.len() == 1)
+    {
+        return Ok(());
+    }
+    let mut composed: multiview_config::MultiviewConfig =
+        serde_json::from_value(serde_json::Value::Object(doc.clone())).map_err(|error| {
+            ControlError::Validation(format!("the composed program cannot be read: {error}"))
         })?;
-        doc.insert("programs".to_owned(), serde_json::json!([program]));
+    composed.refresh_single_program();
+    let refreshed = serde_json::to_value(&composed.programs).map_err(|error| {
+        ControlError::Repository(format!("serializing the composed program: {error}"))
+    })?;
+    let Some(original) = doc
+        .get_mut("programs")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|programs| programs.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let Some(payload) = refreshed
+        .as_array()
+        .and_then(|programs| programs.first())
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(ControlError::Repository(
+            "the composed program has no serialized payload".to_owned(),
+        ));
+    };
+    for field in ["canvas", "layout", "cells", "overlays", "outputs"] {
+        if let Some(value) = payload.get(field) {
+            original.insert(field.to_owned(), value.clone());
+        }
     }
     Ok(())
 }

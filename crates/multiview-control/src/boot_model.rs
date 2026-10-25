@@ -630,20 +630,8 @@ pub async fn persist_running_now(state: &AppState) -> ControlResult<()> {
     config.layout = layout;
     config.cells = cells;
     // The adopted layout/overlays may differ from the requested live stores.
-    // Keep the explicit MP-5 main mirror aligned with the adopted snapshot too.
-    if matches!(
-        config.programs.as_slice(),
-        [program] if program.id.as_str() == "main"
-            && matches!(program.kind, multiview_config::ProgramKind::Multiview { .. })
-    ) {
-        config.programs = vec![multiview_config::ProgramSpec::main_multiview(
-            config.canvas.clone(),
-            config.layout.clone(),
-            config.cells.clone(),
-            config.overlays.clone(),
-            config.outputs.clone(),
-        )];
-    }
+    // Resynchronize the sole declared program without changing its metadata.
+    config.refresh_single_program();
     config.validate().map_err(|e| {
         ControlError::Validation(format!("the adopted running config does not validate: {e}"))
     })?;

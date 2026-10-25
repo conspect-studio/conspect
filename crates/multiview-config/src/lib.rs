@@ -1093,6 +1093,25 @@ impl MultiviewConfig {
         }
     }
 
+    /// Refresh the payload of the sole declared multiview program from the
+    /// legacy top-level sections without changing its identity or metadata.
+    /// The implicit main program has no declaration to refresh.
+    pub fn refresh_single_program(&mut self) {
+        if let [program] = self.programs.as_mut_slice() {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &mut program.kind;
+            canvas.clone_from(&self.canvas);
+            layout.clone_from(&self.layout);
+            cells.clone_from(&self.cells);
+            overlays.clone_from(&self.overlays);
+            program.outputs.clone_from(&self.outputs);
+        }
+    }
+
     fn validate_programs(&self) -> Result<(), ConfigError> {
         let mut ids = HashSet::new();
         for program in self.effective_programs() {
@@ -1284,13 +1303,17 @@ impl MultiviewConfig {
             }
         }
 
-        // OUTPUT: each declared output → an output crosspoint on the single
-        // "main" program (until ADR-0030's ProgramSet lands), addressed by the
-        // output's stable id (explicit operator id, or the derived label — RT-12).
+        // OUTPUT: each output targets the sole declared program, or the implicit
+        // legacy main program. N>1 admission remains the responsibility of MP-7.
+        let program = self
+            .programs
+            .first()
+            .filter(|_| self.programs.len() == 1)
+            .map_or(MAIN_PROGRAM, |spec| spec.id.as_str());
         for output in &self.outputs {
             table.output.push(OutputCrosspoint {
                 output: output.id(),
-                program: MAIN_PROGRAM.to_owned(),
+                program: program.to_owned(),
             });
         }
 
