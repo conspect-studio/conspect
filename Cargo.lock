@@ -3291,6 +3291,7 @@ dependencies = [
  "multiview-overlay",
  "multiview-telemetry",
  "proptest",
+ "proptest-state-machine",
  "rustix",
  "serde",
  "serde_json",
