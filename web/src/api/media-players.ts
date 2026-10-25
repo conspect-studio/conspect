@@ -24,8 +24,7 @@ import {
   readProblem,
   submitOperation,
 } from './operations';
-import { trackAccepted } from './operations';
-import type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
+import type { AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** A configured media player, exactly as the control plane returns it. */
@@ -47,14 +46,6 @@ function isMediaPlayer(value: unknown): value is MediaPlayer {
     typeof value.id === 'string' &&
     typeof value.name === 'string' &&
     'body' in value
-  );
-}
-
-function isAcceptedBody(value: unknown): value is AcceptedBody {
-  return (
-    isRecord(value) &&
-    typeof value.operation_id === 'string' &&
-    typeof value.kind === 'string'
   );
 }
 
@@ -112,19 +103,7 @@ async function submitTransport(
   body: TransportBody,
   options: RequestOptions = {},
 ): Promise<AcceptedOperation> {
-  const response = await fetch(apiUrl(options, path), {
-    method: 'POST',
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    throw await readProblem(response);
-  }
-  const parsed: unknown = await response.json();
-  if (!isAcceptedBody(parsed)) {
-    throw new OperationApiError('The server returned an unexpected command body.');
-  }
-  return trackAccepted(parsed);
+  return submitOperation(path, options, { body });
 }
 
 /** Load an asset into a player (`POST .../load`, body `{ asset }`). */

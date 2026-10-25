@@ -6,12 +6,16 @@
 import { t } from '@lingui/core/macro';
 
 import { toast } from '../components/ui/use-toast';
+import { REPLAY_KIND } from '../realtime/correlatedCommands';
 import type { OperationOutcome } from '../realtime/operations';
 
 /** The slice of an accepted command this module needs. */
 export interface FollowableOperation {
   readonly operation_id: string;
-  readonly completion: Promise<OperationOutcome>;
+  /** Absent for commands the server does not correlate (acceptance-only). */
+  readonly completion?: Promise<OperationOutcome>;
+  /** The 202 body `kind`; `replay` means the original command's kind is unknown. */
+  readonly kind?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -52,6 +56,14 @@ export function followOperation(
       description: `${label} — ${t`Operation id`}: ${accepted.operation_id}`,
     },
   );
+  if (accepted.completion === undefined) {
+    // Uncorrelated command: the server never echoes a `corr` for it, so there is
+    // no outcome to wait for and no timeout to report.
+    return;
+  }
+  // A replayed acceptance may be of an uncorrelated command: report an outcome
+  // if one arrives, but never claim a timeout.
+  const silentTimeout = accepted.kind === REPLAY_KIND;
   accepted.completion.then(
     (outcome): void => {
       const type = outcome.envelope.t;
@@ -67,6 +79,9 @@ export function followOperation(
       toast({ title: t`${label} completed` });
     },
     (): void => {
+      if (silentTimeout) {
+        return;
+      }
       toast({
         title: t`Outcome not received`,
         description: t`${label}: no result arrived for operation ${accepted.operation_id}. It may still be running.`,

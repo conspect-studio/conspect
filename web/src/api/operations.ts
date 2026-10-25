@@ -20,6 +20,7 @@
 // caller can surface the id. `ETag`/`If-Match` optimistic concurrency is honoured
 // on the version-stamped mutations (alarm ack, salvo/profile replace + delete).
 import type { components } from './schema';
+import { isCorrelatedKind, REPLAY_KIND } from '../realtime/correlatedCommands';
 import { correlateOperation } from '../realtime/operations';
 import type { OperationOutcome } from '../realtime/operations';
 import { getStoredToken } from './token';
@@ -36,11 +37,19 @@ export type AcceptedBody = components['schemas']['AcceptedBody'];
  * early-outcome cache), rejects on timeout. Ignoring it is safe.
  */
 export type AcceptedOperation = AcceptedBody & {
-  readonly completion: Promise<OperationOutcome>;
+  /**
+   * Present only when the server correlates this command's outcome (see
+   * `../realtime/correlatedCommands`) or the acceptance is an Idempotency-Key
+   * replay (the original kind is unknown). Absent = acceptance-only.
+   */
+  readonly completion?: Promise<OperationOutcome>;
 };
 
 /** Register an accepted body for correlation and attach its completion promise. */
 export function trackAccepted(body: AcceptedBody): AcceptedOperation {
+  if (!isCorrelatedKind(body.kind) && body.kind !== REPLAY_KIND) {
+    return { ...body };
+  }
   const completion = correlateOperation(body);
   // A caller that never awaits `completion` must not trigger an unhandled rejection.
   completion.catch(() => undefined);
@@ -148,23 +157,51 @@ function isAcceptedBody(value: unknown): value is AcceptedBody {
   );
 }
 
+/** Options for {@link sendCommand}. */
+export interface CommandRequest {
+  /** HTTP method (defaults to `POST`). */
+  readonly method?: 'POST' | 'PUT' | 'DELETE';
+  /** JSON body; omitted for body-less commands. */
+  readonly body?: unknown;
+}
+
 /**
- * `POST` a long-running command and return its `202 Accepted` body. The
- * command's outcome arrives later on the realtime stream, never in this response
- * (conventions section 6).
+ * The single place every 202 command request is sent: mints the default
+ * `crypto.randomUUID` `Idempotency-Key` (an explicit `options.idempotencyKey`
+ * wins) and applies the JSON body, if any. Returns the raw response so callers
+ * with a non-standard success shape (route take 200/202, set-mode, scan) can
+ * parse it themselves; non-2xx responses throw the RFC 9457 problem.
  */
-export async function submitOperation(
+export async function sendCommand(
   path: string,
   options: RequestOptions = {},
-): Promise<AcceptedOperation> {
+  request: CommandRequest = {},
+): Promise<Response> {
   const idempotencyKey = options.idempotencyKey ?? crypto.randomUUID();
+  const hasBody = request.body !== undefined;
   const response = await fetch(apiUrl(options, path), {
-    method: 'POST',
-    headers: buildHeaders({ ...options, idempotencyKey }, false),
+    method: request.method ?? 'POST',
+    headers: buildHeaders({ ...options, idempotencyKey }, hasBody),
+    ...(hasBody ? { body: JSON.stringify(request.body) } : {}),
   });
   if (!response.ok) {
     throw await readProblem(response);
   }
+  return response;
+}
+
+/**
+ * Send a long-running command (optionally with a JSON body) and return its `202
+ * Accepted` body. The outcome arrives later on the realtime stream, never in this
+ * response (conventions section 6); completion tracking is attached only for
+ * commands the server correlates.
+ */
+export async function submitOperation(
+  path: string,
+  options: RequestOptions = {},
+  request: CommandRequest = {},
+): Promise<AcceptedOperation> {
+  const response = await sendCommand(path, options, request);
   const body: unknown = await response.json();
   if (!isAcceptedBody(body)) {
     throw new OperationApiError('The server returned an unexpected command body.');

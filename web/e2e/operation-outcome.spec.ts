@@ -14,7 +14,7 @@ test("salvo take shows acceptance, then the failure outcome with its reason", as
   );
   let socket: WebSocketRoute | undefined;
   await page.route("**/api/v1/salvos/s1/take", async (route) => {
-    await route.fulfill({ status: 202, json: { operation_id: "op-e2e-1", kind: "take" } });
+    await route.fulfill({ status: 202, json: { operation_id: "op-e2e-1", kind: "take_salvo" } });
     // The outcome envelope follows the 202 on the (mocked) realtime socket.
     setTimeout(() => {
       socket?.send(

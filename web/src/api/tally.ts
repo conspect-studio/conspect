@@ -19,9 +19,9 @@ import {
   buildHeaders,
   OperationApiError,
   readProblem,
+  submitOperation,
 } from './operations';
-import { trackAccepted } from './operations';
-import type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
+import type { AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** One resolved tally entry (target + lamp state). */
@@ -57,14 +57,6 @@ function isTallyEntry(value: unknown): value is TallyEntry {
 
 function isProfile(value: unknown): value is TallyProfile {
   return isRecord(value) && typeof value.id === 'string';
-}
-
-function isAcceptedBody(value: unknown): value is AcceptedBody {
-  return (
-    isRecord(value) &&
-    typeof value.operation_id === 'string' &&
-    typeof value.kind === 'string'
-  );
 }
 
 /** List resolved tally state (`GET /api/v1/tally`). */
@@ -164,19 +156,7 @@ async function submitOverride(
   payload: Record<string, unknown>,
   options: RequestOptions,
 ): Promise<AcceptedOperation> {
-  const response = await fetch(apiUrl(options, '/api/v1/tally/override'), {
-    method,
-    headers: buildHeaders(options, true),
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    throw await readProblem(response);
-  }
-  const body: unknown = await response.json();
-  if (!isAcceptedBody(body)) {
-    throw new OperationApiError('The server returned an unexpected command body.');
-  }
-  return trackAccepted(body);
+  return submitOperation('/api/v1/tally/override', options, { method, body: payload });
 }
 
 /** Force a target's lamp (`PUT /api/v1/tally/override` -> 202 + op id). */

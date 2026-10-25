@@ -15,6 +15,7 @@ import {
   buildHeaders,
   OperationApiError,
   readProblem,
+  sendCommand,
 } from './operations';
 import { trackAccepted } from './operations';
 import type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
@@ -113,17 +114,11 @@ export async function takeRoute(
   request: RouteTakeRequest,
   options: RequestOptions = {},
 ): Promise<TakeOutcome> {
-  const response = await fetch(
-    apiUrl(options, `/api/v1/routing/${encodeURIComponent(kind)}/take`),
-    {
-      method: 'POST',
-      headers: buildHeaders(options, true),
-      body: JSON.stringify(request),
-    },
+  const response = await sendCommand(
+    `/api/v1/routing/${encodeURIComponent(kind)}/take`,
+    options,
+    { body: request },
   );
-  if (!response.ok) {
-    throw await readProblem(response);
-  }
   const body: unknown = await response.json();
   if (response.status === 202) {
     if (!isAcceptedBody(body)) {

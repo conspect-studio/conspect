@@ -11,11 +11,11 @@ import { takeRoute } from './routing';
 import { applyLayoutCommand } from '../layout/applyLayout';
 import { setDeviceMode } from '../devices/api';
 
-const keys: Record<string, string | null> = {};
+const keys = new Map<string, string | null>();
 
 function accept(name: string, extra: Record<string, unknown> = {}) {
   return ({ request }: { request: Request }) => {
-    keys[name] = request.headers.get('idempotency-key');
+    keys.set(name, request.headers.get('idempotency-key'));
     return HttpResponse.json({ operation_id: `op-${name}`, kind: 'x', ...extra }, { status: 202 });
   };
 }
@@ -34,7 +34,7 @@ beforeAll(() => {
   server.listen();
 });
 afterEach(() => {
-  for (const k of Object.keys(keys)) delete keys[k];
+  keys.clear();
 });
 afterAll(() => {
   server.close();
@@ -43,23 +43,23 @@ afterAll(() => {
 describe('Idempotency-Key on JSON-body commands', () => {
   it('Load with default options sends an Idempotency-Key', async () => {
     await loadMediaPlayer('p1', 'asset-1');
-    expect(keys.load).toBeTruthy();
+    expect(keys.get('load')).toBeTruthy();
   });
 
   it('Cue, cast volume, tally override, route take, apply-layout, set-mode send one too', async () => {
     await cueMediaPlayer('p1', undefined);
-    await setCastVolume('c1', { level: 0.5 } as never);
-    await setOverride({ kind: 'tile', id: 't' } as never, 'red' as never);
-    await takeRoute('video', {} as never);
+    await setCastVolume('c1', { level_percent: 50 });
+    await setOverride({ kind: 'tile', index: 0 }, 'Red');
+    await takeRoute('video', { source: { input_id: 'i', kind: { kind: 'video' } }, target: { kind: 'video_cell', cell: 'c' } });
     await applyLayoutCommand('l1');
     await setDeviceMode('d1', 'm');
     for (const name of ['cue', 'volume', 'tally', 'take', 'layout', 'mode']) {
-      expect(keys[name], name).toBeTruthy();
+      expect(keys.get(name), name).toBeTruthy();
     }
   });
 
   it('keeps an explicit key', async () => {
     await loadMediaPlayer('p1', 'a', { idempotencyKey: 'mine' });
-    expect(keys.load).toBe('mine');
+    expect(keys.get('load')).toBe('mine');
   });
 });

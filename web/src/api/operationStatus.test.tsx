@@ -28,7 +28,7 @@ describe('followOperation', () => {
   });
 
   it('toasts acceptance first, then the success outcome', async () => {
-    const accepted = trackAccepted({ operation_id: 'st-1', kind: 'take' });
+    const accepted = trackAccepted({ operation_id: 'st-1', kind: 'take_salvo' });
     followOperation(accepted, 'Salvo take');
     expect(toasts().map((x) => x.title)).toEqual(['Command accepted']);
     expect(toasts()[0]?.description).toContain('st-1');
@@ -43,7 +43,7 @@ describe('followOperation', () => {
   });
 
   it('reports a failed outcome destructively with its reason', async () => {
-    const accepted = trackAccepted({ operation_id: 'st-2', kind: 'take' });
+    const accepted = trackAccepted({ operation_id: 'st-2', kind: 'take_salvo' });
     followOperation(accepted, 'Salvo take');
     await act(async () => {
       resolveOperationEnvelope(env('st-2', 'job.failed', { message: 'layout missing' }));
@@ -55,7 +55,7 @@ describe('followOperation', () => {
   });
 
   it('reports a timeout separately from a failure', async () => {
-    const accepted = trackAccepted({ operation_id: 'st-3', kind: 'take' });
+    const accepted = trackAccepted({ operation_id: 'st-3', kind: 'take_salvo' });
     followOperation(accepted, 'Salvo take');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(61_000);
