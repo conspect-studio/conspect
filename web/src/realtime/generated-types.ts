@@ -146,8 +146,8 @@ export interface DeviceMode {
   readonly detail?: string;
   /** The registry device id converging. */
   readonly device_id: string;
-  /** On a failed phase: what had already changed on the device (unchanged = nothing changed; workmode_unconfirmed = a workmode change was sent but not confirmed; workmode_changed = the workmode was changed but a later step failed). */
-  readonly failure_stage?: "unchanged" | "workmode_unconfirmed" | "workmode_changed";
+  /** On a failed phase: what had already changed on the device (unchanged = nothing changed; workmode_unconfirmed = a workmode change was sent but not confirmed; workmode_changed = the workmode was changed but a later step failed; activation_unconfirmed = the slot-activation response was lost so it may have occurred; workmode_changed_activation_unconfirmed = the workmode was changed and the slot-activation response was then lost). */
+  readonly failure_stage?: "unchanged" | "workmode_unconfirmed" | "workmode_changed" | "activation_unconfirmed" | "workmode_changed_activation_unconfirmed";
   readonly impact: ImpactClass;
   /** The target mode being converged to (driver vocabulary). */
   readonly mode: string;

@@ -197,6 +197,13 @@ impl DeviceBroadcaster {
             FailureStage::WorkmodeChanged => {
                 format!("{declared}; workmode changed to {mode}; slot activation failed: {reason}")
             }
+            FailureStage::ActivationUnconfirmed => {
+                format!("{declared}; slot activation may have occurred; response lost: {reason}")
+            }
+            FailureStage::WorkmodeChangedActivationUnconfirmed => format!(
+                "{declared}; workmode changed to {mode}; slot activation may have occurred; \
+                 response lost: {reason}"
+            ),
             // Future stages: say only what is certain.
             _ => format!("{declared}; failed: {reason}"),
         };

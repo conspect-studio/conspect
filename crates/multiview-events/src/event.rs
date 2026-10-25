@@ -1077,6 +1077,14 @@ pub enum FailureStage {
     /// The workmode change was applied and confirmed, but a later step (slot
     /// activation) failed: the device is left in the new workmode.
     WorkmodeChanged,
+    /// The slot-activation request was sent but its response was lost or timed
+    /// out: the activation may have occurred (production playback may have
+    /// stopped and the spare index become active). The workmode was already a
+    /// decoder.
+    ActivationUnconfirmed,
+    /// The workmode was changed and confirmed, then the slot-activation
+    /// response was lost or timed out: both changes may be in effect.
+    WorkmodeChangedActivationUnconfirmed,
 }
 
 /// The declared impact class of a management change (the instant-apply

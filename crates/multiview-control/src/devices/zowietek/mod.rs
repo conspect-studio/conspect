@@ -800,6 +800,21 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
             )
             .await
         {
+            // A transport-level failure (timeout / dropped socket / unreadable
+            // reply) means the switch may have been applied; a definite vendor
+            // error response (`Status`, `Busy`) means the device refused it, so
+            // the stage reached so far stands.
+            if response_may_have_been_lost(&err) {
+                let reached = stage.lock().map_or(FailureStage::Unchanged, |g| *g);
+                set_stage(
+                    stage,
+                    if reached == FailureStage::WorkmodeChanged {
+                        FailureStage::WorkmodeChangedActivationUnconfirmed
+                    } else {
+                        FailureStage::ActivationUnconfirmed
+                    },
+                );
+            }
             self.publish_failure(&err);
             return Err(err.into());
         }
@@ -1018,6 +1033,15 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
 /// The lifecycle state a client error implies: a credential rejection opens the
 /// breaker (`AUTH_FAILED`); anything else rides to `UNREACHABLE`.
 /// Record how far a convergence got (a poisoned lock keeps the prior stage).
+/// Whether a failed request may nevertheless have been applied by the device:
+/// true for every failure that is not a definite vendor error response.
+fn response_may_have_been_lost(err: &ZowietekClientError) -> bool {
+    !matches!(
+        err,
+        ZowietekClientError::Status { .. } | ZowietekClientError::Busy { .. }
+    )
+}
+
 fn set_stage(stage: &std::sync::Mutex<FailureStage>, to: FailureStage) {
     if let Ok(mut guard) = stage.lock() {
         *guard = to;

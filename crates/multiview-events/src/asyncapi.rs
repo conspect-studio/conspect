@@ -1777,8 +1777,8 @@ fn device_mode_schema() -> Value {
             "operation_id": { "type": "string", "description": "The operation id (from the 202) of the set-mode this event is the outcome of, carried end-to-end; absent for convergences no operator request started." },
             "failure_stage": {
                 "type": "string",
-                "enum": ["unchanged", "workmode_unconfirmed", "workmode_changed"],
-                "description": "On a failed phase: what had already changed on the device (unchanged = nothing changed; workmode_unconfirmed = a workmode change was sent but not confirmed; workmode_changed = the workmode was changed but a later step failed)."
+                "enum": ["unchanged", "workmode_unconfirmed", "workmode_changed", "activation_unconfirmed", "workmode_changed_activation_unconfirmed"],
+                "description": "On a failed phase: what had already changed on the device (unchanged = nothing changed; workmode_unconfirmed = a workmode change was sent but not confirmed; workmode_changed = the workmode was changed but a later step failed; activation_unconfirmed = the slot-activation response was lost so it may have occurred; workmode_changed_activation_unconfirmed = the workmode was changed and the slot-activation response was then lost)."
             }
         }
     })
