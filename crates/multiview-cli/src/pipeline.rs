@@ -1693,6 +1693,10 @@ pub struct Pipeline {
     /// silence-fills past what was published). Empty when this run did not opt into
     /// program audio.
     audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+    /// The document's declared `[audio]` routing (ADR-R005 / ADR-0059 §4), if
+    /// any. When it declares routes, the program bus is initialised from them
+    /// (inclusion, `gain_db`, `mute`) instead of routing every store at unity.
+    audio_routing: Option<multiview_config::AudioRouting>,
     /// Per-source **audio** ingest plans (AUD-2): how to open + decode each
     /// source's audio. The drive starts one audio decode thread per plan
     /// (alongside the video decode thread) writing into [`Self::audio_stores`].
@@ -2510,6 +2514,7 @@ impl Pipeline {
             #[cfg(feature = "webrtc-native")]
             egress_registry,
             audio_stores,
+            audio_routing: config.audio.clone(),
             audio_ingest_plans,
             tone_ingest_plans,
             player_audio_ingest_plans,
@@ -3389,17 +3394,10 @@ impl Pipeline {
         // audio at all, so the run is byte-identical to the video-only path.
         let audio_bus = self.encode_cfg.audio.as_ref().map(|cfg| {
             let mut bus = program_audio_bus(cfg, self.cadence);
-            // Route every per-source store onto the program bus at unity gain. The
-            // route key is the source id; per-source gains / breakaways are a
-            // control-plane concern (AUD-7) that re-points/re-gains these routes at
-            // runtime. Sorted for a deterministic route order across runs.
-            let mut ids: Vec<&String> = self.audio_stores.keys().collect();
-            ids.sort_unstable();
-            for id in ids {
-                if let Some(store) = self.audio_stores.get(id) {
-                    let _ = bus.add_source(id.clone(), Arc::clone(store), 1.0);
-                }
-            }
+            // Route the per-source stores onto the program bus from the declared
+            // `[audio]` routes (inclusion, gain_db, mute — ADR-0059 §4); with no
+            // declared routes every store rides at unity (the legacy default).
+            route_program_bus_sources(&mut bus, &self.audio_stores, self.audio_routing.as_ref());
             bus
         });
         // The program-bus loudness normaliser (AUD-6): pair one with the audio bus
@@ -4537,6 +4535,47 @@ fn program_audio_bus(
     };
     let format = multiview_audio::AudioFormat::new(cfg.sample_rate, layout);
     multiview_audio::program::ProgramBus::new(format, cadence)
+}
+
+/// Route each per-source audio store onto the program bus at build.
+///
+/// When the document's `[audio]` block declares routes, they are authoritative
+/// (ADR-R005 §4.1 / ADR-0059 §4): a store joins the bus only if its route sets
+/// `include_in_program_bus`, at that route's `gain_db` (clamped, converted to
+/// linear), and a `mute`d route is routed but silent from its first sample (mute
+/// ≠ unroute, so an unmute restores the gain). A source with no route, or a route
+/// with `include_in_program_bus = false`, contributes nothing. With no `[audio]`
+/// block, or one declaring no routes, every store rides the bus at unity — the
+/// `--program-audio` / `[switcher]` default. Sorted by id for a deterministic
+/// route order across runs.
+fn route_program_bus_sources(
+    bus: &mut multiview_audio::program::ProgramBus,
+    stores: &std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+    routing: Option<&multiview_config::AudioRouting>,
+) {
+    let declared = routing.filter(|r| !r.routes.is_empty());
+    let mut ids: Vec<&String> = stores.keys().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let Some(store) = stores.get(id) else {
+            continue;
+        };
+        let (gain, muted) = match declared {
+            None => (1.0, false),
+            Some(routing) => {
+                let Some(route) = routing
+                    .routes
+                    .iter()
+                    .find(|r| r.input_id == *id && r.include_in_program_bus)
+                else {
+                    continue;
+                };
+                let db = multiview_config::audio::clamp_route_gain_db(route.gain_db);
+                (10.0_f64.powf(f64::from(db) / 20.0), route.mute)
+            }
+        };
+        let _ = bus.add_source_with_mute(id.clone(), Arc::clone(store), gain, muted);
+    }
 }
 
 /// The audio format the display heads' audio sinks are fed in (DEV-B4): the
@@ -14888,6 +14927,61 @@ mod program_audio_declared_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    /// Peak absolute sample of one bus tick.
+    fn bus_peak(bus: &mut multiview_audio::program::ProgramBus) -> f32 {
+        bus.tick()
+            .interleaved()
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// Build a bus whose sources each carry a 0.5 DC signal, routed per `routes`.
+    fn routed_bus(routes: &str) -> multiview_audio::program::ProgramBus {
+        let cfg = program_audio_encode_config();
+        let mut bus = program_audio_bus(&cfg, Rational::new(25, 1));
+        let format = bus.format();
+        let mut stores = std::collections::HashMap::new();
+        for id in ["in_a", "in_b"] {
+            let store = Arc::new(multiview_audio::store::AudioStore::new(format, 48_000));
+            let frames = 48_000usize;
+            let samples = vec![0.5f32; frames * format.channel_count()];
+            store
+                .publish(&multiview_audio::AudioBlock::from_interleaved(format, samples).unwrap())
+                .unwrap();
+            stores.insert(id.to_owned(), store);
+        }
+        let routing: Option<multiview_config::AudioRouting> = (!routes.is_empty())
+            .then(|| toml::from_str(&format!("sample_rate_hz = 48000\n{routes}")).unwrap());
+        route_program_bus_sources(&mut bus, &stores, routing.as_ref());
+        bus
+    }
+
+    const ROUTE_A: &str = "[[routes]]\ninput_id = \"in_a\"\nchannels = { kind = \"stereo\" }\n";
+
+    #[test]
+    fn declared_routes_initialise_bus_inclusion_gain_and_mute() {
+        // Legacy (no declared routes): both sources at unity ⇒ 0.5 + 0.5.
+        assert!((bus_peak(&mut routed_bus("")) - 1.0).abs() < 1e-4);
+
+        // Only in_a included, at -6.0206 dB (×0.5); in_b has no route ⇒ excluded.
+        let gain = format!("{ROUTE_A}include_in_program_bus = true\ngain_db = -6.0206\n");
+        assert!((bus_peak(&mut routed_bus(&gain)) - 0.25).abs() < 1e-3);
+
+        // A muted included route is silent from its first sample.
+        let muted = format!(
+            "{ROUTE_A}include_in_program_bus = true\nmute = true\n[[routes]]\ninput_id = \"in_b\"\nchannels = {{ kind = \"stereo\" }}\ninclude_in_program_bus = false\n"
+        );
+        let mut bus = routed_bus(&muted);
+        assert_eq!(
+            bus_peak(&mut bus),
+            0.0,
+            "muted / excluded audio must be silent"
+        );
+        assert_eq!(bus_peak(&mut bus), 0.0);
+        // Muted ≠ unrouted: the strip stays on the bus with its gain preserved.
+        assert_eq!(bus.live_strip_count(), 1, "excluded in_b is not on the bus");
+    }
 
     /// SW-13a (ADR-0059 §8): a minimal valid single-source document, optionally
     /// carrying an `[audio]` and/or `[switcher]` block — the presence of either

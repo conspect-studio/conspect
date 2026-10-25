@@ -4,7 +4,7 @@
 // crates/multiview-control/src/realtime.rs. Only the commands that function maps
 // to `Some(..)` get an envelope `corr` echoing the 202's `operation_id`; every
 // other command (apply-layout, swap/route, tally override, media load/seek,
-// overlay/source upserts, device/cast/sync-group ops, ...) rides the stream
+// overlay/source upserts, device reboot/cast/sync-group ops, ...) rides the stream
 // UNCORRELATED, so waiting for a `corr` would only ever time out. The 202 body's
 // `kind` is `Command::kind()` (crates/multiview-control/src/command.rs), so the
 // set below is keyed by those kind strings:
@@ -15,6 +15,9 @@
 //   MediaTransport Play/Pause/Stop/Cue   -> "media_play" / "media_pause" / "media_stop" / "media_cue"
 //   ArmMediaExit / TakeMediaExit /
 //   CancelMediaExit                      -> "arm_media_exit" / "take_media_exit" / "cancel_media_exit"
+//
+// Device set-mode is correlated outside this set: its `device.mode` outcome echoes
+// the operation id directly, and `setDeviceMode` registers it itself.
 //
 // Deliberately absent: "media_load", "media_seek" (ambiguous outcome), "apply_layout",
 // "swap_source", "route_*", "set_tally_override", overlay/source upserts.

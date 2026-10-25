@@ -490,8 +490,7 @@ impl CompositorDrive<Nv12Image> {
         let mut source_states: HashMap<String, SourceState> = HashMap::new();
 
         // Draw order: ascending z (lower z first / bottom). Sort cell indices.
-        order.extend(0..cell_count);
-        order.sort_by_key(|&i| self.layout.cells.get(i).map_or(i32::MIN, |c| c.z));
+        self.sort_draw_order(order);
 
         for &i in order.iter() {
             let Some(cell) = self.layout.cells.get(i) else {
@@ -505,15 +504,7 @@ impl CompositorDrive<Nv12Image> {
         }
         // Resolve geometry/opacity from the scene, switcher state and this tick.
         // The resolver writes into the pooled buffer and cannot await a consumer.
-        (self.render_plan_resolver)(
-            &SceneStates {
-                layout: &self.layout,
-                order,
-            },
-            &self.switcher_tick_state,
-            tick,
-            placements,
-        );
+        self.resolve_placements(order, tick, placements);
 
         // Borrow the held images for the compositor's `Tile` slice. This slice is
         // a per-tick local, NOT pooled: a `Tile<'_>` borrows into the pooled
@@ -570,6 +561,41 @@ impl CompositorDrive<Nv12Image> {
             canvas: canvas_image,
             source_states,
         })
+    }
+
+    /// Run only the per-tick render-plan stage of [`CompositorDrive::compose`]
+    /// (draw-order sort + injected resolver) on the pooled scratch, and hand the
+    /// resolved placements to `inspect`. This is the same code path `compose`
+    /// takes, without sampling or compositing, so the resolver's steady-state
+    /// allocation behaviour can be measured in isolation.
+    pub fn resolve_render_plan<R>(&self, tick: Tick, inspect: impl FnOnce(&[Placement]) -> R) -> R {
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.begin(self.layout.cells.len());
+        let ComposeScratch {
+            placements, order, ..
+        } = &mut *scratch;
+        self.sort_draw_order(order);
+        self.resolve_placements(order, tick, placements);
+        inspect(placements)
+    }
+
+    /// Fill the pooled `order` with cell indices in ascending z (stable).
+    fn sort_draw_order(&self, order: &mut Vec<usize>) {
+        order.extend(0..self.layout.cells.len());
+        order.sort_by_key(|&i| self.layout.cells.get(i).map_or(i32::MIN, |c| c.z));
+    }
+
+    /// Invoke the injected resolver into the pooled placements buffer.
+    fn resolve_placements(&self, order: &[usize], tick: Tick, placements: &mut Vec<Placement>) {
+        (self.render_plan_resolver)(
+            &SceneStates {
+                layout: &self.layout,
+                order,
+            },
+            &self.switcher_tick_state,
+            tick,
+            placements,
+        );
     }
 
     /// Sample one cell's image and state without blocking: the bound source's

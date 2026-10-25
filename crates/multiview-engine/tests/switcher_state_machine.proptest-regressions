@@ -7,3 +7,4 @@
 cc 3e76474ab322cf440ba5aa11a058be288b33a5f4b9e7cbb4a14c9770d161778a # shrinks to ops = [(3, 1, 0), (1, 0, 0), (0, 0, 0)], last = 0
 cc 187af37054f8419e33ea7fabc7cebae12402b54decbb9799744df9476b81bab3 # shrinks to prefix = [], parked = [(3, 1, 0), (0, 1, 1)], rate = 2
 cc c089d714e579f740bb39ad24dd4339e48ff2fb579a61adad720743e4319502fb # shrinks to (initial_state, transitions, seen_counter) = (Model { tick: 0, last_manual_position: 0, lever_out_of_sync: false, flight: None, rate: 5 }, [Tbar(65535), Auto, Advance(1), Tbar(65535)], None)
+cc 048c7934d31994434bf4f7dc653fd131621887cd8b66fa0922d023734cd88861 # shrinks to (initial_state, transitions, seen_counter) = (Model { tick: 0, last_manual_position: 0, lever_out_of_sync: false, flight: None, rate: 5 }, [Tbar(0), Tbar(30000), Auto, Tbar(30000), Advance(3)], None)

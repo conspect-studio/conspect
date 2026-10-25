@@ -478,6 +478,19 @@ impl Mixer {
         });
     }
 
+    /// Put an input into the muted state **immediately** (settled envelope, no
+    /// anti-click ramp). Only for a strip that has not yet contributed audio —
+    /// the initial state of a route declared `mute = true` — where there is no
+    /// prior signal to click against and a ramp would leak the opening samples.
+    /// The steady gain is untouched, so a later unmute restores it exactly.
+    pub(crate) fn start_muted(&mut self, point: RoutePoint) {
+        if let Some(strip) = self.strip_mut(point) {
+            strip.muted = true;
+            strip.mute_gain = 0.0;
+            strip.mute_ramp = None;
+        }
+    }
+
     /// Whether an input's program contribution is muted (the steady operator
     /// intent, not the in-flight envelope value). `None` for an unknown input.
     #[must_use]

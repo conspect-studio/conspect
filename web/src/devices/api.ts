@@ -21,6 +21,8 @@ import type { AcceptedOperation, RequestOptions } from '../api/operations';
 import { stringField } from '../resources/api';
 import type { ResourceRecord } from '../resources/types';
 import { parseDeviceStatus } from '../realtime/envelope';
+import { correlateOperation } from '../realtime/operations';
+import type { OperationOutcome } from '../realtime/operations';
 import type { DeviceStatus } from '../realtime/generated-types';
 import type { EngineClockRef } from '../realtime/useEngineEvents';
 import { parseDeviceDriver } from './forms';
@@ -183,9 +185,18 @@ export async function fetchDeviceStatus(
 // --- management verbs -------------------------------------------------------------
 
 /** The `202 Accepted` body of `set-mode` (declared DEV-class impact). */
-export type SetModeAccepted = components['schemas']['SetModeAccepted'];
+export type SetModeBody = components['schemas']['SetModeAccepted'];
 
-function isSetModeAccepted(value: unknown): value is SetModeAccepted {
+/**
+ * An accepted set-mode plus its authoritative completion: the server stamps the
+ * driver's `device.mode` outcome with `corr` = `operation_id`, so `completion`
+ * resolves on that envelope (or rejects on timeout). Ignoring it is safe.
+ */
+export type SetModeAccepted = SetModeBody & {
+  readonly completion: Promise<OperationOutcome>;
+};
+
+function isSetModeAccepted(value: unknown): value is SetModeBody {
   return (
     isRecord(value) &&
     typeof value.operation_id === 'string' &&
@@ -214,9 +225,12 @@ export async function setDeviceMode(
   if (!isSetModeAccepted(body)) {
     throw new Error('The server returned an unexpected set-mode body.');
   }
-  // Device mode changes are not correlated by the server (no CorrKey), so
-  // acceptance is all there is to report.
-  return body;
+  // The server correlates the outcome: the `device.mode` event carries the
+  // set-mode operation id as its envelope `corr` (CorrKey for DeviceMode).
+  const completion = correlateOperation({ operation_id: body.operation_id, kind: 'set_mode' });
+  // A caller that never awaits `completion` must not trigger an unhandled rejection.
+  completion.catch(() => undefined);
+  return { ...body, completion };
 }
 
 /** `POST /api/v1/devices/{id}/reboot` — 202; outcome on the realtime stream. */

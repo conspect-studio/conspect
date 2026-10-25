@@ -283,10 +283,14 @@ impl SwitcherState {
     pub fn tbar(&mut self, position: u16, tick: Tick) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
         // ADR-0055 §5: the absolute setter is idempotent; a re-sent identical
-        // value never changes state (panels re-send at ~30 Hz).
+        // value never changes state (panels re-send at ~30 Hz). A nonzero
+        // write during AUTO is not a duplicate of the manual state: it takes
+        // ownership latest-wins (§5) even if it matches the historical value
+        // AUTO resumed from. A parked lever is still ignored below.
         if position == self.last_manual_position
             && !matches!(self.flight, Some(Flight::Manual { .. }))
-            && (position == 0 || !self.lever_out_of_sync)
+            && (position == 0
+                || (!self.lever_out_of_sync && !matches!(self.flight, Some(Flight::Auto { .. }))))
         {
             return Ok(self.sample(tick));
         }

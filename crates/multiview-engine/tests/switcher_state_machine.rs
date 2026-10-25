@@ -423,19 +423,29 @@ fn duplicated_tbar_zero_does_not_abort_an_independent_auto() {
 }
 
 #[test]
-fn duplicated_nonzero_tbar_does_not_override_auto_resumed_from_it() {
+fn in_sync_tbar_matching_prior_manual_value_takes_over_an_advanced_auto() {
+    // ADR-0055 §5: a T-bar write during AUTO takes ownership (latest-wins),
+    // even when the absolute value equals the position AUTO resumed from.
     let mut state = configured();
     state
         .set_transition(TransitionDescriptor::Mix {
             rate: FrameCount::try_from(10).unwrap(),
         })
         .unwrap();
-    state.tbar(30000, tick(1)).unwrap();
-    assert!(state.auto(tick(2)).unwrap().progress > Progress::ZERO);
-    state.tbar(30000, tick(3)).unwrap();
+    let manual = state.tbar(30000, tick(1)).unwrap().progress;
+    assert!(state.auto(tick(2)).unwrap().progress >= manual);
+    assert!(state.sample(tick(4)).progress > manual);
+    let taken = state.tbar(30000, tick(4)).unwrap();
+    assert_eq!(taken.progress, manual);
+    assert!(!taken.started && !taken.completed);
     assert!(state.is_in_flight());
-    assert!(state.sample(tick(100)).completed);
-    assert_eq!(state.completion_count(), 1);
+    // Manual ownership: AUTO no longer advances or completes.
+    assert_eq!(state.sample(tick(100)).progress, manual);
+    assert_eq!(state.completion_count(), 0);
+    // Duplicate suppression is retained once manual owns the take.
+    let before = format!("{state:?}");
+    assert_eq!(state.tbar(30000, tick(101)).unwrap().progress, manual);
+    assert_eq!(format!("{state:?}"), before);
 }
 
 proptest! {
@@ -674,14 +684,10 @@ impl ReferenceStateMachine for Reference {
             Cmd::Tbar(position)
                 if *position == state.last_manual_position
                     && !state.lever_out_of_sync
-                    && !matches!(state.flight, Some(ModelFlight::Manual)) =>
-            {
-                if matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
-                {
-                    state.flight = None;
-                    state.lever_out_of_sync = state.last_manual_position != 0;
-                }
-            }
+                    && state.flight.is_none() => {}
+            // An in-sync nonzero write during AUTO takes ownership latest-wins
+            // (ADR-0055 §5), even when it equals the historical manual value:
+            // it falls through to the manual-setter arm below.
             Cmd::Tbar(position) if !state.lever_out_of_sync => {
                 state.last_manual_position = *position;
                 state.flight = if *position == u16::MAX {

@@ -173,6 +173,25 @@ impl ProgramBus {
         point
     }
 
+    /// Route a source onto the program bus at linear `program_gain`, starting in
+    /// the declared mute state. A muted source is still **routed** (mute ≠
+    /// unroute, ADR-0059 §4) and silent from its very first sample; its gain is
+    /// preserved so a later [`set_muted`](Self::set_muted)`(point, false)`
+    /// restores it exactly.
+    pub fn add_source_with_mute(
+        &mut self,
+        id: impl Into<String>,
+        store: Arc<AudioStore>,
+        program_gain: f64,
+        muted: bool,
+    ) -> RoutePoint {
+        let point = self.add_source(id, store, program_gain);
+        if muted {
+            self.mixer.start_muted(point);
+        }
+        point
+    }
+
     /// Re-point an **existing** route point onto a different `Arc<AudioStore>`
     /// (replace semantics) — the audio-breakaway primitive (RT-8a).
     ///
