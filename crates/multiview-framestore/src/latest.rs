@@ -23,7 +23,10 @@
 //! index. A publish writes into a slot it can `try_write` (skipping any slot a
 //! reader is inside, and growing the ring if all are) and then advances the
 //! head, so **a publish never waits on a reader**, even one the OS has
-//! descheduled mid-read. A load `try_read`s the head's slot and accepts it only
+//! descheduled mid-read. A publisher may lock a slot only after claiming it
+//! through the slot's atomic tag, which is possible only for a slot strictly
+//! older than the head, so **no publisher, paused anywhere, ever holds the
+//! head slot's lock**. A load `try_read`s the head's slot and accepts it only
 //! if its generation tag matches; it never blocks on a lock. Nothing is
 //! dropped under a lock. See the `swap` module docs for the full argument.
 //!
@@ -56,8 +59,10 @@
 //!   never moves backwards. So with a single writer, a reader can never get a
 //!   value older than one it has already returned, on x86 or `AArch64`.
 //! * **Progress.** Publish never waits on a reader (wait-free with respect to
-//!   readers). Load never blocks on a lock and retries only when a publisher
-//!   made progress (lock-free).
+//!   readers). Load never blocks on a lock and never waits on a publisher,
+//!   even one descheduled while it holds a slot lock. A load attempt fails only
+//!   if the head moved during it, so a load takes at most one attempt more than
+//!   the number of publishes that complete while it runs (lock-free).
 //!
 //! These properties are exercised under stress by `tests/concurrency.rs`
 //! (`reader_never_observes_a_regression_in_sequence`,

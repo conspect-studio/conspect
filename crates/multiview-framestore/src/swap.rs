@@ -16,17 +16,21 @@
 //! ## Design: a slot ring with a generation-tagged head
 //!
 //! The cell owns a growable set of slots (segments of [`SEGMENT`] slots,
-//! chained through [`OnceLock`]). Each slot is a [`RwLock`] around an
-//! `(generation, value)` entry. One [`AtomicU64`] `head` names the slot that
-//! holds the current value and that value's generation.
+//! chained through [`OnceLock`]). Each slot is an atomic **tag** plus a
+//! [`RwLock`] around an `(generation, value)` entry. The tag mirrors the
+//! entry's generation, or is `CLAIMED` while a publisher owns the slot. One
+//! [`AtomicU64`] `head` names the slot that holds the current value and that
+//! value's generation.
 //!
-//! * **Publish** takes a fresh generation, then claims a slot with
-//!   [`RwLock::try_write`], starting just after the head slot and skipping
-//!   every slot it cannot take at once (a reader is inside it) and the head
-//!   slot itself. It writes `(generation, value)` into the claimed slot,
-//!   releases it, and publishes with `head.fetch_max`. If every slot is busy,
-//!   it appends a new segment and claims a slot there. So **the publisher
-//!   never waits on a reader**: `try_write` never blocks, and a reader that is
+//! * **Publish** takes a fresh generation, then claims a slot, starting just
+//!   after the head slot. To claim it **CAS**es the slot's tag from `t` to
+//!   `CLAIMED`, but only after it has read a `head` whose generation is
+//!   strictly greater than `t`. Only then does it [`RwLock::try_write`] the
+//!   entry. If a reader is inside, it puts the tag back and moves on. It writes
+//!   `(generation, value)`, **releases the lock, then stores the new tag**, and
+//!   only after that publishes with `head.fetch_max`. If every slot is busy, it
+//!   appends a new segment and claims a slot there. So **the publisher never
+//!   waits on a reader**: `try_write` never blocks, and a reader that is
 //!   descheduled while inside a slot (for any length of time) only takes that
 //!   one slot out of rotation. The only thing a publisher can ever wait on is
 //!   another *publisher* that is appending a segment at the same instant
@@ -34,19 +38,45 @@
 //!   (8 unless readers have pinned more), plus at most one segment allocation,
 //!   and is independent of reader scheduling.
 //! * **Load** reads `head`, then [`RwLock::try_read`]s the named slot and
-//!   returns a clone of its value **only if the slot's generation tag equals
-//!   the head's generation**. Otherwise (a publisher lapped the ring between
-//!   the two steps, or another publisher is holding the slot) it re-reads
-//!   `head` and retries. A load never blocks on a lock. It retries only when
-//!   a publisher made progress, so it is lock-free. With a single publisher
-//!   (every production user), the head slot is never write-locked and its
-//!   entry is only reclaimed two publishes later, so a load retries only if
-//!   the publisher completed at least two publishes inside the load's few
-//!   instructions.
+//!   returns a clone of its value **only if the entry's generation equals the
+//!   head's generation**. Otherwise it re-reads `head` and retries. A load
+//!   never blocks on a lock.
+//!
+//! ### No publisher ever holds a lock that a reader of the head needs
+//!
+//! Round 3 of the #133 review found that a publisher could take the write lock
+//! of the slot that had *just become* the head (it snapshotted an older head,
+//! another publisher installed into that slot meanwhile) and be descheduled
+//! before it noticed. Every reader then spun until it ran again. The tag claim
+//! rules that out for every interleaving:
+//!
+//! 1. While `head = (g, i)`, slot `i`'s tag is `g`. Its installer stored tag
+//!    `g` *before* moving `head`. Any claim on slot `i` needs a `head`
+//!    generation `> g` first. `head` only grows and generations are unique, so
+//!    if that claim happened before the `fetch_max`, the `fetch_max` was a
+//!    no-op and `head` never named `(g, i)`.
+//! 2. So no publisher can CAS slot `i`'s tag to `CLAIMED` while `(g, i)` is
+//!    the head. A publisher takes a write lock only on a slot it has claimed,
+//!    and it holds the lock only while the tag is `CLAIMED`. The head slot is
+//!    therefore never write-locked, however long any publisher is descheduled,
+//!    including between its lock acquisition and any later check.
+//! 3. A claimed slot cannot become the head while it is claimed: only its
+//!    owner installs into it, and the owner releases the lock and stores the
+//!    tag before `head` can move there.
+//!
+//! Consequence (the exact reader guarantee): **a load attempt can fail only if
+//! `head` changed between the load's read of `head` and its `try_read`**. That
+//! read is either a write-locked stale slot or a generation mismatch, and both
+//! need a newer head. So a load finishes after at most `k + 1` attempts, where
+//! `k` is the number of publishes that complete during it. It never waits on a
+//! paused publisher, on a reader, or on a lock: it is lock-free, and with no
+//! concurrent publish it is a single attempt. With a single publisher (every
+//! production user), a retry needs that publisher to complete a whole publish
+//! inside the load's few instructions.
 //!
 //! Generations come from a per-cell counter and are written together with
-//! the value under the slot's lock. So a tag match means "this exact value is
-//! the one `head` names", and values never cross cells.
+//! the value under the slot's lock. So a generation match means "this exact
+//! value is the one `head` names", and values never cross cells.
 //!
 //! Memory: a slot's previous value is dropped when the slot is reused (outside
 //! the lock), and the entry two publishes behind the head is cleared eagerly
@@ -61,12 +91,15 @@
 //!   cell.
 //! * **Newest-wins, never lost.** `head` only moves forward (`fetch_max`), and
 //!   a publisher can claim only a slot whose generation is strictly older than
-//!   the current head, so the head's entry is never overwritten or cleared. The
+//!   a head it has read, so the head's entry is never overwritten, cleared or
+//!   write-locked. The
 //!   newest value is visible as soon as its publish returns, with no follow-up
 //!   publish or retry needed.
 //! * **Never regresses.** A single thread's successive loads read `head`
 //!   non-decreasingly (coherence of one atomic), and each returns the entry of
 //!   the generation it read.
+//! * **Readers never wait on a publisher.** See the section above: a paused or
+//!   descheduled publisher never holds the head slot's lock.
 //!
 //! Generations take the top 48 bits of `head` (the slot index takes the low
 //! 16), which lasts 2^48 publishes per cell: 8 900 years at 1 000 publishes/s.
@@ -161,17 +194,51 @@ impl<P> Entry<P> {
     }
 }
 
+/// `Slot::tag` value while a publisher owns the slot.
+const CLAIMED: u64 = u64::MAX;
+
+struct Slot<P> {
+    /// Generation of the entry (`0` = empty), or [`CLAIMED`] while a publisher
+    /// owns the slot. A publisher must move it to `CLAIMED` (CAS) before it
+    /// may take `entry`'s write lock, and only from a generation strictly
+    /// older than a head it observed. That is what keeps every write lock off
+    /// the head slot (see [`SwapCell::own`]).
+    tag: AtomicU64,
+    entry: RwLock<Entry<P>>,
+}
+
 struct Segment<P> {
-    slots: [RwLock<Entry<P>>; SEGMENT_LEN],
+    slots: [Slot<P>; SEGMENT_LEN],
     next: OnceLock<Box<Segment<P>>>,
 }
 
 impl<P> Segment<P> {
     fn new() -> Self {
         Self {
-            slots: core::array::from_fn(|_| RwLock::new(Entry::empty())),
+            slots: core::array::from_fn(|_| Slot {
+                tag: AtomicU64::new(0),
+                entry: RwLock::new(Entry::empty()),
+            }),
             next: OnceLock::new(),
         }
+    }
+}
+
+/// A slot a publisher owns: its tag is [`CLAIMED`] and its write lock is held.
+struct Owned<'a, P> {
+    slot: &'a Slot<P>,
+    guard: std::sync::RwLockWriteGuard<'a, Entry<P>>,
+}
+
+impl<P> Owned<'_, P> {
+    /// Replace the entry, release the lock, then publish the slot's new tag.
+    /// Returns the old entry so the caller drops it outside the lock.
+    fn finish(mut self, entry: Entry<P>) -> Entry<P> {
+        let generation = entry.generation;
+        let old = core::mem::replace(&mut *self.guard, entry);
+        drop(self.guard);
+        self.slot.tag.store(generation, Ordering::SeqCst);
+        old
     }
 }
 
@@ -220,7 +287,7 @@ impl<P> fmt::Debug for SwapCell<P> {
 
 impl<P> SwapCell<P> {
     /// The slot with index `idx`, if its segment exists.
-    fn slot(&self, idx: u16) -> Option<&RwLock<Entry<P>>> {
+    fn slot(&self, idx: u16) -> Option<&Slot<P>> {
         let mut segment = &self.first;
         for _ in 0..idx / SEGMENT {
             segment = segment.next.get()?;
@@ -239,24 +306,46 @@ impl<P> SwapCell<P> {
         count
     }
 
+    /// Take exclusive ownership of `slot`, without waiting, if its entry is
+    /// strictly older than the head (and, with `only = Some(g)`, is exactly
+    /// generation `g`).
+    ///
+    /// **Why the head slot is never write-locked.** The tag is CAS'd from `t`
+    /// to [`CLAIMED`] only after a load of `head` showed a generation `> t`.
+    /// `head` only grows, and generations are unique, so from then on the
+    /// head's generation is never `t`: the slot is not the head. While the tag
+    /// is `CLAIMED` the slot cannot *become* the head either: only its owner
+    /// installs into it, and the owner releases the lock and publishes the new
+    /// tag before it moves `head` there. A slot that was just installed but
+    /// not yet made head carries a tag `>=` the head's generation, so it
+    /// cannot be claimed. Only then is the write lock tried. So a publisher
+    /// descheduled at any point while it holds a write lock holds it on a
+    /// slot that no reader of the current head needs.
+    fn own<'a>(&self, slot: &'a Slot<P>, only: Option<u64>) -> Option<Owned<'a, P>> {
+        let tag = slot.tag.load(Ordering::SeqCst);
+        if tag == CLAIMED || only.is_some_and(|g| g != tag) {
+            return None;
+        }
+        if tag >= gen_of(self.head.load(Ordering::SeqCst)) {
+            return None;
+        }
+        slot.tag
+            .compare_exchange(tag, CLAIMED, Ordering::SeqCst, Ordering::Relaxed)
+            .ok()?;
+        let Some(guard) = try_write(&slot.entry) else {
+            // A (stale) reader is inside: give the slot back untouched.
+            slot.tag.store(tag, Ordering::SeqCst);
+            return None;
+        };
+        Some(Owned { slot, guard })
+    }
+
     /// Clear `idx`'s entry if it still holds `generation` and that generation
     /// is no longer the head. Never waits: a busy slot is left for reuse.
     fn clear_if_stale(&self, idx: u16, generation: u64) {
-        // Never even try-lock the slot readers are being sent to: with a single
-        // publisher that slot is then never write-locked at all, so a load's
-        // `try_read` on it cannot fail.
-        if idx == idx_of(self.head.load(Ordering::Acquire)) {
-            return;
-        }
         let Some(slot) = self.slot(idx) else { return };
-        let Some(mut guard) = try_write(slot) else {
-            return;
-        };
-        if guard.generation == generation && generation < gen_of(self.head.load(Ordering::Acquire))
-        {
-            let old = core::mem::replace(&mut *guard, Entry::empty());
-            drop(guard);
-            drop(old);
+        if let Some(owned) = self.own(slot, Some(generation)) {
+            drop(owned.finish(Entry::empty()));
         }
     }
 
@@ -310,25 +399,17 @@ impl<P> SwapCell<P> {
     ) -> Option<u16> {
         for idx in indices {
             let Some(slot) = self.slot(idx) else { continue };
-            let Some(mut guard) = try_write(slot) else {
+            // Only an entry strictly older than the head can be owned, so the
+            // head's entry (and any newer, not-yet-installed one) is never
+            // overwritten or write-locked, even with concurrent publishers.
+            let Some(owned) = self.own(slot, None) else {
                 continue;
             };
             test_hook!(hook::Point::SlotLocked(idx));
-            // Re-check under the lock: only an entry strictly older than the
-            // current head may be replaced, so the head's entry (and any newer,
-            // not-yet-installed one) is never overwritten, even with concurrent
-            // publishers. The head only grows, so this cannot go stale.
-            if guard.generation >= gen_of(self.head.load(Ordering::Acquire)) {
-                continue;
-            }
-            let old = core::mem::replace(
-                &mut *guard,
-                Entry {
-                    generation,
-                    value: value.take(),
-                },
-            );
-            drop(guard);
+            let old = owned.finish(Entry {
+                generation,
+                value: value.take(),
+            });
             drop(old);
             return Some(idx);
         }
@@ -356,7 +437,7 @@ impl<P> SwapCell<P> {
     where
         P: Clone,
     {
-        let guard = try_read(self.slot(idx_of(head))?)?;
+        let guard = try_read(&self.slot(idx_of(head))?.entry)?;
         if guard.generation == gen_of(head) {
             guard.value.clone()
         } else {
@@ -405,10 +486,11 @@ impl<P: Clone> SwapCell<P> {
     pub(crate) fn new(value: P) -> Self {
         let first = Segment::new();
         if let Some(slot) = first.slots.first() {
-            *slot.write().unwrap_or_else(PoisonError::into_inner) = Entry {
+            *slot.entry.write().unwrap_or_else(PoisonError::into_inner) = Entry {
                 generation: 1,
                 value: Some(value),
             };
+            slot.tag.store(1, Ordering::SeqCst);
         }
         let head = encode(1, 0);
         Self {
@@ -419,8 +501,10 @@ impl<P: Clone> SwapCell<P> {
         }
     }
 
-    /// The current value, cloned. Never blocks on a lock (lock-free; see the
-    /// module docs). The only critical section is the pointer clone.
+    /// The current value, cloned. Never blocks on a lock and never waits on a
+    /// publisher: it retries only if `head` moved during the attempt
+    /// (lock-free; see the module docs). The only critical section is the
+    /// pointer clone.
     pub(crate) fn load(&self) -> P {
         loop {
             let head = self.head.load(Ordering::Acquire);
@@ -489,6 +573,7 @@ impl<P> SwapCell<P> {
         let head = self.head.load(Ordering::Acquire);
         self.slot(idx_of(head))
             .expect("the head slot exists")
+            .entry
             .read()
             .unwrap_or_else(PoisonError::into_inner)
     }
