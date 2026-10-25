@@ -187,6 +187,41 @@ fn repeated_terminal_tbar_completes_and_flips_exactly_once() {
 }
 
 #[test]
+fn terminal_lever_ignores_edits_and_jitter_until_returned_to_bottom() {
+    for edit in 0..3 {
+        let mut state = configured();
+        let first = state.tbar(u16::MAX, tick(1)).unwrap();
+        assert!(first.started && first.completed);
+        match edit {
+            0 => state.set_preview(source("c")).unwrap(),
+            1 => state.arm(ArmedSet::default().with_key(1)).unwrap(),
+            _ => state
+                .set_transition(TransitionDescriptor::Mix {
+                    rate: FrameCount::try_from(5).unwrap(),
+                })
+                .unwrap(),
+        }
+        let program = state.program().clone();
+        let preview = state.preview().clone();
+        let keys = state.keys_on_air().to_vec();
+        for position in [64000, u16::MAX, 64000] {
+            let output = state.tbar(position, tick(2)).unwrap();
+            assert_eq!(output.progress, Progress::ZERO);
+            assert!(!output.started && !output.completed);
+            assert!(!state.is_in_flight());
+            assert_eq!(state.completion_count(), 1);
+            assert_eq!(state.program(), &program);
+            assert_eq!(state.preview(), &preview);
+            assert_eq!(state.keys_on_air(), keys);
+        }
+        assert_eq!(state.tbar(0, tick(3)).unwrap().progress, Progress::ZERO);
+        let next = state.tbar(30000, tick(4)).unwrap();
+        assert!(next.started && !next.completed);
+        assert!(state.is_in_flight());
+    }
+}
+
+#[test]
 fn terminal_tbar_completes_manual_take_once() {
     let mut state = configured();
     state.tbar(12345, tick(2)).unwrap();
@@ -293,13 +328,18 @@ enum Cmd {
 #[derive(Clone, Debug)]
 struct Model {
     tick: u64,
+    lever_at_end: bool,
 }
 struct Reference;
 impl ReferenceStateMachine for Reference {
     type State = Model;
     type Transition = Cmd;
     fn init_state() -> BoxedStrategy<Model> {
-        Just(Model { tick: 0 }).boxed()
+        Just(Model {
+            tick: 0,
+            lever_at_end: false,
+        })
+        .boxed()
     }
     fn transitions(_: &Model) -> BoxedStrategy<Cmd> {
         prop_oneof![
@@ -308,6 +348,9 @@ impl ReferenceStateMachine for Reference {
             Just(Cmd::Abort),
             any::<u16>().prop_map(Cmd::Tbar),
             Just(Cmd::RepeatTerminalTbar),
+            Just(Cmd::Tbar(0)),
+            Just(Cmd::Tbar(u16::MAX)),
+            Just(Cmd::Tbar(64000)),
             (0u8..12).prop_map(Cmd::Advance),
             (any::<bool>(), any::<bool>()).prop_map(|(b, k)| Cmd::Arm(b, k)),
             (0u8..3).prop_map(Cmd::SetPreview),
@@ -319,8 +362,14 @@ impl ReferenceStateMachine for Reference {
     fn apply(mut state: Model, transition: &Cmd) -> Model {
         // The reference tracks *observed* completions and the last output projection;
         // its independent invariant is that a bus swap cannot occur without a take.
-        if let Cmd::Advance(n) = transition {
-            state.tick += u64::from(*n);
+        match transition {
+            Cmd::Advance(n) => state.tick += u64::from(*n),
+            Cmd::Tbar(0) | Cmd::Abort => state.lever_at_end = false,
+            Cmd::Tbar(position) if *position == u16::MAX && !state.lever_at_end => {
+                state.lever_at_end = true;
+            }
+            Cmd::RepeatTerminalTbar => state.lever_at_end = true,
+            _ => {}
         }
         state
     }
@@ -354,7 +403,10 @@ impl StateMachineTest for Test {
             was_in_flight: false,
         }
     }
-    fn apply(mut sut: Sut, _: &Model, transition: Cmd) -> Sut {
+    fn apply(mut sut: Sut, model: &Model, transition: Cmd) -> Sut {
+        let parked_manual = model.lever_at_end
+            && !sut.machine.is_in_flight()
+            && matches!(transition, Cmd::Tbar(position) if position != 0);
         let result = match transition {
             Cmd::Auto => sut.machine.auto(tick(sut.tick)).ok(),
             Cmd::Cut => sut.machine.cut().ok(),
@@ -431,6 +483,11 @@ impl StateMachineTest for Test {
             Cmd::Punch(n) => Some(sut.machine.punch(source(&format!("p{n}")))),
         };
         if let Some(output) = result {
+            if parked_manual {
+                assert_eq!(output.progress, Progress::ZERO, "parked lever moved: {transition:?}");
+                assert!(!output.started && !output.completed, "parked lever triggered take: {transition:?}");
+                assert!(!sut.machine.is_in_flight());
+            }
             assert!(output.progress.numerator() <= output.progress.denominator());
             if output.completed {
                 assert!(
