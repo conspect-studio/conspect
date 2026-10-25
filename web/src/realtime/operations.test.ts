@@ -69,4 +69,46 @@ describe("operation correlation", () => {
       replayed: true,
     });
   });
+
+  it("resolves BOTH of two concurrent registrations for the same operation id", async () => {
+    const a = correlateOperation({ operation_id: "dup-1", kind: "take" });
+    const b = correlateOperation({ operation_id: "dup-1", kind: "replay" });
+    expect(resolveOperationEnvelope(env("dup-1"))).toBe(true);
+    await expect(a).resolves.toMatchObject({ operationId: "dup-1", replayed: false });
+    await expect(b).resolves.toMatchObject({ operationId: "dup-1", replayed: true });
+  });
+
+  it("a registration timing out does not starve a sibling registration", async () => {
+    const short = correlateOperation({ operation_id: "dup-2", kind: "take" }, 50);
+    const shortAssertion = expect(short).rejects.toThrow(/timed out/);
+    const long = correlateOperation({ operation_id: "dup-2", kind: "replay" }, 10_000);
+    await vi.advanceTimersByTimeAsync(60);
+    await shortAssertion;
+    resolveOperationEnvelope(env("dup-2"));
+    await expect(long).resolves.toMatchObject({ operationId: "dup-2" });
+  });
+
+  it("a replay AFTER completion resolves from the cache, repeatedly", async () => {
+    const first = correlateOperation({ operation_id: "dup-3", kind: "take" });
+    resolveOperationEnvelope(env("dup-3"));
+    await first;
+    await expect(correlateOperation({ operation_id: "dup-3", kind: "replay" })).resolves.toMatchObject({
+      operationId: "dup-3",
+      replayed: true,
+    });
+    await expect(correlateOperation({ operation_id: "dup-3", kind: "replay" })).resolves.toMatchObject({
+      operationId: "dup-3",
+    });
+  });
+
+  it("a completed outcome still expires after the TTL", async () => {
+    const first = correlateOperation({ operation_id: "dup-4", kind: "take" });
+    resolveOperationEnvelope(env("dup-4"));
+    await first;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    const late = correlateOperation({ operation_id: "dup-4", kind: "replay" }, 50);
+    const assertion = expect(late).rejects.toThrow(/timed out/);
+    await vi.advanceTimersByTimeAsync(60);
+    await assertion;
+  });
 });
