@@ -1588,7 +1588,7 @@ msgstr "Cleared (no alarm)"
 msgid "Cleared only"
 msgstr "Cleared only"
 
-#: src/pages/ProgramMeters.tsx:61
+#: src/pages/ProgramMeters.tsx:85
 msgid "Clip"
 msgstr "Clip"
 
@@ -5489,8 +5489,8 @@ msgstr "Program bus only"
 msgid "Program loudness"
 msgstr "Program loudness"
 
-#: src/pages/ProgramMeters.tsx:40
-#: src/pages/ProgramMeters.tsx:57
+#: src/pages/ProgramMeters.tsx:64
+#: src/pages/ProgramMeters.tsx:81
 msgid "Program meters"
 msgstr "Program meters"
 
@@ -7596,11 +7596,11 @@ msgstr "Waiting for loudness telemetry (realtime offline)…"
 msgid "Waiting for loudness telemetry…"
 msgstr "Waiting for loudness telemetry…"
 
-#: src/pages/ProgramMeters.tsx:46
+#: src/pages/ProgramMeters.tsx:70
 msgid "Waiting for meter telemetry (realtime offline)…"
 msgstr "Waiting for meter telemetry (realtime offline)…"
 
-#: src/pages/ProgramMeters.tsx:44
+#: src/pages/ProgramMeters.tsx:68
 msgid "Waiting for meter telemetry…"
 msgstr "Waiting for meter telemetry…"
 

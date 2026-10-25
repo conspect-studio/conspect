@@ -303,8 +303,14 @@ impl ProgramBus {
     /// before the first mix.
     #[must_use]
     pub fn input_tracks(&self) -> Vec<(&str, &AudioBlock)> {
-        let _ = &self.routes;
-        Vec::new()
+        self.routes
+            .iter()
+            .filter_map(|(point, _)| {
+                let id = self.mixer.input_id(*point)?;
+                let block = self.mixer.discrete_track(*point)?;
+                Some((id, block))
+            })
+            .collect()
     }
 
     /// Mix one output tick of program audio.

@@ -11,6 +11,8 @@ import { Trans } from '@lingui/react/macro';
 
 import { meterFillPercent, useAudioMeter } from '../realtime/useAudioMeter';
 import type { AudioMeterState } from '../realtime/useAudioMeter';
+import { useAudioLoudness } from '../realtime/useAudioLoudness';
+import type { AudioLoudnessSample } from '../realtime/useAudioLoudness';
 import { cn } from '../lib/utils';
 
 function channelLabel(index: number, count: number): string {
@@ -31,8 +33,30 @@ function Bar({ db, kind }: { db: number; kind: 'peak' | 'rms' }): JSX.Element {
   );
 }
 
-/** Presentational view: rendered purely from the meter state. */
-export function ProgramMetersView({ status, current }: AudioMeterState): JSX.Element {
+const ABSENT = '—';
+
+function fmt(value: number | undefined): string {
+  return value === undefined ? ABSENT : value.toFixed(1);
+}
+
+/** Props: the meter state plus the (optional) latest `audio.loudness` sample. */
+export type ProgramMetersProps = AudioMeterState & {
+  readonly loudness?: AudioLoudnessSample | undefined;
+};
+
+function Lufs({ testid, label, value }: { testid: string; label: string; value: number | undefined }): JSX.Element {
+  return (
+    <div className="flex flex-col rounded-md border border-border bg-card px-2 py-1">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span data-testid={testid} className="font-mono text-sm tabular-nums">
+        {fmt(value)}
+      </span>
+    </div>
+  );
+}
+
+/** Presentational view: rendered purely from the meter + loudness state. */
+export function ProgramMetersView({ status, current, inputs, loudness }: ProgramMetersProps): JSX.Element {
   if (current === undefined) {
     return (
       <section aria-label="Program meters" className="rounded-lg border border-border p-4">
@@ -84,11 +108,48 @@ export function ProgramMetersView({ status, current }: AudioMeterState): JSX.Ele
           );
         })}
       </ul>
+
+      {loudness !== undefined ? (
+        <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-5">
+          <Lufs testid="meter-lufs-m" label="M LUFS" value={loudness.momentary} />
+          <Lufs testid="meter-lufs-s" label="S LUFS" value={loudness.short_term} />
+          <Lufs testid="meter-lufs-i" label="I LUFS" value={loudness.integrated} />
+          <Lufs testid="meter-lra" label="LRA LU" value={loudness.lra} />
+          <Lufs testid="meter-dbtp" label="dBTP" value={loudness.true_peak_dbtp} />
+        </div>
+      ) : null}
+
+      {inputs.length > 0 ? (
+        <ul className="mt-3 space-y-1 border-t border-border pt-3" aria-label="Input meters">
+          {inputs.map((m) => {
+            const id = m.input_id ?? String(m.track);
+            return (
+              <li
+                key={m.track}
+                data-testid={`input-meter-${id}`}
+                className="flex items-center gap-3 text-xs"
+              >
+                <span className="w-24 truncate text-muted-foreground">{id}</span>
+                <div className="flex flex-1 flex-col gap-1">
+                  {m.peak_db.map((db, i) => (
+                    <Bar key={i} db={db} kind="peak" />
+                  ))}
+                </div>
+                <span className="w-28 font-mono tabular-nums">
+                  {m.peak_db.map((db) => db.toFixed(1)).join(' / ')} dBFS pk
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
     </section>
   );
 }
 
 /** The live container: subscribes to `audio.meter` + renders the view. */
 export function ProgramMeters(): JSX.Element {
-  return <ProgramMetersView {...useAudioMeter()} />;
+  const meter = useAudioMeter();
+  const { current: loudness } = useAudioLoudness();
+  return <ProgramMetersView {...meter} loudness={loudness} />;
 }

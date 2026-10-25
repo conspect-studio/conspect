@@ -59,6 +59,8 @@ export interface AudioLoudness {
 export interface AudioMeter {
   /** Whether any channel clipped in this window. */
   readonly clip: boolean;
+  /** Source/input id of a per-input sample; absent on the program bus (track 0). */
+  readonly input_id?: string;
   /** Whether the meter pipeline overflowed (dropped windows). */
   readonly overflow: boolean;
   /** Per-channel peak level (dBFS). */
@@ -67,7 +69,7 @@ export interface AudioMeter {
   readonly rms_db: readonly number[];
   /** Effective wire cadence (Hz). */
   readonly sampled_hz: number;
-  /** Track index. */
+  /** Track index: 0 is the program bus; 1.. are per-input tracks. */
   readonly track: number;
 }
 

@@ -140,8 +140,28 @@ impl InputMeters {
     /// Meter every input's discrete block and return the samples due this call
     /// (each input is independently conflated to [`METER_EMIT_HZ`]).
     pub fn push(&mut self, tracks: &[(&str, &AudioBlock)], now_ns: i64) -> Vec<AudioMeter> {
-        let _ = (tracks, now_ns, MAX_INPUT_TRACKS, &mut self.meters);
-        Vec::new()
+        let mut out = Vec::new();
+        for &(id, block) in tracks {
+            let idx = if let Some(i) = self.meters.iter().position(|(known, _)| known == id) {
+                i
+            } else {
+                if self.meters.len() >= MAX_INPUT_TRACKS {
+                    continue;
+                }
+                let track = u32::try_from(self.meters.len() + 1).unwrap_or(u32::MAX);
+                let channels = block.format().channel_count();
+                self.meters
+                    .push((id.to_owned(), MeterTelemetry::new(track, channels)));
+                self.meters.len() - 1
+            };
+            if let Some((name, meter)) = self.meters.get_mut(idx) {
+                if let Some(mut sample) = meter.push(block, now_ns) {
+                    sample.input_id = Some(name.clone());
+                    out.push(sample);
+                }
+            }
+        }
+        out
     }
 }
 

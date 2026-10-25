@@ -4701,6 +4701,9 @@ fn consumer_main(
     // built lazily from the first emitted block's channel count. Same thread and
     // same non-blocking drop-oldest publisher as the loudness lane (inv #10).
     let mut audio_meter: Option<crate::meter_telemetry::MeterTelemetry> = None;
+    // Per-input peak/RMS meters (tracks 1..), fed from each routed source's
+    // discrete pre-mix block.
+    let mut input_meters = crate::meter_telemetry::InputMeters::new();
     // Track which sinks are still live (their receiver has not hung up) so a sink
     // that ended early does not wedge or repeatedly error the consumer.
     let mut live: Vec<bool> = vec![true; sink_txs.len()];
@@ -4769,6 +4772,11 @@ fn consumer_main(
                 });
                 if let Some(sample) = peak_rms.push(&block, now_ns) {
                     publisher.publish_event(Event::AudioMeter(sample));
+                }
+                if let Some(bus) = audio_bus.as_ref() {
+                    for sample in input_meters.push(&bus.input_tracks(), now_ns) {
+                        publisher.publish_event(Event::AudioMeter(sample));
+                    }
                 }
             }
             // DEV-B4: the display heads hear the SAME post-loudnorm program

@@ -18,6 +18,8 @@ export interface AudioMeterSample {
   readonly peak_db: readonly number[];
   /** Per-channel RMS level, dBFS. */
   readonly rms_db: readonly number[];
+  /** Source/input id for a per-input sample (track >= 1); absent on the program bus. */
+  readonly input_id?: string;
   /** Whether any channel clipped in this window. */
   readonly clip: boolean;
   /** Whether the meter pipeline dropped windows. */
@@ -63,8 +65,10 @@ export function parseAudioMeter(data: unknown): AudioMeterSample | undefined {
   ) {
     return undefined;
   }
+  const inputId = typeof data.input_id === "string" ? data.input_id : undefined;
   return {
     track,
+    ...(inputId === undefined ? {} : { input_id: inputId }),
     peak_db: peak,
     rms_db: rms,
     clip: data.clip === true,
@@ -87,12 +91,15 @@ export interface AudioMeterState {
   readonly status: RealtimeStatus;
   /** Latest program-bus (track 0) sample, or `undefined` before the first. */
   readonly current: AudioMeterSample | undefined;
+  /** Latest sample per input track (ordered by track), excluding the program bus. */
+  readonly inputs: readonly AudioMeterSample[];
 }
 
 /** Subscribe to `audio.meter` and expose the latest program-bus sample. */
 export function useAudioMeter(): AudioMeterState {
   const [status, setStatus] = useState<RealtimeStatus>("connecting");
   const [current, setCurrent] = useState<AudioMeterSample | undefined>(undefined);
+  const [inputs, setInputs] = useState<readonly AudioMeterSample[]>([]);
 
   useEffect(() => {
     const connection: RealtimeConnection = new RealtimeConnection(
@@ -106,8 +113,17 @@ export function useAudioMeter(): AudioMeterState {
             return;
           }
           const sample = parseAudioMeter(envelope.data);
-          if (sample?.track === 0) {
+          if (sample === undefined) {
+            return;
+          }
+          if (sample.track === 0) {
             setCurrent(sample);
+          } else {
+            setInputs((prev) =>
+              [...prev.filter((p) => p.track !== sample.track), sample].sort(
+                (a, b) => a.track - b.track,
+              ),
+            );
           }
         },
       },
@@ -119,5 +135,5 @@ export function useAudioMeter(): AudioMeterState {
     };
   }, []);
 
-  return { status, current };
+  return { status, current, inputs };
 }

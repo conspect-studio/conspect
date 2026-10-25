@@ -1588,7 +1588,7 @@ msgstr ""
 msgid "Cleared only"
 msgstr ""
 
-#: src/pages/ProgramMeters.tsx:61
+#: src/pages/ProgramMeters.tsx:85
 msgid "Clip"
 msgstr ""
 
@@ -5489,8 +5489,8 @@ msgstr ""
 msgid "Program loudness"
 msgstr ""
 
-#: src/pages/ProgramMeters.tsx:40
-#: src/pages/ProgramMeters.tsx:57
+#: src/pages/ProgramMeters.tsx:64
+#: src/pages/ProgramMeters.tsx:81
 msgid "Program meters"
 msgstr ""
 
@@ -7596,11 +7596,11 @@ msgstr ""
 msgid "Waiting for loudness telemetry…"
 msgstr ""
 
-#: src/pages/ProgramMeters.tsx:46
+#: src/pages/ProgramMeters.tsx:70
 msgid "Waiting for meter telemetry (realtime offline)…"
 msgstr ""
 
-#: src/pages/ProgramMeters.tsx:44
+#: src/pages/ProgramMeters.tsx:68
 msgid "Waiting for meter telemetry…"
 msgstr ""
 

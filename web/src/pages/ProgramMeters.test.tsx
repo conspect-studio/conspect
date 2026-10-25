@@ -8,6 +8,7 @@ import { renderWithProviders } from '../test/render';
 import { ProgramMetersView } from './ProgramMeters';
 import { meterFillPercent, parseAudioMeter } from '../realtime/useAudioMeter';
 import type { AudioMeterSample } from '../realtime/useAudioMeter';
+import type { AudioLoudnessSample } from '../realtime/useAudioLoudness';
 
 function frame(over: Partial<AudioMeterSample> = {}): AudioMeterSample {
   return {
@@ -88,12 +89,22 @@ describe('ProgramMetersView loudness + per-input', () => {
   });
 
   it('shows dashes for absent loudness fields, never a fabricated number', () => {
+    const gated: AudioLoudnessSample = {
+      program: 0,
+      short_term: -23.2,
+      lra: 5.4,
+      true_peak_dbtp: -3.1,
+      target_lufs: -23,
+      ceiling_dbtp: -1.5,
+      tolerance_lu: 1,
+      sampled_hz: 10,
+    };
     renderWithProviders(
       <ProgramMetersView
         status="open"
         current={frame()}
         inputs={[]}
-        loudness={{ ...loudness, momentary: undefined, integrated: undefined }}
+        loudness={gated}
       />,
     );
     expect(screen.getByTestId('meter-lufs-m')).toHaveTextContent('—');
