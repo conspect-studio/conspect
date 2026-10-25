@@ -264,6 +264,28 @@ fn lever_requires_bottom_after_every_manual_take_termination() {
 }
 
 #[test]
+fn parked_lever_returning_to_bottom_does_not_abort_an_independent_auto() {
+    let mut state = configured();
+    state
+        .set_transition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(5).unwrap(),
+        })
+        .unwrap();
+    assert!(state.tbar(u16::MAX, tick(1)).unwrap().completed);
+    assert_eq!(state.program(), &source("b"));
+    assert!(state.auto(tick(10)).unwrap().started);
+    assert_eq!(state.tbar(40000, tick(11)).unwrap().progress, Progress::ZERO);
+    let returned = state.tbar(0, tick(12)).unwrap();
+    assert_eq!(returned.progress, Progress::new(2, FrameCount::try_from(5).unwrap()));
+    assert!(!returned.started && !returned.completed);
+    assert!(state.is_in_flight());
+    assert_eq!(state.program(), &source("b"));
+    assert!(state.sample(tick(15)).completed);
+    assert_eq!(state.program(), &source("a"));
+    assert_eq!(state.completion_count(), 2);
+}
+
+#[test]
 fn terminal_tbar_completes_manual_take_once() {
     let mut state = configured();
     state.tbar(12345, tick(2)).unwrap();
@@ -417,9 +439,15 @@ impl ReferenceStateMachine for Reference {
     fn apply(mut state: Model, transition: &Cmd) -> Model {
         match transition {
             Cmd::Tbar(0) => {
+                let parked = state.lever_out_of_sync;
                 state.last_manual_position = 0;
                 state.lever_out_of_sync = false;
-                state.flight = None;
+                if !parked {
+                    state.flight = None;
+                } else if matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
+                {
+                    state.flight = None;
+                }
             }
             Cmd::Tbar(position) if !state.lever_out_of_sync => {
                 state.last_manual_position = *position;
