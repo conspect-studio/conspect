@@ -60,7 +60,7 @@ msgstr ""
 msgid "{hours} h ago"
 msgstr ""
 
-#: src/api/operationStatus.ts:67
+#: src/api/operationStatus.ts:79
 msgid "{label} completed"
 msgstr ""
 
@@ -68,12 +68,12 @@ msgstr ""
 msgid "{label} copied to the clipboard."
 msgstr ""
 
-#: src/api/operationStatus.ts:61
+#: src/api/operationStatus.ts:73
 msgid "{label} failed"
 msgstr ""
 
 #. placeholder {0}: accepted.operation_id
-#: src/api/operationStatus.ts:72
+#: src/api/operationStatus.ts:87
 msgid "{label}: no result arrived for operation {0}. It may still be running."
 msgstr ""
 
@@ -939,7 +939,7 @@ msgstr ""
 msgid "Apply filter"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:117
+#: src/pages/LayoutEditorPage.tsx:118
 #: src/pages/LayoutsPage.tsx:147
 msgid "Apply layout"
 msgstr ""
@@ -1323,11 +1323,11 @@ msgstr ""
 msgid "Cannot assign: area(s) {broken} would no longer be a rectangle. Areas must stay contiguous rectangles."
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:267
+#: src/pages/LayoutEditorPage.tsx:268
 msgid "Cannot convert this preset"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:255
+#: src/pages/LayoutEditorPage.tsx:256
 msgid "Cannot convert this preset to a grid"
 msgstr ""
 
@@ -1667,7 +1667,7 @@ msgstr ""
 msgid "Columns"
 msgstr ""
 
-#: src/api/operationStatus.ts:51
+#: src/api/operationStatus.ts:55
 #: src/pages/MediaPlayersPage.tsx:146
 #: src/pages/SalvosPage.tsx:157
 msgid "Command accepted"
@@ -1712,7 +1712,7 @@ msgstr ""
 msgid "Compose reference"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:337
+#: src/pages/LayoutEditorPage.tsx:338
 msgid "Compose the output multiview. The Canvas tab is drag-and-drop; the Cells tab is the fully keyboard-operable equivalent."
 msgstr ""
 
@@ -1818,19 +1818,19 @@ msgid "Convert to a free-form layout?"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:258
-#: src/pages/LayoutEditorPage.tsx:302
+#: src/pages/LayoutEditorPage.tsx:303
 msgid "Convert to free-form"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:294
+#: src/pages/LayoutEditorPage.tsx:295
 msgid "Convert to grid"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:171
+#: src/pages/LayoutEditorPage.tsx:172
 msgid "Converted to a grid (not yet saved). Save to keep the grid form."
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:193
+#: src/pages/LayoutEditorPage.tsx:194
 msgid "Converted to free-form (not yet saved). Save to keep the absolute placement."
 msgstr ""
 
@@ -2093,8 +2093,8 @@ msgstr ""
 msgid "Could not save as a device"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:95
-#: src/pages/LayoutEditorPage.tsx:133
+#: src/pages/LayoutEditorPage.tsx:96
+#: src/pages/LayoutEditorPage.tsx:134
 msgid "Could not save layout"
 msgstr ""
 
@@ -2835,15 +2835,15 @@ msgstr ""
 msgid "Edit device"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:145
-#: src/pages/LayoutEditorPage.tsx:156
-#: src/pages/LayoutEditorPage.tsx:169
-#: src/pages/LayoutEditorPage.tsx:191
-#: src/pages/LayoutEditorPage.tsx:216
-#: src/pages/LayoutEditorPage.tsx:229
-#: src/pages/LayoutEditorPage.tsx:278
-#: src/pages/LayoutEditorPage.tsx:315
-#: src/pages/LayoutEditorPage.tsx:335
+#: src/pages/LayoutEditorPage.tsx:146
+#: src/pages/LayoutEditorPage.tsx:157
+#: src/pages/LayoutEditorPage.tsx:170
+#: src/pages/LayoutEditorPage.tsx:192
+#: src/pages/LayoutEditorPage.tsx:217
+#: src/pages/LayoutEditorPage.tsx:230
+#: src/pages/LayoutEditorPage.tsx:279
+#: src/pages/LayoutEditorPage.tsx:316
+#: src/pages/LayoutEditorPage.tsx:336
 msgid "Edit layout"
 msgstr ""
 
@@ -3731,7 +3731,7 @@ msgstr ""
 msgid "IPv6"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:256
+#: src/pages/LayoutEditorPage.tsx:257
 msgid "Its tiles overlap (picture-in-picture), which a grid cannot express. Convert to free-form instead."
 msgstr ""
 
@@ -3874,15 +3874,15 @@ msgstr ""
 msgid "Layout or preset name (optional)"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:90
+#: src/pages/LayoutEditorPage.tsx:91
 msgid "Layout saved"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:118
+#: src/pages/LayoutEditorPage.tsx:119
 msgid "Layout saved & applied live"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:125
+#: src/pages/LayoutEditorPage.tsx:126
 msgid "Layout saved, but apply failed"
 msgstr ""
 
@@ -4125,7 +4125,7 @@ msgstr ""
 msgid "Loading heartbeat status…"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:147
+#: src/pages/LayoutEditorPage.tsx:148
 msgid "Loading layout…"
 msgstr ""
 
@@ -4700,7 +4700,7 @@ msgstr ""
 msgid "New instances blocked"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:335
+#: src/pages/LayoutEditorPage.tsx:336
 #: src/pages/LayoutsPage.tsx:212
 msgid "New layout"
 msgstr ""
@@ -5196,8 +5196,8 @@ msgstr ""
 msgid "Operation {0}; the result arrives on the realtime stream."
 msgstr ""
 
-#: src/api/operationStatus.ts:52
-#: src/pages/LayoutEditorPage.tsx:119
+#: src/api/operationStatus.ts:56
+#: src/pages/LayoutEditorPage.tsx:120
 #: src/pages/LayoutsPage.tsx:149
 #: src/pages/MediaPlayersPage.tsx:147
 #: src/pages/MediaPlayersPage.tsx:168
@@ -5243,7 +5243,7 @@ msgstr ""
 msgid "Out of spec"
 msgstr ""
 
-#: src/api/operationStatus.ts:71
+#: src/api/operationStatus.ts:86
 msgid "Outcome not received"
 msgstr ""
 
@@ -6645,7 +6645,7 @@ msgstr ""
 msgid "Take vamp exit"
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:119
+#: src/pages/LayoutEditorPage.tsx:120
 #: src/pages/LayoutsPage.tsx:149
 msgid "Takes effect at the next frame boundary."
 msgstr ""
@@ -6756,7 +6756,7 @@ msgstr ""
 msgid "That key was not accepted. Check it and try again."
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:158
+#: src/pages/LayoutEditorPage.tsx:159
 msgid "That layout no longer exists."
 msgstr ""
 
@@ -7074,7 +7074,7 @@ msgstr ""
 msgid "The stored area map was ragged and has been normalized for editing; saving will persist the repaired map."
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:268
+#: src/pages/LayoutEditorPage.tsx:269
 msgid "The stored preset body could not be expanded."
 msgstr ""
 
@@ -7214,7 +7214,7 @@ msgstr ""
 msgid "This field is required."
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:218
+#: src/pages/LayoutEditorPage.tsx:219
 msgid "This grid layout's body could not be parsed (its track or area lists are malformed). Fix the stored document via the API."
 msgstr ""
 
@@ -7242,11 +7242,11 @@ msgstr ""
 msgid "This is why the wall keeps running through any input failure: the output's timing is independent of every input by construction. Frame rates are handled as exact fractions (NTSC 29.97 is <0>30000/1001</0>, never a rounded decimal), so the cadence cannot drift over long runs."
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:287
+#: src/pages/LayoutEditorPage.tsx:288
 msgid "This layout uses the factory preset \"{preset}\". To edit it, convert it to an editable form first — nothing changes until you save."
 msgstr ""
 
-#: src/pages/LayoutEditorPage.tsx:323
+#: src/pages/LayoutEditorPage.tsx:324
 msgid "This layout's body could not be parsed into an editable form. Fix the stored document via the API."
 msgstr ""
 
