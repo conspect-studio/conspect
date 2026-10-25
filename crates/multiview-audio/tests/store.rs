@@ -661,22 +661,93 @@ fn output_pull_tick_count_is_independent_of_the_rtp_feed() {
     );
 }
 
+/// Publishes per store in the cross-instance audio test.
+const XS_PUBLISHES: usize = 200_000;
+/// Frames in each cross-instance window (always `[0, XS_FRAMES)`).
+const XS_FRAMES: usize = 4;
+
+/// Store `a`'s per-instance sample tag for publish `n`: `4n + 1` (store `b`
+/// uses `4n + 3`). Exact in `f32` for `n < 2^22`.
+fn tag_a(n: usize) -> f32 {
+    (4 * n + 1) as f32
+}
+
+/// What one full-window read of store `a` may legally return: every sample
+/// equal to `tag_a(n)` for one `n` in `0..=XS_PUBLISHES`, with `n` never older
+/// than `prev`. `b`'s samples (`4n + 3`), `b`'s or anyone's silence, a mixed
+/// window, or an out-of-range tag all fail (#134 review: no relative-only
+/// checks).
+fn check_audio_a(samples: &[f32], prev: usize) -> Result<usize, String> {
+    let first = *samples.first().ok_or("empty read")?;
+    if samples.iter().any(|&s| s != first) {
+        return Err(format!(
+            "store `a` returned a mixed/foreign window {samples:?}"
+        ));
+    }
+    if !(first >= 1.0 && first.fract() == 0.0) {
+        return Err(format!("store `a` returned a foreign sample {first}"));
+    }
+    // reason: `first` is checked >= 1 and integral above; tags stay < 2^24.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let raw = first as usize;
+    if raw % 4 != 1 {
+        return Err(format!("store `a` returned a foreign sample {first} (tag)"));
+    }
+    let n = raw / 4;
+    if n > XS_PUBLISHES {
+        return Err(format!(
+            "store `a` returned a foreign sample {first} (range)"
+        ));
+    }
+    if n < prev {
+        return Err(format!("samples regressed: {n} < {prev}"));
+    }
+    Ok(n)
+}
+
+#[test]
+fn audio_validator_rejects_foreign_windows() {
+    let own = |n: usize| vec![tag_a(n); XS_FRAMES * 2];
+    assert_eq!(check_audio_a(&own(0), 0), Ok(0));
+    assert_eq!(check_audio_a(&own(9), 3), Ok(9));
+    // Store `b`'s value for the same and other publishes.
+    for n in [0, 1, 9, XS_PUBLISHES] {
+        assert!(check_audio_a(&[(4 * n + 3) as f32; XS_FRAMES * 2], 0).is_err());
+    }
+    // `b`'s empty seed (reads as silence), a mixed window, out of range,
+    // and a regression.
+    assert!(check_audio_a(&[0.0; XS_FRAMES * 2], 0).is_err());
+    let mut mixed = own(5);
+    mixed[3] = 23.0;
+    assert!(check_audio_a(&mixed, 0).is_err());
+    assert!(check_audio_a(&own(XS_PUBLISHES + 1), 0).is_err());
+    assert!(check_audio_a(&own(3), 9).is_err());
+}
+
 /// Regression for #134 (upstream vorner/arc-swap#210, first found in
 /// `multiview-framestore` by #133). Two independent stores of the same format,
-/// published by one thread in lock-step with whole-window replacements of the
-/// same size, so the snapshot allocation freed from `a` is immediately reused
-/// for `b`'s next one. arc-swap's default strategy keys its process-global debt
-/// list by raw address, so `b`'s writer could "pay" a debt a reader of `a`
-/// holds, and `a.read` would then return `b`'s samples. A store must only ever
-/// return samples published into it, and one reader must never see them go
-/// backwards.
+/// written by one thread in lock-step at the same absolute frame (`publish_at`,
+/// which allocates a fresh window each time), so the snapshot allocation freed
+/// from `a` is immediately reused for `b`'s next one. arc-swap's default
+/// strategy keys its process-global debt list by raw address, so `b`'s writer
+/// could "pay" a debt a reader of `a` holds, and `a.read` would then return
+/// `b`'s samples. Both stores are seeded before the readers start, and the
+/// window is always `[0, XS_FRAMES)`, so every read is one snapshot that must
+/// pass [`check_audio_a`].
 #[test]
 fn read_never_returns_samples_published_into_another_store() {
-    const PUBLISHES: usize = 200_000;
-    const READERS: usize = 2;
-    const FRAMES: usize = 4;
-    let a = Arc::new(AudioStore::new(stereo(), FRAMES));
-    let b = Arc::new(AudioStore::new(stereo(), FRAMES));
+    // One reader: the read cursor is single-consumer (`seek_to` + `read`
+    // from two threads would race it and read past the window).
+    const READERS: usize = 1;
+    let a = Arc::new(AudioStore::new(stereo(), XS_FRAMES));
+    let b = Arc::new(AudioStore::new(stereo(), XS_FRAMES));
+    let publish = |n: usize| {
+        let block =
+            |v: f32| AudioBlock::from_interleaved(stereo(), vec![v; XS_FRAMES * 2]).unwrap();
+        a.publish_at(0, &block(tag_a(n))).unwrap();
+        b.publish_at(0, &block((4 * n + 3) as f32)).unwrap();
+    };
+    publish(0);
     let done = Arc::new(AtomicBool::new(false));
 
     let readers: Vec<_> = (0..READERS)
@@ -684,45 +755,33 @@ fn read_never_returns_samples_published_into_another_store() {
             let a = Arc::clone(&a);
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
-                let mut prev = 0.0_f32;
-                let mut samples = 0_u64;
+                let mut prev = 0;
+                let mut reads = 0_u64;
                 while !done.load(Ordering::Acquire) {
-                    // The window is always `[base, base + FRAMES)`; read all of it.
-                    a.seek_to_live_edge();
-                    let edge = a.read_cursor();
-                    a.seek_to(edge - FRAMES as i64);
-                    let block = a.read(FRAMES);
-                    let first = block.interleaved()[0];
-                    for &s in block.interleaved() {
-                        assert!(
-                            s >= 0.0,
-                            "store `a` returned a sample published into store `b` ({s})"
-                        );
-                    }
-                    if first > 0.0 {
-                        assert!(first >= prev, "samples regressed: {first} < {prev}");
-                        prev = first;
-                        samples += 1;
-                    }
+                    a.seek_to(0);
+                    let block = a.read(XS_FRAMES);
+                    prev =
+                        check_audio_a(block.interleaved(), prev).unwrap_or_else(|e| panic!("{e}"));
+                    reads += 1;
                 }
-                samples
+                reads
             })
         })
         .collect();
 
-    let mut buf = vec![0.0_f32; FRAMES * 2];
-    for counter in 1..=PUBLISHES {
-        // Exact in f32: counter < 2^24.
-        buf.fill(counter as f32);
-        a.publish_samples(&buf).unwrap();
-        buf.fill(-(counter as f32));
-        b.publish_samples(&buf).unwrap();
+    for n in 1..=XS_PUBLISHES {
+        publish(n);
     }
     done.store(true, Ordering::Release);
     for reader in readers {
-        let samples = reader.join().expect("reader thread panicked");
-        assert!(samples > 0, "reader observed no published window");
+        let reads = reader.join().expect("reader thread panicked");
+        assert!(reads > 0, "reader observed no published window");
     }
+    a.seek_to(0);
+    assert_eq!(
+        check_audio_a(a.read(XS_FRAMES).interleaved(), 0),
+        Ok(XS_PUBLISHES)
+    );
 }
 
 /// Invariants #1/#10 soak for the `SwapCell`-backed window (#134): with more

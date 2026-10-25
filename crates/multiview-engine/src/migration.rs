@@ -495,49 +495,84 @@ mod tests {
         assert_eq!(read[0].device_id, load.device_id);
     }
 
+    /// Publishes per board in the cross-instance test.
+    const XS_PUBLISHES: u32 = 100_000;
+
+    fn xs_dev(owner: &str, n: u32) -> DeviceLoad {
+        DeviceLoad::unknown(DeviceId::new(multiview_hal::load::Vendor::Nvidia, owner, n))
+    }
+
+    /// What a reader of board `a` may legally observe: exactly one device
+    /// tagged `"a"` with index in `0..=XS_PUBLISHES`, never older than `prev`.
+    /// `b`'s snapshot (tag `"b"`), an empty snapshot (either board's seed),
+    /// or an out-of-range index all fail (#134 review: no relative-only
+    /// checks).
+    fn check_board_a(loads: &[DeviceLoad], prev: u32) -> Result<u32, String> {
+        let [d] = loads else {
+            return Err(format!(
+                "board `a` returned a foreign snapshot of {} devices",
+                loads.len()
+            ));
+        };
+        if d.device_id.stable_id() != "a" {
+            return Err(format!(
+                "board `a` returned `{}`'s snapshot",
+                d.device_id.stable_id()
+            ));
+        }
+        let n = d.device_id.index();
+        if n > XS_PUBLISHES {
+            return Err(format!("board `a` returned a foreign index {n}"));
+        }
+        if n < prev {
+            return Err(format!("snapshot regressed: {n} < {prev}"));
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn board_validator_rejects_foreign_snapshots() {
+        assert_eq!(check_board_a(&[xs_dev("a", 0)], 0), Ok(0));
+        assert_eq!(check_board_a(&[xs_dev("a", 9)], 3), Ok(9));
+        assert!(check_board_a(&[xs_dev("b", 9)], 0).is_err());
+        assert!(check_board_a(&[], 0).is_err(), "an empty seed is foreign");
+        assert!(check_board_a(&[xs_dev("a", 1), xs_dev("a", 2)], 0).is_err());
+        assert!(check_board_a(&[xs_dev("a", XS_PUBLISHES + 1)], 0).is_err());
+        assert!(check_board_a(&[xs_dev("a", 3)], 9).is_err(), "regression");
+    }
+
     /// Regression for #134 (upstream vorner/arc-swap#210): two independent
     /// load boards published in lock-step with same-size snapshots, so the
-    /// allocation freed from `a` is reused for `b`'s next one. A board must only
-    /// ever return snapshots published into it, and never regress.
+    /// allocation freed from `a` is reused for `b`'s next one. Both are seeded
+    /// before the readers start, so every read must pass [`check_board_a`].
     #[test]
     fn load_snapshot_never_returns_another_boards_snapshot() {
         use std::sync::atomic::AtomicBool;
-        const PUBLISHES: u32 = 100_000;
         let a = Arc::new(LoadSnapshot::new());
         let b = Arc::new(LoadSnapshot::new());
+        a.publish(vec![xs_dev("a", 0)]);
+        b.publish(vec![xs_dev("b", 0)]);
         let done = Arc::new(AtomicBool::new(false));
-        let dev = |owner: &str, n: u32| {
-            DeviceLoad::unknown(DeviceId::new(multiview_hal::load::Vendor::Nvidia, owner, n))
-        };
         let readers: Vec<_> = (0..2)
             .map(|_| {
                 let (a, done) = (Arc::clone(&a), Arc::clone(&done));
                 std::thread::spawn(move || {
                     let mut prev = 0;
                     while !done.load(Ordering::Acquire) {
-                        if let Some(d) = a.load().first() {
-                            assert_eq!(
-                                d.device_id.stable_id(),
-                                "a",
-                                "board `a` returned `b`'s snapshot"
-                            );
-                            assert!(d.device_id.index() >= prev, "snapshot regressed");
-                            prev = d.device_id.index();
-                        }
+                        prev = check_board_a(&a.load(), prev).unwrap_or_else(|e| panic!("{e}"));
                     }
                 })
             })
             .collect();
-        for n in 1..=PUBLISHES {
-            a.publish(vec![dev("a", n)]);
-            b.publish(vec![dev("b", n)]);
+        for n in 1..=XS_PUBLISHES {
+            a.publish(vec![xs_dev("a", n)]);
+            b.publish(vec![xs_dev("b", n)]);
         }
         done.store(true, Ordering::Release);
         for r in readers {
             r.join().expect("reader panicked");
         }
-        assert_eq!(a.load()[0].device_id.index(), PUBLISHES);
-        assert_eq!(b.load()[0].device_id.stable_id(), "b");
+        assert_eq!(check_board_a(&a.load(), 0), Ok(XS_PUBLISHES));
     }
 
     #[test]

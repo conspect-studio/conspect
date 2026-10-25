@@ -264,43 +264,112 @@ proptest! {
     }
 }
 
+/// Rounds per table in the cross-instance test.
+const XS_ROUNDS: u64 = 50_000;
+
+/// Table `a`'s origin; table `b` uses `10.0.0.2`.
+fn xs_origin_a() -> IpAddr {
+    v4(10, 0, 0, 1)
+}
+
+/// The announcement table `a` observes in round `n`: hash `n % 1000 + 1`,
+/// SDP `a:<n>`, seen at `n` ns. Table `b`'s round `n` uses origin `.2` and
+/// SDP `b:<n>`.
+fn xs_announce(owner: &str, origin: IpAddr, n: u64) -> SapPacket {
+    let h = u16::try_from(n % 1000 + 1).unwrap();
+    announce(h, origin, &format!("{owner}:{n}"))
+}
+
+/// What one inventory read of table `a` may legally hold: exactly one session
+/// whose origin, SDP tag, hash and `last_seen` all name the same round
+/// `n` of table `a`, in `0..=XS_ROUNDS` and never older than `prev`. `b`'s
+/// session, an empty inventory (either table's seed), or a session whose
+/// fields disagree all fail (#134 review: no relative-only checks).
+fn check_table_a(
+    sessions: &[multiview_input::sap::session::DiscoveredSession],
+    prev: u64,
+) -> Result<u64, String> {
+    let [s] = sessions else {
+        return Err(format!("table `a` returned {} sessions", sessions.len()));
+    };
+    if s.key.origin != xs_origin_a() {
+        return Err(format!(
+            "table `a` returned origin {}'s session",
+            s.key.origin
+        ));
+    }
+    let sdp = std::str::from_utf8(&s.sdp).map_err(|e| e.to_string())?;
+    let n: u64 = sdp
+        .strip_prefix("a:")
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("table `a` returned a foreign SDP {sdp:?}"))?;
+    if n > XS_ROUNDS
+        || u64::from(s.key.msg_id_hash.get()) != n % 1000 + 1
+        || s.last_seen != Duration::from_nanos(n)
+    {
+        return Err(format!(
+            "table `a` returned an inconsistent/foreign session {s:?}"
+        ));
+    }
+    if n < prev {
+        return Err(format!("inventory regressed: {n} < {prev}"));
+    }
+    Ok(n)
+}
+
+#[test]
+fn table_validator_rejects_foreign_inventories() {
+    let ob = v4(10, 0, 0, 2);
+    let observed = |owner: &str, origin: IpAddr, n: u64| {
+        let t = SapSessionTable::with_limits(1, 1);
+        t.observe(&xs_announce(owner, origin, n), Duration::from_nanos(n));
+        t.inventory()
+    };
+    assert_eq!(check_table_a(&observed("a", xs_origin_a(), 0), 0), Ok(0));
+    assert_eq!(check_table_a(&observed("a", xs_origin_a(), 9), 3), Ok(9));
+    // `b`'s session, even if it carried `a`'s origin or `a`'s SDP tag.
+    assert!(check_table_a(&observed("b", ob, 9), 0).is_err());
+    assert!(check_table_a(&observed("b", xs_origin_a(), 9), 0).is_err());
+    assert!(check_table_a(&observed("a", ob, 9), 0).is_err());
+    assert!(check_table_a(&[], 0).is_err(), "an empty seed is foreign");
+    assert!(check_table_a(&observed("a", xs_origin_a(), XS_ROUNDS + 1), 0).is_err());
+    assert!(check_table_a(&observed("a", xs_origin_a(), 3), 9).is_err());
+}
+
 /// Regression for #134 (upstream vorner/arc-swap#210): two independent tables
 /// written in lock-step with same-size snapshots, so the allocation freed from
-/// `a` is reused for `b`'s next one. A table's inventory must only ever hold
-/// sessions observed by that table.
+/// `a` is reused for `b`'s next one. Both are seeded before the readers
+/// start, so every inventory read must pass [`check_table_a`].
 #[test]
 fn inventory_never_returns_another_tables_sessions() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    const ROUNDS: u64 = 50_000;
     let a = Arc::new(SapSessionTable::with_limits(1, 1));
     let b = Arc::new(SapSessionTable::with_limits(1, 1));
-    let (oa, ob) = (v4(10, 0, 0, 1), v4(10, 0, 0, 2));
+    let ob = v4(10, 0, 0, 2);
+    let round = |n: u64| {
+        a.observe(&xs_announce("a", xs_origin_a(), n), Duration::from_nanos(n));
+        b.observe(&xs_announce("b", ob, n), Duration::from_nanos(n));
+    };
+    round(0);
     let done = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..2)
         .map(|_| {
             let (a, done) = (Arc::clone(&a), Arc::clone(&done));
             std::thread::spawn(move || {
-                let mut prev = Duration::ZERO;
+                let mut prev = 0;
                 while !done.load(Ordering::Acquire) {
-                    for s in a.inventory().iter() {
-                        assert_eq!(s.key.origin, oa, "table `a` returned `b`'s session");
-                        assert!(s.last_seen >= prev, "inventory regressed");
-                        prev = s.last_seen;
-                    }
+                    prev = check_table_a(&a.inventory(), prev).unwrap_or_else(|e| panic!("{e}"));
                 }
             })
         })
         .collect();
-    for n in 1..=ROUNDS {
-        let h = u16::try_from(n % 1000 + 1).unwrap();
-        a.observe(&announce(h, oa, "v=0"), Duration::from_nanos(n));
-        b.observe(&announce(h, ob, "v=0"), Duration::from_nanos(n));
+    for n in 1..=XS_ROUNDS {
+        round(n);
     }
     done.store(true, Ordering::Release);
     for r in readers {
         r.join().expect("reader panicked");
     }
-    assert_eq!(a.inventory()[0].key.origin, oa);
-    assert_eq!(b.inventory()[0].key.origin, ob);
+    assert_eq!(check_table_a(&a.inventory(), 0), Ok(XS_ROUNDS));
 }

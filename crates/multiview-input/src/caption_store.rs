@@ -110,17 +110,61 @@ mod tests {
         MediaTime::from_nanos(ns)
     }
 
+    /// Publishes per store in the cross-instance test.
+    const XS_PUBLISHES: i64 = 100_000;
+
+    /// Store `a`'s cue for publish `n` is `4n + 1`; store `b`'s is `4n + 3`.
+    const fn cue_a(n: i64) -> i64 {
+        4 * n + 1
+    }
+
+    /// What one `active_at(0)` read of store `a` may legally return: `a`'s cue
+    /// for some publish `n` in `0..=XS_PUBLISHES`, never older than `prev`.
+    /// `b`'s cue (tag `3`), `None` (an empty seed), or an out-of-range cue all
+    /// fail (#134 review: no relative-only checks).
+    fn check_cue_a(cue: Option<i64>, prev: i64) -> Result<i64, String> {
+        let cue = cue.ok_or("store `a` returned no cue (a foreign/empty snapshot)")?;
+        if cue.rem_euclid(4) != 1 {
+            return Err(format!("store `a` returned a foreign cue {cue} (tag)"));
+        }
+        let n = cue.div_euclid(4);
+        if !(0..=XS_PUBLISHES).contains(&n) {
+            return Err(format!("store `a` returned a foreign cue {cue} (range)"));
+        }
+        if n < prev {
+            return Err(format!("cue regressed: {n} < {prev}"));
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn cue_validator_rejects_foreign_cues() {
+        assert_eq!(check_cue_a(Some(cue_a(0)), 0), Ok(0));
+        assert_eq!(check_cue_a(Some(cue_a(9)), 3), Ok(9));
+        for n in [0, 1, 9, XS_PUBLISHES] {
+            assert!(check_cue_a(Some(4 * n + 3), 0).is_err(), "`b`'s cue");
+        }
+        assert!(check_cue_a(None, 0).is_err(), "an empty seed is foreign");
+        assert!(check_cue_a(Some(cue_a(XS_PUBLISHES + 1)), 0).is_err());
+        assert!(check_cue_a(Some(cue_a(-1)), 0).is_err());
+        assert!(check_cue_a(Some(cue_a(3)), 9).is_err(), "regression");
+    }
+
     /// Regression for #134 (upstream vorner/arc-swap#210): two independent
     /// stores published in lock-step with same-size snapshots, so the
-    /// allocation freed from `a` is reused for `b`'s next one. A store must only
-    /// return cues published into it.
+    /// allocation freed from `a` is reused for `b`'s next one. Both are seeded
+    /// before the readers start, so every read must pass [`check_cue_a`].
     #[test]
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, clippy::panic)]
     fn active_at_never_returns_another_stores_cue() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        const PUBLISHES: i64 = 100_000;
         let a = Arc::new(CaptionCueStore::<i64>::with_capacity(1));
         let b = Arc::new(CaptionCueStore::<i64>::with_capacity(1));
+        let publish = |n: i64| {
+            a.publish(mt(0), mt(1), cue_a(n));
+            b.publish(mt(0), mt(1), 4 * n + 3);
+        };
+        publish(0);
         let done = Arc::new(AtomicBool::new(false));
         let readers: Vec<_> = (0..2)
             .map(|_| {
@@ -128,25 +172,20 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut prev = 0;
                     while !done.load(Ordering::Acquire) {
-                        if let Some(cue) = a.active_at(mt(0)) {
-                            assert!(cue > 0, "store `a` returned `b`'s cue {cue}");
-                            assert!(cue >= prev, "cue regressed: {cue} < {prev}");
-                            prev = cue;
-                        }
+                        prev =
+                            check_cue_a(a.active_at(mt(0)), prev).unwrap_or_else(|e| panic!("{e}"));
                     }
                 })
             })
             .collect();
-        for n in 1..=PUBLISHES {
-            a.publish(mt(0), mt(1), n);
-            b.publish(mt(0), mt(1), -n);
+        for n in 1..=XS_PUBLISHES {
+            publish(n);
         }
         done.store(true, Ordering::Release);
         for r in readers {
             r.join().expect("reader panicked");
         }
-        assert_eq!(a.active_at(mt(0)), Some(PUBLISHES));
-        assert_eq!(b.active_at(mt(0)), Some(-PUBLISHES));
+        assert_eq!(check_cue_a(a.active_at(mt(0)), 0), Ok(XS_PUBLISHES));
     }
 
     #[test]

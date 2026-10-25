@@ -153,7 +153,11 @@ fn without_a_repoint_a_steady_layer_keeps_sampling_the_same_source() {
     assert_eq!(displayed_text(&mut layer, at_secs(5)), None);
 }
 
-/// A cue source that always reports one fixed cue whose text names its owner.
+/// Re-points per layer in the cross-instance test.
+const XS_REPOINTS: u64 = 50_000;
+
+/// A cue source that always reports one fixed cue whose text names its owner
+/// and re-point counter (`"a:7"`).
 struct Tagged(&'static str, u64);
 
 impl CueSource for Tagged {
@@ -166,13 +170,50 @@ impl CueSource for Tagged {
     }
 }
 
+/// What one `peek` of layer `a` may legally return: a `Tagged("a", n)` cue
+/// with `n` in `0..=XS_REPOINTS`, never older than `prev`. `b`'s cue, no cue
+/// (e.g. an `EmptyCueSource`), a malformed or multi-line cue, or an
+/// out-of-range counter all fail (#134 review: no relative-only checks).
+fn check_layer_a(cue: Option<multiview_overlay::subtitle::Cue>, prev: u64) -> Result<u64, String> {
+    let cue = cue.ok_or("layer `a` sampled a foreign source with no cue")?;
+    let [line] = cue.lines.as_slice() else {
+        return Err(format!("layer `a` sampled a foreign cue {:?}", cue.lines));
+    };
+    let n: u64 = line
+        .strip_prefix("a:")
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("layer `a` sampled a foreign cue {line:?}"))?;
+    if n > XS_REPOINTS {
+        return Err(format!("layer `a` sampled a foreign cue {line:?} (range)"));
+    }
+    if n < prev {
+        return Err(format!("source regressed: {n} < {prev}"));
+    }
+    Ok(n)
+}
+
+#[test]
+fn layer_validator_rejects_foreign_cues() {
+    let cue = |owner, n| Tagged(owner, n).active_at(MediaTime::ZERO);
+    assert_eq!(check_layer_a(cue("a", 0), 0), Ok(0));
+    assert_eq!(check_layer_a(cue("a", 9), 3), Ok(9));
+    assert!(check_layer_a(cue("b", 9), 0).is_err(), "`b`'s cue");
+    assert!(check_layer_a(None, 0).is_err(), "no cue");
+    assert!(check_layer_a(cue("a", XS_REPOINTS + 1), 0).is_err());
+    assert!(check_layer_a(cue("a", 3), 9).is_err(), "regression");
+    let mut two = cue("a", 1);
+    if let Some(c) = two.as_mut() {
+        c.lines.push("a:2".to_owned());
+    }
+    assert!(check_layer_a(two, 0).is_err(), "multi-line cue");
+}
+
 /// Regression for #134 (upstream vorner/arc-swap#210): two independent layers
 /// re-pointed in lock-step, so the source cell freed from `a` is reused for
-/// `b`'s next one. A layer must only ever sample a source re-pointed into it.
+/// `b`'s next one. Every `peek` of `a` must pass [`check_layer_a`].
 #[test]
 fn sample_never_reads_a_source_repointed_into_another_layer() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    const REPOINTS: u64 = 50_000;
     let a = Arc::new(SubtitleLayer::new(Arc::new(Tagged("a", 0))));
     let b = Arc::new(SubtitleLayer::new(Arc::new(Tagged("b", 0))));
     let done = Arc::new(AtomicBool::new(false));
@@ -180,21 +221,18 @@ fn sample_never_reads_a_source_repointed_into_another_layer() {
         // `sample` needs `&mut`; `peek` is the same source load through `&self`.
         let (a, done) = (Arc::clone(&a), Arc::clone(&done));
         std::thread::spawn(move || {
-            let mut prev = 0_u64;
+            let mut prev = 0;
             while !done.load(Ordering::Acquire) {
-                let text = a.peek(MediaTime::ZERO).expect("tagged source").text();
-                let (owner, n) = text.split_once(':').expect("owner:n");
-                assert_eq!(owner, "a", "layer `a` sampled `b`'s source");
-                let n: u64 = n.parse().expect("counter");
-                assert!(n >= prev, "source regressed: {n} < {prev}");
-                prev = n;
+                prev =
+                    check_layer_a(a.peek(MediaTime::ZERO), prev).unwrap_or_else(|e| panic!("{e}"));
             }
         })
     };
-    for n in 1..=REPOINTS {
+    for n in 1..=XS_REPOINTS {
         a.repoint(Arc::new(Tagged("a", n)));
         b.repoint(Arc::new(Tagged("b", n)));
     }
     done.store(true, Ordering::Release);
     reader.join().expect("reader panicked");
+    assert_eq!(check_layer_a(a.peek(MediaTime::ZERO), 0), Ok(XS_REPOINTS));
 }
