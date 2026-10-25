@@ -949,6 +949,62 @@ mod plan_take {
     }
 
     #[tokio::test]
+    async fn a_rejected_dispatch_leaves_no_correlation_behind() {
+        use multiview_events::{DeviceMode, Event, ImpactClass, ModePhase};
+        // A poller is "running" but its control channel is full, so dispatch is
+        // rejected: the 202 stands, yet the op must not stay correlated.
+        struct Wedged;
+        impl DevicePollerFactory for Wedged {
+            fn spawn(&self, _d: &Device, _w: &PollerWiring) -> Option<PollerHandle> {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(multiview_control::devices::PollerControl::SecretUpdated)
+                    .unwrap();
+                // Keep the receiver alive inside the task so the channel stays
+                // open-but-full.
+                let task = tokio::spawn(async move {
+                    let _keep = _rx;
+                    std::future::pending::<()>().await;
+                });
+                Some(PollerHandle::new(tx, task))
+            }
+        }
+        let registry = Arc::new(DevicePollerRegistry::with_factory(Arc::new(Wedged)));
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let slot2 = Arc::clone(&slot);
+        let h = harness_with(move |state| {
+            *slot2.lock().unwrap() = Some(Arc::clone(&state.corr));
+            state.with_device_pollers(registry)
+        });
+        seed_indexed_device(&h, "dev-foyer", 3).await;
+        let corr = slot.lock().unwrap().take().unwrap();
+
+        let resp = send(
+            &h.router,
+            post(
+                "/api/v1/devices/dev-foyer/set-mode",
+                &json!({ "mode": "decoder", "ack_impact": "c2" }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // A later, unrelated terminal device.mode event must not be attributed
+        // to the rejected operation.
+        let later = Event::DeviceMode(DeviceMode {
+            device_id: "dev-foyer".to_owned(),
+            mode: "decoder".to_owned(),
+            phase: ModePhase::Finished,
+            impact: ImpactClass::Class2,
+            detail: None,
+        });
+        let key = CorrKey::for_event(&later).unwrap();
+        assert!(
+            corr.resolve(&key, 9_999).is_none(),
+            "a rejected dispatch must not leave its op in the correlation queue"
+        );
+    }
+
+    #[tokio::test]
     async fn acked_apply_dispatches_and_correlates_the_outcome() {
         let transport = scripted();
         let (h, corr) = running_harness(&transport).await;

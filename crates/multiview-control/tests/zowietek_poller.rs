@@ -554,3 +554,59 @@ async fn spawned_actor_runs_and_stops_on_handle_drop() {
     join.abort();
     let _ = join.await;
 }
+
+// ---- Round 5 (#55): automatic convergence never takes the Class-2 path ------
+
+/// A poller whose driver carries spare decode index 3 and whose desired mode is
+/// `decoder`: adopting it (and reconnecting) is observe-only — it must not send
+/// a single mutating call (the disruptive switch needs an acknowledged set-mode).
+#[tokio::test]
+async fn adopt_with_a_spare_index_and_desired_decoder_makes_zero_mutating_calls() {
+    let (_engine, broadcaster, status, drivers) = harness();
+    let transport = ScriptedTransport::new();
+    transport.push("system", login_ok());
+    transport.push("venc", venc_encoder());
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport.clone()),
+        broadcaster,
+        Arc::clone(&drivers),
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(Some(3));
+    let mut poller = ZowietekPoller::new(
+        "dev-a",
+        driver,
+        Arc::clone(&status),
+        "[fd00:db8::1]",
+        PollerConfig::test_fast(),
+    )
+    .with_desired_mode(Some("decoder".to_owned()));
+
+    assert_eq!(poller.adopt_step().await, PollerStep::Online);
+    let _ = poller.reconnect_step().await;
+
+    let mutating: Vec<_> = transport
+        .wire()
+        .into_iter()
+        .filter(|(_, body)| {
+            matches!(
+                body["opt"].as_str(),
+                Some(
+                    "change_workmode"
+                        | "streamplay_switch"
+                        | "streamplay_modify"
+                        | "streamplay_add"
+                        | "streamplay_del"
+                        | "stop"
+                        | "start"
+                )
+            )
+        })
+        .collect();
+    assert!(
+        mutating.is_empty(),
+        "automatic convergence must not mutate a spare-index device: {mutating:?}"
+    );
+}
