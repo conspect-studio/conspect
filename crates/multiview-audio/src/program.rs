@@ -35,6 +35,10 @@ use crate::store::AudioStore;
 /// small, dependency-free enum so the audio crate (which sits below the engine
 /// and control crates) can surface the class of a [`SwitchTier`] without a
 /// crate-dependency cycle.
+///
+/// The class is a property of the **path**, not of the tier (ADR-0059 §7): the
+/// control-plane crosspoint classifier is authoritative for a given take, and
+/// [`SwitchTier::class`] reports only the tier's worst-case cost floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ApplyClass {
@@ -57,22 +61,44 @@ pub enum ApplyClass {
 ///   tier (so a caller/UI can badge it) but does not implement the coded path.
 /// * [`ClickFree`](Self::ClickFree) — a **decode → program-bus cross-fade →
 ///   re-encode** switch: the equal-power [`GainRamp`] cross-fade implemented here
-///   ([`ProgramBus::repoint_crossfade`]). It is genuinely pop-free but pays the
-///   transcode floor, so it is **Class-2** (the operator opts in).
+///   ([`ProgramBus::repoint_crossfade`]).
+///
+/// ## The apply class is a property of the path, not of the tier
+///
+/// [`class`](Self::class) reports the tier's **worst-case cost floor** — the
+/// class it carries on a **coded-passthrough** path, where choosing the decoded
+/// cross-fade would *force* a transcode that was not otherwise happening (so
+/// [`ClickFree`](Self::ClickFree) floors at [`Class2`](ApplyClass::Class2)). It
+/// is **not** the live answer for a given take: on the program-bus path the bus
+/// is *always* decode → mix → re-encode when program audio is on, so the
+/// cross-fade adds no reset and no new transcode and the take is **Class-1**.
+/// The authoritative classification is the control plane's crosspoint
+/// classifier (invariant #11; ADR-0059 §7), never this tier. Gain, mute, AFV
+/// cross-fades and master envelopes are all Class-1 on that path; only a bus
+/// **layout** change (count / identity / per-track codec) stays Class-2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SwitchTier {
-    /// Coded passthrough, AU-aligned step. Class-1, video-clean, not guaranteed
-    /// pop-free.
+    /// Coded passthrough, AU-aligned step. Hot (Class-1) and video-clean, but
+    /// not guaranteed pop-free (the coded-domain seam transient is
+    /// uncancellable).
     SoftStep,
-    /// Decoded-bus equal-power cross-fade. Class-2, genuinely pop-free.
+    /// Decoded-bus equal-power cross-fade. Genuinely pop-free; its worst-case
+    /// cost floor is Class-2 (a coded-passthrough path would pay a transcode it
+    /// was not otherwise paying), but on the always-re-encoded program-bus path
+    /// the take is Class-1 (see the type docs).
     ClickFree,
 }
 
 impl SwitchTier {
-    /// The invariant-#11 apply class of this tier: [`SoftStep`](Self::SoftStep)
-    /// is [`Class1`](ApplyClass::Class1); [`ClickFree`](Self::ClickFree) is
+    /// The tier's **worst-case cost floor**: the apply class it carries on a
+    /// coded-passthrough path. [`SoftStep`](Self::SoftStep) is
+    /// [`Class1`](ApplyClass::Class1); [`ClickFree`](Self::ClickFree) is
     /// [`Class2`](ApplyClass::Class2).
+    ///
+    /// This is a floor, not the live answer — the apply class is a property of
+    /// the **path** (ADR-0059 §7), and the control-plane crosspoint classifier
+    /// is authoritative for a given take (a program-bus re-point is Class-1).
     #[must_use]
     pub const fn class(self) -> ApplyClass {
         match self {
@@ -106,9 +132,10 @@ pub struct ProgramBus {
     /// Outgoing strips that are fading out during a cross-fade (RT-9). Each is a
     /// temporary route reading the *old* store at a declining (`cos`) ramp; once
     /// its ramp completes it is reclaimed from the mixer and dropped from
-    /// `routes`. Tracked here so [`mix`](ProgramBus::mix) can retire it on the
-    /// tick the ramp finishes.
-    fading_out: Vec<RoutePoint>,
+    /// `routes`. Each entry pairs the channel with its outgoing strip so mute
+    /// applies to every contribution, and [`mix`](ProgramBus::mix) retires the
+    /// strip on the tick its ramp finishes.
+    fading_out: Vec<(RoutePoint, RoutePoint)>,
     format: AudioFormat,
 }
 
@@ -251,7 +278,11 @@ impl ProgramBus {
         self.mixer
             .set_gain_ramp(out_point, GainRamp::down(ramp_frames));
         self.routes.push((out_point, old_store));
-        self.fading_out.push(out_point);
+        self.fading_out.push((point, out_point));
+        // The outgoing strip inherits the channel's mute envelope: re-pointing a
+        // muted channel must stay silent across the cross-fade rather than leak
+        // the old source's audio (mute ≠ unroute, ADR-0059 §4).
+        self.mixer.copy_mute_state(point, out_point);
 
         // INCOMING: re-point the channel onto the NEW store (live-edge seek, as
         // in `repoint`) and fade it in on a `sin` taper. The channel keeps its
@@ -274,6 +305,43 @@ impl ProgramBus {
     #[must_use]
     pub const fn format(&self) -> AudioFormat {
         self.format
+    }
+
+    /// Set a bus channel's steady program-route gain (linear) — the `SetGain`
+    /// half of ADR-0059 §4. Leaves the route and the mute state untouched; a
+    /// gain change is not a route change and not an unmute. A no-op for an
+    /// unknown point.
+    pub fn set_gain(&mut self, point: RoutePoint, gain: f64) {
+        self.mixer.set_gain(point, gain);
+    }
+
+    /// Mute or unmute a bus channel's program contribution **without unrouting
+    /// it** (ADR-0059 §4, "mute ≠ unroute"): the channel's steady gain is
+    /// preserved, so an unmute restores it exactly, and the change rides the
+    /// mixer's short equal-power anti-click envelope. Every outgoing cross-fade
+    /// strip still feeding this channel receives the same mute transition; an
+    /// unmute restores each strip's own preserved gain. A no-op for an unknown
+    /// point.
+    pub fn set_muted(&mut self, point: RoutePoint, muted: bool) {
+        self.mixer.set_muted(point, muted);
+        for &(channel, outgoing) in &self.fading_out {
+            if channel == point {
+                self.mixer.set_muted(outgoing, muted);
+            }
+        }
+    }
+
+    /// Whether a bus channel's program contribution is muted. `false` for an
+    /// unknown point (nothing to mute).
+    #[must_use]
+    pub fn is_muted(&self, point: RoutePoint) -> bool {
+        self.mixer.is_muted(point).unwrap_or(false)
+    }
+
+    /// The current steady program-route gain of a bus channel, if known.
+    #[must_use]
+    pub fn program_gain(&self, point: RoutePoint) -> Option<f64> {
+        self.mixer.program_gain(point)
     }
 
     /// The number of physical mixer input-strip slots backing this bus
@@ -394,7 +462,7 @@ impl ProgramBus {
             fading_out,
             ..
         } = self;
-        fading_out.retain(|&out_point| {
+        fading_out.retain(|&(_, out_point)| {
             if mixer.gain_ramp(out_point).is_some() {
                 return true; // still fading
             }

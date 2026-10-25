@@ -56,6 +56,54 @@ fn every_example_config_validates() {
 }
 
 #[test]
+fn conflicting_declared_main_fails_validation_before_pipeline_build() {
+    let toml = r##"
+schema_version = 1
+[canvas]
+width = 1920
+height = 1080
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "absolute"
+[[outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+[[programs]]
+id = "main"
+kind = "multiview"
+[programs.canvas]
+width = 1920
+height = 1080
+fps = "50/1"
+pixel_format = "nv12"
+background = "#101014"
+[programs.canvas.color]
+profile = "sdr-bt709-limited"
+[programs.layout]
+kind = "absolute"
+[[programs.outputs]]
+kind = "rtsp_server"
+mount = "/multiview"
+codec = "h264"
+"##;
+    let dir = tempdir();
+    let path = dir.join("conflicting-main.toml");
+    fs::write(&path, toml).expect("write temp config");
+    let report = validate_config(&path).expect("validation returns report");
+    assert!(!report.is_ok());
+    let rendered = report.render();
+    assert!(
+        rendered.contains("main") && rendered.contains("canvas"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn broken_config_fails_with_a_clear_message() {
     // A config that parses but references an undeclared source id — a semantic
     // (not syntactic) violation that `MultiviewConfig::validate` must catch.

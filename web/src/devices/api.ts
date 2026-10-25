@@ -14,9 +14,10 @@ import {
   apiUrl,
   buildHeaders,
   readProblem,
+  sendCommand,
   submitOperation,
 } from '../api/operations';
-import type { AcceptedBody, RequestOptions } from '../api/operations';
+import type { AcceptedOperation, RequestOptions } from '../api/operations';
 import { stringField } from '../resources/api';
 import type { ResourceRecord } from '../resources/types';
 import { parseDeviceStatus } from '../realtime/envelope';
@@ -204,21 +205,17 @@ export async function setDeviceMode(
   mode: string,
   options: RequestOptions = {},
 ): Promise<SetModeAccepted> {
-  const response = await fetch(
-    apiUrl(options, `/api/v1/devices/${encodeURIComponent(id)}/set-mode`),
-    {
-      method: 'POST',
-      headers: buildHeaders(options, true),
-      body: JSON.stringify({ mode }),
-    },
+  const response = await sendCommand(
+    `/api/v1/devices/${encodeURIComponent(id)}/set-mode`,
+    options,
+    { body: { mode } },
   );
-  if (!response.ok) {
-    throw await readProblem(response);
-  }
   const body: unknown = await response.json();
   if (!isSetModeAccepted(body)) {
     throw new Error('The server returned an unexpected set-mode body.');
   }
+  // Device mode changes are not correlated by the server (no CorrKey), so
+  // acceptance is all there is to report.
   return body;
 }
 
@@ -226,7 +223,7 @@ export async function setDeviceMode(
 export async function rebootDevice(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`/api/v1/devices/${encodeURIComponent(id)}/reboot`, options);
 }
 
@@ -268,7 +265,7 @@ export async function testPatternDevice(
 export async function measureSyncGroup(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`/api/v1/sync-groups/${encodeURIComponent(id)}/measure`, options);
 }
 
@@ -455,13 +452,7 @@ function isScanAccepted(value: unknown): value is ScanAccepted {
  * scan NEVER creates a device (ADR-0041).
  */
 export async function scanDevices(options: RequestOptions = {}): Promise<ScanAccepted> {
-  const response = await fetch(apiUrl(options, '/api/v1/discovery/devices/scan'), {
-    method: 'POST',
-    headers: buildHeaders(options, false),
-  });
-  if (!response.ok) {
-    throw await readProblem(response);
-  }
+  const response = await sendCommand('/api/v1/discovery/devices/scan', options);
   const body: unknown = await response.json();
   if (!isScanAccepted(body)) {
     throw new Error('The server returned an unexpected scan body.');

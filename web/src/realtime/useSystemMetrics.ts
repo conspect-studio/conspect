@@ -10,9 +10,8 @@
 // can never back-pressure the engine, and the client buffer never grows.
 import { useEffect, useState } from "react";
 
-import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
-import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
+import { subscribeRealtime } from "./shared";
 
 /** The GPU vendor classes the control plane reports (mirrors `GpuVendor`). */
 export type GpuVendor = "nvidia" | "intel" | "amd" | "apple" | "other";
@@ -427,30 +426,19 @@ export function useSystemMetrics(): SystemMetricsState {
 
   useEffect(() => {
     const ring = new SystemMetricsRing();
-    const connection: RealtimeConnection = new RealtimeConnection(
-      realtimeWsBaseUrl(),
-      {
-        onStatus: (next): void => {
-          setStatus(next);
-        },
-        onEnvelope: (envelope): void => {
-          // Only fold our topic's metric samples; everything else is ignored.
-          if (envelope.t !== "system.metrics") {
-            return;
-          }
-          const metrics = parseSystemMetrics(envelope.data);
-          if (metrics === undefined) {
-            return;
-          }
-          ring.push(metrics);
-          setSnapshot(ring.snapshot());
-        },
-      },
-      mintWsTicket,
-    );
-    connection.start();
+    const unsubscribe = subscribeRealtime("system", (envelope): void => {
+      if (envelope.t !== "system.metrics") {
+        return;
+      }
+      const metrics = parseSystemMetrics(envelope.data);
+      if (metrics === undefined) {
+        return;
+      }
+      ring.push(metrics);
+      setSnapshot(ring.snapshot());
+    }, setStatus);
     return (): void => {
-      connection.stop();
+      unsubscribe();
     };
   }, []);
 

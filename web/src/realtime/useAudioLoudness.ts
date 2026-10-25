@@ -14,9 +14,8 @@
 // per-sample reference (target ± tolerance, dBTP ceiling).
 import { useEffect, useState } from "react";
 
-import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
-import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
+import { subscribeRealtime } from "./shared";
 
 /** A program-bus EBU R128 loudness sample (mirrors the Rust `AudioLoudness`). */
 export interface AudioLoudnessSample {
@@ -261,11 +260,9 @@ export function useAudioLoudness(): AudioLoudnessState {
 
   useEffect(() => {
     const ballistics = new LoudnessBallistics();
-    const connection: RealtimeConnection = new RealtimeConnection(realtimeWsBaseUrl(), {
-      onStatus: (next): void => {
-        setStatus(next);
-      },
-      onEnvelope: (envelope): void => {
+    const unsubscribe = subscribeRealtime(
+      AUDIO_LOUDNESS_TOPIC,
+      (envelope): void => {
         // Only fold our topic's loudness samples; everything else is ignored.
         if (envelope.t !== AUDIO_LOUDNESS_EVENT) {
           return;
@@ -281,10 +278,10 @@ export function useAudioLoudness(): AudioLoudnessState {
           heldPeakDbtp: ballistics.heldPeakDbtp(),
         });
       },
-    }, mintWsTicket);
-    connection.start();
+      setStatus,
+    );
     return (): void => {
-      connection.stop();
+      unsubscribe();
     };
   }, []);
 

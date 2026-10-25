@@ -68,6 +68,16 @@ pub enum ConfigError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// A declared program conflicts with the legacy top-level program block.
+    #[error("program {program:?} {field} differs from the top-level multiview block")]
+    ProgramMismatch {
+        /// The conflicting program id.
+        program: String,
+        /// The conflicting field (`kind`, `canvas`, `layout`, `cells`,
+        /// `overlays`, or `outputs`).
+        field: &'static str,
+    },
+
     /// An output's audio selection exceeds what its transport can actually
     /// deliver (ADR-R005 §4.2 capability matrix): e.g. selectable discrete
     /// tracks on NDI (channel-map only), or more discrete tracks than a legacy
