@@ -500,6 +500,11 @@ impl<P: Pacer> EngineRuntime<P> {
         // compose ran — holding 1.0× cadence instead of slipping (ADR-T018, inv
         // #1/#2/#3). `None` only before the very first frame is composed.
         let mut last_good: Option<CompositedFrame> = None;
+        // Repeats emitted since the control hook last ran (#143). Reset on every
+        // hook call; the repeat path runs the hook once this reaches
+        // `MAX_REPEATS_BETWEEN_CONTROL`, so command drain can never be starved by
+        // a catch-up burst however slow a per-tick stage is.
+        let mut repeats_since_control: u32 = 0;
         loop {
             if stop.is_stopped() {
                 return Ok(RunOutcome {
@@ -592,11 +597,25 @@ impl<P: Pacer> EngineRuntime<P> {
                     // `state_of` fan-out clones the canvas once, exactly as it does
                     // for a fresh frame (inv #3: a repeat carries a NEW pts, never a
                     // duplicate/rewound one).
+                    // Bounded control cadence (#143, inv #1/#10): a long burst
+                    // still drains the command queue every
+                    // `MAX_REPEATS_BETWEEN_CONTROL` repeats. The hook is the same
+                    // non-blocking O(1) frame-boundary seam as the fresh path; a
+                    // swap it applies lands on the next fresh compose.
+                    if repeats_since_control >= MAX_REPEATS_BETWEEN_CONTROL {
+                        control(&mut self.drive);
+                        repeats_since_control = 0;
+                    }
                     let repeat_tick: Tick = self.clock.tick();
                     let Some(last) = last_good.as_mut() else {
                         break;
                     };
                     last.tick = repeat_tick;
+                    // Mark the repeat so a projection can skip its expensive
+                    // per-frame stages (probes) and reuse its last result: the
+                    // canvas is unchanged, and paying full cost per catch-up tick
+                    // is what kept the burst from ever catching up (#143).
+                    last.repeat = true;
                     publisher.publish_state(state_of(&*last));
                     if let Some(event) = event_of(&*last) {
                         publisher.publish_event(event);
@@ -605,6 +624,7 @@ impl<P: Pacer> EngineRuntime<P> {
                     self.ticks_emitted.fetch_add(1, Ordering::AcqRel);
                     self.frames_repeated.fetch_add(1, Ordering::AcqRel);
                     repeats = repeats.saturating_add(1);
+                    repeats_since_control = repeats_since_control.saturating_add(1);
                 }
             }
 
@@ -619,6 +639,7 @@ impl<P: Pacer> EngineRuntime<P> {
             //     it never awaits and never holds a lock a client can fill, so the
             //     output clock cannot be stalled by control (invariants #1 + #10).
             control(&mut self.drive);
+            repeats_since_control = 0;
 
             // 3. Sample + compose exactly one frame (lock-free, never blocks on
             //    an input).

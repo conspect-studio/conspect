@@ -2,7 +2,7 @@
 //! output clock (#143, invariants #1 + #10; design note
 //! `docs/architecture/probe-starvation.md`).
 //!
-//! Found while fixing #137: FaultDetector black/freeze probes running inside the
+//! Found while fixing #137: `FaultDetector` black/freeze probes running inside the
 //! `state_of` projection took longer than a tick period. The ADR-T018 cadence-hold
 //! loop called `state_of` for EVERY last-good repeat and re-read wall-clock after
 //! each one, so a projection costing more than one period made the catch-up burst
@@ -101,7 +101,7 @@ fn worst_control_gap(calls_at_emitted: &[u64], total: u64) -> u64 {
     worst
 }
 
-/// A probe that honours the `repeat` flag (the production FaultDetector wiring):
+/// A probe that honours the `repeat` flag (the production `FaultDetector` wiring):
 /// it costs 3× the tick period on every FRESH frame for the first `SLOW_TICKS`
 /// emitted ticks, then drops to one period. The output must hold exactly one
 /// contiguous frame per tick against wall-clock, drain commands within a bounded

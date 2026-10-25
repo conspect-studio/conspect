@@ -3640,6 +3640,13 @@ impl Pipeline {
             self.cadence,
             source_probes,
         );
+        // The last fault verdict, reused on cadence-hold REPEAT frames (#143): a
+        // repeat re-emits the unchanged last-good canvas, so re-running the
+        // black/freeze probes would only add per-tick cost on exactly the ticks
+        // where the loop is already behind — what kept catch-up from converging.
+        #[cfg(feature = "overlay")]
+        let mut last_faults: std::collections::HashMap<String, crate::overlays::TileFault> =
+            std::collections::HashMap::new();
         // RT-3 read-only stream-inventory discovery (off the hot loop, inv #10):
         // the per-input inventories were probed ONCE at build time. Emit one
         // `input.streams` event per input here — at run start, BEFORE the clock
@@ -3676,7 +3683,14 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             let caption_bitmaps = sample_caption_bitmaps(&caption_stores, frame.pts());
             #[cfg(feature = "overlay")]
-            let faults = fault_detector.sample(frame.pts(), frame.tick.index, &frame.source_states);
+            let faults = if frame.repeat {
+                last_faults.clone()
+            } else {
+                let faults =
+                    fault_detector.sample(frame.pts(), frame.tick.index, &frame.source_states);
+                last_faults.clone_from(&faults);
+                faults
+            };
             if let Some(obs) = hot_tick_observer.as_ref() {
                 obs.fetch_add(1, Ordering::Release);
             }
