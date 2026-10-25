@@ -169,6 +169,19 @@ fn duplicate_program_ids_are_rejected() {
 }
 
 #[test]
+fn legacy_multiple_untargeted_program_bus_routes_validate() {
+    let legacy = LEGACY_BASE.replace("target_track = \"cam_a\"\n", "");
+    let cfg = MultiviewConfig::load_from_toml(&legacy).expect("legacy routes parse");
+    assert!(cfg.routing.is_none());
+    assert_eq!(cfg.audio.as_ref().unwrap().routes.len(), 2);
+    assert!(cfg.audio.as_ref().unwrap().routes.iter().all(|route| {
+        route.include_in_program_bus && route.target_track.is_none()
+    }));
+    cfg.validate()
+        .expect("multiple untargeted legacy program-bus routes validate");
+}
+
+#[test]
 fn legacy_base_validates_and_has_no_explicit_routing() {
     let cfg = load_legacy();
     cfg.validate().expect("legacy base validates");
