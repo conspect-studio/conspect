@@ -726,6 +726,13 @@ mod scripted {
             self.lock().requests.last().cloned()
         }
 
+        /// Every recorded request, in the order issued (for wire-order and
+        /// no-mutation assertions).
+        #[must_use]
+        pub fn requests(&self) -> Vec<ScriptedRequest> {
+            self.lock().requests.clone()
+        }
+
         /// How many requests were recorded for `module`.
         #[must_use]
         pub fn request_count(&self, module: &str) -> usize {

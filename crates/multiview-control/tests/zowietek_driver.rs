@@ -819,3 +819,173 @@ fn indexed_plan_refuses_when_the_configured_rows_activity_is_unknown() {
         "unknown activity must be refused, not treated as inactive: {plan:?}"
     );
 }
+
+// ---- Round 2 (#55): every refusal happens BEFORE any device mutation --------
+
+/// The `opt`s that change device state (everything else is a read).
+const MUTATING_OPTS: &[&str] = &[
+    "change_workmode",
+    "streamplay_switch",
+    "streamplay_modify",
+    "streamplay_add",
+    "streamplay_del",
+    "stop",
+    "start",
+];
+
+fn wire_opts(transport: &ScriptedTransport) -> Vec<String> {
+    transport
+        .requests()
+        .iter()
+        .filter_map(|r| {
+            r.body
+                .get("opt")
+                .and_then(|o| o.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn mutating_calls(transport: &ScriptedTransport) -> Vec<String> {
+    wire_opts(transport)
+        .into_iter()
+        .filter(|o| MUTATING_OPTS.contains(&o.as_str()))
+        .collect()
+}
+
+fn ack() -> ScriptedReply {
+    ScriptedReply::json(json!({"rsp":"succeed","status":"00000"}))
+}
+
+#[tokio::test]
+async fn absent_index_in_encoder_mode_refuses_with_zero_mutating_calls() {
+    let transport = ScriptedTransport::new();
+    transport.push("workmode", workmode_id_reply(0));
+    transport.push("streamplay", spare_table_reply()); // has 2 and 3, not 99
+    let driver = adopted_encoder(&transport)
+        .await
+        .with_spare_decode_index(Some(99));
+
+    let err = driver
+        .converge_indexed()
+        .await
+        .expect_err("absent index must refuse");
+
+    assert!(
+        matches!(
+            err,
+            ConvergenceError::Ungrounded(ConvergenceUngrounded::ConfiguredIndexAbsent {
+                index: 99,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        mutating_calls(&transport),
+        Vec::<String>::new(),
+        "the encoder must not be stopped for a refusal; wire: {:?}",
+        wire_opts(&transport)
+    );
+}
+
+#[tokio::test]
+async fn unreadable_table_in_encoder_mode_refuses_without_change_workmode() {
+    let transport = ScriptedTransport::new();
+    transport.push("workmode", workmode_id_reply(0));
+    transport.push("streamplay", ScriptedReply::empty_body()); // encoder: no table
+    let driver = adopted_encoder(&transport).await;
+
+    let err = driver
+        .converge_indexed()
+        .await
+        .expect_err("an unreadable table must refuse");
+
+    assert!(matches!(err, ConvergenceError::Ungrounded(_)), "{err:?}");
+    assert_eq!(
+        mutating_calls(&transport),
+        Vec::<String>::new(),
+        "wire: {:?}",
+        wire_opts(&transport)
+    );
+}
+
+#[tokio::test]
+async fn happy_path_validates_then_changes_workmode_then_confirms_then_switches() {
+    let transport = ScriptedTransport::new();
+    transport.push("workmode", workmode_id_reply(0));
+    transport.push("workmode", ack());
+    transport.push("workmode", workmode_id_reply(1));
+    transport.push("streamplay", spare_table_reply());
+    transport.push("streamplay", ack());
+    let driver = adopted_encoder(&transport).await;
+    let skip = transport.requests().len();
+
+    driver.converge_indexed().await.expect("converges");
+
+    let opts: Vec<String> = transport.requests()[skip..]
+        .iter()
+        .filter_map(|r| {
+            r.body
+                .get("opt")
+                .and_then(|o| o.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        opts,
+        [
+            "get_workmode_id",
+            "streamplay_get_all",
+            "change_workmode",
+            "get_workmode_id",
+            "streamplay_switch"
+        ],
+        "validate -> change_workmode -> confirm -> switch"
+    );
+}
+
+/// Drive `converge_indexed` for every refusal variant, in both workmodes, and
+/// assert that no mutating opt was ever sent.
+#[tokio::test]
+async fn no_refusal_variant_ever_sends_a_mutating_opt() {
+    let active_spare = ok_data(&json!([
+        {"index": 2, "name": "p", "switch": 0, "streamplay_status": "idle", "url": "rtsp://x/a"},
+        {"index": 3, "name": "s", "switch": 1, "streamplay_status": "playing", "url": "rtsp://x/b"}
+    ]));
+    let unknown_activity = ok_data(&json!([
+        {"index": 2, "name": "p", "switch": 1, "url": "rtsp://x/a"},
+        {"index": 3, "name": "s", "url": "rtsp://x/b"}
+    ]));
+    for mode in [0_u32, 1] {
+        // (label, spare index, table reply)
+        let cases: Vec<(&str, Option<u32>, Option<ScriptedReply>)> = vec![
+            ("no-index", None, Some(spare_table_reply())),
+            ("active", Some(3), Some(active_spare.clone())),
+            ("absent", Some(99), Some(spare_table_reply())),
+            ("activity-unknown", Some(3), Some(unknown_activity.clone())),
+            ("unreadable", Some(3), Some(ScriptedReply::empty_body())),
+        ];
+        for (label, index, table) in cases {
+            let transport = ScriptedTransport::new();
+            transport.push("workmode", workmode_id_reply(mode));
+            if let Some(t) = table {
+                transport.push("streamplay", t);
+            }
+            let driver = adopted_encoder(&transport)
+                .await
+                .with_spare_decode_index(index);
+            let result = driver.converge_indexed().await;
+            assert!(
+                result.is_err(),
+                "{label}/mode {mode}: must refuse: {result:?}"
+            );
+            assert_eq!(
+                mutating_calls(&transport),
+                Vec::<String>::new(),
+                "{label}/mode {mode}: wire {:?}",
+                wire_opts(&transport)
+            );
+        }
+    }
+}
