@@ -235,6 +235,7 @@ impl SwitcherState {
     pub fn auto(&mut self, tick: Tick) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
         match self.flight {
+            // Ignored repeat AUTO is invisible: report exactly sample(tick).
             Some(Flight::Auto { .. }) => return Ok(self.sample(tick)),
             Some(Flight::Manual { position }) => {
                 let rate = self.rate();
@@ -300,7 +301,10 @@ impl SwitcherState {
             });
         }
         if self.lever_out_of_sync {
-            return Ok(SwitcherProjection::idle());
+            // Ignored inputs are invisible: any input the machine ignores must
+            // return exactly what sample(tick) would have returned at this
+            // tick, so an independent AUTO keeps its progress and completion.
+            return Ok(self.sample(tick));
         }
         self.last_manual_position = position;
         let started = self.flight.is_none();
