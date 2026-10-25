@@ -292,6 +292,75 @@ fn parked_lever_returning_to_bottom_does_not_abort_an_independent_auto() {
 }
 
 #[test]
+fn duplicated_tbar_zero_does_not_abort_an_independent_auto() {
+    let mut state = configured();
+    state
+        .set_transition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(5).unwrap(),
+        })
+        .unwrap();
+    assert!(state.tbar(u16::MAX, tick(1)).unwrap().completed);
+    assert!(state.auto(tick(10)).unwrap().started);
+    state.tbar(0, tick(11)).unwrap();
+    let again = state.tbar(0, tick(12)).unwrap();
+    assert_eq!(
+        again.progress,
+        Progress::new(2, FrameCount::try_from(5).unwrap())
+    );
+    assert!(state.is_in_flight());
+    assert!(state.sample(tick(15)).completed);
+    assert_eq!(state.completion_count(), 2);
+}
+
+#[test]
+fn duplicated_nonzero_tbar_does_not_override_auto_resumed_from_it() {
+    let mut state = configured();
+    state
+        .set_transition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(10).unwrap(),
+        })
+        .unwrap();
+    state.tbar(30000, tick(1)).unwrap();
+    assert!(state.auto(tick(2)).unwrap().progress > Progress::ZERO);
+    state.tbar(30000, tick(3)).unwrap();
+    assert!(state.is_in_flight());
+    assert!(state.sample(tick(100)).completed);
+    assert_eq!(state.completion_count(), 1);
+}
+
+proptest! {
+    #[test]
+    fn resending_the_last_tbar_value_is_a_no_op(
+        ops in proptest::collection::vec((0u8..6, any::<u16>(), 0u8..6), 0..24),
+        last in prop_oneof![Just(0u16), Just(u16::MAX), any::<u16>()],
+    ) {
+        let mut state = configured();
+        state
+            .set_transition(TransitionDescriptor::Mix {
+                rate: FrameCount::try_from(5).unwrap(),
+            })
+            .unwrap();
+        let mut now = 0u64;
+        for (kind, value, advance) in ops {
+            now += u64::from(advance);
+            let _ = match kind {
+                0 => state.auto(tick(now)),
+                1 => state.cut(),
+                2 => Ok(state.abort()),
+                3 => state.tbar(value, tick(now)),
+                4 => Ok(state.punch(source("c"))),
+                _ => Ok(state.sample(tick(now))),
+            };
+        }
+        let _ = state.tbar(last, tick(now));
+        let _ = state.sample(tick(now));
+        let before = format!("{state:?}");
+        let _ = state.tbar(last, tick(now));
+        prop_assert_eq!(format!("{state:?}"), before);
+    }
+}
+
+#[test]
 fn parked_lever_return_after_cut_or_punch_preserves_independent_auto() {
     for ending in ["cut", "punch"] {
         let mut state = configured();
