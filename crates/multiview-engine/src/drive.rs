@@ -68,6 +68,12 @@ pub struct CompositedFrame {
     ///
     /// Includes every cell-bound source; a cell with no bound source is omitted.
     pub source_states: HashMap<String, SourceState>,
+    /// `true` when this is a **last-good repeat** the cadence-hold path re-emitted
+    /// under a fresh tick (ADR-T018) rather than a fresh composite. A per-tick
+    /// projection with an expensive stage (content-fault probes) should skip that
+    /// work on repeats and reuse its last result: the canvas did not change, and
+    /// paying the cost on every catch-up tick is what starved the loop (#143).
+    pub repeat: bool,
 }
 
 impl CompositedFrame {
@@ -547,6 +553,7 @@ impl CompositorDrive<Nv12Image> {
             tick,
             canvas: canvas_image,
             source_states,
+            repeat: false,
         })
     }
 

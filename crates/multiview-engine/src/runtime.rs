@@ -60,6 +60,19 @@ use crate::isolation::EnginePublisher;
 /// 120 ticks is ~4 s at 30 fps / ~2 s at 60 fps of held last-good before resync.
 pub const MAX_REPEATS_PER_TICK: u32 = 120;
 
+/// The most last-good **repeats** the cadence-hold path emits before it runs the
+/// per-tick control hook again (#143, invariants #1 + #10).
+///
+/// The control hook (the management plane's command drain) normally runs once
+/// per fresh compose. A catch-up burst emits only repeats, so without this bound
+/// a slow per-tick stage could keep the loop in repeat bursts and starve command
+/// drain for up to [`MAX_REPEATS_PER_TICK`] ticks per burst, burst after burst.
+/// With it, the hook runs at least once every `MAX_REPEATS_BETWEEN_CONTROL + 1`
+/// emitted ticks **regardless of stage cost**. 8 ticks is 320 ms at 25 fps /
+/// 133 ms at 60 fps of worst-case command latency under overload; the hook is
+/// O(1) per call, so the extra calls cost nothing measurable.
+pub const MAX_REPEATS_BETWEEN_CONTROL: u32 = 8;
+
 /// The longest a [`RealtimePacer`] sleeps in one step before re-checking the
 /// [`StopSignal`]. This deliberately bounds stop-observation latency to ~one
 /// poll interval (~10 ms) **regardless of clock state** — even a deadline the
