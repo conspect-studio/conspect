@@ -2,7 +2,7 @@
 use multiview_core::switcher::{ArmedSet, FrameCount, Progress, SourceRef, TransitionDescriptor};
 use multiview_core::time::MediaTime;
 use multiview_engine::clock::Tick;
-use multiview_engine::switcher::{SwitcherError, SwitcherState};
+use multiview_engine::switcher::{SwitcherError, SwitcherProjection, SwitcherState};
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
 
@@ -381,6 +381,43 @@ struct Sut {
     previous: (SourceRef, SourceRef),
     previous_progress: Progress,
     was_in_flight: bool,
+    lever_at_end: bool,
+}
+impl Sut {
+    fn check_projection(&mut self, transition: &Cmd, output: SwitcherProjection, parked: bool) {
+        if parked {
+            assert_eq!(
+                output.progress,
+                Progress::ZERO,
+                "parked lever moved: {transition:?}"
+            );
+            assert!(
+                !output.started && !output.completed,
+                "parked lever triggered take: {transition:?}"
+            );
+            assert!(!self.machine.is_in_flight());
+        }
+        assert!(output.progress.numerator() <= output.progress.denominator());
+        if output.completed {
+            assert!(
+                self.was_in_flight || output.started,
+                "a completion must close an active or newly started take: {transition:?}"
+            );
+            self.completions += 1;
+            assert!(!self.machine.is_in_flight());
+        }
+        if !output.completed && !matches!(transition, Cmd::Punch(_)) {
+            // A flip-flop is exclusively a completion effect.
+            assert_eq!(
+                (
+                    self.machine.program().clone(),
+                    self.machine.preview().clone()
+                ),
+                self.previous
+            );
+        }
+        self.previous_progress = output.progress;
+    }
 }
 struct Test;
 impl StateMachineTest for Test {
@@ -401,10 +438,11 @@ impl StateMachineTest for Test {
             previous: (source("a"), source("b")),
             previous_progress: Progress::ZERO,
             was_in_flight: false,
+            lever_at_end: false,
         }
     }
-    fn apply(mut sut: Sut, model: &Model, transition: Cmd) -> Sut {
-        let parked_manual = model.lever_at_end
+    fn apply(mut sut: Sut, _: &Model, transition: Cmd) -> Sut {
+        let parked_manual = sut.lever_at_end
             && !sut.machine.is_in_flight()
             && matches!(transition, Cmd::Tbar(position) if position != 0);
         let result = match transition {
@@ -483,35 +521,23 @@ impl StateMachineTest for Test {
             Cmd::Punch(n) => Some(sut.machine.punch(source(&format!("p{n}")))),
         };
         if let Some(output) = result {
-            if parked_manual {
-                assert_eq!(output.progress, Progress::ZERO, "parked lever moved: {transition:?}");
-                assert!(!output.started && !output.completed, "parked lever triggered take: {transition:?}");
-                assert!(!sut.machine.is_in_flight());
-            }
-            assert!(output.progress.numerator() <= output.progress.denominator());
-            if output.completed {
-                assert!(
-                    sut.was_in_flight || output.started,
-                    "a completion must close an active or newly started take: {transition:?}"
-                );
-                sut.completions += 1;
-                assert!(!sut.machine.is_in_flight());
-            }
-            if !output.completed && !matches!(transition, Cmd::Punch(_)) {
-                // A flip-flop is exclusively a completion effect.
-                assert_eq!(
-                    (sut.machine.program().clone(), sut.machine.preview().clone()),
-                    sut.previous
-                );
-            }
-            sut.previous_progress = output.progress;
+            sut.check_projection(&transition, output, parked_manual);
         }
         sut.previous = (sut.machine.program().clone(), sut.machine.preview().clone());
         sut.was_in_flight = sut.machine.is_in_flight();
+        sut.lever_at_end = match transition {
+            Cmd::Tbar(0) | Cmd::Abort => false,
+            Cmd::Tbar(position) if position == u16::MAX && result.is_some() && !parked_manual => {
+                true
+            }
+            Cmd::RepeatTerminalTbar if result.is_some() => true,
+            _ => sut.lever_at_end,
+        };
         sut
     }
     fn check_invariants(sut: &Sut, model: &Model) {
         assert_eq!(sut.tick, model.tick);
+        assert_eq!(sut.lever_at_end, model.lever_at_end);
         assert!(sut.previous_progress.numerator() <= sut.previous_progress.denominator());
         assert_eq!(sut.completions, sut.machine.completion_count());
     }

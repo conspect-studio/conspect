@@ -75,6 +75,8 @@ pub struct SwitcherState {
     flip_flop: bool,
     flight: Option<Flight>,
     completion_count: u64,
+    // Physical terminal position remains latched across bus/configuration edits.
+    // Only an explicit abort or a bottom-position sample re-arms manual takes.
     tbar_at_end: bool,
 }
 
@@ -150,7 +152,6 @@ impl SwitcherState {
             return Err(SwitcherError::InFlight);
         }
         self.preview = scene;
-        self.tbar_at_end = false;
         Ok(())
     }
 
@@ -182,7 +183,6 @@ impl SwitcherState {
             *slot = true;
         }
         self.armed = armed;
-        self.tbar_at_end = false;
         Ok(())
     }
 
@@ -222,7 +222,6 @@ impl SwitcherState {
             return Err(SwitcherError::InvalidTransition);
         }
         self.transition = descriptor;
-        self.tbar_at_end = false;
         Ok(())
     }
 
@@ -260,7 +259,6 @@ impl SwitcherState {
             return self.cut();
         }
         let rate = self.rate();
-        self.tbar_at_end = false;
         self.flight = Some(Flight::Auto {
             start: i128::from(tick.index),
             rate,
@@ -297,7 +295,6 @@ impl SwitcherState {
             projection.started = started;
             return Ok(projection);
         }
-        self.tbar_at_end = false;
         self.flight = Some(Flight::Manual { position });
         Ok(SwitcherProjection {
             progress: Progress::new(
@@ -315,7 +312,6 @@ impl SwitcherState {
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
     pub fn cut(&mut self) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
-        self.tbar_at_end = false;
         let started = self.flight.is_none();
         let mut projection = self.finish();
         projection.started = started;
@@ -332,7 +328,6 @@ impl SwitcherState {
     /// Punch a scene directly onto program without a preview swap or key change.
     pub fn punch(&mut self, scene: SourceRef) -> SwitcherProjection {
         self.flight = None;
-        self.tbar_at_end = false;
         self.program = scene;
         self.completion_count = self.completion_count.saturating_add(1);
         SwitcherProjection {
