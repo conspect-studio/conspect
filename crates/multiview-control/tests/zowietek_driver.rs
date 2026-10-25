@@ -1383,3 +1383,66 @@ async fn every_mode_event_of_an_operation_carries_its_operation_id() {
         "{events:?}"
     );
 }
+
+#[tokio::test]
+async fn a_lost_slot_switch_response_on_a_decoder_is_activation_unconfirmed_not_unchanged() {
+    use multiview_events::FailureStage;
+    // Already a decoder; the switch is sent but its response is lost/times out.
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    transport.push_opt(
+        "streamplay",
+        "streamplay_switch",
+        ScriptedReply::socket_dropped(),
+    );
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+    driver
+        .converge_indexed_with_op(Some("op-l"))
+        .await
+        .expect_err("response lost");
+    let failed = failed_event(&mut sub);
+    assert_eq!(
+        failed.failure_stage,
+        Some(FailureStage::ActivationUnconfirmed)
+    );
+    let detail = failed.detail.unwrap_or_default();
+    assert!(
+        detail.contains("slot activation may have occurred; response lost"),
+        "{detail:?}"
+    );
+    assert!(!detail.contains("not applied"), "{detail:?}");
+    assert_eq!(failed.operation_id.as_deref(), Some("op-l"));
+}
+
+#[tokio::test]
+async fn a_workmode_change_then_a_lost_slot_switch_response_reports_both() {
+    use multiview_events::FailureStage;
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("system", "change_workmode", ack());
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    transport.push_opt(
+        "streamplay",
+        "streamplay_switch",
+        ScriptedReply::socket_dropped(),
+    );
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+    driver
+        .converge_indexed_with_op(Some("op-b"))
+        .await
+        .expect_err("response lost");
+    let failed = failed_event(&mut sub);
+    assert_eq!(
+        failed.failure_stage,
+        Some(FailureStage::WorkmodeChangedActivationUnconfirmed)
+    );
+    let detail = failed.detail.unwrap_or_default();
+    assert!(
+        detail.contains("workmode changed to decoder")
+            && detail.contains("slot activation may have occurred; response lost"),
+        "{detail:?}"
+    );
+    assert!(!detail.contains("not applied"), "{detail:?}");
+}
