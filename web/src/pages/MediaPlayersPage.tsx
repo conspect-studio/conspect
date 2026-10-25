@@ -60,6 +60,7 @@ import {
   TableRow,
 } from '../components/ui/table';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** The transport-state `kind` discriminants we render badges for. */
 type StateKind = MediaPlayerEvent['state']['kind'];
@@ -141,7 +142,7 @@ export function MediaPlayersPage(): JSX.Element {
       { id: player.id, action },
       {
         onSuccess: (accepted): void => {
-          toast({
+          followOperation(accepted, t`Transport command`, {
             title: t`Command accepted`,
             description: `${t`Operation id`}: ${accepted.operation_id}`,
           });
@@ -162,7 +163,7 @@ export function MediaPlayersPage(): JSX.Element {
       { id: player.id, action: 'cue' },
       {
         onSuccess: (accepted): void => {
-          toast({
+          followOperation(accepted, t`Cue`, {
             title: t`Cue accepted`,
             description: `${t`Operation id`}: ${accepted.operation_id}`,
           });
@@ -197,7 +198,7 @@ export function MediaPlayersPage(): JSX.Element {
       { id: player.id, action: 'load', asset },
       {
         onSuccess: (accepted): void => {
-          toast({
+          followOperation(accepted, t`Load`, {
             title: t`Load accepted`,
             description: `${t`Operation id`}: ${accepted.operation_id}`,
           });

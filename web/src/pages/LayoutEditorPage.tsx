@@ -29,6 +29,7 @@ import { useOverlays, useSources } from '../resources/queries';
 import { PageHeader } from '../components/PageHeader';
 import { Button } from '../components/ui/button';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** The editor page (new or edit). */
 export function LayoutEditorPage(): JSX.Element {
@@ -113,7 +114,7 @@ export function LayoutEditorPage(): JSX.Element {
         onSuccess: (): void => {
           applyLayoutCommand(id)
             .then((accepted): void => {
-              toast({
+              followOperation(accepted, t`Apply layout`, {
                 title: t`Layout saved & applied live`,
                 description: `${t`Takes effect at the next frame boundary.`} ${t`Operation id`}: ${accepted.operation_id}`,
               });

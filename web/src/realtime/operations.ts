@@ -19,26 +19,34 @@ export interface OperationOutcome {
   readonly replayed: boolean;
 }
 
-interface Pending {
+interface Waiter {
   readonly resolve: (outcome: OperationOutcome) => void;
   readonly timer: ReturnType<typeof setTimeout>;
   readonly replayed: boolean;
 }
 
+/** Lifecycle envelopes that carry a `corr` but are not the final outcome. */
+const NON_TERMINAL: ReadonlySet<string> = new Set(["job.accepted", "job.progress", "device.discovered"]);
+
 const EARLY_CAPACITY = 256;
 const EARLY_TTL_MS = 60_000;
 
-const pending = new Map<string, Pending>();
+/** One entry per operation id; every registration fans out from it. */
+const pending = new Map<string, Set<Waiter>>();
 /** Insertion-ordered: the first key is the oldest. */
 const early = new Map<string, { readonly envelope: Envelope; readonly at: number }>();
 
-function takeEarly(id: string): Envelope | undefined {
+/** Look up a cached outcome without consuming it (replays resolve again). */
+function peekEarly(id: string): Envelope | undefined {
   const entry = early.get(id);
   if (entry === undefined) {
     return undefined;
   }
-  early.delete(id);
-  return Date.now() - entry.at <= EARLY_TTL_MS ? entry.envelope : undefined;
+  if (Date.now() - entry.at > EARLY_TTL_MS) {
+    early.delete(id);
+    return undefined;
+  }
+  return entry.envelope;
 }
 
 function rememberEarly(id: string, envelope: Envelope): void {
@@ -67,32 +75,47 @@ export function correlateOperation(
 ): Promise<OperationOutcome> {
   const id = accepted.operation_id;
   const replayed = accepted.kind === "replay";
-  const cached = takeEarly(id);
+  const cached = peekEarly(id);
   if (cached !== undefined) {
     return Promise.resolve({ operationId: id, envelope: cached, replayed });
   }
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      pending.delete(id);
+      const waiters = pending.get(id);
+      if (waiters !== undefined) {
+        waiters.delete(waiter);
+        if (waiters.size === 0) {
+          pending.delete(id);
+        }
+      }
       reject(new Error(`Operation ${id} outcome timed out`));
     }, timeoutMs);
-    pending.set(id, { resolve, timer, replayed });
+    const waiter: Waiter = { resolve, timer, replayed };
+    const waiters = pending.get(id);
+    if (waiters === undefined) {
+      pending.set(id, new Set([waiter]));
+    } else {
+      waiters.add(waiter);
+    }
   });
 }
 
 /** Match an envelope's `corr` to a pending operation; true when it resolved one. */
 export function resolveOperationEnvelope(envelope: Envelope): boolean {
   const corr = envelope.corr;
-  if (typeof corr !== "string") {
+  if (typeof corr !== "string" || NON_TERMINAL.has(envelope.t)) {
     return false;
   }
-  const entry = pending.get(corr);
-  if (entry === undefined) {
-    rememberEarly(corr, envelope);
+  // Always cache: a later replay of the same Idempotency-Key gets no new outcome.
+  rememberEarly(corr, envelope);
+  const waiters = pending.get(corr);
+  if (waiters === undefined) {
     return false;
   }
   pending.delete(corr);
-  clearTimeout(entry.timer);
-  entry.resolve({ operationId: corr, envelope, replayed: entry.replayed });
+  for (const waiter of waiters) {
+    clearTimeout(waiter.timer);
+    waiter.resolve({ operationId: corr, envelope, replayed: waiter.replayed });
+  }
   return true;
 }

@@ -17,6 +17,8 @@ import {
   submitOperation,
 } from '../api/operations';
 import type { AcceptedOperation, RequestOptions } from '../api/operations';
+import { correlateOperation } from '../realtime/operations';
+import type { OperationOutcome } from '../realtime/operations';
 import { stringField } from '../resources/api';
 import type { ResourceRecord } from '../resources/types';
 import { parseDeviceStatus } from '../realtime/envelope';
@@ -203,7 +205,7 @@ export async function setDeviceMode(
   id: string,
   mode: string,
   options: RequestOptions = {},
-): Promise<SetModeAccepted> {
+): Promise<SetModeAccepted & { readonly completion: Promise<OperationOutcome> }> {
   const response = await fetch(
     apiUrl(options, `/api/v1/devices/${encodeURIComponent(id)}/set-mode`),
     {
@@ -219,7 +221,9 @@ export async function setDeviceMode(
   if (!isSetModeAccepted(body)) {
     throw new Error('The server returned an unexpected set-mode body.');
   }
-  return body;
+  const completion = correlateOperation({ operation_id: body.operation_id, kind: 'set-mode' });
+  completion.catch(() => undefined);
+  return { ...body, completion };
 }
 
 /** `POST /api/v1/devices/{id}/reboot` — 202; outcome on the realtime stream. */
