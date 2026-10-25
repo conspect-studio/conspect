@@ -542,6 +542,15 @@ impl ReferenceStateMachine for Reference {
     }
     fn apply(mut state: Model, transition: &Cmd) -> Model {
         match transition {
+            Cmd::Tbar(0)
+                if state.last_manual_position == 0
+                    && !matches!(state.flight, Some(ModelFlight::Manual)) =>
+            {
+                if matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
+                {
+                    state.flight = None;
+                }
+            }
             Cmd::Tbar(0) => {
                 let parked = state.lever_out_of_sync;
                 state.last_manual_position = 0;
@@ -550,6 +559,17 @@ impl ReferenceStateMachine for Reference {
                     || matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
                 {
                     state.flight = None;
+                }
+            }
+            Cmd::Tbar(position)
+                if *position == state.last_manual_position
+                    && !state.lever_out_of_sync
+                    && !matches!(state.flight, Some(ModelFlight::Manual)) =>
+            {
+                if matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
+                {
+                    state.flight = None;
+                    state.lever_out_of_sync = state.last_manual_position != 0;
                 }
             }
             Cmd::Tbar(position) if !state.lever_out_of_sync => {

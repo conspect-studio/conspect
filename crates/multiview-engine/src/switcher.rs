@@ -281,6 +281,14 @@ impl SwitcherState {
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
     pub fn tbar(&mut self, position: u16, tick: Tick) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
+        // ADR-0055 §5: the absolute setter is idempotent; a re-sent identical
+        // value never changes state (panels re-send at ~30 Hz).
+        if position == self.last_manual_position
+            && !matches!(self.flight, Some(Flight::Manual { .. }))
+            && (position == 0 || !self.lever_out_of_sync)
+        {
+            return Ok(self.sample(tick));
+        }
         if position == 0 {
             let parked = self.lever_out_of_sync;
             self.last_manual_position = 0;
