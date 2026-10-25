@@ -127,6 +127,13 @@ mod hook {
         SlotLocked(u16),
         /// A `load` attempt failed and will retry.
         LoadRetry,
+        /// A publisher's `try_write` found a reader inside a slot and skipped
+        /// it (a miss, never a wait).
+        ReaderBusy,
+        /// A publisher is about to make the only call in a publish that can
+        /// block: appending a segment (`OnceLock::get_or_init`, which can wait
+        /// only on another publisher appending at the same instant).
+        BlockingAcquire,
     }
 
     type Hook = Box<dyn FnMut(Point)>;
@@ -335,6 +342,7 @@ impl<P> SwapCell<P> {
             .compare_exchange(tag, CLAIMED, Ordering::SeqCst, Ordering::Relaxed)
             .ok()?;
         let Some(guard) = try_write(&slot.entry) else {
+            test_hook!(hook::Point::ReaderBusy);
             // A (stale) reader is inside: give the slot back untouched.
             slot.tag.store(tag, Ordering::SeqCst);
             return None;
@@ -429,6 +437,7 @@ impl<P> SwapCell<P> {
             segment = next;
         }
         // Blocks only on another publisher appending at the same instant.
+        test_hook!(hook::Point::BlockingAcquire);
         segment.next.get_or_init(|| Box::new(Segment::new()));
         true
     }
@@ -600,25 +609,30 @@ mod chaos {
     fn segment_constants_agree() {
         assert_eq!(usize::from(super::SEGMENT), super::SEGMENT_LEN);
     }
-    /// Far below the shortest output tick (16.7 ms at 60 fps).
-    const PER_PUBLISH_BUDGET: Duration = Duration::from_millis(1);
+    /// Sanity bound for the whole 1000-publish loop. Not a latency budget:
+    /// "never waits on the reader" is asserted structurally (all publishes
+    /// return while the reader is still parked, zero blocking acquisitions).
+    const LOOP_SANITY_BOUND: Duration = Duration::from_secs(2);
 
     #[test]
     fn publisher_never_waits_on_a_descheduled_reader() {
         let cell: Arc<SwapCell<Option<Arc<u64>>>> = Arc::new(SwapCell::new(Some(Arc::new(0))));
         let held = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
+        let reader_parked = Arc::new(AtomicBool::new(false));
 
-        // A reader inside its read critical section, then "descheduled" (parked
-        // on a barrier) for 500 ms.
+        // A reader inside its read critical section on the head slot, then
+        // "descheduled" (parked on a barrier) until the publisher is done.
         let reader = {
             let cell = Arc::clone(&cell);
-            let held = Arc::clone(&held);
-            let release = Arc::clone(&release);
+            let (held, release) = (Arc::clone(&held), Arc::clone(&release));
+            let reader_parked = Arc::clone(&reader_parked);
             thread::spawn(move || {
                 let guard = cell.hold_reader_for_test();
+                reader_parked.store(true, Ordering::SeqCst);
                 held.wait();
                 release.wait();
+                reader_parked.store(false, Ordering::SeqCst);
                 drop(guard);
                 cell.load()
             })
@@ -626,32 +640,61 @@ mod chaos {
         held.wait();
 
         // The output clock publishes 1000 times while that reader is parked.
-        let done = Arc::new(AtomicU64::new(0));
+        // It counts its own returned publishes, misses and blocking calls.
         let publisher = {
             let cell = Arc::clone(&cell);
-            let done = Arc::clone(&done);
+            let reader_parked = Arc::clone(&reader_parked);
             thread::spawn(move || {
-                let mut worst = Duration::ZERO;
-                for v in 1..=PUBLISHES {
-                    let t = Instant::now();
-                    cell.store(Some(Arc::new(v)));
-                    worst = worst.max(t.elapsed());
-                    done.store(v, Ordering::Release);
+                let misses = Arc::new(AtomicU64::new(0));
+                let blocking = Arc::new(AtomicU64::new(0));
+                {
+                    let (misses, blocking) = (Arc::clone(&misses), Arc::clone(&blocking));
+                    hook::set(move |point| match point {
+                        hook::Point::ReaderBusy => {
+                            misses.fetch_add(1, Ordering::Relaxed);
+                        }
+                        hook::Point::BlockingAcquire => {
+                            blocking.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    });
                 }
-                worst
+                let start = Instant::now();
+                let mut returned_while_parked = 0u64;
+                for v in 1..=PUBLISHES {
+                    cell.store(Some(Arc::new(v)));
+                    if reader_parked.load(Ordering::SeqCst) {
+                        returned_while_parked += 1;
+                    }
+                }
+                (
+                    returned_while_parked,
+                    start.elapsed(),
+                    misses.load(Ordering::Relaxed),
+                    blocking.load(Ordering::Relaxed),
+                )
             })
         };
 
-        thread::sleep(Duration::from_millis(500));
-        let completed = done.load(Ordering::Acquire);
+        // The reader stays parked until the publisher thread has finished.
+        let (returned_while_parked, elapsed, misses, blocking) =
+            publisher.join().expect("publisher panicked");
+        assert!(reader_parked.load(Ordering::SeqCst), "reader still parked");
         assert_eq!(
-            completed, PUBLISHES,
-            "publisher stalled behind a descheduled reader: {completed}/{PUBLISHES} publishes in 500 ms"
+            returned_while_parked, PUBLISHES,
+            "every publish must return while the reader is parked inside a slot"
         );
-        let worst = publisher.join().expect("publisher panicked");
+        assert_eq!(
+            blocking, 0,
+            "a publish took a blocking acquisition while a reader was parked"
+        );
         assert!(
-            worst < PER_PUBLISH_BUDGET,
-            "a publish took {worst:?} (budget {PER_PUBLISH_BUDGET:?})"
+            misses > 0,
+            "the parked reader's slot must have been met (and skipped) by try_write"
+        );
+        assert!(
+            elapsed < LOOP_SANITY_BOUND,
+            "1000 publishes took {elapsed:?} (sanity bound {LOOP_SANITY_BOUND:?})"
         );
 
         release.wait();
