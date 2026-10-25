@@ -54,6 +54,7 @@ fn manual_override_abort_and_midflight_cut() {
     assert_eq!(state.program(), &source("b"));
     assert!(!state.tbar(u16::MAX, tick(2)).unwrap().completed);
     assert_eq!(state.program(), &source("b"));
+    state.tbar(0, tick(3)).unwrap();
     state.auto(tick(3)).unwrap();
     let p = state.tbar(32768, tick(4)).unwrap().progress;
     assert_eq!(state.sample(tick(100)).progress, p);
@@ -222,6 +223,47 @@ fn terminal_lever_ignores_edits_and_jitter_until_returned_to_bottom() {
 }
 
 #[test]
+fn lever_requires_bottom_after_every_manual_take_termination() {
+    for ending in ["cut", "abort", "auto", "max"] {
+        let mut state = configured();
+        state
+            .set_transition(TransitionDescriptor::Mix {
+                rate: FrameCount::try_from(10).unwrap(),
+            })
+            .unwrap();
+        assert!(state.tbar(30000, tick(100)).unwrap().started);
+        match ending {
+            "cut" => assert!(state.cut().unwrap().completed),
+            "abort" => assert_eq!(state.abort().progress, Progress::ZERO),
+            "auto" => {
+                assert!(!state.auto(tick(100)).unwrap().completed);
+                assert!(state.sample(tick(106)).completed);
+            }
+            _ => assert!(state.tbar(u16::MAX, tick(101)).unwrap().completed),
+        }
+        let completed = state.completion_count();
+        let program = state.program().clone();
+        for position in [30000, 31000, u16::MAX] {
+            let output = state.tbar(position, tick(110)).unwrap();
+            assert_eq!(
+                output,
+                SwitcherProjection {
+                    progress: Progress::ZERO,
+                    started: false,
+                    completed: false,
+                },
+                "ending={ending}, position={position}"
+            );
+            assert!(!state.is_in_flight());
+            assert_eq!(state.completion_count(), completed);
+            assert_eq!(state.program(), &program);
+        }
+        assert_eq!(state.tbar(0, tick(111)).unwrap().progress, Progress::ZERO);
+        assert!(state.tbar(30000, tick(112)).unwrap().started);
+    }
+}
+
+#[test]
 fn terminal_tbar_completes_manual_take_once() {
     let mut state = configured();
     state.tbar(12345, tick(2)).unwrap();
@@ -319,6 +361,9 @@ enum Cmd {
     Abort,
     Tbar(u16),
     RepeatTerminalTbar,
+    ResumeAndFinish,
+    CutAfterManual,
+    AbortAfterManual,
     Advance(u8),
     Arm(bool, bool),
     SetPreview(u8),
@@ -328,7 +373,11 @@ enum Cmd {
 #[derive(Clone, Debug)]
 struct Model {
     tick: u64,
-    lever_at_end: bool,
+    last_manual_position: u16,
+    lever_out_of_sync: bool,
+    // A model flight is either manual or an AUTO finishing on this tick.
+    flight_end: Option<Option<u64>>,
+    rate: u32,
 }
 struct Reference;
 impl ReferenceStateMachine for Reference {
@@ -337,7 +386,10 @@ impl ReferenceStateMachine for Reference {
     fn init_state() -> BoxedStrategy<Model> {
         Just(Model {
             tick: 0,
-            lever_at_end: false,
+            last_manual_position: 0,
+            lever_out_of_sync: false,
+            flight_end: None,
+            rate: 5,
         })
         .boxed()
     }
@@ -348,6 +400,9 @@ impl ReferenceStateMachine for Reference {
             Just(Cmd::Abort),
             any::<u16>().prop_map(Cmd::Tbar),
             Just(Cmd::RepeatTerminalTbar),
+            Just(Cmd::ResumeAndFinish),
+            Just(Cmd::CutAfterManual),
+            Just(Cmd::AbortAfterManual),
             Just(Cmd::Tbar(0)),
             Just(Cmd::Tbar(u16::MAX)),
             Just(Cmd::Tbar(64000)),
@@ -360,15 +415,70 @@ impl ReferenceStateMachine for Reference {
         .boxed()
     }
     fn apply(mut state: Model, transition: &Cmd) -> Model {
-        // The reference tracks *observed* completions and the last output projection;
-        // its independent invariant is that a bus swap cannot occur without a take.
         match transition {
-            Cmd::Advance(n) => state.tick += u64::from(*n),
-            Cmd::Tbar(0) | Cmd::Abort => state.lever_at_end = false,
-            Cmd::Tbar(position) if *position == u16::MAX && !state.lever_at_end => {
-                state.lever_at_end = true;
+            Cmd::Tbar(0) => {
+                state.last_manual_position = 0;
+                state.lever_out_of_sync = false;
+                state.flight_end = None;
             }
-            Cmd::RepeatTerminalTbar => state.lever_at_end = true,
+            Cmd::Tbar(position) if !state.lever_out_of_sync => {
+                state.last_manual_position = *position;
+                state.flight_end = if *position == u16::MAX {
+                    state.lever_out_of_sync = true;
+                    None
+                } else {
+                    Some(None)
+                };
+            }
+            Cmd::RepeatTerminalTbar if !state.lever_out_of_sync => {
+                state.last_manual_position = u16::MAX;
+                state.lever_out_of_sync = true;
+                state.flight_end = None;
+            }
+            Cmd::CutAfterManual | Cmd::AbortAfterManual | Cmd::ResumeAndFinish => {
+                if !state.lever_out_of_sync {
+                    if matches!(transition, Cmd::ResumeAndFinish) {
+                        state.tick += 12;
+                    }
+                    state.last_manual_position = 30000;
+                    state.lever_out_of_sync = true;
+                    state.flight_end = None;
+                }
+            }
+            Cmd::Cut | Cmd::Abort | Cmd::Punch(_) => {
+                state.flight_end = None;
+                state.lever_out_of_sync = state.last_manual_position != 0;
+            }
+            Cmd::Auto => {
+                if let Some(None) = state.flight_end {
+                    let elapsed = (u64::from(state.last_manual_position) * u64::from(state.rate)
+                        + u64::from(u16::MAX) / 2)
+                        / u64::from(u16::MAX);
+                    let remaining = u64::from(state.rate) - elapsed;
+                    if remaining == 0 {
+                        state.flight_end = None;
+                        state.lever_out_of_sync = state.last_manual_position != 0;
+                    } else {
+                        state.flight_end = Some(Some(state.tick + remaining));
+                    }
+                } else if state.flight_end.is_none() {
+                    state.flight_end = Some(Some(state.tick + u64::from(state.rate)));
+                }
+            }
+            Cmd::Advance(n) => {
+                state.tick += u64::from(*n);
+                if state
+                    .flight_end
+                    .flatten()
+                    .is_some_and(|end| state.tick >= end)
+                {
+                    state.flight_end = None;
+                    state.lever_out_of_sync = state.last_manual_position != 0;
+                }
+            }
+            Cmd::SetTransition(rate) if state.flight_end.is_none() => {
+                state.rate = u32::from(*rate);
+            }
             _ => {}
         }
         state
@@ -381,11 +491,16 @@ struct Sut {
     previous: (SourceRef, SourceRef),
     previous_progress: Progress,
     was_in_flight: bool,
-    lever_at_end: bool,
+    lever_out_of_sync: bool,
+    last_manual_position: u16,
 }
 impl Sut {
     fn check_projection(&mut self, transition: &Cmd, output: SwitcherProjection, parked: bool) {
         if parked {
+            assert!(
+                !output.started,
+                "started while lever out of sync: {transition:?}"
+            );
             assert_eq!(
                 output.progress,
                 Progress::ZERO,
@@ -438,13 +553,13 @@ impl StateMachineTest for Test {
             previous: (source("a"), source("b")),
             previous_progress: Progress::ZERO,
             was_in_flight: false,
-            lever_at_end: false,
+            lever_out_of_sync: false,
+            last_manual_position: 0,
         }
     }
-    fn apply(mut sut: Sut, _: &Model, transition: Cmd) -> Sut {
-        let parked_manual = sut.lever_at_end
-            && !sut.machine.is_in_flight()
-            && matches!(transition, Cmd::Tbar(position) if position != 0);
+    fn apply(mut sut: Sut, model: &Model, transition: Cmd) -> Sut {
+        let parked_manual =
+            sut.lever_out_of_sync && matches!(transition, Cmd::Tbar(position) if position != 0);
         let result = match transition {
             Cmd::Auto => sut.machine.auto(tick(sut.tick)).ok(),
             Cmd::Cut => sut.machine.cut().ok(),
@@ -460,6 +575,24 @@ impl StateMachineTest for Test {
                     );
                 }
                 first
+            }
+            Cmd::CutAfterManual | Cmd::AbortAfterManual | Cmd::ResumeAndFinish => {
+                if !model.lever_out_of_sync {
+                    sut.machine.tbar(30000, tick(sut.tick)).ok();
+                    sut.was_in_flight = true;
+                    match transition {
+                        Cmd::CutAfterManual => sut.machine.cut().ok(),
+                        Cmd::AbortAfterManual => Some(sut.machine.abort()),
+                        Cmd::ResumeAndFinish => {
+                            sut.machine.auto(tick(sut.tick)).ok();
+                            sut.tick += 12;
+                            Some(sut.machine.sample(tick(sut.tick)))
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    None
+                }
             }
             Cmd::Advance(n) => {
                 sut.tick += u64::from(n);
@@ -525,19 +658,16 @@ impl StateMachineTest for Test {
         }
         sut.previous = (sut.machine.program().clone(), sut.machine.preview().clone());
         sut.was_in_flight = sut.machine.is_in_flight();
-        sut.lever_at_end = match transition {
-            Cmd::Tbar(0) | Cmd::Abort => false,
-            Cmd::Tbar(position) if position == u16::MAX && result.is_some() && !parked_manual => {
-                true
-            }
-            Cmd::RepeatTerminalTbar if result.is_some() => true,
-            _ => sut.lever_at_end,
-        };
+        let next_model = Reference::apply(model.clone(), &transition);
+        sut.lever_out_of_sync = next_model.lever_out_of_sync;
+        sut.last_manual_position = next_model.last_manual_position;
         sut
     }
     fn check_invariants(sut: &Sut, model: &Model) {
         assert_eq!(sut.tick, model.tick);
-        assert_eq!(sut.lever_at_end, model.lever_at_end);
+        assert_eq!(sut.machine.is_in_flight(), model.flight_end.is_some());
+        assert_eq!(sut.lever_out_of_sync, model.lever_out_of_sync);
+        assert_eq!(sut.last_manual_position, model.last_manual_position);
         assert!(sut.previous_progress.numerator() <= sut.previous_progress.denominator());
         assert_eq!(sut.completions, sut.machine.completion_count());
     }
