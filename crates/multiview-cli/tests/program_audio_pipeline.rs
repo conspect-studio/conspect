@@ -573,7 +573,7 @@ async fn audio_meter_frames_are_bounded_rate_and_a_stalled_subscriber_never_dela
     let mut live = publisher.subscribe();
     let done = Arc::new(AtomicBool::new(false));
     let done_rx = Arc::clone(&done);
-    let drain = tokio::spawn(async move {
+    let drain = std::thread::spawn(move || {
         let mut program = 0_u32;
         let mut input = 0_u32;
         let mut input_ids: Vec<String> = Vec::new();
@@ -598,7 +598,7 @@ async fn audio_meter_frames_are_bounded_rate_and_a_stalled_subscriber_never_dela
                     if done_rx.load(Ordering::Acquire) {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
         }
@@ -610,7 +610,7 @@ async fn audio_meter_frames_are_bounded_rate_and_a_stalled_subscriber_never_dela
         .await
         .expect("bounded run");
     done.store(true, Ordering::Release);
-    let (program, input, input_ids) = drain.await.expect("drain task");
+    let (program, input, input_ids) = drain.join().expect("drain thread");
 
     assert_eq!(
         report.frames, TICKS,
