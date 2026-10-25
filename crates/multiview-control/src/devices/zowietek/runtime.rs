@@ -420,7 +420,11 @@ impl DevicePollerFactory for ReqwestPollerFactory {
             Arc::clone(&wiring.drivers),
             &username,
             &password,
-        );
+        )
+        // The explicit spare decode index lives on the driver: an index-scoped
+        // decoder convergence names it and refuses (before any wire I/O) when
+        // it is absent or cannot be determined (issue #55).
+        .with_spare_decode_index(device.spare_decode_index);
         // The management host the source facet addresses: the authority of the
         // device address (host[:port] without the scheme), bracket-preserving so
         // an IPv6 literal stays a valid URL host.
@@ -439,11 +443,7 @@ impl DevicePollerFactory for ReqwestPollerFactory {
         )
         // Thread the config-as-code desired_mode: the poller converges the
         // device onto it whenever adopt/reconnect reaches ONLINE.
-        .with_desired_mode(device.desired_mode.clone())
-        // Thread the explicit spare decode index: an index-scoped decoder
-        // convergence names this index and refuses (before any wire I/O) when
-        // it is absent or cannot be determined (issue #55).
-        .with_spare_decode_index(device.spare_decode_index);
+        .with_desired_mode(device.desired_mode.clone());
         Some(poller.spawn())
     }
 }

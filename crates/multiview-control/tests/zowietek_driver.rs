@@ -588,6 +588,13 @@ async fn indexed_convergence_applies_the_grounded_index_scoped_switch() {
             json!({ "rsp": "succeed", "status": "00000", "data": { "workmode": "encoder" } }),
         ),
     );
+    // 0) the grounded workmode read: the device is already a decoder.
+    transport.push(
+        "workmode",
+        ScriptedReply::json(
+            json!({ "rsp": "succeed", "status": "00000", "data": { "workmode_id": 1 } }),
+        ),
+    );
     // 1) the grounded decode-table read (`streamplay_get_all`), then
     // 2) the grounded index-scoped switch ack.
     transport.push(
@@ -661,16 +668,16 @@ async fn indexed_convergence_applies_the_grounded_index_scoped_switch() {
 // ---- Review fixes (#55): grounded workmode transition + activity grounding --
 
 /// A `{"rsp":"succeed","status":"00000","data":…}` reply.
-fn ok_data(data: serde_json::Value) -> ScriptedReply {
+fn ok_data(data: &serde_json::Value) -> ScriptedReply {
     ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000", "data": data }))
 }
 
 fn workmode_id_reply(id: u32) -> ScriptedReply {
-    ok_data(json!({ "workmode_id": id }))
+    ok_data(&json!({ "workmode_id": id }))
 }
 
 fn spare_table_reply() -> ScriptedReply {
-    ok_data(json!([
+    ok_data(&json!([
         {"index": 2, "name": "production", "switch": 1, "streamplay_status": "playing",
          "url": "rtsp://[fd00:db8::42]:8554/main/av"},
         {"index": 3, "name": "spare", "switch": 0, "streamplay_status": "idle",
@@ -682,7 +689,7 @@ fn spare_table_reply() -> ScriptedReply {
 async fn adopted_encoder(transport: &ScriptedTransport) -> ZowietekDriver<ScriptedTransport> {
     let (_engine, broadcaster, drivers) = harness();
     transport.push("system", login_ok());
-    transport.push("venc", ok_data(json!({ "workmode": "encoder" })));
+    transport.push("venc", ok_data(&json!({ "workmode": "encoder" })));
     let driver = ZowietekDriver::new(
         "dev-a",
         Arc::new(transport.clone()),
@@ -774,7 +781,10 @@ async fn an_unreflected_change_workmode_fails_without_caching_decoder() {
         .await
         .expect_err("an acknowledged-but-unreflected change must fail");
 
-    assert!(!err.to_string().is_empty());
+    assert!(
+        matches!(err, ConvergenceError::WorkmodeNotReflected { .. }),
+        "{err:?}"
+    );
     assert_eq!(
         transport.request_count("streamplay"),
         0,
