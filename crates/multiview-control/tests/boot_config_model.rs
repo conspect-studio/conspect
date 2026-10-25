@@ -816,6 +816,69 @@ async fn a_resumed_run_does_not_reapply_the_unchanged_boot_file() {
     watch.stop();
 }
 
+/// Explicit main programs must track the live stores after REST edits, while
+/// the adopted snapshot written to active.toml must remain valid as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_main_survives_output_and_cell_mutations() {
+    let mut boot = MultiviewConfig::load_from_toml(BOOT_DOC).expect("boot parses");
+    boot.programs = boot.effective_programs();
+    let r = rig(&boot.to_toml().expect("declared main renders"));
+
+    let response = send(
+        &r.router,
+        support::post_json(
+            "/api/v1/outputs/second",
+            OPERATOR_TOKEN,
+            &serde_json::json!({
+                "name": "second",
+                "body": { "id": "second", "kind": "hls", "path": "/tmp/second.m3u8",
+                          "codec": "mpeg2video", "segment_ms": 1000 }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_declared_main_exports_and_persists(&r).await;
+
+    let working = r.state.working_layout_id.as_deref().expect("working layout");
+    let response = send(
+        &r.router,
+        get(&format!("/api/v1/layouts/{working}"), OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = support::etag(&response).expect("layout etag");
+    let mut layout = body_json(response).await;
+    layout["body"]["cells"][0]["source"]["input_id"] = serde_json::json!("in_b");
+    let response = send(
+        &r.router,
+        put_json(
+            &format!("/api/v1/layouts/{working}"),
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &layout,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_declared_main_exports_and_persists(&r).await;
+}
+
+async fn assert_declared_main_exports_and_persists(r: &Rig) {
+    let response = send(&r.router, get("/api/v1/config/export", OPERATOR_TOKEN)).await;
+    assert_eq!(response.status(), StatusCode::OK, "export must validate");
+    let text = String::from_utf8(support::body_bytes(response).await).expect("TOML export");
+    let exported = MultiviewConfig::load_from_toml(&text).expect("export parses");
+    exported.validate().expect("export validates");
+    assert_eq!(exported.programs.len(), 1, "retain declared main");
+    persist_running_now(&r.state).await.expect("persist Running");
+    let active_path = r.state.boot_model.as_ref().expect("boot model").active_path();
+    let text = std::fs::read_to_string(active_path).expect("active.toml written");
+    let active = MultiviewConfig::load_from_toml(&text).expect("active parses");
+    active.validate().expect("active validates");
+    assert_eq!(active.programs.len(), 1, "persist declared main");
+}
+
 /// Pin (d): the persisted `active.toml` round-trips
 /// `MultiviewConfig::load_from_toml` + `validate`, and carries the live edit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
