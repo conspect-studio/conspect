@@ -95,10 +95,7 @@ fn auto_resumes_manual_position_and_completes_at_proportional_tick() {
     assert!(!resumed.started);
     assert!(!resumed.completed);
     assert_eq!(manual.progress.numerator(), 32768);
-    assert_eq!(
-        resumed.progress,
-        Progress::new(5, FrameCount::try_from(10).unwrap())
-    );
+    assert_eq!(resumed.progress, manual.progress);
     assert!(!state.sample(tick(104)).completed);
     assert!(state.sample(tick(105)).completed);
     assert_eq!(state.completion_count(), 1);
@@ -114,18 +111,16 @@ fn manual_resume_at_tick_zero_keeps_exact_elapsed_offset() {
             rate: FrameCount::try_from(10).unwrap(),
         })
         .unwrap();
-    state.tbar(32768, tick(0)).unwrap();
-    assert_eq!(
-        state.auto(tick(0)).unwrap().progress,
-        Progress::new(5, FrameCount::try_from(10).unwrap())
-    );
+    let manual = state.tbar(32768, tick(0)).unwrap();
+    assert_eq!(state.auto(tick(0)).unwrap().progress, manual.progress);
     assert!(!state.sample(tick(4)).completed);
     assert!(state.sample(tick(5)).completed);
 }
 
 #[test]
 fn fractional_tbar_handoff_rounds_half_up_without_backstepping() {
-    for (rate, position, elapsed) in [(10, 39000, 6), (2, 30000, 1), (2, 40000, 1)] {
+    for (rate, position, elapsed) in [(10, 39000, 6), (2, 30000, 1), (2, 40000, 1), (10, 34500, 5)]
+    {
         let mut state = configured();
         let rate = FrameCount::try_from(rate).unwrap();
         state
@@ -133,10 +128,12 @@ fn fractional_tbar_handoff_rounds_half_up_without_backstepping() {
             .unwrap();
         let manual = state.tbar(position, tick(100)).unwrap().progress;
         let resumed = state.auto(tick(100)).unwrap();
-        assert!(resumed.progress >= manual, "rate={rate:?}, position={position}");
+        assert!(
+            resumed.progress >= manual,
+            "rate={rate:?}, position={position}"
+        );
         assert!(!resumed.completed);
-        if (u64::from(elapsed) * u64::from(u16::MAX))
-            >= u64::from(position) * u64::from(rate.get())
+        if (u64::from(elapsed) * u64::from(u16::MAX)) >= u64::from(position) * u64::from(rate.get())
         {
             assert_eq!(resumed.progress, Progress::new(elapsed, rate));
         } else {

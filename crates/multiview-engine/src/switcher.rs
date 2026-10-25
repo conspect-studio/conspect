@@ -49,8 +49,14 @@ impl SwitcherProjection {
 
 #[derive(Debug, Clone)]
 enum Flight {
-    Auto { start: i128, rate: FrameCount },
-    Manual { position: u16 },
+    Auto {
+        start: i128,
+        rate: FrameCount,
+        min_progress: Option<Progress>,
+    },
+    Manual {
+        position: u16,
+    },
 }
 
 /// Owns the program/preview scenes, USK on-air state and next-transition setup.
@@ -231,10 +237,20 @@ impl SwitcherState {
             Some(Flight::Auto { .. }) => return Ok(self.sample(tick)),
             Some(Flight::Manual { position }) => {
                 let rate = self.rate();
-                let elapsed = u64::from(position) * u64::from(rate.get()) / u64::from(u16::MAX);
+                // ADR-T015 §3: round half up against the full u16 fixed-point scale.
+                let elapsed = (u64::from(position) * u64::from(rate.get())
+                    + u64::from(u16::MAX) / 2)
+                    / u64::from(u16::MAX);
                 self.flight = Some(Flight::Auto {
                     start: i128::from(tick.index) - i128::from(elapsed),
                     rate,
+                    // Rounding to frames can land below the manual position. Guard
+                    // reported progress until the tick-derived ramp catches up;
+                    // the anchor and completion tick still follow ADR-T015 §3.
+                    min_progress: Some(Progress::new(
+                        u32::from(position),
+                        FrameCount::try_from(u32::from(u16::MAX)).unwrap_or(FrameCount::ONE),
+                    )),
                 });
                 return Ok(self.sample(tick));
             }
@@ -248,6 +264,7 @@ impl SwitcherState {
         self.flight = Some(Flight::Auto {
             start: i128::from(tick.index),
             rate,
+            min_progress: None,
         });
         Ok(SwitcherProjection {
             progress: Progress::ZERO,
@@ -337,13 +354,31 @@ impl SwitcherState {
                 started: false,
                 completed: false,
             },
-            Some(Flight::Auto { start, rate }) => {
+            Some(Flight::Auto {
+                start,
+                rate,
+                min_progress,
+            }) => {
                 let elapsed = (i128::from(tick.index) - start).max(0);
                 if elapsed >= i128::from(rate.get()) {
                     self.finish()
                 } else {
+                    let progress =
+                        Progress::new(u32::try_from(elapsed).unwrap_or(rate.get()), rate);
+                    let progress = match min_progress {
+                        Some(floor) if progress < floor => floor,
+                        Some(_) => {
+                            self.flight = Some(Flight::Auto {
+                                start,
+                                rate,
+                                min_progress: None,
+                            });
+                            progress
+                        }
+                        None => progress,
+                    };
                     SwitcherProjection {
-                        progress: Progress::new(u32::try_from(elapsed).unwrap_or(rate.get()), rate),
+                        progress,
                         started: false,
                         completed: false,
                     }
