@@ -1096,8 +1096,39 @@ impl MultiviewConfig {
     fn validate_programs(&self) -> Result<(), ConfigError> {
         let mut ids = HashSet::new();
         for program in self.effective_programs() {
-            if !ids.insert(program.id) {
+            if !ids.insert(program.id.clone()) {
                 return Err(ConfigError::Validation("duplicate program id".to_owned()));
+            }
+        }
+
+        // Until the CLI admits multiple independently built programs, the
+        // declared spec must describe exactly the legacy block that drives its
+        // clock, layout, and sinks. Metadata and id do not affect that shape.
+        for program in &self.programs {
+            let ProgramKind::Multiview {
+                canvas,
+                layout,
+                cells,
+                overlays,
+            } = &program.kind;
+            let mismatch = if canvas != &self.canvas {
+                Some("canvas")
+            } else if layout != &self.layout {
+                Some("layout")
+            } else if cells != &self.cells {
+                Some("cells")
+            } else if overlays != &self.overlays {
+                Some("overlays")
+            } else if program.outputs != self.outputs {
+                Some("outputs")
+            } else {
+                None
+            };
+            if let Some(field) = mismatch {
+                return Err(ConfigError::ProgramMismatch {
+                    program: program.id.to_string(),
+                    field,
+                });
             }
         }
         Ok(())

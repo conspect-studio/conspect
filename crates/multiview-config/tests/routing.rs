@@ -161,12 +161,17 @@ fn declared_main_must_match_top_level_canvas_cadence() {
     let mut cfg = load_legacy();
     cfg.canvas.fps = "25/1".parse().unwrap();
     let mut main = cfg.effective_programs().remove(0);
-    let ProgramKind::Multiview { canvas, .. } = &mut main.kind;
+    let ProgramKind::Multiview { canvas, .. } = &mut main.kind else {
+        panic!("implicit main must be multiview")
+    };
     canvas.fps = "50/1".parse().unwrap();
     cfg.programs = vec![main];
     assert!(matches!(
         cfg.validate(),
-        Err(ConfigError::ProgramMismatch { field: "canvas", .. })
+        Err(ConfigError::ProgramMismatch {
+            field: "canvas",
+            ..
+        })
     ));
 }
 
@@ -174,7 +179,9 @@ fn declared_main_must_match_top_level_canvas_cadence() {
 fn declared_main_must_match_top_level_cells_and_outputs() {
     let mut cfg = load_legacy();
     let mut main = cfg.effective_programs().remove(0);
-    let ProgramKind::Multiview { cells, .. } = &mut main.kind;
+    let ProgramKind::Multiview { cells, .. } = &mut main.kind else {
+        panic!("implicit main must be multiview")
+    };
     cells[0].id = "different_cell".to_owned();
     cfg.programs = vec![main];
     assert!(matches!(
@@ -188,7 +195,10 @@ fn declared_main_must_match_top_level_cells_and_outputs() {
     cfg.programs = vec![main];
     assert!(matches!(
         cfg.validate(),
-        Err(ConfigError::ProgramMismatch { field: "outputs", .. })
+        Err(ConfigError::ProgramMismatch {
+            field: "outputs",
+            ..
+        })
     ));
 }
 
