@@ -116,6 +116,16 @@ fn load_legacy() -> MultiviewConfig {
 }
 
 #[test]
+fn output_crosspoint_rejects_undeclared_program() {
+    let mut cfg = load_legacy();
+    let mut routing = cfg.routing_table();
+    routing.output[0].program = "missing".to_owned();
+    cfg.routing = Some(routing);
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("missing") && err.contains("program"), "{err}");
+}
+
+#[test]
 fn legacy_base_validates_and_has_no_explicit_routing() {
     let cfg = load_legacy();
     cfg.validate().expect("legacy base validates");
@@ -245,6 +255,24 @@ fn build_legacy(n: u8, perm: &[usize]) -> String {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// An absent programs block and its explicit desugared form solve alike.
+    #[test]
+    fn absent_and_desugared_programs_solve_identically(
+        perm in (1usize..6).prop_flat_map(|n| {
+            Just((0..n).collect::<Vec<_>>()).prop_shuffle()
+        }),
+    ) {
+        let doc = build_legacy(u8::try_from(perm.len()).unwrap(), &perm);
+        let implicit = MultiviewConfig::load_from_toml(&doc).unwrap();
+        let mut explicit = implicit.clone();
+        explicit.programs = implicit.effective_programs();
+        prop_assert!(implicit.validate().is_ok());
+        prop_assert!(explicit.validate().is_ok());
+        prop_assert_eq!(implicit.effective_programs(), explicit.effective_programs());
+        prop_assert_eq!(implicit.solve_layout().unwrap(), explicit.solve_layout().unwrap());
+        prop_assert_eq!(implicit.routing_table(), explicit.routing_table());
+    }
 
     /// THE load-bearing property: a legacy doc and its desugared v3 routing
     /// table solve to identical cell→input video routing, for a random binding.
