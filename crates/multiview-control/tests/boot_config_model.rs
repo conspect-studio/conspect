@@ -838,9 +838,13 @@ async fn declared_main_survives_output_and_cell_mutations() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert_declared_main_exports_and_persists(&r).await;
+    assert_declared_main_exports_and_persists(&r, "in_a").await;
 
-    let working = r.state.working_layout_id.as_deref().expect("working layout");
+    let working = r
+        .state
+        .working_layout_id
+        .as_deref()
+        .expect("working layout");
     let response = send(
         &r.router,
         get(&format!("/api/v1/layouts/{working}"), OPERATOR_TOKEN),
@@ -861,22 +865,46 @@ async fn declared_main_survives_output_and_cell_mutations() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_declared_main_exports_and_persists(&r).await;
+    let response = send(
+        &r.router,
+        support::post_json(
+            "/api/v1/commands/apply-layout",
+            OPERATOR_TOKEN,
+            &serde_json::json!({ "layout": working }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_declared_main_exports_and_persists(&r, "in_b").await;
 }
 
-async fn assert_declared_main_exports_and_persists(r: &Rig) {
+async fn assert_declared_main_exports_and_persists(r: &Rig, expected_cell_source: &str) {
     let response = send(&r.router, get("/api/v1/config/export", OPERATOR_TOKEN)).await;
     assert_eq!(response.status(), StatusCode::OK, "export must validate");
     let text = String::from_utf8(support::body_bytes(response).await).expect("TOML export");
     let exported = MultiviewConfig::load_from_toml(&text).expect("export parses");
     exported.validate().expect("export validates");
     assert_eq!(exported.programs.len(), 1, "retain declared main");
-    persist_running_now(&r.state).await.expect("persist Running");
-    let active_path = r.state.boot_model.as_ref().expect("boot model").active_path();
+    assert_eq!(exported.outputs.len(), 2, "export new output");
+    assert_eq!(
+        serde_json::to_value(&exported.cells[0]).expect("cell JSON")["source"]["input_id"],
+        expected_cell_source,
+        "export changed cell"
+    );
+    persist_running_now(&r.state)
+        .await
+        .expect("persist Running");
+    let active_path = r
+        .state
+        .boot_model
+        .as_ref()
+        .expect("boot model")
+        .active_path();
     let text = std::fs::read_to_string(active_path).expect("active.toml written");
     let active = MultiviewConfig::load_from_toml(&text).expect("active parses");
     active.validate().expect("active validates");
     assert_eq!(active.programs.len(), 1, "persist declared main");
+    assert_eq!(active.outputs.len(), 2, "persist new output");
 }
 
 /// Pin (d): the persisted `active.toml` round-trips

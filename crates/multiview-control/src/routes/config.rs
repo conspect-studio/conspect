@@ -404,11 +404,47 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     // against the declared sources (the `PUT /api/v1/audio-routing` check
     // intentionally defers).
     insert_store_backed_sections(doc, state)?;
+    refresh_declared_main(doc)?;
     // The composition is returned with secrets INTACT. The redaction for the
     // outward-facing export happens in `compose_export_document`; the Running
     // snapshot (`compose_running_config`) keeps the real credentials so a
     // resume reload works (the atomic writer tightens the file's mode).
     Ok(document)
+}
+
+/// While MP-5 runs N=1, a declared main multiview program mirrors the
+/// store-composed legacy sections. Never replace non-main or multi-program
+/// declarations: validation must still reject those unsupported shapes.
+fn refresh_declared_main(
+    doc: &mut serde_json::Map<String, serde_json::Value>,
+) -> ControlResult<()> {
+    let declared_main = matches!(
+        doc.get("programs")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|programs| programs.as_slice().first().filter(|_| programs.len() == 1)),
+        Some(program) if program.get("id").and_then(serde_json::Value::as_str) == Some("main")
+            && program.get("kind").and_then(serde_json::Value::as_str) == Some("multiview")
+    );
+    if declared_main {
+        let composed: multiview_config::MultiviewConfig =
+            serde_json::from_value(serde_json::Value::Object(doc.clone())).map_err(|error| {
+                ControlError::Validation(format!(
+                    "the composed main program cannot be read: {error}"
+                ))
+            })?;
+        let main = multiview_config::ProgramSpec::main_multiview(
+            composed.canvas,
+            composed.layout,
+            composed.cells,
+            composed.overlays,
+            composed.outputs,
+        );
+        let program = serde_json::to_value(main).map_err(|error| {
+            ControlError::Repository(format!("serializing the composed main program: {error}"))
+        })?;
+        doc.insert("programs".to_owned(), serde_json::json!([program]));
+    }
+    Ok(())
 }
 
 /// Overlay the runtime-mutable store-backed sections — `audio`, `salvos`,
