@@ -124,6 +124,60 @@ fn manual_resume_at_tick_zero_keeps_exact_elapsed_offset() {
 }
 
 #[test]
+fn fractional_tbar_handoff_rounds_half_up_without_backstepping() {
+    for (rate, position, elapsed) in [(10, 39000, 6), (2, 30000, 1), (2, 40000, 1)] {
+        let mut state = configured();
+        let rate = FrameCount::try_from(rate).unwrap();
+        state
+            .set_transition(TransitionDescriptor::Mix { rate })
+            .unwrap();
+        let manual = state.tbar(position, tick(100)).unwrap().progress;
+        let resumed = state.auto(tick(100)).unwrap();
+        assert!(resumed.progress >= manual, "rate={rate:?}, position={position}");
+        assert!(!resumed.completed);
+        if (u64::from(elapsed) * u64::from(u16::MAX))
+            >= u64::from(position) * u64::from(rate.get())
+        {
+            assert_eq!(resumed.progress, Progress::new(elapsed, rate));
+        } else {
+            assert_eq!(resumed.progress, manual);
+        }
+        let finish = 100 + u64::from(rate.get() - elapsed);
+        assert!(!state.sample(tick(finish - 1)).completed);
+        assert!(state.sample(tick(finish)).completed);
+        assert_eq!(state.completion_count(), 1);
+    }
+}
+
+proptest! {
+    #[test]
+    fn auto_from_tbar_never_backsteps_and_finishes_on_rounded_tick(
+        rate in 1u32..=u32::MAX,
+        position in 1u16..u16::MAX,
+    ) {
+        let mut state = configured();
+        let rate = FrameCount::try_from(rate).unwrap();
+        state.set_transition(TransitionDescriptor::Mix { rate }).unwrap();
+        let start = 100u64;
+        let manual = state.tbar(position, tick(start)).unwrap().progress;
+        let elapsed = (u64::from(position) * u64::from(rate.get())
+            + u64::from(u16::MAX) / 2) / u64::from(u16::MAX);
+        let finish = start + u64::from(rate.get()) - elapsed;
+        let resumed = state.auto(tick(start)).unwrap();
+        prop_assert!(resumed.progress >= manual);
+        if finish > start {
+            prop_assert!(!resumed.completed);
+            prop_assert!(!state.sample(tick(finish - 1)).completed);
+            prop_assert!(state.sample(tick(finish)).completed);
+        } else {
+            prop_assert!(resumed.completed);
+        }
+        prop_assert_eq!(state.completion_count(), 1);
+        prop_assert!(!state.sample(tick(finish + 1)).completed);
+    }
+}
+
+#[test]
 fn terminal_tbar_completes_manual_take_once() {
     let mut state = configured();
     state.tbar(12345, tick(2)).unwrap();
