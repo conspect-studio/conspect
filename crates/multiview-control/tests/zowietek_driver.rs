@@ -988,3 +988,159 @@ async fn no_refusal_variant_ever_sends_a_mutating_opt() {
         }
     }
 }
+
+// ---- Round 3 (#55): every unsuccessful indexed convergence publishes Failed --
+
+/// An adopted encoder-mode driver over `transport`, with a subscription on its
+/// own engine so a test can read the published `device.mode` events.
+async fn adopted_with_events(
+    transport: &ScriptedTransport,
+    index: Option<u32>,
+) -> (
+    ZowietekDriver<ScriptedTransport>,
+    multiview_engine::EventSubscription<Event>,
+) {
+    let (engine, broadcaster, drivers) = harness();
+    let sub = engine.subscribe();
+    transport.push("system", login_ok());
+    transport.push("venc", ok_data(&json!({ "workmode": "encoder" })));
+    let driver = ZowietekDriver::new(
+        "dev-a",
+        Arc::new(transport.clone()),
+        broadcaster,
+        drivers,
+        "admin",
+        "admin",
+    )
+    .with_spare_decode_index(index);
+    driver.probe_and_adopt().await.expect("adopt ok");
+    (driver, sub)
+}
+
+/// Drain the `device.mode` events published so far.
+fn mode_events(
+    sub: &mut multiview_engine::EventSubscription<Event>,
+) -> Vec<multiview_events::DeviceMode> {
+    let mut out = Vec::new();
+    while let Ok(evt) = sub.try_recv() {
+        if let Event::DeviceMode(m) = &*evt.event {
+            out.push(m.clone());
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn every_indexed_refusal_publishes_a_failed_outcome_with_the_typed_reason() {
+    use multiview_events::{ImpactClass, ModePhase};
+    let active_spare = ok_data(&json!([
+        {"index": 2, "name": "p", "switch": 0, "streamplay_status": "idle", "url": "rtsp://x/a"},
+        {"index": 3, "name": "s", "switch": 1, "streamplay_status": "playing", "url": "rtsp://x/b"}
+    ]));
+    let unknown_activity = ok_data(&json!([
+        {"index": 2, "name": "p", "switch": 1, "url": "rtsp://x/a"},
+        {"index": 3, "name": "s", "url": "rtsp://x/b"}
+    ]));
+    // (label, index, table, expected reason fragment)
+    let cases: Vec<(&str, Option<u32>, Option<ScriptedReply>, &str)> = vec![
+        (
+            "no-index",
+            None,
+            None,
+            "no configured spare decode index",
+        ),
+        (
+            "active",
+            Some(3),
+            Some(active_spare),
+            "already decoding on configured spare index 3",
+        ),
+        (
+            "absent",
+            Some(99),
+            Some(spare_table_reply()),
+            "does not report configured spare decode index 99",
+        ),
+        (
+            "activity-unknown",
+            Some(3),
+            Some(unknown_activity),
+            "did not report whether configured spare decode index 3",
+        ),
+        (
+            "unreadable",
+            Some(3),
+            Some(ScriptedReply::empty_body()),
+            "readable decode table",
+        ),
+    ];
+    for (label, index, table, reason) in cases {
+        let transport = ScriptedTransport::new();
+        if let Some(t) = table {
+            transport.push("streamplay", t);
+        }
+        let (driver, mut sub) = adopted_with_events(&transport, index).await;
+        driver
+            .converge_indexed()
+            .await
+            .expect_err("refusal expected");
+        let events = mode_events(&mut sub);
+        let failed: Vec<_> = events
+            .iter()
+            .filter(|m| m.phase == ModePhase::Failed)
+            .collect();
+        assert_eq!(failed.len(), 1, "{label}: exactly one Failed outcome: {events:?}");
+        let detail = failed[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains(reason),
+            "{label}: Failed detail carries the typed refusal reason: {detail:?}"
+        );
+        if index.is_some() {
+            assert_eq!(failed[0].impact, ImpactClass::Class2, "{label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unreflected_workmode_change_publishes_a_failed_outcome_with_the_reason() {
+    use multiview_events::ModePhase;
+    let transport = ScriptedTransport::new();
+    transport.push("workmode", workmode_id_reply(0));
+    transport.push("workmode", ack());
+    transport.push("workmode", workmode_id_reply(0));
+    transport.push("streamplay", spare_table_reply());
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+    driver.converge_indexed().await.expect_err("must fail");
+    let failed: Vec<_> = mode_events(&mut sub)
+        .into_iter()
+        .filter(|m| m.phase == ModePhase::Failed)
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("still reports workmode"),
+        "{failed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_slot_switch_publishes_exactly_one_failed_outcome() {
+    use multiview_events::ModePhase;
+    let transport = ScriptedTransport::new();
+    transport.push("workmode", workmode_id_reply(1));
+    transport.push("streamplay", spare_table_reply());
+    transport.push(
+        "streamplay",
+        ScriptedReply::json(json!({"rsp":"failed","status":"00004"})),
+    );
+    let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
+    driver.converge_indexed().await.expect_err("must fail");
+    let failed = mode_events(&mut sub)
+        .into_iter()
+        .filter(|m| m.phase == ModePhase::Failed)
+        .count();
+    assert_eq!(failed, 1);
+}
