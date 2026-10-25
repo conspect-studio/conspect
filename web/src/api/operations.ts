@@ -20,6 +20,8 @@
 // caller can surface the id. `ETag`/`If-Match` optimistic concurrency is honoured
 // on the version-stamped mutations (alarm ack, salvo/profile replace + delete).
 import type { components } from './schema';
+import { correlateOperation } from '../realtime/operations';
+import type { OperationOutcome } from '../realtime/operations';
 import { getStoredToken } from './token';
 
 /** An RFC 9457 problem document, as modelled in the spec. */
@@ -27,6 +29,23 @@ export type Problem = components['schemas']['Problem'];
 
 /** The `202 Accepted` body the command endpoints return. */
 export type AcceptedBody = components['schemas']['AcceptedBody'];
+
+/**
+ * An accepted command plus the authoritative completion: resolves when the
+ * realtime envelope whose `corr` equals `operation_id` arrives (or from the
+ * early-outcome cache), rejects on timeout. Ignoring it is safe.
+ */
+export type AcceptedOperation = AcceptedBody & {
+  readonly completion: Promise<OperationOutcome>;
+};
+
+/** Register an accepted body for correlation and attach its completion promise. */
+export function trackAccepted(body: AcceptedBody): AcceptedOperation {
+  const completion = correlateOperation(body);
+  // A caller that never awaits `completion` must not trigger an unhandled rejection.
+  completion.catch(() => undefined);
+  return { ...body, completion };
+}
 
 /** A failed operator-surface call, normalized to a message + status (+ detail). */
 export class OperationApiError extends Error {
@@ -137,7 +156,7 @@ function isAcceptedBody(value: unknown): value is AcceptedBody {
 export async function submitOperation(
   path: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   const idempotencyKey = options.idempotencyKey ?? crypto.randomUUID();
   const response = await fetch(apiUrl(options, path), {
     method: 'POST',
@@ -150,5 +169,5 @@ export async function submitOperation(
   if (!isAcceptedBody(body)) {
     throw new OperationApiError('The server returned an unexpected command body.');
   }
-  return body;
+  return trackAccepted(body);
 }

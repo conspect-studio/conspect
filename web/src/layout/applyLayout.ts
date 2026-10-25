@@ -15,7 +15,8 @@
 // `submitOperation` in ../api/operations only posts body-less commands, so this
 // reuses its header/url/problem helpers with an explicit JSON body.
 import { apiUrl, buildHeaders, OperationApiError, readProblem } from '../api/operations';
-import type { AcceptedBody, RequestOptions } from '../api/operations';
+import { trackAccepted } from '../api/operations';
+import type { AcceptedBody, AcceptedOperation, RequestOptions } from '../api/operations';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -49,7 +50,7 @@ export function describeApplyError(error: unknown): string {
 export async function applyLayoutCommand(
   layoutId: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   const response = await fetch(apiUrl(options, '/api/v1/commands/apply-layout'), {
     method: 'POST',
     headers: buildHeaders(options, true),
@@ -62,5 +63,5 @@ export async function applyLayoutCommand(
   if (!isAcceptedBody(body)) {
     throw new OperationApiError('The server returned an unexpected command body.');
   }
-  return body;
+  return trackAccepted(body);
 }

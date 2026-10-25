@@ -126,10 +126,12 @@ describe("shared realtime service", () => {
     off();
   });
 
-  it("resolves a kind:replay acceptance immediately as replayed", async () => {
-    await expect(correlateOperation({ operation_id: "op-3", kind: "replay" })).resolves.toMatchObject({
-      operationId: "op-3",
-      replayed: true,
-    });
+  it("resolves a kind:replay acceptance only when the matching corr arrives", async () => {
+    const off = subscribeRealtime("system", vi.fn());
+    const ws = await socket();
+    const outcome = correlateOperation({ operation_id: "op-3", kind: "replay" });
+    ws.emit({ t: "operation.completed", topic: "system", seq: 1, corr: "op-3", data: {} });
+    await expect(outcome).resolves.toMatchObject({ operationId: "op-3", replayed: true });
+    off();
   });
 });

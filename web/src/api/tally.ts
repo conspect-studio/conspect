@@ -20,7 +20,8 @@ import {
   OperationApiError,
   readProblem,
 } from './operations';
-import type { AcceptedBody, RequestOptions } from './operations';
+import { trackAccepted } from './operations';
+import type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** One resolved tally entry (target + lamp state). */
@@ -44,7 +45,7 @@ export interface ProfileWithEtag {
 }
 
 export { OperationApiError } from './operations';
-export type { AcceptedBody, RequestOptions } from './operations';
+export type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -162,7 +163,7 @@ async function submitOverride(
   method: 'PUT' | 'DELETE',
   payload: Record<string, unknown>,
   options: RequestOptions,
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   const response = await fetch(apiUrl(options, '/api/v1/tally/override'), {
     method,
     headers: buildHeaders(options, true),
@@ -175,7 +176,7 @@ async function submitOverride(
   if (!isAcceptedBody(body)) {
     throw new OperationApiError('The server returned an unexpected command body.');
   }
-  return body;
+  return trackAccepted(body);
 }
 
 /** Force a target's lamp (`PUT /api/v1/tally/override` -> 202 + op id). */
@@ -183,7 +184,7 @@ export function setOverride(
   target: TallyTarget,
   color: TallyColor,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOverride('PUT', { target, color }, options);
 }
 
@@ -191,6 +192,6 @@ export function setOverride(
 export function clearOverride(
   target: TallyTarget,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOverride('DELETE', { target }, options);
 }

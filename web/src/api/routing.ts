@@ -16,7 +16,8 @@ import {
   OperationApiError,
   readProblem,
 } from './operations';
-import type { AcceptedBody, RequestOptions } from './operations';
+import { trackAccepted } from './operations';
+import type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** The body of a plan or take request (a source → target crosspoint). */
@@ -99,7 +100,7 @@ export async function planRoute(
 /** The outcome of a take: applied hot, or accepted as a migration. */
 export type TakeOutcome =
   | { readonly status: 'applied'; readonly applied: TakeApplied }
-  | { readonly status: 'accepted'; readonly accepted: AcceptedBody };
+  | { readonly status: 'accepted'; readonly accepted: AcceptedOperation };
 
 /**
  * Apply a take (`POST /api/v1/routing/{kind}/take`). A hot take resolves to
@@ -128,7 +129,7 @@ export async function takeRoute(
     if (!isAcceptedBody(body)) {
       throw new OperationApiError('The server returned an unexpected command body.');
     }
-    return { status: 'accepted', accepted: body };
+    return { status: 'accepted', accepted: trackAccepted(body) };
   }
   if (!isTakeApplied(body)) {
     throw new OperationApiError('The server returned an unexpected take result.');

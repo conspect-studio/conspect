@@ -16,7 +16,7 @@ import {
   readProblem,
   submitOperation,
 } from '../api/operations';
-import type { AcceptedBody, RequestOptions } from '../api/operations';
+import type { AcceptedOperation, RequestOptions } from '../api/operations';
 import { stringField } from '../resources/api';
 import type { ResourceRecord } from '../resources/types';
 import { parseDeviceStatus } from '../realtime/envelope';
@@ -226,7 +226,7 @@ export async function setDeviceMode(
 export async function rebootDevice(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`/api/v1/devices/${encodeURIComponent(id)}/reboot`, options);
 }
 
@@ -268,7 +268,7 @@ export async function testPatternDevice(
 export async function measureSyncGroup(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`/api/v1/sync-groups/${encodeURIComponent(id)}/measure`, options);
 }
 

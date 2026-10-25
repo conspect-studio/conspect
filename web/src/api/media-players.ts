@@ -24,7 +24,8 @@ import {
   readProblem,
   submitOperation,
 } from './operations';
-import type { AcceptedBody, RequestOptions } from './operations';
+import { trackAccepted } from './operations';
+import type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** A configured media player, exactly as the control plane returns it. */
@@ -34,7 +35,7 @@ export type MediaPlayer = components['schemas']['Resource'];
 export type TransportBody = components['schemas']['TransportBody'];
 
 export { OperationApiError } from './operations';
-export type { AcceptedBody, RequestOptions } from './operations';
+export type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -110,7 +111,7 @@ async function submitTransport(
   path: string,
   body: TransportBody,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   const response = await fetch(apiUrl(options, path), {
     method: 'POST',
     headers: buildHeaders(options, true),
@@ -123,7 +124,7 @@ async function submitTransport(
   if (!isAcceptedBody(parsed)) {
     throw new OperationApiError('The server returned an unexpected command body.');
   }
-  return parsed;
+  return trackAccepted(parsed);
 }
 
 /** Load an asset into a player (`POST .../load`, body `{ asset }`). */
@@ -131,7 +132,7 @@ export function loadMediaPlayer(
   id: string,
   asset: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitTransport(`${itemPath(id)}/load`, { asset }, options);
 }
 
@@ -143,7 +144,7 @@ export function cueMediaPlayer(
   id: string,
   frame: number | undefined,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitTransport(
     `${itemPath(id)}/cue`,
     frame === undefined ? {} : { frame },
@@ -156,7 +157,7 @@ export function seekMediaPlayer(
   id: string,
   frame: number | undefined,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitTransport(
     `${itemPath(id)}/seek`,
     frame === undefined ? {} : { frame },
@@ -168,7 +169,7 @@ export function seekMediaPlayer(
 export function playMediaPlayer(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/play`, options);
 }
 
@@ -176,7 +177,7 @@ export function playMediaPlayer(
 export function pauseMediaPlayer(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/pause`, options);
 }
 
@@ -184,7 +185,7 @@ export function pauseMediaPlayer(
 export function stopMediaPlayer(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/stop`, options);
 }
 
@@ -192,7 +193,7 @@ export function stopMediaPlayer(
 export function armMediaPlayerExit(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/exit/arm`, options);
 }
 
@@ -200,7 +201,7 @@ export function armMediaPlayerExit(
 export function takeMediaPlayerExit(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/exit/take`, options);
 }
 
@@ -208,6 +209,6 @@ export function takeMediaPlayerExit(
 export function cancelMediaPlayerExit(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/exit/cancel`, options);
 }

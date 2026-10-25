@@ -26,7 +26,7 @@ import {
   stopCastSession,
 } from './cast-sessions';
 import type {
-  AcceptedBody,
+  AcceptedOperation,
   CastSession,
   CastVolumeRequest,
   OperationApiError,
@@ -148,9 +148,9 @@ export interface SetCastVolumeVars {
 /** Set the receiver volume; returns the `202` operation id body. */
 export function useSetCastVolume(
   context: CastContext = {},
-): UseMutationResult<AcceptedBody, OperationApiError, SetCastVolumeVars> {
-  return useMutation<AcceptedBody, OperationApiError, SetCastVolumeVars>({
-    mutationFn: ({ id, request }): Promise<AcceptedBody> =>
+): UseMutationResult<AcceptedOperation, OperationApiError, SetCastVolumeVars> {
+  return useMutation<AcceptedOperation, OperationApiError, SetCastVolumeVars>({
+    mutationFn: ({ id, request }): Promise<AcceptedOperation> =>
       setCastVolume(id, request, options(context)),
   });
 }

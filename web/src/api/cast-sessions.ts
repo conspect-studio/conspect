@@ -19,7 +19,8 @@ import {
   OperationApiError,
   readProblem,
 } from './operations';
-import type { AcceptedBody, RequestOptions } from './operations';
+import { trackAccepted } from './operations';
+import type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** One live cast session, exactly as the control plane returns it. */
@@ -38,7 +39,7 @@ export type CastVolumeRequest = components['schemas']['CastVolumeRequest'];
 export type Resource = components['schemas']['Resource'];
 
 export { OperationApiError } from './operations';
-export type { AcceptedBody, RequestOptions } from './operations';
+export type { AcceptedBody, AcceptedOperation, RequestOptions } from './operations';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -165,7 +166,7 @@ export async function setCastVolume(
   id: string,
   request: CastVolumeRequest,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   const response = await fetch(apiUrl(options, `${itemPath(id)}/volume`), {
     method: 'POST',
     headers: buildHeaders(options, true),
@@ -178,5 +179,5 @@ export async function setCastVolume(
   if (!isAcceptedBody(body)) {
     throw new OperationApiError('The server returned an unexpected command body.');
   }
-  return body;
+  return trackAccepted(body);
 }
