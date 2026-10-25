@@ -9,7 +9,7 @@
 //! and sub-frame:
 //!
 //! - A [`SubtitleLayer`] holds the **active cue source** behind an
-//!   [`arc_swap::ArcSwap`] — an `Arc<dyn CueSource>` that exposes the same
+//!   [`SwapCell`] — an `Arc<dyn CueSource>` that exposes the same
 //!   `active_at(now)` window sampling as the per-source caption cue store
 //!   (ADR-0019). The compositor *samples* that source once per output tick; it
 //!   never blocks on it (invariants #1/#10).
@@ -51,8 +51,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use multiview_core::time::MediaTime;
+use multiview_framestore::SwapCell;
 
 use crate::subtitle::{Cue, CueTrack};
 
@@ -111,11 +111,10 @@ impl CueSource for EmptyCueSource {
 pub struct SubtitleLayer {
     /// The active cue source, atomically replaceable by [`repoint`](Self::repoint).
     ///
-    /// `arc-swap` can only hold a `Sized` payload behind its `Arc`, and
-    /// `dyn CueSource` is unsized, so the swappable cell stores the (Sized)
-    /// `Arc<dyn CueSource>` fat pointer — a lock-free double-`Arc` that lets the
-    /// command-drain replace the whole trait object atomically.
-    source: ArcSwap<Arc<dyn CueSource>>,
+    /// A [`SwapCell`] (never a foreign source, vorner/arc-swap#210, #134): the
+    /// command-drain replaces the whole trait object atomically and never waits
+    /// on the compositor's per-tick load.
+    source: SwapCell<Arc<dyn CueSource>>,
     /// Armed by [`repoint`](Self::repoint); consumed by the next
     /// [`sample`](Self::sample) to force the CLEAR-on-switch hard cut.
     seam_armed: AtomicBool,
@@ -134,7 +133,7 @@ impl SubtitleLayer {
     #[must_use]
     pub fn new(source: Arc<dyn CueSource>) -> Self {
         Self {
-            source: ArcSwap::new(Arc::new(source)),
+            source: SwapCell::new(source),
             seam_armed: AtomicBool::new(false),
             latched: None,
             last_was_seam: false,
@@ -149,7 +148,7 @@ impl SubtitleLayer {
     /// the old cue and then samples `source`. Takes `&self` so it can run on the
     /// engine's command-drain at a tick boundary without `&mut` ownership.
     pub fn repoint(&self, source: Arc<dyn CueSource>) {
-        self.source.store(Arc::new(source));
+        self.source.store(source);
         self.seam_armed.store(true, Ordering::Release);
     }
 
@@ -179,6 +178,14 @@ impl SubtitleLayer {
         let active = self.source.load().active_at(now);
         self.latched.clone_from(&active);
         active
+    }
+
+    /// The cue the currently bound source has active at `now`, **without**
+    /// advancing the display latch or consuming the seam (a `&self` read for
+    /// probes and tests; [`sample`](Self::sample) is the per-tick path).
+    #[must_use]
+    pub fn peek(&self, now: MediaTime) -> Option<Cue> {
+        self.source.load().active_at(now)
     }
 
     /// Whether the most recent [`sample`](Self::sample) was a re-point seam frame

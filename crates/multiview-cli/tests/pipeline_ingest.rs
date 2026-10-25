@@ -577,7 +577,7 @@ async fn pipeline_serves_control_api_and_live_preview_while_ingesting() {
     // JPEG on demand — the program preview the WebUI renders, served straight
     // from the ingesting pipeline (not a separate process).
     assert!(
-        preview_slot.load_full().is_some(),
+        preview_slot.load().is_some(),
         "the pipeline published a program frame into the live-preview slot"
     );
     let jpeg = provider

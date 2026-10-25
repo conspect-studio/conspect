@@ -118,7 +118,7 @@ const MAX_SUBTITLE_REPOINT_BACKLOG: usize = 256;
 ///
 /// The router is sampled (`&mut`) on the bake consumer thread, so a re-point from
 /// the control plane cannot mutate it directly. Instead the handle publishes the
-/// request onto a lock-free RCU slot (the same `arc-swap` read-copy-update the cue
+/// request onto a lock-free RCU slot (the same `SwapCell` read-copy-update the cue
 /// store uses) that the router **drains at the start of each `sample`** (the
 /// sample-boundary apply — the subtitle analogue of the video command-drain at the
 /// frame boundary). Publishing is wait-free and bounded drop-oldest, so the
@@ -129,7 +129,7 @@ const MAX_SUBTITLE_REPOINT_BACKLOG: usize = 256;
 #[cfg(feature = "overlay")]
 #[derive(Clone)]
 pub struct SubtitleRouteHandle {
-    pending: Arc<arc_swap::ArcSwap<Vec<SubtitleRePoint>>>,
+    pending: Arc<multiview_framestore::SwapCell<Arc<Vec<SubtitleRePoint>>>>,
 }
 
 #[cfg(feature = "overlay")]
@@ -185,7 +185,7 @@ pub struct SubtitleRouter {
     stores: std::collections::HashMap<String, Arc<CueStore>>,
     /// The wait-free pending re-point slot the [`SubtitleRouteHandle`] publishes to
     /// and `sample` drains. Shared by `Arc` with every handle clone.
-    pending: Arc<arc_swap::ArcSwap<Vec<SubtitleRePoint>>>,
+    pending: Arc<multiview_framestore::SwapCell<Arc<Vec<SubtitleRePoint>>>>,
 }
 
 #[cfg(feature = "overlay")]
@@ -208,7 +208,7 @@ impl SubtitleRouter {
         Self {
             layers,
             stores,
-            pending: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
+            pending: Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new())),
         }
     }
 

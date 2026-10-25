@@ -19,13 +19,11 @@
 //! and **follows** it — it never independently consumes transport verbs. The
 //! audio rail is therefore *sampled* by, and follows, the one authority
 //! (invariant #1: audio samples, never paces; the bus is a wait-free
-//! [`arc_swap::ArcSwap`], so neither rail ever blocks the other — invariant #10).
+//! [`SwapCell`](multiview_framestore::SwapCell), so neither rail ever blocks the other — invariant #10).
 //! Same-boundary alignment is true **by construction** (one authority, one
 //! geometry).
 
 use std::sync::Arc;
-
-use arc_swap::ArcSwap;
 
 use multiview_core::time::MediaTime;
 
@@ -80,13 +78,13 @@ impl Default for PlayerControl {
 /// video rail publishes its transport state into and the audio rail samples.
 ///
 /// Shared by `Arc` between the two decode threads. Publishing is a wait-free
-/// `ArcSwap` store at operator rate (only when a verb changes the transport
-/// state — not per frame); sampling is a wait-free `ArcSwap` load per audio
+/// `SwapCell` store at operator rate (only when a verb changes the transport
+/// state — not per frame); sampling is a `SwapCell` load per audio
 /// block. Neither rail ever blocks the other, and neither can stall the output
 /// clock (invariants #1/#10).
 #[derive(Debug)]
 pub struct PlayerControlBus {
-    slot: ArcSwap<PlayerControl>,
+    slot: multiview_framestore::SwapCell<Arc<PlayerControl>>,
     /// The next generation to stamp (only the video rail writes it, between
     /// frames, so a plain `Cell`-free monotonic via the stored value suffices —
     /// we read-modify-write the slot under the single-writer convention).
@@ -106,14 +104,14 @@ impl PlayerControlBus {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            slot: ArcSwap::from_pointee(PlayerControl::default()),
+            slot: multiview_framestore::SwapCell::from_pointee(PlayerControl::default()),
             next_gen: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
     /// Publish the video rail's authoritative transport decision (called by the
     /// video `stream_player` after it applies a verb). Stamps a fresh monotonic
-    /// generation. Wait-free `ArcSwap` store — never blocks the audio rail.
+    /// generation. Wait-free `SwapCell` store — never blocks the audio rail.
     pub fn publish(&self, state: AudioTransport, exit_arm_anchor: Option<MediaTime>) {
         let generation = self
             .next_gen
@@ -126,9 +124,9 @@ impl PlayerControlBus {
     }
 
     /// Sample the latest published control (called by the audio rail each block).
-    /// Wait-free `ArcSwap` load.
+    /// Wait-free `SwapCell` load.
     #[must_use]
     pub fn load(&self) -> PlayerControl {
-        *self.slot.load_full()
+        *self.slot.load()
     }
 }

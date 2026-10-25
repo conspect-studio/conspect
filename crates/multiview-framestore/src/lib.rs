@@ -53,11 +53,12 @@ pub mod error;
 pub mod latest;
 pub mod liveness;
 pub mod state;
-mod swap;
+pub mod swap;
 pub mod tile;
 
 pub use error::{Error, Result};
 pub use latest::LatestSlot;
 pub use liveness::{PacketLiveness, PacketLivenessState, PacketLivenessThresholds};
 pub use state::{classify, TileThresholds};
+pub use swap::{SwapCell, SwapPointer};
 pub use tile::{NoSignalPolicy, TileRead, TileStore};

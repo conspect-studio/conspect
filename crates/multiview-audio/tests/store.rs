@@ -660,3 +660,175 @@ fn output_pull_tick_count_is_independent_of_the_rtp_feed() {
         "a negative-index / early-burst RTP feed does not change the output tick count"
     );
 }
+
+/// Publishes per store in the cross-instance audio test.
+const XS_PUBLISHES: usize = 200_000;
+/// Frames in each cross-instance window (always `[0, XS_FRAMES)`).
+const XS_FRAMES: usize = 4;
+
+/// Store `a`'s per-instance sample tag for publish `n`: `4n + 1` (store `b`
+/// uses `4n + 3`). Exact in `f32` for `n < 2^22`.
+fn tag_a(n: usize) -> f32 {
+    (4 * n + 1) as f32
+}
+
+/// What one full-window read of store `a` may legally return: every sample
+/// equal to `tag_a(n)` for one `n` in `0..=XS_PUBLISHES`, with `n` never older
+/// than `prev`. `b`'s samples (`4n + 3`), `b`'s or anyone's silence, a mixed
+/// window, or an out-of-range tag all fail (#134 review: no relative-only
+/// checks).
+fn check_audio_a(samples: &[f32], prev: usize) -> Result<usize, String> {
+    let first = *samples.first().ok_or("empty read")?;
+    if samples.iter().any(|&s| s != first) {
+        return Err(format!(
+            "store `a` returned a mixed/foreign window {samples:?}"
+        ));
+    }
+    if !(first >= 1.0 && first.fract() == 0.0) {
+        return Err(format!("store `a` returned a foreign sample {first}"));
+    }
+    // reason: `first` is checked >= 1 and integral above; tags stay < 2^24.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let raw = first as usize;
+    if raw % 4 != 1 {
+        return Err(format!("store `a` returned a foreign sample {first} (tag)"));
+    }
+    let n = raw / 4;
+    if n > XS_PUBLISHES {
+        return Err(format!(
+            "store `a` returned a foreign sample {first} (range)"
+        ));
+    }
+    if n < prev {
+        return Err(format!("samples regressed: {n} < {prev}"));
+    }
+    Ok(n)
+}
+
+#[test]
+fn audio_validator_rejects_foreign_windows() {
+    let own = |n: usize| vec![tag_a(n); XS_FRAMES * 2];
+    assert_eq!(check_audio_a(&own(0), 0), Ok(0));
+    assert_eq!(check_audio_a(&own(9), 3), Ok(9));
+    // Store `b`'s value for the same and other publishes.
+    for n in [0, 1, 9, XS_PUBLISHES] {
+        assert!(check_audio_a(&[(4 * n + 3) as f32; XS_FRAMES * 2], 0).is_err());
+    }
+    // `b`'s empty seed (reads as silence), a mixed window, out of range,
+    // and a regression.
+    assert!(check_audio_a(&[0.0; XS_FRAMES * 2], 0).is_err());
+    let mut mixed = own(5);
+    mixed[3] = 23.0;
+    assert!(check_audio_a(&mixed, 0).is_err());
+    assert!(check_audio_a(&own(XS_PUBLISHES + 1), 0).is_err());
+    assert!(check_audio_a(&own(3), 9).is_err());
+}
+
+/// Regression for #134 (upstream vorner/arc-swap#210, first found in
+/// `multiview-framestore` by #133). Two independent stores of the same format,
+/// written by one thread in lock-step at the same absolute frame (`publish_at`,
+/// which allocates a fresh window each time), so the snapshot allocation freed
+/// from `a` is immediately reused for `b`'s next one. arc-swap's default
+/// strategy keys its process-global debt list by raw address, so `b`'s writer
+/// could "pay" a debt a reader of `a` holds, and `a.read` would then return
+/// `b`'s samples. Both stores are seeded before the readers start, and the
+/// window is always `[0, XS_FRAMES)`, so every read is one snapshot that must
+/// pass [`check_audio_a`].
+#[test]
+fn read_never_returns_samples_published_into_another_store() {
+    // One reader: the read cursor is single-consumer (`seek_to` + `read`
+    // from two threads would race it and read past the window).
+    const READERS: usize = 1;
+    let a = Arc::new(AudioStore::new(stereo(), XS_FRAMES));
+    let b = Arc::new(AudioStore::new(stereo(), XS_FRAMES));
+    let publish = |n: usize| {
+        let block =
+            |v: f32| AudioBlock::from_interleaved(stereo(), vec![v; XS_FRAMES * 2]).unwrap();
+        a.publish_at(0, &block(tag_a(n))).unwrap();
+        b.publish_at(0, &block((4 * n + 3) as f32)).unwrap();
+    };
+    publish(0);
+    let done = Arc::new(AtomicBool::new(false));
+
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let a = Arc::clone(&a);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut prev = 0;
+                let mut reads = 0_u64;
+                while !done.load(Ordering::Acquire) {
+                    a.seek_to(0);
+                    let block = a.read(XS_FRAMES);
+                    prev =
+                        check_audio_a(block.interleaved(), prev).unwrap_or_else(|e| panic!("{e}"));
+                    reads += 1;
+                }
+                reads
+            })
+        })
+        .collect();
+
+    for n in 1..=XS_PUBLISHES {
+        publish(n);
+    }
+    done.store(true, Ordering::Release);
+    for reader in readers {
+        let reads = reader.join().expect("reader thread panicked");
+        assert!(reads > 0, "reader observed no published window");
+    }
+    a.seek_to(0);
+    assert_eq!(
+        check_audio_a(a.read(XS_FRAMES).interleaved(), 0),
+        Ok(XS_PUBLISHES)
+    );
+}
+
+/// Invariants #1/#10 soak for the `SwapCell`-backed window (#134): with more
+/// hot readers than the publisher can out-schedule, every replace publish
+/// still returns (the publisher never waits on a reader), and the newest
+/// window is readable as soon as its publish returns. The structural
+/// "never waits on a parked reader" proof is `multiview-framestore`'s
+/// `swap::chaos` suite, which this store inherits; this checks the store
+/// wiring under real oversubscription.
+#[test]
+fn publisher_completes_under_oversubscribed_readers() {
+    const PUBLISHES: i64 = 10_000;
+    const FRAMES: usize = 960;
+    let store = Arc::new(AudioStore::new(stereo(), FRAMES * 4));
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..16)
+        .map(|_| {
+            let (s, stop) = (Arc::clone(&store), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Gap-free under contention: always exactly FRAMES frames.
+                    s.seek_to(0);
+                    assert_eq!(s.read(FRAMES).frame_count(), FRAMES);
+                }
+            })
+        })
+        .collect();
+    let mut w = vec![0.0_f32; FRAMES * 2];
+    let started = std::time::Instant::now();
+    for n in 1..=PUBLISHES {
+        w.fill(n as f32);
+        store.publish_window(n * FRAMES as i64, &w).unwrap();
+    }
+    let elapsed = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        r.join().expect("reader thread panicked");
+    }
+    // A sanity bound for the whole loop, not a latency budget.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "{PUBLISHES} publishes took {elapsed:?}"
+    );
+    store.seek_to(PUBLISHES * FRAMES as i64);
+    let last = store.read(FRAMES);
+    assert!(
+        last.interleaved().iter().all(|&s| s == PUBLISHES as f32),
+        "the newest window is not visible after its publish returned"
+    );
+}

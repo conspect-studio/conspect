@@ -510,7 +510,7 @@ jobs:
         # soname -> ubuntu-noble package:
         #   libva.so.2 / libva-drm.so.2 -> libva2 / libva-drm2  (VAAPI)
         #   libopus.so.0                -> libopus0
-        #   libsrt.so.1.5               -> libsrt1.5-gnutls      (matches --enable-gnutls; universe)
+        #   libsrt.so.1.5               -> libsrt1.5-openssl     (the image builds against libsrt-openssl-dev, whose SONAME is libsrt.so.1.5; the gnutls flavour ships libsrt-gnutls.so.1.5)
         #   libvpl.so.2                 -> libvpl2               (oneVPL)
         # gnutls + libdrm are preinstalled on ubuntu-latest; NO x264/x265 (GPL-gated,
         # absent from the -lgpl build). The `ldd` completeness guard below fails fast
@@ -520,7 +520,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev nasm \
-            libva2 libva-drm2 libopus0 libsrt1.5-gnutls libvpl2
+            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2
       - name: Extract pinned FFmpeg 8.1.1 from the base image
         # The base is `FROM scratch` (only /opt/multiview-ffmpeg), so we create a
         # (never-run) container from it and `docker cp` the prefix out — the same

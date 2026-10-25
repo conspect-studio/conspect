@@ -17,11 +17,12 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# Lock-free atomic `Arc` slot backing the bounded last-good audio store
-# (`store.rs`): the engine reader loads an immutable snapshot wait-free while a
-# decode thread swaps a fresh one in — same primitive (and version) the video
-# tile store uses in `multiview-framestore`. Safe, no `unsafe`, no new vendor.
-arc-swap = "1.9.1"
+# `SwapCell`, the atomic `Arc` slot backing the bounded last-good audio store
+# (`store.rs`): the engine reader loads an immutable snapshot without blocking
+# while a decode thread swaps a fresh one in, and the publisher never waits on a
+# reader — the same primitive the video tile store uses. Replaces arc-swap
+# (vorner/arc-swap#210, #134). Safe, no `unsafe`, std-only.
+multiview-framestore = { workspace = true }
 
 # Real audio demux/decode/resample lives behind the off-by-default `ffmpeg`
 # feature so the DEFAULT build stays pure-Rust with no native deps. multiview-audio

@@ -501,7 +501,7 @@ struct LiveIsland {
 /// (empty until — and unless — admission names a device). Lock-free reads on
 /// the hub worker; never touched by the output clock.
 #[cfg(feature = "gpu")]
-type LiveIslandSlot = Arc<arc_swap::ArcSwapOption<LiveIsland>>;
+type LiveIslandSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveIsland>>>>;
 
 /// Choose the GPU to host the whole pipeline island at **admission** — the
 /// load-aware, decide-once pick (ADR-0035 Tier-1, ADR-0018; the GPU-placement
@@ -1184,7 +1184,7 @@ segment_ms = 1000
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
             // EMPTY island slot — admission named no device.
-            island: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            island: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             load_source: Box::new(CountingLoadSource {
                 polls: std::sync::Arc::clone(&polls),
             }),
@@ -1273,7 +1273,7 @@ segment_ms = 1000
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
-            island: std::sync::Arc::new(arc_swap::ArcSwapOption::from_pointee(island(
+            island: std::sync::Arc::new(multiview_framestore::SwapCell::from_some(island(
                 FakeTwoGpu::GPU1_UUID,
                 1,
                 "1",
@@ -1566,10 +1566,11 @@ pub struct Pipeline {
     /// shared slot). The control plane reads it via
     /// [`subtitle_route_handle`](Self::subtitle_route_handle) to drive a subtitle
     /// breakaway (`RouteSubtitle`, RT-11) into the running pipeline. `None` before a
-    /// run starts (or on a run with no caption stores). A lock-free `ArcSwapOption`
+    /// run starts (or on a run with no caption stores). A `SwapCell`
     /// so publishing/reading the handle never blocks the engine (inv #1/#10).
     #[cfg(feature = "overlay")]
-    subtitle_route: Arc<arc_swap::ArcSwapOption<crate::captions::SubtitleRouteHandle>>,
+    subtitle_route:
+        Arc<multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>>,
     /// Per-source caption reader plans (resolved at build time): the rendition
     /// `m3u8` to demux + the store to publish into. Consumed by the ingest
     /// supervisor (one reader thread each) on the first `drive`, like the video
@@ -1620,7 +1621,7 @@ pub struct Pipeline {
     /// applied overlay change through it (via
     /// [`overlay_apply_slot`](Self::overlay_apply_slot) → the binary's drain
     /// wiring) and the bake consumer re-derives its overlay render state from
-    /// it at the next frame — a lock-free `ArcSwap`, so neither side can pace
+    /// it at the next frame — a `SwapCell`, so neither side can pace
     /// the other (inv #1/#10).
     #[cfg(feature = "overlay")]
     overlay_apply: crate::live_overlays::OverlayApplySlot,
@@ -1961,7 +1962,7 @@ struct IngestPlan {
     /// [`ingest_plan_for`]). The bridge thread is spawned in
     /// [`IngestSupervisor::start`].
     #[cfg(feature = "youtube")]
-    youtube_url_slot: Option<Arc<arc_swap::ArcSwapOption<String>>>,
+    youtube_url_slot: Option<Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>>,
 }
 
 /// Everything one AES67 / ST 2110-30 audio source needs to be received on its own
@@ -2484,7 +2485,7 @@ impl Pipeline {
             source_handles,
             stop_registry: crate::live_sources::stop_registry(),
             #[cfg(feature = "gpu")]
-            live_island: Arc::new(arc_swap::ArcSwapOption::empty()),
+            live_island: Arc::new(multiview_framestore::SwapCell::empty()),
             ingest_plans,
             player_mailboxes,
             #[cfg(feature = "webrtc-native")]
@@ -2501,7 +2502,7 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             caption_stores,
             #[cfg(feature = "overlay")]
-            subtitle_route: Arc::new(arc_swap::ArcSwapOption::empty()),
+            subtitle_route: Arc::new(multiview_framestore::SwapCell::empty()),
             #[cfg(feature = "overlay")]
             caption_plans,
             canvas_color,
@@ -2958,12 +2959,12 @@ impl Pipeline {
     /// on it — re-pointing a layer to another source's cues takes effect on the
     /// next output tick (the run's [`SubtitleRouter`](crate::captions::SubtitleRouter)
     /// drains it at the sample boundary). Reading the handle is a lock-free
-    /// `ArcSwapOption` load, so it can never pace or stall the engine (inv #1/#10).
+    /// `SwapCell` load, so it can never pace or stall the engine (inv #1/#10).
     /// This is the run-side seam `Command::RouteSubtitle` (RT-11) drives.
     #[cfg(feature = "overlay")]
     #[must_use]
     pub fn subtitle_route_handle(&self) -> Option<Arc<crate::captions::SubtitleRouteHandle>> {
-        self.subtitle_route.load_full()
+        self.subtitle_route.load()
     }
 
     /// RT-10b: the **shared** subtitle re-point slot (the `Arc` behind
@@ -2972,14 +2973,15 @@ impl Pipeline {
     /// Cloning this slot lets a caller observe the live handle **concurrently with
     /// a running `drive`** (which borrows the pipeline mutably): the run publishes
     /// the handle into this slot at drive start, and a holder of a slot clone reads
-    /// it with a lock-free [`ArcSwapOption`](arc_swap::ArcSwapOption) load. This is
+    /// it with a lock-free [`SwapCell`](multiview_framestore::SwapCell) load. This is
     /// how the control plane wires `RouteSubtitle` to the running pipeline (and how
     /// the run-path re-point is exercised in tests) without aliasing `self`.
     #[cfg(feature = "overlay")]
     #[must_use]
     pub fn subtitle_route_slot(
         &self,
-    ) -> Arc<arc_swap::ArcSwapOption<crate::captions::SubtitleRouteHandle>> {
+    ) -> Arc<multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>>
+    {
         Arc::clone(&self.subtitle_route)
     }
 
@@ -2988,7 +2990,7 @@ impl Pipeline {
     /// ([`command_drain_with_seams`](crate::control::command_drain_with_seams))
     /// so `UpsertOverlay`/`RemoveOverlay` publish through it at the frame
     /// boundary; the bake consumer re-derives its overlay render state from it
-    /// at the next frame. Reading/writing is a lock-free `ArcSwap` load/store,
+    /// at the next frame. Reading/writing is a `SwapCell` load/store,
     /// so neither side can pace or stall the output clock (inv #1/#10).
     #[cfg(feature = "overlay")]
     #[must_use]
@@ -4017,7 +4019,7 @@ impl StreamBaker {
         // The Conspect tile-watermark seam (S3, ADR-0050 §5): when a signal is
         // wired, the bake stamps the corner watermark on the composited multiview
         // canvas whenever the published ladder level is at a watermark rung. The
-        // per-frame decision is a single wait-free `arc_swap` load off the hot loop.
+        // per-frame decision is a single `SwapCell` load off the hot loop.
         if let Some(signal) = ctx.watermark_signal.clone() {
             baker = baker.with_watermark(signal, ctx.canvas_width, ctx.canvas_height);
         }
@@ -4032,7 +4034,7 @@ impl StreamBaker {
 
     /// Re-derive the overlay render state from the live working-set slot iff
     /// its generation advanced (ADR-W022). The steady-state per-frame cost is
-    /// one wait-free `ArcSwap` load plus an integer compare; on a change the
+    /// one `SwapCell` load plus an integer compare; on a change the
     /// re-derivation is O(overlays) pure math (no I/O, no rasterization), and
     /// the frame baked next is drawn entirely from the new set — a clean
     /// frame-boundary (Class-1) transition. Without a wired slot the
@@ -6368,7 +6370,7 @@ impl LiveIngestSpawner {
     /// The GPU-free build carries no `island` field at all and keeps the
     /// constructor `Default` (no NVDEC compiled to mis-place).
     fn decode_placement_for(&self, source_id: &str) -> DecodePlacement {
-        if let Some(island) = self.island.load_full() {
+        if let Some(island) = self.island.load() {
             select_live_decode_placement(
                 self.load_source.as_ref(),
                 &island,
@@ -8258,9 +8260,11 @@ fn build_input_inventories(
 /// a fresh URL already in hand (make-before-break), no cold resolve at the boundary
 /// (ADR-0015 P2–P4). Lock-free, written only by the loop (invariants #1/#10).
 #[cfg(feature = "youtube")]
-fn youtube_url_slot_for(location: &SourceLocation) -> Option<Arc<arc_swap::ArcSwapOption<String>>> {
+fn youtube_url_slot_for(
+    location: &SourceLocation,
+) -> Option<Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>> {
     match location {
-        SourceLocation::Youtube { .. } => Some(Arc::new(arc_swap::ArcSwapOption::empty())),
+        SourceLocation::Youtube { .. } => Some(Arc::new(multiview_framestore::SwapCell::empty())),
         _ => None,
     }
 }
@@ -10231,13 +10235,13 @@ fn resolve_youtube_master(watch_url: &str) -> Result<String, String> {
 /// unit-testable with no network/subprocess (the live resolve is gated separately).
 #[cfg(feature = "youtube")]
 fn youtube_open_url<F>(
-    slot: Option<&arc_swap::ArcSwapOption<String>>,
+    slot: Option<&multiview_framestore::SwapCell<Option<Arc<String>>>>,
     resolve_inline: F,
 ) -> Result<String, String>
 where
     F: FnOnce() -> Result<String, String>,
 {
-    if let Some(fresh) = slot.and_then(arc_swap::ArcSwapOption::load_full) {
+    if let Some(fresh) = slot.and_then(multiview_framestore::SwapCell::load) {
         // The proactive loop has a fresh, make-before-break-resolved URL in hand.
         return Ok((*fresh).clone());
     }
@@ -10267,7 +10271,7 @@ where
 #[cfg(feature = "youtube")]
 fn youtube_reresolve_thread(
     watch_url: &str,
-    slot: &Arc<arc_swap::ArcSwapOption<String>>,
+    slot: &Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
     stop: &AtomicBool,
 ) {
     use multiview_input::youtube::reresolve::{
@@ -12644,7 +12648,7 @@ mod youtube_tests {
         // IN-5b make-before-break: when the proactive loop has published a fresh
         // master into the slot, the (re)open uses IT and NEVER calls the inline
         // resolver — the tile reopens onto the next-up URL without a cold resolve.
-        let slot = arc_swap::ArcSwapOption::empty();
+        let slot = multiview_framestore::SwapCell::empty();
         slot.store(Some(Arc::new(
             "https://r1.googlevideo.com/fresh.m3u8?expire=9999".to_owned(),
         )));
@@ -12668,7 +12672,7 @@ mod youtube_tests {
         // Cold start (slot empty, before the loop's first publish) OR no loop: the
         // (re)open resolves inline this once, so the very first open never waits on
         // the loop and a source with no running loop still works (IN-5 fallback).
-        let slot = arc_swap::ArcSwapOption::<String>::empty();
+        let slot = multiview_framestore::SwapCell::<Option<Arc<String>>>::empty();
         let inline_called = std::cell::Cell::new(false);
         let chosen = youtube_open_url(Some(&slot), || {
             inline_called.set(true);
@@ -12688,7 +12692,7 @@ mod youtube_tests {
         // When the slot is empty AND the inline resolve fails (binary absent /
         // extraction broke), the error propagates so the reconnect bracket backs
         // off and the tile degrades — never a panic, never a silent success.
-        let slot = arc_swap::ArcSwapOption::<String>::empty();
+        let slot = multiview_framestore::SwapCell::<Option<Arc<String>>>::empty();
         let err = youtube_open_url(Some(&slot), || Err("yt-dlp unavailable".to_owned()))
             .expect_err("an empty slot with a failing inline resolve must error");
         assert_eq!(err, "yt-dlp unavailable");
@@ -12744,7 +12748,8 @@ mod youtube_tests {
         };
 
         // The plan slot the decode thread reads via `youtube_open_url`.
-        let slot: Arc<arc_swap::ArcSwapOption<String>> = Arc::new(arc_swap::ArcSwapOption::empty());
+        let slot: Arc<multiview_framestore::SwapCell<Option<Arc<String>>>> =
+            Arc::new(multiview_framestore::SwapCell::empty());
         let swap_slot = Arc::clone(&slot);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_loop = Arc::clone(&stop);
@@ -12779,7 +12784,7 @@ mod youtube_tests {
         // The slot holds the LATEST master — the decode thread's next (re)open uses
         // it (make-before-break); the loop only ever wrote the lock-free slot
         // (bounded, non-blocking — inv #10).
-        let held = slot.load_full().expect("slot holds the latest master");
+        let held = slot.load().expect("slot holds the latest master");
         assert_eq!(*held, second.manifest_url);
     }
 
@@ -12796,7 +12801,8 @@ mod youtube_tests {
             ),
             calls: std::sync::atomic::AtomicU32::new(0),
         };
-        let slot: Arc<arc_swap::ArcSwapOption<String>> = Arc::new(arc_swap::ArcSwapOption::empty());
+        let slot: Arc<multiview_framestore::SwapCell<Option<Arc<String>>>> =
+            Arc::new(multiview_framestore::SwapCell::empty());
         let swap_slot = Arc::clone(&slot);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_loop = Arc::clone(&stop);

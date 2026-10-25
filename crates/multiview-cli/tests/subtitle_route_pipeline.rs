@@ -303,7 +303,7 @@ async fn a_subtitle_repoint_takes_effect_in_the_running_pipeline() {
         // Bounded poll: the handle is published at drive start (well within this).
         let mut handle = None;
         for _ in 0..2_000 {
-            if let Some(h) = slot.load_full() {
+            if let Some(h) = slot.load() {
                 handle = Some(h);
                 break;
             }

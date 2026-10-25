@@ -13,14 +13,14 @@
 //! The store is generic over an opaque payload `C`; the caller supplies each
 //! cue's `[start, end)` window explicitly, so this module needs no caption type
 //! and stays pure + testable without the `ffmpeg` feature. It is lock-free
-//! (`ArcSwap`, read-copy-update): the writer never blocks the reader and the
+//! (`SwapCell`, read-copy-update; not arc-swap, vorner/arc-swap#210, #134): the writer never blocks the reader and the
 //! reader never blocks the writer — nothing here can pace or back-pressure the
 //! engine, which never touches this store (invariants #1/#10).
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use multiview_core::time::MediaTime;
+use multiview_framestore::SwapCell;
 
 /// Default number of cues retained. Captions are sparse (seconds apart), so a
 /// small window comfortably covers the read-ahead between decode and display.
@@ -38,7 +38,7 @@ struct Entry<C> {
 /// source. Cheap to clone-on-write because cues are sparse.
 #[derive(Debug)]
 pub struct CaptionCueStore<C> {
-    entries: ArcSwap<Vec<Entry<C>>>,
+    entries: SwapCell<Arc<Vec<Entry<C>>>>,
     capacity: usize,
 }
 
@@ -53,7 +53,7 @@ impl<C: Clone> CaptionCueStore<C> {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: ArcSwap::from_pointee(Vec::new()),
+            entries: SwapCell::from_pointee(Vec::new()),
             capacity: capacity.max(1),
         }
     }
@@ -108,6 +108,84 @@ mod tests {
     /// Build a `MediaTime` from a nanosecond count (test ergonomics).
     fn mt(ns: i64) -> MediaTime {
         MediaTime::from_nanos(ns)
+    }
+
+    /// Publishes per store in the cross-instance test.
+    const XS_PUBLISHES: i64 = 100_000;
+
+    /// Store `a`'s cue for publish `n` is `4n + 1`; store `b`'s is `4n + 3`.
+    const fn cue_a(n: i64) -> i64 {
+        4 * n + 1
+    }
+
+    /// What one `active_at(0)` read of store `a` may legally return: `a`'s cue
+    /// for some publish `n` in `0..=XS_PUBLISHES`, never older than `prev`.
+    /// `b`'s cue (tag `3`), `None` (an empty seed), or an out-of-range cue all
+    /// fail (#134 review: no relative-only checks).
+    fn check_cue_a(cue: Option<i64>, prev: i64) -> Result<i64, String> {
+        let cue = cue.ok_or("store `a` returned no cue (a foreign/empty snapshot)")?;
+        if cue.rem_euclid(4) != 1 {
+            return Err(format!("store `a` returned a foreign cue {cue} (tag)"));
+        }
+        let n = cue.div_euclid(4);
+        if !(0..=XS_PUBLISHES).contains(&n) {
+            return Err(format!("store `a` returned a foreign cue {cue} (range)"));
+        }
+        if n < prev {
+            return Err(format!("cue regressed: {n} < {prev}"));
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn cue_validator_rejects_foreign_cues() {
+        assert_eq!(check_cue_a(Some(cue_a(0)), 0), Ok(0));
+        assert_eq!(check_cue_a(Some(cue_a(9)), 3), Ok(9));
+        for n in [0, 1, 9, XS_PUBLISHES] {
+            assert!(check_cue_a(Some(4 * n + 3), 0).is_err(), "`b`'s cue");
+        }
+        assert!(check_cue_a(None, 0).is_err(), "an empty seed is foreign");
+        assert!(check_cue_a(Some(cue_a(XS_PUBLISHES + 1)), 0).is_err());
+        assert!(check_cue_a(Some(cue_a(-1)), 0).is_err());
+        assert!(check_cue_a(Some(cue_a(3)), 9).is_err(), "regression");
+    }
+
+    /// Regression for #134 (upstream vorner/arc-swap#210): two independent
+    /// stores published in lock-step with same-size snapshots, so the
+    /// allocation freed from `a` is reused for `b`'s next one. Both are seeded
+    /// before the readers start, so every read must pass [`check_cue_a`].
+    #[test]
+    #[allow(clippy::expect_used, clippy::panic)]
+    fn active_at_never_returns_another_stores_cue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let a = Arc::new(CaptionCueStore::<i64>::with_capacity(1));
+        let b = Arc::new(CaptionCueStore::<i64>::with_capacity(1));
+        let publish = |n: i64| {
+            a.publish(mt(0), mt(1), cue_a(n));
+            b.publish(mt(0), mt(1), 4 * n + 3);
+        };
+        publish(0);
+        let done = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let (a, done) = (Arc::clone(&a), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let mut prev = 0;
+                    while !done.load(Ordering::Acquire) {
+                        prev =
+                            check_cue_a(a.active_at(mt(0)), prev).unwrap_or_else(|e| panic!("{e}"));
+                    }
+                })
+            })
+            .collect();
+        for n in 1..=XS_PUBLISHES {
+            publish(n);
+        }
+        done.store(true, Ordering::Release);
+        for r in readers {
+            r.join().expect("reader panicked");
+        }
+        assert_eq!(check_cue_a(a.active_at(mt(0)), 0), Ok(XS_PUBLISHES));
     }
 
     #[test]

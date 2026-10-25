@@ -13,10 +13,7 @@ publish = false
 
 [dependencies]
 multiview-core = { workspace = true }
-multiview-framestore = { workspace = true }
-# Lock-free read-copy-update for the per-source caption cue store (same
-# primitive the frame stores use); no native deps, keeps the crate `unsafe`-free.
-arc-swap = "1.9.1"
+multiview-framestore = { workspace = true } # also `SwapCell` for the caption/SAP stores (#134)
 # Bounded zlib inflate for the RFC 2974 SAP `C=1` (compressed) packet path
 # (ADR-0041 Decision 8). `decompress_to_vec_zlib_with_limit` enforces a hard
 # decompressed-size cap DURING inflate, so an unauthenticated compressed

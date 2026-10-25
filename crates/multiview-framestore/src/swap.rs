@@ -15,7 +15,7 @@
 //!
 //! ## Design: a slot ring with a generation-tagged head
 //!
-//! The cell owns a growable set of slots (segments of [`SEGMENT`] slots,
+//! The cell owns a growable set of slots (segments of 8 slots,
 //! chained through [`OnceLock`]). Each slot is an atomic **tag** plus a
 //! [`RwLock`] around an `(generation, value)` entry. The tag mirrors the
 //! entry's generation, or is `CLAIMED` while a publisher owns the slot. One
@@ -267,13 +267,49 @@ fn try_write<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGuard<'_, T>> 
     }
 }
 
+mod sealed {
+    use std::sync::Arc;
+
+    /// Seals [`SwapPointer`](super::SwapPointer): only the two pointer shapes
+    /// below may be stored, so a clone is always one atomic increment.
+    #[allow(unreachable_pub)] // reason: the sealed-trait pattern; never nameable outside.
+    pub trait Sealed {}
+    impl<T: ?Sized> Sealed for Arc<T> {}
+    impl<T: ?Sized> Sealed for Option<Arc<T>> {}
+}
+
+/// The payloads a [`SwapCell`] can hold: `Arc<T>` or `Option<Arc<T>>`.
+///
+/// Sealed. `P::clone` runs inside a slot's read lock, so `P` must be a pointer
+/// whose clone is one atomic increment, never a deep copy.
+pub trait SwapPointer: Clone + sealed::Sealed {}
+impl<T: ?Sized> SwapPointer for Arc<T> {}
+impl<T: ?Sized> SwapPointer for Option<Arc<T>> {}
+
 /// A thread-safe cell holding a cheaply-clonable pointer `P` (`Arc<T>` or
 /// `Option<Arc<T>>`). Reads clone the pointer; publishes never wait on a
-/// reader. See the [module docs](self).
+/// reader, and a load only ever returns a value stored into *this* cell. See
+/// the [module docs](self).
 ///
-/// Crate-private: `P::clone` runs inside a slot's read lock, so `P` must be a
-/// pointer whose clone is one atomic increment (never a deep copy).
-pub(crate) struct SwapCell<P> {
+/// This is the process-wide replacement for `arc_swap::ArcSwap{,Option}`
+/// (#133, #134; ADR-T002 addendum). Typical shapes:
+///
+/// ```
+/// use std::sync::Arc;
+/// use multiview_framestore::SwapCell;
+///
+/// let cell = SwapCell::new(Arc::new(1_u32));
+/// cell.store(Arc::new(2));
+/// assert_eq!(*cell.load(), 2);
+/// assert_eq!(*cell.rcu(|n| **n + 1), 2);
+/// assert_eq!(*cell.load(), 3);
+///
+/// let maybe: SwapCell<Option<Arc<String>>> = SwapCell::empty();
+/// assert!(maybe.load().is_none());
+/// maybe.store(Some(Arc::new("x".to_owned())));
+/// assert_eq!(maybe.load().as_deref().map(String::as_str), Some("x"));
+/// ```
+pub struct SwapCell<P> {
     /// `generation << 16 | slot index` of the current value.
     head: AtomicU64,
     /// The previous `head`, kept readable for one more publish and then
@@ -492,9 +528,10 @@ impl<P> SwapCell<P> {
     }
 }
 
-impl<P: Clone> SwapCell<P> {
+impl<P: SwapPointer> SwapCell<P> {
     /// Create a cell holding `value`.
-    pub(crate) fn new(value: P) -> Self {
+    #[must_use]
+    pub fn new(value: P) -> Self {
         let first = Segment::new();
         if let Some(slot) = first.slots.first() {
             *slot.entry.write().unwrap_or_else(PoisonError::into_inner) = Entry {
@@ -516,7 +553,8 @@ impl<P: Clone> SwapCell<P> {
     /// publisher: it retries only if `head` moved during the attempt
     /// (lock-free; see the module docs). The only critical section is the
     /// pointer clone.
-    pub(crate) fn load(&self) -> P {
+    #[must_use]
+    pub fn load(&self) -> P {
         loop {
             let head = self.head.load(Ordering::Acquire);
             if let Some(value) = self.read_tagged(head) {
@@ -530,7 +568,8 @@ impl<P: Clone> SwapCell<P> {
     /// Atomically replace the current value with `value` and return exactly
     /// the value it replaced. Retries (never waits) if another publisher got
     /// in first.
-    pub(crate) fn swap(&self, value: P) -> P {
+    #[allow(clippy::needless_pass_by_value)] // reason: the cell takes ownership of `value` (cloned per retry, then stored), like `ArcSwap::swap`.
+    pub fn swap(&self, value: P) -> P {
         loop {
             let head = self.head.load(Ordering::Acquire);
             let Some(current) = self.read_tagged(head) else {
@@ -545,20 +584,53 @@ impl<P: Clone> SwapCell<P> {
 
     /// Make `value` the current value. Never waits on a reader; the replaced
     /// value is dropped outside any lock.
-    pub(crate) fn store(&self, value: P) {
+    pub fn store(&self, value: P) {
         // `install` only fails if every one of the 65 535 addressable slots is
         // pinned at once (more threads than the OS allows).
         let _installed = self.install(value, None);
     }
 }
 
+impl<T> SwapCell<Option<Arc<T>>> {
+    /// An empty cell (`None`), the `ArcSwapOption::empty()` equivalent.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(None)
+    }
+
+    /// A cell holding `Some(Arc::new(value))`, the
+    /// `ArcSwapOption::from_pointee` equivalent.
+    #[must_use]
+    pub fn from_some(value: T) -> Self {
+        Self::new(Some(Arc::new(value)))
+    }
+}
+
+impl<T: Default> Default for SwapCell<Arc<T>> {
+    fn default() -> Self {
+        Self::new(Arc::new(T::default()))
+    }
+}
+
+impl<T> Default for SwapCell<Option<Arc<T>>> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl<T> SwapCell<Arc<T>> {
+    /// Create a cell holding `Arc::new(value)`.
+    #[must_use]
+    pub fn from_pointee(value: T) -> Self {
+        Self::new(Arc::new(value))
+    }
+
     /// Read-copy-update: compute `f(&current)` **outside** any lock, then
     /// install it only if `current` is still the head. Retry if another
-    /// publisher got in first. With a single publisher (the
-    /// [`TileStore`](crate::TileStore) contract) this always succeeds on the
-    /// first pass. Returns the value that was replaced.
-    pub(crate) fn rcu<F>(&self, mut f: F) -> Arc<T>
+    /// publisher got in first, so `f` may run more than once. With a single
+    /// publisher (the [`TileStore`](crate::TileStore) contract) this always
+    /// succeeds on the first pass. Returns the value that was replaced.
+    pub fn rcu<F>(&self, mut f: F) -> Arc<T>
     where
         F: FnMut(&Arc<T>) -> T,
     {

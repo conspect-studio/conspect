@@ -16,7 +16,7 @@
 //! # Never off air (invariant #1 / #10)
 //!
 //! Everything here is **data the engine samples**, never control flow on the tick
-//! path. The [`WatermarkSignal`] is an `arc_swap`'d [`EnforcementLevel`] read with
+//! path. The [`WatermarkSignal`] is a `SwapCell`-held [`EnforcementLevel`] read with
 //! a single wait-free load — no lock, no allocation, no `.await` — so the overlay
 //! bake's per-frame watermark decision cannot pace or stall the output clock. The
 //! signal is updated **off-thread** (a background poll of the lease store), never
@@ -25,7 +25,6 @@
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 #[cfg(feature = "heartbeat")]
 use multiview_licence::heartbeat::{DeviceIdentity, HeartbeatClient, HeartbeatConfig};
 use multiview_licence::verify::PinnedKey;
@@ -49,7 +48,7 @@ pub const LEASE_DIR_ENV: &str = "MULTIVIEW_LICENCE_DIR";
 /// The wait-free **tile-watermark signal** the overlay bake samples each frame
 /// (Conspect S3, ADR-0050 §5).
 ///
-/// It holds an `arc_swap`'d [`EnforcementLevel`] — the single published ladder
+/// It holds a `SwapCell`-held [`EnforcementLevel`] — the single published ladder
 /// level. The bake reads [`WatermarkSignal::watermark`] with one lock-free load
 /// (no lock, no allocation), so the per-frame watermark decision is O(1) and
 /// cannot stall the output clock (invariant #1). The level is updated off-thread
@@ -57,9 +56,9 @@ pub const LEASE_DIR_ENV: &str = "MULTIVIEW_LICENCE_DIR";
 /// the hot loop.
 #[derive(Clone)]
 pub struct WatermarkSignal {
-    /// The published ladder level. `arc_swap` gives a wait-free latest-value read
+    /// The published ladder level. `SwapCell` gives a wait-free latest-value read
     /// + an off-thread atomic store (ADR-I001 isolation primitive).
-    level: Arc<ArcSwap<EnforcementLevel>>,
+    level: Arc<multiview_framestore::SwapCell<Arc<EnforcementLevel>>>,
 }
 
 impl WatermarkSignal {
@@ -75,7 +74,7 @@ impl WatermarkSignal {
     #[must_use]
     pub fn at(level: EnforcementLevel) -> Self {
         Self {
-            level: Arc::new(ArcSwap::from_pointee(level)),
+            level: Arc::new(multiview_framestore::SwapCell::from_pointee(level)),
         }
     }
 
@@ -87,7 +86,7 @@ impl WatermarkSignal {
     /// The currently-published ladder level (a wait-free load).
     #[must_use]
     pub fn level(&self) -> EnforcementLevel {
-        **self.level.load()
+        *self.level.load()
     }
 
     /// Whether the bake should stamp the corner watermark this frame — a single

@@ -112,7 +112,7 @@ pub mod node;
 /// rejection path and a `display-kms` build tests the acceptance path.
 pub mod outputs;
 /// The live adaptive-placement execution loop (GPU-5c): the off-hot-path
-/// `LoadPoller → arc_swap` poll + `PlacementController` observe/dispatch loop
+/// `LoadPoller → SwapCell` poll + `PlacementController` observe/dispatch loop
 /// that activates GPU-5b's inert controller, records the placement counters,
 /// emits `ShedLoad`, and drives the engine make-before-break crosspoint.
 pub mod placement;

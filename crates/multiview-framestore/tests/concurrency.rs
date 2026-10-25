@@ -283,3 +283,87 @@ fn load_never_returns_a_value_published_into_another_slot() {
     assert_eq!(a.load().map(|v| (v.owner, v.counter)), Some((0, PUBLISHES)));
     assert_eq!(b.load().map(|v| (v.owner, v.counter)), Some((1, PUBLISHES)));
 }
+
+/// Publishes into the typed cross-instance test's cell `a` (`STORES`).
+const TYPED_STORES: u64 = 500_000;
+/// Cell `a`'s per-instance checksum key: every value `a` stores is
+/// `(n, n ^ TAG_A)`. Cell `b` stores `[0xFF; 16]`, which reads back through
+/// `a`'s type as `(u64::MAX, u64::MAX)` and fails the checksum (`MAX ^ TAG_A !=
+/// MAX`) and the range. Relative checks alone (`v.0 == v.1`, monotonic) would
+/// pass it (#134 review).
+const TAG_A: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+
+/// What a reader of cell `a` may legally observe: `a`'s seed `(0, TAG_A)` or
+/// a value `a` stored, never older than `prev`.
+fn check_typed_a(v: (u64, u64), prev: u64) -> Result<u64, String> {
+    if v.1 != v.0 ^ TAG_A {
+        return Err(format!(
+            "cell `a` returned a foreign value {v:x?} (checksum)"
+        ));
+    }
+    if v.0 > TYPED_STORES {
+        return Err(format!("cell `a` returned a foreign value {v:x?} (range)"));
+    }
+    if v.0 < prev {
+        return Err(format!("value regressed: {} < {prev}", v.0));
+    }
+    Ok(v.0)
+}
+
+/// `b`'s payload as `a`'s reader would see it under type confusion.
+fn b_as_a(bytes: [u8; 16]) -> (u64, u64) {
+    let (lo, hi) = bytes.split_at(8);
+    (
+        u64::from_ne_bytes(lo.try_into().unwrap()),
+        u64::from_ne_bytes(hi.try_into().unwrap()),
+    )
+}
+
+#[test]
+fn typed_validator_rejects_cell_b_payload_reinterpreted_as_a() {
+    let foreign = b_as_a([0xFF; 16]);
+    assert_eq!(foreign, (u64::MAX, u64::MAX));
+    // The old assertions (`v.0 == v.1`, `v.0 >= prev`) accepted it.
+    assert!(foreign.0 == foreign.1 && foreign.0 >= TYPED_STORES);
+    for prev in [0, 1, TYPED_STORES] {
+        assert!(check_typed_a(foreign, prev).is_err());
+    }
+    // And `a`'s own values are accepted.
+    assert_eq!(check_typed_a((0, TAG_A), 0), Ok(0));
+    assert_eq!(check_typed_a((7, 7 ^ TAG_A), 3), Ok(7));
+    assert!(check_typed_a((3, 3 ^ TAG_A), 7).is_err(), "regression");
+}
+
+#[test]
+fn swap_cell_never_returns_a_value_stored_into_another_cell_of_another_type() {
+    // #134: the public `SwapCell` replaces arc-swap for every slot in the
+    // process (the cli's `Arc<SwapCell<..>>` aliases included). Two cells of
+    // DIFFERENT payload types but the same allocation size, stored in
+    // lock-step: under arc-swap's process-global debt list a load on `a`
+    // could return `b`'s `Arc` (type confusion). `a` must only ever return
+    // its own values (see `check_typed_a`).
+    use multiview_framestore::SwapCell;
+    let a: Arc<SwapCell<Arc<(u64, u64)>>> = Arc::new(SwapCell::from_pointee((0, TAG_A)));
+    let b: Arc<SwapCell<Arc<[u8; 16]>>> = Arc::new(SwapCell::from_pointee([0xFF; 16]));
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (a, done) = (Arc::clone(&a), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut prev = 0;
+                while !done.load(Ordering::Acquire) {
+                    prev = check_typed_a(*a.load(), prev).unwrap_or_else(|e| panic!("{e}"));
+                }
+            })
+        })
+        .collect();
+    for n in 1..=TYPED_STORES {
+        a.store(Arc::new((n, n ^ TAG_A)));
+        b.store(Arc::new([0xFF; 16]));
+    }
+    done.store(true, Ordering::Release);
+    for r in readers {
+        r.join().expect("reader thread panicked");
+    }
+    assert_eq!(*a.load(), (TYPED_STORES, TYPED_STORES ^ TAG_A));
+}

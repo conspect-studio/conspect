@@ -50,12 +50,12 @@ pub const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 /// The shared run-anchor slot: the run path stores an
 /// [`EpochAnchor`] (tick-0 seed + the run's monotonic source) when the output
 /// clock seeds; the timing task picks it up lazily with a lock-free load.
-pub type EpochAnchorSlot = Arc<arc_swap::ArcSwapOption<EpochAnchor>>;
+pub type EpochAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<EpochAnchor>>>>;
 
 /// An empty anchor slot (no run seeded yet).
 #[must_use]
 pub fn anchor_slot() -> EpochAnchorSlot {
-    Arc::new(arc_swap::ArcSwapOption::empty())
+    Arc::new(multiview_framestore::SwapCell::empty())
 }
 
 /// The per-deployment knobs the spawned task publishes with.
@@ -175,7 +175,7 @@ async fn run(
         // Lazily bind to the run's anchor once the clock has seeded. A run
         // that never seeds (startup failure) publishes nothing — honest.
         if sampler.is_none() {
-            if let Some(a) = anchor.load_full() {
+            if let Some(a) = anchor.load() {
                 let mut s = EpochSampler::new(
                     a.seed_nanos(),
                     SystemWallSampler::new(a.time()),
@@ -272,7 +272,7 @@ impl PtpLeg {
     /// Take one PHC reading at the run's monotonic "now" (staleness/holdover
     /// fire through the tracker when the read fails).
     fn sample(&mut self, anchor: &EpochAnchorSlot) {
-        if let (Some(sampler), Some(a)) = (self.sampler.as_mut(), anchor.load_full()) {
+        if let (Some(sampler), Some(a)) = (self.sampler.as_mut(), anchor.load()) {
             let now_ns = a.time().now_nanos();
             let _status = sampler.sample_once(now_ns);
         }

@@ -97,14 +97,17 @@ exceptions = [
 ]
 
 [bans]
-# arc-swap (all versions through 1.9.3): its default hybrid strategy can make
-# `load`/`load_full` on one instance return an `Arc` that was stored into
-# ANOTHER instance (process-global debt list keyed by raw address; upstream
-# https://github.com/vorner/arc-swap/issues/210, open, no RustSec advisory
-# yet). `multiview-framestore` (the invariant-#2 slot) no longer uses it (#133,
-# ADR-T002 addendum). Remaining users are listed in that addendum. New uses on
-# the data plane must not use `DefaultStrategy`.
 multiple-versions = "warn"
+# arc-swap is banned outright, transitive users included (#134). Its default
+# hybrid strategy can make `load`/`load_full` on one instance return an `Arc`
+# that was stored into ANOTHER instance (process-global debt list keyed by raw
+# address): upstream https://github.com/vorner/arc-swap/issues/210, open, no
+# RustSec advisory yet. With a different `T` that is type confusion. Use
+# `multiview_framestore::SwapCell` instead (ADR-T002 addendum). Lift this only
+# once #210 is fixed upstream and the fix is reviewed.
+deny = [
+  { crate = "arc-swap", reason = "vorner/arc-swap#210: a load can return an Arc stored into a different instance; use multiview_framestore::SwapCell (#133, #134)" },
+]
 # Deny real `version = "*"` wildcards on registry crates, but exempt
 # intra-workspace `path` dependencies: the `multiview-*` crates depend on each
 # other by path and carry no version requirement (which cargo-deny otherwise

@@ -9,7 +9,7 @@
 //!    [`LoadSource`](multiview_hal::LoadSource) (the NVML poller when `cuda` is
 //!    on, else the no-GPU source) and publishes it into the engine's wait-free
 //!    [`LoadSnapshot`](multiview_engine::LoadSnapshot) (the `LoadPoller →
-//!    arc_swap` seam, ADR-0017 §2);
+//!    SwapCell` seam, ADR-0017 §2);
 //! 2. drives the [`PlacementCoordinator`](multiview_engine::PlacementCoordinator)
 //!    one **control** tick — `observe(snapshot)` → dispatch — recording every
 //!    decision in the [`PlacementCounters`](multiview_telemetry::PlacementCounters);
@@ -340,7 +340,7 @@ async fn run(
             return;
         }
         // 1. Poll the per-GPU load off the hot path and publish it wait-free
-        //    (the LoadPoller → arc_swap seam). A slow/absent poller never stalls
+        //    (the LoadPoller → SwapCell seam). A slow/absent poller never stalls
         //    the engine — the reader just sees the last snapshot (inv #10).
         snapshot.publish(load_source.poll());
 

@@ -26,9 +26,13 @@
 //! evicted span and then catches the live tail.
 //!
 //! ## Lock-free
-//! The sample window lives behind an [`arc_swap::ArcSwap`] snapshot — the same
-//! primitive the video tile store uses. The reader loads an immutable snapshot
-//! wait-free; the writer builds the next snapshot and swaps it in. There is no
+//! The sample window lives behind a [`multiview_framestore::SwapCell`] snapshot —
+//! the same primitive the video tile store uses. The reader loads an immutable
+//! snapshot without ever blocking; the writer builds the next snapshot and swaps
+//! it in, and **never waits on a reader**, even one descheduled mid-read
+//! (invariants #1/#10). A load only ever returns a window published into *this*
+//! store. arc-swap was dropped here for vorner/arc-swap#210, which could hand one
+//! store's reader another store's window (#134, ADR-T002 addendum). There is no
 //! `unsafe` (this crate is `unsafe_code = forbid`) and no mutex on the read path.
 //!
 //! The read cursor is a single [`AtomicI64`]: the store is a single-producer /
@@ -38,7 +42,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwap;
+use multiview_framestore::SwapCell;
 
 use crate::error::{AudioError, Result};
 use crate::format::{AudioBlock, AudioFormat};
@@ -46,7 +50,7 @@ use crate::format::{AudioBlock, AudioFormat};
 /// The number of preallocated snapshot buffers the [`AudioStore::publish_window`]
 /// **replace** path rotates through — the audio analogue of the video tile store's
 /// triple-buffer (invariant #2). Three is the classic count for a single-producer /
-/// single-consumer hand-off: at any instant the `ArcSwap` slot holds one and the
+/// single-consumer hand-off: at any instant the `SwapCell` slot holds one and the
 /// reader may hold one in-flight clone, so a third is always free for the writer to
 /// fill in place (reused via `Arc::get_mut`, never reallocated on the steady path —
 /// rule 22 / ADR-T019 §2.2).
@@ -140,7 +144,7 @@ pub struct AudioStore {
     /// Maximum number of frames retained in the ring (drop-oldest beyond this).
     capacity_frames: usize,
     /// The current immutable sample window. Swapped wholesale on each publish.
-    window: ArcSwap<RingSnapshot>,
+    window: SwapCell<Arc<RingSnapshot>>,
     /// The consumer's absolute read cursor (next frame to be read). Only the
     /// single consumer advances it.
     read_frame: AtomicI64,
@@ -148,7 +152,7 @@ pub struct AudioStore {
     /// [`AudioStore::publish_window`] **replace** path (ADR-T019 §2.2). Guarded by
     /// a `Mutex` that is **uncontended in normal use** — only the single producer
     /// thread calls `publish_window`, and the wait-free reader never touches it (it
-    /// reads `window` via `ArcSwap`). The lock just makes the single-writer reuse
+    /// reads `window` via `SwapCell`). The lock just makes the single-writer reuse
     /// of the pooled `Arc`s sound without `unsafe`. `None` until first use (the
     /// append-only `publish`/`publish_at` paths never allocate it).
     window_pool: Mutex<WindowPool>,
@@ -224,7 +228,7 @@ impl AudioStore {
         Self {
             format,
             capacity_frames: capacity_frames.max(1),
-            window: ArcSwap::from_pointee(RingSnapshot {
+            window: SwapCell::from_pointee(RingSnapshot {
                 base_frame: 0,
                 samples: Vec::new(),
             }),

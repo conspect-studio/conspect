@@ -1,7 +1,7 @@
 //! The wait-free convenience flags the engine seams derive from a single
 //! published [`EnforcementLevel`] (Conspect S1/S3, ADR-0050 §3/§5/§6).
 //!
-//! The cli publishes ONE `EnforcementLevel` (arc-swapped) and the engine seams
+//! The cli publishes ONE `EnforcementLevel` (in a `SwapCell`) and the engine seams
 //! read exactly two cheap booleans off it: `watermark()` (S3) and
 //! `blocks_new_instances()` (S1). These tests pin the level→flag mapping so the
 //! engine surface stays "two booleans derived from data" and every level still
