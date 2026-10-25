@@ -589,8 +589,9 @@ async fn indexed_convergence_applies_the_grounded_index_scoped_switch() {
         ),
     );
     // 0) the grounded workmode read: the device is already a decoder.
-    transport.push(
-        "workmode",
+    transport.push_opt(
+        "system",
+        "get_workmode_id",
         ScriptedReply::json(
             json!({ "rsp": "succeed", "status": "00000", "data": { "workmode_id": 1 } }),
         ),
@@ -707,12 +708,13 @@ async fn adopted_encoder(transport: &ScriptedTransport) -> ZowietekDriver<Script
 async fn indexed_convergence_changes_workmode_before_activating_the_slot() {
     let transport = ScriptedTransport::new();
     // get_workmode_id → encoder, change_workmode ack, get_workmode_id → decoder.
-    transport.push("workmode", workmode_id_reply(0));
-    transport.push(
-        "workmode",
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt(
+        "system",
+        "change_workmode",
         ScriptedReply::json(json!({"rsp":"succeed","status":"00000"})),
     );
-    transport.push("workmode", workmode_id_reply(1));
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
     transport.push("streamplay", spare_table_reply());
     transport.push(
         "streamplay",
@@ -726,7 +728,7 @@ async fn indexed_convergence_changes_workmode_before_activating_the_slot() {
         .expect("encoder -> decoder converges");
 
     assert_eq!(
-        transport.request_count("workmode"),
+        workmode_wire_count(&transport),
         3,
         "read, change, re-read"
     );
@@ -744,7 +746,7 @@ async fn indexed_convergence_changes_workmode_before_activating_the_slot() {
 #[tokio::test]
 async fn indexed_convergence_skips_the_workmode_change_when_already_decoder() {
     let transport = ScriptedTransport::new();
-    transport.push("workmode", workmode_id_reply(1));
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
     transport.push("streamplay", spare_table_reply());
     transport.push(
         "streamplay",
@@ -758,7 +760,7 @@ async fn indexed_convergence_skips_the_workmode_change_when_already_decoder() {
         .expect("already decoder converges");
 
     assert_eq!(
-        transport.request_count("workmode"),
+        workmode_wire_count(&transport),
         1,
         "only the get_workmode_id read; no change_workmode"
     );
@@ -767,12 +769,13 @@ async fn indexed_convergence_skips_the_workmode_change_when_already_decoder() {
 #[tokio::test]
 async fn an_unreflected_change_workmode_fails_without_caching_decoder() {
     let transport = ScriptedTransport::new();
-    transport.push("workmode", workmode_id_reply(0));
-    transport.push(
-        "workmode",
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt(
+        "system",
+        "change_workmode",
         ScriptedReply::json(json!({"rsp":"succeed","status":"00000"})),
     );
-    transport.push("workmode", workmode_id_reply(0)); // ack'd but still encoder
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0)); // ack'd but still encoder
     transport.push("streamplay", spare_table_reply());
     let driver = adopted_encoder(&transport).await;
 
@@ -859,7 +862,7 @@ fn ack() -> ScriptedReply {
 #[tokio::test]
 async fn absent_index_in_encoder_mode_refuses_with_zero_mutating_calls() {
     let transport = ScriptedTransport::new();
-    transport.push("workmode", workmode_id_reply(0));
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
     transport.push("streamplay", spare_table_reply()); // has 2 and 3, not 99
     let driver = adopted_encoder(&transport)
         .await
@@ -891,7 +894,7 @@ async fn absent_index_in_encoder_mode_refuses_with_zero_mutating_calls() {
 #[tokio::test]
 async fn unreadable_table_in_encoder_mode_refuses_without_change_workmode() {
     let transport = ScriptedTransport::new();
-    transport.push("workmode", workmode_id_reply(0));
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
     transport.push("streamplay", ScriptedReply::empty_body()); // encoder: no table
     let driver = adopted_encoder(&transport).await;
 
@@ -912,9 +915,9 @@ async fn unreadable_table_in_encoder_mode_refuses_without_change_workmode() {
 #[tokio::test]
 async fn happy_path_validates_then_changes_workmode_then_confirms_then_switches() {
     let transport = ScriptedTransport::new();
-    transport.push("workmode", workmode_id_reply(0));
-    transport.push("workmode", ack());
-    transport.push("workmode", workmode_id_reply(1));
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("system", "change_workmode", ack());
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
     transport.push("streamplay", spare_table_reply());
     transport.push("streamplay", ack());
     let driver = adopted_encoder(&transport).await;
@@ -967,7 +970,7 @@ async fn no_refusal_variant_ever_sends_a_mutating_opt() {
         ];
         for (label, index, table) in cases {
             let transport = ScriptedTransport::new();
-            transport.push("workmode", workmode_id_reply(mode));
+            transport.push_opt("system", "get_workmode_id", workmode_id_reply(mode));
             if let Some(t) = table {
                 transport.push("streamplay", t);
             }
@@ -1104,9 +1107,9 @@ async fn every_indexed_refusal_publishes_a_failed_outcome_with_the_typed_reason(
 async fn an_unreflected_workmode_change_publishes_a_failed_outcome_with_the_reason() {
     use multiview_events::ModePhase;
     let transport = ScriptedTransport::new();
-    transport.push("workmode", workmode_id_reply(0));
-    transport.push("workmode", ack());
-    transport.push("workmode", workmode_id_reply(0));
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("system", "change_workmode", ack());
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
     transport.push("streamplay", spare_table_reply());
     let (driver, mut sub) = adopted_with_events(&transport, Some(3)).await;
     driver.converge_indexed().await.expect_err("must fail");
@@ -1129,7 +1132,7 @@ async fn an_unreflected_workmode_change_publishes_a_failed_outcome_with_the_reas
 async fn a_failed_slot_switch_publishes_exactly_one_failed_outcome() {
     use multiview_events::ModePhase;
     let transport = ScriptedTransport::new();
-    transport.push("workmode", workmode_id_reply(1));
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
     transport.push("streamplay", spare_table_reply());
     transport.push(
         "streamplay",
@@ -1142,4 +1145,127 @@ async fn a_failed_slot_switch_publishes_exactly_one_failed_outcome() {
         .filter(|m| m.phase == ModePhase::Failed)
         .count();
     assert_eq!(failed, 1);
+}
+
+// ---- Round 4 (#55): the COMPLETE outgoing wire shape of every grounded opt ---
+
+/// How many requests the grounded workmode group (`/system`, group
+/// `workmode`) received.
+fn workmode_wire_count(transport: &ScriptedTransport) -> usize {
+    transport
+        .wire()
+        .iter()
+        .filter(|(path, body)| path == "/system" && body["group"] == "workmode")
+        .count()
+}
+
+/// The grounding table (aperim/multiview#140), verbatim: endpoint path and the
+/// full JSON body for every opt the convergence driver sends.
+fn grounded_wire_table() -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    vec![
+        (
+            "get_workmode_id",
+            "/system",
+            json!({"group":"workmode","opt":"get_workmode_id","data":null}),
+        ),
+        (
+            "change_workmode",
+            "/system",
+            json!({"group":"workmode","opt":"change_workmode","data":{"workmode_id":1}}),
+        ),
+        (
+            "streamplay_get_all",
+            "/streamplay",
+            json!({"group":"streamplay","opt":"streamplay_get_all","data":null}),
+        ),
+        (
+            "streamplay_switch",
+            "/streamplay",
+            json!({"group":"streamplay","opt":"streamplay_switch","data":{"index":3,"switch":1}}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_grounded_opt_goes_out_with_its_exact_path_and_body() {
+    // encoder -> decoder: read, validate table, change, confirm, switch.
+    let transport = ScriptedTransport::new();
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(0));
+    transport.push_opt("system", "change_workmode", ack());
+    transport.push_opt("system", "get_workmode_id", workmode_id_reply(1));
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    transport.push_opt("streamplay", "streamplay_switch", ack());
+    let driver = adopted_encoder(&transport).await;
+    let skip = transport.wire().len();
+
+    driver.converge_indexed().await.expect("converges");
+
+    let table = grounded_wire_table();
+    let expect = |opt: &str| {
+        let (_, path, body) = table.iter().find(|(o, _, _)| *o == opt).unwrap();
+        ((*path).to_owned(), body.clone())
+    };
+    assert_eq!(
+        transport.wire()[skip..].to_vec(),
+        vec![
+            expect("streamplay_get_all"),
+            expect("get_workmode_id"),
+            expect("change_workmode"),
+            expect("get_workmode_id"),
+            expect("streamplay_switch"),
+        ],
+        "the complete outgoing wire (path + full body) matches the grounding"
+    );
+}
+
+#[tokio::test]
+async fn output_target_enumeration_sends_the_grounded_streamplay_get_all() {
+    let transport = ScriptedTransport::new();
+    transport.push_opt("streamplay", "streamplay_get_all", spare_table_reply());
+    let driver = adopted_encoder(&transport).await;
+    let skip = transport.wire().len();
+
+    let targets = driver.enumerate_output_targets().await.expect("enumerates");
+
+    assert_eq!(targets.len(), 2, "both grounded rows become targets");
+    assert_eq!(
+        transport.wire()[skip..].to_vec(),
+        vec![(
+            "/streamplay".to_owned(),
+            json!({"group":"streamplay","opt":"streamplay_get_all","data":null})
+        )]
+    );
+}
+
+#[test]
+fn the_protocol_models_render_exactly_the_grounding_table() {
+    use multiview_control::devices::zowietek::protocol::{
+        ChangeWorkmode, NullDataCall, StreamplaySwitch,
+    };
+    use multiview_control::devices::zowietek::WorkMode;
+    let table = grounded_wire_table();
+    let render = |opt: &str| -> (String, serde_json::Value) {
+        match opt {
+            "get_workmode_id" => (
+                format!("/{}", NullDataCall::GetWorkmodeId.module()),
+                NullDataCall::GetWorkmodeId.body(),
+            ),
+            "streamplay_get_all" => (
+                format!("/{}", NullDataCall::StreamplayGetAll.module()),
+                NullDataCall::StreamplayGetAll.body(),
+            ),
+            "change_workmode" => (
+                format!("/{}", ChangeWorkmode::MODULE),
+                ChangeWorkmode::to(WorkMode::Decoder).body(),
+            ),
+            "streamplay_switch" => (
+                format!("/{}", StreamplaySwitch::MODULE),
+                StreamplaySwitch::activate(3).body(),
+            ),
+            other => panic!("unmodelled opt {other}"),
+        }
+    };
+    for (opt, path, body) in &table {
+        assert_eq!(render(opt), ((*path).to_owned(), body.clone()), "{opt}");
+    }
 }

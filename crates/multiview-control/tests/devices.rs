@@ -798,7 +798,7 @@ mod plan_take {
         t.push("system", ok(&json!({ "uuid": "u", "type": 0 })));
         t.push("venc", ok(&json!({ "workmode": "encoder" })));
         // Convergence: get_workmode_id (already decoder), table, switch ack.
-        t.push("workmode", ok(&json!({ "workmode_id": 1 })));
+        t.push_opt("system", "get_workmode_id", ok(&json!({ "workmode_id": 1 })));
         t.push(
             "streamplay",
             ok(&json!([
