@@ -79,6 +79,49 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock, TryLockError};
 
+/// Test-only injection points that let a test park a publisher at an exact
+/// step (see `chaos::readers_never_wait_on_a_publisher_parked_in_a_slot_lock`).
+#[cfg(test)]
+mod hook {
+    use std::cell::RefCell;
+
+    /// Where the current publisher is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Point {
+        /// `claim` has read `head` and not yet locked any slot.
+        HeadSnapshot,
+        /// `claim` holds the write lock of slot `.0`.
+        SlotLocked(u16),
+    }
+
+    type Hook = Box<dyn FnMut(Point)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Install `f` for publishes made by the calling thread.
+    pub(super) fn set(f: impl FnMut(Point) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn fire(point: Point) {
+        HOOK.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f(point);
+            }
+        });
+    }
+}
+
+/// Fire a test hook (compiled out of non-test builds).
+macro_rules! test_hook {
+    ($point:expr) => {
+        #[cfg(test)]
+        hook::fire($point);
+    };
+}
+
 /// Slots per segment.
 const SEGMENT: u16 = 8;
 /// [`SEGMENT`] as an array length.
@@ -232,6 +275,7 @@ impl<P> SwapCell<P> {
     /// 65 535 addressable slots are pinned at once.
     fn claim(&self, generation: u64, value: P) -> Option<u16> {
         let head_idx = idx_of(self.head.load(Ordering::Acquire));
+        test_hook!(hook::Point::HeadSnapshot);
         let mut value = Some(value);
         let mut count = self.slot_count();
         // First pass: every allocated slot, round-robin from just after the
@@ -269,6 +313,7 @@ impl<P> SwapCell<P> {
             let Some(mut guard) = try_write(slot) else {
                 continue;
             };
+            test_hook!(hook::Point::SlotLocked(idx));
             // Re-check under the lock: only an entry strictly older than the
             // current head may be replaced, so the head's entry (and any newer,
             // not-yet-installed one) is never overwritten, even with concurrent
@@ -455,9 +500,9 @@ mod chaos {
     //! Round-2 #133 chaos test (invariants #1 / #10): a reader that is
     //! descheduled while inside its read critical section must not delay the
     //! publisher by even one tick.
-    use super::{gen_of, SwapCell};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
+    use super::{gen_of, hook, idx_of, SwapCell};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -605,5 +650,152 @@ mod chaos {
             "the last-generation publish is some publisher's final value"
         );
         assert_eq!(gen_of(head) + 1, cell.next_gen.load(Ordering::Acquire));
+    }
+
+    /// Per-load latency budget while a publisher is parked: below one output
+    /// tick (16.7 ms at 60 fps), with headroom for a loaded CI host.
+    const LOAD_BUDGET: Duration = Duration::from_millis(10);
+
+    type Tagged = Arc<SwapCell<Arc<(u8, u64)>>>;
+
+    /// A reader that loads in a loop until `stop`, asserting every value is
+    /// B's (publisher 2) and never regresses. Sends its first value on
+    /// `first`, returns (worst load latency, loads, last value).
+    fn spawn_checked_reader(
+        cell: &Tagged,
+        stop: &Arc<AtomicBool>,
+        first: mpsc::Sender<u64>,
+    ) -> thread::JoinHandle<(Duration, u64, u64)> {
+        let cell = Arc::clone(cell);
+        let stop = Arc::clone(stop);
+        thread::spawn(move || {
+            let mut worst = Duration::ZERO;
+            let mut last = 0u64;
+            let mut loads = 0u64;
+            loop {
+                let t = Instant::now();
+                let v = cell.load();
+                worst = worst.max(t.elapsed());
+                let (who, n) = *v;
+                assert_eq!(who, 2, "only B's values are installed, got {v:?}");
+                assert!(n >= last, "regressed: {n} < {last}");
+                last = n;
+                if loads == 0 {
+                    first.send(n).unwrap();
+                }
+                loads += 1;
+                if stop.load(Ordering::Acquire) {
+                    return (worst, loads, last);
+                }
+            }
+        })
+    }
+
+    /// Round-3 #133 finding (reviewer interleaving), made deterministic with
+    /// the test hooks: publisher A snapshots `head` (slot 0) in `claim` and
+    /// pauses; publisher B publishes (into slot 1, which becomes the head); A
+    /// resumes, takes a slot's write lock and is parked there indefinitely.
+    /// Readers must keep returning at once: the newest installed value, never
+    /// a foreign one, never regressing, each load within [`LOAD_BUDGET`].
+    #[test]
+    fn readers_never_wait_on_a_publisher_parked_in_a_slot_lock() {
+        // Values are (publisher, n): 0 = initial, 1 = A, 2 = B.
+        let cell: Tagged = Arc::new(SwapCell::new(Arc::new((0, 0))));
+        let snapshotted = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let locked = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let a_locked_idx = Arc::new(Mutex::new(None::<u16>));
+
+        let a = {
+            let cell = Arc::clone(&cell);
+            let (snapshotted, resume) = (Arc::clone(&snapshotted), Arc::clone(&resume));
+            let (locked, release) = (Arc::clone(&locked), Arc::clone(&release));
+            let a_locked_idx = Arc::clone(&a_locked_idx);
+            thread::spawn(move || {
+                let mut paused = false;
+                let mut parked = false;
+                hook::set(move |point| match point {
+                    hook::Point::HeadSnapshot if !paused => {
+                        paused = true;
+                        snapshotted.wait();
+                        resume.wait();
+                    }
+                    hook::Point::SlotLocked(idx) if !parked => {
+                        parked = true;
+                        *a_locked_idx.lock().unwrap() = Some(idx);
+                        locked.wait();
+                        release.wait();
+                    }
+                    _ => {}
+                });
+                cell.store(Arc::new((1, 1)));
+            })
+        };
+
+        // A has read head = slot 0 and paused. B (this thread) publishes.
+        snapshotted.wait();
+        assert_eq!(idx_of(cell.head.load(Ordering::Acquire)), 0);
+        cell.store(Arc::new((2, 1)));
+        let b_head = cell.head.load(Ordering::Acquire);
+        resume.wait();
+        // A now holds some slot's write lock and is parked inside it.
+        locked.wait();
+        let a_idx = a_locked_idx.lock().unwrap().expect("A locked a slot");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (first_tx, first_rx) = mpsc::channel();
+        let readers: Vec<_> = (0..2)
+            .map(|_| spawn_checked_reader(&cell, &stop, first_tx.clone()))
+            .collect();
+        drop(first_tx);
+
+        // While A stays parked and B is idle, a load must still return.
+        let mut firsts = Vec::new();
+        for _ in 0..2 {
+            match first_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(n) => firsts.push(n),
+                Err(_) => break,
+            }
+        }
+        if firsts.len() < 2 {
+            // Unpark A so the stalled readers can finish, then fail.
+            release.wait();
+            stop.store(true, Ordering::Release);
+            panic!(
+                "a load blocked for 2 s behind publisher A parked in slot {a_idx} \
+                 (head slot {}): {}/2 readers returned",
+                idx_of(b_head),
+                firsts.len()
+            );
+        }
+        assert_eq!(firsts, vec![1, 1], "readers return B's (newest) value");
+        assert_ne!(
+            a_idx,
+            idx_of(cell.head.load(Ordering::Acquire)),
+            "a parked publisher must never hold the head slot's lock"
+        );
+
+        // B keeps publishing while A is still parked; readers follow it.
+        for n in 2..=1000 {
+            cell.store(Arc::new((2, n)));
+        }
+        assert_eq!(*cell.load(), (2, 1000));
+        stop.store(true, Ordering::Release);
+        for r in readers {
+            let (worst, loads, last) = r.join().expect("reader panicked");
+            assert!(loads > 0);
+            assert!(last <= 1000);
+            assert!(
+                worst < LOAD_BUDGET,
+                "a load took {worst:?} while A was parked (budget {LOAD_BUDGET:?})"
+            );
+        }
+
+        // A finishes. Its generation is older than all of B's, so B's newest
+        // value stays current.
+        release.wait();
+        a.join().expect("publisher A panicked");
+        assert_eq!(*cell.load(), (2, 1000));
     }
 }
