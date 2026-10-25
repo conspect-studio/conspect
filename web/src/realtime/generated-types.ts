@@ -146,9 +146,13 @@ export interface DeviceMode {
   readonly detail?: string;
   /** The registry device id converging. */
   readonly device_id: string;
+  /** On a failed phase: what had already changed on the device (unchanged = nothing changed; workmode_unconfirmed = a workmode change was sent but not confirmed; workmode_changed = the workmode was changed but a later step failed). */
+  readonly failure_stage?: "unchanged" | "workmode_unconfirmed" | "workmode_changed";
   readonly impact: ImpactClass;
   /** The target mode being converged to (driver vocabulary). */
   readonly mode: string;
+  /** The operation id (from the 202) of the set-mode this event is the outcome of, carried end-to-end; absent for convergences no operator request started. */
+  readonly operation_id?: string;
   /** Which convergence phase this event reports. */
   readonly phase: "started" | "finished" | "failed";
 }

@@ -1063,6 +1063,22 @@ pub enum ModePhase {
     Failed,
 }
 
+/// What a **failed** `device.mode` convergence had already changed on the
+/// device — the typed truth the UI/API reads instead of parsing `detail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FailureStage {
+    /// Refused or failed before any mutating call (or the failing step changed nothing): the device is unchanged.
+    Unchanged,
+    /// A workmode change was sent but not confirmed by the re-read: the
+    /// device's workmode is unknown, the decode slot was not touched.
+    WorkmodeUnconfirmed,
+    /// The workmode change was applied and confirmed, but a later step (slot
+    /// activation) failed: the device is left in the new workmode.
+    WorkmodeChanged,
+}
+
 /// The declared impact class of a management change (the instant-apply
 /// doctrine's legend, managed-devices.md §10). `#[non_exhaustive]` so further
 /// classes can be added without a breaking wire change.
@@ -1102,6 +1118,16 @@ pub struct DeviceMode {
     /// pre-apply, if the driver provides one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The operation id (from the `202`) of the `set-mode` this event is the
+    /// outcome of, carried end-to-end so correlation never depends on queue
+    /// order. Absent for convergences no operator request started (adopt,
+    /// reconnect) and for legacy callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    /// On a `failed` phase: what had already changed on the device. Absent on
+    /// other phases and for drivers that do not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<FailureStage>,
 }
 
 /// A driver-reported device error — the `data` body of `device.error`

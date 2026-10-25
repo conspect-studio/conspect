@@ -35,7 +35,7 @@ use multiview_config::DeviceDriver;
 use multiview_engine::EnginePublisher;
 use multiview_events::{
     CastSessionRemoved, CastSessionStarted, DeviceAdopted, DeviceError, DeviceMode, DeviceRemoved,
-    DeviceState, DeviceStatus, Event, ImpactClass, ModePhase,
+    DeviceState, DeviceStatus, Event, FailureStage, ImpactClass, ModePhase,
 };
 
 use super::registry::DeviceStatusRegistry;
@@ -115,23 +115,24 @@ impl DeviceBroadcaster {
 
     /// Publish `device.mode` with phase `Started` for a mode convergence whose
     /// device-side (DEV-class) impact was declared before apply (ADR-M009).
+    /// `op` is the operation id of the `set-mode` this is the outcome of.
     #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
-    pub fn mode_started(&self, device_id: &str, mode: &str) -> u64 {
-        self.publish_mode(device_id, mode, ModePhase::Started)
+    pub fn mode_started(&self, device_id: &str, mode: &str, op: Option<&str>) -> u64 {
+        self.publish_mode(device_id, mode, ModePhase::Started, op)
     }
 
     /// Publish `device.mode` with phase `Finished` once a convergence completed
     /// (the device reached the requested mode; ADR-M009).
     #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
-    pub fn mode_finished(&self, device_id: &str, mode: &str) -> u64 {
-        self.publish_mode(device_id, mode, ModePhase::Finished)
+    pub fn mode_finished(&self, device_id: &str, mode: &str, op: Option<&str>) -> u64 {
+        self.publish_mode(device_id, mode, ModePhase::Finished, op)
     }
 
     /// Publish `device.mode` with phase `Failed` when a convergence could not
     /// complete (the driver re-converges per its supervision policy; ADR-M009).
     #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
-    pub fn mode_failed(&self, device_id: &str, mode: &str) -> u64 {
-        self.publish_mode(device_id, mode, ModePhase::Failed)
+    pub fn mode_failed(&self, device_id: &str, mode: &str, op: Option<&str>) -> u64 {
+        self.publish_mode(device_id, mode, ModePhase::Failed, op)
     }
 
     /// Publish `device.mode` with phase `Started` for an **index-scoped**
@@ -139,36 +140,44 @@ impl DeviceBroadcaster {
     /// decoder's sole active decode, so this declares the Class-2
     /// controlled-reset impact before apply (issue #55 / inv #11).
     #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
-    pub fn mode_indexed_started(&self, device_id: &str, mode: &str, index: u32) -> u64 {
-        self.publish_indexed_mode(device_id, mode, index, ModePhase::Started)
+    pub fn mode_indexed_started(
+        &self,
+        device_id: &str,
+        mode: &str,
+        index: u32,
+        op: Option<&str>,
+    ) -> u64 {
+        self.publish_indexed_mode(device_id, mode, index, ModePhase::Started, op)
     }
 
     /// Publish `device.mode` with phase `Finished` once an index-scoped switch
     /// completed (the device's sole active decode is now `index`).
     #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
-    pub fn mode_indexed_finished(&self, device_id: &str, mode: &str, index: u32) -> u64 {
-        self.publish_indexed_mode(device_id, mode, index, ModePhase::Finished)
-    }
-
-    /// Publish `device.mode` with phase `Failed` when an index-scoped switch
-    /// could not complete (the driver re-converges per its supervision policy).
-    #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
-    pub fn mode_indexed_failed(&self, device_id: &str, mode: &str, index: u32) -> u64 {
-        self.publish_indexed_mode(device_id, mode, index, ModePhase::Failed)
+    pub fn mode_indexed_finished(
+        &self,
+        device_id: &str,
+        mode: &str,
+        index: u32,
+        op: Option<&str>,
+    ) -> u64 {
+        self.publish_indexed_mode(device_id, mode, index, ModePhase::Finished, op)
     }
 
     /// Publish `device.mode` Failed for an index-scoped convergence that was
-    /// refused or failed, carrying the typed `reason` after the declared impact
-    /// statement (issue #55 / inv #11: every accepted operation gets an
-    /// outcome). With a known spare `index` the impact is Class-2; with none
-    /// configured nothing was ever going to be touched, so it is DEV-class.
+    /// refused or failed (issue #55 / inv #11: every accepted operation gets an
+    /// outcome). `stage` states exactly what had already changed on the device
+    /// and the human detail says so; `reason` is the typed failure text. With a
+    /// known spare `index` the impact is Class-2; with none configured nothing
+    /// was ever going to be touched, so it is DEV-class.
     #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
-    pub fn mode_indexed_refused(
+    pub fn mode_indexed_failed(
         &self,
         device_id: &str,
         mode: &str,
         index: Option<u32>,
+        stage: FailureStage,
         reason: &str,
+        op: Option<&str>,
     ) -> u64 {
         let (impact, declared) = index.map_or_else(
             || (ImpactClass::Device, mode_impact_detail(device_id, mode)),
@@ -179,24 +188,40 @@ impl DeviceBroadcaster {
                 )
             },
         );
+        let detail = match stage {
+            FailureStage::Unchanged => format!("{declared}; not applied: {reason}"),
+            FailureStage::WorkmodeUnconfirmed => format!(
+                "{declared}; workmode change to {mode} was sent but not confirmed \
+                 (device workmode unknown, slot not activated): {reason}"
+            ),
+            FailureStage::WorkmodeChanged => {
+                format!("{declared}; workmode changed to {mode}; slot activation failed: {reason}")
+            }
+            // Future stages: say only what is certain.
+            _ => format!("{declared}; failed: {reason}"),
+        };
         self.publish_mode_with(
             device_id,
             mode,
             ModePhase::Failed,
             impact,
-            format!("{declared}; not applied: {reason}"),
+            detail,
+            op,
+            Some(stage),
         )
     }
 
     /// Publish a `device.mode` event in `phase`, carrying the DEV-class impact
     /// and the declared-impact statement (ADR-M009).
-    fn publish_mode(&self, device_id: &str, mode: &str, phase: ModePhase) -> u64 {
+    fn publish_mode(&self, device_id: &str, mode: &str, phase: ModePhase, op: Option<&str>) -> u64 {
         self.publish_mode_with(
             device_id,
             mode,
             phase,
             ImpactClass::Device,
             mode_impact_detail(device_id, mode),
+            op,
+            None,
         )
     }
 
@@ -208,6 +233,7 @@ impl DeviceBroadcaster {
         mode: &str,
         index: u32,
         phase: ModePhase,
+        op: Option<&str>,
     ) -> u64 {
         self.publish_mode_with(
             device_id,
@@ -215,11 +241,15 @@ impl DeviceBroadcaster {
             phase,
             ImpactClass::Class2,
             indexed_switch_impact_detail(device_id, index, mode),
+            op,
+            None,
         )
     }
 
     /// Publish a `device.mode` event in `phase` with an explicit impact class
-    /// and declared-impact statement (ADR-M009 / inv #11).
+    /// and declared-impact statement (ADR-M009 / inv #11). `op` is carried
+    /// end-to-end so the realtime layer correlates by id, never by queue order.
+    #[allow(clippy::too_many_arguments)]
     fn publish_mode_with(
         &self,
         device_id: &str,
@@ -227,6 +257,8 @@ impl DeviceBroadcaster {
         phase: ModePhase,
         impact: ImpactClass,
         detail: String,
+        op: Option<&str>,
+        failure_stage: Option<FailureStage>,
     ) -> u64 {
         self.engine.publish_event(Event::DeviceMode(DeviceMode {
             device_id: device_id.to_owned(),
@@ -234,6 +266,8 @@ impl DeviceBroadcaster {
             phase,
             impact,
             detail: Some(detail),
+            operation_id: op.map(str::to_owned),
+            failure_stage,
         }))
     }
 

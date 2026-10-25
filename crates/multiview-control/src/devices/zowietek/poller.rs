@@ -213,6 +213,10 @@ pub enum PollerControl {
     SetMode {
         /// The desired converged work mode (driver vocabulary, e.g. `decoder`).
         mode: String,
+        /// The operation id (from the route's `202`) this convergence answers,
+        /// stamped on every `device.mode` it publishes so correlation is
+        /// end-to-end. `None` for legacy / unacknowledged callers.
+        operation_id: Option<String>,
     },
     /// The operator updated the stored credential (`secret_ref`): re-arm a probe
     /// out of `AUTH_FAILED` (drives the lifecycle breaker closed).
@@ -490,7 +494,7 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
     /// loop runs on each received control message).
     pub async fn handle_control(&mut self, command: PollerControl) {
         match command {
-            PollerControl::SetMode { mode } => {
+            PollerControl::SetMode { mode, operation_id } => {
                 // The operator's set-mode is the new desired mode: record it so
                 // every later adopt/reconnect pass re-converges onto the last
                 // operator intent (and a failed apply below is retried there).
@@ -502,7 +506,7 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
                 // published as a device.mode Failed by the driver and surfaced
                 // here — re-converged on the next adopt/reconnect pass (the
                 // desired mode recorded above).
-                if let Err(err) = self.converge(&mode).await {
+                if let Err(err) = self.converge(&mode, operation_id.as_deref()).await {
                     tracing::warn!(
                         device = %self.device_id,
                         mode = %mode,
@@ -556,7 +560,7 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
             );
             return;
         }
-        if let Err(err) = self.converge(&desired).await {
+        if let Err(err) = self.converge(&desired, None).await {
             tracing::warn!(
                 device = %self.device_id,
                 mode = %desired,
@@ -574,11 +578,18 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
     /// never the active one. Every other device keeps the legacy
     /// close-before-open mode convergence unchanged, so a device without a
     /// configured spare index behaves exactly as before.
-    async fn converge(&mut self, mode: &str) -> Result<(), super::ConvergenceError> {
+    async fn converge(
+        &mut self,
+        mode: &str,
+        op: Option<&str>,
+    ) -> Result<(), super::ConvergenceError> {
         if mode == "decoder" && self.driver.convergence_index().is_some() {
-            self.driver.converge_indexed().await
+            self.driver.converge_indexed_with_op(op).await
         } else {
-            self.driver.converge_mode(mode).await.map_err(Into::into)
+            self.driver
+                .converge_mode_with_op(mode, op)
+                .await
+                .map_err(Into::into)
         }
     }
 

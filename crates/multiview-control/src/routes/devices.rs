@@ -628,17 +628,6 @@ pub(crate) async fn set_mode(
         &id,
         Some(serde_json::json!({ "action": "set-mode", "mode": request.mode })),
     );
-    // Record the outcome correlation BEFORE dispatch (so a fast outcome cannot
-    // race it); only for the acknowledged index-scoped path, whose every
-    // accepted op publishes a terminal Finished/Failed outcome.
-    let corr_key = (plan.requires_ack && state.device_pollers.is_running(&id)).then(|| {
-        crate::realtime::CorrKey::DeviceMode {
-            device_id: id.clone(),
-        }
-    });
-    if let Some(key) = &corr_key {
-        state.corr.record(key.clone(), op.clone());
-    }
     // Dispatch the convergence to the device's running driver/poller (DEV-A4):
     // the actor records the requested mode as its desired mode, runs
     // `plan_mode_convergence` → `converge_mode` (close-before-open), and
@@ -653,15 +642,13 @@ pub(crate) async fn set_mode(
         &id,
         crate::devices::PollerControl::SetMode {
             mode: request.mode.clone(),
+            // The operation id travels with the command and comes back on every
+            // device.mode the driver publishes: correlation is end-to-end, never
+            // queue order.
+            operation_id: Some(op.to_string()),
         },
     );
     if !dispatched {
-        // No outcome will follow a rejected dispatch: withdraw the correlation
-        // so a later, unrelated device.mode terminal event is not attributed to
-        // this operation.
-        if let Some(key) = &corr_key {
-            state.corr.cancel(key, &op);
-        }
         tracing::debug!(
             device = %id,
             mode = %request.mode,

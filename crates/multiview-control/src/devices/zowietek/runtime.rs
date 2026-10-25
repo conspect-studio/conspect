@@ -516,7 +516,8 @@ mod tests {
         assert!(!reg.dispatch(
             "dev-a",
             super::PollerControl::SetMode {
-                mode: "decoder".to_owned()
+                mode: "decoder".to_owned(),
+                operation_id: None
             }
         ));
         // Stop aborts nothing when none is running (it still tombstones, so a

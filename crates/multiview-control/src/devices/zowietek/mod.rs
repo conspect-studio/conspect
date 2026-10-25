@@ -47,7 +47,7 @@ pub mod runtime;
 use std::sync::Arc;
 
 use multiview_config::DeviceDriver;
-use multiview_events::DeviceState;
+use multiview_events::{DeviceState, FailureStage};
 use serde_json::Value;
 
 use self::client::{
@@ -581,13 +581,27 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
     ///
     /// [`ZowietekClientError`] if the close or open step fails on the wire.
     pub async fn converge_mode(&self, desired: &str) -> Result<(), ZowietekClientError> {
+        self.converge_mode_with_op(desired, None).await
+    }
+
+    /// [`converge_mode`](Self::converge_mode) carrying the operation id of the
+    /// `set-mode` that asked for it, stamped on every `device.mode` it publishes.
+    ///
+    /// # Errors
+    ///
+    /// [`ZowietekClientError`] if the close or open step fails on the wire.
+    pub async fn converge_mode_with_op(
+        &self,
+        desired: &str,
+        op: Option<&str>,
+    ) -> Result<(), ZowietekClientError> {
         let plan = self.plan_mode_convergence(desired);
         let ModeConvergence::Switch { to, .. } = &plan else {
             // Already converged: no restart, no event.
             return Ok(());
         };
         // Declare the DEV-class impact at the start (instant-apply doctrine).
-        self.broadcaster.mode_started(&self.device_id, to);
+        self.broadcaster.mode_started(&self.device_id, to, op);
         let session = self.session_clone()?;
         // Close-before-open: stop the current pipeline, THEN start the target.
         // The vendor decode table is the only documented lever (see the type
@@ -595,13 +609,13 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         // publishes a `device.mode` Failed so the operator sees the convergence
         // did not complete (the driver re-converges on the next pass).
         if let Err(err) = self.apply_mode_switch(&session, to).await {
-            self.broadcaster.mode_failed(&self.device_id, to);
+            self.broadcaster.mode_failed(&self.device_id, to, op);
             return Err(err);
         }
         if let Some(mode) = WorkMode::parse(to) {
             self.set_workmode(mode);
         }
-        self.broadcaster.mode_finished(&self.device_id, to);
+        self.broadcaster.mode_finished(&self.device_id, to, op);
         Ok(())
     }
 
@@ -679,23 +693,42 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
     /// [`ConvergenceError::Wire`] if the grounded read or the switch fails on
     /// the wire.
     pub async fn converge_indexed(&self) -> Result<(), ConvergenceError> {
-        let result = self.converge_indexed_inner().await;
+        self.converge_indexed_with_op(None).await
+    }
+
+    /// [`converge_indexed`](Self::converge_indexed) carrying the operation id of
+    /// the `set-mode` that asked for it: every `device.mode` it publishes echoes
+    /// that id, and a failed outcome states exactly what had already changed
+    /// ([`FailureStage`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`converge_indexed`](Self::converge_indexed).
+    pub async fn converge_indexed_with_op(&self, op: Option<&str>) -> Result<(), ConvergenceError> {
+        let stage = std::sync::Mutex::new(FailureStage::Unchanged);
+        let result = self.converge_indexed_inner(op, &stage).await;
         // Every accepted operation gets an outcome (inv #11): an unsuccessful
-        // indexed convergence — a fail-safe refusal or a wire failure —
-        // publishes exactly one `device.mode` Failed carrying the typed reason.
-        // (The inner steps never publish Failed themselves.)
+        // indexed convergence publishes exactly one `device.mode` Failed with
+        // the typed reason AND the stage reached — the inner steps advance
+        // `stage` at each device mutation and never publish Failed themselves.
         if let Err(err) = &result {
-            self.broadcaster.mode_indexed_refused(
+            let _ = self.broadcaster.mode_indexed_failed(
                 &self.device_id,
                 WorkMode::Decoder.as_str(),
                 self.spare_decode_index,
+                stage.lock().map_or(FailureStage::Unchanged, |g| *g),
                 &err.to_string(),
+                op,
             );
         }
         result
     }
 
-    async fn converge_indexed_inner(&self) -> Result<(), ConvergenceError> {
+    async fn converge_indexed_inner(
+        &self,
+        op: Option<&str>,
+        stage: &std::sync::Mutex<FailureStage>,
+    ) -> Result<(), ConvergenceError> {
         // Fail-safe FIRST (inv #11): a device with no configured spare index is
         // never touched — not even a decode-table read. Guessing an index on a
         // single-active decoder would stop a live production decode.
@@ -749,12 +782,12 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         // Only now — every refusal passed — may the device be mutated: the
         // decoder workmode first (grounded `change_workmode`, confirmed by a
         // re-read), then the slot switch.
-        self.ensure_decoder_workmode(&session).await?;
+        self.ensure_decoder_workmode(&session, op, stage).await?;
 
         // Surface the Class-2 (controlled-reset) disruption before applying.
         let mode = WorkMode::Decoder.as_str();
         self.broadcaster
-            .mode_indexed_started(&self.device_id, mode, index);
+            .mode_indexed_started(&self.device_id, mode, index, op);
         if let Err(err) = self
             .client
             .request(
@@ -772,7 +805,7 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         }
         self.set_workmode(WorkMode::Decoder);
         self.broadcaster
-            .mode_indexed_finished(&self.device_id, mode, index);
+            .mode_indexed_finished(&self.device_id, mode, index, op);
         Ok(())
     }
 
@@ -809,6 +842,8 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
     async fn ensure_decoder_workmode(
         &self,
         session: &ZowietekSession,
+        op: Option<&str>,
+        stage: &std::sync::Mutex<FailureStage>,
     ) -> Result<(), ConvergenceError> {
         let mode = WorkMode::Decoder.as_str();
         if self.read_workmode_id(session).await? == Some(WorkMode::Decoder) {
@@ -817,8 +852,10 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         let index = self.spare_decode_index.unwrap_or_default();
         // Declare the Class-2 disruption before the workmode change.
         self.broadcaster
-            .mode_indexed_started(&self.device_id, mode, index);
+            .mode_indexed_started(&self.device_id, mode, index, op);
         let change = protocol::ChangeWorkmode::to(WorkMode::Decoder);
+        // From here the device may have changed workmode even if a call errors.
+        set_stage(stage, FailureStage::WorkmodeUnconfirmed);
         let result: Result<Option<WorkMode>, ZowietekClientError> = async {
             self.client
                 .request(
@@ -834,7 +871,11 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         }
         .await;
         match result {
-            Ok(Some(WorkMode::Decoder)) => Ok(()),
+            Ok(Some(WorkMode::Decoder)) => {
+                // Confirmed by the re-read: the device is now in decoder mode.
+                set_stage(stage, FailureStage::WorkmodeChanged);
+                Ok(())
+            }
             Ok(observed) => Err(ConvergenceError::WorkmodeNotReflected {
                 device_id: self.device_id.clone(),
                 observed: observed.map_or("unknown", WorkMode::as_str).to_owned(),
@@ -976,6 +1017,13 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
 
 /// The lifecycle state a client error implies: a credential rejection opens the
 /// breaker (`AUTH_FAILED`); anything else rides to `UNREACHABLE`.
+/// Record how far a convergence got (a poisoned lock keeps the prior stage).
+fn set_stage(stage: &std::sync::Mutex<FailureStage>, to: FailureStage) {
+    if let Ok(mut guard) = stage.lock() {
+        *guard = to;
+    }
+}
+
 fn lifecycle_state_for(err: &ZowietekClientError) -> DeviceState {
     match err {
         ZowietekClientError::Status { status, .. } if is_auth_status(status) => {

@@ -118,13 +118,6 @@ pub enum CorrKey {
     /// and the window's seq fence keeps an earlier scan's stragglers from ever
     /// being stamped with a newer scan's id.
     Discovery,
-    /// A device's terminal `device.mode` outcome (`Finished` or `Failed`) — the
-    /// outcome of an acknowledged index-scoped `set-mode` apply (issue #55). The
-    /// consume-once pending lane, keyed by device id.
-    DeviceMode {
-        /// The registry device id converging.
-        device_id: String,
-    },
 }
 
 impl CorrKey {
@@ -263,17 +256,6 @@ impl CorrKey {
             // The running scan's rows correlate via the windowed Discovery key
             // (recorded at scan start, seq-fenced).
             Event::DeviceDiscovered(_) => Some(Self::Discovery),
-            // Only the terminal phases are outcomes; `Started` is the declaration.
-            Event::DeviceMode(e)
-                if matches!(
-                    e.phase,
-                    multiview_events::ModePhase::Finished | multiview_events::ModePhase::Failed
-                ) =>
-            {
-                Some(Self::DeviceMode {
-                    device_id: e.device_id.clone(),
-                })
-            }
             // A media-player lifecycle transition projects to the same key its
             // originating command produced (ADR-0097 §6, ADR-RT008): the player
             // id + the discrete transport state it entered.
@@ -404,30 +386,6 @@ impl CorrRegistry {
                         inner.pending.remove(&evicted);
                     }
                 }
-            }
-        }
-    }
-
-    /// Withdraw one pending correlation of `op` under `key` (e.g. its dispatch
-    /// was rejected, so no outcome will ever follow): a later, unrelated
-    /// outcome with the same key must not be attributed to it. A no-op when the
-    /// pair is not pending (already consumed, evicted, or never recorded).
-    pub fn cancel(&self, key: &CorrKey, op: &OperationId) {
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
-        let removed = inner.pending.get_mut(key).is_some_and(|queue| {
-            queue.iter().position(|o| o == op).is_some_and(|pos| {
-                queue.remove(pos);
-                true
-            })
-        });
-        if inner.pending.get(key).is_some_and(VecDeque::is_empty) {
-            inner.pending.remove(key);
-        }
-        if removed {
-            if let Some(pos) = inner.order.iter().position(|k| k == key) {
-                inner.order.remove(pos);
             }
         }
     }
@@ -1233,9 +1191,15 @@ impl SessionStream {
         // reuse a consumed correlation. Non-command events stay uncorrelated. The
         // registry lock is control-plane-only and never touches the engine hot
         // loop (invariant #10).
-        let corr = self.corr.as_ref().and_then(|registry| {
-            CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
-        });
+        let corr = match &event {
+            // A `device.mode` outcome carries the operation id of the set-mode it
+            // answers (end-to-end): echo it directly. No registry, no queue — an
+            // event with no id (adopt/reconnect convergence) stays uncorrelated.
+            Event::DeviceMode(mode) => mode.operation_id.clone().map(OperationId::from_string),
+            _ => self.corr.as_ref().and_then(|registry| {
+                CorrKey::for_event(&event).and_then(|key| registry.resolve(&key, seq_event.seq))
+            }),
+        };
         let mut envelope = Envelope::new(
             topic,
             seq,
@@ -2459,6 +2423,8 @@ mod topic_routing_tests {
                 phase: ModePhase::Finished,
                 impact: ImpactClass::Device,
                 detail: None,
+                operation_id: None,
+                failure_stage: None,
             }),
             Event::DeviceError(DeviceError {
                 device_id: "dev-a".to_owned(),
