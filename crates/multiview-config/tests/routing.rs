@@ -210,6 +210,20 @@ fn identical_declared_main_is_accepted() {
 }
 
 #[test]
+fn lone_aux_program_without_explicit_routing_desugars_to_aux() {
+    let mut cfg = load_legacy();
+    let mut aux = cfg.effective_programs().remove(0);
+    aux.id = "aux".try_into().unwrap();
+    cfg.programs = vec![aux];
+    cfg.validate().expect("an aux-only program validates");
+    assert!(cfg
+        .routing_table()
+        .output
+        .iter()
+        .all(|crosspoint| crosspoint.program == "aux"));
+}
+
+#[test]
 fn duplicate_program_ids_are_rejected() {
     let mut cfg = load_legacy();
     let main = cfg.effective_programs().remove(0);

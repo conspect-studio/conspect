@@ -816,13 +816,31 @@ async fn a_resumed_run_does_not_reapply_the_unchanged_boot_file() {
     watch.stop();
 }
 
-/// Explicit main programs must track the live stores after REST edits, while
+/// Explicit single programs must track the live stores after REST edits, while
 /// the adopted snapshot written to active.toml must remain valid as well.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declared_main_survives_output_and_cell_mutations() {
+    declared_program_survives_output_and_cell_mutations("main").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_aux_survives_output_and_cell_mutations() {
+    declared_program_survives_output_and_cell_mutations("aux").await;
+}
+
+async fn declared_program_survives_output_and_cell_mutations(program_id: &str) {
     let mut boot = MultiviewConfig::load_from_toml(BOOT_DOC).expect("boot parses");
     boot.programs = boot.effective_programs();
-    let r = rig(&boot.to_toml().expect("declared main renders"));
+    boot.programs[0].id = program_id.try_into().expect("valid program id");
+    boot.programs[0].display_name = Some("Operator program".to_owned());
+    boot.programs[0].autostart = false;
+    let mut routing = boot.routing_table();
+    for output in &mut routing.output {
+        output.program = program_id.to_owned();
+    }
+    boot.routing = Some(routing);
+    boot.validate().expect("declared program validates");
+    let r = rig(&boot.to_toml().expect("declared program renders"));
 
     let response = send(
         &r.router,
@@ -838,7 +856,7 @@ async fn declared_main_survives_output_and_cell_mutations() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert_declared_main_exports_and_persists(&r, "in_a").await;
+    assert_declared_program_exports_and_persists(&r, program_id, "in_a").await;
 
     let working = r
         .state
@@ -875,16 +893,24 @@ async fn declared_main_survives_output_and_cell_mutations() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_declared_main_exports_and_persists(&r, "in_b").await;
+    assert_declared_program_exports_and_persists(&r, program_id, "in_b").await;
 }
 
-async fn assert_declared_main_exports_and_persists(r: &Rig, expected_cell_source: &str) {
+async fn assert_declared_program_exports_and_persists(
+    r: &Rig,
+    program_id: &str,
+    expected_cell_source: &str,
+) {
     let response = send(&r.router, get("/api/v1/config/export", OPERATOR_TOKEN)).await;
     assert_eq!(response.status(), StatusCode::OK, "export must validate");
     let text = String::from_utf8(support::body_bytes(response).await).expect("TOML export");
     let exported = MultiviewConfig::load_from_toml(&text).expect("export parses");
     exported.validate().expect("export validates");
-    assert_eq!(exported.programs.len(), 1, "retain declared main");
+    assert_eq!(exported.programs.len(), 1, "retain declared program");
+    assert_eq!(exported.programs[0].id.as_str(), program_id);
+    assert_eq!(exported.programs[0].display_name.as_deref(), Some("Operator program"));
+    assert!(!exported.programs[0].autostart);
+    assert_eq!(exported.programs[0].outputs, exported.outputs);
     assert_eq!(exported.outputs.len(), 2, "export new output");
     assert_eq!(
         serde_json::to_value(&exported.cells[0]).expect("cell JSON")["source"]["input_id"],
@@ -903,7 +929,11 @@ async fn assert_declared_main_exports_and_persists(r: &Rig, expected_cell_source
     let text = std::fs::read_to_string(active_path).expect("active.toml written");
     let active = MultiviewConfig::load_from_toml(&text).expect("active parses");
     active.validate().expect("active validates");
-    assert_eq!(active.programs.len(), 1, "persist declared main");
+    assert_eq!(active.programs.len(), 1, "persist declared program");
+    assert_eq!(active.programs[0].id.as_str(), program_id);
+    assert_eq!(active.programs[0].display_name.as_deref(), Some("Operator program"));
+    assert!(!active.programs[0].autostart);
+    assert_eq!(active.programs[0].outputs, active.outputs);
     assert_eq!(active.outputs.len(), 2, "persist new output");
 }
 
