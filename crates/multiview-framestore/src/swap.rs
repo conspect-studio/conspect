@@ -118,3 +118,91 @@ impl<T> SwapCell<Arc<T>> {
         }
     }
 }
+
+#[cfg(test)]
+impl<P> SwapCell<P> {
+    /// Test seam: take and hold a reader's critical section on the value
+    /// readers currently load, exactly as a reader that the OS deschedules
+    /// in the middle of `load` would hold it.
+    fn hold_reader_for_test(&self) -> impl Drop + '_ {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod chaos {
+    //! Round-2 #133 chaos test (invariants #1 / #10): a reader that is
+    //! descheduled while inside its read critical section must not delay the
+    //! publisher by even one tick.
+    use super::SwapCell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const PUBLISHES: u64 = 1000;
+    /// Far below the shortest output tick (16.7 ms at 60 fps).
+    const PER_PUBLISH_BUDGET: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn publisher_never_waits_on_a_descheduled_reader() {
+        let cell: Arc<SwapCell<Option<Arc<u64>>>> = Arc::new(SwapCell::new(Some(Arc::new(0))));
+        let held = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        // A reader inside its read critical section, then "descheduled" (parked
+        // on a barrier) for 500 ms.
+        let reader = {
+            let cell = Arc::clone(&cell);
+            let held = Arc::clone(&held);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                let guard = cell.hold_reader_for_test();
+                held.wait();
+                release.wait();
+                drop(guard);
+                cell.load()
+            })
+        };
+        held.wait();
+
+        // The output clock publishes 1000 times while that reader is parked.
+        let done = Arc::new(AtomicU64::new(0));
+        let publisher = {
+            let cell = Arc::clone(&cell);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                let mut worst = Duration::ZERO;
+                for v in 1..=PUBLISHES {
+                    let t = Instant::now();
+                    cell.store(Some(Arc::new(v)));
+                    worst = worst.max(t.elapsed());
+                    done.store(v, Ordering::Release);
+                }
+                worst
+            })
+        };
+
+        thread::sleep(Duration::from_millis(500));
+        let completed = done.load(Ordering::Acquire);
+        assert_eq!(
+            completed, PUBLISHES,
+            "publisher stalled behind a descheduled reader: {completed}/{PUBLISHES} publishes in 500 ms"
+        );
+        let worst = publisher.join().expect("publisher panicked");
+        assert!(
+            worst < PER_PUBLISH_BUDGET,
+            "a publish took {worst:?} (budget {PER_PUBLISH_BUDGET:?})"
+        );
+
+        release.wait();
+        let seen = reader.join().expect("reader panicked");
+        assert_eq!(
+            seen.as_deref(),
+            Some(&PUBLISHES),
+            "reader must see the newest value"
+        );
+        assert_eq!(cell.load().as_deref(), Some(&PUBLISHES));
+    }
+}
