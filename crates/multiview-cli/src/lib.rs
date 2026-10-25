@@ -92,6 +92,9 @@ pub mod live_sources;
 /// back-pressure the engine (inv #10). Always compiled (the pure meter is
 /// GPU/FFmpeg-free); the bake-consumer wiring lives behind the `ffmpeg` pipeline.
 pub mod loudness_telemetry;
+/// Off-hot-path program-bus peak/RMS meter telemetry (`audio.meter`, ~30 Hz,
+/// conflated + drop-oldest; inv #10) published from the bake consumer.
+pub mod meter_telemetry;
 /// The CONSPECT local-metrics retention feed (engine-seam S5; ADR-0052 §3): an
 /// off-hot-loop, read-only subscriber that mirrors live engine events
 /// (utilisation / per-input reconnect / incident markers) into the
