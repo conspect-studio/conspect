@@ -75,9 +75,10 @@ pub struct SwitcherState {
     flip_flop: bool,
     flight: Option<Flight>,
     completion_count: u64,
-    // Physical terminal position remains latched across bus/configuration edits.
-    // Only an explicit abort or a bottom-position sample re-arms manual takes.
-    tbar_at_end: bool,
+    // ADR-0055 Decisions 5–6 / ADR-T015 §3: an ended take cannot reuse a
+    // nonzero physical lever reading; only a bottom sample re-arms the lever.
+    last_manual_position: u16,
+    lever_out_of_sync: bool,
 }
 
 impl SwitcherState {
@@ -93,7 +94,8 @@ impl SwitcherState {
             flip_flop: true,
             flight: None,
             completion_count: 0,
-            tbar_at_end: false,
+            last_manual_position: 0,
+            lever_out_of_sync: false,
         }
     }
 
@@ -273,6 +275,7 @@ impl SwitcherState {
 
     /// Set the absolute u16 T-bar position; duplicates do not advance progress.
     /// Manual input overrides any AUTO ramp; position zero cancels the flight.
+    /// After a take ends above zero, nonzero input is ignored until zero re-arms it.
     ///
     /// # Errors
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
@@ -283,15 +286,17 @@ impl SwitcherState {
     ) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
         if position == 0 {
+            self.last_manual_position = 0;
+            self.lever_out_of_sync = false;
             return Ok(self.abort());
         }
-        if self.flight.is_none() && self.tbar_at_end {
+        if self.lever_out_of_sync {
             return Ok(SwitcherProjection::idle());
         }
+        self.last_manual_position = position;
         let started = self.flight.is_none();
         if position == u16::MAX {
             let mut projection = self.finish();
-            self.tbar_at_end = true;
             projection.started = started;
             return Ok(projection);
         }
@@ -321,13 +326,14 @@ impl SwitcherState {
     /// Cancel the active flight, keeping PGM/PVW, key states and arming intact.
     pub fn abort(&mut self) -> SwitcherProjection {
         self.flight = None;
-        self.tbar_at_end = false;
+        self.lever_out_of_sync = self.last_manual_position != 0;
         SwitcherProjection::idle()
     }
 
     /// Punch a scene directly onto program without a preview swap or key change.
     pub fn punch(&mut self, scene: SourceRef) -> SwitcherProjection {
         self.flight = None;
+        self.lever_out_of_sync = self.last_manual_position != 0;
         self.program = scene;
         self.completion_count = self.completion_count.saturating_add(1);
         SwitcherProjection {
@@ -404,6 +410,7 @@ impl SwitcherState {
 
     fn finish(&mut self) -> SwitcherProjection {
         self.flight = None;
+        self.lever_out_of_sync = self.last_manual_position != 0;
         if self.armed.background {
             if self.flip_flop {
                 std::mem::swap(&mut self.program, &mut self.preview);

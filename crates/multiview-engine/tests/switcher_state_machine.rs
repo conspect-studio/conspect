@@ -361,22 +361,23 @@ enum Cmd {
     Abort,
     Tbar(u16),
     RepeatTerminalTbar,
-    ResumeAndFinish,
-    CutAfterManual,
-    AbortAfterManual,
     Advance(u8),
     Arm(bool, bool),
     SetPreview(u8),
     SetTransition(u8),
     Punch(u8),
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelFlight {
+    Manual,
+    Auto { end_tick: u64 },
+}
 #[derive(Clone, Debug)]
 struct Model {
     tick: u64,
     last_manual_position: u16,
     lever_out_of_sync: bool,
-    // A model flight is either manual or an AUTO finishing on this tick.
-    flight_end: Option<Option<u64>>,
+    flight: Option<ModelFlight>,
     rate: u32,
 }
 struct Reference;
@@ -388,7 +389,7 @@ impl ReferenceStateMachine for Reference {
             tick: 0,
             last_manual_position: 0,
             lever_out_of_sync: false,
-            flight_end: None,
+            flight: None,
             rate: 5,
         })
         .boxed()
@@ -400,12 +401,11 @@ impl ReferenceStateMachine for Reference {
             Just(Cmd::Abort),
             any::<u16>().prop_map(Cmd::Tbar),
             Just(Cmd::RepeatTerminalTbar),
-            Just(Cmd::ResumeAndFinish),
-            Just(Cmd::CutAfterManual),
-            Just(Cmd::AbortAfterManual),
             Just(Cmd::Tbar(0)),
             Just(Cmd::Tbar(u16::MAX)),
             Just(Cmd::Tbar(64000)),
+            Just(Cmd::Tbar(30000)),
+            Just(Cmd::Tbar(31000)),
             (0u8..12).prop_map(Cmd::Advance),
             (any::<bool>(), any::<bool>()).prop_map(|(b, k)| Cmd::Arm(b, k)),
             (0u8..3).prop_map(Cmd::SetPreview),
@@ -419,64 +419,55 @@ impl ReferenceStateMachine for Reference {
             Cmd::Tbar(0) => {
                 state.last_manual_position = 0;
                 state.lever_out_of_sync = false;
-                state.flight_end = None;
+                state.flight = None;
             }
             Cmd::Tbar(position) if !state.lever_out_of_sync => {
                 state.last_manual_position = *position;
-                state.flight_end = if *position == u16::MAX {
+                state.flight = if *position == u16::MAX {
                     state.lever_out_of_sync = true;
                     None
                 } else {
-                    Some(None)
+                    Some(ModelFlight::Manual)
                 };
             }
             Cmd::RepeatTerminalTbar if !state.lever_out_of_sync => {
                 state.last_manual_position = u16::MAX;
                 state.lever_out_of_sync = true;
-                state.flight_end = None;
-            }
-            Cmd::CutAfterManual | Cmd::AbortAfterManual | Cmd::ResumeAndFinish => {
-                if !state.lever_out_of_sync {
-                    if matches!(transition, Cmd::ResumeAndFinish) {
-                        state.tick += 12;
-                    }
-                    state.last_manual_position = 30000;
-                    state.lever_out_of_sync = true;
-                    state.flight_end = None;
-                }
+                state.flight = None;
             }
             Cmd::Cut | Cmd::Abort | Cmd::Punch(_) => {
-                state.flight_end = None;
+                state.flight = None;
                 state.lever_out_of_sync = state.last_manual_position != 0;
             }
             Cmd::Auto => {
-                if let Some(None) = state.flight_end {
+                if let Some(ModelFlight::Manual) = state.flight {
                     let elapsed = (u64::from(state.last_manual_position) * u64::from(state.rate)
                         + u64::from(u16::MAX) / 2)
                         / u64::from(u16::MAX);
                     let remaining = u64::from(state.rate) - elapsed;
                     if remaining == 0 {
-                        state.flight_end = None;
+                        state.flight = None;
                         state.lever_out_of_sync = state.last_manual_position != 0;
                     } else {
-                        state.flight_end = Some(Some(state.tick + remaining));
+                        state.flight = Some(ModelFlight::Auto {
+                            end_tick: state.tick + remaining,
+                        });
                     }
-                } else if state.flight_end.is_none() {
-                    state.flight_end = Some(Some(state.tick + u64::from(state.rate)));
+                } else if state.flight.is_none() {
+                    state.flight = Some(ModelFlight::Auto {
+                        end_tick: state.tick + u64::from(state.rate),
+                    });
                 }
             }
             Cmd::Advance(n) => {
                 state.tick += u64::from(*n);
-                if state
-                    .flight_end
-                    .flatten()
-                    .is_some_and(|end| state.tick >= end)
+                if matches!(state.flight, Some(ModelFlight::Auto { end_tick }) if state.tick >= end_tick)
                 {
-                    state.flight_end = None;
+                    state.flight = None;
                     state.lever_out_of_sync = state.last_manual_position != 0;
                 }
             }
-            Cmd::SetTransition(rate) if state.flight_end.is_none() => {
+            Cmd::SetTransition(rate) if state.flight.is_none() => {
                 state.rate = u32::from(*rate);
             }
             _ => {}
@@ -510,7 +501,7 @@ impl Sut {
                 !output.started && !output.completed,
                 "parked lever triggered take: {transition:?}"
             );
-            assert!(!self.machine.is_in_flight());
+            assert_eq!(self.machine.is_in_flight(), self.was_in_flight);
         }
         assert!(output.progress.numerator() <= output.progress.denominator());
         if output.completed {
@@ -532,6 +523,29 @@ impl Sut {
             );
         }
         self.previous_progress = output.progress;
+    }
+
+    fn track_lever(&mut self, transition: &Cmd, has_output: bool, parked: bool) {
+        if matches!(transition, Cmd::Tbar(0)) {
+            self.last_manual_position = 0;
+            self.lever_out_of_sync = false;
+        } else if !parked {
+            if let Cmd::Tbar(position) = transition {
+                self.last_manual_position = *position;
+            } else if matches!(transition, Cmd::RepeatTerminalTbar) && !self.lever_out_of_sync {
+                self.last_manual_position = u16::MAX;
+            }
+            if has_output && !self.machine.is_in_flight() {
+                self.lever_out_of_sync = self.last_manual_position != 0;
+            }
+        }
+        if matches!(
+            transition,
+            Cmd::Advance(_) | Cmd::Auto | Cmd::Cut | Cmd::Abort | Cmd::Punch(_)
+        ) && !self.machine.is_in_flight()
+        {
+            self.lever_out_of_sync = self.last_manual_position != 0;
+        }
     }
 }
 struct Test;
@@ -557,7 +571,7 @@ impl StateMachineTest for Test {
             last_manual_position: 0,
         }
     }
-    fn apply(mut sut: Sut, model: &Model, transition: Cmd) -> Sut {
+    fn apply(mut sut: Sut, _model: &Model, transition: Cmd) -> Sut {
         let parked_manual =
             sut.lever_out_of_sync && matches!(transition, Cmd::Tbar(position) if position != 0);
         let result = match transition {
@@ -575,24 +589,6 @@ impl StateMachineTest for Test {
                     );
                 }
                 first
-            }
-            Cmd::CutAfterManual | Cmd::AbortAfterManual | Cmd::ResumeAndFinish => {
-                if !model.lever_out_of_sync {
-                    sut.machine.tbar(30000, tick(sut.tick)).ok();
-                    sut.was_in_flight = true;
-                    match transition {
-                        Cmd::CutAfterManual => sut.machine.cut().ok(),
-                        Cmd::AbortAfterManual => Some(sut.machine.abort()),
-                        Cmd::ResumeAndFinish => {
-                            sut.machine.auto(tick(sut.tick)).ok();
-                            sut.tick += 12;
-                            Some(sut.machine.sample(tick(sut.tick)))
-                        }
-                        _ => unreachable!(),
-                    }
-                } else {
-                    None
-                }
             }
             Cmd::Advance(n) => {
                 sut.tick += u64::from(n);
@@ -658,14 +654,12 @@ impl StateMachineTest for Test {
         }
         sut.previous = (sut.machine.program().clone(), sut.machine.preview().clone());
         sut.was_in_flight = sut.machine.is_in_flight();
-        let next_model = Reference::apply(model.clone(), &transition);
-        sut.lever_out_of_sync = next_model.lever_out_of_sync;
-        sut.last_manual_position = next_model.last_manual_position;
+        sut.track_lever(&transition, result.is_some(), parked_manual);
         sut
     }
     fn check_invariants(sut: &Sut, model: &Model) {
         assert_eq!(sut.tick, model.tick);
-        assert_eq!(sut.machine.is_in_flight(), model.flight_end.is_some());
+        assert_eq!(sut.machine.is_in_flight(), model.flight.is_some());
         assert_eq!(sut.lever_out_of_sync, model.lever_out_of_sync);
         assert_eq!(sut.last_manual_position, model.last_manual_position);
         assert!(sut.previous_progress.numerator() <= sut.previous_progress.denominator());
