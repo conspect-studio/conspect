@@ -73,6 +73,15 @@ export function parseAudioMeter(data: unknown): AudioMeterSample | undefined {
   };
 }
 
+/** Bottom of the displayed scale, dBFS. */
+const FLOOR_DB = -60;
+
+/** Map a dBFS level onto a 0..100 bar fill over the -60..0 dBFS scale. */
+export function meterFillPercent(db: number): number {
+  const clamped = Math.min(0, Math.max(FLOOR_DB, db));
+  return ((clamped - FLOOR_DB) / -FLOOR_DB) * 100;
+}
+
 /** What the meter widget renders. */
 export interface AudioMeterState {
   readonly status: RealtimeStatus;
@@ -97,7 +106,7 @@ export function useAudioMeter(): AudioMeterState {
             return;
           }
           const sample = parseAudioMeter(envelope.data);
-          if (sample !== undefined && sample.track === 0) {
+          if (sample?.track === 0) {
             setCurrent(sample);
           }
         },

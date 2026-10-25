@@ -40,6 +40,7 @@ import {
 } from '../resources/FormControls';
 import { HelpLink } from '../components/HelpLink';
 import { LoudnessMeter } from './LoudnessMeter';
+import { ProgramMeters } from './ProgramMeters';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
@@ -511,6 +512,7 @@ export function AudioPage(): JSX.Element {
               M/S/I/LRA/dBTP against the compliance target, ballistics applied
               client-side. UI-only — it consumes telemetry, never the engine path
               (invariant #10). */}
+          <ProgramMeters />
           <LoudnessMeter />
         </div>
       )}

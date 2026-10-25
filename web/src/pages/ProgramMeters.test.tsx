@@ -5,8 +5,8 @@ import { describe, expect, it } from 'vitest';
 import { screen } from '@testing-library/react';
 
 import { renderWithProviders } from '../test/render';
-import { ProgramMetersView, meterFillPercent } from './ProgramMeters';
-import { parseAudioMeter } from '../realtime/useAudioMeter';
+import { ProgramMetersView } from './ProgramMeters';
+import { meterFillPercent, parseAudioMeter } from '../realtime/useAudioMeter';
 import type { AudioMeterSample } from '../realtime/useAudioMeter';
 
 function frame(over: Partial<AudioMeterSample> = {}): AudioMeterSample {
