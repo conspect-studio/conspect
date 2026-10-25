@@ -3,7 +3,7 @@
 //! Per-tile **last-good-frame** stores and the tile **failure-ladder state
 //! machine** — Multiview invariant #2.
 //!
-//! Each input decodes independently into a lock-free single-slot
+//! Each input decodes independently into a non-blocking single-slot
 //! [`LatestSlot`] (overwrite / newest-wins); the compositor
 //! samples it on every output tick and **never blocks**. A
 //! [`TileStore`] wraps that slot with a timing policy that
@@ -18,8 +18,11 @@
 //!
 //! ## Invariants upheld here
 //!
-//! * **Reader never blocks / never tears** — reads clone an [`Arc`](std::sync::Arc)
-//!   out of an [`arc_swap::ArcSwapOption`]; no locks, no `unsafe`.
+//! * **Publisher never waits on a reader, reader never blocks, never tears**:
+//!   reads clone an [`Arc`](std::sync::Arc) out of a tagged slot ring (`swap`
+//!   module) that a publish can always write without waiting, even while a
+//!   reader is descheduled mid-read. arc-swap was dropped here for
+//!   vorner/arc-swap#210 (#133). No `unsafe`.
 //! * **Bounded memory** — single slot, newest wins; a fast source overwrites,
 //!   a slow source is held.
 //! * **Deterministic timing** — "now" is *injected* as a
@@ -50,6 +53,7 @@ pub mod error;
 pub mod latest;
 pub mod liveness;
 pub mod state;
+mod swap;
 pub mod tile;
 
 pub use error::{Error, Result};

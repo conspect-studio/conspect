@@ -3160,7 +3160,6 @@ dependencies = [
 name = "multiview-framestore"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "multiview-core",
  "proptest",
  "proptest-state-machine",

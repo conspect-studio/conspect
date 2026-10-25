@@ -1,6 +1,6 @@
-//! The per-tile last-good-frame store: lock-free slot + failure-ladder state.
+//! The per-tile last-good-frame store: non-blocking slot + failure-ladder state.
 //!
-//! [`TileStore<T>`] ties together the lock-free [`LatestSlot`] (the
+//! [`TileStore<T>`] ties together the non-blocking [`LatestSlot`] (the
 //! last-good-frame cell) and the [`classify`] failure-ladder policy. It is the
 //! concrete realization of invariant #2 for a single tile:
 //!
@@ -17,12 +17,12 @@
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use multiview_core::time::MediaTime;
 use multiview_core::traits::SourceState;
 
 use crate::latest::LatestSlot;
 use crate::state::{classify, TileThresholds};
+use crate::swap::SwapCell;
 
 /// Select the entry whose `at` is nearest-but-not-after `now`, falling back to
 /// the earliest retained entry when every entry is still ahead of `now`.
@@ -220,8 +220,10 @@ pub struct TileStore<T> {
     /// A bounded, media-time-ordered ring of recently-published frames, used by
     /// [`read_at`](TileStore::read_at) to latch the frame nearest-but-not-after
     /// the output clock's instant (streaming-gotchas §1). Stored as a snapshot
-    /// behind an [`ArcSwap`] so the reader is **lock-free and never blocks** on a
-    /// writer (invariant #1): the writer copies the (≤ [`RING_CAPACITY`]) ring,
+    /// in a [`SwapCell`], whose publish never waits on a reader and whose
+    /// load never blocks, so neither side waits on the other or on the
+    /// writer's copy (invariant #1; the copy runs outside any lock, see #133):
+    /// the writer copies the (≤ [`RING_CAPACITY`]) ring,
     /// appends, drops the oldest beyond capacity, and atomically swaps it in.
     ///
     /// The publish is O(capacity) copy-on-write **by design** (ADR-T009): that is
@@ -231,7 +233,7 @@ pub struct TileStore<T> {
     /// since the copy runs on the *sampled input thread* (never the output clock).
     ///
     /// [`RING_CAPACITY`]: TileStore::RING_CAPACITY
-    ring: ArcSwap<Vec<RingEntry<T>>>,
+    ring: SwapCell<Arc<Vec<RingEntry<T>>>>,
 }
 
 impl<T> TileStore<T> {
@@ -257,7 +259,7 @@ impl<T> TileStore<T> {
             policy,
             last_frame_at_ns: AtomicI64::new(NEVER_PUBLISHED),
             latch_watermark_seq: AtomicU64::new(NO_LATCH_SEQ),
-            ring: ArcSwap::from_pointee(Vec::new()),
+            ring: SwapCell::new(Arc::new(Vec::new())),
         }
     }
 
@@ -304,7 +306,7 @@ impl<T> TileStore<T> {
         // pointing past the new content.
         //
         // Publishes are single-writer per tile (one actor per source), so the
-        // tail observed here is stable against other writers; only the lock-free
+        // tail observed here is stable against other writers; only the
         // readers touch the ring concurrently, and they never mutate it.
         //
         // Frames the output clock has already advanced past are dead weight
@@ -563,7 +565,7 @@ impl<T> TileStore<T> {
         self.slot.sequence()
     }
 
-    /// Borrow the underlying lock-free slot (e.g. to share a reader handle).
+    /// Borrow the underlying latest-value slot (e.g. to share a reader handle).
     #[must_use]
     pub fn slot(&self) -> &LatestSlot<T> {
         &self.slot
@@ -635,7 +637,7 @@ mod cross_generation_watermark_race {
             thread::spawn(move || {
                 // Load the G0 (high-time) snapshot BEFORE the reconnect — exactly
                 // what a reader does at the top of `read_at`.
-                let g0 = s.ring.load_full();
+                let g0 = s.ring.load();
                 captured.wait();
                 // Wait until the producer has re-anchored to the new LOW
                 // generation, then advance the watermark from the STALE snapshot

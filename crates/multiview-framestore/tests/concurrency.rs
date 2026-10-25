@@ -215,3 +215,71 @@ fn tile_store_read_is_consistent_under_concurrent_publishing() {
     assert!(observed > 0, "reader observed no frames");
     assert_eq!(store.sequence(), PUBLISHES);
 }
+
+/// A payload that records which slot it was published into.
+#[derive(Debug)]
+struct Owned {
+    /// `0` for values published into slot `a`, `1` for slot `b`.
+    owner: u64,
+    /// The publish counter (monotonic per slot).
+    counter: u64,
+}
+
+#[test]
+fn load_never_returns_a_value_published_into_another_slot() {
+    // Regression for #133 (upstream vorner/arc-swap#210). Two independent
+    // slots of the SAME payload type, written by one thread in lock-step, so
+    // the allocation freed from `a` is immediately reused for `b`'s next value.
+    // arc-swap's default (hybrid) strategy keys its process-global debt list by
+    // raw address: `b`'s writer can "pay" a reader-of-`a`'s in-flight debt on
+    // the reused address, and the reader then returns `b`'s `Arc` from
+    // `a.load()` — a foreign value (and, seen through a sequence number, a
+    // "regression"). A slot must only ever return values published into it,
+    // and a single reader must never observe its counter go backwards.
+    const PUBLISHES: u64 = 2_000_000;
+    const READERS: usize = 4;
+
+    let a: Arc<LatestSlot<Owned>> = Arc::new(LatestSlot::new());
+    let b: Arc<LatestSlot<Owned>> = Arc::new(LatestSlot::new());
+    let done = Arc::new(AtomicBool::new(false));
+
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let a = Arc::clone(&a);
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                let mut prev = 0_u64;
+                let mut samples = 0_u64;
+                while !done.load(Ordering::Acquire) {
+                    if let Some(v) = a.load() {
+                        assert_eq!(
+                            v.owner, 0,
+                            "slot `a` returned a value published into slot `b` (counter {})",
+                            v.counter
+                        );
+                        assert!(
+                            v.counter >= prev,
+                            "sequence regressed for this reader: {} < {prev}",
+                            v.counter
+                        );
+                        prev = v.counter;
+                        samples += 1;
+                    }
+                }
+                samples
+            })
+        })
+        .collect();
+
+    for counter in 1..=PUBLISHES {
+        a.publish(Owned { owner: 0, counter });
+        b.publish(Owned { owner: 1, counter });
+    }
+    done.store(true, Ordering::Release);
+    for reader in readers {
+        let samples = reader.join().expect("reader thread panicked");
+        assert!(samples > 0, "reader observed no values");
+    }
+    assert_eq!(a.load().map(|v| (v.owner, v.counter)), Some((0, PUBLISHES)));
+    assert_eq!(b.load().map(|v| (v.owner, v.counter)), Some((1, PUBLISHES)));
+}

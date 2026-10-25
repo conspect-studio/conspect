@@ -255,8 +255,9 @@ impl<T> SourceHandle<T> {
 ///    **never here** (see the module "Bounded teardown off the hot path" docs).
 /// 2. The handle's own `Arc<TileStore<T>>` drops; when it is the last reference the
 ///    [`TileStore`] drops with any held frame `Arc<T>`. [`TileStore`] has **no**
-///    explicit `Drop` — its frame slot is an `arc_swap::ArcSwapOption<T>` plus a
-///    bounded `ArcSwap<Vec<..>>` ring, so teardown just drops the held `Arc<T>`s.
+///    explicit `Drop`: its frame slot is a small slot ring of `Option<Arc<T>>`
+///    plus a bounded `Arc<Vec<..>>` media-time ring, so teardown just drops the
+///    held `Arc<T>`s.
 ///
 /// For the production `T = Nv12Image` that final frame drop is non-blocking. A
 /// **source** frame — the only kind a *source* store ever holds, since the public
