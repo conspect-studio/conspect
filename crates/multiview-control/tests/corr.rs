@@ -361,3 +361,25 @@ async fn posted_start_command_correlates_its_realtime_outcome() {
     assert_eq!(parsed["corr"], op, "the JSON envelope carries corr == op");
     assert_eq!(parsed["t"], "output.status");
 }
+
+/// A terminal `device.mode` outcome (Finished or Failed) correlates by device;
+/// the Started declaration does not consume the correlation (#55).
+#[test]
+fn device_mode_terminal_outcomes_map_to_the_device_key() {
+    use multiview_events::{DeviceMode, ImpactClass, ModePhase};
+    let event = |phase| {
+        Event::DeviceMode(DeviceMode {
+            device_id: "dev-a".to_owned(),
+            mode: "decoder".to_owned(),
+            phase,
+            impact: ImpactClass::Class2,
+            detail: None,
+        })
+    };
+    let key = Some(CorrKey::DeviceMode {
+        device_id: "dev-a".to_owned(),
+    });
+    assert_eq!(CorrKey::for_event(&event(ModePhase::Failed)), key);
+    assert_eq!(CorrKey::for_event(&event(ModePhase::Finished)), key);
+    assert_eq!(CorrKey::for_event(&event(ModePhase::Started)), None);
+}

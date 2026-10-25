@@ -693,7 +693,7 @@ async fn set_mode_declares_class2_index_scoped_disruption_before_apply() {
         post_json(
             "/api/v1/devices/dev-foyer/set-mode",
             OPERATOR_TOKEN,
-            &json!({ "mode": "decoder" }),
+            &json!({ "mode": "decoder", "ack_impact": "c2" }),
         ),
     )
     .await;
@@ -739,4 +739,243 @@ async fn set_mode_without_a_spare_index_keeps_the_dev_impact() {
         body["impact"], "dev",
         "no configured spare index ⇒ unchanged DEV-class declaration: {body}"
     );
+}
+
+// ---- Round 3 (#55): plan/take — Class-2 impact is surfaced BEFORE dispatch ---
+
+mod plan_take {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use multiview_config::Device;
+    use multiview_control::devices::zowietek::client::{ScriptedReply, ScriptedTransport};
+    use multiview_control::devices::zowietek::poller::PollerConfig;
+    use multiview_control::devices::zowietek::ZowietekDriver;
+    use multiview_control::devices::{
+        DevicePollerFactory, DevicePollerRegistry, PollerHandle, PollerWiring, ZowietekPoller,
+    };
+    use multiview_control::realtime::{CorrKey, CorrRegistry};
+
+    fn ok(data: serde_json::Value) -> ScriptedReply {
+        ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000", "data": data }))
+    }
+
+    /// Spawns a real poller over one shared scripted transport whose poll
+    /// cadence is slow (so only the dispatched convergence touches the wire).
+    struct Factory(ScriptedTransport);
+
+    impl DevicePollerFactory for Factory {
+        fn spawn(&self, device: &Device, wiring: &PollerWiring) -> Option<PollerHandle> {
+            let driver = ZowietekDriver::new(
+                &device.id,
+                Arc::new(self.0.clone()),
+                wiring.broadcaster.clone(),
+                Arc::clone(&wiring.drivers),
+                "admin",
+                "admin",
+            )
+            .with_spare_decode_index(device.spare_decode_index);
+            let config = PollerConfig {
+                poll_period: Duration::from_secs(3600),
+                ..PollerConfig::test_fast()
+            };
+            Some(
+                ZowietekPoller::new(
+                    &device.id,
+                    driver,
+                    Arc::clone(wiring.broadcaster.registry()),
+                    "[fd00:db8::1]",
+                    config,
+                )
+                .spawn(),
+            )
+        }
+    }
+
+    fn scripted() -> ScriptedTransport {
+        let t = ScriptedTransport::new();
+        t.push("system", ok(json!({ "uuid": "u", "type": 0 })));
+        t.push("venc", ok(json!({ "workmode": "encoder" })));
+        // Convergence: get_workmode_id (already decoder), table, switch ack.
+        t.push("workmode", ok(json!({ "workmode_id": 1 })));
+        t.push(
+            "streamplay",
+            ok(json!([
+                {"index": 2, "name": "p", "switch": 1, "streamplay_status": "playing",
+                 "url": "rtsp://x/a"},
+                {"index": 3, "name": "s", "switch": 0, "streamplay_status": "idle",
+                 "url": "rtsp://x/b"}
+            ])),
+        );
+        t.push(
+            "streamplay",
+            ScriptedReply::json(json!({ "rsp": "succeed", "status": "00000" })),
+        );
+        t
+    }
+
+    async fn running_harness(
+        transport: &ScriptedTransport,
+    ) -> (support::Harness, Arc<CorrRegistry>) {
+        let registry = Arc::new(DevicePollerRegistry::with_factory(Arc::new(Factory(
+            transport.clone(),
+        ))));
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let slot2 = Arc::clone(&slot);
+        let h = harness_with(move |state| {
+            *slot2.lock().unwrap() = Some(Arc::clone(&state.corr));
+            state.with_device_pollers(registry)
+        });
+        seed_indexed_device(&h, "dev-foyer", 3).await;
+        // Wait for the adopt (login + probe) to land on the wire.
+        for _ in 0..200 {
+            if transport.request_count("venc") > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(transport.request_count("venc") > 0, "poller adopted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let corr = slot.lock().unwrap().take().unwrap();
+        (h, corr)
+    }
+
+    fn post(path: &str, body: &serde_json::Value) -> Request<Body> {
+        post_json(path, OPERATOR_TOKEN, body)
+    }
+
+    #[tokio::test]
+    async fn plan_reports_class2_with_zero_wire_calls() {
+        let transport = scripted();
+        let (h, _corr) = running_harness(&transport).await;
+        let before = transport.requests().len();
+
+        let resp = send(
+            &h.router,
+            post(
+                "/api/v1/devices/dev-foyer/set-mode/plan",
+                &json!({ "mode": "decoder" }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["impact"], "c2", "{body}");
+        assert_eq!(body["requires_ack"], true, "{body}");
+        assert!(body["detail"].as_str().unwrap().contains("index 3"), "{body}");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(transport.requests().len(), before, "plan makes no wire call");
+    }
+
+    #[tokio::test]
+    async fn plan_for_a_device_without_a_spare_index_is_dev_and_needs_no_ack() {
+        let h = harness();
+        seed_device(&h, "dev-foyer").await;
+        let resp = send(
+            &h.router,
+            post(
+                "/api/v1/devices/dev-foyer/set-mode/plan",
+                &json!({ "mode": "decoder" }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["impact"], "dev", "{body}");
+        assert_eq!(body["requires_ack"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn plan_is_object_authorized_and_404s_unknown_devices() {
+        let h = harness();
+        let resp = send(
+            &h.router,
+            post("/api/v1/devices/nope/set-mode/plan", &json!({ "mode": "decoder" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = send(
+            &h.router,
+            post_json(
+                "/api/v1/devices/nope/set-mode/plan",
+                VIEWER_TOKEN,
+                &json!({ "mode": "decoder" }),
+            ),
+        )
+        .await;
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::NOT_FOUND,
+            "a viewer may plan (read-only)"
+        );
+    }
+
+    #[tokio::test]
+    async fn class2_apply_without_the_ack_is_refused_and_dispatches_nothing() {
+        let transport = scripted();
+        let (h, _corr) = running_harness(&transport).await;
+        let before = transport.requests().len();
+
+        for body in [
+            json!({ "mode": "decoder" }),
+            json!({ "mode": "decoder", "ack_impact": "dev" }),
+        ] {
+            let resp = send(&h.router, post("/api/v1/devices/dev-foyer/set-mode", &body)).await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{body}");
+            let problem = body_json(resp).await;
+            let detail = problem["detail"].as_str().unwrap();
+            assert!(
+                detail.contains("c2") && detail.contains("index 3"),
+                "the refusal carries the impact: {problem}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(transport.requests().len(), before, "nothing was dispatched");
+    }
+
+    #[tokio::test]
+    async fn acked_apply_dispatches_and_correlates_the_outcome() {
+        let transport = scripted();
+        let (h, corr) = running_harness(&transport).await;
+
+        let resp = send(
+            &h.router,
+            post(
+                "/api/v1/devices/dev-foyer/set-mode",
+                &json!({ "mode": "decoder", "ack_impact": "c2" }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp).await;
+        assert_eq!(body["impact"], "c2");
+        for _ in 0..200 {
+            if transport
+                .requests()
+                .iter()
+                .any(|r| r.body.get("opt") == Some(&json!("streamplay_switch")))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .any(|r| r.body.get("opt") == Some(&json!("streamplay_switch"))),
+            "the acked apply dispatched the index-scoped switch"
+        );
+        // The outcome (Finished/Failed) is correlated to this operation id.
+        let op = corr
+            .resolve(
+                &CorrKey::DeviceMode {
+                    device_id: "dev-foyer".to_owned(),
+                },
+                u64::MAX,
+            )
+            .expect("a device.mode outcome correlation was recorded");
+        assert_eq!(op.as_str(), body["operation_id"].as_str().unwrap());
+    }
 }

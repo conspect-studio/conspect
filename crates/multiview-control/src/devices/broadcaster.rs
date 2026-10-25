@@ -157,6 +157,37 @@ impl DeviceBroadcaster {
         self.publish_indexed_mode(device_id, mode, index, ModePhase::Failed)
     }
 
+    /// Publish `device.mode` Failed for an index-scoped convergence that was
+    /// refused or failed, carrying the typed `reason` after the declared impact
+    /// statement (issue #55 / inv #11: every accepted operation gets an
+    /// outcome). With a known spare `index` the impact is Class-2; with none
+    /// configured nothing was ever going to be touched, so it is DEV-class.
+    #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
+    pub fn mode_indexed_refused(
+        &self,
+        device_id: &str,
+        mode: &str,
+        index: Option<u32>,
+        reason: &str,
+    ) -> u64 {
+        let (impact, declared) = index.map_or_else(
+            || (ImpactClass::Device, mode_impact_detail(device_id, mode)),
+            |i| {
+                (
+                    ImpactClass::Class2,
+                    indexed_switch_impact_detail(device_id, i, mode),
+                )
+            },
+        );
+        self.publish_mode_with(
+            device_id,
+            mode,
+            ModePhase::Failed,
+            impact,
+            format!("{declared}; not applied: {reason}"),
+        )
+    }
+
     /// Publish a `device.mode` event in `phase`, carrying the DEV-class impact
     /// and the declared-impact statement (ADR-M009).
     fn publish_mode(&self, device_id: &str, mode: &str, phase: ModePhase) -> u64 {

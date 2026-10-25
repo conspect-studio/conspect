@@ -677,6 +677,23 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
     /// [`ConvergenceError::Wire`] if the grounded read or the switch fails on
     /// the wire.
     pub async fn converge_indexed(&self) -> Result<(), ConvergenceError> {
+        let result = self.converge_indexed_inner().await;
+        // Every accepted operation gets an outcome (inv #11): an unsuccessful
+        // indexed convergence — a fail-safe refusal or a wire failure —
+        // publishes exactly one `device.mode` Failed carrying the typed reason.
+        // (The inner steps never publish Failed themselves.)
+        if let Err(err) = &result {
+            self.broadcaster.mode_indexed_refused(
+                &self.device_id,
+                WorkMode::Decoder.as_str(),
+                self.spare_decode_index,
+                &err.to_string(),
+            );
+        }
+        result
+    }
+
+    async fn converge_indexed_inner(&self) -> Result<(), ConvergenceError> {
         // Fail-safe FIRST (inv #11): a device with no configured spare index is
         // never touched — not even a decode-table read. Guessing an index on a
         // single-active decoder would stop a live production decode.
@@ -746,8 +763,6 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
             )
             .await
         {
-            self.broadcaster
-                .mode_indexed_failed(&self.device_id, mode, index);
             self.publish_failure(&err);
             return Err(err.into());
         }
@@ -815,16 +830,12 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         match result {
             Ok(Some(WorkMode::Decoder)) => Ok(()),
             Ok(observed) => {
-                self.broadcaster
-                    .mode_indexed_failed(&self.device_id, mode, index);
                 Err(ConvergenceError::WorkmodeNotReflected {
                     device_id: self.device_id.clone(),
                     observed: observed.map_or("unknown", WorkMode::as_str).to_owned(),
                 })
             }
             Err(err) => {
-                self.broadcaster
-                    .mode_indexed_failed(&self.device_id, mode, index);
                 self.publish_failure(&err);
                 Err(err.into())
             }
