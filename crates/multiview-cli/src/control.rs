@@ -1017,11 +1017,10 @@ fn resolve_and_apply(config: &MultiviewConfig, drive: &mut CompositorDrive<Nv12I
 ///   [`SubtitleLayer::repoint`](multiview_overlay::SubtitleLayer) the
 ///   [`RouteApplier`] drives in-engine). Without a seam (the software-engine path,
 ///   which renders no subtitles) the route is a logged held action, never a panic.
-/// * [`Command::RouteAudio`] desugars to [`RouteIntent::Audio`] but the run path
-///   wires **no per-source audio crosspoint** yet (program audio is silence —
-///   there is no per-source `AudioStore` to re-point onto, the run-side audio
-///   ingest is RT-5/RT-8b, unbuilt). It is therefore a **surfaced** held action
-///   (`tracing::warn!` naming the missing crosspoint), never a silent drop.
+/// * [`Command::RouteAudio`] resolves a configured channel and source's live
+///   audio store, then publishes to the bounded audio control slot. The consumer
+///   calls `ProgramBus::repoint_crossfade` before the next audio tick. Without
+///   program audio or a known store/target, it is a logged held action.
 /// * [`Command::ApplyLayout`] **with a route-resolved document** (ADR-W019)
 ///   swaps the STORED layout in at the frame boundary — geometry, bindings,
 ///   cell ids, and per-cell `on_loss` slates — in O(cells) with no I/O and no
@@ -1108,6 +1107,27 @@ pub fn command_drain_with_live_sources_and_players(
     }
 }
 
+/// Build the non-overlay full run with its live audio slot as well as source
+/// and player seams. The legacy form remains for software-only callers.
+#[cfg(feature = "ffmpeg")]
+#[allow(clippy::implicit_hasher)]
+pub fn command_drain_with_audio_and_players(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_audio_route(audio_route)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
 /// Build the per-tick control hook **with the live overlay seam** (ADR-W022)
 /// threaded in, so `UpsertOverlay`/`RemoveOverlay` apply to the running
 /// engine: the drain mirrors the document into the working overlay set and
@@ -1152,7 +1172,7 @@ pub fn command_drain_with_live_overlays(
 /// rendering) wires the plain [`command_drain`].
 // The player-mailbox map always originates from `Pipeline::player_mailboxes()`
 // (the default hasher); generalizing over the hasher buys no caller anything.
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
 pub fn command_drain_with_seams(
     commands: CommandReceiver,
@@ -1161,6 +1181,7 @@ pub fn command_drain_with_seams(
     subtitle_route: Arc<
         multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>,
     >,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     overlays: crate::live_overlays::OverlayApplySlot,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<
@@ -1170,6 +1191,7 @@ pub fn command_drain_with_seams(
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
         .with_subtitle_route(subtitle_route)
+        .with_audio_route(audio_route)
         .with_live_overlays(overlays)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
@@ -1236,8 +1258,8 @@ fn map_transport_verb(
 ///   (RT-6);
 /// * **subtitle** → the run's live [`SubtitleRouteHandle`](crate::captions::SubtitleRouteHandle)
 ///   seam (RT-10b), when one is threaded in via [`command_drain_with_seams`];
-/// * **audio** → a surfaced held action (the run wires no per-source audio
-///   crosspoint yet — RT-5/RT-8b), never a silent drop.
+/// * **audio** → a bounded, wait-free audio mailbox drained by the bake consumer
+///   immediately before the next sample-aligned `ProgramBus` tick.
 ///
 /// Geometry-changing commands (`ApplyLayout`) still re-solve, exactly as before.
 pub struct CommandDrain {
@@ -1261,6 +1283,10 @@ pub struct CommandDrain {
     subtitle_route: Option<
         Arc<multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>>,
     >,
+    /// Non-blocking audio re-point seam, published at run startup.
+    #[cfg(feature = "ffmpeg")]
+    audio_route:
+        Option<Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>>,
     /// The live-source producer seam (ADR-W018), when wired
     /// ([`command_drain_with_live_sources`] / [`command_drain_with_seams`]): the
     /// bounded, non-blocking handle to the off-thread
@@ -1310,6 +1336,8 @@ impl CommandDrain {
             resolution: RouteResolution::default(),
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             subtitle_route: None,
+            #[cfg(feature = "ffmpeg")]
+            audio_route: None,
             live_sources: None,
             live_overlays: None,
             player_mailboxes: std::collections::HashMap::new(),
@@ -1366,6 +1394,19 @@ impl CommandDrain {
         >,
     ) -> Self {
         self.subtitle_route = Some(subtitle_route);
+        self
+    }
+
+    /// Thread the run-owned bus's resolved, non-blocking audio command slot in.
+    #[cfg(feature = "ffmpeg")]
+    #[must_use]
+    fn with_audio_route(
+        mut self,
+        audio_route: Arc<
+            multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>,
+        >,
+    ) -> Self {
+        self.audio_route = Some(audio_route);
         self
     }
 
@@ -1609,23 +1650,7 @@ impl CommandDrain {
                 ref target,
                 ref source,
                 ..
-            } => {
-                // RT-11: `RouteAudio` desugars to `RouteIntent::Audio` and the
-                // canonical apply is `RouteApplier::apply_audio` →
-                // `ProgramBus::repoint_crossfade`. BUT the run wires **no per-source
-                // audio crosspoint** yet: program audio is silence (there is no
-                // per-source `AudioStore` to re-point onto), and the program bus is
-                // owned off-thread by the bake consumer with no re-point seam. The
-                // run-side audio ingest (per-source decode → `AudioStore` → bus
-                // registration) is RT-5/RT-8b, not built. Surface the held route
-                // loudly — NEVER a silent drop — naming the missing crosspoint.
-                tracing::warn!(
-                    target = %target,
-                    source = ?source,
-                    "route_audio held: the run has no per-source audio crosspoint yet \
-                     (program audio is silence; per-source audio ingest is RT-5/RT-8b)"
-                );
-            }
+            } => self.route_audio(target, source),
             Command::RouteSubtitle {
                 ref layer,
                 ref source,
@@ -2171,16 +2196,31 @@ impl CommandDrain {
             }));
     }
 
-    /// Apply a `RouteSubtitle` by driving the run's live subtitle re-point seam
-    /// (RT-10b): re-point the layer rendered into `layer` to the cues of the source
-    /// `source` resolves to.
-    ///
-    /// The seam ([`SubtitleRouteHandle`](crate::captions::SubtitleRouteHandle)) is
-    /// the thread-safe bridge to the bake consumer's `SubtitleRouter`, which applies
-    /// the re-point at its next sample boundary via the engine
-    /// [`SubtitleLayer::repoint`](multiview_overlay::SubtitleLayer) (CLEAR-on-switch
-    /// at the seam). Publishing is wait-free + bounded drop-oldest, so it can never
-    /// pace or stall the output clock (invariants #1/#10). The run's `SubtitleRouter`
+    /// Publish a resolved audio re-point without borrowing the consumer-owned bus.
+    /// The one-store-per-source run supports Best (not arbitrary alternate tracks).
+    #[cfg(feature = "ffmpeg")]
+    fn route_audio(&self, target: &str, source: &multiview_config::routing::StreamRef) {
+        let Some(handle) = self.audio_route.as_ref().and_then(|slot| slot.load()) else {
+            tracing::warn!(target, "route_audio held: program audio is not running");
+            return;
+        };
+        if !matches!(
+            source.selector,
+            multiview_config::routing::StreamSelector::Best
+        ) || source.kind != multiview_core::stream::StreamKind::Audio
+            || !handle.request_route(target, &source.input_id, 480)
+        {
+            tracing::warn!(target, source = ?source, "route_audio held: unknown channel, source or track");
+        }
+    }
+
+    #[cfg(not(feature = "ffmpeg"))]
+    #[allow(clippy::unused_self)]
+    fn route_audio(&self, target: &str, _source: &multiview_config::routing::StreamRef) {
+        tracing::warn!(target, "route_audio held: this build has no program audio");
+    }
+
+    /// Apply a `RouteSubtitle` through the live re-point seam. The router
     /// keys layers + sources by source id, so the subtitle `StreamRef`'s `input_id`
     /// names the target source (selector resolution to a specific track within a
     /// source is the run-side caption-track work; identity-by-source is today's
@@ -2521,6 +2561,68 @@ input_id = "in_b"
     /// The matching canvas for `TWO_CELL_DOC` (64x64 @ 25/1).
     fn matching_canvas() -> serde_json::Value {
         serde_json::json!({ "width": 64, "height": 64, "fps": "25/1" })
+    }
+
+    /// A real command drained on the clock publishes a resolved re-point to the
+    /// off-thread consumer, which applies the crossfade before its next audio tick.
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn route_audio_command_reaches_program_bus_crossfade_without_clock_wait() {
+        use multiview_config::routing::StreamRef;
+        use multiview_core::stream::StreamKind;
+        let old = crate::audio::new_store();
+        let incoming = crate::audio::new_store();
+        // Different steady signals show the crossfade replaces, not appends, the
+        // target channel; tick_to(3) also catches up a dropped video tick.
+        old.publish_samples(&vec![0.25; 48_000 * 2])
+            .expect("old audio");
+        incoming
+            .publish_samples(&vec![0.75; 48_000 * 2])
+            .expect("incoming audio");
+        let mut bus = multiview_audio::ProgramBus::new(
+            crate::audio::canonical_format(),
+            multiview_core::time::Rational::new(25, 1),
+        );
+        let point = bus.add_source("in_a", Arc::clone(&old), 1.0);
+        let mut channels = std::collections::HashMap::new();
+        channels.insert("in_a".to_owned(), point);
+        let mut stores = std::collections::HashMap::new();
+        stores.insert("in_a".to_owned(), old);
+        stores.insert("in_b".to_owned(), Arc::clone(&incoming));
+        let handle = Arc::new(crate::audio::AudioControlHandle::from_sources(
+            stores, channels,
+        ));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(Some(Arc::clone(
+            &handle,
+        ))));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, test_config(), publisher).with_audio_route(slot);
+        let mut drive = test_drive(&test_config());
+        sender
+            .try_submit(Command::RouteAudio {
+                op: OperationId::new(),
+                target: "in_a".to_owned(),
+                source: StreamRef::best("in_b", StreamKind::Audio),
+                gain_db: 0.0,
+                mute: false,
+            })
+            .expect("submit audio breakaway");
+        drain.apply(&mut drive);
+        assert_eq!(handle.apply_pending(&mut bus), 1);
+        // The live edge is intentionally seeked on re-point; fresh decoder audio
+        // arriving after that edge is sampled without replaying stale history.
+        incoming
+            .publish_samples(&vec![0.75; 5_760 * 2])
+            .expect("fresh audio");
+        let block = bus.tick_to(3);
+        assert_eq!(block.frame_count(), 5_760);
+        assert!(block
+            .interleaved()
+            .iter()
+            .skip(480 * 2)
+            .all(|sample| (*sample - 0.75).abs() < 0.001));
     }
 
     /// ADR-W019: an `ApplyLayout` carrying a stored, route-solved document swaps

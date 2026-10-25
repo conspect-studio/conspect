@@ -64,6 +64,110 @@ pub(crate) fn new_store() -> Arc<AudioStore> {
     Arc::new(AudioStore::new(canonical_format(), STORE_CAPACITY_FRAMES))
 }
 
+/// Maximum unresolved operator re-points retained while the bake consumer is slow.
+pub(crate) const MAX_AUDIO_REPOINT_BACKLOG: usize = 256;
+
+#[derive(Clone)]
+struct AudioRepoint {
+    point: multiview_audio::RoutePoint,
+    store: Arc<AudioStore>,
+    ramp_frames: usize,
+}
+
+/// Non-blocking, bounded drop-oldest mailbox between the control drain and the
+/// bake-consumer-owned program bus. No lock or client is shared with the clock.
+#[derive(Clone)]
+pub struct AudioControlHandle {
+    pending: Arc<multiview_framestore::SwapCell<Arc<Vec<AudioRepoint>>>>,
+    sources: Arc<std::collections::HashMap<String, Arc<AudioStore>>>,
+    channels: Arc<std::collections::HashMap<String, multiview_audio::RoutePoint>>,
+}
+
+impl Default for AudioControlHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioControlHandle {
+    /// Create an empty mailbox; route resolution is installed at run startup.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::from_sources(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// Create the run's source and destination registry, keyed by configured ids.
+    #[must_use]
+    pub fn from_sources(
+        sources: std::collections::HashMap<String, Arc<AudioStore>>,
+        channels: std::collections::HashMap<String, multiview_audio::RoutePoint>,
+    ) -> Self {
+        Self {
+            pending: Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new())),
+            sources: Arc::new(sources),
+            channels: Arc::new(channels),
+        }
+    }
+
+    /// Resolve a command against the run's actual channels and per-source stores.
+    /// A missing target/source stays held, never silently binds a wrong source.
+    #[must_use]
+    pub fn request_route(&self, target: &str, source_id: &str, ramp_frames: usize) -> bool {
+        let (Some(&point), Some(store)) = (self.channels.get(target), self.sources.get(source_id))
+        else {
+            return false;
+        };
+        self.request_repoint(point, Arc::clone(store), ramp_frames);
+        true
+    }
+
+    /// Publish a resolved re-point; a wedged consumer cannot block the producer.
+    pub fn request_repoint(
+        &self,
+        point: multiview_audio::RoutePoint,
+        store: Arc<AudioStore>,
+        ramp_frames: usize,
+    ) {
+        let current = self.pending.load();
+        let mut next = current.as_ref().clone();
+        if next.len() >= MAX_AUDIO_REPOINT_BACKLOG {
+            next.remove(0);
+        }
+        next.push(AudioRepoint {
+            point,
+            store,
+            ramp_frames,
+        });
+        self.pending.store(Arc::new(next));
+    }
+
+    /// Apply before the next audio tick, on the sole bus-owning bake consumer.
+    pub fn apply_pending(&self, bus: &mut multiview_audio::program::ProgramBus) -> usize {
+        let pending = self.pending.swap(Arc::new(Vec::new()));
+        let mut applied = 0;
+        for request in pending.iter() {
+            if let Err(error) = bus.repoint_crossfade(
+                request.point,
+                Arc::clone(&request.store),
+                request.ramp_frames,
+            ) {
+                tracing::warn!(%error, "audio route held: unknown program channel");
+            } else {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.load().len()
+    }
+}
+
 #[cfg(test)]
 mod route_seam_tests {
     use super::*;
@@ -80,8 +184,14 @@ mod route_seam_tests {
         handle.request_repoint(point, Arc::clone(&incoming), 480);
         assert_eq!(handle.apply_pending(&mut bus), 1);
         let after = bus.tick_to(13);
-        assert_eq!(before.frame_count() + after.frame_count(),
-            multiview_audio::cadence::SampleClock::new(48_000, Rational::new(30_000, 1001)).total_at(14) as usize);
+        assert_eq!(
+            before.frame_count() + after.frame_count(),
+            usize::try_from(
+                multiview_audio::cadence::SampleClock::new(48_000, Rational::new(30_000, 1001))
+                    .total_at(13)
+            )
+            .expect("small test sample budget")
+        );
         assert_eq!(handle.apply_pending(&mut bus), 0);
     }
 
@@ -95,6 +205,17 @@ mod route_seam_tests {
             handle.request_repoint(point, Arc::clone(&store), 480);
         }
         assert!(handle.pending_len() <= MAX_AUDIO_REPOINT_BACKLOG);
+        // Simulate a permanently wedged consumer: publishing 1024 commands
+        // above did not await it, and the independent output tick clock still
+        // advances its exact rational sample budget without applying commands.
+        let mut emitted = 0;
+        for tick in 1..=120 {
+            emitted += bus.tick_to(tick).frame_count();
+        }
+        assert_eq!(
+            u64::try_from(emitted).expect("small test sample budget"),
+            multiview_audio::cadence::SampleClock::new(48_000, Rational::new(25, 1)).total_at(120)
+        );
     }
 }
 

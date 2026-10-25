@@ -668,15 +668,17 @@ async fn run_pipeline_until_ctrl_c(
             config.clone(),
             Arc::clone(&publisher),
             pipeline.subtitle_route_slot(),
+            pipeline.audio_route_slot(),
             pipeline.overlay_apply_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
         ));
         #[cfg(not(feature = "overlay"))]
-        let drain: ControlDrain = Box::new(control::command_drain_with_live_sources_and_players(
+        let drain: ControlDrain = Box::new(control::command_drain_with_audio_and_players(
             command_rx,
             config.clone(),
             Arc::clone(&publisher),
+            pipeline.audio_route_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
         ));

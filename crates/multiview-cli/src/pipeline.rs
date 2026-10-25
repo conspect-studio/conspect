@@ -1695,6 +1695,8 @@ pub struct Pipeline {
     /// silence-fills past what was published). Empty when this run did not opt into
     /// program audio.
     audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+    /// Published at drive start; control reads without locking or waiting on bake.
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     /// Per-source **audio** ingest plans (AUD-2): how to open + decode each
     /// source's audio. The drive starts one audio decode thread per plan
     /// (alongside the video decode thread) writing into [`Self::audio_stores`].
@@ -2503,6 +2505,7 @@ impl Pipeline {
             #[cfg(feature = "webrtc-native")]
             egress_registry,
             audio_stores,
+            audio_route: Arc::new(multiview_framestore::SwapCell::empty()),
             audio_ingest_plans,
             tone_ingest_plans,
             player_audio_ingest_plans,
@@ -2990,6 +2993,15 @@ impl Pipeline {
         self.subtitle_route.load()
     }
 
+    /// Shared audio re-point rendezvous; published on drive start only when the
+    /// run has program audio. The clock only loads/publishes a bounded RCU slot.
+    #[must_use]
+    pub fn audio_route_slot(
+        &self,
+    ) -> Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>> {
+        Arc::clone(&self.audio_route)
+    }
+
     /// RT-10b: the **shared** subtitle re-point slot (the `Arc` behind
     /// [`subtitle_route_handle`](Self::subtitle_route_handle)).
     ///
@@ -3391,11 +3403,16 @@ impl Pipeline {
             // runtime. Sorted for a deterministic route order across runs.
             let mut ids: Vec<&String> = self.audio_stores.keys().collect();
             ids.sort_unstable();
+            let mut channels = std::collections::HashMap::new();
             for id in ids {
                 if let Some(store) = self.audio_stores.get(id) {
-                    let _ = bus.add_source(id.clone(), Arc::clone(store), 1.0);
+                    let point = bus.add_source(id.clone(), Arc::clone(store), 1.0);
+                    channels.insert(id.clone(), point);
                 }
             }
+            self.audio_route.store(Some(Arc::new(
+                crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels),
+            )));
             bus
         });
         // The program-bus loudness normaliser (AUD-6): pair one with the audio bus
@@ -3508,6 +3525,7 @@ impl Pipeline {
             policy,
             encoder,
             audio_bus,
+            self.audio_route.load(),
             audio_loudnorm,
             audio_loudness,
             loudness_publisher,
@@ -4345,6 +4363,7 @@ impl StreamEgress {
         policy: SendPolicy,
         encoder: ProgramEncoder,
         audio_bus: Option<multiview_audio::program::ProgramBus>,
+        audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
         audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
         audio_loudness: Option<crate::loudness_telemetry::LoudnessTelemetry>,
         loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
@@ -4409,6 +4428,7 @@ impl StreamEgress {
                     sink_txs,
                     encoder,
                     audio_bus,
+                    audio_route,
                     audio_loudnorm,
                     audio_loudness,
                     loudness_publisher,
@@ -4684,6 +4704,7 @@ fn consumer_main(
     sink_txs: Vec<SyncSender<EncodedPacket>>,
     mut encoder: ProgramEncoder,
     mut audio_bus: Option<multiview_audio::program::ProgramBus>,
+    audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
     mut audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
     mut audio_loudness: Option<crate::loudness_telemetry::LoudnessTelemetry>,
     loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
@@ -4734,6 +4755,12 @@ fn consumer_main(
         // the bake consumer, never on the output-clock loop. `None` (audio off) skips
         // this entirely — the run is video-only as before.
         if let Some(bus) = audio_bus.as_mut() {
+            // Apply resolved operator commands at this sample boundary before
+            // advancing the absolute tick clock. A stalled consumer merely sheds
+            // bounded pending commands; it never holds the output clock (#1/#10).
+            if let Some(handle) = audio_route.as_ref() {
+                handle.apply_pending(bus);
+            }
             let block = drive_audio_for_item(bus, item.tick_index);
             // EBU R128 loudness normalisation of the PROGRAM bus (AUD-6), still off
             // the engine hot loop (this bake-consumer thread): a smoothed makeup
