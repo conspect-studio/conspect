@@ -261,6 +261,8 @@ impl IdempotencyStore {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
+    use std::time::{Duration, Instant};
+
     use super::{IdempotencyStore, Reservation, Version};
 
     #[test]
@@ -342,5 +344,98 @@ mod tests {
             matches!(store.reserve(key), Reservation::Replay(replayed) if replayed == live_op),
             "the live reservation survives a stale release"
         );
+    }
+
+    #[test]
+    fn capacity_cap_holds_under_ten_times_inserts() {
+        let cap = 50;
+        let store = IdempotencyStore::with_limits(Duration::from_secs(3600), cap);
+        let now = Instant::now();
+        for i in 0..cap * 10 {
+            let _ = store.reserve_at(Some(&format!("k{i}")), now);
+            assert!(store.len() <= cap, "entry count must never exceed the cap");
+        }
+        assert_eq!(store.len(), cap, "memory stays bounded at the cap");
+    }
+
+    #[test]
+    fn eviction_is_oldest_first() {
+        let store = IdempotencyStore::with_limits(Duration::from_secs(3600), 3);
+        let now = Instant::now();
+        let store = IdempotencyStore::with_limits(Duration::from_secs(3600), 3);
+        for k in ["a", "b", "c"] {
+            let _ = store.reserve_at(Some(k), now);
+        }
+        let _ = store.reserve_at(Some("d"), now);
+        assert!(matches!(store.reserve_at(Some("b"), now), Reservation::Replay(_)));
+        assert!(matches!(store.reserve_at(Some("c"), now), Reservation::Replay(_)));
+        assert!(matches!(store.reserve_at(Some("d"), now), Reservation::Replay(_)));
+        assert!(
+            matches!(store.reserve_at(Some("a"), now), Reservation::Fresh(_)),
+            "the oldest key was evicted and is treated as new"
+        );
+    }
+
+    #[test]
+    fn an_expired_key_is_treated_as_new() {
+        let ttl = Duration::from_secs(60);
+        let store = IdempotencyStore::with_limits(ttl, 100);
+        let t0 = Instant::now();
+        let Reservation::Fresh(first) = store.reserve_at(Some("k"), t0) else {
+            panic!("fresh");
+        };
+        let Reservation::Fresh(second) = store.reserve_at(Some("k"), t0 + ttl + Duration::from_secs(1))
+        else {
+            panic!("an expired key must reserve Fresh again");
+        };
+        assert_ne!(first, second, "expiry mints a new operation id");
+        assert_eq!(store.len(), 1, "the expired entry was replaced, not leaked");
+    }
+
+    #[test]
+    fn within_the_ttl_a_replay_returns_the_original_acceptance() {
+        let ttl = Duration::from_secs(60);
+        let store = IdempotencyStore::with_limits(ttl, 100);
+        let t0 = Instant::now();
+        let Reservation::Fresh(op) = store.reserve_at(Some("k"), t0) else {
+            panic!("fresh");
+        };
+        for secs in [1, 30, 59] {
+            assert!(
+                matches!(
+                    store.reserve_at(Some("k"), t0 + Duration::from_secs(secs)),
+                    Reservation::Replay(ref r) if *r == op
+                ),
+                "replay at +{secs}s must return the original op, not re-execute"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_entries_are_swept_on_insert() {
+        let ttl = Duration::from_secs(60);
+        let store = IdempotencyStore::with_limits(ttl, 1000);
+        let t0 = Instant::now();
+        for i in 0..100 {
+            let _ = store.reserve_at(Some(&format!("k{i}")), t0);
+        }
+        assert_eq!(store.len(), 100);
+        let _ = store.reserve_at(Some("late"), t0 + ttl + Duration::from_secs(1));
+        assert_eq!(store.len(), 1, "expired keys are evicted lazily on insert");
+    }
+
+    #[test]
+    fn release_and_rebind_keep_the_store_consistent() {
+        let store = IdempotencyStore::with_limits(Duration::from_secs(3600), 2);
+        let now = Instant::now();
+        let Reservation::Fresh(a) = store.reserve_at(Some("a"), now) else {
+            panic!("fresh");
+        };
+        store.release(Some("a"), &a);
+        assert_eq!(store.len(), 0);
+        for k in ["x", "y", "z"] {
+            let _ = store.reserve_at(Some(k), now);
+        }
+        assert_eq!(store.len(), 2);
     }
 }
