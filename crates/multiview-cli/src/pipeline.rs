@@ -14490,9 +14490,12 @@ segment_ms = 1000
         explicit.programs = config.effective_programs();
         let declared = Pipeline::build(&explicit).expect("explicit main program builds");
         assert_eq!(implicit.program_spec, declared.program_spec);
+        explicit.programs[0].id = "aux".try_into().unwrap();
+        let aux = Pipeline::build(&explicit).expect("aux-only program builds");
+        assert_eq!(aux.program_id().as_str(), "aux");
 
         explicit.programs.push(explicit.programs[0].clone());
-        explicit.programs[1].id = "aux".try_into().unwrap();
+        explicit.programs[1].id = "main".try_into().unwrap();
         let err = Pipeline::build(&explicit).err().expect("N>1 awaits MP-7");
         assert!(err.to_string().contains("MP-7"), "{err}");
     }
