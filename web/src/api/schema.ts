@@ -3165,6 +3165,13 @@ export interface components {
             /** @description Stable device id; may be omitted (the path id is injected). */
             id?: string | null;
             reconnect?: null | components["schemas"]["ReconnectPolicyDoc"];
+            /**
+             * Format: int32
+             * @description The explicit spare decode index targeted by an index-scoped `zowietek`
+             *     decoder convergence (issue #55). Absent ⇒ the driver never guesses an
+             *     index and refuses rather than disrupt an unknown decode.
+             */
+            spare_decode_index?: number | null;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::DeviceDriver`] (ADR-M008): the

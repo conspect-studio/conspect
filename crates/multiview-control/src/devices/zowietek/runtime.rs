@@ -439,7 +439,11 @@ impl DevicePollerFactory for ReqwestPollerFactory {
         )
         // Thread the config-as-code desired_mode: the poller converges the
         // device onto it whenever adopt/reconnect reaches ONLINE.
-        .with_desired_mode(device.desired_mode.clone());
+        .with_desired_mode(device.desired_mode.clone())
+        // Thread the explicit spare decode index: an index-scoped decoder
+        // convergence names this index and refuses (before any wire I/O) when
+        // it is absent or cannot be determined (issue #55).
+        .with_spare_decode_index(device.spare_decode_index);
         Some(poller.spawn())
     }
 }

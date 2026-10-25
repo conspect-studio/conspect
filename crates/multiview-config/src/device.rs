@@ -2,8 +2,9 @@
 //! for operator-adopted hardware (ADR-M008; managed-devices brief §2, §7.3).
 //!
 //! A [`Device`] carries **desired state only** — driver, address, write-only
-//! credential ref, desired mode, offline-alarm severity, reconnect policy,
-//! and display assignment. Runtime state (online state, firmware,
+//! credential ref, desired mode, the explicit spare decode index an
+//! index-scoped convergence may target, offline-alarm severity, reconnect
+//! policy, and display assignment. Runtime state (online state, firmware,
 //! temperature, current streams, achieved skew, discovered-but-unadopted
 //! inventory, ad-hoc cast sessions) has **no representation in this model**,
 //! so a config export can only ever emit what was authored; credentials only
@@ -208,6 +209,21 @@ pub struct Device {
     /// keeps its current mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_mode: Option<String>,
+    /// The explicit **spare decode index** the index-scoped convergence targets
+    /// when converging a `zowietek` **decoder** onto `desired_mode` (issue #55,
+    /// upstream `aperim/multiview#140`).
+    ///
+    /// The vendor decoder is single-active: activating a decode index makes it
+    /// the decoder's sole active decode and stops whatever was playing, so the
+    /// driver must name the index deliberately. This field is the operator's
+    /// declaration of which index is safe to take (a spare input), and the
+    /// driver refuses to converge — before any wire I/O — whenever it is absent
+    /// or cannot be determined (the active index, or an index the device does
+    /// not report). Absent ⇒ the driver never guesses an index and keeps the
+    /// legacy unscoped convergence behaviour for that device. Ignored by other
+    /// driver families.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spare_decode_index: Option<u32>,
     /// The X.733 severity of the alarm raised when the device stays offline
     /// beyond the dwell, written as the lowercase device token (`"major"`;
     /// the core `PascalCase` form `"Major"` is tolerated on input). Absent ⇒

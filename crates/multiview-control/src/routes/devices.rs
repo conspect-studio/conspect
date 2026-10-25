@@ -532,7 +532,7 @@ pub(crate) async fn set_mode(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
-    require_device(&state, &id)?;
+    let device = require_device(&state, &id)?;
     let op = reserve_operation(&state, &idem);
     state.audit(
         &principal.key_id,
@@ -566,14 +566,33 @@ pub(crate) async fn set_mode(
              desired_mode converges when a poller next adopts"
         );
     }
-    // The declared DEV-class impact is the SAME statement the driver's
-    // `ModeConvergence::Switch` plan declares (both derive it from
-    // `mode_impact_detail`), so the API surfaces exactly what the driver will do
-    // — ADR-M009: the impact is declared BEFORE apply.
+    // The declared impact is the SAME statement the driver's convergence plan
+    // declares, so the API surfaces exactly what the driver will do — ADR-M009:
+    // the impact is declared BEFORE apply.
+    //
+    // A `zowietek` device that names an explicit spare decode index converges
+    // *index-scoped* (issue #55, upstream #140): the grounded
+    // `streamplay_switch{index,switch}` activates that index as the
+    // single-active decoder's sole decode and stops whatever was playing. That
+    // is Class-2 disruption, and it names the index; every other device keeps
+    // the device-side (`dev`) statement.
+    let spare_decode_index =
+        serde_json::from_value::<multiview_config::Device>(device.resource.body.clone())
+            .ok()
+            .filter(|device| {
+                device.driver == multiview_config::DeviceDriver::Zowietek
+                    && request.mode == "decoder"
+            })
+            .and_then(|device| device.spare_decode_index);
     let body = SetModeAccepted {
         operation_id: op.to_string(),
-        impact: "dev".to_owned(),
-        detail: crate::devices::broadcaster::mode_impact_detail(&id, &request.mode),
+        impact: spare_decode_index.map_or("dev", |_| "c2").to_owned(),
+        detail: spare_decode_index.map_or_else(
+            || crate::devices::broadcaster::mode_impact_detail(&id, &request.mode),
+            |index| {
+                crate::devices::broadcaster::indexed_switch_impact_detail(&id, index, &request.mode)
+            },
+        ),
     };
     Ok((StatusCode::ACCEPTED, Json(body)).into_response())
 }

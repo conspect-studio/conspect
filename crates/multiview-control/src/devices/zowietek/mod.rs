@@ -41,6 +41,7 @@
 
 pub mod client;
 pub mod poller;
+pub mod protocol;
 pub mod runtime;
 
 use std::sync::Arc;
@@ -52,7 +53,8 @@ use serde_json::Value;
 use self::client::{
     BitrateBps, RpcVerb, ZowietekClient, ZowietekClientError, ZowietekSession, ZowietekTransport,
 };
-use super::broadcaster::{mode_impact_detail, DeviceBroadcaster};
+use self::protocol::DecodeTable;
+use super::broadcaster::{indexed_switch_impact_detail, mode_impact_detail, DeviceBroadcaster};
 use super::driver_registry::DeviceDriverRegistry;
 use super::projection::{OutputTarget, SourceCandidate};
 
@@ -97,6 +99,28 @@ impl WorkMode {
             _ => None,
         }
     }
+
+    /// The vendor `workmode_id` for this mode (`encoder = 0`, `decoder = 1`),
+    /// as grounded in upstream issue #140.
+    #[must_use]
+    pub const fn wire_id(self) -> u32 {
+        match self {
+            Self::Encoder => 0,
+            Self::Decoder => 1,
+        }
+    }
+
+    /// Map a vendor `workmode_id` back to a [`WorkMode`]; `None` for an id this
+    /// driver does not recognise (the vendor table is wider than the two modes
+    /// this driver converges).
+    #[must_use]
+    pub const fn from_wire_id(workmode_id: u32) -> Option<Self> {
+        match workmode_id {
+            0 => Some(Self::Encoder),
+            1 => Some(Self::Decoder),
+            _ => None,
+        }
+    }
 }
 
 /// The plan to converge a device to a desired workmode (ADR-M009 §3.3).
@@ -123,6 +147,75 @@ pub enum ModeConvergence {
         /// The human-readable device-side impact declared before apply.
         impact_detail: String,
     },
+    /// The device must switch its decode target to a specific configured spare
+    /// index. The vendor decode table is **single-active**: activating `index`
+    /// implicitly stops whatever was playing, so this is a Class-2
+    /// (controlled-reset) convergence even though it is index-scoped and does
+    /// not touch the workmode (`streamplay_switch` in decoder workmode).
+    IndexedSwitch {
+        /// The configured spare decode index being activated.
+        index: u32,
+        /// The decode index the device reported as active, if it reported one.
+        active_index: Option<u32>,
+        /// The human-readable Class-2 impact declared before apply.
+        impact_detail: String,
+    },
+}
+
+/// Why an index-scoped decode convergence could not be grounded (fail-safe:
+/// the driver refuses rather than guessing an index on a live decoder).
+///
+/// The refusal is computed **before any wire I/O**, so a device that cannot
+/// ground its configured index is never touched.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConvergenceUngrounded {
+    /// No spare decode index is configured for the device.
+    #[error(
+        "device {device_id} has no configured spare decode index; refusing to guess a decode \
+         index on a single-active decoder"
+    )]
+    NoConfiguredIndex {
+        /// The device id whose spare index is missing.
+        device_id: String,
+    },
+    /// The configured spare index is the decode index the device reports as
+    /// active — never the active one.
+    #[error(
+        "device {device_id} is already decoding on configured spare index {index}; refusing to \
+         target the active decode index on a single-active decoder"
+    )]
+    ConfiguredIndexActive {
+        /// The device id whose configured index is active.
+        device_id: String,
+        /// The configured index, which the device reports as active.
+        index: u32,
+    },
+    /// The configured spare index is absent from the device's decode table.
+    #[error(
+        "device {device_id} does not report configured spare decode index {index}; refusing to \
+         switch an index the device does not have"
+    )]
+    ConfiguredIndexAbsent {
+        /// The device id whose configured index is absent.
+        device_id: String,
+        /// The configured index, absent from the decode table.
+        index: u32,
+        /// The decode index the device reported as active, if any.
+        active_index: Option<u32>,
+    },
+}
+
+/// A failure to converge a device's decode target.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConvergenceError {
+    /// The index-scoped plan could not be grounded; nothing was applied.
+    #[error(transparent)]
+    Ungrounded(#[from] ConvergenceUngrounded),
+    /// The decode-table read or the index-scoped switch failed on the wire.
+    #[error(transparent)]
+    Wire(#[from] ZowietekClientError),
 }
 
 impl ModeConvergence {
@@ -134,15 +227,17 @@ impl ModeConvergence {
             Self::AlreadyConverged { mode } => {
                 format!("device is already in {mode:?}; no change, no disruption")
             }
-            Self::Switch { impact_detail, .. } => impact_detail.clone(),
+            Self::Switch { impact_detail, .. } | Self::IndexedSwitch { impact_detail, .. } => {
+                impact_detail.clone()
+            }
         }
     }
 
     /// Whether applying this plan restarts the device pipeline (true for a real
-    /// switch, false for a no-op).
+    /// switch — including an index-scoped one — false for a no-op).
     #[must_use]
     pub const fn restarts_device(&self) -> bool {
-        matches!(self, Self::Switch { .. })
+        !matches!(self, Self::AlreadyConverged { .. })
     }
 }
 
@@ -163,6 +258,10 @@ pub struct ZowietekDriver<T: ZowietekTransport> {
     session: std::sync::Mutex<Option<ZowietekSession>>,
     /// The last probed workmode, cached for convergence planning.
     workmode: std::sync::Mutex<Option<WorkMode>>,
+    /// The operator-configured spare decode index this driver may activate
+    /// (issue #55). `None` means the device keeps the legacy close-before-open
+    /// convergence: the index-scoped path is never guessed.
+    spare_decode_index: Option<u32>,
 }
 
 impl<T: ZowietekTransport> ZowietekDriver<T> {
@@ -184,13 +283,33 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
             drivers,
             session: std::sync::Mutex::new(None),
             workmode: std::sync::Mutex::new(None),
+            spare_decode_index: None,
         }
+    }
+
+    /// Configure the operator-declared **spare** decode index this driver may
+    /// activate for decoder convergence (issue #55). A `#[must_use]` builder,
+    /// mirroring the poller's `with_desired_mode`, so [`ZowietekDriver::new`]
+    /// keeps its arity.
+    ///
+    /// `None` (the default) leaves the legacy behaviour untouched: convergence
+    /// never touches a decode index.
+    #[must_use]
+    pub fn with_spare_decode_index(mut self, index: Option<u32>) -> Self {
+        self.spare_decode_index = index;
+        self
     }
 
     /// The device id this driver manages.
     #[must_use]
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    /// The configured spare decode index, if any.
+    #[must_use]
+    pub const fn convergence_index(&self) -> Option<u32> {
+        self.spare_decode_index
     }
 
     /// The last probed [`WorkMode`], if any (cached at adopt/reconnect). The
@@ -373,7 +492,12 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         let session = self.session_clone()?;
         let data = self
             .client
-            .get_info(&session, "streamplay", "streamplay", Value::Null)
+            .get_info(
+                &session,
+                protocol::STREAMPLAY_GROUP,
+                protocol::STREAMPLAY_GET_ALL,
+                Value::Null,
+            )
             .await?;
         let targets = parse_decode_targets(&data);
         self.drivers
@@ -438,6 +562,134 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
             self.set_workmode(mode);
         }
         self.broadcaster.mode_finished(&self.device_id, to);
+        Ok(())
+    }
+
+    /// Plan an **index-scoped** decode convergence against the grounded decode
+    /// table (issue #55 / upstream `aperim/multiview#140`).
+    ///
+    /// The vendor decoder is single-active, so the plan targets exactly one
+    /// operator-configured spare decode index and never the active one. The
+    /// plan is refused, fail-safe, whenever the index cannot be determined:
+    /// nothing configured, the configured index is the active decode, or the
+    /// device does not report that index. The driver never guesses an index on
+    /// a single-active decoder.
+    ///
+    /// Pure (no I/O): the route calls this to surface the Class-2 disruption
+    /// before apply (inv #11).
+    ///
+    /// # Errors
+    ///
+    /// [`ConvergenceUngrounded`] for each fail-safe refusal above.
+    pub fn plan_decode_convergence(
+        &self,
+        table: &DecodeTable,
+    ) -> Result<ModeConvergence, ConvergenceUngrounded> {
+        let Some(index) = self.spare_decode_index else {
+            return Err(ConvergenceUngrounded::NoConfiguredIndex {
+                device_id: self.device_id.clone(),
+            });
+        };
+        let active_index = table.active_index();
+        if active_index == Some(index) {
+            return Err(ConvergenceUngrounded::ConfiguredIndexActive {
+                device_id: self.device_id.clone(),
+                index,
+            });
+        }
+        if !table.contains(index) {
+            return Err(ConvergenceUngrounded::ConfiguredIndexAbsent {
+                device_id: self.device_id.clone(),
+                index,
+                active_index,
+            });
+        }
+        Ok(ModeConvergence::IndexedSwitch {
+            index,
+            active_index,
+            impact_detail: indexed_switch_impact_detail(
+                &self.device_id,
+                index,
+                WorkMode::Decoder.as_str(),
+            ),
+        })
+    }
+
+    /// Converge the decode target with the **grounded** index-scoped
+    /// `streamplay_switch` (issue #55).
+    ///
+    /// Refuses **before any wire I/O** when no spare decode index is configured
+    /// (the fail-safe), then reads the grounded decode table
+    /// (`streamplay_get_all`), refuses again if the configured index is active
+    /// or absent, declares the Class-2 disruption, and activates the configured
+    /// index — which makes it the decoder's sole active decode and stops
+    /// whatever the decoder was playing.
+    ///
+    /// # Errors
+    ///
+    /// [`ConvergenceError::Ungrounded`] for a refusal (nothing was applied) or
+    /// [`ConvergenceError::Wire`] if the grounded read or the switch fails on
+    /// the wire.
+    pub async fn converge_indexed(&self) -> Result<(), ConvergenceError> {
+        // Fail-safe FIRST (inv #11): a device with no configured spare index is
+        // never touched — not even a decode-table read. Guessing an index on a
+        // single-active decoder would stop a live production decode.
+        if self.spare_decode_index.is_none() {
+            let refused = ConvergenceUngrounded::NoConfiguredIndex {
+                device_id: self.device_id.clone(),
+            };
+            tracing::warn!(
+                device = %self.device_id,
+                error = %refused,
+                "zowietek index-scoped convergence refused: no configured spare decode index"
+            );
+            return Err(refused.into());
+        }
+
+        let session = self.session_clone()?;
+        // The grounded decode-table read: a bare `opt:"streamplay"` returns an
+        // empty `data` (upstream #140 correction 1).
+        let table = DecodeTable::parse(
+            &self
+                .client
+                .get_info(
+                    &session,
+                    protocol::STREAMPLAY_GROUP,
+                    protocol::STREAMPLAY_GET_ALL,
+                    Value::Null,
+                )
+                .await?,
+        );
+        let plan = self.plan_decode_convergence(&table)?;
+        let ModeConvergence::IndexedSwitch { index, .. } = plan else {
+            // `plan_decode_convergence` only ever plans an indexed switch.
+            return Ok(());
+        };
+
+        // Surface the Class-2 (controlled-reset) disruption before applying.
+        let mode = WorkMode::Decoder.as_str();
+        self.broadcaster
+            .mode_indexed_started(&self.device_id, mode, index);
+        if let Err(err) = self
+            .client
+            .request(
+                &session,
+                RpcVerb::SetInfo,
+                protocol::STREAMPLAY_GROUP,
+                protocol::STREAMPLAY_GROUP,
+                protocol::STREAMPLAY_SWITCH,
+                protocol::StreamplaySwitch::activate(index).data(),
+            )
+            .await
+        {
+            self.broadcaster
+                .mode_indexed_failed(&self.device_id, mode, index);
+            self.publish_failure(&err);
+            return Err(err.into());
+        }
+        self.set_workmode(WorkMode::Decoder);
+        self.broadcaster
+            .mode_indexed_finished(&self.device_id, mode, index);
         Ok(())
     }
 
@@ -599,30 +851,22 @@ fn streams_healthy(data: &Value) -> bool {
     }
 }
 
-/// Parse the `/streamplay` decode table into bindable [`OutputTarget`]s. Each
-/// entry's `proto` becomes the target transport kind; the `index` names the slot.
+/// Parse the `/streamplay` decode table into bindable [`OutputTarget`]s.
+///
+/// The grounded `streamplay_get_all` shape returns the slots as `data:[…]` rows
+/// carrying `index` and a target `url` (upstream issue #140); the transport
+/// kind is the URL scheme. The older `data.entries:[{index,proto}]` shape is
+/// still accepted so a firmware that answers the legacy way keeps enumerating.
+/// A row's `index` names the slot; a row without one is skipped rather than
+/// guessed (the index is the decode target's identity and is never invented).
 fn parse_decode_targets(data: &Value) -> Vec<OutputTarget> {
-    let Some(entries) = data.get("entries").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    entries
+    DecodeTable::parse(data)
+        .rows()
         .iter()
-        .enumerate()
-        .map(|(position, entry)| {
-            let index = entry
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or_else(|| u64::try_from(position).unwrap_or(0));
-            let kind = entry
-                .get("proto")
-                .and_then(Value::as_str)
-                .unwrap_or("rtsp")
-                .to_owned();
-            OutputTarget {
-                id: format!("slot-{index}"),
-                kind,
-                label: Some(format!("decode slot {index}")),
-            }
+        .map(|row| OutputTarget {
+            id: format!("slot-{}", row.index),
+            kind: row.kind(),
+            label: Some(format!("decode slot {}", row.index)),
         })
         .collect()
 }

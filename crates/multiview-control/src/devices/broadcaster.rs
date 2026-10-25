@@ -134,15 +134,75 @@ impl DeviceBroadcaster {
         self.publish_mode(device_id, mode, ModePhase::Failed)
     }
 
+    /// Publish `device.mode` with phase `Started` for an **index-scoped**
+    /// decoder convergence. Activating a spare decode index makes it the
+    /// decoder's sole active decode, so this declares the Class-2
+    /// controlled-reset impact before apply (issue #55 / inv #11).
+    #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
+    pub fn mode_indexed_started(&self, device_id: &str, mode: &str, index: u32) -> u64 {
+        self.publish_indexed_mode(device_id, mode, index, ModePhase::Started)
+    }
+
+    /// Publish `device.mode` with phase `Finished` once an index-scoped switch
+    /// completed (the device's sole active decode is now `index`).
+    #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
+    pub fn mode_indexed_finished(&self, device_id: &str, mode: &str, index: u32) -> u64 {
+        self.publish_indexed_mode(device_id, mode, index, ModePhase::Finished)
+    }
+
+    /// Publish `device.mode` with phase `Failed` when an index-scoped switch
+    /// could not complete (the driver re-converges per its supervision policy).
+    #[allow(clippy::must_use_candidate)] // seq is informational; see `adopted`.
+    pub fn mode_indexed_failed(&self, device_id: &str, mode: &str, index: u32) -> u64 {
+        self.publish_indexed_mode(device_id, mode, index, ModePhase::Failed)
+    }
+
     /// Publish a `device.mode` event in `phase`, carrying the DEV-class impact
     /// and the declared-impact statement (ADR-M009).
     fn publish_mode(&self, device_id: &str, mode: &str, phase: ModePhase) -> u64 {
+        self.publish_mode_with(
+            device_id,
+            mode,
+            phase,
+            ImpactClass::Device,
+            mode_impact_detail(device_id, mode),
+        )
+    }
+
+    /// Publish an index-scoped `device.mode` event in `phase`, carrying the
+    /// Class-2 impact and its declared-impact statement (issue #55).
+    fn publish_indexed_mode(
+        &self,
+        device_id: &str,
+        mode: &str,
+        index: u32,
+        phase: ModePhase,
+    ) -> u64 {
+        self.publish_mode_with(
+            device_id,
+            mode,
+            phase,
+            ImpactClass::Class2,
+            indexed_switch_impact_detail(device_id, index, mode),
+        )
+    }
+
+    /// Publish a `device.mode` event in `phase` with an explicit impact class
+    /// and declared-impact statement (ADR-M009 / inv #11).
+    fn publish_mode_with(
+        &self,
+        device_id: &str,
+        mode: &str,
+        phase: ModePhase,
+        impact: ImpactClass,
+        detail: String,
+    ) -> u64 {
         self.engine.publish_event(Event::DeviceMode(DeviceMode {
             device_id: device_id.to_owned(),
             mode: mode.to_owned(),
             phase,
-            impact: ImpactClass::Device,
-            detail: Some(mode_impact_detail(device_id, mode)),
+            impact,
+            detail: Some(detail),
         }))
     }
 
@@ -231,6 +291,20 @@ pub(crate) fn mode_impact_detail(device_id: &str, mode: &str) -> String {
         "device {device_id} restarts its pipeline to converge to {mode:?}; bound sources from \
          this device ride the tile ladder to NO_SIGNAL during the switch; no Multiview outputs \
          are affected"
+    )
+}
+
+/// The human-readable Class-2 impact statement declared before an
+/// **index-scoped** decode convergence (issue #55 / inv #11): the vendor
+/// decoder is single-active, so activating spare decode index `index` makes it
+/// the sole active decode and stops whatever the decoder was playing. Multiview
+/// program output is never interrupted.
+#[must_use]
+pub(crate) fn indexed_switch_impact_detail(device_id: &str, index: u32, mode: &str) -> String {
+    format!(
+        "device {device_id} is a single-active decoder: activating spare decode index {index} to \
+         converge to {mode:?} makes it the sole active decode and stops whatever index the \
+         decoder is currently playing; no Multiview outputs are affected"
     )
 }
 

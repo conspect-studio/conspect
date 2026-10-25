@@ -10269,6 +10269,15 @@
                 "description": "Supervised-reconnect backoff bounds; absent uses the driver defaults."
               }
             ]
+          },
+          "spare_decode_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The explicit spare decode index targeted by an index-scoped `zowietek`\ndecoder convergence (issue #55). Absent ⇒ the driver never guesses an\nindex and refuses rather than disrupt an unknown decode.",
+            "minimum": 0
           }
         }
       },

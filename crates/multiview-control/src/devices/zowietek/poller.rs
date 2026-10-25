@@ -495,12 +495,14 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
                 // every later adopt/reconnect pass re-converges onto the last
                 // operator intent (and a failed apply below is retried there).
                 self.desired_mode = Some(mode.clone());
-                // Run the close-before-open convergence; the driver declares the
-                // DEV-class impact and publishes the device.mode outcome. A
-                // failure is published as a device.mode Failed by the driver and
-                // surfaced here — re-converged on the next adopt/reconnect pass
-                // (the desired mode recorded above).
-                if let Err(err) = self.driver.converge_mode(&mode).await {
+                // Run the convergence — index-scoped when this is a decoder with
+                // an explicit spare decode index (issue #55), else the
+                // close-before-open mode switch; the driver declares the impact
+                // class and publishes the device.mode outcome. A failure is
+                // published as a device.mode Failed by the driver and surfaced
+                // here — re-converged on the next adopt/reconnect pass (the
+                // desired mode recorded above).
+                if let Err(err) = self.converge(&mode).await {
                     tracing::warn!(
                         device = %self.device_id,
                         mode = %mode,
@@ -541,7 +543,7 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
         let Some(desired) = self.desired_mode.clone() else {
             return;
         };
-        if let Err(err) = self.driver.converge_mode(&desired).await {
+        if let Err(err) = self.converge(&desired).await {
             tracing::warn!(
                 device = %self.device_id,
                 mode = %desired,
@@ -549,6 +551,21 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
                 "zowietek desired_mode convergence failed after coming ONLINE; \
                  re-converges on the next adopt/reconnect pass"
             );
+        }
+    }
+
+    /// Converge the device onto `mode`, choosing the **index-scoped** grounded
+    /// path when the device is a decoder with an explicit spare decode index
+    /// (issue #55): the driver reads the grounded decode table, refuses if the
+    /// configured index is unusable, and otherwise switches *that* index only —
+    /// never the active one. Every other device keeps the legacy
+    /// close-before-open mode convergence unchanged, so a device without a
+    /// configured spare index behaves exactly as before.
+    async fn converge(&mut self, mode: &str) -> Result<(), super::ConvergenceError> {
+        if mode == "decoder" && self.driver.convergence_index().is_some() {
+            self.driver.converge_indexed().await
+        } else {
+            self.driver.converge_mode(mode).await.map_err(Into::into)
         }
     }
 
