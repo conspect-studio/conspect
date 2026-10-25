@@ -64,6 +64,40 @@ pub(crate) fn new_store() -> Arc<AudioStore> {
     Arc::new(AudioStore::new(canonical_format(), STORE_CAPACITY_FRAMES))
 }
 
+#[cfg(test)]
+mod route_seam_tests {
+    use super::*;
+    use multiview_audio::program::ProgramBus;
+
+    #[test]
+    fn route_audio_reaches_crossfade_at_sample_boundary_without_losing_ticks() {
+        let old = new_store();
+        let incoming = new_store();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(30_000, 1001));
+        let point = bus.add_source("program", Arc::clone(&old), 1.0);
+        let handle = AudioControlHandle::new();
+        let before = bus.tick_to(10);
+        handle.request_repoint(point, Arc::clone(&incoming), 480);
+        assert_eq!(handle.apply_pending(&mut bus), 1);
+        let after = bus.tick_to(13);
+        assert_eq!(before.frame_count() + after.frame_count(),
+            multiview_audio::cadence::SampleClock::new(48_000, Rational::new(30_000, 1001)).total_at(14) as usize);
+        assert_eq!(handle.apply_pending(&mut bus), 0);
+    }
+
+    #[test]
+    fn audio_control_backlog_is_bounded_when_consumer_is_wedged() {
+        let handle = AudioControlHandle::new();
+        let store = new_store();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(25, 1));
+        let point = bus.add_source("source", Arc::clone(&store), 1.0);
+        for _ in 0..1024 {
+            handle.request_repoint(point, Arc::clone(&store), 480);
+        }
+        assert!(handle.pending_len() <= MAX_AUDIO_REPOINT_BACKLOG);
+    }
+}
+
 /// Everything one source needs to decode its audio on its own thread: where the
 /// audio lives (a libav-openable path or URL) and whether it is a live
 /// (never-ending) source.
