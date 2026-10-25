@@ -27,6 +27,12 @@ use serde_json::{json, Value};
 
 use super::WorkMode;
 
+/// The endpoint module that serves the workmode group (`POST /system`).
+pub const WORKMODE_MODULE: &str = "system";
+
+/// The endpoint module that serves the decode table (`POST /streamplay`).
+pub const STREAMPLAY_MODULE: &str = "streamplay";
+
 /// The `workmode` request group.
 pub const WORKMODE_GROUP: &str = "workmode";
 /// The `streamplay` request group.
@@ -60,6 +66,16 @@ pub enum NullDataCall {
 }
 
 impl NullDataCall {
+    /// The endpoint module (`/system` for the workmode read, `/streamplay` for
+    /// the decode reads).
+    #[must_use]
+    pub const fn module(self) -> &'static str {
+        match self {
+            Self::GetWorkmodeId => WORKMODE_MODULE,
+            Self::StreamplayGetAll | Self::GetDecoderState => STREAMPLAY_MODULE,
+        }
+    }
+
     /// The request group.
     #[must_use]
     pub const fn group(self) -> &'static str {
@@ -112,6 +128,9 @@ pub struct ChangeWorkmode {
 }
 
 impl ChangeWorkmode {
+    /// The endpoint module this call is sent to (`/system`).
+    pub const MODULE: &'static str = WORKMODE_MODULE;
+
     /// A switch to a known [`WorkMode`].
     #[must_use]
     pub const fn to(mode: WorkMode) -> Self {
@@ -139,6 +158,9 @@ pub struct StreamplaySwitch {
 }
 
 impl StreamplaySwitch {
+    /// The endpoint module this call is sent to (`/streamplay`).
+    pub const MODULE: &'static str = STREAMPLAY_MODULE;
+
     /// Activate `index` as the decoder's sole active decode (Class-2: whatever
     /// was playing stops).
     #[must_use]

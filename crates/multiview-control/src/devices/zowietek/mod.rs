@@ -530,8 +530,10 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         let session = self.session_clone()?;
         let data = self
             .client
-            .get_info(
+            .request(
                 &session,
+                RpcVerb::GetInfo,
+                protocol::STREAMPLAY_MODULE,
                 protocol::STREAMPLAY_GROUP,
                 protocol::STREAMPLAY_GET_ALL,
                 Value::Null,
@@ -718,8 +720,10 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
         // without `change_workmode`.
         let raw = self
             .client
-            .get_info(
+            .request(
                 &session,
+                RpcVerb::GetInfo,
+                protocol::STREAMPLAY_MODULE,
                 protocol::STREAMPLAY_GROUP,
                 protocol::STREAMPLAY_GET_ALL,
                 Value::Null,
@@ -756,7 +760,7 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
             .request(
                 &session,
                 RpcVerb::SetInfo,
-                protocol::STREAMPLAY_GROUP,
+                protocol::STREAMPLAY_MODULE,
                 protocol::STREAMPLAY_GROUP,
                 protocol::STREAMPLAY_SWITCH,
                 protocol::StreamplaySwitch::activate(index).data(),
@@ -781,8 +785,10 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
     ) -> Result<Option<WorkMode>, ZowietekClientError> {
         let data = self
             .client
-            .get_info(
+            .request(
                 session,
+                RpcVerb::GetInfo,
+                protocol::WORKMODE_MODULE,
                 protocol::WORKMODE_GROUP,
                 protocol::GET_WORKMODE_ID,
                 Value::Null,
@@ -818,7 +824,7 @@ impl<T: ZowietekTransport> ZowietekDriver<T> {
                 .request(
                     session,
                     RpcVerb::SetInfo,
-                    protocol::WORKMODE_GROUP,
+                    protocol::WORKMODE_MODULE,
                     protocol::WORKMODE_GROUP,
                     protocol::CHANGE_WORKMODE,
                     serde_json::to_value(change).unwrap_or(Value::Null),

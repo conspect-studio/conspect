@@ -727,11 +727,7 @@ async fn indexed_convergence_changes_workmode_before_activating_the_slot() {
         .await
         .expect("encoder -> decoder converges");
 
-    assert_eq!(
-        workmode_wire_count(&transport),
-        3,
-        "read, change, re-read"
-    );
+    assert_eq!(workmode_wire_count(&transport), 3, "read, change, re-read");
     assert_eq!(
         transport.last_request().unwrap().body,
         json!({"group":"streamplay","opt":"streamplay_switch","data":{"index":3,"switch":1}}),
