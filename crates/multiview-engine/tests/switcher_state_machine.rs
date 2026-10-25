@@ -94,12 +94,33 @@ fn auto_resumes_manual_position_and_completes_at_proportional_tick() {
     let resumed = state.auto(tick(100)).unwrap();
     assert!(!resumed.started);
     assert!(!resumed.completed);
-    assert_eq!(resumed.progress, manual.progress);
+    assert_eq!(manual.progress.numerator(), 32768);
+    assert_eq!(
+        resumed.progress,
+        Progress::new(5, FrameCount::try_from(10).unwrap())
+    );
     assert!(!state.sample(tick(104)).completed);
     assert!(state.sample(tick(105)).completed);
     assert_eq!(state.completion_count(), 1);
     assert_eq!(state.program(), &source("b"));
     assert!(!state.sample(tick(106)).completed);
+}
+
+#[test]
+fn manual_resume_at_tick_zero_keeps_exact_elapsed_offset() {
+    let mut state = configured();
+    state
+        .set_transition(TransitionDescriptor::Mix {
+            rate: FrameCount::try_from(10).unwrap(),
+        })
+        .unwrap();
+    state.tbar(32768, tick(0)).unwrap();
+    assert_eq!(
+        state.auto(tick(0)).unwrap().progress,
+        Progress::new(5, FrameCount::try_from(10).unwrap())
+    );
+    assert!(!state.sample(tick(4)).completed);
+    assert!(state.sample(tick(5)).completed);
 }
 
 #[test]
@@ -128,7 +149,10 @@ fn configuration_is_rejected_during_auto_and_applies_after_completion() {
     state.auto(tick(10)).unwrap();
     let keys = ArmedSet::default().with_key(1);
     assert_eq!(state.arm(keys.clone()), Err(SwitcherError::InFlight));
-    assert_eq!(state.set_transition(next.clone()), Err(SwitcherError::InFlight));
+    assert_eq!(
+        state.set_transition(next.clone()),
+        Err(SwitcherError::InFlight)
+    );
     assert_eq!(state.set_preview(source("c")), Err(SwitcherError::InFlight));
     assert_eq!(state.armed(), &ArmedSet::default().with_background());
     assert_eq!(state.transition(), &initial);
@@ -154,7 +178,10 @@ fn configuration_is_rejected_during_manual_and_applies_after_completion() {
         rate: FrameCount::try_from(3).unwrap(),
     };
     assert_eq!(state.arm(keys.clone()), Err(SwitcherError::InFlight));
-    assert_eq!(state.set_transition(next.clone()), Err(SwitcherError::InFlight));
+    assert_eq!(
+        state.set_transition(next.clone()),
+        Err(SwitcherError::InFlight)
+    );
     assert_eq!(state.set_preview(source("c")), Err(SwitcherError::InFlight));
     assert!(state.tbar(u16::MAX, tick(2)).unwrap().completed);
     assert_eq!(state.arm(keys.clone()), Ok(()));
@@ -195,6 +222,8 @@ enum Cmd {
     Tbar(u16),
     Advance(u8),
     Arm(bool, bool),
+    SetPreview(u8),
+    SetTransition(u8),
     Punch(u8),
 }
 #[derive(Clone, Debug)]
@@ -216,6 +245,8 @@ impl ReferenceStateMachine for Reference {
             any::<u16>().prop_map(Cmd::Tbar),
             (0u8..12).prop_map(Cmd::Advance),
             (any::<bool>(), any::<bool>()).prop_map(|(b, k)| Cmd::Arm(b, k)),
+            (0u8..3).prop_map(Cmd::SetPreview),
+            (2u8..12).prop_map(Cmd::SetTransition),
             (0u8..3).prop_map(Cmd::Punch)
         ]
         .boxed()
@@ -276,7 +307,49 @@ impl StateMachineTest for Test {
                 if key {
                     set = set.with_key(1);
                 }
-                let _ = sut.machine.arm(set);
+                let expected = if sut.machine.is_in_flight() {
+                    Err(SwitcherError::InFlight)
+                } else if !background && !key {
+                    Err(SwitcherError::NothingArmed)
+                } else {
+                    Ok(())
+                };
+                assert_eq!(sut.machine.arm(set.clone()), expected);
+                if expected.is_ok() {
+                    assert_eq!(sut.machine.armed(), &set);
+                }
+                None
+            }
+            Cmd::SetPreview(n) => {
+                let scene = source(&format!("v{n}"));
+                let before = sut.machine.preview().clone();
+                let expected = if sut.machine.is_in_flight() {
+                    Err(SwitcherError::InFlight)
+                } else {
+                    Ok(())
+                };
+                assert_eq!(sut.machine.set_preview(scene.clone()), expected);
+                assert_eq!(
+                    sut.machine.preview(),
+                    if expected.is_ok() { &scene } else { &before }
+                );
+                None
+            }
+            Cmd::SetTransition(n) => {
+                let next = TransitionDescriptor::Mix {
+                    rate: FrameCount::try_from(u32::from(n)).unwrap_or(FrameCount::ONE),
+                };
+                let before = sut.machine.transition().clone();
+                let expected = if sut.machine.is_in_flight() {
+                    Err(SwitcherError::InFlight)
+                } else {
+                    Ok(())
+                };
+                assert_eq!(sut.machine.set_transition(next.clone()), expected);
+                assert_eq!(
+                    sut.machine.transition(),
+                    if expected.is_ok() { &next } else { &before }
+                );
                 None
             }
             Cmd::Punch(n) => Some(sut.machine.punch(source(&format!("p{n}")))),

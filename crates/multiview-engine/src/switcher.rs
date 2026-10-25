@@ -21,6 +21,9 @@ pub enum SwitcherError {
     /// The descriptor has an invalid timing or switch point.
     #[error("invalid transition descriptor")]
     InvalidTransition,
+    /// Configuration cannot change during an active take.
+    #[error("cannot change switcher configuration during an active take")]
+    InFlight,
 }
 
 /// One immutable frame-boundary projection for the render-plan resolver.
@@ -46,7 +49,7 @@ impl SwitcherProjection {
 
 #[derive(Debug, Clone)]
 enum Flight {
-    Auto { start: u64, rate: FrameCount },
+    Auto { start: i128, rate: FrameCount },
     Manual { position: u16 },
 }
 
@@ -132,20 +135,29 @@ impl SwitcherState {
         self.flip_flop = enabled;
     }
 
-    /// Stage the preview scene; an active take keeps its already-selected target.
-    pub fn set_preview(&mut self, scene: SourceRef) {
-        if self.flight.is_none() {
-            self.preview = scene;
-            self.tbar_at_end = false;
+    /// Stage the preview scene for the next take.
+    ///
+    /// # Errors
+    /// Returns [`SwitcherError::InFlight`] during an active take.
+    pub fn set_preview(&mut self, scene: SourceRef) -> Result<(), SwitcherError> {
+        if self.flight.is_some() {
+            return Err(SwitcherError::InFlight);
         }
+        self.preview = scene;
+        self.tbar_at_end = false;
+        Ok(())
     }
 
     /// Select the elements that move on the next take. No duplicates or zero keys.
     ///
     /// # Errors
     /// Returns [`SwitcherError::NothingArmed`] for an empty set or
-    /// [`SwitcherError::InvalidKey`] for duplicate/out-of-range indices.
+    /// [`SwitcherError::InvalidKey`] for duplicate/out-of-range indices, or
+    /// [`SwitcherError::InFlight`] during an active take.
     pub fn arm(&mut self, armed: ArmedSet) -> Result<(), SwitcherError> {
+        if self.flight.is_some() {
+            return Err(SwitcherError::InFlight);
+        }
         if armed.is_empty() {
             return Err(SwitcherError::NothingArmed);
         }
@@ -163,21 +175,23 @@ impl SwitcherState {
             }
             *slot = true;
         }
-        if self.flight.is_none() {
-            self.armed = armed;
-            self.tbar_at_end = false;
-        }
+        self.armed = armed;
+        self.tbar_at_end = false;
         Ok(())
     }
 
     /// Configure the next take; invalid dip/stinger parameters are rejected.
     ///
     /// # Errors
-    /// Returns [`SwitcherError::InvalidTransition`] on invalid timing.
+    /// Returns [`SwitcherError::InvalidTransition`] on invalid timing or
+    /// [`SwitcherError::InFlight`] during an active take.
     pub fn set_transition(
         &mut self,
         descriptor: TransitionDescriptor,
     ) -> Result<(), SwitcherError> {
+        if self.flight.is_some() {
+            return Err(SwitcherError::InFlight);
+        }
         let valid = match &descriptor {
             TransitionDescriptor::Dip {
                 rate, switch_point, ..
@@ -201,21 +215,30 @@ impl SwitcherState {
         if !valid {
             return Err(SwitcherError::InvalidTransition);
         }
-        if self.flight.is_none() {
-            self.transition = descriptor;
-            self.tbar_at_end = false;
-        }
+        self.transition = descriptor;
+        self.tbar_at_end = false;
         Ok(())
     }
 
-    /// Start AUTO on this tick; repeated AUTO during a flight cannot stack.
+    /// Start AUTO on this tick, or resume a manual take from its current position.
+    /// Repeated AUTO during an automatic flight cannot stack.
     ///
     /// # Errors
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
     pub fn auto(&mut self, tick: Tick) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
-        if self.flight.is_some() {
-            return Ok(self.sample(tick));
+        match self.flight {
+            Some(Flight::Auto { .. }) => return Ok(self.sample(tick)),
+            Some(Flight::Manual { position }) => {
+                let rate = self.rate();
+                let elapsed = u64::from(position) * u64::from(rate.get()) / u64::from(u16::MAX);
+                self.flight = Some(Flight::Auto {
+                    start: i128::from(tick.index) - i128::from(elapsed),
+                    rate,
+                });
+                return Ok(self.sample(tick));
+            }
+            None => {}
         }
         if matches!(self.transition, TransitionDescriptor::Cut) {
             return self.cut();
@@ -223,7 +246,7 @@ impl SwitcherState {
         let rate = self.rate();
         self.tbar_at_end = false;
         self.flight = Some(Flight::Auto {
-            start: tick.index,
+            start: i128::from(tick.index),
             rate,
         });
         Ok(SwitcherProjection {
@@ -234,7 +257,7 @@ impl SwitcherState {
     }
 
     /// Set the absolute u16 T-bar position; duplicates do not advance progress.
-    /// Manual input overrides any AUTO ramp until a take completes or aborts.
+    /// Manual input overrides any AUTO ramp; position zero cancels the flight.
     ///
     /// # Errors
     /// Returns [`SwitcherError::NothingArmed`] if no elements are armed.
@@ -244,6 +267,9 @@ impl SwitcherState {
         _tick: Tick,
     ) -> Result<SwitcherProjection, SwitcherError> {
         self.require_armed()?;
+        if position == 0 {
+            return Ok(self.abort());
+        }
         if self.flight.is_none() && self.tbar_at_end {
             return Ok(SwitcherProjection::idle());
         }
@@ -312,8 +338,8 @@ impl SwitcherState {
                 completed: false,
             },
             Some(Flight::Auto { start, rate }) => {
-                let elapsed = tick.index.saturating_sub(start);
-                if elapsed >= u64::from(rate.get()) {
+                let elapsed = (i128::from(tick.index) - start).max(0);
+                if elapsed >= i128::from(rate.get()) {
                     self.finish()
                 } else {
                     SwitcherProjection {
