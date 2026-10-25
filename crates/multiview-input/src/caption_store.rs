@@ -110,6 +110,45 @@ mod tests {
         MediaTime::from_nanos(ns)
     }
 
+    /// Regression for #134 (upstream vorner/arc-swap#210): two independent
+    /// stores published in lock-step with same-size snapshots, so the
+    /// allocation freed from `a` is reused for `b`'s next one. A store must only
+    /// return cues published into it.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn active_at_never_returns_another_stores_cue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const PUBLISHES: i64 = 100_000;
+        let a = Arc::new(CaptionCueStore::<i64>::with_capacity(1));
+        let b = Arc::new(CaptionCueStore::<i64>::with_capacity(1));
+        let done = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let (a, done) = (Arc::clone(&a), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let mut prev = 0;
+                    while !done.load(Ordering::Acquire) {
+                        if let Some(cue) = a.active_at(mt(0)) {
+                            assert!(cue > 0, "store `a` returned `b`'s cue {cue}");
+                            assert!(cue >= prev, "cue regressed: {cue} < {prev}");
+                            prev = cue;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for n in 1..=PUBLISHES {
+            a.publish(mt(0), mt(1), n);
+            b.publish(mt(0), mt(1), -n);
+        }
+        done.store(true, Ordering::Release);
+        for r in readers {
+            r.join().expect("reader panicked");
+        }
+        assert_eq!(a.active_at(mt(0)), Some(PUBLISHES));
+        assert_eq!(b.active_at(mt(0)), Some(-PUBLISHES));
+    }
+
     #[test]
     fn active_at_returns_the_cue_covering_now_with_a_half_open_window() {
         let store = CaptionCueStore::new();

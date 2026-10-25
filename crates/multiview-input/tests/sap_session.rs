@@ -263,3 +263,44 @@ proptest! {
         }
     }
 }
+
+/// Regression for #134 (upstream vorner/arc-swap#210): two independent tables
+/// written in lock-step with same-size snapshots, so the allocation freed from
+/// `a` is reused for `b`'s next one. A table's inventory must only ever hold
+/// sessions observed by that table.
+#[test]
+fn inventory_never_returns_another_tables_sessions() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    const ROUNDS: u64 = 50_000;
+    let a = Arc::new(SapSessionTable::with_limits(1, 1));
+    let b = Arc::new(SapSessionTable::with_limits(1, 1));
+    let (oa, ob) = (v4(10, 0, 0, 1), v4(10, 0, 0, 2));
+    let done = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (a, done) = (Arc::clone(&a), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut prev = Duration::ZERO;
+                while !done.load(Ordering::Acquire) {
+                    for s in a.inventory().iter() {
+                        assert_eq!(s.key.origin, oa, "table `a` returned `b`'s session");
+                        assert!(s.last_seen >= prev, "inventory regressed");
+                        prev = s.last_seen;
+                    }
+                }
+            })
+        })
+        .collect();
+    for n in 1..=ROUNDS {
+        let h = u16::try_from(n % 1000 + 1).unwrap();
+        a.observe(&announce(h, oa, "v=0"), Duration::from_nanos(n));
+        b.observe(&announce(h, ob, "v=0"), Duration::from_nanos(n));
+    }
+    done.store(true, Ordering::Release);
+    for r in readers {
+        r.join().expect("reader panicked");
+    }
+    assert_eq!(a.inventory()[0].key.origin, oa);
+    assert_eq!(b.inventory()[0].key.origin, ob);
+}

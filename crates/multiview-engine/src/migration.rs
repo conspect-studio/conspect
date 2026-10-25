@@ -494,6 +494,51 @@ mod tests {
         assert_eq!(read[0].device_id, load.device_id);
     }
 
+    /// Regression for #134 (upstream vorner/arc-swap#210): two independent
+    /// load boards published in lock-step with same-size snapshots, so the
+    /// allocation freed from `a` is reused for `b`'s next one. A board must only
+    /// ever return snapshots published into it, and never regress.
+    #[test]
+    fn load_snapshot_never_returns_another_boards_snapshot() {
+        use std::sync::atomic::AtomicBool;
+        const PUBLISHES: u32 = 100_000;
+        let a = Arc::new(LoadSnapshot::new());
+        let b = Arc::new(LoadSnapshot::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let dev = |owner: &str, n: u32| {
+            DeviceLoad::unknown(DeviceId::new(multiview_hal::load::Vendor::Nvidia, owner, n))
+        };
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let (a, done) = (Arc::clone(&a), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    let mut prev = 0;
+                    while !done.load(Ordering::Acquire) {
+                        if let Some(d) = a.load().first() {
+                            assert_eq!(
+                                d.device_id.stable_id(),
+                                "a",
+                                "board `a` returned `b`'s snapshot"
+                            );
+                            assert!(d.device_id.index() >= prev, "snapshot regressed");
+                            prev = d.device_id.index();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for n in 1..=PUBLISHES {
+            a.publish(vec![dev("a", n)]);
+            b.publish(vec![dev("b", n)]);
+        }
+        done.store(true, Ordering::Release);
+        for r in readers {
+            r.join().expect("reader panicked");
+        }
+        assert_eq!(a.load()[0].device_id.index(), PUBLISHES);
+        assert_eq!(b.load()[0].device_id.stable_id(), "b");
+    }
+
     #[test]
     fn keepalive_sink_is_a_named_no_op() {
         let k = KeepaliveSink::new("k1");

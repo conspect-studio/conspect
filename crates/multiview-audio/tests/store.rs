@@ -660,3 +660,67 @@ fn output_pull_tick_count_is_independent_of_the_rtp_feed() {
         "a negative-index / early-burst RTP feed does not change the output tick count"
     );
 }
+
+/// Regression for #134 (upstream vorner/arc-swap#210, first found in
+/// `multiview-framestore` by #133). Two independent stores of the same format,
+/// published by one thread in lock-step with whole-window replacements of the
+/// same size, so the snapshot allocation freed from `a` is immediately reused
+/// for `b`'s next one. arc-swap's default strategy keys its process-global debt
+/// list by raw address, so `b`'s writer could "pay" a debt a reader of `a`
+/// holds, and `a.read` would then return `b`'s samples. A store must only ever
+/// return samples published into it, and one reader must never see them go
+/// backwards.
+#[test]
+fn read_never_returns_samples_published_into_another_store() {
+    const PUBLISHES: usize = 200_000;
+    const READERS: usize = 2;
+    const FRAMES: usize = 4;
+    let a = Arc::new(AudioStore::new(stereo(), FRAMES));
+    let b = Arc::new(AudioStore::new(stereo(), FRAMES));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let a = Arc::clone(&a);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut prev = 0.0_f32;
+                let mut samples = 0_u64;
+                while !done.load(Ordering::Acquire) {
+                    // The window is always `[base, base + FRAMES)`; read all of it.
+                    a.seek_to_live_edge();
+                    let edge = a.read_cursor();
+                    a.seek_to(edge - FRAMES as i64);
+                    let block = a.read(FRAMES);
+                    let first = block.interleaved()[0];
+                    for &s in block.interleaved() {
+                        assert!(
+                            s >= 0.0,
+                            "store `a` returned a sample published into store `b` ({s})"
+                        );
+                    }
+                    if first > 0.0 {
+                        assert!(first >= prev, "samples regressed: {first} < {prev}");
+                        prev = first;
+                        samples += 1;
+                    }
+                }
+                samples
+            })
+        })
+        .collect();
+
+    let mut buf = vec![0.0_f32; FRAMES * 2];
+    for counter in 1..=PUBLISHES {
+        // Exact in f32: counter < 2^24.
+        buf.fill(counter as f32);
+        a.publish_samples(&buf).unwrap();
+        buf.fill(-(counter as f32));
+        b.publish_samples(&buf).unwrap();
+    }
+    done.store(true, Ordering::Release);
+    for reader in readers {
+        let samples = reader.join().expect("reader thread panicked");
+        assert!(samples > 0, "reader observed no published window");
+    }
+}

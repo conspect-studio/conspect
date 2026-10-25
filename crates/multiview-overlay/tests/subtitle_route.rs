@@ -152,3 +152,49 @@ fn without_a_repoint_a_steady_layer_keeps_sampling_the_same_source() {
     );
     assert_eq!(displayed_text(&mut layer, at_secs(5)), None);
 }
+
+/// A cue source that always reports one fixed cue whose text names its owner.
+struct Tagged(&'static str, u64);
+
+impl CueSource for Tagged {
+    fn active_at(&self, _now: MediaTime) -> Option<multiview_overlay::subtitle::Cue> {
+        Some(multiview_overlay::subtitle::Cue {
+            start: MediaTime::ZERO,
+            end: at_secs(1),
+            lines: vec![format!("{}:{}", self.0, self.1)],
+        })
+    }
+}
+
+/// Regression for #134 (upstream vorner/arc-swap#210): two independent layers
+/// re-pointed in lock-step, so the source cell freed from `a` is reused for
+/// `b`'s next one. A layer must only ever sample a source re-pointed into it.
+#[test]
+fn sample_never_reads_a_source_repointed_into_another_layer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const REPOINTS: u64 = 50_000;
+    let a = Arc::new(SubtitleLayer::new(Arc::new(Tagged("a", 0))));
+    let b = Arc::new(SubtitleLayer::new(Arc::new(Tagged("b", 0))));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        // `sample` needs `&mut`; `peek` is the same source load through `&self`.
+        let (a, done) = (Arc::clone(&a), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut prev = 0_u64;
+            while !done.load(Ordering::Acquire) {
+                let text = a.peek(MediaTime::ZERO).expect("tagged source").text();
+                let (owner, n) = text.split_once(':').expect("owner:n");
+                assert_eq!(owner, "a", "layer `a` sampled `b`'s source");
+                let n: u64 = n.parse().expect("counter");
+                assert!(n >= prev, "source regressed: {n} < {prev}");
+                prev = n;
+            }
+        })
+    };
+    for n in 1..=REPOINTS {
+        a.repoint(Arc::new(Tagged("a", n)));
+        b.repoint(Arc::new(Tagged("b", n)));
+    }
+    done.store(true, Ordering::Release);
+    reader.join().expect("reader panicked");
+}
