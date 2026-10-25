@@ -174,9 +174,13 @@ fn legacy_multiple_untargeted_program_bus_routes_validate() {
     let cfg = MultiviewConfig::load_from_toml(&legacy).expect("legacy routes parse");
     assert!(cfg.routing.is_none());
     assert_eq!(cfg.audio.as_ref().unwrap().routes.len(), 2);
-    assert!(cfg.audio.as_ref().unwrap().routes.iter().all(|route| {
-        route.include_in_program_bus && route.target_track.is_none()
-    }));
+    assert!(cfg
+        .audio
+        .as_ref()
+        .unwrap()
+        .routes
+        .iter()
+        .all(|route| { route.include_in_program_bus && route.target_track.is_none() }));
     cfg.validate()
         .expect("multiple untargeted legacy program-bus routes validate");
 }

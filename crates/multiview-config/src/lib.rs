@@ -1279,10 +1279,27 @@ impl MultiviewConfig {
     /// checked for **consistency** with the legacy cell-bindings: a video
     /// crosspoint may not contradict a `[[cells]]` binding of the same cell
     /// (mirroring ADR-0030's rejection of an inconsistent both-populated
-    /// document). An absent table desugars and is validated too, so its implicit
-    /// output→main crosspoints cannot name an undeclared program.
+    /// document). Without an explicit table, only check that desugared output
+    /// crosspoints name a declared program; legacy audio routes may mix into
+    /// the same program bus.
     fn validate_routing(&self) -> Result<(), ConfigError> {
         let table = self.routing_table();
+        if self.routing.is_none() {
+            for xp in &table.output {
+                if !self.programs.is_empty()
+                    && !self
+                        .programs
+                        .iter()
+                        .any(|program| program.id.as_str() == xp.program)
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "output crosspoint for {:?} references undeclared program {:?}",
+                        xp.output, xp.program
+                    )));
+                }
+            }
+            return Ok(());
+        }
 
         let tracks = self.selectable_tracks();
         let output_ids = self.output_ids();
