@@ -543,6 +543,19 @@ impl<T: ZowietekTransport> ZowietekPoller<T> {
         let Some(desired) = self.desired_mode.clone() else {
             return;
         };
+        // The index-scoped path is Class-2 (it stops the active decode on a
+        // single-active decoder): it must NEVER run on its own. Adopt/reconnect
+        // only observes and reports the drift; the disruptive switch runs solely
+        // through an acknowledged `set-mode` (plan → ack → apply, inv #11).
+        if desired == "decoder" && self.driver.convergence_index().is_some() {
+            tracing::warn!(
+                device = %self.device_id,
+                mode = %desired,
+                "zowietek desired_mode needs a Class-2 index-scoped switch; not applied \
+                 automatically — POST /devices/<id>/set-mode/plan then an acknowledged set-mode"
+            );
+            return;
+        }
         if let Err(err) = self.converge(&desired).await {
             tracing::warn!(
                 device = %self.device_id,

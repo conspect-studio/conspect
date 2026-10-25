@@ -408,6 +408,30 @@ impl CorrRegistry {
         }
     }
 
+    /// Withdraw one pending correlation of `op` under `key` (e.g. its dispatch
+    /// was rejected, so no outcome will ever follow): a later, unrelated
+    /// outcome with the same key must not be attributed to it. A no-op when the
+    /// pair is not pending (already consumed, evicted, or never recorded).
+    pub fn cancel(&self, key: &CorrKey, op: &OperationId) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let removed = inner.pending.get_mut(key).is_some_and(|queue| {
+            queue.iter().position(|o| o == op).is_some_and(|pos| {
+                queue.remove(pos);
+                true
+            })
+        });
+        if inner.pending.get(key).is_some_and(VecDeque::is_empty) {
+            inner.pending.remove(key);
+        }
+        if removed {
+            if let Some(pos) = inner.order.iter().position(|k| k == key) {
+                inner.order.remove(pos);
+            }
+        }
+    }
+
     /// Open (or replace) a **windowed** correlation: every outcome event
     /// matching `key` published with an engine sequence **after** `from_seq`
     /// echoes `op` as `corr`, until a newer window for the same key replaces

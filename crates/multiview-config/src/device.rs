@@ -205,8 +205,10 @@ pub struct Device {
     pub address: Option<String>,
     /// The desired converged work mode (e.g. `"decoder"`). Valid values are
     /// driver-specific; the driver re-converges the device onto this mode
-    /// whenever an adopt or reconnect brings it `ONLINE`. Absent ⇒ the device
-    /// keeps its current mode.
+    /// whenever an adopt or reconnect brings it `ONLINE` — except a `zowietek`
+    /// decoder with a `spare_decode_index`, whose Class-2 (disruptive) switch is
+    /// never automatic: it runs only through an acknowledged `set-mode`. Absent
+    /// ⇒ the device keeps its current mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desired_mode: Option<String>,
     /// The explicit **spare decode index** the index-scoped convergence targets

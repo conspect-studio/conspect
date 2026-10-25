@@ -656,6 +656,12 @@ pub(crate) async fn set_mode(
         },
     );
     if !dispatched {
+        // No outcome will follow a rejected dispatch: withdraw the correlation
+        // so a later, unrelated device.mode terminal event is not attributed to
+        // this operation.
+        if let Some(key) = &corr_key {
+            state.corr.cancel(key, &op);
+        }
         tracing::debug!(
             device = %id,
             mode = %request.mode,

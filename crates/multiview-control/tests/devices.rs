@@ -956,13 +956,13 @@ mod plan_take {
         struct Wedged;
         impl DevicePollerFactory for Wedged {
             fn spawn(&self, _d: &Device, _w: &PollerWiring) -> Option<PollerHandle> {
-                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tx.try_send(multiview_control::devices::PollerControl::SecretUpdated)
                     .unwrap();
                 // Keep the receiver alive inside the task so the channel stays
                 // open-but-full.
                 let task = tokio::spawn(async move {
-                    let _keep = _rx;
+                    let _keep = rx;
                     std::future::pending::<()>().await;
                 });
                 Some(PollerHandle::new(tx, task))
