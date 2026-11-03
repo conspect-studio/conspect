@@ -592,9 +592,16 @@ impl AudioStore {
             let snapshot = self.window.load();
             let head = snapshot.head_frame(channels.max(1));
             let want = i64::try_from(frames).unwrap_or(i64::MAX);
+            // ...or that has run ahead of the write head by more than the ring
+            // (a reconnect restarts the producer's absolute frames, or the
+            // source stalled long enough that the cursor raced past it): the
+            // cursor would otherwise sit in silence until the writer caught up
+            // — never, for a restarted generation. Same re-sync to the edge.
+            let ahead_by = start.saturating_sub(head);
+            let capacity = i64::try_from(self.capacity_frames).unwrap_or(i64::MAX);
             if self.live_append.load(Ordering::Relaxed)
                 && head > snapshot.base_frame
-                && start.saturating_add(want) <= snapshot.base_frame
+                && (start.saturating_add(want) <= snapshot.base_frame || ahead_by > capacity)
             {
                 start = head.saturating_sub(want).max(snapshot.base_frame);
             }
@@ -726,6 +733,17 @@ mod resync_tests {
                 .iter()
                 .all(|&s| (s - 0.5).abs() < f32::EPSILON),
             "expected live tone after resync, got silence"
+        );
+        // A cursor far AHEAD of the head (a restarted producer generation)
+        // also re-syncs instead of riding silence until the writer catches up.
+        store.seek_to(10_000_000);
+        let ahead = store.read(1_600);
+        assert!(
+            ahead
+                .interleaved()
+                .iter()
+                .all(|&s| (s - 0.5).abs() < f32::EPSILON),
+            "a cursor far ahead of the head must re-sync to live audio"
         );
         // And the following read continues contiguously (no repeat).
         let next = store.read(1_600);
