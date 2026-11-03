@@ -10638,6 +10638,26 @@ fn open_and_stream(
         );
     }
 
+    // Read the demuxer on its own thread, ahead of the PTS-paced decode below,
+    // so a slow segment fetch drains a queued backlog instead of stalling the
+    // tile (see `PacketReader`). Only the video and routed subtitle packets are
+    // queued.
+    #[cfg(feature = "overlay")]
+    let sub_index = plan.incontainer_sub.as_ref().map(|r| r.stream_index);
+    #[cfg(not(feature = "overlay"))]
+    let sub_index: Option<usize> = None;
+    let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
+        let mut packet = ffmpeg::codec::packet::Packet::empty();
+        match packet.read(&mut input) {
+            Ok(()) if packet.stream() == stream_index || Some(packet.stream()) == sub_index => {
+                Some(ReadItem::Packet(packet))
+            }
+            Ok(()) => None,
+            Err(ffmpeg::Error::Eof) => Some(ReadItem::Eof),
+            Err(other) => Some(ReadItem::Error(other.to_string())),
+        }
+    })?;
+
     // Pump packets, publishing each decoded+scaled frame into the store.
     let mut drained = false;
     loop {
@@ -10681,9 +10701,13 @@ fn open_and_stream(
         if drained {
             return Ok(());
         }
-        let mut packet = ffmpeg::codec::packet::Packet::empty();
-        match packet.read(&mut input) {
-            Ok(()) => {
+        // Wait in short slices so `stop` stays responsive while the origin is
+        // slow; a dead read still surfaces within `rw_timeout` as an error.
+        let Some(item) = reader.next(Duration::from_millis(100)) else {
+            continue;
+        };
+        match item {
+            ReadItem::Packet(packet) => {
                 if packet.stream() == stream_index {
                     decoder.send_packet(&packet).map_err(|e| e.to_string())?;
                 } else {
@@ -10697,11 +10721,11 @@ fn open_and_stream(
                     pump_incontainer_sub(plan, incontainer_sub.as_mut(), &packet);
                 }
             }
-            Err(ffmpeg::Error::Eof) => {
+            ReadItem::Eof => {
                 decoder.send_eof().map_err(|e| e.to_string())?;
                 drained = true;
             }
-            Err(other) => return Err(other.to_string()),
+            ReadItem::Error(err) => return Err(err),
         }
     }
 }
@@ -11601,6 +11625,94 @@ impl PtsWallClock {
             None => MediaTime::ZERO,
         }
     }
+}
+
+/// Packets a source's read-ahead queue holds (video + routed subtitle packets
+/// only). At 30 fps that is ~34 s of media, at 60 fps ~17 s — more than the
+/// ~3 segments a live playlist exposes, so the live edge (not this queue) bounds
+/// how far ahead the reader runs. A few MB at news bitrates; bounded.
+const READ_AHEAD_PACKETS: usize = 1024;
+
+/// One result of a demuxer read, handed from the read-ahead thread to the
+/// decode/pace loop.
+enum ReadItem<P> {
+    /// A routed packet.
+    Packet(P),
+    /// Clean end of stream.
+    Eof,
+    /// A read error (the connection is over; the caller reconnects).
+    Error(String),
+}
+
+/// The consumer side of a live source's read-ahead thread.
+///
+/// The demuxer used to be read on the decode thread, which is paced to wall
+/// clock by PTS, so it could never get ahead of real time: a live HLS reader
+/// blocks inside libav while it fetches each segment, and a fetch longer than
+/// the 2 s jitter hold aged the tile into RECONNECTING although the origin was
+/// healthy (and fell behind the live edge, "skipping segments ahead"). The
+/// reader thread instead reads as fast as the origin delivers, into a bounded
+/// queue, so the paced decode drains a backlog across a slow fetch.
+///
+/// Dropping it cancels the reader: a blocked `send` fails at once, and a read
+/// blocked inside libav returns within `rw_timeout`. The thread is detached so
+/// a reconnect never waits on a stalled read (it only touches its own `Input`).
+struct PacketReader<P> {
+    rx: Receiver<ReadItem<P>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl<P> PacketReader<P> {
+    /// The next item, waiting at most `timeout`; `None` on timeout. A reader
+    /// thread that exited without a terminal item reads as an error.
+    fn next(&self, timeout: Duration) -> Option<ReadItem<P>> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(item) => Some(item),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Some(ReadItem::Error("live read-ahead thread exited".to_owned()))
+            }
+        }
+    }
+}
+
+impl<P> Drop for PacketReader<P> {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Spawn the read-ahead thread. `read` performs one blocking demuxer read and
+/// returns `None` for a packet that is not routed (skipped, not queued). The
+/// thread stops after a terminal item, on cancel, or once the consumer is gone.
+fn spawn_packet_reader<P, F>(
+    source_id: &str,
+    capacity: usize,
+    mut read: F,
+) -> Result<PacketReader<P>, String>
+where
+    P: Send + 'static,
+    F: FnMut() -> Option<ReadItem<P>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let id = source_id.to_owned();
+    std::thread::Builder::new()
+        .name(format!("multiview-read-{source_id}"))
+        .spawn(move || {
+            // Attribute libav's log lines on this thread to the source (ADR-0060).
+            let _resource = ingest_resource_scope(&id);
+            while !thread_cancel.load(Ordering::Acquire) {
+                let Some(item) = read() else { continue };
+                let terminal = !matches!(item, ReadItem::Packet(_));
+                if tx.send(item).is_err() || terminal {
+                    return;
+                }
+            }
+        })
+        .map_err(|e| format!("spawn live read-ahead thread: {e}"))?;
+    Ok(PacketReader { rx, cancel })
 }
 
 /// How far ahead of the output clock a live frame is placed (its jitter hold).
@@ -15977,6 +16089,117 @@ mod program_bus_gain_tests {
             got[3],
             ("unrouted".to_owned(), 0.0),
             "no route: metered, not mixed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod packet_reader_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{spawn_packet_reader, ReadItem};
+
+    fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// The live stall: the decode side is paced to wall clock and is not
+    /// pulling, yet the reader must keep fetching so a backlog is queued for the
+    /// next slow segment fetch — up to the bound, and no further.
+    #[test]
+    fn reads_ahead_of_an_idle_consumer_up_to_the_bound() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        let reader = spawn_packet_reader("t", 8, move || {
+            Some(ReadItem::Packet(counter.fetch_add(1, Ordering::SeqCst)))
+        })
+        .expect("spawn");
+        assert!(
+            wait_until(Duration::from_secs(2), || reads.load(Ordering::SeqCst) >= 8),
+            "reader did not run ahead: {} reads",
+            reads.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        // 8 queued + at most one blocked in `send`.
+        assert!(reads.load(Ordering::SeqCst) <= 9, "queue must stay bounded");
+        for want in 0..8 {
+            match reader.next(Duration::from_secs(1)) {
+                Some(ReadItem::Packet(got)) => assert_eq!(got, want, "in order"),
+                _ => panic!("expected packet {want}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unrouted_reads_are_skipped_and_eof_is_terminal() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        let reader = spawn_packet_reader("t", 4, move || match c.fetch_add(1, Ordering::SeqCst) {
+            0 | 2 => None,
+            1 => Some(ReadItem::Packet(7_u8)),
+            _ => Some(ReadItem::Eof),
+        })
+        .expect("spawn");
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Packet(7))
+        ));
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Eof)
+        ));
+        // The thread stopped after EOF: a further read is a disconnect error.
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Error(_))
+        ));
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            4,
+            "no reads after the terminal item"
+        );
+    }
+
+    #[test]
+    fn a_slow_read_times_out_without_blocking_the_consumer() {
+        let reader = spawn_packet_reader("t", 4, move || {
+            std::thread::sleep(Duration::from_millis(300));
+            Some(ReadItem::Packet(1_u8))
+        })
+        .expect("spawn");
+        let t0 = Instant::now();
+        assert!(reader.next(Duration::from_millis(20)).is_none());
+        assert!(t0.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn dropping_the_reader_stops_the_thread() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Flag(Arc::clone(&done));
+        let reader = spawn_packet_reader("t", 2, move || {
+            let _keep = &flag;
+            Some(ReadItem::Packet(0_u8))
+        })
+        .expect("spawn");
+        drop(reader);
+        assert!(
+            wait_until(Duration::from_secs(2), || done.load(Ordering::SeqCst)),
+            "reader thread (and the Input it owns) must be released"
         );
     }
 }
