@@ -10516,6 +10516,8 @@ fn open_and_stream(
     // The wall-clock pacer: maps the first frame's PTS to "now" and releases
     // each subsequent frame when wall-clock catches up to its PTS (invariant #4).
     let mut pacer = PtsWallClock::new();
+    // Live frames go onto the output timeline with a jitter hold (see `LiveStamper`).
+    let mut stamper = LiveStamper::new();
 
     // MEDIA-PLAYER CHANNEL (ADR-0057 / ADR-0097): when this source is a player,
     // run the transport-driven decode loop instead of the plain pump. It owns
@@ -10569,7 +10571,7 @@ fn open_and_stream(
             // tile from the clock that samples it; a finite file/VOD keeps its
             // source-relative stamp (it plays from its own start).
             let at = if plan.live {
-                output_anchored_stamp(&plan.output_origin, pacer.publish_time(pts))
+                stamper.stamp(&plan.output_origin, pts, pacer.publish_time(pts))
             } else {
                 pacer.publish_time(pts)
             };
@@ -11500,31 +11502,62 @@ impl PtsWallClock {
     }
 }
 
-/// The timeline instant a live decode publishes a just-released frame at.
+/// How far ahead of the output clock a live frame is placed (its jitter hold).
 ///
-/// When the run's output origin is known (`origin` holds the program's time
-/// source + tick-0 seed), the frame is stamped at the **current output media
-/// instant** `time.now() - seed` — the same scale as `tick.pts`, which the
-/// output clock samples tiles by. A source that connects, stalls or reconnects
-/// at any point therefore lands its frames at "now" on the output timeline: the
-/// tile reads LIVE as soon as frames flow again and never shows NO SIGNAL /
-/// RECONNECTING while frames are arriving, nor plays a burst to catch up.
+/// A live HLS/TS reader stalls at every segment boundary while it fetches the
+/// next segment; frames published "just in time" age past the tile's freshness
+/// threshold during that fetch (LIVE→STALE), then arrive in a burst. Placing
+/// each frame `LIVE_JITTER_HOLD` ahead, at its true media spacing, absorbs any
+/// gap shorter than this without a visible pause or catch-up.
+const LIVE_JITTER_HOLD: MediaTime = MediaTime::from_nanos(2_000_000_000);
+
+/// Stamps live frames onto the run's OUTPUT timeline (the scale `tick.pts`
+/// samples tiles on), preserving the source's media spacing.
 ///
-/// Without an origin (before the program seeds, bounded/test drives) it falls
-/// back to the source-relative `fallback` stamp ([`PtsWallClock::publish_time`]).
-fn output_anchored_stamp(
-    origin: &crate::timing_status::EpochAnchorSlot,
-    fallback: MediaTime,
-) -> MediaTime {
-    match origin.load() {
-        Some(anchor) => MediaTime::from_nanos(
-            anchor
-                .time()
+/// On the first frame of a connection it anchors `stamp(pts0) = now + hold`;
+/// each later frame is `anchor + (pts - pts0)`. It re-anchors when the source
+/// timeline goes backwards or the stamp leaves `[now, now + 2*hold]` (a long
+/// stall, a PTS jump, or accumulated clock drift), so latency stays bounded.
+/// Without a run origin (before the program seeds, bounded/test drives) it
+/// returns the caller's source-relative `fallback`.
+struct LiveStamper {
+    anchor: Option<(MediaTime, MediaTime)>,
+}
+
+impl LiveStamper {
+    const fn new() -> Self {
+        Self { anchor: None }
+    }
+
+    fn stamp(
+        &mut self,
+        origin: &crate::timing_status::EpochAnchorSlot,
+        pts: MediaTime,
+        fallback: MediaTime,
+    ) -> MediaTime {
+        let Some(run) = origin.load() else {
+            return fallback;
+        };
+        let now = MediaTime::from_nanos(
+            run.time()
                 .now_nanos()
-                .saturating_sub(anchor.seed_nanos())
+                .saturating_sub(run.seed_nanos())
                 .max(0),
-        ),
-        None => fallback,
+        );
+        if let Some((out0, pts0)) = self.anchor {
+            if pts >= pts0 {
+                let at = out0.saturating_add(pts.saturating_sub(pts0));
+                let latest = now
+                    .saturating_add(LIVE_JITTER_HOLD)
+                    .saturating_add(LIVE_JITTER_HOLD);
+                if at >= now && at <= latest {
+                    return at;
+                }
+            }
+        }
+        let out0 = now.saturating_add(LIVE_JITTER_HOLD);
+        self.anchor = Some((out0, pts));
+        out0
     }
 }
 
@@ -15687,41 +15720,85 @@ a=mediaclk:direct=0\r\n"
 }
 
 #[cfg(test)]
-mod output_anchored_stamp_tests {
+mod live_stamper_tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use multiview_core::time::MediaTime;
     use multiview_engine::{ManualTimeSource, TimeSource};
 
-    use super::output_anchored_stamp;
+    use super::{LiveStamper, LIVE_JITTER_HOLD};
+
+    const SECOND: i64 = 1_000_000_000;
+
+    fn run_at(seed_ns: i64) -> (Arc<ManualTimeSource>, crate::timing_status::EpochAnchorSlot) {
+        let time = Arc::new(ManualTimeSource::new());
+        time.set(seed_ns);
+        let source: Arc<dyn TimeSource> = time.clone();
+        let slot = crate::timing_status::anchor_slot();
+        slot.store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+            source, seed_ns,
+        ))));
+        (time, slot)
+    }
+
+    fn ms(n: i64) -> MediaTime {
+        MediaTime::from_nanos(n * 1_000_000)
+    }
 
     #[test]
     fn without_an_origin_the_source_relative_stamp_is_kept() {
         let slot = crate::timing_status::anchor_slot();
-        let fallback = MediaTime::from_nanos(1_234);
-        assert_eq!(output_anchored_stamp(&slot, fallback), fallback);
+        let mut s = LiveStamper::new();
+        assert_eq!(s.stamp(&slot, ms(10), ms(7)), ms(7));
     }
 
     #[test]
-    fn a_reconnected_source_stamps_at_the_current_output_instant() {
-        // The output clock seeded at t=5 s and has run for 600 s. A source that
-        // (re)connects now publishes its first frame: its source-relative stamp
-        // is ~0, but the output samples at ~600 s — with the old stamp the tile
-        // would read 600 s stale (NO SIGNAL) while frames are arriving.
-        let time = Arc::new(ManualTimeSource::new());
-        time.set(5_000_000_000);
-        let slot = crate::timing_status::anchor_slot();
-        let source: Arc<dyn TimeSource> = time.clone();
-        slot.store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
-            source,
-            5_000_000_000,
-        ))));
-        time.advance(std::time::Duration::from_secs(600));
-        let stamped = output_anchored_stamp(&slot, MediaTime::ZERO);
-        assert_eq!(stamped, MediaTime::from_nanos(600_000_000_000));
-        // A later frame lands later, on the same scale the clock ticks on.
-        time.advance(std::time::Duration::from_nanos(33_366_667));
-        let next = output_anchored_stamp(&slot, MediaTime::from_nanos(33_366_667));
-        assert_eq!(next, MediaTime::from_nanos(600_033_366_667));
+    fn a_late_connecting_source_lands_ahead_of_the_output_clock() {
+        // Output has run 600 s; a source connects now. Its first frame must be
+        // on the output timeline (not at 0, which would read 600 s stale).
+        let (time, slot) = run_at(5 * SECOND);
+        time.advance(Duration::from_secs(600));
+        let mut s = LiveStamper::new();
+        let at = s.stamp(&slot, ms(90_000), MediaTime::ZERO);
+        assert_eq!(
+            at,
+            MediaTime::from_nanos(600 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
+    }
+
+    #[test]
+    fn a_segment_fetch_stall_keeps_media_spacing_no_catch_up_burst() {
+        let (time, slot) = run_at(0);
+        let mut s = LiveStamper::new();
+        let first = s.stamp(&slot, ms(0), MediaTime::ZERO);
+        // The reader stalls 1.5 s fetching the next segment, then releases the
+        // late frames together: they keep their 33 ms media spacing.
+        time.advance(Duration::from_millis(1_500));
+        let a = s.stamp(&slot, ms(1_001), MediaTime::ZERO);
+        let b = s.stamp(&slot, ms(1_034), MediaTime::ZERO);
+        assert_eq!(a, first.saturating_add(ms(1_001)));
+        assert_eq!(b.saturating_sub(a), ms(33));
+    }
+
+    #[test]
+    fn backwards_pts_or_a_long_stall_re_anchors() {
+        let (time, slot) = run_at(0);
+        let mut s = LiveStamper::new();
+        s.stamp(&slot, ms(50_000), MediaTime::ZERO);
+        // Reconnect: the new connection's PTS restarts lower.
+        time.advance(Duration::from_secs(3));
+        let re = s.stamp(&slot, ms(100), MediaTime::ZERO);
+        assert_eq!(
+            re,
+            MediaTime::from_nanos(3 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
+        // A 10 s stall puts the next stamp behind the clock: re-anchor ahead.
+        time.advance(Duration::from_secs(10));
+        let after = s.stamp(&slot, ms(200), MediaTime::ZERO);
+        assert_eq!(
+            after,
+            MediaTime::from_nanos(13 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
     }
 }
