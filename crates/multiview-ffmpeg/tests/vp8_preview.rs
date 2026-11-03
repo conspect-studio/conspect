@@ -75,6 +75,7 @@ mod gated {
             bit_rate: 200_000,
             // GOP comes from the preview option set (`g`), not the target.
             gop: 0,
+            color: multiview_core::color::ColorInfo::default(),
             cuda_device: None,
         }
     }

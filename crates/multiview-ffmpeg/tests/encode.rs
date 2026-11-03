@@ -30,6 +30,7 @@ fn target(codec: &str) -> VideoEncodeTarget {
         gop: 12,
         // Default: no device pin — behaviour is unchanged from before the NVENC
         // affinity seam existed (P1a). Tests that exercise the pin set it below.
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     }
 }

@@ -217,6 +217,14 @@ pub struct EncodeConfig {
     pub gop: u32,
     /// Target bitrate in bits/sec (`0` lets the codec choose).
     pub bit_rate: usize,
+    /// The canvas's four-axis color tag (invariant #8's "tag output" step,
+    /// issue #161) — e.g. BT.709 primaries/transfer/matrix with limited range
+    /// for the `sdr-bt709-limited` canvas profile. Threaded into the
+    /// `multiview-ffmpeg` [`VideoEncodeTarget::color`] so the encoder's codec
+    /// context and every encoded frame carry it, through the one shared
+    /// encoder-setup path every backend (software, NVENC, VAAPI/QSV) opens
+    /// through.
+    pub color: multiview_core::color::ColorInfo,
     /// Optional program-audio encoder muxed alongside the video (AUD-4). `None`
     /// is video-only output: the muxer registers a single video stream and every
     /// existing video-only sink/test is unchanged. `Some` adds a second (audio)
@@ -297,7 +305,10 @@ impl AudioEncodeConfig {
 impl EncodeConfig {
     /// A sensible LGPL-clean default for tests/examples: `mpeg2video` fed
     /// `yuv420p`, 30 fps, the given geometry, a one-second GOP. Video-only
-    /// (`audio: None`) so existing streaming-encode tests are unchanged.
+    /// (`audio: None`) so existing streaming-encode tests are unchanged. Tags
+    /// with the default SDR BT.709 limited canvas color
+    /// ([`multiview_compositor::pipeline::CanvasColor::default`]'s tag,
+    /// ADR-C001) — issue #161.
     #[must_use]
     pub fn mpeg2(width: u32, height: u32) -> Self {
         Self {
@@ -308,6 +319,12 @@ impl EncodeConfig {
             cadence: Rational::FPS_30,
             gop: 30,
             bit_rate: 2_000_000,
+            color: multiview_core::color::ColorInfo {
+                primaries: multiview_core::color::ColorPrimaries::Bt709,
+                transfer: multiview_core::color::TransferCharacteristic::Bt709,
+                matrix: multiview_core::color::MatrixCoefficients::Bt709,
+                range: multiview_core::color::ColorRange::Limited,
+            },
             audio: None,
             // No device pin by default — behaviour is unchanged from before the
             // NVENC affinity seam (Tier-2 P1a); the pin is opt-in.
@@ -332,6 +349,7 @@ impl EncodeConfig {
             time_base: self.time_base(),
             bit_rate: self.bit_rate,
             gop: self.gop,
+            color: self.color,
             // NVENC device-affinity pin (Tier-2 P1a): inert for software codecs;
             // the encoder gates the bind on the `*_nvenc` codec-name suffix.
             cuda_device: self.cuda_ordinal.clone(),

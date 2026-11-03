@@ -155,6 +155,39 @@ pub fn start_gate(level: Option<multiview_licence::EnforcementLevel>) -> Result<
     }
 }
 
+/// Warn loudly when a **bounded** run (`--ticks`/`--duration`) carries a
+/// configured `[control]` section.
+///
+/// By design (ADR-W020 §9, ADR-W024 §8, the `--ticks`/`--duration` smoke-run
+/// semantics), only the until-stopped run paths bring up the control plane
+/// (`multiview_cli::control::bind_and_serve`, called from the binary's
+/// `run_software_until_ctrl_c` / `run_pipeline_until_ctrl_c`); a bounded run
+/// never binds `cfg.listen`, so neither the REST/WebUI surface **nor** the
+/// `/hls/{output-id}/` HLS delivery mounts (`multiview_cli::control::hls_mounts`
+/// plus `multiview_output::hls::http::hls_router`) are reachable for its
+/// duration. A configured HLS/LL-HLS output still writes its segments to
+/// disk, but nothing in this process serves them over HTTP while bounded.
+/// This is deliberate (bounded runs are the output-clock smoke test, not a
+/// serving deployment; see `docs/operations/building.md` §4), but a
+/// configured `[control]` on a bounded invocation is very likely an operator
+/// mistake (a soak/duration run that expected `/livez`/`/readyz`/the API/the
+/// HLS mounts to be observable), so it is surfaced once, loudly, rather than
+/// left as a silent no-op.
+pub fn warn_if_control_plane_configured_on_bounded_run(config: &MultiviewConfig, ticks: u64) {
+    if let Some(control) = config.control.as_ref() {
+        tracing::warn!(
+            ticks,
+            listen = %control.listen,
+            "a bounded run (--ticks/--duration) never starts the control plane: \
+             [control] is configured, but neither the REST/WebUI API nor the \
+             /hls/{{output-id}}/ HLS delivery mounts are served for a bounded \
+             run (ADR-W020 §9 / ADR-W024 §8 smoke-run semantics) — omit \
+             --ticks/--duration to serve them, or ignore this warning for a \
+             pure output-clock smoke test"
+        );
+    }
+}
+
 /// Errors that can occur building or running the software engine.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

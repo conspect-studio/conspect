@@ -39,6 +39,7 @@ fn ts_config(codec: &str) -> EncodeConfig {
         gop: 25,
         bit_rate: 800_000,
         audio: None,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_ordinal: None,
     }
 }

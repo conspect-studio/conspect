@@ -50,6 +50,7 @@ fn config(fps: i64, gop: u32) -> EncodeConfig {
         gop,
         bit_rate: 2_000_000,
         audio: None,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_ordinal: None,
     }
 }

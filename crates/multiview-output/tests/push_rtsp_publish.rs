@@ -244,6 +244,7 @@ fn rtsp_live_push_reaches_a_listening_sidecar() {
         gop: 25,
         bit_rate: 1_500_000,
         audio: None,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_ordinal: None,
     };
     let sink = PushSink::new(config, target.protocol(), target.publish_url());

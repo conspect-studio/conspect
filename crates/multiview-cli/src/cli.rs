@@ -116,6 +116,13 @@ pub struct RunArgs {
 
     /// Stop after this many output ticks (frames). Omit to run until Ctrl-C (or,
     /// for a bounded run, give `--duration` instead).
+    ///
+    /// A bounded run (`--ticks` or `--duration`) is the output-clock smoke
+    /// test: it never starts the management control plane, so a configured
+    /// `[control]` section's REST/WebUI API and `/hls/{output-id}/` HLS
+    /// delivery mounts are NOT served for its duration (a loud warning names
+    /// this at startup if `[control]` is present). Omit both flags (run until
+    /// Ctrl-C/SIGTERM) to serve them.
     #[arg(long, value_name = "N")]
     pub ticks: Option<u64>,
 

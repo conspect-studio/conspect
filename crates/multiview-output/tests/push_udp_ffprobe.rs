@@ -123,6 +123,7 @@ fn ts_config(fps: i64, gop: u32) -> EncodeConfig {
         gop,
         bit_rate: 1_500_000,
         audio: None,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_ordinal: None,
     }
 }

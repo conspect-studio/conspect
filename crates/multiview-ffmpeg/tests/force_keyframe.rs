@@ -33,6 +33,7 @@ fn target() -> VideoEncodeTarget {
         // A GOP far longer than the test run, so the ONLY keyframes are frame 0
         // (the unavoidable first intra) and whatever the seam forces.
         gop: 240,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     }
 }
