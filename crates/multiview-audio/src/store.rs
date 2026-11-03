@@ -689,9 +689,44 @@ pub fn audio_decode_loop(
             return;
         }
     };
+    // Pace publishes to wall clock by PTS (invariant #4, the audio twin of the
+    // video `PtsWallClock`): a live HLS reader bursts several segments on
+    // connect and at each catch-up; publishing them unpaced overruns the bounded
+    // ring, so the consumer's cursor and the window drift apart and the source
+    // cuts in and out. Allow a small lead so the reader stays ahead of the bus.
+    let mut pace: Option<(std::time::Instant, multiview_core::time::MediaTime)> = None;
+    let lead = std::time::Duration::from_millis(500);
     while !stop.load(Ordering::Acquire) {
-        match decoder.next_block() {
-            Ok(Some(block)) => {
+        match decoder.next_decoded() {
+            Ok(Some(unit)) => {
+                let block = unit.block;
+                match pace {
+                    Some((t0, p0)) if unit.pts >= p0 => {
+                        let off =
+                            u64::try_from(unit.pts.saturating_sub(p0).as_nanos()).unwrap_or(0);
+                        let due = t0 + std::time::Duration::from_nanos(off);
+                        let now = std::time::Instant::now();
+                        if due > now + lead {
+                            let wait = due.saturating_duration_since(now).saturating_sub(lead);
+                            // A gap larger than a few seconds is a discontinuity:
+                            // re-anchor rather than sleep through it.
+                            if wait > std::time::Duration::from_secs(5) {
+                                pace = Some((now, unit.pts));
+                            } else {
+                                let mut remaining = wait;
+                                while remaining > std::time::Duration::ZERO
+                                    && !stop.load(Ordering::Acquire)
+                                {
+                                    let slice = remaining.min(std::time::Duration::from_millis(50));
+                                    std::thread::sleep(slice);
+                                    remaining = remaining.saturating_sub(slice);
+                                }
+                            }
+                        }
+                    }
+                    // First block, or backwards PTS (wrap / discontinuity): (re-)anchor.
+                    None | Some(_) => pace = Some((std::time::Instant::now(), unit.pts)),
+                }
                 if let Err(error) = store.publish(&block) {
                     // A format mismatch here is a programming error (the decoder
                     // and store share the same canonical format); log and stop
