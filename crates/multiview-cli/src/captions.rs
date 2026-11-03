@@ -310,6 +310,11 @@ pub struct CaptionPlan {
 ///   directory** (the master URL with its last path segment — the filename —
 ///   stripped), with any query/fragment on the master dropped.
 ///
+/// The joined path then has its `.`/`..` segments removed (RFC 3986 §5.2.4):
+/// CDNs such as `CloudFront` reject a literal `..` (HTTP 400), and ad-insertion
+/// origins (AWS `MediaTailor`) emit variant URIs like `../../../manifest/…`.
+/// The rendition's own query string is kept unchanged.
+///
 /// A master URL with no recognizable `scheme://authority` (e.g. a bare local
 /// path) falls back to a simple directory join so a `file:`-less local master
 /// still resolves.
@@ -327,11 +332,12 @@ pub fn resolve_rendition_uri(master_url: &str, rendition_uri: &str) -> String {
     let (origin, path) = split_origin(master_base);
 
     // A root-relative rendition path replaces the master's path entirely.
-    if let Some(abs_path) = rendition_uri.strip_prefix('/') {
+    if rendition_uri.starts_with('/') {
+        let normalised = remove_dot_segments(rendition_uri);
         return match origin {
-            Some(origin) => format!("{origin}/{abs_path}"),
+            Some(origin) => format!("{origin}{normalised}"),
             // No origin (a bare local master): treat as a filesystem-absolute path.
-            None => format!("/{abs_path}"),
+            None => normalised,
         };
     }
 
@@ -340,7 +346,7 @@ pub fn resolve_rendition_uri(master_url: &str, rendition_uri: &str) -> String {
         Some(idx) => path.get(..=idx).unwrap_or(""),
         None => "",
     };
-    let joined = format!("{dir}{rendition_uri}");
+    let joined = remove_dot_segments(&format!("{dir}{rendition_uri}"));
     match origin {
         Some(origin) => format!("{origin}{joined}"),
         None => joined,
@@ -1058,6 +1064,45 @@ impl CuePacer {
     }
 }
 
+/// RFC 3986 §5.2.4 `remove_dot_segments` on a path, leaving any `?query` /
+/// `#fragment` suffix untouched. `..` above the root stops at the root.
+fn remove_dot_segments(path_and_rest: &str) -> String {
+    let split = path_and_rest
+        .find(['?', '#'])
+        .unwrap_or(path_and_rest.len());
+    let (path, rest) = path_and_rest.split_at(split);
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    let mut trailing_dir = false;
+    for (i, seg) in segments.iter().enumerate() {
+        match *seg {
+            "." => trailing_dir = i == last,
+            ".." => {
+                // Never pop the leading empty segment of an absolute path.
+                if out.len() > usize::from(absolute) {
+                    out.pop();
+                }
+                trailing_dir = i == last;
+            }
+            "" if i == 0 && absolute => out.push(""),
+            other => {
+                out.push(other);
+                trailing_dir = false;
+            }
+        }
+    }
+    let mut joined = out.join("/");
+    if absolute && joined.is_empty() {
+        joined.push('/');
+    }
+    if trailing_dir && !joined.ends_with('/') {
+        joined.push('/');
+    }
+    format!("{joined}{rest}")
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -1094,6 +1139,44 @@ mod tests {
         let master = "https://host.example/a/master.m3u8?token=xyz#frag";
         let got = resolve_rendition_uri(master, "subs/index.m3u8");
         assert_eq!(got, "https://host.example/a/subs/index.m3u8");
+    }
+
+    #[test]
+    fn dot_dot_segments_are_removed_rfc3986() {
+        // AWS MediaTailor masters (e.g. CNN FAST) list variants as
+        // `../../../manifest/...`; CloudFront rejects a literal `..` with 400,
+        // so the joined path must have its dot-segments removed (RFC 3986 §5.2.4).
+        let master = "https://d.example/v1/master/acct/chan/CNNFAST_GB.m3u8";
+        let got = resolve_rendition_uri(master, "../../../manifest/acct/chan/sess/3.m3u8");
+        assert_eq!(got, "https://d.example/v1/manifest/acct/chan/sess/3.m3u8");
+    }
+
+    #[test]
+    fn single_dot_and_excess_dot_dot_segments_are_normalised() {
+        let master = "https://h.example/a/b/master.m3u8";
+        assert_eq!(
+            resolve_rendition_uri(master, "./v/./index.m3u8"),
+            "https://h.example/a/b/v/index.m3u8"
+        );
+        // More `..` than path depth stops at the root (RFC 3986 §5.2.4).
+        assert_eq!(
+            resolve_rendition_uri(master, "../../../../x/index.m3u8"),
+            "https://h.example/x/index.m3u8"
+        );
+        // A rendition query string survives normalisation.
+        assert_eq!(
+            resolve_rendition_uri(master, "../v/index.m3u8?sid=1&a=..%2F"),
+            "https://h.example/a/v/index.m3u8?sid=1&a=..%2F"
+        );
+    }
+
+    #[test]
+    fn root_relative_dot_segments_are_normalised() {
+        let master = "https://h.example/a/master.m3u8";
+        assert_eq!(
+            resolve_rendition_uri(master, "/x/../y/index.m3u8"),
+            "https://h.example/y/index.m3u8"
+        );
     }
 
     #[test]
