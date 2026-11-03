@@ -34,7 +34,7 @@ use ffmpeg::util::frame::Audio;
 use ffmpeg::ChannelLayout;
 use ffmpeg_next as ffmpeg;
 
-use multiview_core::time::{MediaTime, Rational};
+use multiview_core::time::MediaTime;
 
 use crate::convert::MediaKind;
 use crate::decode_stream::StreamAudioDecoder;
@@ -116,8 +116,20 @@ impl AudioFileDecoder {
             .best_stream(MediaKind::Audio)
             .ok_or(FfmpegError::StreamNotFound("audio"))?;
 
-        // Find the matching stream's parameters + time-base to build the decoder.
-        let (parameters, time_base) = Self::stream_params(path, stream_index)?;
+        // Read the chosen stream's parameters + time-base from the ALREADY-OPEN
+        // demuxer. Re-opening the URL just for them (the old path) fails on
+        // session-bound live playlists (an ad-insertion origin such as AWS
+        // MediaTailor serves a variant URL once per session), leaving the source
+        // silent; it also doubled every network open.
+        let parameters = demuxer
+            .stream_parameters(stream_index)
+            .ok_or(FfmpegError::StreamNotFound("audio"))?;
+        let time_base = demuxer
+            .streams()
+            .into_iter()
+            .find(|s| s.index == stream_index)
+            .map(|s| s.time_base)
+            .ok_or(FfmpegError::StreamNotFound("audio"))?;
         let decoder = StreamAudioDecoder::new(parameters, time_base)?;
 
         let target_layout = ChannelLayout::default(i32::from(target_channels));
@@ -134,25 +146,6 @@ impl AudioFileDecoder {
             finished: false,
             eof_sent: false,
         })
-    }
-
-    /// Re-open the container briefly to read the chosen stream's codec
-    /// parameters and time-base (the [`Demuxer`] does not expose the raw
-    /// `Parameters` needed to construct a decoder).
-    fn stream_params(
-        path: &Path,
-        stream_index: usize,
-    ) -> Result<(ffmpeg::codec::Parameters, Rational)> {
-        let input = ffmpeg::format::input(&path).map_err(|source| FfmpegError::OpenInput {
-            path: path.display().to_string(),
-            source,
-        })?;
-        let stream = input
-            .streams()
-            .nth(stream_index)
-            .ok_or(FfmpegError::StreamNotFound("audio"))?;
-        let time_base = crate::convert::from_ff_rational(stream.time_base());
-        Ok((stream.parameters(), time_base))
     }
 
     /// The target sample rate in Hz.
