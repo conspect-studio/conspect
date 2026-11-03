@@ -221,7 +221,7 @@ where
     let mut state = AppState::new(
         publisher,
         commands,
-        Arc::new(InMemoryRepository::new()),
+        layout_repository(boot_model.as_deref()).await,
         Arc::new(api_keys),
     )
     .with_seeded_resources(seeded)
@@ -2239,6 +2239,44 @@ fn salvo_event(salvo: String, phase: SalvoPhase, head: Option<String>) -> SalvoE
         Some(head) => event.with_head(head),
         None => event,
     }
+}
+
+/// The stored-layout repository for this run.
+///
+/// With the `sqlite` feature and a config-file run (a boot model), layouts are
+/// persisted to `<config-dir>/.multiview/layouts.db`, so they survive a restart
+/// beside the persisted Running state (`active.toml`). Otherwise — or if the
+/// database cannot be opened — layouts live in memory for the life of the
+/// process (logged, never fatal: the control plane must still come up).
+#[cfg_attr(
+    not(feature = "sqlite"),
+    allow(clippy::unused_async, reason = "awaits only the sqlite open")
+)]
+async fn layout_repository(
+    boot_model: Option<&multiview_control::boot_model::BootModel>,
+) -> Arc<dyn multiview_control::repository::Repository> {
+    #[cfg(feature = "sqlite")]
+    if let Some(model) = boot_model {
+        let dir = model.state_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, dir = %dir.display(), "cannot create the layout store dir; layouts are in-memory only");
+        } else {
+            let path = dir.join("layouts.db");
+            let url = format!("sqlite://{}?mode=rwc", path.display());
+            match multiview_control::sqlite::SqliteRepository::connect(&url).await {
+                Ok(repo) => {
+                    tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
+                    return Arc::new(repo);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "cannot open the layout store; layouts are in-memory only");
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "sqlite"))]
+    let _ = boot_model;
+    Arc::new(InMemoryRepository::new())
 }
 
 #[cfg(test)]

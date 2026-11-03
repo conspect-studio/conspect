@@ -31,6 +31,7 @@ import type { LayoutModel } from '../model';
 import type { SourceView } from '../../resources/types';
 import { AreaMatrixEditor } from './AreaMatrixEditor';
 import { CellPropertiesPanel } from './CellPropertiesPanel';
+import { FrameRateField } from './FrameRateField';
 import { GridValidationMessage } from './validationMessages';
 import type { LayoutSavePayload } from './LayoutEditor';
 import { HelpLink } from '../../components/HelpLink';
@@ -339,21 +340,14 @@ export function GridLayoutEditor({
               }}
             />
           </div>
-          <div className="flex flex-col gap-1">
-            <Label htmlFor="grid-canvas-fps" className="text-xs">
-              <Trans>Frame rate (rational)</Trans>
-            </Label>
-            <Input
-              id="grid-canvas-fps"
-              className="w-32"
-              value={model.canvas.fps}
-              placeholder="30/1"
-              aria-invalid={errors.some((issue) => issue.path === 'canvas.fps')}
-              onChange={(event): void => {
-                editor.setCanvas({ ...model.canvas, fps: event.target.value });
-              }}
-            />
-          </div>
+          <FrameRateField
+            id="grid-canvas-fps"
+            value={model.canvas.fps}
+            invalid={errors.some((issue) => issue.path === 'canvas.fps')}
+            onChange={(fps): void => {
+              editor.setCanvas({ ...model.canvas, fps });
+            }}
+          />
         </fieldset>
 
         <fieldset className="flex flex-wrap items-end gap-3">

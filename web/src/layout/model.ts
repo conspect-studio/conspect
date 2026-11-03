@@ -754,7 +754,7 @@ export function emptyLayout(name = ''): LayoutModel {
   return {
     id: '',
     name,
-    canvas: { width: 1920, height: 1080, fps: '30/1' },
+    canvas: { width: 1920, height: 1080, fps: '30000/1001' },
     rootExtra: {},
     canvasExtra: {},
     layoutExtra: {},

@@ -17,6 +17,7 @@ import { useLayoutEditor } from '../useLayoutEditor';
 import { LAYOUT_PRESETS, toLayoutBody } from '../model';
 import type { LayoutModel, LayoutPreset } from '../model';
 import type { OverlayView, SourceView } from '../../resources/types';
+import { FrameRateField } from './FrameRateField';
 import { CellsForm } from './CellsForm';
 import { SourcePalette } from './SourcePalette';
 import { ValidationMessage } from './validationMessages';
@@ -251,28 +252,14 @@ export function LayoutEditor({
               }}
             />
           </div>
-          <div className="flex flex-col gap-1">
-            <Label htmlFor="layout-canvas-fps" className="text-xs">
-              <Trans>Frame rate (rational)</Trans>
-            </Label>
-            <Input
-              id="layout-canvas-fps"
-              className="w-32"
-              value={editor.model.canvas.fps}
-              placeholder="30/1"
-              aria-invalid={issues.some((issue) => issue.path === 'canvas.fps')}
-              aria-describedby="layout-canvas-fps-hint"
-              onChange={(event): void => {
-                editor.setCanvas({
-                  ...editor.model.canvas,
-                  fps: event.target.value,
-                });
-              }}
-            />
-            <p id="layout-canvas-fps-hint" className="text-xs text-muted-foreground">
-              <Trans>Exact "num/den", e.g. 30/1 or 30000/1001 — never a float.</Trans>
-            </p>
-          </div>
+          <FrameRateField
+            id="layout-canvas-fps"
+            value={editor.model.canvas.fps}
+            invalid={issues.some((issue) => issue.path === 'canvas.fps')}
+            onChange={(fps): void => {
+              editor.setCanvas({ ...editor.model.canvas, fps });
+            }}
+          />
         </fieldset>
 
         <fieldset className="flex flex-wrap items-end gap-2">

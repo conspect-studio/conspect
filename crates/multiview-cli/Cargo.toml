@@ -311,6 +311,10 @@ qsv = ["multiview-hal/qsv"]
 # build can serve the full management UI: `run --features web,overlay`.
 web = ["multiview-control/embed-web"]
 
+# Persist stored layouts to `<config-dir>/.multiview/layouts.db` (SQLite) so they
+# survive a restart. Off by default; on in the platform presets.
+sqlite = ["multiview-control/sqlite"]
+
 # Control-plane TLS termination (TLS-0, ADR-W029): serve the management plane
 # (API + docs + web UI) over HTTPS with an operator-managed cert/key when the
 # config carries `[control.tls]`. Forwards `multiview-control/tls` (axum-server +
@@ -523,6 +527,7 @@ nvidia = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "sqlite",
     # The cli's OWN `ffmpeg` feature — gates the run/pipeline path itself; without
     # it `multiview run` has no ingest/encode pipeline at all (GPU-6b: the presets
     # forwarded the dependency crates' ffmpeg but not the cli's, so a `--features
@@ -586,6 +591,7 @@ apple = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "sqlite",
     "ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped Apple deploy image
@@ -614,6 +620,7 @@ linux-vaapi = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "sqlite",
     "ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped VAAPI deploy image

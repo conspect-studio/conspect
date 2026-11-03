@@ -58,7 +58,7 @@ describe('LayoutEditor', () => {
     expect(payload?.body).toMatchObject({
       schema_version: 1,
       layout: { kind: 'absolute' },
-      canvas: { fps: '30/1' },
+      canvas: { fps: '30000/1001' }, // new layouts default to 29.97 (NTSC exact)
     });
     const cells = (payload?.body as { cells: unknown[] }).cells;
     expect(cells).toHaveLength(1);
