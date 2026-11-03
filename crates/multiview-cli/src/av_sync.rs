@@ -7,7 +7,8 @@
 //! the tile latch at this tick's output instant (the tile's nearest-but-not-after
 //! rule), and which raw PTS is the bus reading at this tick's sample position?
 //! `video_raw - audio_raw` is the on-air lip-sync error in source time
-//! (positive = audio leads the picture). It is logged as min/median/max every
+//! (positive = the picture is newer than the sound, audio LATE; negative = audio
+//! early). It is logged as min/median/max every
 //! 5 s and published per source as `av_offset_ms` (the latest window median)
 //! for the status API.
 //!
@@ -47,7 +48,7 @@ impl Default for AvProbe {
 
 impl AvProbe {
     /// The latest measured on-air offset in ms (video raw − audio raw; positive
-    /// = audio ahead of the picture), or `None` before a measurement.
+    /// = audio late, negative = audio early), or `None` before a measurement.
     #[must_use]
     pub fn offset_ms(&self) -> Option<i64> {
         let v = self.offset_ms.load(Ordering::Relaxed);
@@ -158,7 +159,7 @@ impl AvMeter {
                 av_offset_ms_median = median,
                 av_offset_ms_max = max,
                 samples = values.len(),
-                "a/v offset (video raw pts - audio raw pts at the same output instant; + = audio early)"
+                "a/v offset (video raw pts - audio raw pts at the same output instant; + = audio late)"
             );
             values.clear();
         }
@@ -170,8 +171,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// Video and audio placed through the same mapping measure 0; audio
-    /// placed 200 ms late (by raw time) measures +200.
+    /// Video and audio placed through the same mapping measure 0. Audio 200 ms
+    /// late (at an output instant it carries older source time than the picture)
+    /// measures +200.
     #[test]
     fn a_locked_source_measures_zero_and_a_slip_measures_the_slip() {
         let cadence = multiview_core::time::Rational::new(30, 1);
@@ -187,7 +189,7 @@ mod tests {
                     Some(100_000_000_000 + k * 1_000_000_000 / 30),
                 );
             }
-            // Audio: raw 100 s at output 10 s (+ slip), 10 s of it.
+            // Audio: raw 100 s minus the slip at output 10 s, so the sound is late.
             p.audio
                 .placed(480_000, 480_000, 100_000_000_000 - slip_ms * 1_000_000);
             let mut m = AvMeter::new(cadence, 48_000);

@@ -911,7 +911,7 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
                 .unwrap_or(serde_json::Value::Null);
             let mut tile = serde_json::json!({ "id": id, "state": state });
             // On-air lip-sync error of a live source (video raw PTS − audio raw
-            // PTS at the same output instant, ms; + = audio early). Absent until
+            // PTS at the same output instant, ms; + = audio late). Absent until
             // measured.
             if let (Some(o), Some(obj)) = (offsets.get(id), tile.as_object_mut()) {
                 obj.insert("av_offset_ms".to_owned(), serde_json::json!(o));

@@ -396,6 +396,7 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
                 stop,
                 &|| video_anchor(&slot),
                 Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
+                &plan.id,
             );
         } else {
             audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
@@ -411,9 +412,10 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // and reconnect — the same policy the video ingest uses.
         attempt = next_reconnect_attempt(attempt, ran_for);
         let nap = reconnect_backoff(attempt, jitter.next_unit());
-        tracing::debug!(
+        tracing::info!(
             source = %plan.id,
             attempt,
+            ?ran_for,
             ?nap,
             "reconnecting live source audio after backoff"
         );
