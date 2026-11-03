@@ -168,6 +168,9 @@ impl PreviewVideoEncoder {
             time_base: Rational::new(1, i64::from(PREVIEW_FPS)),
             bit_rate: PREVIEW_BITRATE,
             gop: preview_gop_frames(fps),
+            // Tag with the source canvas frame's own resolved color (issue
+            // #161) rather than leaving the preview stream untagged.
+            color: image.color(),
             cuda_device: None,
         };
         VideoEncoder::new_with_options(&target, &options).ok()

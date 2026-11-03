@@ -313,6 +313,11 @@ fn encode_config(spec: &SlateSpec) -> EncodeConfig {
         cadence: spec.video.cadence,
         gop: spec.video.gop,
         bit_rate: 0,
+        // The slate is a plain SDR card; tag with the player-style untagged
+        // default for its geometry (ADR-C002 — BT.709 for anything but SD line
+        // counts, limited range) rather than leaving the slate encode
+        // untagged (issue #161).
+        color: ColorInfo::default().resolve_defaults(spec.video.width, spec.video.height),
         audio: spec.audio.as_ref().map(|a| {
             // Native libav AAC (LGPL); `bit_rate: 0` lets the encoder choose.
             AudioEncodeConfig::aac(a.sample_rate, a.channels, 0)

@@ -78,6 +78,7 @@ fn encode_video() -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
         time_base: Rational::new(1, FPS),
         bit_rate: 2_000_000,
         gop: GOP,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     };
     let mut encoder = VideoEncoder::new(&target).expect("open video encoder");

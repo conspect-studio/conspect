@@ -2389,6 +2389,12 @@ impl Pipeline {
             cadence,
             gop,
             bit_rate: 4_000_000,
+            // The canvas's color tag (issue #161): the same `tag` the slate/
+            // nosignal-card NV12 frames above are stamped with, so the encoder
+            // and every encoded frame carry the canvas's real profile
+            // (BT.709 limited for the default `sdr-bt709-limited` canvas)
+            // instead of an untagged stream.
+            color: tag,
             // AUD-4: video-only until the program-audio path is wired through
             // drive_streaming (subsequent slice); `None` keeps the muxer
             // single-stream so the existing run output is unchanged.

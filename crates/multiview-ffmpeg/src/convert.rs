@@ -235,6 +235,83 @@ pub fn color_from_ff(
     }
 }
 
+/// Translate the [`MatrixCoefficients`] axis into its libav color-space
+/// (matrix coefficients) code point.
+#[must_use]
+fn matrix_to_ff(matrix: MatrixCoefficients) -> ff_color::Space {
+    match matrix {
+        MatrixCoefficients::Bt709 => ff_color::Space::BT709,
+        MatrixCoefficients::Bt601 => ff_color::Space::SMPTE170M,
+        MatrixCoefficients::Bt2020Ncl => ff_color::Space::BT2020NCL,
+        MatrixCoefficients::Rgb => ff_color::Space::RGB,
+        _ => ff_color::Space::Unspecified,
+    }
+}
+
+/// Translate the [`ColorPrimaries`] axis into its libav primaries code point.
+#[must_use]
+fn primaries_to_ff(primaries: ColorPrimaries) -> ff_color::Primaries {
+    match primaries {
+        ColorPrimaries::Bt709 => ff_color::Primaries::BT709,
+        ColorPrimaries::Bt601_525 => ff_color::Primaries::SMPTE170M,
+        ColorPrimaries::Bt601_625 => ff_color::Primaries::BT470BG,
+        ColorPrimaries::Bt2020 => ff_color::Primaries::BT2020,
+        _ => ff_color::Primaries::Unspecified,
+    }
+}
+
+/// Translate the [`TransferCharacteristic`] axis into its libav
+/// transfer-characteristic code point.
+#[must_use]
+fn transfer_to_ff(trc: TransferCharacteristic) -> ff_color::TransferCharacteristic {
+    match trc {
+        TransferCharacteristic::Bt709 => ff_color::TransferCharacteristic::BT709,
+        TransferCharacteristic::Bt601 => ff_color::TransferCharacteristic::SMPTE170M,
+        TransferCharacteristic::Bt2020 => ff_color::TransferCharacteristic::BT2020_10,
+        TransferCharacteristic::Srgb => ff_color::TransferCharacteristic::IEC61966_2_1,
+        TransferCharacteristic::Pq => ff_color::TransferCharacteristic::SMPTE2084,
+        TransferCharacteristic::Hlg => ff_color::TransferCharacteristic::ARIB_STD_B67,
+        _ => ff_color::TransferCharacteristic::Unspecified,
+    }
+}
+
+/// Translate the [`ColorRange`] axis into its libav color-range code point.
+#[must_use]
+fn range_to_ff(range: ColorRange) -> ff_color::Range {
+    match range {
+        ColorRange::Limited => ff_color::Range::MPEG,
+        ColorRange::Full => ff_color::Range::JPEG,
+        // `ColorRange` is `#[non_exhaustive]`; `Unspecified` plus any future
+        // variant this crate does not yet map stays libav's `Unspecified` —
+        // never guessed.
+        ColorRange::Unspecified | _ => ff_color::Range::Unspecified,
+    }
+}
+
+/// Decompose a [`ColorInfo`] (the four independent axes) into the libav
+/// color-space/primaries/transfer/range code points it tags an encoder
+/// context or frame with — the inverse of [`color_from_ff`].
+///
+/// This is the "tag output" step of the fixed color pipeline (invariant #8):
+/// every axis is translated independently and an `Unspecified` axis stays
+/// libav's `Unspecified` code point (never guessed here).
+#[must_use]
+pub fn color_to_ff(
+    color: ColorInfo,
+) -> (
+    ff_color::Space,
+    ff_color::Primaries,
+    ff_color::TransferCharacteristic,
+    ff_color::Range,
+) {
+    (
+        matrix_to_ff(color.matrix),
+        primaries_to_ff(color.primaries),
+        transfer_to_ff(color.transfer),
+        range_to_ff(color.range),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +386,40 @@ mod tests {
         assert_eq!(info.primaries, ColorPrimaries::Bt601_525);
         assert_eq!(info.transfer, TransferCharacteristic::Bt601);
         assert_eq!(info.range, ColorRange::Full);
+    }
+
+    #[test]
+    fn color_to_ff_round_trips_sdr_bt709_limited() {
+        // The issue-#161 canvas profile: BT.709 primaries/transfer/matrix,
+        // limited range. Round-tripping through `color_to_ff` -> `color_from_ff`
+        // must reproduce every axis exactly (invariant #8's "tag output" step
+        // is the exact inverse of "detect 4 axes").
+        let sdr_bt709_limited = ColorInfo {
+            primaries: ColorPrimaries::Bt709,
+            transfer: TransferCharacteristic::Bt709,
+            matrix: MatrixCoefficients::Bt709,
+            range: ColorRange::Limited,
+        };
+        let (space, primaries, trc, range) = color_to_ff(sdr_bt709_limited);
+        assert_eq!(space, ff_color::Space::BT709);
+        assert_eq!(primaries, ff_color::Primaries::BT709);
+        assert_eq!(trc, ff_color::TransferCharacteristic::BT709);
+        assert_eq!(range, ff_color::Range::MPEG);
+        assert_eq!(
+            color_from_ff(space, primaries, trc, range),
+            sdr_bt709_limited
+        );
+    }
+
+    #[test]
+    fn color_to_ff_leaves_unspecified_axes_unspecified() {
+        // An untagged axis must stay libav's Unspecified code point — the
+        // "tag output" step never guesses a value for an axis the caller did
+        // not resolve.
+        let (space, primaries, trc, range) = color_to_ff(ColorInfo::default());
+        assert_eq!(space, ff_color::Space::Unspecified);
+        assert_eq!(primaries, ff_color::Primaries::Unspecified);
+        assert_eq!(trc, ff_color::TransferCharacteristic::Unspecified);
+        assert_eq!(range, ff_color::Range::Unspecified);
     }
 }

@@ -23,9 +23,10 @@ use ffmpeg::util::frame::{Audio, Video};
 use ffmpeg::{codec, encoder, ChannelLayout, Dictionary};
 use ffmpeg_next as ffmpeg;
 
+use multiview_core::color::ColorInfo;
 use multiview_core::time::Rational;
 
-use crate::convert::to_ff_rational;
+use crate::convert::{color_to_ff, to_ff_rational};
 use crate::decode::ensure_initialized;
 use crate::encode_options::CodecOptions;
 use crate::error::{FfmpegError, Result};
@@ -61,6 +62,18 @@ pub struct VideoEncodeTarget {
     pub bit_rate: usize,
     /// Keyframe interval in frames (GOP size); `0` lets the codec choose.
     pub gop: u32,
+    /// The four-axis color description (invariant #8's "tag output" step,
+    /// issue #161) every encoded frame and the encoder's codec context are
+    /// tagged with — range/primaries/transfer/matrix, e.g. BT.709 limited for
+    /// the `sdr-bt709-limited` canvas profile. Tagging only labels; the pixels
+    /// fed to the encoder were already produced to match (the compositor's
+    /// fixed color pipeline). Applied in [`VideoEncoder::new_with_options`] (the
+    /// shared encoder-setup path all backends — software, NVENC, VAAPI/QSV —
+    /// go through) and re-stamped on every frame in [`VideoEncoder::send_frame`]
+    /// so a hardware encoder that reads frame-side tags (rather than only the
+    /// context) is covered too. An `Unspecified` axis is passed through as
+    /// libav's `Unspecified` code point — this never guesses a value.
+    pub color: ColorInfo,
     /// Optional CUDA device ordinal (e.g. `Some("1")`) to pin a `*_nvenc`
     /// encoder onto, so encode lands on the admission-selected GPU instead of
     /// libav's default CUDA device (ordinal 0) — the NVENC device-affinity seam
@@ -71,10 +84,56 @@ pub struct VideoEncodeTarget {
     pub cuda_device: Option<String>,
 }
 
+/// Tag a not-yet-opened encoder context's color-space/range/primaries/transfer
+/// fields from `color` (invariant #8's "tag output" step, issue #161).
+///
+/// This is the single shared seam every [`VideoEncodeTarget`] backend —
+/// software, `*_nvenc`, VAAPI/QSV — opens its context through
+/// ([`VideoEncoder::new_with_options`] calls this unconditionally, before
+/// `avcodec_open2`), so a hardware codec picks up the same tags as the LGPL
+/// software path this crate can exercise in CI without a GPU. `color_range`
+/// and `colorspace` go through `ffmpeg_next`'s safe setters; `color_primaries`
+/// and `color_trc` have no safe setter on the encoder context in this
+/// `ffmpeg_next` version, so they are written directly on the `AVCodecContext`.
+fn tag_encoder_context(ctx: &mut encoder::video::Video, color: ColorInfo) {
+    let (space, primaries, trc, range) = color_to_ff(color);
+    ctx.set_colorspace(space);
+    ctx.set_color_range(range);
+    // SAFETY: `ctx.as_mut_ptr()` returns the live `AVCodecContext` this `Video`
+    // wraps (not yet opened — `avcodec_open2` has not been called); writing its
+    // `color_primaries`/`color_trc` enum fields is a plain field store with no
+    // aliasing or lifetime hazard, mirroring `set_colorspace`/`set_color_range`
+    // immediately above (same struct, same call site, same borrow).
+    #[allow(unsafe_code)]
+    unsafe {
+        (*ctx.as_mut_ptr()).color_primaries = primaries.into();
+        (*ctx.as_mut_ptr()).color_trc = trc.into();
+    }
+}
+
+/// Tag a frame's color-space/range/primaries/transfer fields from `color`
+/// before it is sent to the encoder — the frame-side twin of
+/// [`tag_encoder_context`]. Some encoders (hardware ones in particular) read
+/// the per-frame tags rather than only the codec-context tags, so both are
+/// stamped from the same [`ColorInfo`] (issue #161).
+fn tag_frame(frame: &mut Video, color: ColorInfo) {
+    let (space, primaries, trc, range) = color_to_ff(color);
+    frame.set_color_space(space);
+    frame.set_color_range(range);
+    frame.set_color_primaries(primaries);
+    frame.set_color_transfer_characteristic(trc);
+}
+
 /// A configured-and-opened video encoder.
 pub struct VideoEncoder {
     encoder: encoder::video::Encoder,
     time_base: Rational,
+    /// The four-axis color tag ([`VideoEncodeTarget::color`]) every frame sent
+    /// through [`Self::send_frame`] is stamped with before encoding, so a
+    /// hardware encoder that reads frame-side color (rather than only the
+    /// codec-context tags [`tag_encoder_context`] already applied at open) is
+    /// covered too (issue #161).
+    color: ColorInfo,
     /// Armed by [`Self::force_next_keyframe`] (the ADR-0049 force-keyframe
     /// seam): the next frame sent is encoded as an intra/IDR picture. One-shot —
     /// cleared by the send that consumes it.
@@ -139,6 +198,7 @@ impl VideoEncoder {
         if target.gop > 0 {
             ctx.set_gop(target.gop);
         }
+        tag_encoder_context(&mut ctx, target.color);
 
         // NVENC device-affinity pin (Tier-2 P1a): when an ordinal is requested
         // AND the codec is a `*_nvenc` encoder, bind a CUDA device context for
@@ -176,6 +236,7 @@ impl VideoEncoder {
         Ok(Self {
             encoder,
             time_base: target.time_base,
+            color: target.color,
             force_keyframe: false,
             hw_device,
         })
@@ -253,6 +314,11 @@ impl VideoEncoder {
     /// Send one frame, whose PTS the caller has already set from the tick
     /// counter (encoder time-base). Drain packets with [`Self::receive_packet`].
     ///
+    /// Every frame is re-stamped with this encoder's [`VideoEncodeTarget::color`]
+    /// tags before it reaches libav (issue #161) — the frame-side half of the
+    /// "tag output" step (invariant #8), alongside the codec-context tags
+    /// [`tag_encoder_context`] applied once at open.
+    ///
     /// If [`Self::force_next_keyframe`] armed the seam, this send consumes it:
     /// the frame is deep-copied once (geometry-bounded, and rate-bounded by the
     /// caller's ≥2 s force floor — never a steady-state cost), stamped
@@ -261,16 +327,19 @@ impl VideoEncoder {
     /// # Errors
     /// Returns [`FfmpegError::Encode`] on a libav send error.
     pub fn send_frame(&mut self, frame: &Video) -> Result<()> {
+        // `Video::clone` copies the pixel planes AND the frame props (PTS
+        // included) via av_frame_copy + av_frame_copy_props, so the tagged copy
+        // is the same frame with only its color tags (and, on the
+        // force-keyframe path, the picture type) overwritten.
+        let mut tagged = frame.clone();
+        tag_frame(&mut tagged, self.color);
         if self.force_keyframe {
             self.force_keyframe = false;
-            // `Video::clone` copies the pixel planes AND the frame props (PTS
-            // included) via av_frame_copy + av_frame_copy_props, so the keyed
-            // copy is the same frame with only the picture type forced.
-            let mut keyed = frame.clone();
-            keyed.set_kind(ffmpeg::picture::Type::I);
-            return self.encoder.send_frame(&keyed).map_err(FfmpegError::Encode);
+            tagged.set_kind(ffmpeg::picture::Type::I);
         }
-        self.encoder.send_frame(frame).map_err(FfmpegError::Encode)
+        self.encoder
+            .send_frame(&tagged)
+            .map_err(FfmpegError::Encode)
     }
 
     /// Flush the encoder (signal EOF) so buffered packets can be drained.

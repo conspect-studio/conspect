@@ -142,6 +142,7 @@ fn target() -> VideoEncodeTarget {
         time_base: Rational::new(1, i64::from(FPS)),
         bit_rate: 2_000_000,
         gop: GOP,
+        color: multiview_core::color::ColorInfo::default(),
         cuda_device: None,
     }
 }
