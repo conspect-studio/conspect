@@ -27,6 +27,7 @@ import {
   deleteLayoutById,
   LayoutApiError,
   updateLayout,
+  fetchLayoutEtag,
 } from './layouts';
 import type { Layout, LayoutInput } from './layouts';
 
@@ -135,15 +136,22 @@ export function useSaveLayout(
   return useMutation<Layout, ApiError, SaveLayoutVars, SaveSnapshot>({
     mutationFn: async ({ input, id, create }): Promise<Layout> => {
       const etags = readEtags(queryClient);
-      // Decide create vs update: explicit `create` flag wins; otherwise check
-      // whether we already have an ETag (which means the server knows it).
-      const isCreate = create ?? !(id in etags);
       let result;
       try {
-        if (isCreate) {
+        // Decide create vs update: explicit `create` flag wins; a cached ETag
+        // means update. With neither (a reloaded session editing an existing
+        // layout — the list carries no ETags), ask the server: a current ETag
+        // means update with it as If-Match; a 404 means create.
+        let ifMatch = etags[id];
+        let isCreate = create;
+        if (isCreate === undefined && ifMatch === undefined) {
+          ifMatch = await fetchLayoutEtag(context.api, id);
+          isCreate = ifMatch === undefined;
+        }
+        if (isCreate === true) {
           result = await createLayout(context.api, id, input);
         } else {
-          result = await updateLayout(context.api, id, input, etags[id]);
+          result = await updateLayout(context.api, id, input, ifMatch);
         }
       } catch (error) {
         throw toApiError(error);
