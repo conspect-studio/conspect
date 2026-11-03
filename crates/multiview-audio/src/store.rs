@@ -1189,7 +1189,7 @@ impl Placer {
     /// Name the source in this placer's log lines.
     #[must_use]
     pub fn with_source(mut self, source: &str) -> Self {
-        self.source = source.to_owned();
+        source.clone_into(&mut self.source);
         self
     }
 
@@ -1343,6 +1343,7 @@ impl Placer {
 ///
 /// Neither thread is on the output clock and the store is never blocked
 /// (invariants #1/#10).
+#[allow(clippy::too_many_arguments)] // reason: each input is distinct (decoder, store, stop, anchor source, two bounds, log, source id); a struct would only hide the data flow.
 pub fn anchored_publish_loop(
     mut next: impl FnMut() -> Result<Option<(AudioBlock, multiview_core::time::MediaTime)>>,
     store: &AudioStore,
