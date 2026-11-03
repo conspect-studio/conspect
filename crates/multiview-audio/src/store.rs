@@ -844,6 +844,7 @@ pub fn audio_decode_loop_anchored(
     stop: &std::sync::atomic::AtomicBool,
     anchor: &(dyn Fn() -> Option<PtsAnchor> + Sync),
     log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
+    source: &str,
 ) {
     if stop.load(Ordering::Acquire) {
         return;
@@ -867,6 +868,7 @@ pub fn audio_decode_loop_anchored(
         ANCHORED_LEAD,
         MAX_QUEUED_AUDIO,
         log,
+        source,
     );
 }
 
@@ -933,14 +935,25 @@ impl EpochLog {
         }
     }
 
-    /// The (latest) epoch whose span contains `raw_ns`, with a small margin.
+    /// The epoch a video anchor at `raw_ns` belongs to: the (latest) span holding
+    /// it, with a small margin. An anchor outside every span is usually not on
+    /// another clock: it can be older than this connection's first audio (video
+    /// anchored long ago and has been healthy since) or newer than the audio
+    /// decoded so far (audio reads behind video). So it belongs to the nearest
+    /// end: before all spans the oldest, otherwise the newest.
     fn epoch_of(&self, raw_ns: i64) -> Option<u64> {
-        self.epochs
-            .iter()
-            .rev()
-            .find(|e| {
-                raw_ns >= e.min_ns.saturating_sub(EPOCH_MARGIN_NS)
-                    && raw_ns <= e.max_ns.saturating_add(EPOCH_MARGIN_NS)
+        let inside = self.epochs.iter().rev().find(|e| {
+            raw_ns >= e.min_ns.saturating_sub(EPOCH_MARGIN_NS)
+                && raw_ns <= e.max_ns.saturating_add(EPOCH_MARGIN_NS)
+        });
+        let before_all = self.epochs.iter().all(|e| raw_ns < e.min_ns);
+        inside
+            .or_else(|| {
+                if before_all {
+                    self.epochs.front()
+                } else {
+                    self.epochs.back()
+                }
             })
             .map(|e| e.id)
     }
@@ -1011,8 +1024,53 @@ impl AnchorMap {
         }
     }
 
-    /// The output-timeline frame for a block at raw `raw_ns` in audio clock span
-    /// `epoch`, or `None` if no usable mapping exists yet (hold it).
+    /// Where a block at raw `raw_ns` in audio clock span `epoch` goes.
+    ///
+    /// A video anchor of the block's own span always wins over a self-anchor,
+    /// so audio locks as soon as video maps it, and follows every later
+    /// generation. A video mapping BEHIND the cursor means the block is late
+    /// (its picture has aired): the caller drops it, never re-seats it
+    /// unlocked. Only a mapping more than `far_frames` AHEAD is taken as not
+    /// belonging to this audio.
+    #[must_use]
+    pub fn map(&self, raw_ns: i64, epoch: u64, epochs: &EpochLog, cursor: i64) -> Mapped {
+        let not_far_ahead = |a: &PtsAnchor| {
+            a.frame_for(raw_ns, self.rate).saturating_sub(cursor) <= self.far_frames
+        };
+        let mine = || {
+            self.anchors
+                .iter()
+                .filter(|a| epochs.epoch_of(a.raw_pts0_ns) == Some(epoch))
+                .filter(|a| not_far_ahead(a))
+        };
+        let video = mine()
+            .filter(|a| a.raw_pts0_ns <= raw_ns)
+            .max_by_key(|a| (a.raw_pts0_ns, a.generation))
+            .or_else(|| mine().min_by_key(|a| (a.raw_pts0_ns, a.generation)));
+        if let Some(a) = video {
+            let at = a.frame_for(raw_ns, self.rate);
+            // A generation covers output only up to where the next one starts:
+            // audio it maps past that point is media video skipped (a gap close
+            // or a dropped frame) and must not overwrite what the next shows.
+            let superseded = mine()
+                .filter(|n| n.raw_pts0_ns > raw_ns && n.generation > a.generation)
+                .min_by_key(|n| (n.raw_pts0_ns, n.generation))
+                .is_some_and(|n| at >= output_ns_to_frame(n.out0_ns, self.rate));
+            return if superseded {
+                Mapped::Skipped
+            } else {
+                Mapped::Video(at)
+            };
+        }
+        self.unlocked
+            .iter()
+            .find(|(e, _)| *e == epoch)
+            .map(|(_, a)| a.frame_for(raw_ns, self.rate))
+            .filter(|at| at.saturating_sub(cursor).abs() <= self.far_frames)
+            .map_or(Mapped::None, Mapped::Unlocked)
+    }
+
+    /// [`map`](Self::map) as a frame (either mapping), for placement.
     #[must_use]
     pub fn frame_for(
         &self,
@@ -1021,34 +1079,26 @@ impl AnchorMap {
         epochs: &EpochLog,
         cursor: i64,
     ) -> Option<i64> {
-        let mine = || {
-            self.anchors
-                .iter()
-                .filter(|a| epochs.epoch_of(a.raw_pts0_ns) == Some(epoch))
-        };
-        let video = mine()
-            .filter(|a| a.raw_pts0_ns <= raw_ns)
-            .max_by_key(|a| (a.raw_pts0_ns, a.generation))
-            .or_else(|| mine().min_by_key(|a| (a.raw_pts0_ns, a.generation)));
-        let usable = |a: &PtsAnchor| {
-            let at = a.frame_for(raw_ns, self.rate);
-            (at.saturating_sub(cursor).abs() <= self.far_frames).then_some(at)
-        };
-        video.and_then(usable).or_else(|| {
-            self.unlocked
-                .iter()
-                .find(|(e, _)| *e == epoch)
-                .and_then(|(_, a)| usable(a))
-        })
+        match self.map(raw_ns, epoch, epochs, cursor) {
+            Mapped::Video(at) | Mapped::Unlocked(at) => Some(at),
+            Mapped::Skipped | Mapped::None => None,
+        }
     }
+}
 
-    /// Whether `epoch` has any video anchor, i.e. audio in it is locked.
-    #[must_use]
-    pub fn is_locked(&self, epoch: u64, epochs: &EpochLog) -> bool {
-        self.anchors
-            .iter()
-            .any(|a| epochs.epoch_of(a.raw_pts0_ns) == Some(epoch))
-    }
+/// The result of [`AnchorMap::map`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Mapped {
+    /// Through a video anchor: locked to the picture.
+    Video(i64),
+    /// Through a self-anchor (no video mapping): unlocked.
+    Unlocked(i64),
+    /// Media the picture skipped (a later generation already owns that
+    /// output): drop it.
+    Skipped,
+    /// No mapping yet.
+    None,
 }
 
 /// One decoded block awaiting (or retained after) placement.
@@ -1109,8 +1159,12 @@ pub struct Placer {
     lead_frames: i64,
     wait: std::time::Duration,
     held_since: Option<std::time::Instant>,
-    warned_unlocked: bool,
     log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
+    source: String,
+    /// The lock state last logged (`None` before the first placement).
+    locked: Option<bool>,
+    /// Blocks dropped as late (behind the picture).
+    late_dropped: u64,
 }
 
 impl Placer {
@@ -1125,9 +1179,18 @@ impl Placer {
             lead_frames,
             wait,
             held_since: None,
-            warned_unlocked: false,
             log: None,
+            source: String::new(),
+            locked: None,
+            late_dropped: 0,
         }
+    }
+
+    /// Name the source in this placer's log lines.
+    #[must_use]
+    pub fn with_source(mut self, source: &str) -> Self {
+        source.clone_into(&mut self.source);
+        self
     }
 
     /// Record every placement (and clear) into `log`, for on-air A/V offset
@@ -1155,37 +1218,56 @@ impl Placer {
         let changed = self.map.observe(latest);
         let mut batch: Vec<PendingBlock> = Vec::new();
         while let Some(front) = queue.units.front() {
-            if let Some(at) = self
+            let mapped = self
                 .map
-                .frame_for(front.raw_ns, front.epoch, &queue.epochs, cursor)
-            {
-                {
-                    self.held_since = None;
-                    if at > cursor.saturating_add(self.lead_frames) {
-                        break;
+                .map(front.raw_ns, front.epoch, &queue.epochs, cursor);
+            if let Mapped::Video(at) | Mapped::Unlocked(at) = mapped {
+                self.held_since = None;
+                let locked = matches!(mapped, Mapped::Video(_));
+                if self.locked != Some(locked) {
+                    self.locked = Some(locked);
+                    tracing::info!(source = %self.source, locked, raw_ns = front.raw_ns, at, cursor, "live audio: lock state changed");
+                }
+                let frames = i64::try_from(front.block.frame_count()).unwrap_or(0);
+                if at.saturating_add(frames) <= cursor {
+                    // Late: its picture has already aired. Drop it, never re-seat.
+                    self.late_dropped = self.late_dropped.saturating_add(1);
+                    if self.late_dropped % 100 == 1 {
+                        tracing::info!(source = %self.source, behind_frames = cursor - at, dropped = self.late_dropped, "live audio: dropping late audio (behind the picture)");
                     }
-                    let Some(unit) = queue.units.pop_front() else {
-                        break;
-                    };
+                    if let Some(unit) = queue.units.pop_front() {
+                        queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
+                    }
+                    continue;
+                }
+                if at > cursor.saturating_add(self.lead_frames) {
+                    break;
+                }
+                let Some(unit) = queue.units.pop_front() else {
+                    break;
+                };
+                queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
+                batch.push(unit);
+            } else if mapped == Mapped::Skipped {
+                self.held_since = None;
+                if let Some(unit) = queue.units.pop_front() {
                     queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
-                    batch.push(unit);
                 }
             } else {
-                {
-                    let since = *self.held_since.get_or_insert(now);
-                    if now.saturating_duration_since(since) < self.wait {
-                        break;
-                    }
-                    if !self.warned_unlocked {
-                        self.warned_unlocked = true;
-                        tracing::warn!(
-                            "live audio: no usable video anchor; playing audio unlocked"
-                        );
-                    }
-                    let (raw, epoch) = (front.raw_ns, front.epoch);
-                    self.map
-                        .play_unlocked(epoch, raw, cursor.saturating_add(self.lead_frames));
+                let since = *self.held_since.get_or_insert(now);
+                if now.saturating_duration_since(since) < self.wait {
+                    break;
                 }
+                tracing::warn!(
+                    source = %self.source,
+                    raw_ns = front.raw_ns,
+                    cursor,
+                    latest = ?latest,
+                    "live audio: no usable video anchor; playing audio unlocked"
+                );
+                let (raw, epoch) = (front.raw_ns, front.epoch);
+                self.map
+                    .play_unlocked(epoch, raw, cursor.saturating_add(self.lead_frames));
             }
         }
         if changed {
@@ -1261,6 +1343,7 @@ impl Placer {
 ///
 /// Neither thread is on the output clock and the store is never blocked
 /// (invariants #1/#10).
+#[allow(clippy::too_many_arguments)] // reason: each input is distinct (decoder, store, stop, anchor source, two bounds, log, source id); a struct would only hide the data flow.
 pub fn anchored_publish_loop(
     mut next: impl FnMut() -> Result<Option<(AudioBlock, multiview_core::time::MediaTime)>>,
     store: &AudioStore,
@@ -1269,6 +1352,7 @@ pub fn anchored_publish_loop(
     lead: std::time::Duration,
     max_queued: std::time::Duration,
     log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
+    source: &str,
 ) {
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -1287,7 +1371,9 @@ pub fn anchored_publish_loop(
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            let mut placer = Placer::new(rate, lead_frames, ANCHOR_WAIT).with_log(log);
+            let mut placer = Placer::new(rate, lead_frames, ANCHOR_WAIT)
+                .with_log(log)
+                .with_source(source);
             while !stop.load(Ordering::Acquire) {
                 {
                     let mut q = lock(&queue);
@@ -1307,7 +1393,10 @@ pub fn anchored_publish_loop(
                     consecutive_errors = 0;
                     lock(&queue).push(block, pts.as_nanos(), rate, max_queued_frames);
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    tracing::info!(source, "live audio: end of stream; ending connection");
+                    break;
+                }
                 Err(AudioError::Stalled(reason)) => {
                     tracing::warn!(%reason, "audio decode loop: input stalled; ending connection");
                     break;
@@ -1743,6 +1832,129 @@ mod resync_tests {
         }
     }
 
+    /// Video anchored minutes ago and has been healthy since, so it has published
+    /// nothing new; audio connects (or reconnects) now. The old anchor still
+    /// holds on the same clock, so audio must lock to it, not wait and then play
+    /// unlocked at an arbitrary offset.
+    #[test]
+    fn audio_connecting_after_video_locks_to_the_older_anchor() {
+        let g1 = anchor(1, 20 * SEC, 100 * SEC);
+        let raws: Vec<i64> = (0..30).map(|i| 400 * SEC + i * SEC / 10).collect();
+        let store = run(&raws, &[g1], 320 * RATE);
+        for p in [400 * SEC, 401 * SEC, 402 * SEC] {
+            assert_eq!(raw_at(&store, video_frame(&g1, p)), ms_of(p), "p={p}");
+        }
+    }
+
+    /// The same when audio is behind video: video re-anchored at a raw time past
+    /// everything audio has decoded so far.
+    #[test]
+    fn audio_behind_the_newest_anchor_still_locks() {
+        let g1 = anchor(1, 330 * SEC, 410 * SEC);
+        let raws: Vec<i64> = (0..30).map(|i| 400 * SEC + i * SEC / 10).collect();
+        let store = run(&raws, &[g1], 320 * RATE);
+        assert_eq!(
+            raw_at(&store, video_frame(&g1, 401 * SEC)),
+            ms_of(401 * SEC)
+        );
+    }
+
+    /// A splice under the 30 s sanity limit: the old anchor still maps near the
+    /// cursor, so only span membership stops audio past the jump using it.
+    #[test]
+    fn audio_past_a_short_splice_does_not_use_the_old_anchor() {
+        let mut raws: Vec<i64> = (0..10).map(|i| 100 * SEC + i * SEC / 10).collect();
+        raws.extend((0..10).map(|i| 120 * SEC + i * SEC / 10));
+        let g1 = anchor(1, 20 * SEC, 100 * SEC);
+        let store = run(&raws, &[g1], 20 * RATE);
+        assert_eq!(raw_at(&store, video_frame(&g1, 120 * SEC)), 0.0);
+    }
+
+    /// Audio from its own (slow) connection is more than the far limit behind
+    /// the picture. It must be dropped as late, never held and then played
+    /// unlocked: an unlocked re-seat plays it seconds behind the picture.
+    #[test]
+    fn lagging_audio_with_a_video_anchor_is_dropped_never_played_unlocked() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut q = DecodedQueue::default();
+        // Video shows raw 160 s at 60 s; this audio is raw 100-102 s (60 s late).
+        let g1 = anchor(1, 60 * SEC, 160 * SEC);
+        for i in 0..20 {
+            let r = 100 * SEC + i * SEC / 10;
+            q.push(stamped(format, r), r, 48_000, usize::MAX);
+        }
+        let mut placer = Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(15));
+        let t0 = std::time::Instant::now();
+        placer.step(&store, &mut q, Some(g1), 60 * RATE, t0);
+        placer.step(
+            &store,
+            &mut q,
+            Some(g1),
+            60 * RATE,
+            t0 + std::time::Duration::from_secs(16),
+        );
+        assert!(q.is_empty(), "late audio must drain, not wait");
+        assert_eq!(store.buffered_frames(), 0, "late audio must not be placed");
+    }
+
+    /// A source that played unlocked (video had never anchored) must follow the
+    /// picture as soon as video anchors, and keep following every later video
+    /// generation (here a 5.6 s gap close).
+    #[test]
+    fn unlocked_audio_locks_when_video_anchors_and_follows_later_generations() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut q = DecodedQueue::default();
+        for i in 0..200 {
+            let r = 500 * SEC + i * SEC / 10;
+            q.push(stamped(format, r), r, 48_000, usize::MAX);
+        }
+        let mut placer = Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(15));
+        let t0 = std::time::Instant::now();
+        placer.step(&store, &mut q, None, 10 * RATE, t0);
+        placer.step(
+            &store,
+            &mut q,
+            None,
+            10 * RATE,
+            t0 + std::time::Duration::from_secs(16),
+        );
+        assert_eq!(
+            raw_at(&store, 13 * RATE),
+            ms_of(500 * SEC),
+            "unlocked at cursor + lead"
+        );
+        // Video anchors: raw 501 s at 14 s.
+        let g1 = anchor(1, 14 * SEC, 501 * SEC);
+        placer.step(
+            &store,
+            &mut q,
+            Some(g1),
+            12 * RATE,
+            t0 + std::time::Duration::from_secs(17),
+        );
+        assert_eq!(
+            raw_at(&store, video_frame(&g1, 502 * SEC)),
+            ms_of(502 * SEC),
+            "locked after video anchors"
+        );
+        // Gap close: video skips 5.6 s of media; raw 508.6 s now shows at 16 s.
+        let g2 = anchor(2, 16 * SEC, 508 * SEC + 6 * SEC / 10);
+        placer.step(
+            &store,
+            &mut q,
+            Some(g2),
+            14 * RATE,
+            t0 + std::time::Duration::from_secs(18),
+        );
+        assert_eq!(
+            raw_at(&store, video_frame(&g2, 509 * SEC)),
+            ms_of(509 * SEC),
+            "audio follows the gap close"
+        );
+    }
+
     /// No video anchor at all: the audio waits, then plays unlocked.
     #[test]
     fn audio_without_a_video_anchor_plays_unlocked_after_the_wait() {
@@ -1791,6 +2003,7 @@ mod resync_tests {
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(20),
             None,
+            "test",
         );
         assert_eq!(calls, 1);
     }

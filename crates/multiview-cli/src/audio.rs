@@ -341,6 +341,58 @@ pub(crate) struct AudioIngestPlan {
     pub(crate) live: bool,
 }
 
+/// How long [`await_shared_url`] waits for the video's fetcher.
+#[derive(Debug, Clone, Copy)]
+struct SharedUrlWait {
+    /// Video has not anchored yet: it may still be fetching its first segment,
+    /// so outlast the fetcher's own first-segment deadline (40 s).
+    first_connect: Duration,
+    /// Video is already running without a fetcher entry (or is reconnecting).
+    reconnect: Duration,
+    poll: Duration,
+}
+
+impl SharedUrlWait {
+    const DEFAULT: Self = Self {
+        first_connect: Duration::from_secs(45),
+        reconnect: Duration::from_secs(10),
+        poll: Duration::from_millis(100),
+    };
+}
+
+/// Wait for the video's fetched copy of this source, so audio does not race
+/// the fetcher to the origin: the URL is registered only after the first
+/// segment is in memory, which takes seconds on a slow origin. Returns `None`
+/// (open the origin) once video has anchored without a fetcher (it fell back
+/// to libav), on `stop`, or at the deadline. Runs on the audio ingest thread,
+/// never the output clock.
+fn await_shared_url(
+    lookup: impl Fn() -> Option<String>,
+    video_generation: impl Fn() -> Option<u64>,
+    stop: &AtomicBool,
+    wait: SharedUrlWait,
+) -> Option<String> {
+    let baseline = video_generation();
+    let limit = if baseline.is_none() {
+        wait.first_connect
+    } else {
+        wait.reconnect
+    };
+    let started = Instant::now();
+    loop {
+        if let Some(url) = lookup() {
+            return Some(url);
+        }
+        if stop.load(Ordering::Acquire)
+            || video_generation() != baseline
+            || started.elapsed() >= limit
+        {
+            return lookup();
+        }
+        std::thread::sleep(wait.poll);
+    }
+}
+
 /// Drive a source's audio decode under the supervised-reconnect bracket: open +
 /// decode the source's best audio stream into `store` (resampling to the
 /// canonical 48 kHz stereo format), reconnecting a *live* source on EOF/error
@@ -369,17 +421,40 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // ("Invalid data found"), leaving the source silent. Re-resolved on every
         // connection (variant URIs can be session-bound). Best-effort: `None`
         // keeps the original URL.
-        let pinned = if plan.live
-            && plan
-                .location
-                .split(['?', '#'])
-                .next()
-                .is_some_and(|b| b.to_ascii_lowercase().ends_with(".m3u8"))
-        {
+        let is_hls = plan
+            .location
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|b| b.to_ascii_lowercase().ends_with(".m3u8"));
+        // Prefer the video's fetched copy (one fetch per source: audio and video
+        // read the same segments). Fall back to opening the origin when video is
+        // not on the fetcher.
+        let shared =
+            if plan.live && is_hls && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none() {
+                let slot = crate::pipeline::live_anchor_slot(&plan.id);
+                await_shared_url(
+                    || crate::hls_fetch::shared_url(&plan.id),
+                    || slot.load().map(|a| a.generation),
+                    stop,
+                    SharedUrlWait::DEFAULT,
+                )
+            } else {
+                None
+            };
+        let shared_fetch = shared.is_some();
+        let pinned = if shared.is_some() {
+            shared
+        } else if plan.live && is_hls {
             crate::pipeline::resolve_hls_audio_url(&plan.location)
         } else {
             None
         };
+        tracing::info!(
+            source = %plan.id,
+            location = %pinned.as_deref().unwrap_or(&plan.location),
+            shared_fetch,
+            "live audio: opening"
+        );
         let location = std::path::Path::new(pinned.as_deref().unwrap_or(&plan.location));
         // One connection's worth of decode. `audio_decode_loop` opens the decoder
         // on THIS thread (libav contexts are not `Send`), publishes every decoded
@@ -396,6 +471,7 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
                 stop,
                 &|| video_anchor(&slot),
                 Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
+                &plan.id,
             );
         } else {
             audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
@@ -411,9 +487,10 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // and reconnect — the same policy the video ingest uses.
         attempt = next_reconnect_attempt(attempt, ran_for);
         let nap = reconnect_backoff(attempt, jitter.next_unit());
-        tracing::debug!(
+        tracing::info!(
             source = %plan.id,
             attempt,
+            ?ran_for,
             ?nap,
             "reconnecting live source audio after backoff"
         );
@@ -1461,5 +1538,76 @@ mod player_audio_tests {
             "peak retained buffer {cap_frames} frames ballooned past the window {window_len} \
              (+1 block slack) — the pre-vamp_in prefix was buffered (CRITICAL-3)"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_url_wait_tests {
+    #![allow(clippy::unwrap_used)]
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::{await_shared_url, SharedUrlWait};
+
+    const FAST: SharedUrlWait = SharedUrlWait {
+        first_connect: Duration::from_millis(200),
+        reconnect: Duration::from_millis(50),
+        poll: Duration::from_millis(1),
+    };
+
+    /// The race seen live: audio asks before the fetcher has its first segment.
+    #[test]
+    fn audio_waits_for_a_fetcher_that_is_still_starting() {
+        let calls = Cell::new(0);
+        let stop = AtomicBool::new(false);
+        let url = await_shared_url(
+            || {
+                calls.set(calls.get() + 1);
+                (calls.get() > 5).then(|| "http://[::1]:1/live.m3u8".to_owned())
+            },
+            || None,
+            &stop,
+            FAST,
+        );
+        assert_eq!(url.as_deref(), Some("http://[::1]:1/live.m3u8"));
+    }
+
+    /// Video anchored with no fetcher entry: it fell back to libav, so audio
+    /// opens the origin now instead of serving out the whole wait.
+    #[test]
+    fn audio_stops_waiting_once_video_runs_without_a_fetcher() {
+        let calls = Cell::new(0u32);
+        let stop = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let url = await_shared_url(
+            || None,
+            || {
+                calls.set(calls.get() + 1);
+                (calls.get() > 3).then_some(1)
+            },
+            &stop,
+            SharedUrlWait {
+                first_connect: Duration::from_secs(30),
+                ..FAST
+            },
+        );
+        assert_eq!(url, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_wait_is_bounded_and_stops_on_request() {
+        let stop = AtomicBool::new(false);
+        assert_eq!(await_shared_url(|| None, || None, &stop, FAST), None);
+        assert_eq!(await_shared_url(|| None, || Some(4), &stop, FAST), None);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let wait = SharedUrlWait {
+            first_connect: Duration::from_secs(30),
+            ..FAST
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(await_shared_url(|| None, || None, &stop, wait), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
