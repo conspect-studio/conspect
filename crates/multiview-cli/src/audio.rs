@@ -64,6 +64,14 @@ pub(crate) fn new_store() -> Arc<AudioStore> {
     Arc::new(AudioStore::new(canonical_format(), STORE_CAPACITY_FRAMES))
 }
 
+/// A store for a **live network** source's decoded audio: it buffers a 1 s
+/// cushion before it plays (and after running dry), so a segment fetch or a
+/// late connect is ridden out rather than heard as a gap (see
+/// [`AudioStore::live`]). Holds up to 4 s (the decode paces 2 s ahead).
+pub(crate) fn new_live_store() -> Arc<AudioStore> {
+    Arc::new(AudioStore::live(canonical_format(), 192_000, 48_000))
+}
+
 /// Maximum unresolved operator re-points retained while the bake consumer is slow.
 pub(crate) const MAX_AUDIO_REPOINT_BACKLOG: usize = 256;
 

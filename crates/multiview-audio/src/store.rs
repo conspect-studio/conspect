@@ -153,6 +153,12 @@ pub struct AudioStore {
     /// a window-placing producer ([`publish_window`](AudioStore::publish_window))
     /// positions content deliberately, and its gaps must stay silent.
     live_append: std::sync::atomic::AtomicBool,
+    /// Frames a **live** store buffers before playing, and again after running
+    /// dry (0 = not a live-buffered store: plain cursor semantics).
+    prebuffer_frames: i64,
+    /// Whether a live-buffered store is (re)filling and reads as silence without
+    /// consuming. Starts set, so the bus cannot run ahead of a late source.
+    buffering: std::sync::atomic::AtomicBool,
     /// The writer-side triple-buffer pool for the allocation-free
     /// [`AudioStore::publish_window`] **replace** path (ADR-T019 §2.2). Guarded by
     /// a `Mutex` that is **uncontended in normal use** — only the single producer
@@ -223,6 +229,18 @@ impl WindowPool {
 }
 
 impl AudioStore {
+    /// A store for a **live** source, which arrives on its own clock while the
+    /// bus reads on the output clock. It buffers `prebuffer_frames` before it
+    /// plays and again whenever it runs dry, and a read never moves the cursor
+    /// past what was written, so audio arriving after a late connect or a stall
+    /// is played rather than landing behind the cursor (silent forever).
+    #[must_use]
+    pub fn live(format: AudioFormat, capacity_frames: usize, prebuffer_frames: usize) -> Self {
+        let mut store = Self::new(format, capacity_frames);
+        store.prebuffer_frames = i64::try_from(prebuffer_frames.max(1)).unwrap_or(i64::MAX);
+        store
+    }
+
     /// Create an empty store of `format` that retains at most `capacity_frames`
     /// frames of buffered audio (drop-oldest beyond that).
     ///
@@ -239,6 +257,8 @@ impl AudioStore {
             }),
             read_frame: AtomicI64::new(0),
             live_append: std::sync::atomic::AtomicBool::new(false),
+            prebuffer_frames: 0,
+            buffering: std::sync::atomic::AtomicBool::new(true),
             window_pool: Mutex::new(WindowPool::default()),
         }
     }
@@ -606,11 +626,36 @@ impl AudioStore {
                 start = head.saturating_sub(want).max(snapshot.base_frame);
             }
         }
-        // Advance the cursor first: the read is a pure function of `start`, and
-        // only this (single) consumer touches the cursor.
         let want = i64::try_from(frames).unwrap_or(i64::MAX);
-        self.read_frame
-            .store(start.saturating_add(want), Ordering::Relaxed);
+        // A live-buffered store: wait for the cushion, and never consume what has
+        // not been written (see `live`). A stranded cursor re-syncs to one
+        // cushion behind the head, not to the head itself.
+        if self.prebuffer_frames > 0 {
+            let snapshot = self.window.load();
+            let head = snapshot.head_frame(channels.max(1));
+            if start < snapshot.base_frame || start > head {
+                start = head
+                    .saturating_sub(self.prebuffer_frames)
+                    .max(snapshot.base_frame);
+            }
+            let available = head.saturating_sub(start);
+            if self.buffering.load(Ordering::Relaxed) {
+                if available < self.prebuffer_frames {
+                    self.read_frame.store(start, Ordering::Relaxed);
+                    return AudioBlock::silence(self.format, frames);
+                }
+                self.buffering.store(false, Ordering::Relaxed);
+            } else if available < want {
+                self.buffering.store(true, Ordering::Relaxed);
+            }
+            self.read_frame
+                .store(start.saturating_add(want.min(available)), Ordering::Relaxed);
+        } else {
+            // Advance the cursor first: the read is a pure function of `start`,
+            // and only this (single) consumer touches the cursor.
+            self.read_frame
+                .store(start.saturating_add(want), Ordering::Relaxed);
+        }
 
         // Start fully silent, then overlay whatever the live window provides.
         let mut out = vec![0.0f32; frames.saturating_mul(channels)];
@@ -693,9 +738,9 @@ pub fn audio_decode_loop(
     // video `PtsWallClock`): a live HLS reader bursts several segments on
     // connect and at each catch-up; publishing them unpaced overruns the bounded
     // ring, so the consumer's cursor and the window drift apart and the source
-    // cuts in and out. Allow a small lead so the reader stays ahead of the bus.
+    // cuts in and out. The lead is the cushion that rides out a segment fetch.
     let mut pace: Option<(std::time::Instant, multiview_core::time::MediaTime)> = None;
-    let lead = std::time::Duration::from_millis(500);
+    let lead = std::time::Duration::from_secs(2);
     while !stop.load(Ordering::Acquire) {
         match decoder.next_decoded() {
             Ok(Some(unit)) => {
@@ -749,6 +794,79 @@ mod resync_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::format::{AudioFormat, ChannelLayout};
+
+    const TICK: usize = 1_600;
+
+    fn live_store() -> (AudioFormat, AudioStore) {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        (format, AudioStore::live(format, 192_000, 48_000))
+    }
+
+    fn tone(format: AudioFormat) -> AudioBlock {
+        AudioBlock::from_interleaved(format, vec![0.5f32; TICK * 2]).unwrap()
+    }
+
+    fn audible(block: &AudioBlock) -> bool {
+        block.interleaved().iter().all(|&s| s != 0.0)
+    }
+
+    /// The bus reads every tick whether or not audio has arrived; audio then
+    /// arrives at exactly real time. After the cushion fills, nothing is lost.
+    #[test]
+    fn audio_arriving_after_the_bus_started_is_heard_at_real_time() {
+        let (format, store) = live_store();
+        for _ in 0..30 {
+            let _ = store.read(TICK); // 1 s of output before the source connects
+        }
+        let block = tone(format);
+        let mut heard = 0;
+        for _ in 0..300 {
+            store.publish(&block).unwrap();
+            if audible(&store.read(TICK)) {
+                heard += 1;
+            }
+        }
+        assert_eq!(heard, 300 - 30 + 1, "only the 1 s cushion may be silent");
+    }
+
+    /// A segment fetch stalls the source for less than the cushion: no gap.
+    #[test]
+    fn a_stall_shorter_than_the_cushion_is_inaudible() {
+        let (format, store) = live_store();
+        let block = tone(format);
+        for _ in 0..45 {
+            store.publish(&block).unwrap(); // 1.5 s buffered
+        }
+        for tick in 0..40 {
+            assert!(audible(&store.read(TICK)), "gap at tick {tick}");
+        }
+    }
+
+    /// After running dry the store re-buffers, then plays continuously, instead
+    /// of chattering on and off one partial block at a time.
+    #[test]
+    fn running_dry_rebuffers_once_then_plays_without_chatter() {
+        let (format, store) = live_store();
+        let block = tone(format);
+        for _ in 0..31 {
+            store.publish(&block).unwrap();
+        }
+        while audible(&store.read(TICK)) {}
+        let mut transitions = 0;
+        let mut last = false;
+        for _ in 0..120 {
+            store.publish(&block).unwrap();
+            let now = audible(&store.read(TICK));
+            if now != last {
+                transitions += 1;
+            }
+            last = now;
+        }
+        assert_eq!(
+            transitions, 1,
+            "silent once while re-buffering, then continuous"
+        );
+    }
 
     #[test]
     fn a_cursor_behind_the_dropped_window_resyncs_to_live_audio() {

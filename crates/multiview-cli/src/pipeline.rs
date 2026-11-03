@@ -2322,7 +2322,15 @@ impl Pipeline {
             // The store is built per audio-bearing source so the bus can route it;
             // it stays empty (silence-filling) until the decode thread fills it.
             if let Some(audio_plan) = audio_ingest_plan_for(source) {
-                audio_stores.insert(source.id.clone(), crate::audio::new_store());
+                // A live network source arrives on its own clock: give it the
+                // cushioned store so fetch stalls are inaudible. A file plays
+                // from frame 0 against the output clock: the plain store.
+                let store = if audio_plan.live {
+                    crate::audio::new_live_store()
+                } else {
+                    crate::audio::new_store()
+                };
+                audio_stores.insert(source.id.clone(), store);
                 audio_ingest_plans.push(audio_plan);
             }
             // AUD-5: the `bars` synthetic source emits a 1 kHz line-up tone (its
