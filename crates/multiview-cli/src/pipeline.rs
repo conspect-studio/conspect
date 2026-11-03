@@ -1695,6 +1695,10 @@ pub struct Pipeline {
     /// silence-fills past what was published). Empty when this run did not opt into
     /// program audio.
     audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+    /// The document's declared `[audio]` routes (ADR-R005 / ADR-0059 §4). When
+    /// it declares any, they decide program-bus membership (`include_in_program_bus`),
+    /// gain (`gain_db`) and `mute` at build; with none, every store rides at unity.
+    audio_routing: Option<multiview_config::AudioRouting>,
     /// Published at drive start; control reads without locking or waiting on bake.
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     /// Per-source **audio** ingest plans (AUD-2): how to open + decode each
@@ -2505,6 +2509,7 @@ impl Pipeline {
             #[cfg(feature = "webrtc-native")]
             egress_registry,
             audio_stores,
+            audio_routing: config.audio.clone(),
             audio_route: Arc::new(multiview_framestore::SwapCell::empty()),
             audio_ingest_plans,
             tone_ingest_plans,
@@ -3401,13 +3406,16 @@ impl Pipeline {
             // route key is the source id; per-source gains / breakaways are a
             // control-plane concern (AUD-7) that re-points/re-gains these routes at
             // runtime. Sorted for a deterministic route order across runs.
-            let mut ids: Vec<&String> = self.audio_stores.keys().collect();
-            ids.sort_unstable();
+            // The `[audio]` routes decide membership/gain/mute (ADR-0059 §4);
+            // with none declared every store rides at unity.
             let mut channels = std::collections::HashMap::new();
-            for id in ids {
-                if let Some(store) = self.audio_stores.get(id) {
-                    let point = bus.add_source(id.clone(), Arc::clone(store), 1.0);
-                    channels.insert(id.clone(), point);
+            for (id, gain) in program_bus_gains(
+                self.audio_stores.keys().map(String::as_str),
+                self.audio_routing.as_ref(),
+            ) {
+                if let Some(store) = self.audio_stores.get(id.as_str()) {
+                    let point = bus.add_source(id.clone(), Arc::clone(store), gain);
+                    channels.insert(id, point);
                 }
             }
             self.audio_route.store(Some(Arc::new(
@@ -11621,6 +11629,38 @@ impl LiveStamper {
     }
 }
 
+/// The `(source id, linear program gain)` pairs the program bus is built from.
+///
+/// When the document's `[audio]` block declares routes they are authoritative
+/// (ADR-R005 §4.1 / ADR-0059 §4): a store joins only if its route sets
+/// `include_in_program_bus`, at that route's `gain_db` (linear); a `mute`d route
+/// joins at zero gain (mute ≠ unroute). A source without a route contributes
+/// nothing. With no routes, every store rides at unity. Sorted by id.
+fn program_bus_gains<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    routing: Option<&multiview_config::AudioRouting>,
+) -> Vec<(String, f64)> {
+    let mut ids: Vec<&str> = ids.collect();
+    ids.sort_unstable();
+    let routes = routing.map(|r| r.routes.as_slice()).unwrap_or_default();
+    if routes.is_empty() {
+        return ids.into_iter().map(|id| (id.to_owned(), 1.0)).collect();
+    }
+    ids.into_iter()
+        .filter_map(|id| {
+            let route = routes
+                .iter()
+                .find(|r| r.input_id == id && r.include_in_program_bus)?;
+            let gain = if route.mute {
+                0.0
+            } else {
+                10f64.powf(f64::from(route.gain_db.clamp(-96.0, 24.0)) / 20.0)
+            };
+            Some((id.to_owned(), gain))
+        })
+        .collect()
+}
+
 /// Lazily-built scaler from a decoded NV12 frame's geometry to the tile size,
 /// emitting an [`Nv12Image`] tagged like the canvas.
 struct TileScaler {
@@ -15860,5 +15900,41 @@ mod live_stamper_tests {
             after,
             MediaTime::from_nanos(13 * SECOND).saturating_add(LIVE_JITTER_HOLD)
         );
+    }
+}
+
+#[cfg(test)]
+mod program_bus_gain_tests {
+    use super::program_bus_gains;
+
+    fn routing(json: serde_json::Value) -> multiview_config::AudioRouting {
+        serde_json::from_value(json).expect("valid routing")
+    }
+
+    #[test]
+    fn no_routes_means_every_source_at_unity() {
+        let got = program_bus_gains(["b", "a"].into_iter(), None);
+        assert_eq!(got, vec![("a".to_owned(), 1.0), ("b".to_owned(), 1.0)]);
+    }
+
+    #[test]
+    fn declared_routes_decide_membership_gain_and_mute() {
+        let r = routing(serde_json::json!({
+            "sample_rate_hz": 48000,
+            "routes": [
+                {"input_id": "cnn", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "gain_db": -6.0},
+                {"input_id": "bbc", "channels": {"kind": "stereo"}, "include_in_program_bus": false},
+                {"input_id": "abc", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "mute": true}
+            ]
+        }));
+        let got = program_bus_gains(["abc", "bbc", "cnn", "unrouted"].into_iter(), Some(&r));
+        assert_eq!(got.len(), 2, "only included routes join: {got:?}");
+        assert_eq!(
+            got[0],
+            ("abc".to_owned(), 0.0),
+            "muted = routed at zero gain"
+        );
+        assert_eq!(got[1].0, "cnn");
+        assert!((got[1].1 - 0.501_187).abs() < 1e-5, "-6 dB is about 0.501");
     }
 }
