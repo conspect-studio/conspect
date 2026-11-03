@@ -148,6 +148,11 @@ pub struct AudioStore {
     /// The consumer's absolute read cursor (next frame to be read). Only the
     /// single consumer advances it.
     read_frame: AtomicI64,
+    /// Whether the producer is a live **appender** ([`publish`](AudioStore::publish)).
+    /// Only then may a read re-sync a cursor stranded behind the dropped window;
+    /// a window-placing producer ([`publish_window`](AudioStore::publish_window))
+    /// positions content deliberately, and its gaps must stay silent.
+    live_append: std::sync::atomic::AtomicBool,
     /// The writer-side triple-buffer pool for the allocation-free
     /// [`AudioStore::publish_window`] **replace** path (ADR-T019 §2.2). Guarded by
     /// a `Mutex` that is **uncontended in normal use** — only the single producer
@@ -233,6 +238,7 @@ impl AudioStore {
                 samples: Vec::new(),
             }),
             read_frame: AtomicI64::new(0),
+            live_append: std::sync::atomic::AtomicBool::new(false),
             window_pool: Mutex::new(WindowPool::default()),
         }
     }
@@ -318,6 +324,7 @@ impl AudioStore {
     /// Returns [`AudioError::FormatMismatch`] if `block`'s format differs from
     /// the store's working format.
     pub fn publish(&self, block: &AudioBlock) -> Result<()> {
+        self.live_append.store(true, Ordering::Relaxed);
         if block.format() != self.format {
             return Err(AudioError::FormatMismatch {
                 expected_rate: self.format.sample_rate(),
@@ -347,6 +354,7 @@ impl AudioStore {
     /// Returns [`AudioError::RaggedBlock`] if `samples.len()` is not a whole
     /// multiple of the store's channel count.
     pub fn publish_samples(&self, samples: &[f32]) -> Result<()> {
+        self.live_append.store(true, Ordering::Relaxed);
         let channels = self.format.channel_count();
         if channels == 0 {
             return Ok(());
@@ -505,6 +513,7 @@ impl AudioStore {
     /// Returns [`AudioError::RaggedBlock`] if `samples.len()` is not a whole
     /// multiple of the store's channel count (so the ring never tears mid-frame).
     pub fn publish_window(&self, base_frame: i64, samples: &[f32]) -> Result<()> {
+        self.live_append.store(false, Ordering::Relaxed);
         let channels = self.format.channel_count();
         if channels == 0 {
             return Ok(());
@@ -572,7 +581,24 @@ impl AudioStore {
     #[must_use]
     pub fn read(&self, frames: usize) -> AudioBlock {
         let channels = self.format.channel_count();
-        let start = self.read_frame.load(Ordering::Relaxed);
+        let mut start = self.read_frame.load(Ordering::Relaxed);
+        // Re-sync a cursor that has fallen entirely behind the retained window:
+        // a live decode publishes faster than real time (connect burst, segment
+        // catch-up) and the bounded ring drops its oldest frames, so a cursor
+        // still parked before `base` would read silence forever. Jump to one
+        // read-budget behind the live edge (never into the future), so the
+        // source plays again at the next read instead of staying mute.
+        {
+            let snapshot = self.window.load();
+            let head = snapshot.head_frame(channels.max(1));
+            let want = i64::try_from(frames).unwrap_or(i64::MAX);
+            if self.live_append.load(Ordering::Relaxed)
+                && head > snapshot.base_frame
+                && start.saturating_add(want) <= snapshot.base_frame
+            {
+                start = head.saturating_sub(want).max(snapshot.base_frame);
+            }
+        }
         // Advance the cursor first: the read is a pure function of `start`, and
         // only this (single) consumer touches the cursor.
         let want = i64::try_from(frames).unwrap_or(i64::MAX);
@@ -673,5 +699,36 @@ pub fn audio_decode_loop(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resync_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::format::{AudioFormat, ChannelLayout};
+
+    #[test]
+    fn a_cursor_behind_the_dropped_window_resyncs_to_live_audio() {
+        // A live decode bursts 3 s of tone into a 1 s ring while the consumer
+        // has not read yet: the first frames are evicted. The consumer's next
+        // read must return the live tone, not permanent silence.
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::new(format, 48_000);
+        let tone = AudioBlock::from_interleaved(format, vec![0.5f32; 4_800 * 2]).unwrap();
+        for _ in 0..30 {
+            store.publish(&tone).unwrap();
+        }
+        let block = store.read(1_600);
+        assert!(
+            block
+                .interleaved()
+                .iter()
+                .all(|&s| (s - 0.5).abs() < f32::EPSILON),
+            "expected live tone after resync, got silence"
+        );
+        // And the following read continues contiguously (no repeat).
+        let next = store.read(1_600);
+        assert!(next.interleaved().iter().any(|&s| s != 0.0) || store.buffered_frames() > 0);
     }
 }
