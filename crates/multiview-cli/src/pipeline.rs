@@ -1898,6 +1898,10 @@ struct IngestPlan {
     /// or reconnected. Unset (no run yet, tests, bounded drives) falls back to
     /// the source-relative stamp. Read lock-free (a `SwapCell` load).
     output_origin: crate::timing_status::EpochAnchorSlot,
+    /// Where a live decode publishes its per-connection output anchor (see
+    /// [`LiveAnchor`]) for the audio rail; [`live_anchor_slot`] of the source id
+    /// for config sources.
+    live_anchor: LiveAnchorSlot,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -8520,6 +8524,7 @@ fn ingest_plan_for(
         tile_h,
         store,
         output_origin: crate::timing_status::anchor_slot(),
+        live_anchor: live_anchor_slot(&source.id),
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -8723,6 +8728,7 @@ fn build_media_player_boot(
             tile_h,
             store,
             output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -10647,6 +10653,47 @@ fn open_and_stream(
         );
     }
 
+    // Read the demuxer on its own thread, ahead of the PTS-paced decode below,
+    // so a slow segment fetch drains a queued backlog instead of stalling the
+    // tile (see `PacketReader`). Only the video and routed subtitle packets are
+    // queued.
+    #[cfg(feature = "overlay")]
+    let sub_index = plan.incontainer_sub.as_ref().map(|r| r.stream_index);
+    #[cfg(not(feature = "overlay"))]
+    let sub_index: Option<usize> = None;
+    let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
+        let mut packet = ffmpeg::codec::packet::Packet::empty();
+        match packet.read(&mut input) {
+            Ok(()) if packet.stream() == stream_index || Some(packet.stream()) == sub_index => {
+                Some(ReadItem::Packet(packet))
+            }
+            Ok(()) => None,
+            Err(ffmpeg::Error::Eof) => Some(ReadItem::Eof),
+            Err(other) => Some(ReadItem::Error(other.to_string())),
+        }
+    })?;
+    // A live source queues about a segment before pacing starts (see
+    // `LIVE_PREBUFFER`); a file/VOD starts at once.
+    let mut pending = if plan.live {
+        let tb_num = i128::from(time_base.num);
+        let tb_den = i128::from(time_base.den);
+        prebuffer(
+            &reader,
+            |p: &ffmpeg::codec::packet::Packet| {
+                if p.stream() != stream_index || tb_den <= 0 {
+                    return None;
+                }
+                let ts = p.pts().or_else(|| p.dts())?;
+                i64::try_from(i128::from(ts) * 1_000_000_000 * tb_num / tb_den).ok()
+            },
+            LIVE_PREBUFFER,
+            LIVE_PREBUFFER_DEADLINE,
+            stop,
+        )
+    } else {
+        std::collections::VecDeque::new()
+    };
+
     // Pump packets, publishing each decoded+scaled frame into the store.
     let mut drained = false;
     loop {
@@ -10681,7 +10728,13 @@ fn open_and_stream(
             // tile from the clock that samples it; a finite file/VOD keeps its
             // source-relative stamp (it plays from its own start).
             let at = if plan.live {
-                stamper.stamp(&plan.output_origin, pts, pacer.publish_time(pts))
+                let at = stamper.stamp(&plan.output_origin, pts, pacer.publish_time(pts));
+                // Expose the (re-)anchor for audio-to-vision lock.
+                if let Some(anchor) = stamper.take_reanchored() {
+                    let raw_ns = decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base));
+                    publish_live_anchor(&plan.live_anchor, anchor, raw_ns);
+                }
+                at
             } else {
                 pacer.publish_time(pts)
             };
@@ -10690,9 +10743,16 @@ fn open_and_stream(
         if drained {
             return Ok(());
         }
-        let mut packet = ffmpeg::codec::packet::Packet::empty();
-        match packet.read(&mut input) {
-            Ok(()) => {
+        // Wait in short slices so `stop` stays responsive while the origin is
+        // slow; a dead read still surfaces within `rw_timeout` as an error.
+        let Some(item) = pending
+            .pop_front()
+            .or_else(|| reader.next(Duration::from_millis(100)))
+        else {
+            continue;
+        };
+        match item {
+            ReadItem::Packet(packet) => {
                 if packet.stream() == stream_index {
                     decoder.send_packet(&packet).map_err(|e| e.to_string())?;
                 } else {
@@ -10706,11 +10766,11 @@ fn open_and_stream(
                     pump_incontainer_sub(plan, incontainer_sub.as_mut(), &packet);
                 }
             }
-            Err(ffmpeg::Error::Eof) => {
+            ReadItem::Eof => {
                 decoder.send_eof().map_err(|e| e.to_string())?;
                 drained = true;
             }
-            Err(other) => return Err(other.to_string()),
+            ReadItem::Error(err) => return Err(err),
         }
     }
 }
@@ -11612,6 +11672,144 @@ impl PtsWallClock {
     }
 }
 
+/// Packets a source's read-ahead queue holds (video + routed subtitle packets
+/// only). At 30 fps that is ~34 s of media, at 60 fps ~17 s — more than the
+/// ~3 segments a live playlist exposes, so the live edge (not this queue) bounds
+/// how far ahead the reader runs. A few MB at news bitrates; bounded.
+const READ_AHEAD_PACKETS: usize = 1024;
+
+/// One result of a demuxer read, handed from the read-ahead thread to the
+/// decode/pace loop.
+enum ReadItem<P> {
+    /// A routed packet.
+    Packet(P),
+    /// Clean end of stream.
+    Eof,
+    /// A read error (the connection is over; the caller reconnects).
+    Error(String),
+}
+
+/// The consumer side of a live source's read-ahead thread.
+///
+/// The demuxer used to be read on the decode thread, which is paced to wall
+/// clock by PTS, so it could never get ahead of real time: a live HLS reader
+/// blocks inside libav while it fetches each segment, and a fetch longer than
+/// the 2 s jitter hold aged the tile into RECONNECTING although the origin was
+/// healthy (and fell behind the live edge, "skipping segments ahead"). The
+/// reader thread instead reads as fast as the origin delivers, into a bounded
+/// queue, so the paced decode drains a backlog across a slow fetch.
+///
+/// Dropping it cancels the reader: a blocked `send` fails at once, and a read
+/// blocked inside libav returns within `rw_timeout`. The thread is detached so
+/// a reconnect never waits on a stalled read (it only touches its own `Input`).
+struct PacketReader<P> {
+    rx: Receiver<ReadItem<P>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl<P> PacketReader<P> {
+    /// The next item, waiting at most `timeout`; `None` on timeout. A reader
+    /// thread that exited without a terminal item reads as an error.
+    fn next(&self, timeout: Duration) -> Option<ReadItem<P>> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(item) => Some(item),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Some(ReadItem::Error("live read-ahead thread exited".to_owned()))
+            }
+        }
+    }
+}
+
+impl<P> Drop for PacketReader<P> {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Spawn the read-ahead thread. `read` performs one blocking demuxer read and
+/// returns `None` for a packet that is not routed (skipped, not queued). The
+/// thread stops after a terminal item, on cancel, or once the consumer is gone.
+fn spawn_packet_reader<P, F>(
+    source_id: &str,
+    capacity: usize,
+    mut read: F,
+) -> Result<PacketReader<P>, String>
+where
+    P: Send + 'static,
+    F: FnMut() -> Option<ReadItem<P>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let id = source_id.to_owned();
+    std::thread::Builder::new()
+        .name(format!("multiview-read-{source_id}"))
+        .spawn(move || {
+            // Attribute libav's log lines on this thread to the source (ADR-0060).
+            let _resource = ingest_resource_scope(&id);
+            while !thread_cancel.load(Ordering::Acquire) {
+                let Some(item) = read() else { continue };
+                let terminal = !matches!(item, ReadItem::Packet(_));
+                if tx.send(item).is_err() || terminal {
+                    return;
+                }
+            }
+        })
+        .map_err(|e| format!("spawn live read-ahead thread: {e}"))?;
+    Ok(PacketReader { rx, cancel })
+}
+
+/// Media a live source queues before its first frame is paced. The pacer anchors
+/// on its first frame, so with an empty queue the next slow segment fetch makes
+/// every later frame late (measured on cnn-usa: up to 7 s behind in the first
+/// 25 s, until the backlog builds). About one HLS segment of prebuffer makes the
+/// cushion exist from the first frame. The tile shows NO SIGNAL meanwhile, as it
+/// does for any connect.
+const LIVE_PREBUFFER: Duration = Duration::from_secs(6);
+
+/// The longest a live connect waits for [`LIVE_PREBUFFER`] before starting with
+/// whatever has arrived.
+const LIVE_PREBUFFER_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Pull from `reader` until the queued packets span `target` of media (by
+/// `media_ns`, `None` for packets without a timestamp or of another stream),
+/// a terminal item arrives, `deadline` passes, or `stop` is raised. Returns the
+/// items in order, for the caller to process before reading on.
+fn prebuffer<P>(
+    reader: &PacketReader<P>,
+    media_ns: impl Fn(&P) -> Option<i64>,
+    target: Duration,
+    deadline: Duration,
+    stop: &AtomicBool,
+) -> std::collections::VecDeque<ReadItem<P>> {
+    let mut queued = std::collections::VecDeque::new();
+    let end = Instant::now() + deadline;
+    let want = i64::try_from(target.as_nanos()).unwrap_or(i64::MAX);
+    let mut first: Option<i64> = None;
+    while !stop.load(Ordering::Acquire) {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Some(item) = reader.next(left.min(Duration::from_millis(100))) else {
+            continue;
+        };
+        let span = match &item {
+            ReadItem::Packet(p) => media_ns(p).map(|t| t.saturating_sub(*first.get_or_insert(t))),
+            ReadItem::Eof | ReadItem::Error(_) => {
+                queued.push_back(item);
+                break;
+            }
+        };
+        queued.push_back(item);
+        if span.is_some_and(|s| s >= want) {
+            break;
+        }
+    }
+    queued
+}
+
 /// How far ahead of the output clock a live frame is placed (its jitter hold).
 ///
 /// A live HLS/TS reader stalls at every segment boundary while it fetches the
@@ -11632,11 +11830,98 @@ const LIVE_JITTER_HOLD: MediaTime = MediaTime::from_nanos(2_000_000_000);
 /// returns the caller's source-relative `fallback`.
 struct LiveStamper {
     anchor: Option<(MediaTime, MediaTime)>,
+    /// Set by a [`stamp`](Self::stamp) that (re-)anchored; cleared by
+    /// [`take_reanchored`](Self::take_reanchored).
+    reanchored: bool,
+}
+
+/// A live source's video anchor: the per-connection mapping from source media
+/// time to the run's OUTPUT timeline that [`LiveStamper`] stamps video with.
+///
+/// Published on every (re-)anchor so the audio rail can place its samples at
+/// the same output instant as the picture (audio locked to vision): a sample
+/// at source time `t` (same stream clock as `raw_pts0_ns`) belongs at
+/// `out0 + (t - raw_pts0_ns)`. `out0` already includes the jitter hold and any
+/// connect prebuffer (it is the release instant + hold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveAnchor {
+    /// Bumped on every (re-)anchor of this source (per process, starts at 1).
+    pub generation: u64,
+    /// Output-timeline instant (since the run's tick-0 seed) of the anchor frame.
+    pub out0: MediaTime,
+    /// The anchor frame's PTS on the video normalizer's timeline.
+    pub pts0: MediaTime,
+    /// The anchor frame's RAW container PTS in nanoseconds (the demuxer's stream
+    /// clock shared with the audio stream — for MPEG-TS, the 90 kHz PTS scaled),
+    /// `None` when the frame carried no PTS.
+    pub raw_pts0_ns: Option<i64>,
+}
+
+/// A lock-free cell holding a source's latest [`LiveAnchor`] (`None` before the
+/// first live frame on the output timeline). Written by the video ingest
+/// thread, read by anyone (audio) without blocking (invariants #1/#10).
+pub type LiveAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveAnchor>>>>;
+
+/// The process-wide [`LiveAnchorSlot`] for source `id` — the same `Arc` for
+/// every caller, so the audio rail can look up the slot the video rail writes.
+/// Takes a mutex only to find/create the entry (plan build, control plane);
+/// never on a per-frame path.
+pub fn live_anchor_slot(id: &str) -> LiveAnchorSlot {
+    static SLOTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>>,
+    > = std::sync::OnceLock::new();
+    let map = SLOTS.get_or_init(Default::default);
+    let mut map = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        map.entry(id.to_owned())
+            .or_insert_with(|| Arc::new(multiview_framestore::SwapCell::empty())),
+    )
+}
+
+/// `ticks` of `time_base` in nanoseconds (exact integer math, `None` on a
+/// degenerate base or overflow).
+fn ticks_to_ns(ticks: i64, time_base: Rational) -> Option<i64> {
+    if time_base.den <= 0 {
+        return None;
+    }
+    let ns =
+        i128::from(ticks) * 1_000_000_000 * i128::from(time_base.num) / i128::from(time_base.den);
+    i64::try_from(ns).ok()
+}
+
+/// Publish a fresh anchor into `slot`, bumping its generation.
+fn publish_live_anchor(
+    slot: &LiveAnchorSlot,
+    (out0, pts0): (MediaTime, MediaTime),
+    raw_pts0_ns: Option<i64>,
+) {
+    let generation = slot.load().map_or(0, |a| a.generation).saturating_add(1);
+    slot.store(Some(Arc::new(LiveAnchor {
+        generation,
+        out0,
+        pts0,
+        raw_pts0_ns,
+    })));
 }
 
 impl LiveStamper {
     const fn new() -> Self {
-        Self { anchor: None }
+        Self {
+            anchor: None,
+            reanchored: false,
+        }
+    }
+
+    /// The current anchor if the last [`stamp`](Self::stamp) (re-)anchored,
+    /// once.
+    fn take_reanchored(&mut self) -> Option<(MediaTime, MediaTime)> {
+        if std::mem::take(&mut self.reanchored) {
+            self.anchor
+        } else {
+            None
+        }
     }
 
     fn stamp(
@@ -11667,6 +11952,7 @@ impl LiveStamper {
         }
         let out0 = now.saturating_add(LIVE_JITTER_HOLD);
         self.anchor = Some((out0, pts));
+        self.reanchored = true;
         out0
     }
 }
@@ -13887,6 +14173,7 @@ mod live_overlay_bake_tests {
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
             output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             // No Conspect watermark in these pixel tests: the asserted face
             // regions must change ONLY with the live overlay slot (S3 has its
             // own coverage), and the 320x180 test canvas matches `item`.
@@ -14383,6 +14670,7 @@ mod media_player_loop_tests {
             tile_h,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -14548,6 +14836,7 @@ mod media_player_loop_tests {
             tile_h: 120,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -14657,6 +14946,7 @@ mod media_player_loop_tests {
             tile_h,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -15928,6 +16218,56 @@ mod live_stamper_tests {
     }
 
     #[test]
+    fn every_re_anchor_is_published_with_a_new_generation() {
+        let (time, slot) = run_at(0);
+        let anchors = super::live_anchor_slot("anchor-test");
+        assert!(Arc::ptr_eq(
+            &anchors,
+            &super::live_anchor_slot("anchor-test")
+        ));
+        let mut s = LiveStamper::new();
+        let stamp = |pts: MediaTime, s: &mut LiveStamper| {
+            s.stamp(&slot, pts, MediaTime::ZERO);
+            if let Some(a) = s.take_reanchored() {
+                super::publish_live_anchor(&anchors, a, Some(pts.as_nanos() + 7));
+            }
+        };
+        stamp(ms(1_000), &mut s);
+        let first = anchors.load().expect("anchor published");
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.out0, LIVE_JITTER_HOLD);
+        assert_eq!(first.pts0, ms(1_000));
+        assert_eq!(first.raw_pts0_ns, Some(ms(1_000).as_nanos() + 7));
+        // Steady frames do not re-publish.
+        stamp(ms(1_033), &mut s);
+        assert_eq!(anchors.load().expect("anchor").generation, 1);
+        // A reconnect (PTS restarts lower) re-anchors and bumps the generation.
+        time.advance(Duration::from_secs(3));
+        stamp(ms(5), &mut s);
+        let re = anchors.load().expect("anchor");
+        assert_eq!(re.generation, 2);
+        assert_eq!(
+            re.out0,
+            MediaTime::from_nanos(3 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
+        assert_eq!(re.pts0, ms(5));
+    }
+
+    #[test]
+    fn ticks_convert_to_nanoseconds_exactly() {
+        let tb = multiview_core::time::Rational {
+            num: 1,
+            den: 90_000,
+        };
+        assert_eq!(super::ticks_to_ns(90_000, tb), Some(SECOND));
+        assert_eq!(super::ticks_to_ns(3_003, tb), Some(33_366_666));
+        assert_eq!(
+            super::ticks_to_ns(1, multiview_core::time::Rational { num: 1, den: 0 }),
+            None
+        );
+    }
+
+    #[test]
     fn without_an_origin_the_source_relative_stamp_is_kept() {
         let slot = crate::timing_status::anchor_slot();
         let mut s = LiveStamper::new();
@@ -16023,6 +16363,200 @@ mod program_bus_gain_tests {
             got[3],
             ("unrouted".to_owned(), 0.0),
             "no route: metered, not mixed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod packet_reader_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{prebuffer, spawn_packet_reader, ReadItem};
+
+    fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// The live stall: the decode side is paced to wall clock and is not
+    /// pulling, yet the reader must keep fetching so a backlog is queued for the
+    /// next slow segment fetch — up to the bound, and no further.
+    #[test]
+    fn reads_ahead_of_an_idle_consumer_up_to_the_bound() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        let reader = spawn_packet_reader("t", 8, move || {
+            Some(ReadItem::Packet(counter.fetch_add(1, Ordering::SeqCst)))
+        })
+        .expect("spawn");
+        assert!(
+            wait_until(Duration::from_secs(2), || reads.load(Ordering::SeqCst) >= 8),
+            "reader did not run ahead: {} reads",
+            reads.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        // 8 queued + at most one blocked in `send`.
+        assert!(reads.load(Ordering::SeqCst) <= 9, "queue must stay bounded");
+        for want in 0..8 {
+            match reader.next(Duration::from_secs(1)) {
+                Some(ReadItem::Packet(got)) => assert_eq!(got, want, "in order"),
+                _ => panic!("expected packet {want}"),
+            }
+        }
+    }
+
+    /// A live connect queues about a segment of media before pacing starts, so
+    /// the first slow fetch is covered by a backlog rather than making frames
+    /// late.
+    #[test]
+    fn prebuffer_collects_the_target_media_span_then_returns() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        // One packet per 100 ms of media; packet 3 carries no timestamp.
+        let reader = spawn_packet_reader("t", 64, move || {
+            let i = c.fetch_add(1, Ordering::SeqCst);
+            Some(ReadItem::Packet(i))
+        })
+        .expect("spawn");
+        let stop = AtomicBool::new(false);
+        let got = prebuffer(
+            &reader,
+            |i: &usize| (*i != 3).then(|| i64::try_from(*i).unwrap() * 100_000_000),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            &stop,
+        );
+        let ids: Vec<usize> = got
+            .iter()
+            .map(|it| match it {
+                ReadItem::Packet(i) => *i,
+                _ => panic!("only packets expected"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            (0..=10).collect::<Vec<_>>(),
+            "stops once 1 s is spanned"
+        );
+        // Nothing is lost: the next read continues after the prebuffer.
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Packet(11))
+        ));
+    }
+
+    #[test]
+    fn prebuffer_gives_up_at_the_deadline_or_a_terminal_item() {
+        let reader = spawn_packet_reader("t", 4, move || {
+            std::thread::sleep(Duration::from_millis(20));
+            None::<ReadItem<u8>>
+        })
+        .expect("spawn");
+        let stop = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let got = prebuffer(
+            &reader,
+            |_| Some(0),
+            Duration::from_secs(6),
+            Duration::from_millis(200),
+            &stop,
+        );
+        assert!(got.is_empty());
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "bounded by the deadline"
+        );
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        let eof = spawn_packet_reader("t", 4, move || {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                Some(ReadItem::Packet(1_u8))
+            } else {
+                Some(ReadItem::Eof)
+            }
+        })
+        .expect("spawn");
+        let got = prebuffer(
+            &eof,
+            |_| Some(0),
+            Duration::from_secs(6),
+            Duration::from_secs(5),
+            &stop,
+        );
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got.back(), Some(ReadItem::Eof)));
+    }
+
+    #[test]
+    fn unrouted_reads_are_skipped_and_eof_is_terminal() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        let reader = spawn_packet_reader("t", 4, move || match c.fetch_add(1, Ordering::SeqCst) {
+            0 | 2 => None,
+            1 => Some(ReadItem::Packet(7_u8)),
+            _ => Some(ReadItem::Eof),
+        })
+        .expect("spawn");
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Packet(7))
+        ));
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Eof)
+        ));
+        // The thread stopped after EOF: a further read is a disconnect error.
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Error(_))
+        ));
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            4,
+            "no reads after the terminal item"
+        );
+    }
+
+    #[test]
+    fn a_slow_read_times_out_without_blocking_the_consumer() {
+        let reader = spawn_packet_reader("t", 4, move || {
+            std::thread::sleep(Duration::from_millis(300));
+            Some(ReadItem::Packet(1_u8))
+        })
+        .expect("spawn");
+        let t0 = Instant::now();
+        assert!(reader.next(Duration::from_millis(20)).is_none());
+        assert!(t0.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn dropping_the_reader_stops_the_thread() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Flag(Arc::clone(&done));
+        let reader = spawn_packet_reader("t", 2, move || {
+            let _keep = &flag;
+            Some(ReadItem::Packet(0_u8))
+        })
+        .expect("spawn");
+        drop(reader);
+        assert!(
+            wait_until(Duration::from_secs(2), || done.load(Ordering::SeqCst)),
+            "reader thread (and the Input it owns) must be released"
         );
     }
 }
