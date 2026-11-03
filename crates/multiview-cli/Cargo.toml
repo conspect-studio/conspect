@@ -77,6 +77,12 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "blocking",
 ], optional = true }
+# The live HLS segment fetcher (`hls_fetch`): a small blocking rustls client for
+# parallel byte-range segment GETs over lossy/high-RTT paths, plus URI
+# resolution. Optional, pulled in only by `ffmpeg` (off by default, like
+# `ffmpeg-next`), both already in the workspace lock.
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+url = { version = "2", optional = true }
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 thiserror = { workspace = true }
@@ -429,6 +435,8 @@ ptp = ["multiview-engine/ptp"]
 ffmpeg = [
     "dep:ffmpeg-next",
     "dep:tempfile",
+    "dep:ureq",
+    "dep:url",
     # `test-fixtures` (⊇ `multiview-ffmpeg/ffmpeg`) exposes the libav-built `dvbsub`
     # MPEG-TS fixture generator the DVB-sub end-to-end test needs (the FFmpeg CLI
     # cannot transcode text → bitmap subtitle). It is forwarded via the `ffmpeg`

@@ -10491,6 +10491,8 @@ fn open_and_stream(
     // Network sources open with an `rw_timeout` so a dead live source fails fast
     // instead of hanging this decode thread on open or a blocking read (#45).
     let opts = ingest_open_options(&plan.location);
+    // Kept alive for this connection: the loopback server libav reads from.
+    let mut hls_fetcher: Option<crate::hls_fetch::HlsFetcher> = None;
     let mut input = match &plan.location {
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
@@ -10506,6 +10508,27 @@ fn open_and_stream(
             // the post-open discard + reconnect bracket as the remaining guards
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
             let open_url = main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h);
+            // A live HLS media playlist is fetched by our parallel-range segment
+            // fetcher and read by libav from loopback memory (see `hls_fetch`);
+            // anything it cannot serve (VOD, encrypted, fMP4) opens directly.
+            let open_url = if plan.live
+                && is_hls_location(&plan.location)
+                && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none()
+            {
+                match crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop) {
+                    Ok(fetcher) => {
+                        let local = fetcher.local_url().to_owned();
+                        hls_fetcher = Some(fetcher);
+                        local
+                    }
+                    Err(err) => {
+                        tracing::info!(source = %plan.id, error = %err, "hls fetch: not used, libav opens the origin");
+                        open_url
+                    }
+                }
+            } else {
+                open_url
+            };
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
@@ -10544,6 +10567,8 @@ fn open_and_stream(
         }
     };
 
+    // The fetcher lives for this connection (it stops when this returns).
+    let _hls_fetcher = hls_fetcher;
     let (stream_index, params, time_base, declared_fps) = best_video_stream_params(&input)?;
 
     // Prefer NVDEC hardware decode (`*_cuvid`) so 4K H.264/HEVC decode runs on
