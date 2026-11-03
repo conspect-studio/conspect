@@ -9259,6 +9259,31 @@ pub(crate) fn resolve_hls_variant_url(
     resolve_hls_variant_url_with(master_url, target_height, &crate::captions::LibavFetcher)
 }
 
+/// The HLS URL to open for a source's **audio** decode.
+///
+/// Pinning a variant isolates the demuxer from a master's `WebVTT` renditions
+/// (one bad `.vtt` fails the whole open). But a variant can be video-only, with
+/// audio in a separate `EXT-X-MEDIA` rendition — pinning that leaves the audio
+/// decode with no audio stream. So pin only when the master actually declares
+/// subtitle renditions; otherwise open the master and let libav select the audio.
+pub(crate) fn resolve_hls_audio_url(master_url: &str) -> Option<String> {
+    use crate::captions::PlaylistFetcher as _;
+    let playlist = crate::captions::LibavFetcher.fetch(master_url).ok()?;
+    let master = multiview_input::hls::MasterPlaylist::parse(&playlist.body).ok()?;
+    let has_subtitles = master
+        .renditions
+        .iter()
+        .any(|r| r.media_type == multiview_input::hls::MediaType::Subtitles);
+    if !has_subtitles {
+        return None;
+    }
+    let variant = master.pick_video_variant(None)?;
+    Some(crate::captions::resolve_rendition_uri(
+        &playlist.url,
+        &variant.uri,
+    ))
+}
+
 /// [`resolve_hls_variant_url`] with an injectable [`PlaylistFetcher`](crate::captions::PlaylistFetcher)
 /// — the fetch→parse→pick→resolve seam, exercised offline in tests with canned
 /// master bytes (no network, no FFI).

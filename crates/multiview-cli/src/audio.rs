@@ -273,7 +273,7 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
                 .next()
                 .is_some_and(|b| b.to_ascii_lowercase().ends_with(".m3u8"))
         {
-            crate::pipeline::resolve_hls_variant_url(&plan.location, None)
+            crate::pipeline::resolve_hls_audio_url(&plan.location)
         } else {
             None
         };
