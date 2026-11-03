@@ -1183,6 +1183,7 @@ segment_ms = 1000
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
+            output_origin: crate::timing_status::anchor_slot(),
             // EMPTY island slot — admission named no device.
             island: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             load_source: Box::new(CountingLoadSource {
@@ -1273,6 +1274,7 @@ segment_ms = 1000
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
+            output_origin: crate::timing_status::anchor_slot(),
             island: std::sync::Arc::new(multiview_framestore::SwapCell::from_some(island(
                 FakeTwoGpu::GPU1_UUID,
                 1,
@@ -1882,6 +1884,14 @@ struct IngestPlan {
     tile_h: u32,
     /// The store to publish decoded frames into (shared with the drive loop).
     store: Arc<TileStore<Nv12Image>>,
+    /// The run's output-clock origin (time source + tick-0 seed), published
+    /// once the program seeds. When set, a live decode publishes each frame
+    /// stamped at the **output media instant it was released at**
+    /// (`time.now() - seed`), so a tile's frames sit on the same timeline the
+    /// output clock samples (`tick.pts`) whatever moment the source connected
+    /// or reconnected. Unset (no run yet, tests, bounded drives) falls back to
+    /// the source-relative stamp. Read lock-free (a `SwapCell` load).
+    output_origin: crate::timing_status::EpochAnchorSlot,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -2684,6 +2694,7 @@ impl Pipeline {
             layout: Arc::clone(&self.layout),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
+            output_origin: Arc::clone(&self.epoch_anchor),
             #[cfg(feature = "gpu")]
             island: Arc::clone(&self.live_island),
             #[cfg(feature = "gpu")]
@@ -3227,7 +3238,12 @@ impl Pipeline {
         // run reliably stops the clock AND the ingest (invariant #1). Taking the
         // plans by value means a second call simply ingests nothing (the stores
         // hold their last frames / slate) rather than double-spawning.
-        let plans = std::mem::take(&mut self.ingest_plans);
+        let mut plans = std::mem::take(&mut self.ingest_plans);
+        // Every decode stamps its frames on the run's output timeline once the
+        // program seeds (see `IngestPlan::output_origin`).
+        for plan in &mut plans {
+            plan.output_origin = Arc::clone(&self.epoch_anchor);
+        }
         // Native caption readers exist only under `overlay` (they feed the
         // per-tile burn-in renderer); without it there are none.
         #[cfg(feature = "overlay")]
@@ -6302,6 +6318,8 @@ struct LiveIngestSpawner {
     canvas_color: CanvasColor,
     /// The output cadence (generator pacing / plan metadata).
     cadence: Rational,
+    /// The run's output-clock origin slot (see [`IngestPlan::output_origin`]).
+    output_origin: crate::timing_status::EpochAnchorSlot,
     /// The pinned island slot `drive_streaming` publishes (ADR-W018 §7).
     #[cfg(feature = "gpu")]
     island: LiveIslandSlot,
@@ -6320,10 +6338,6 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         let crate::live_sources::SourceSpawn { source, store } = spawn;
         let (tile_w, tile_h) = cell_pixel_size(&self.layout, &source.id)
             .unwrap_or((self.layout.canvas.width, self.layout.canvas.height));
-        #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
-        // reason: without `gpu` there is no placement consult, so the plan is
-        // never re-stamped after construction; the binding must still be `mut`
-        // for the gpu arm below.
         let mut plan = match ingest_plan_for(
             &source,
             tile_w,
@@ -6343,6 +6357,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
                 return None;
             }
         };
+        plan.output_origin = Arc::clone(&self.output_origin);
         // Hardware re-assessment on every change (ADR-W018 §7), under `gpu`.
         #[cfg(feature = "gpu")]
         {
@@ -8431,6 +8446,7 @@ fn ingest_plan_for(
         tile_w,
         tile_h,
         store,
+        output_origin: crate::timing_status::anchor_slot(),
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -8633,6 +8649,7 @@ fn build_media_player_boot(
             tile_w,
             tile_h,
             store,
+            output_origin: crate::timing_status::anchor_slot(),
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -10547,7 +10564,16 @@ fn open_and_stream(
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            plan.store.publish(image, pacer.publish_time(pts));
+            // Live sources stamp on the OUTPUT timeline (the instant this frame
+            // is released), so connect/reconnect timing never desynchronises the
+            // tile from the clock that samples it; a finite file/VOD keeps its
+            // source-relative stamp (it plays from its own start).
+            let at = if plan.live {
+                output_anchored_stamp(&plan.output_origin, pacer.publish_time(pts))
+            } else {
+                pacer.publish_time(pts)
+            };
+            plan.store.publish(image, at);
         }
         if drained {
             return Ok(());
@@ -11471,6 +11497,34 @@ impl PtsWallClock {
             Some((_, base_pts)) => pts.saturating_sub(base_pts),
             None => MediaTime::ZERO,
         }
+    }
+}
+
+/// The timeline instant a live decode publishes a just-released frame at.
+///
+/// When the run's output origin is known (`origin` holds the program's time
+/// source + tick-0 seed), the frame is stamped at the **current output media
+/// instant** `time.now() - seed` — the same scale as `tick.pts`, which the
+/// output clock samples tiles by. A source that connects, stalls or reconnects
+/// at any point therefore lands its frames at "now" on the output timeline: the
+/// tile reads LIVE as soon as frames flow again and never shows NO SIGNAL /
+/// RECONNECTING while frames are arriving, nor plays a burst to catch up.
+///
+/// Without an origin (before the program seeds, bounded/test drives) it falls
+/// back to the source-relative `fallback` stamp ([`PtsWallClock::publish_time`]).
+fn output_anchored_stamp(
+    origin: &crate::timing_status::EpochAnchorSlot,
+    fallback: MediaTime,
+) -> MediaTime {
+    match origin.load() {
+        Some(anchor) => MediaTime::from_nanos(
+            anchor
+                .time()
+                .now_nanos()
+                .saturating_sub(anchor.seed_nanos())
+                .max(0),
+        ),
+        None => fallback,
     }
 }
 
@@ -13618,6 +13672,7 @@ mod live_overlay_bake_tests {
             analog_clocks: Vec::new(),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
+            output_origin: crate::timing_status::anchor_slot(),
             // No Conspect watermark in these pixel tests: the asserted face
             // regions must change ONLY with the live overlay slot (S3 has its
             // own coverage), and the 320x180 test canvas matches `item`.
@@ -14113,6 +14168,7 @@ mod media_player_loop_tests {
             tile_w,
             tile_h,
             store: Arc::clone(&store),
+            output_origin: crate::timing_status::anchor_slot(),
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -14277,6 +14333,7 @@ mod media_player_loop_tests {
             tile_w: 160,
             tile_h: 120,
             store: Arc::clone(&store),
+            output_origin: crate::timing_status::anchor_slot(),
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -14385,6 +14442,7 @@ mod media_player_loop_tests {
             tile_w,
             tile_h,
             store: Arc::clone(&store),
+            output_origin: crate::timing_status::anchor_slot(),
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -15625,5 +15683,45 @@ a=mediaclk:direct=0\r\n"
             build_aes67_output(&aes67_output_value_with_ptime(0)).is_err(),
             "a zero packet time is a typed refusal, not a silent coercion to 1 frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod output_anchored_stamp_tests {
+    use std::sync::Arc;
+
+    use multiview_core::time::MediaTime;
+    use multiview_engine::{ManualTimeSource, TimeSource};
+
+    use super::output_anchored_stamp;
+
+    #[test]
+    fn without_an_origin_the_source_relative_stamp_is_kept() {
+        let slot = crate::timing_status::anchor_slot();
+        let fallback = MediaTime::from_nanos(1_234);
+        assert_eq!(output_anchored_stamp(&slot, fallback), fallback);
+    }
+
+    #[test]
+    fn a_reconnected_source_stamps_at_the_current_output_instant() {
+        // The output clock seeded at t=5 s and has run for 600 s. A source that
+        // (re)connects now publishes its first frame: its source-relative stamp
+        // is ~0, but the output samples at ~600 s — with the old stamp the tile
+        // would read 600 s stale (NO SIGNAL) while frames are arriving.
+        let time = Arc::new(ManualTimeSource::new());
+        time.set(5_000_000_000);
+        let slot = crate::timing_status::anchor_slot();
+        let source: Arc<dyn TimeSource> = time.clone();
+        slot.store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+            source,
+            5_000_000_000,
+        ))));
+        time.advance(std::time::Duration::from_secs(600));
+        let stamped = output_anchored_stamp(&slot, MediaTime::ZERO);
+        assert_eq!(stamped, MediaTime::from_nanos(600_000_000_000));
+        // A later frame lands later, on the same scale the clock ticks on.
+        time.advance(std::time::Duration::from_nanos(33_366_667));
+        let next = output_anchored_stamp(&slot, MediaTime::from_nanos(33_366_667));
+        assert_eq!(next, MediaTime::from_nanos(600_033_366_667));
     }
 }
