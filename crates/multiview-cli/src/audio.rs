@@ -255,12 +255,29 @@ pub(crate) struct AudioIngestPlan {
 pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop: &AtomicBool) {
     let mut attempt: u32 = 0;
     let mut jitter = JitterRng::seeded(&plan.id);
-    let location = std::path::Path::new(&plan.location);
     loop {
         if stop.load(Ordering::Acquire) {
             return;
         }
         let started = Instant::now();
+        // An HLS master is opened as a pinned variant media playlist, exactly as
+        // the video ingest does: libav opening a master also opens its WebVTT /
+        // alternate renditions, and one bad `.vtt` makes the whole open fail
+        // ("Invalid data found"), leaving the source silent. Re-resolved on every
+        // connection (variant URIs can be session-bound). Best-effort: `None`
+        // keeps the original URL.
+        let pinned = if plan.live
+            && plan
+                .location
+                .split(['?', '#'])
+                .next()
+                .is_some_and(|b| b.to_ascii_lowercase().ends_with(".m3u8"))
+        {
+            crate::pipeline::resolve_hls_variant_url(&plan.location, None)
+        } else {
+            None
+        };
+        let location = std::path::Path::new(pinned.as_deref().unwrap_or(&plan.location));
         // One connection's worth of decode. `audio_decode_loop` opens the decoder
         // on THIS thread (libav contexts are not `Send`), publishes every decoded
         // block, and returns on stop / EOF / open-or-decode error — logging the

@@ -9244,7 +9244,10 @@ fn is_hls_location(location: &SourceLocation) -> bool {
 /// master cannot be fetched/parsed (best-effort: the open then falls back to the
 /// original URL, with the post-open discard + reconnect bracket as the remaining
 /// guards; this never fails the build, invariants #1/#10).
-fn resolve_hls_variant_url(master_url: &str, target_height: Option<u32>) -> Option<String> {
+pub(crate) fn resolve_hls_variant_url(
+    master_url: &str,
+    target_height: Option<u32>,
+) -> Option<String> {
     resolve_hls_variant_url_with(master_url, target_height, &crate::captions::LibavFetcher)
 }
 
