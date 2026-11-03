@@ -64,12 +64,29 @@ pub(crate) fn new_store() -> Arc<AudioStore> {
     Arc::new(AudioStore::new(canonical_format(), STORE_CAPACITY_FRAMES))
 }
 
-/// A store for a **live network** source's decoded audio: it buffers a 1 s
-/// cushion before it plays (and after running dry), so a segment fetch or a
-/// late connect is ridden out rather than heard as a gap (see
-/// [`AudioStore::live`]). Holds up to 4 s (the decode paces 2 s ahead).
+/// A store for a **live network** source's decoded audio, locked to its video:
+/// a [`timeline`](AudioStore::timeline) store whose frames are output-timeline
+/// positions. The decode places each block where the source's video stamper
+/// put the same PTS ([`crate::pipeline::live_anchor_slot`]), and the bus reads
+/// it at its own sample clock.
 pub(crate) fn new_live_store() -> Arc<AudioStore> {
-    Arc::new(AudioStore::live(canonical_format(), 192_000, 48_000))
+    Arc::new(AudioStore::timeline(
+        canonical_format(),
+        multiview_audio::store::TIMELINE_CAPACITY,
+    ))
+}
+
+/// The source's latest video anchor, as the audio crate's [`PtsAnchor`]
+/// (`None` before video anchors, or when its anchor frame carried no raw PTS).
+fn video_anchor(
+    slot: &crate::pipeline::LiveAnchorSlot,
+) -> Option<multiview_audio::store::PtsAnchor> {
+    let a = slot.load()?;
+    Some(multiview_audio::store::PtsAnchor {
+        generation: a.generation,
+        out0_ns: a.out0.as_nanos(),
+        raw_pts0_ns: a.raw_pts0_ns?,
+    })
 }
 
 /// Maximum unresolved operator re-points retained while the bake consumer is slow.
@@ -291,7 +308,19 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // block, and returns on stop / EOF / open-or-decode error — logging the
         // fault itself. A no-audio source returns immediately (open finds no audio
         // stream); its tile then simply rides silence.
-        audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
+        if plan.live && store.is_timeline() {
+            // Locked to vision: place by the video's PTS → output mapping.
+            let slot = crate::pipeline::live_anchor_slot(&plan.id);
+            multiview_audio::store::audio_decode_loop_anchored(
+                location,
+                ChannelLayout::Stereo,
+                store,
+                stop,
+                &|| video_anchor(&slot),
+            );
+        } else {
+            audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
+        }
         let ran_for = started.elapsed();
         if !plan.live || stop.load(Ordering::Acquire) {
             // A finite source has played its audio out (the store silence-fills

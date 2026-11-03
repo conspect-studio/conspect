@@ -39,6 +39,15 @@ pub struct DecodedBlock {
     pub pts: MediaTime,
 }
 
+/// A read timeout is a dead input, not a decode error.
+fn map_ffmpeg_error(source: &multiview_ffmpeg::FfmpegError) -> AudioError {
+    if matches!(source, multiview_ffmpeg::FfmpegError::ReadTimeout { .. }) {
+        AudioError::Stalled(source.to_string())
+    } else {
+        AudioError::Decode(source.to_string())
+    }
+}
+
 /// A file-backed audio decoder yielding canonical-format [`AudioBlock`]s.
 ///
 /// Wraps the pure [`multiview_ffmpeg::AudioFileDecoder`] seam: every block is
@@ -63,6 +72,24 @@ impl AudioFileDecoder {
             .map_err(|_| AudioError::InvalidFormat("channel count exceeds u16"))?;
         let inner = FfDecoder::open(path.as_ref(), AudioFormat::CANONICAL_RATE, channels)
             .map_err(|source| AudioError::Decode(source.to_string()))?;
+        Ok(Self {
+            inner,
+            format: AudioFormat::new(AudioFormat::CANONICAL_RATE, layout),
+        })
+    }
+
+    /// [`open`](Self::open) for a live network source: a stalled open or read
+    /// aborts ([`AudioError::Stalled`]) instead of hanging the audio thread, and
+    /// an HLS input carries the same open options as the video ingest.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn open_live(path: impl AsRef<std::path::Path>, layout: ChannelLayout) -> Result<Self> {
+        let channels = u16::try_from(layout.channel_count())
+            .map_err(|_| AudioError::InvalidFormat("channel count exceeds u16"))?;
+        let inner = FfDecoder::open_live(path.as_ref(), AudioFormat::CANONICAL_RATE, channels)
+            .map_err(|e| map_ffmpeg_error(&e))?;
         Ok(Self {
             inner,
             format: AudioFormat::new(AudioFormat::CANONICAL_RATE, layout),
@@ -97,11 +124,7 @@ impl AudioFileDecoder {
     ///
     /// As [`next_block`](Self::next_block).
     pub fn next_decoded(&mut self) -> Result<Option<DecodedBlock>> {
-        let Some(samples) = self
-            .inner
-            .next_block()
-            .map_err(|source| AudioError::Decode(source.to_string()))?
-        else {
+        let Some(samples) = self.inner.next_block().map_err(|e| map_ffmpeg_error(&e))? else {
             return Ok(None);
         };
         let block = self.block_from_samples(&samples)?;

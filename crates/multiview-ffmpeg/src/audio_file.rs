@@ -38,9 +38,15 @@ use multiview_core::time::MediaTime;
 
 use crate::convert::MediaKind;
 use crate::decode_stream::StreamAudioDecoder;
-use crate::demux::Demuxer;
+use crate::demux::{DemuxOptions, Demuxer};
 use crate::error::{FfmpegError, Result};
 use crate::resample::{ResampleSpec, Resampler};
+
+/// How long one live read may block before the input counts as dead. Longer
+/// than video's socket timeout because this also bounds a whole `av_read_frame`,
+/// which on HLS spans the playlist wait plus a segment fetch (seen at 27 s on a
+/// slow origin).
+pub const LIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One decoded + resampled audio block as pure interleaved `f32`.
 ///
@@ -106,12 +112,44 @@ impl AudioFileDecoder {
     /// * [`FfmpegError::FrameMismatch`] — `target_channels` is zero, or the
     ///   stream parameters could not be resolved.
     pub fn open(path: &Path, target_rate: u32, target_channels: u16) -> Result<Self> {
+        Self::from_demuxer(Demuxer::open(path)?, target_rate, target_channels)
+    }
+
+    /// [`open`](Self::open) for a live network source: a stalled open or read
+    /// aborts with [`FfmpegError::ReadTimeout`] within [`LIVE_READ_TIMEOUT`]
+    /// instead of hanging the caller, and an `.m3u8` input also gets the video
+    /// ingest's HLS options (`seg_max_retry`, `strict`, `protocol_whitelist`).
+    ///
+    /// # Errors
+    /// As [`open`](Self::open), plus [`FfmpegError::ReadTimeout`].
+    pub fn open_live(path: &Path, target_rate: u32, target_channels: u16) -> Result<Self> {
+        let is_hls = path
+            .to_string_lossy()
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|base| base.to_ascii_lowercase().ends_with(".m3u8"));
+        let mut options = DemuxOptions::new().with_rw_timeout(LIVE_READ_TIMEOUT);
+        if is_hls {
+            options = options.with_options(&[
+                ("strict", "normal"),
+                ("seg_max_retry", "8"),
+                ("protocol_whitelist", "file,http,https,tcp,tls,crypto,data"),
+            ]);
+        }
+        Self::from_demuxer(
+            Demuxer::open_with_interrupt(path, options)?,
+            target_rate,
+            target_channels,
+        )
+    }
+
+    /// Select `demuxer`'s best audio stream and build the decoder.
+    fn from_demuxer(demuxer: Demuxer, target_rate: u32, target_channels: u16) -> Result<Self> {
         if target_rate == 0 || target_channels == 0 {
             return Err(FfmpegError::FrameMismatch(
                 "target rate and channel count must be non-zero",
             ));
         }
-        let demuxer = Demuxer::open(path)?;
         let stream_index = demuxer
             .best_stream(MediaKind::Audio)
             .ok_or(FfmpegError::StreamNotFound("audio"))?;

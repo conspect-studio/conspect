@@ -167,6 +167,10 @@ pub struct AudioStore {
     /// of the pooled `Arc`s sound without `unsafe`. `None` until first use (the
     /// append-only `publish`/`publish_at` paths never allocate it).
     window_pool: Mutex<WindowPool>,
+    /// A **timeline** store ([`AudioStore::timeline`]): content is placed at
+    /// absolute frames of the OUTPUT timeline (frame = output time × rate), so
+    /// the read cursor is owned by the bus clock and never jumps to a live edge.
+    timeline: bool,
 }
 
 /// The writer-side reusable snapshot pool for [`AudioStore::publish_window`].
@@ -260,7 +264,28 @@ impl AudioStore {
             prebuffer_frames: 0,
             buffering: std::sync::atomic::AtomicBool::new(true),
             window_pool: Mutex::new(WindowPool::default()),
+            timeline: false,
         }
+    }
+
+    /// A store whose frames are **output-timeline** positions (audio locked to
+    /// vision): a producer places each block with
+    /// [`publish_at`](AudioStore::publish_at) at `output time × rate`, and the
+    /// bus keeps the read cursor on its own sample clock (see
+    /// [`is_timeline`](AudioStore::is_timeline)). Unwritten frames read silence.
+    #[must_use]
+    pub fn timeline(format: AudioFormat, capacity_frames: usize) -> Self {
+        let mut store = Self::new(format, capacity_frames);
+        store.timeline = true;
+        store
+    }
+
+    /// Whether this is a [`timeline`](AudioStore::timeline) store: the bus must
+    /// position its cursor at the bus sample-clock position (absolute output
+    /// frames), never at the live edge.
+    #[must_use]
+    pub const fn is_timeline(&self) -> bool {
+        self.timeline
     }
 
     /// The store's working format (the format every published block must match
@@ -758,14 +783,541 @@ pub fn audio_decode_loop(
     );
 }
 
+/// A source's mapping from its container clock to the OUTPUT timeline — the
+/// same mapping its video is stamped with (audio locked to vision). A sample at
+/// raw container time `t` (ns) belongs at output time `out0 + (t - raw_pts0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtsAnchor {
+    /// Changes on every (re-)anchor of the source's video.
+    pub generation: u64,
+    /// Output-timeline instant (ns since the run's tick-0 seed) of the anchor.
+    pub out0_ns: i64,
+    /// The anchor's raw container PTS in ns (the stream clock audio shares).
+    pub raw_pts0_ns: i64,
+}
+
+impl PtsAnchor {
+    /// The output time (ns) of raw container time `raw_pts_ns`.
+    #[must_use]
+    pub const fn output_ns(&self, raw_pts_ns: i64) -> i64 {
+        self.out0_ns
+            .saturating_add(raw_pts_ns.saturating_sub(self.raw_pts0_ns))
+    }
+
+    /// The absolute store frame (output time × `rate`, floored) of raw
+    /// container time `raw_pts_ns`.
+    #[must_use]
+    pub fn frame_for(&self, raw_pts_ns: i64, rate: u32) -> i64 {
+        output_ns_to_frame(self.output_ns(raw_pts_ns), rate)
+    }
+}
+
+/// Output time (ns) → absolute frame at `rate` (floored, exact integer math).
+#[must_use]
+pub fn output_ns_to_frame(ns: i64, rate: u32) -> i64 {
+    let f = (i128::from(ns) * i128::from(rate)).div_euclid(1_000_000_000);
+    i64::try_from(f).unwrap_or(if f < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// How far ahead of the bus cursor anchored audio is placed (a store holding
+/// [`TIMELINE_CAPACITY`] frames keeps the placed lead plus a margin).
+pub const ANCHORED_LEAD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A source with decoded audio but no video anchor this long anchors its audio
+/// to itself (an audio-only or video-dead source still plays, unlocked).
+pub const ANCHOR_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Frames a live timeline store retains (6 s at 48 kHz).
+pub const TIMELINE_CAPACITY: usize = 288_000;
+
+/// [`audio_decode_loop`] for a LIVE source whose audio is **locked to its
+/// video**: each decoded block is placed with
+/// [`publish_at`](AudioStore::publish_at) at the output-timeline frame its
+/// container PTS maps to through `anchor` (the video stamper's mapping). `store`
+/// should be an [`AudioStore::timeline`] store. See
+/// [`anchored_publish_loop`].
+#[cfg(feature = "ffmpeg")]
+pub fn audio_decode_loop_anchored(
+    path: impl AsRef<std::path::Path>,
+    layout: crate::format::ChannelLayout,
+    store: &AudioStore,
+    stop: &std::sync::atomic::AtomicBool,
+    anchor: &(dyn Fn() -> Option<PtsAnchor> + Sync),
+) {
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
+    let mut decoder = match crate::decode::AudioFileDecoder::open_live(path.as_ref(), layout) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            tracing::warn!(%error, "audio decode loop: open failed; source rides silence");
+            return;
+        }
+    };
+    anchored_publish_loop(
+        || {
+            decoder
+                .next_decoded()
+                .map(|unit| unit.map(|u| (u.block, u.pts)))
+        },
+        store,
+        stop,
+        anchor,
+        ANCHORED_LEAD,
+        MAX_QUEUED_AUDIO,
+    );
+}
+
+/// A raw-PTS jump larger than this is a splice (the video `PtsNormalizer`
+/// re-anchors there too). Audio either side of a splice is on different clocks,
+/// so it is only ever mapped through anchors from its own side.
+const SPLICE_NS: i64 = 10_000_000_000;
+
+/// How far outside an audio clock span a video anchor's raw time may fall and
+/// still belong to it (video's first frame after a splice is not sample-aligned
+/// with audio).
+const EPOCH_MARGIN_NS: i64 = 1_000_000_000;
+
+/// Anchors retained. At the expected peak of about 4 generations a second this
+/// is about 30 s, well over the 6 s of audio that can still be re-placed.
+const MAX_ANCHORS: usize = 128;
+
+/// Audio clock spans retained (one per splice).
+const MAX_EPOCHS: usize = 8;
+
+/// One continuous span of an audio source's raw clock, between splices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Epoch {
+    id: u64,
+    min_ns: i64,
+    max_ns: i64,
+}
+
+/// The audio side's record of its raw clock spans (split at splices).
+#[derive(Debug, Clone, Default)]
+pub struct EpochLog {
+    epochs: VecDeque<Epoch>,
+    next_end_ns: Option<i64>,
+}
+
+use std::collections::VecDeque;
+
+impl EpochLog {
+    /// Record a decoded block covering raw `[start_ns, end_ns)`; returns its
+    /// epoch id.
+    pub fn push(&mut self, start_ns: i64, end_ns: i64) -> u64 {
+        let splice = self
+            .next_end_ns
+            .is_some_and(|e| start_ns.saturating_sub(e).abs() > SPLICE_NS);
+        self.next_end_ns = Some(end_ns);
+        match self.epochs.back_mut() {
+            Some(cur) if !splice => {
+                cur.min_ns = cur.min_ns.min(start_ns);
+                cur.max_ns = cur.max_ns.max(end_ns);
+                cur.id
+            }
+            _ => {
+                let id = self.epochs.back().map_or(0, |e| e.id.saturating_add(1));
+                self.epochs.push_back(Epoch {
+                    id,
+                    min_ns: start_ns,
+                    max_ns: end_ns,
+                });
+                while self.epochs.len() > MAX_EPOCHS {
+                    self.epochs.pop_front();
+                }
+                id
+            }
+        }
+    }
+
+    /// The (latest) epoch whose span contains `raw_ns`, with a small margin.
+    fn epoch_of(&self, raw_ns: i64) -> Option<u64> {
+        self.epochs
+            .iter()
+            .rev()
+            .find(|e| {
+                raw_ns >= e.min_ns.saturating_sub(EPOCH_MARGIN_NS)
+                    && raw_ns <= e.max_ns.saturating_add(EPOCH_MARGIN_NS)
+            })
+            .map(|e| e.id)
+    }
+}
+
+/// The set of video anchors a source has published, and how audio maps through
+/// them.
+///
+/// Every publish is rebased on the frame it was taken at, so generation `g`
+/// governs raw times `t >= g.raw_pts0_ns` until a later one takes over. A block
+/// at raw `t` therefore maps through the anchor of its own clock span with the
+/// greatest `raw_pts0_ns <= t`, which is where video put a frame at raw `t`. A
+/// block from before the first anchor of its span uses that first anchor (the
+/// same linear mapping, extended back).
+#[derive(Debug)]
+pub struct AnchorMap {
+    rate: u32,
+    /// Mappings further than this from the bus cursor are treated as wrong.
+    far_frames: i64,
+    anchors: VecDeque<PtsAnchor>,
+    /// Fallback per-span anchors, used when video never anchored that span.
+    unlocked: Vec<(u64, PtsAnchor)>,
+}
+
+impl AnchorMap {
+    /// An empty map at `rate`.
+    #[must_use]
+    pub const fn new(rate: u32, far_frames: i64) -> Self {
+        Self {
+            rate,
+            far_frames,
+            anchors: VecDeque::new(),
+            unlocked: Vec::new(),
+        }
+    }
+
+    /// Record the source's latest anchor; true if it is a new generation.
+    pub fn observe(&mut self, latest: Option<PtsAnchor>) -> bool {
+        let Some(a) = latest else { return false };
+        if self
+            .anchors
+            .back()
+            .is_some_and(|b| b.generation == a.generation)
+        {
+            return false;
+        }
+        self.anchors.push_back(a);
+        while self.anchors.len() > MAX_ANCHORS {
+            self.anchors.pop_front();
+        }
+        true
+    }
+
+    /// Fall back to playing `epoch` unlocked: raw `raw_ns` plays at `at_frame`.
+    pub fn play_unlocked(&mut self, epoch: u64, raw_ns: i64, at_frame: i64) {
+        let out0_ns = i128::from(at_frame) * 1_000_000_000 / i128::from(self.rate.max(1));
+        self.unlocked.retain(|(e, _)| *e != epoch);
+        self.unlocked.push((
+            epoch,
+            PtsAnchor {
+                generation: 0,
+                out0_ns: i64::try_from(out0_ns).unwrap_or(i64::MAX),
+                raw_pts0_ns: raw_ns,
+            },
+        ));
+        if self.unlocked.len() > MAX_EPOCHS {
+            self.unlocked.remove(0);
+        }
+    }
+
+    /// The output-timeline frame for a block at raw `raw_ns` in audio clock span
+    /// `epoch`, or `None` if no usable mapping exists yet (hold it).
+    #[must_use]
+    pub fn frame_for(
+        &self,
+        raw_ns: i64,
+        epoch: u64,
+        epochs: &EpochLog,
+        cursor: i64,
+    ) -> Option<i64> {
+        let mine = || {
+            self.anchors
+                .iter()
+                .filter(|a| epochs.epoch_of(a.raw_pts0_ns) == Some(epoch))
+        };
+        let video = mine()
+            .filter(|a| a.raw_pts0_ns <= raw_ns)
+            .max_by_key(|a| (a.raw_pts0_ns, a.generation))
+            .or_else(|| mine().min_by_key(|a| (a.raw_pts0_ns, a.generation)));
+        let usable = |a: &PtsAnchor| {
+            let at = a.frame_for(raw_ns, self.rate);
+            (at.saturating_sub(cursor).abs() <= self.far_frames).then_some(at)
+        };
+        video.and_then(usable).or_else(|| {
+            self.unlocked
+                .iter()
+                .find(|(e, _)| *e == epoch)
+                .and_then(|(_, a)| usable(a))
+        })
+    }
+
+    /// Whether `epoch` has any video anchor, i.e. audio in it is locked.
+    #[must_use]
+    pub fn is_locked(&self, epoch: u64, epochs: &EpochLog) -> bool {
+        self.anchors
+            .iter()
+            .any(|a| epochs.epoch_of(a.raw_pts0_ns) == Some(epoch))
+    }
+}
+
+/// One decoded block awaiting (or retained after) placement.
+#[derive(Debug, Clone)]
+pub struct PendingBlock {
+    block: AudioBlock,
+    raw_ns: i64,
+    epoch: u64,
+}
+
+/// The decoder → placer hand-off: decoded blocks, their total frames, and the
+/// audio clock spans they cover.
+#[derive(Debug, Default)]
+pub struct DecodedQueue {
+    units: VecDeque<PendingBlock>,
+    frames: usize,
+    epochs: EpochLog,
+}
+
+impl DecodedQueue {
+    /// Queue a decoded block at raw PTS `raw_ns`, dropping the oldest beyond
+    /// `max_frames` (bounded: the network read is never stalled).
+    pub fn push(&mut self, block: AudioBlock, raw_ns: i64, rate: u32, max_frames: usize) {
+        let frames = block.frame_count();
+        let dur = i64::try_from(frames)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000)
+            / i64::from(rate.max(1));
+        let epoch = self.epochs.push(raw_ns, raw_ns.saturating_add(dur));
+        self.frames = self.frames.saturating_add(frames);
+        self.units.push_back(PendingBlock {
+            block,
+            raw_ns,
+            epoch,
+        });
+        while self.frames > max_frames {
+            let Some(old) = self.units.pop_front() else {
+                break;
+            };
+            self.frames = self.frames.saturating_sub(old.block.frame_count());
+        }
+    }
+
+    /// Whether nothing is queued.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+}
+
+/// The placer's state: the anchor map plus the placed blocks that may still be
+/// unplayed (re-placed whenever a new generation arrives).
+#[derive(Debug)]
+pub struct Placer {
+    map: AnchorMap,
+    history: VecDeque<PendingBlock>,
+    history_frames: usize,
+    lead_frames: i64,
+    wait: std::time::Duration,
+    held_since: Option<std::time::Instant>,
+    warned_unlocked: bool,
+}
+
+impl Placer {
+    /// A placer at `rate` placing up to `lead_frames` ahead of the cursor, and
+    /// giving up on a video anchor after `wait`.
+    #[must_use]
+    pub const fn new(rate: u32, lead_frames: i64, wait: std::time::Duration) -> Self {
+        Self {
+            map: AnchorMap::new(rate, lead_frames.saturating_mul(10)),
+            history: VecDeque::new(),
+            history_frames: 0,
+            lead_frames,
+            wait,
+            held_since: None,
+            warned_unlocked: false,
+        }
+    }
+
+    /// One placement pass at bus `cursor`: take every queued block due within
+    /// the lead and write it at its mapped frame. On a new anchor generation
+    /// the unplayed window is cleared and the retained blocks are re-placed
+    /// with the new mapping (so a step of one frame period repeats or drops
+    /// that much audio exactly where video held or dropped a frame, and a
+    /// stretch reads silence while the picture is frozen).
+    pub fn step(
+        &mut self,
+        store: &AudioStore,
+        queue: &mut DecodedQueue,
+        latest: Option<PtsAnchor>,
+        cursor: i64,
+        now: std::time::Instant,
+    ) {
+        let changed = self.map.observe(latest);
+        let mut batch: Vec<PendingBlock> = Vec::new();
+        while let Some(front) = queue.units.front() {
+            if let Some(at) = self
+                .map
+                .frame_for(front.raw_ns, front.epoch, &queue.epochs, cursor)
+            {
+                {
+                    self.held_since = None;
+                    if at > cursor.saturating_add(self.lead_frames) {
+                        break;
+                    }
+                    let Some(unit) = queue.units.pop_front() else {
+                        break;
+                    };
+                    queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
+                    batch.push(unit);
+                }
+            } else {
+                {
+                    let since = *self.held_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) < self.wait {
+                        break;
+                    }
+                    if !self.warned_unlocked {
+                        self.warned_unlocked = true;
+                        tracing::warn!(
+                            "live audio: no usable video anchor; playing audio unlocked"
+                        );
+                    }
+                    let (raw, epoch) = (front.raw_ns, front.epoch);
+                    self.map
+                        .play_unlocked(epoch, raw, cursor.saturating_add(self.lead_frames));
+                }
+            }
+        }
+        if changed {
+            let _ = store.publish_window(cursor, &[]);
+            let retained: Vec<PendingBlock> = self.history.iter().cloned().collect();
+            self.place(store, &queue.epochs, cursor, &retained);
+        }
+        self.place(store, &queue.epochs, cursor, &batch);
+        for unit in batch {
+            self.history_frames = self.history_frames.saturating_add(unit.block.frame_count());
+            self.history.push_back(unit);
+        }
+        while self.history_frames > store.capacity_frames {
+            let Some(old) = self.history.pop_front() else {
+                break;
+            };
+            self.history_frames = self.history_frames.saturating_sub(old.block.frame_count());
+        }
+    }
+
+    /// Write `units` (raw order) at their mapped frames, coalescing runs that
+    /// are contiguous within 2 frames into one write and skipping blocks
+    /// wholly behind `cursor` (late).
+    fn place(&self, store: &AudioStore, epochs: &EpochLog, cursor: i64, units: &[PendingBlock]) {
+        let channels = store.format().channel_count().max(1);
+        let mut run: Vec<f32> = Vec::new();
+        let mut run_at: i64 = 0;
+        let flush = |run: &mut Vec<f32>, at: i64| {
+            if !run.is_empty() {
+                if let Ok(block) = AudioBlock::from_interleaved(store.format(), std::mem::take(run))
+                {
+                    let _ = store.publish_at(at, &block);
+                }
+            }
+        };
+        for unit in units {
+            let Some(at) = self.map.frame_for(unit.raw_ns, unit.epoch, epochs, cursor) else {
+                continue;
+            };
+            let frames = i64::try_from(unit.block.frame_count()).unwrap_or(i64::MAX);
+            if at.saturating_add(frames) <= cursor {
+                continue;
+            }
+            let run_end = run_at.saturating_add(i64::try_from(run.len() / channels).unwrap_or(0));
+            if run.is_empty() || at.saturating_sub(run_end).abs() > 2 {
+                flush(&mut run, run_at);
+                run_at = at;
+            }
+            run.extend_from_slice(unit.block.interleaved());
+        }
+        flush(&mut run, run_at);
+    }
+}
+
+/// Decode on THIS thread into a bounded [`DecodedQueue`] (drop-oldest: a live
+/// network read is never stalled), and run a [`Placer`] on a separate thread
+/// every 50 ms against the bus cursor and the source's latest video anchor.
+///
+/// * No usable anchor for a block's clock span: it waits (bounded). After
+///   [`ANCHOR_WAIT`] that span plays **unlocked** (self-anchored), so an
+///   audio-only source still plays; a video anchor for the span later wins.
+/// * A raw jump over [`SPLICE_NS`] starts a new clock span: audio after it is
+///   only mapped by anchors whose raw time lies in its span.
+/// * A new anchor generation re-places the retained unplayed audio.
+/// * A stalled input ([`AudioError::Stalled`]) ends the connection at once; a
+///   transient decode error is skipped.
+///
+/// Neither thread is on the output clock and the store is never blocked
+/// (invariants #1/#10).
+pub fn anchored_publish_loop(
+    mut next: impl FnMut() -> Result<Option<(AudioBlock, multiview_core::time::MediaTime)>>,
+    store: &AudioStore,
+    stop: &std::sync::atomic::AtomicBool,
+    anchor: &(dyn Fn() -> Option<PtsAnchor> + Sync),
+    lead: std::time::Duration,
+    max_queued: std::time::Duration,
+) {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    let rate = store.format().sample_rate().max(1);
+    let to_frames = |d: Duration| -> i64 {
+        i64::try_from(d.as_nanos().saturating_mul(u128::from(rate)) / 1_000_000_000)
+            .unwrap_or(i64::MAX)
+    };
+    let lead_frames = to_frames(lead);
+    let max_queued_frames = usize::try_from(to_frames(max_queued))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let queue: Mutex<DecodedQueue> = Mutex::new(DecodedQueue::default());
+    let producer_done = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut placer = Placer::new(rate, lead_frames, ANCHOR_WAIT);
+            while !stop.load(Ordering::Acquire) {
+                {
+                    let mut q = lock(&queue);
+                    if producer_done.load(Ordering::Acquire) && q.is_empty() {
+                        return;
+                    }
+                    placer.step(store, &mut q, anchor(), store.read_cursor(), Instant::now());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let mut consecutive_errors: u32 = 0;
+        while !stop.load(Ordering::Acquire) {
+            match next() {
+                Ok(Some((block, pts))) => {
+                    consecutive_errors = 0;
+                    lock(&queue).push(block, pts.as_nanos(), rate, max_queued_frames);
+                }
+                Ok(None) => break,
+                Err(AudioError::Stalled(reason)) => {
+                    tracing::warn!(%reason, "audio decode loop: input stalled; ending connection");
+                    break;
+                }
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                        tracing::warn!(%error, consecutive_errors, "audio decode loop: repeated decode errors; ending connection");
+                        break;
+                    }
+                    if consecutive_errors == 1 {
+                        tracing::warn!(%error, "audio decode loop: decode error; skipping");
+                    }
+                }
+            }
+        }
+        producer_done.store(true, Ordering::Release);
+    });
+}
+
 /// Drive `next` (a decoder) on THIS thread and publish its blocks into `store`
 /// from a separate **pacer** thread, paced to wall clock by PTS.
 ///
 /// Why two threads: a live HLS read blocks inside libav for a whole segment
 /// fetch (3-27 s on a slow origin). When the same thread also slept to pace
 /// publication, the next fetch only *started* once playback was within `lead`
-/// of the end of the previous segment — so every fetch longer than the 2 s lead
-/// was heard as a gap (cnn-usa / cnn-na: ~40-65 % audible). Here the decoder
+/// of the end of the previous segment, so a fetch longer than the 2 s lead could
+/// not be ridden out (measured on cnn-na; cnn-usa's gaps remain unexplained).
+/// Here the decoder
 /// reads as fast as the network delivers into a bounded queue
 /// (`max_queued` of audio; while it is full the decoder waits), and the pacer
 /// publishes each block when it is within `lead` of its due time. A fetch stall
@@ -877,6 +1429,10 @@ pub fn paced_publish_loop(
                     q.0.push_back(unit);
                 }
                 Ok(None) => break, // end-of-stream: the pacer drains the queue
+                Err(AudioError::Stalled(reason)) => {
+                    tracing::warn!(%reason, "audio decode loop: input stalled; ending connection");
+                    break;
+                }
                 Err(error) => {
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
@@ -976,8 +1532,8 @@ mod resync_tests {
     /// origin; real time is kept on average). The decoder must start the next
     /// fetch while the previous segment is still being paced out, so the bus
     /// never runs dry. (Regression: pacing sleeps on the decode thread deferred
-    /// every fetch until playback was within the lead of the end, so each fetch
-    /// longer than the lead was heard as a gap — cnn-usa / cnn-na.)
+    /// every fetch until playback was within the lead of the end, so a fetch
+    /// longer than the lead was heard as a gap.)
     #[test]
     fn a_slow_segment_fetch_does_not_gap_the_paced_audio() {
         use std::sync::atomic::AtomicBool;
@@ -1025,6 +1581,198 @@ mod resync_tests {
             assert!(started, "audio never started");
             assert_eq!(gaps, 0, "silent ticks after audio started");
         });
+    }
+
+    const SEC: i64 = 1_000_000_000;
+    const RATE: i64 = 48_000;
+
+    fn anchor(generation: u64, out0_ns: i64, raw0_ns: i64) -> PtsAnchor {
+        PtsAnchor {
+            generation,
+            out0_ns,
+            raw_pts0_ns: raw0_ns,
+        }
+    }
+
+    /// Where VIDEO puts a frame at raw `p` under the generation in force for it
+    /// (`LiveStamper`: `at = out0 + (p - raw_pts0)`), as an output frame.
+    fn video_frame(a: &PtsAnchor, p: i64) -> i64 {
+        output_ns_to_frame(a.out0_ns + (p - a.raw_pts0_ns), 48_000)
+    }
+
+    /// 100 ms blocks whose samples encode their own raw time in ms, so a read
+    /// of the store tells which raw instant plays at that output frame.
+    fn stamped(format: AudioFormat, raw_ns: i64) -> AudioBlock {
+        let ms = ms_of(raw_ns);
+        AudioBlock::from_interleaved(format, vec![ms; 4_800 * 2]).unwrap()
+    }
+
+    /// `ns` in whole ms as `f32` (exact: every test value is < 2^24 ms).
+    fn ms_of(ns: i64) -> f32 {
+        f32::from(u16::try_from(ns / 1_000_000 / 100).unwrap()) * 100.0
+            + f32::from(u16::try_from(ns / 1_000_000 % 100).unwrap())
+    }
+
+    fn raw_at(store: &AudioStore, frame: i64) -> f32 {
+        store.seek_to(frame);
+        store.read(1).interleaved()[0]
+    }
+
+    /// Feed `raws` (ns) as 100 ms blocks and run placer steps while video
+    /// publishes `anchors` (in order, one per step) with the cursor at `cursor`.
+    fn run(raws: &[i64], anchors: &[PtsAnchor], cursor: i64) -> AudioStore {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut q = DecodedQueue::default();
+        for &r in raws {
+            q.push(stamped(format, r), r, 48_000, usize::MAX);
+        }
+        let mut placer = Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(15));
+        let now = std::time::Instant::now();
+        for a in anchors {
+            placer.step(&store, &mut q, Some(*a), cursor, now);
+        }
+        store
+    }
+
+    #[test]
+    fn output_time_converts_to_a_store_frame_exactly() {
+        assert_eq!(
+            anchor(1, 12 * SEC, 1_000 * SEC).frame_for(1_000 * SEC + SEC / 2, 48_000),
+            12 * RATE + 24_000
+        );
+    }
+
+    /// Audio at raw p plays at the output frame where video showed raw p, and
+    /// after a re-anchor (reconnect: video moved 1.5 s later on the output
+    /// timeline) the not-yet-played audio moves with it, with no change before
+    /// the step.
+    #[test]
+    fn audio_at_pts_p_lands_where_video_put_pts_p_across_a_re_anchor() {
+        let raws: Vec<i64> = (0..40).map(|i| 100 * SEC + i * SEC / 10).collect();
+        let g1 = anchor(1, 20 * SEC, 100 * SEC);
+        let cursor = 20 * RATE;
+        let store = run(&raws, &[g1], cursor);
+        for p in [100 * SEC, 101 * SEC, 102 * SEC + SEC / 2] {
+            assert_eq!(raw_at(&store, video_frame(&g1, p)), ms_of(p), "p={p}");
+        }
+        // Re-anchor rebased at raw 101 s: video now shows raw 101 s at 22.5 s.
+        let g2 = anchor(2, 22 * SEC + SEC / 2, 101 * SEC);
+        let store = run(&raws, &[g1, g2], cursor);
+        for p in [101 * SEC, 102 * SEC, 102 * SEC + 7 * SEC / 10] {
+            assert_eq!(raw_at(&store, video_frame(&g2, p)), ms_of(p), "after p={p}");
+        }
+        assert_eq!(
+            raw_at(&store, video_frame(&g1, 100 * SEC + SEC / 2)),
+            100_500.0,
+            "before the step"
+        );
+    }
+
+    /// Managed buffering steps: +1 frame period repeats 33 ms of audio where
+    /// video held a frame; every sample still lands where video put its raw time.
+    #[test]
+    fn a_one_frame_delay_step_keeps_lock_on_both_sides() {
+        let raws: Vec<i64> = (0..30).map(|i| 50 * SEC + i * SEC / 10).collect();
+        let period = 33_366_667;
+        let g1 = anchor(7, 40 * SEC, 50 * SEC);
+        let g2 = anchor(8, 40 * SEC + SEC + period, 51 * SEC);
+        let store = run(&raws, &[g1, g2], 40 * RATE);
+        assert_eq!(
+            raw_at(&store, video_frame(&g1, 50 * SEC + SEC / 2)),
+            50_500.0
+        );
+        assert_eq!(raw_at(&store, video_frame(&g2, 52 * SEC)), 52_000.0);
+    }
+
+    /// A splice (>10 s raw jump, absorbed by the video normalizer): audio after
+    /// it is held until video anchors the new clock, never mapped through the
+    /// old raw origin, then lands where video put it.
+    #[test]
+    fn audio_after_a_splice_lands_where_video_put_it() {
+        for jump in [500 * SEC, 5 * SEC] {
+            let mut raws: Vec<i64> = (0..10).map(|i| 100 * SEC + i * SEC / 10).collect();
+            raws.extend((0..20).map(|i| jump + i * SEC / 10));
+            let g1 = anchor(1, 20 * SEC, 100 * SEC);
+            let cursor = 20 * RATE;
+            // Video has not reached the splice: post-splice audio is not placed.
+            let store = run(&raws, &[g1], cursor);
+            assert_eq!(
+                raw_at(&store, video_frame(&g1, 100 * SEC + SEC / 2)),
+                100_500.0
+            );
+            assert_eq!(
+                raw_at(&store, 21 * RATE + 1_000),
+                0.0,
+                "post-splice audio must wait (jump {jump})"
+            );
+            // Video crosses the splice and publishes a mapping for the new clock.
+            let g2 = anchor(2, 21 * SEC, jump);
+            let store = run(&raws, &[g1, g2], cursor);
+            assert_eq!(
+                raw_at(&store, video_frame(&g1, 100 * SEC + SEC / 2)),
+                100_500.0,
+                "pre-splice (jump {jump})"
+            );
+            for p in [jump, jump + SEC, jump + 3 * SEC / 2] {
+                assert_eq!(
+                    raw_at(&store, video_frame(&g2, p)),
+                    ms_of(p),
+                    "post-splice p={p}"
+                );
+            }
+        }
+    }
+
+    /// No video anchor at all: the audio waits, then plays unlocked.
+    #[test]
+    fn audio_without_a_video_anchor_plays_unlocked_after_the_wait() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut q = DecodedQueue::default();
+        for i in 0..20 {
+            q.push(
+                stamped(format, 7 * SEC + i * SEC / 10),
+                7 * SEC + i * SEC / 10,
+                48_000,
+                usize::MAX,
+            );
+        }
+        let mut placer = Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(15));
+        let t0 = std::time::Instant::now();
+        placer.step(&store, &mut q, None, 0, t0);
+        assert_eq!(store.buffered_frames(), 0);
+        placer.step(
+            &store,
+            &mut q,
+            None,
+            0,
+            t0 + std::time::Duration::from_secs(16),
+        );
+        assert_eq!(raw_at(&store, 3 * RATE), 7_000.0);
+    }
+
+    /// A stalled decoder ends the connection instead of retrying 32 read
+    /// timeouts.
+    #[test]
+    fn a_stalled_input_ends_the_connection_on_the_first_error() {
+        use std::sync::atomic::AtomicBool;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let stop = AtomicBool::new(false);
+        let mut calls = 0;
+        anchored_publish_loop(
+            || {
+                calls += 1;
+                Err(AudioError::Stalled("read timeout".to_owned()))
+            },
+            &store,
+            &stop,
+            &|| None,
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(20),
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

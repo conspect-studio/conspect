@@ -323,8 +323,15 @@ impl ProgramBus {
     /// [`tick_to`](Self::tick_to) instead, so audio cannot drift from video
     /// (invariant #3).
     pub fn tick(&mut self) -> AudioBlock {
+        let start = self.clock_frame();
         let frames = self.clock.next_tick();
-        self.mix(frames)
+        self.mix(start, frames)
+    }
+
+    /// The bus's absolute sample position: the output-timeline frame the next
+    /// mixed sample belongs to (`total_at(ticks)`).
+    fn clock_frame(&self) -> i64 {
+        i64::try_from(self.clock.total_at(self.clock.tick_count())).unwrap_or(i64::MAX)
     }
 
     /// Mix program audio up to the absolute output **tick index** `target_tick`.
@@ -343,8 +350,9 @@ impl ProgramBus {
     /// `StreamItem`; combined with [`repoint`](Self::repoint)'s live-edge seek it
     /// keeps an audio breakaway lip-synced across overload gaps.
     pub fn tick_to(&mut self, target_tick: u64) -> AudioBlock {
+        let start = self.clock_frame();
         let frames = self.clock.advance_to(target_tick);
-        self.mix(frames)
+        self.mix(start, frames)
     }
 
     /// Pull `frames` from each routed source's store and mix the program bus,
@@ -352,7 +360,12 @@ impl ProgramBus {
     /// never absent (the audio continuity guarantee). Does no I/O and cannot
     /// block (the stores are wait-free reads), so it is safe on the output-clock
     /// hot loop (invariant #1) and never back-pressures any input (invariant #10).
-    fn mix(&mut self, frames: usize) -> AudioBlock {
+    ///
+    /// A [`timeline`](AudioStore::is_timeline) store (audio placed at output-time
+    /// frames, locked to vision) is read at `start` — the bus clock's own
+    /// absolute frame — so it can never drift from, or re-sync away from, the
+    /// output timeline.
+    fn mix(&mut self, start: i64, frames: usize) -> AudioBlock {
         // Pull-and-submit + mix with the PRE-advance envelope position (so this
         // tick's block uses the ramp values for its own frames), then advance the
         // ramps and retire any completed cross-fade. Disjoint field borrows:
@@ -369,6 +382,9 @@ impl ProgramBus {
                 // format (= the bus format), so `submit` cannot fail on a format
                 // mismatch; a (impossible) error degrades to dropping that input
                 // this tick rather than panicking on the hot loop.
+                if store.is_timeline() {
+                    store.seek_to(start);
+                }
                 let block = store.read(frames);
                 let _ = mixer.submit(*point, block);
             }
