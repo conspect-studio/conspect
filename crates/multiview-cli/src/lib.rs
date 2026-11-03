@@ -186,6 +186,12 @@ pub mod player;
 #[cfg(feature = "ffmpeg")]
 pub mod pipeline;
 
+/// Live HLS segment fetcher: parallel byte-range segment downloads served to
+/// the libav demuxer from memory over loopback, so a source whose single TCP
+/// flow delivers below real time still plays. Behind the `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod hls_fetch;
+
 /// Per-source **runtime audio ingest** (AUD-2): the audio peer of the video
 /// decode thread. Opens + decodes each file/URL source's audio on its own
 /// thread into a lock-free per-source `AudioStore` (canonical 48 kHz stereo),

@@ -1,0 +1,1181 @@
+//! Live HLS segment fetcher: parallel byte-range downloads, served to libav
+//! from memory over loopback.
+//!
+//! libav's HLS demuxer fetches one segment at a time over one TCP connection.
+//! On a lossy, high-RTT path (mda001 → cnn-usa: ~300 ms RTT, ~5 % loss) one TCP
+//! flow delivers only ~30–60 KB/s, i.e. 0.2–0.4x real time for a 780 KB / 5.6 s
+//! segment. No buffer can hide a source that is delivered slower than it plays.
+//! This module fetches each segment as several parallel `Range` requests (whole
+//! GETs when the origin does not support ranges), keeps the next segments in
+//! flight, retries, and republishes completed segments in an in-memory media
+//! playlist served on `[::1]` so the unchanged libav demuxer reads them at
+//! memory speed.
+//!
+//! Control/IO plane only: every thread here is a network or loopback-server
+//! thread. Nothing touches the output clock or blocks the data plane
+//! (invariants #1/#10). Memory is bounded: at most [`WINDOW`] segments are kept.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt::Write as _;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
+
+/// Set (to anything) to disable the fetcher: live HLS opens the origin with
+/// libav directly, as before. An operator escape hatch.
+pub const DISABLE_ENV: &str = "MULTIVIEW_DISABLE_HLS_FETCH";
+
+/// Completed segments kept for the local playlist (bounded memory).
+const WINDOW: usize = 8;
+/// Segments fetched concurrently.
+const IN_FLIGHT: usize = 3;
+/// Parallel ranges per segment after the probe range.
+const RANGE_PARTS: u64 = 6;
+/// The first (probe) range: learns the size and whether ranges work.
+const PROBE_BYTES: u64 = 64 * 1024;
+/// Attempts per range / whole GET before the segment attempt fails.
+const RANGE_ATTEMPTS: u32 = 4;
+/// TCP connect timeout (origins on mda001 sometimes take 8 s to accept; fail
+/// fast and retry rather than wait).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Upper bound for one HTTP call. Generous: a no-`Range` origin sends a whole
+/// segment in one call at single-flow speed.
+const CALL_TIMEOUT: Duration = Duration::from_secs(40);
+/// The largest segment accepted.
+const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// With nothing published for this long the origin counts as gone: the local
+/// playlist answers 404, libav's read fails and `ingest_loop` reconnects. Without
+/// this libav would poll a healthy loopback playlist forever.
+const DEAD_ORIGIN: Duration = Duration::from_secs(30);
+/// How long [`HlsFetcher::start`] waits for the first segment.
+const FIRST_SEGMENT_DEADLINE: Duration = Duration::from_secs(40);
+
+/// One media segment listed by the origin playlist.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OriginSegment {
+    /// Media sequence number.
+    pub seq: u64,
+    /// `#EXTINF` duration in seconds.
+    pub duration: f64,
+    /// Preceded by `#EXT-X-DISCONTINUITY`.
+    pub discontinuity: bool,
+    /// The URI as written (relative or absolute).
+    pub uri: String,
+}
+
+/// The parts of a live media playlist the fetcher needs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OriginPlaylist {
+    /// `#EXT-X-TARGETDURATION` in seconds.
+    pub target_duration: f64,
+    /// The listed segments, in order.
+    pub segments: Vec<OriginSegment>,
+}
+
+/// Why a playlist cannot be fetched this way (the caller lets libav open the
+/// origin directly instead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unsupported {
+    /// Not a playlist.
+    NotAPlaylist,
+    /// A master playlist (variant pinning happens before this).
+    Master,
+    /// `#EXT-X-ENDLIST`: not live.
+    Vod,
+    /// Encryption, init sections or byte-range segments.
+    Feature(&'static str),
+}
+
+/// Parse a live media playlist.
+pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsupported> {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if lines.next() != Some("#EXTM3U") {
+        return Err(Unsupported::NotAPlaylist);
+    }
+    let mut target_duration = 0.0_f64;
+    let mut seq = 0_u64;
+    let mut duration: Option<f64> = None;
+    let mut discontinuity = false;
+    let mut segments = Vec::new();
+    for line in lines {
+        if let Some(v) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+            target_duration = v.trim().parse().unwrap_or(0.0);
+        } else if let Some(v) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            seq = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("#EXTINF:") {
+            duration = v.split(',').next().and_then(|d| d.trim().parse().ok());
+        } else if line == "#EXT-X-DISCONTINUITY" {
+            discontinuity = true;
+        } else if line == "#EXT-X-ENDLIST" {
+            return Err(Unsupported::Vod);
+        } else if line.starts_with("#EXT-X-STREAM-INF") {
+            return Err(Unsupported::Master);
+        } else if line.starts_with("#EXT-X-MAP") {
+            return Err(Unsupported::Feature("EXT-X-MAP"));
+        } else if line.starts_with("#EXT-X-BYTERANGE") {
+            return Err(Unsupported::Feature("EXT-X-BYTERANGE"));
+        } else if let Some(attrs) = line.strip_prefix("#EXT-X-KEY:") {
+            if !attrs.contains("METHOD=NONE") {
+                return Err(Unsupported::Feature("EXT-X-KEY"));
+            }
+        } else if !line.starts_with('#') {
+            segments.push(OriginSegment {
+                seq,
+                duration: duration.take().unwrap_or(target_duration),
+                discontinuity: std::mem::take(&mut discontinuity),
+                uri: line.to_owned(),
+            });
+            seq = seq.saturating_add(1);
+        }
+    }
+    if target_duration <= 0.0 {
+        target_duration = segments.iter().map(|s| s.duration).fold(0.0, f64::max);
+    }
+    Ok(OriginPlaylist {
+        target_duration: target_duration.max(1.0),
+        segments,
+    })
+}
+
+/// Split `[start, total)` into at most `parts` contiguous inclusive ranges.
+pub(crate) fn split_ranges(start: u64, total: u64, parts: u64) -> Vec<(u64, u64)> {
+    if start >= total || parts == 0 {
+        return Vec::new();
+    }
+    let len = total - start;
+    let parts = parts.min(len);
+    let base = len / parts;
+    let extra = len % parts;
+    let mut out = Vec::with_capacity(usize::try_from(parts).unwrap_or(0));
+    let mut at = start;
+    for i in 0..parts {
+        let n = base + u64::from(i < extra);
+        out.push((at, at + n - 1));
+        at += n;
+    }
+    out
+}
+
+/// Parse the total from `Content-Range: bytes a-b/total`.
+fn content_range_total(value: &str) -> Option<u64> {
+    value.rsplit('/').next()?.trim().parse().ok()
+}
+
+/// Live fetch statistics for one source (lock-free; read by reporting).
+#[derive(Debug, Default)]
+pub struct FetchStats {
+    /// Segments fetched and published.
+    pub segments_fetched: AtomicU64,
+    /// Segments given up on (expired or failing past their deadline).
+    pub segments_skipped: AtomicU64,
+    /// Bytes downloaded.
+    pub bytes: AtomicU64,
+    /// Last segment's fetch rate: media seconds per wall second, x1000.
+    pub last_rate_milli: AtomicU64,
+    /// Smoothed fetch rate (EWMA, alpha 1/4), x1000.
+    pub avg_rate_milli: AtomicU64,
+    /// 1 when the origin served ranges for the last segment, else 0.
+    pub ranges_supported: AtomicU64,
+    /// Set when a fetcher gave up on the origin: the next connect lets libav
+    /// open it directly (then the flag clears), so a fetcher-specific failure
+    /// cannot keep a source down.
+    pub bypass_next: AtomicBool,
+}
+
+impl FetchStats {
+    fn record(&self, bytes: usize, media: f64, wall: Duration, ranged: bool) {
+        self.segments_fetched.fetch_add(1, Ordering::Relaxed);
+        self.bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(0), Ordering::Relaxed);
+        self.ranges_supported
+            .store(u64::from(ranged), Ordering::Relaxed);
+        let rate = if wall.is_zero() {
+            0
+        } else {
+            // Float only for a human-facing statistic, never for timing.
+            let micros = wall.as_micros().max(1);
+            let media_micros = Duration::from_secs_f64(media.clamp(0.0, 1e6)).as_micros();
+            u64::try_from(media_micros.saturating_mul(1000) / micros).unwrap_or(u64::MAX)
+        };
+        self.last_rate_milli.store(rate, Ordering::Relaxed);
+        let prev = self.avg_rate_milli.load(Ordering::Relaxed);
+        let avg = if prev == 0 {
+            rate
+        } else {
+            (prev * 3 + rate) / 4
+        };
+        self.avg_rate_milli.store(avg, Ordering::Relaxed);
+    }
+}
+
+/// The process-wide [`FetchStats`] for source `id` (one `Arc` per id).
+pub fn stats(id: &str) -> Arc<FetchStats> {
+    static STATS: OnceLock<Mutex<HashMap<String, Arc<FetchStats>>>> = OnceLock::new();
+    let map = STATS.get_or_init(Default::default);
+    let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(map.entry(id.to_owned()).or_default())
+}
+
+/// A completed segment in the local window.
+struct LocalSegment {
+    local_seq: u64,
+    duration: f64,
+    discontinuity: bool,
+    bytes: Arc<Vec<u8>>,
+}
+
+/// State shared by the coordinator and the loopback server.
+struct Shared {
+    window: Mutex<Window>,
+    ready: Condvar,
+    stop: AtomicBool,
+}
+
+struct Window {
+    target_duration: f64,
+    segments: VecDeque<LocalSegment>,
+    next_local: u64,
+    /// The coordinator gave up (unsupported playlist after start, etc.).
+    failed: Option<String>,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Window> {
+        self.window.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn publish(&self, duration: f64, discontinuity: bool, bytes: Vec<u8>) {
+        let mut w = self.lock();
+        let local_seq = w.next_local;
+        w.next_local += 1;
+        w.segments.push_back(LocalSegment {
+            local_seq,
+            duration,
+            discontinuity,
+            bytes: Arc::new(bytes),
+        });
+        while w.segments.len() > WINDOW {
+            w.segments.pop_front();
+        }
+        drop(w);
+        self.ready.notify_all();
+    }
+
+    /// The local playlist, or `None` once the origin is given up on.
+    fn playlist(&self) -> Option<String> {
+        let w = self.lock();
+        if w.failed.is_some() {
+            return None;
+        }
+        let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
+        let target = w.target_duration.ceil().max(1.0);
+        let _ = writeln!(out, "#EXT-X-TARGETDURATION:{target}");
+        let first = w.segments.front().map_or(w.next_local, |s| s.local_seq);
+        let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{first}");
+        for s in &w.segments {
+            if s.discontinuity {
+                out.push_str("#EXT-X-DISCONTINUITY\n");
+            }
+            let _ = write!(out, "#EXTINF:{:.6},\n/s/{}.ts\n", s.duration, s.local_seq);
+        }
+        Some(out)
+    }
+
+    /// Give up on the origin (see [`DEAD_ORIGIN`]).
+    fn fail(&self, reason: String) {
+        self.lock().failed = Some(reason);
+        self.ready.notify_all();
+    }
+
+    fn segment(&self, local_seq: u64) -> Option<Arc<Vec<u8>>> {
+        self.lock()
+            .segments
+            .iter()
+            .find(|s| s.local_seq == local_seq)
+            .map(|s| Arc::clone(&s.bytes))
+    }
+}
+
+/// A running fetcher for one live media playlist. Dropping it stops the
+/// coordinator and the loopback server.
+pub(crate) struct HlsFetcher {
+    shared: Arc<Shared>,
+    local_url: String,
+}
+
+impl Drop for HlsFetcher {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.shared.ready.notify_all();
+    }
+}
+
+impl HlsFetcher {
+    /// Start fetching `playlist_url` (a live MEDIA playlist) and wait until its
+    /// first segment is in memory. Returns `Err` when the playlist cannot be
+    /// handled this way (the caller opens the origin with libav instead), when
+    /// nothing arrives in time, or when `stop` is raised.
+    pub(crate) fn start(
+        source_id: &str,
+        playlist_url: &str,
+        stop: &AtomicBool,
+    ) -> Result<Self, String> {
+        let st = stats(source_id);
+        if st.bypass_next.swap(false, Ordering::AcqRel) {
+            return Err("bypassed after the fetcher gave up on this origin".to_owned());
+        }
+        let base = url::Url::parse(playlist_url).map_err(|e| format!("playlist url: {e}"))?;
+        let agent = agent();
+        // Probe the playlist once synchronously so an unsupported one falls back
+        // before any thread starts.
+        let (first, final_url) = fetch_playlist(&agent, base.as_str())?;
+        // Segment URIs resolve against the playlist's final URL (RFC 8216 §4.1),
+        // which differs from the request URL after a redirect.
+        let segment_base = url::Url::parse(&final_url).unwrap_or_else(|_| base.clone());
+        let shared = Arc::new(Shared {
+            window: Mutex::new(Window {
+                target_duration: first.target_duration,
+                segments: VecDeque::new(),
+                next_local: 0,
+                failed: None,
+            }),
+            ready: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let listener = TcpListener::bind("[::1]:0").map_err(|e| format!("loopback bind: {e}"))?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let local_url = format!("http://[::1]:{port}/live.m3u8");
+        spawn_server(source_id, listener, Arc::clone(&shared))?;
+        let coord_shared = Arc::clone(&shared);
+        let id = source_id.to_owned();
+        std::thread::Builder::new()
+            .name(format!("multiview-hls-{source_id}"))
+            .spawn(move || {
+                let origin = Origin {
+                    id: &id,
+                    agent: &agent,
+                    playlist: &base,
+                    segments: &segment_base,
+                };
+                coordinate(&origin, first, &coord_shared, &st);
+            })
+            .map_err(|e| format!("spawn hls coordinator: {e}"))?;
+        let fetcher = Self { shared, local_url };
+        // Wait for the first segment (stop-responsive).
+        let deadline = Instant::now() + FIRST_SEGMENT_DEADLINE;
+        let mut w = fetcher.shared.lock();
+        loop {
+            if !w.segments.is_empty() {
+                break;
+            }
+            if let Some(err) = w.failed.clone() {
+                return Err(err);
+            }
+            let now = Instant::now();
+            if stop.load(Ordering::Acquire) || now >= deadline {
+                return Err("no live segment arrived".to_owned());
+            }
+            let wait = (deadline - now).min(Duration::from_millis(100));
+            w = fetcher
+                .shared
+                .ready
+                .wait_timeout(w, wait)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        drop(w);
+        Ok(fetcher)
+    }
+
+    /// The loopback playlist URL libav should open.
+    pub(crate) fn local_url(&self) -> &str {
+        &self.local_url
+    }
+}
+
+fn agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(CALL_TIMEOUT))
+        .max_idle_connections_per_host(RANGE_PARTS_USIZE * IN_FLIGHT + 2)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+const RANGE_PARTS_USIZE: usize = 6;
+
+/// Fetch and parse the playlist; returns it with its final URL (after redirects).
+fn fetch_playlist(agent: &ureq::Agent, url: &str) -> Result<(OriginPlaylist, String), String> {
+    use ureq::ResponseExt as _;
+    let mut last = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        match agent.get(url).call() {
+            Ok(resp) if resp.status().as_u16() == 200 => {
+                let final_url = resp.get_uri().to_string();
+                let body = resp
+                    .into_body()
+                    .with_config()
+                    .limit(4 * 1024 * 1024)
+                    .read_to_string()
+                    .map_err(|e| e.to_string())?;
+                let parsed = parse_media_playlist(&body)
+                    .map_err(|u| format!("unsupported playlist: {u:?}"))?;
+                return Ok((parsed, final_url));
+            }
+            Ok(resp) => last = format!("playlist http {}", resp.status().as_u16()),
+            Err(e) => last = format!("playlist: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// One HTTP GET, optionally ranged. Returns `(status, content-range total, body)`.
+fn get(
+    agent: &ureq::Agent,
+    url: &str,
+    range: Option<(u64, u64)>,
+) -> Result<(u16, Option<u64>, Vec<u8>), String> {
+    let mut req = agent.get(url);
+    if let Some((a, b)) = range {
+        req = req.header("Range", &format!("bytes={a}-{b}"));
+    }
+    let resp = req.call().map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    let total = resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(content_range_total);
+    let body = resp
+        .into_body()
+        .with_config()
+        .limit(MAX_SEGMENT_BYTES)
+        .read_to_vec()
+        .map_err(|e| e.to_string())?;
+    Ok((status, total, body))
+}
+
+/// Retry `f` up to `attempts` times while `deadline` allows.
+fn with_retries<T>(
+    attempts: u32,
+    deadline: Instant,
+    stop: &AtomicBool,
+    mut f: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut last = String::from("no attempt");
+    for attempt in 0..attempts {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            break;
+        }
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(250 * u64::from(attempt.min(4))));
+        }
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Fetch one segment: a probe range, then the rest as parallel ranges (or the
+/// whole body when the origin ignores `Range`). Returns `(bytes, ranged)`.
+pub(crate) fn fetch_segment(
+    agent: &ureq::Agent,
+    url: &str,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Result<(Vec<u8>, bool), String> {
+    // The newest listed segment can 404 briefly: keep asking until the deadline
+    // rather than skip real media.
+    let (status, total, probe) = with_retries(u32::MAX, deadline, stop, || {
+        let r = get(agent, url, Some((0, PROBE_BYTES - 1)))?;
+        match r.0 {
+            200 | 206 => Ok(r),
+            // A segment listed but not yet on the edge cache: retry shortly.
+            s => Err(format!("segment http {s}")),
+        }
+    })?;
+    if status == 200 {
+        return Ok((probe, false));
+    }
+    let total = match total {
+        Some(t) if t <= MAX_SEGMENT_BYTES => t,
+        Some(t) => return Err(format!("segment too large: {t}")),
+        None => return Err("206 without a Content-Range total".to_owned()),
+    };
+    let have = u64::try_from(probe.len()).unwrap_or(0);
+    if have >= total {
+        return Ok((probe, true));
+    }
+    let ranges = split_ranges(have, total, RANGE_PARTS);
+    let parts: Vec<Result<Vec<u8>, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(a, b)| {
+                scope.spawn(move || {
+                    with_retries(RANGE_ATTEMPTS, deadline, stop, || {
+                        let (s, _, body) = get(agent, url, Some((a, b)))?;
+                        let want = usize::try_from(b - a + 1).unwrap_or(usize::MAX);
+                        if s == 206 && body.len() == want {
+                            Ok(body)
+                        } else {
+                            Err(format!("range {a}-{b}: http {s}, {} bytes", body.len()))
+                        }
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("range thread panicked".to_owned()))
+            })
+            .collect()
+    });
+    let mut out = probe;
+    out.reserve(usize::try_from(total - have).unwrap_or(0));
+    for part in parts {
+        out.extend_from_slice(&part?);
+    }
+    Ok((out, true))
+}
+
+/// The origin URLs one coordinator works against.
+struct Origin<'a> {
+    id: &'a str,
+    agent: &'a ureq::Agent,
+    /// The playlist as requested (reloads start here).
+    playlist: &'a url::Url,
+    /// The playlist's final URL (segment URIs resolve against it).
+    segments: &'a url::Url,
+}
+
+/// A finished segment download: `(bytes, ranged, wall)` or the error.
+type SegmentResult = Result<(Vec<u8>, bool, Duration), String>;
+
+/// The coordinator's bookkeeping, separated from its I/O so it can be tested.
+#[derive(Default)]
+struct Schedule {
+    next_seq: Option<u64>,
+    /// Every segment not yet published or skipped, in order.
+    order: VecDeque<OriginSegment>,
+    /// The subset of `order` not yet dispatched.
+    queued: VecDeque<OriginSegment>,
+    done: BTreeMap<u64, SegmentResult>,
+    /// The next published segment follows lost media.
+    gap: bool,
+}
+
+impl Schedule {
+    /// Absorb a reloaded playlist. Returns the segments lost to expiry, or
+    /// `None` when the sequence ran backwards (the origin restarted).
+    fn absorb(&mut self, playlist: OriginPlaylist) -> Option<u64> {
+        // Start three segments from the live edge (RFC 8216 §6.3.3).
+        let segments = playlist.segments;
+        let start = *self.next_seq.get_or_insert_with(|| {
+            let edge = segments.len().saturating_sub(3);
+            segments.get(edge).map_or(0, |s| s.seq)
+        });
+        let window = u64::try_from(WINDOW).unwrap_or(u64::MAX);
+        if segments.last().is_some_and(|s| s.seq + window < start) {
+            return None;
+        }
+        let mut lost = 0;
+        if let Some(oldest) = segments.first().map(|s| s.seq) {
+            // Undispatched segments that left the playlist are gone: asking for
+            // them only costs time the next segment needs. Dispatched ones stay
+            // in `order`: they may well still complete.
+            let expired: Vec<u64> = self
+                .queued
+                .iter()
+                .map(|s| s.seq)
+                .filter(|&seq| seq < oldest)
+                .collect();
+            self.queued.retain(|s| s.seq >= oldest);
+            self.order.retain(|s| !expired.contains(&s.seq));
+            lost += u64::try_from(expired.len()).unwrap_or(0);
+            if oldest > start {
+                lost += oldest - start;
+                self.next_seq = Some(oldest);
+            }
+        }
+        self.gap |= lost > 0;
+        let from = self.next_seq.unwrap_or(start);
+        for s in segments.into_iter().filter(|s| s.seq >= from) {
+            self.next_seq = Some(s.seq + 1);
+            self.order.push_back(s.clone());
+            self.queued.push_back(s);
+        }
+        Some(lost)
+    }
+
+    /// The next segment that can be published or skipped, with its result.
+    fn pop_ready(&mut self) -> Option<(OriginSegment, SegmentResult)> {
+        let result = self.done.remove(&self.order.front()?.seq)?;
+        Some((self.order.pop_front()?, result))
+    }
+}
+
+/// The coordinator: reload the playlist, keep [`IN_FLIGHT`] segments
+/// downloading, publish completed segments in order, skip ones that fail, and
+/// give up after [`DEAD_ORIGIN`] without a published segment.
+#[allow(clippy::too_many_lines)]
+// reason: one sequential poll loop (reload, dispatch, collect, publish, liveness).
+fn coordinate(
+    origin: &Origin<'_>,
+    first: OriginPlaylist,
+    shared: &Arc<Shared>,
+    stats: &Arc<FetchStats>,
+) {
+    let id = origin.id;
+    let mut playlist = Some(first);
+    let mut sched = Schedule::default();
+    let mut in_flight = 0_usize;
+    let mut target = 6.0_f64;
+    let mut next_reload = Instant::now();
+    let mut last_progress = Instant::now();
+    let (tx, rx) = mpsc::channel::<(u64, SegmentResult)>();
+    while !shared.stop.load(Ordering::Acquire) {
+        // (1) Playlist reload.
+        if playlist.is_none() && Instant::now() >= next_reload {
+            match fetch_playlist(origin.agent, origin.playlist.as_str()) {
+                Ok((p, _)) => playlist = Some(p),
+                Err(e) => {
+                    tracing::warn!(source = %id, error = %e, "hls fetch: playlist reload failed");
+                    next_reload = Instant::now() + Duration::from_secs(1);
+                }
+            }
+        }
+        if let Some(p) = playlist.take() {
+            target = p.target_duration;
+            shared.lock().target_duration = target;
+            let Some(lost) = sched.absorb(p) else {
+                shared.fail("media sequence ran backwards".to_owned());
+                return;
+            };
+            if lost > 0 {
+                stats.segments_skipped.fetch_add(lost, Ordering::Relaxed);
+                tracing::warn!(source = %id, lost, "hls fetch: segments expired before fetch");
+            }
+            // Reload about every half target duration (RFC 8216 §6.3.4).
+            next_reload = Instant::now() + Duration::from_secs_f64((target / 2.0).max(1.0));
+        }
+        // (2) Keep segments in flight.
+        while in_flight < IN_FLIGHT {
+            let Some(seg) = sched.queued.pop_front() else {
+                break;
+            };
+            let Ok(url) = origin.segments.join(&seg.uri) else {
+                sched
+                    .done
+                    .insert(seg.seq, Err(format!("bad segment uri {}", seg.uri)));
+                continue;
+            };
+            let agent = origin.agent.clone();
+            let tx = tx.clone();
+            let shared = Arc::clone(shared);
+            // A segment older than ~3 target durations has left the playlist.
+            let deadline = Instant::now() + Duration::from_secs_f64(target * 3.0);
+            let seq = seg.seq;
+            in_flight += 1;
+            let spawned = std::thread::Builder::new()
+                .name(format!("multiview-hls-seg-{id}"))
+                .spawn(move || {
+                    let t0 = Instant::now();
+                    let r = fetch_segment(&agent, url.as_str(), deadline, &shared.stop)
+                        .map(|(b, ranged)| (b, ranged, t0.elapsed()));
+                    let _ = tx.send((seq, r));
+                });
+            if spawned.is_err() {
+                // Thread exhaustion: skip it rather than wedge `order` forever.
+                in_flight -= 1;
+                sched.done.insert(seq, Err("spawn failed".to_owned()));
+                break;
+            }
+        }
+        // (3) Collect results.
+        let wait = next_reload
+            .saturating_duration_since(Instant::now())
+            .clamp(Duration::from_millis(10), Duration::from_millis(200));
+        if let Ok((seq, r)) = rx.recv_timeout(wait) {
+            in_flight = in_flight.saturating_sub(1);
+            sched.done.insert(seq, r);
+            while let Ok((seq, r)) = rx.try_recv() {
+                in_flight = in_flight.saturating_sub(1);
+                sched.done.insert(seq, r);
+            }
+        }
+        // (4) Publish in order.
+        while let Some((seg, result)) = sched.pop_ready() {
+            match result {
+                Ok((bytes, ranged, wall)) => {
+                    stats.record(bytes.len(), seg.duration, wall, ranged);
+                    let gap = std::mem::take(&mut sched.gap);
+                    shared.publish(seg.duration, seg.discontinuity || gap, bytes);
+                    last_progress = Instant::now();
+                }
+                Err(e) => {
+                    stats.segments_skipped.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(source = %id, seq = seg.seq, error = %e, "hls fetch: segment skipped");
+                    sched.gap = true;
+                }
+            }
+        }
+        // (5) Liveness: libav only sees a healthy loopback, so this is the one
+        // place a dead origin can surface as a reconnect.
+        if last_progress.elapsed() >= DEAD_ORIGIN {
+            tracing::warn!(source = %id, "hls fetch: no segment published, giving up on this connection");
+            stats.bypass_next.store(true, Ordering::Release);
+            shared.fail("no segment published".to_owned());
+            return;
+        }
+    }
+}
+
+/// Serve the local playlist and segments over loopback HTTP/1.1 (keep-alive,
+/// `Range` aware) until the fetcher stops.
+fn spawn_server(source_id: &str, listener: TcpListener, shared: Arc<Shared>) -> Result<(), String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("loopback nonblocking: {e}"))?;
+    let id = source_id.to_owned();
+    std::thread::Builder::new()
+        .name(format!("multiview-hls-srv-{source_id}"))
+        .spawn(move || {
+            while !shared.stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let shared = Arc::clone(&shared);
+                        let _ = std::thread::Builder::new()
+                            .name(format!("multiview-hls-conn-{id}"))
+                            .spawn(move || serve_connection(stream, &shared));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+        })
+        .map_err(|e| format!("spawn hls server: {e}"))?;
+    Ok(())
+}
+
+fn serve_connection(stream: TcpStream, shared: &Shared) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+    let _ = stream.set_nodelay(true);
+    let Ok(write_half) = stream.try_clone() else {
+        return;
+    };
+    let mut writer = write_half;
+    let mut reader = BufReader::new(stream);
+    loop {
+        if shared.stop.load(Ordering::Acquire) {
+            return;
+        }
+        let mut request_line = String::new();
+        match reader.read_line(&mut request_line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let mut range: Option<(u64, Option<u64>)> = None;
+        let mut close = false;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                let v = v.trim();
+                if k.eq_ignore_ascii_case("range") {
+                    range = parse_range(v);
+                } else if k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close") {
+                    close = true;
+                }
+            }
+        }
+        let path = request_line.split_whitespace().nth(1).unwrap_or("");
+        let body: Option<(Arc<Vec<u8>>, &str)> = if path.starts_with("/live.m3u8") {
+            shared
+                .playlist()
+                .map(|p| (Arc::new(p.into_bytes()), "application/vnd.apple.mpegurl"))
+        } else {
+            path.strip_prefix("/s/")
+                .and_then(|p| p.strip_suffix(".ts"))
+                .and_then(|n| n.parse().ok())
+                .and_then(|n| shared.segment(n))
+                .map(|b| (b, "video/mp2t"))
+        };
+        let ok = match body {
+            Some((bytes, ctype)) => write_body(&mut writer, &bytes, ctype, range),
+            None => writer
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .is_ok(),
+        };
+        if !ok || close {
+            return;
+        }
+    }
+}
+
+fn parse_range(v: &str) -> Option<(u64, Option<u64>)> {
+    let spec = v.strip_prefix("bytes=")?;
+    let (a, b) = spec.split_once('-')?;
+    let a = a.trim().parse().ok()?;
+    let b = b.trim();
+    Some((a, if b.is_empty() { None } else { b.parse().ok() }))
+}
+
+fn write_body(
+    w: &mut TcpStream,
+    bytes: &[u8],
+    ctype: &str,
+    range: Option<(u64, Option<u64>)>,
+) -> bool {
+    let len = u64::try_from(bytes.len()).unwrap_or(0);
+    let (status, start, end) = match range {
+        Some((a, b)) if a < len => (206, a, b.unwrap_or(len - 1).min(len - 1)),
+        Some(_) if len > 0 => {
+            let head = format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\n\r\n");
+            return w.write_all(head.as_bytes()).is_ok();
+        }
+        _ => (200, 0, len.saturating_sub(1)),
+    };
+    let slice: &[u8] = if len == 0 {
+        &[]
+    } else {
+        let (s, e) = (
+            usize::try_from(start).unwrap_or(0),
+            usize::try_from(end).unwrap_or(0),
+        );
+        bytes.get(s..=e).unwrap_or_default()
+    };
+    let mut head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
+        if status == 206 { "Partial Content" } else { "OK" },
+        slice.len()
+    );
+    if status == 206 {
+        let _ = write!(head, "Content-Range: bytes {start}-{end}/{len}\r\n");
+    }
+    head.push_str("\r\n");
+    w.write_all(head.as_bytes()).is_ok() && w.write_all(slice).is_ok() && w.flush().is_ok()
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::indexing_slicing,
+    clippy::format_push_string
+)]
+// reason: a compact fake origin and byte-range assertions in test code.
+mod tests {
+    use super::*;
+
+    const LIVE: &str = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:30712\n#EXT-X-PROGRAM-DATE-TIME:2026-11-03T21:14:58.150Z\n#EXTINF:5.600,\na/1.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:5.600,\nhttps://cdn.example.net/2.ts?m=1\n";
+
+    #[test]
+    fn parses_a_live_media_playlist() {
+        let p = parse_media_playlist(LIVE).expect("live playlist");
+        assert!((p.target_duration - 6.0).abs() < f64::EPSILON);
+        assert_eq!(p.segments.len(), 2);
+        assert_eq!(p.segments[0].seq, 30712);
+        assert_eq!(p.segments[0].uri, "a/1.ts");
+        assert!(!p.segments[0].discontinuity);
+        assert_eq!(p.segments[1].seq, 30713);
+        assert!(p.segments[1].discontinuity);
+        assert!((p.segments[1].duration - 5.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_what_it_cannot_serve() {
+        assert_eq!(parse_media_playlist("nope"), Err(Unsupported::NotAPlaylist));
+        assert_eq!(
+            parse_media_playlist("#EXTM3U\n#EXTINF:6,\na.ts\n#EXT-X-ENDLIST\n"),
+            Err(Unsupported::Vod)
+        );
+        assert_eq!(
+            parse_media_playlist(
+                "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:6,\na.ts\n"
+            ),
+            Err(Unsupported::Feature("EXT-X-KEY"))
+        );
+        assert!(
+            parse_media_playlist("#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:6,\na.ts\n").is_ok()
+        );
+        assert_eq!(
+            parse_media_playlist("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n"),
+            Err(Unsupported::Master)
+        );
+    }
+
+    #[test]
+    fn ranges_cover_the_rest_exactly() {
+        assert_eq!(split_ranges(0, 10, 3), vec![(0, 3), (4, 6), (7, 9)]);
+        assert_eq!(
+            split_ranges(65_536, 65_538, 6),
+            vec![(65_536, 65_536), (65_537, 65_537)]
+        );
+        assert_eq!(split_ranges(5, 5, 6), Vec::new());
+        let r = split_ranges(65_536, 780_000, 6);
+        assert_eq!(r.first().map(|x| x.0), Some(65_536));
+        assert_eq!(r.last().map(|x| x.1), Some(779_999));
+        assert!(r.windows(2).all(|w| w[0].1 + 1 == w[1].0));
+        assert_eq!(content_range_total("bytes 0-65535/780000"), Some(780_000));
+    }
+
+    fn listing(seqs: std::ops::Range<u64>) -> OriginPlaylist {
+        OriginPlaylist {
+            target_duration: 6.0,
+            segments: seqs
+                .map(|seq| OriginSegment {
+                    seq,
+                    duration: 5.6,
+                    discontinuity: false,
+                    uri: format!("{seq}.ts"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn schedule_starts_three_from_the_edge_and_takes_only_new_segments() {
+        let mut sched = Schedule::default();
+        assert_eq!(sched.absorb(listing(10..20)), Some(0));
+        let seqs: Vec<u64> = sched.queued.iter().map(|s| s.seq).collect();
+        assert_eq!(seqs, vec![17, 18, 19]);
+        assert_eq!(sched.absorb(listing(11..21)), Some(0));
+        assert_eq!(sched.queued.back().map(|s| s.seq), Some(20));
+        assert_eq!(sched.queued.len(), 4, "no duplicates");
+    }
+
+    #[test]
+    fn expired_undispatched_segments_count_as_lost_and_mark_a_gap() {
+        let mut sched = Schedule::default();
+        sched.absorb(listing(0..4));
+        assert!(!sched.gap);
+        // 1..=3 are queued; the playlist moved on past 1 and 2.
+        assert_eq!(sched.absorb(listing(3..8)), Some(2));
+        assert!(sched.gap);
+        assert_eq!(sched.queued.front().map(|s| s.seq), Some(3));
+        assert_eq!(sched.order.front().map(|s| s.seq), Some(3));
+    }
+
+    #[test]
+    fn a_dispatched_segment_that_left_the_playlist_can_still_publish() {
+        let mut sched = Schedule::default();
+        sched.absorb(listing(0..3));
+        // 0 is downloading (dispatched), 1 and 2 are queued.
+        sched.queued.pop_front();
+        assert_eq!(sched.absorb(listing(2..6)), Some(1), "only 1 is lost");
+        sched.done.insert(0, Ok((vec![0], false, Duration::ZERO)));
+        assert_eq!(sched.pop_ready().map(|(seg, _)| seg.seq), Some(0));
+        assert!(sched.done.is_empty());
+    }
+
+    #[test]
+    fn a_sequence_that_ran_backwards_is_refused() {
+        let mut sched = Schedule::default();
+        sched.absorb(listing(1_000..1_004));
+        assert_eq!(sched.absorb(listing(0..4)), None);
+    }
+
+    #[test]
+    fn segments_publish_in_order_whatever_order_they_finish() {
+        let mut sched = Schedule::default();
+        sched.absorb(listing(0..3));
+        sched.done.insert(2, Ok((vec![2], false, Duration::ZERO)));
+        assert!(sched.pop_ready().is_none(), "0 is not done");
+        sched.done.insert(0, Ok((vec![0], false, Duration::ZERO)));
+        assert_eq!(sched.pop_ready().map(|(seg, _)| seg.seq), Some(0));
+        sched.done.insert(1, Err("gone".to_owned()));
+        assert!(sched.pop_ready().is_some_and(|(_, r)| r.is_err()));
+        assert_eq!(sched.pop_ready().map(|(seg, _)| seg.seq), Some(2));
+    }
+
+    /// A per-connection bandwidth-limited origin, like one TCP flow over the
+    /// lossy 300 ms path from mda001: each connection sends at most
+    /// `bytes_per_sec`, after `latency` per request.
+    struct Origin {
+        port: u16,
+        hits: Arc<AtomicU64>,
+    }
+
+    fn origin(body: Vec<u8>, bytes_per_sec: usize, latency: Duration, ranges: bool) -> Origin {
+        let listener = TcpListener::bind("[::1]:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let body = Arc::new(body);
+        let hits = Arc::new(AtomicU64::new(0));
+        let h = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let body = Arc::clone(&body);
+                let hits = Arc::clone(&h);
+                std::thread::spawn(move || {
+                    let Ok(mut w) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut r = BufReader::new(stream);
+                    loop {
+                        let mut first = String::new();
+                        if r.read_line(&mut first).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let mut range = None;
+                        loop {
+                            let mut l = String::new();
+                            if r.read_line(&mut l).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let l = l.trim_end().to_owned();
+                            if l.is_empty() {
+                                break;
+                            }
+                            if let Some(v) = l
+                                .strip_prefix("Range: ")
+                                .or_else(|| l.strip_prefix("range: "))
+                            {
+                                range = parse_range(v);
+                            }
+                        }
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(latency);
+                        let len = u64::try_from(body.len()).expect("len");
+                        let (status, a, b) = match range {
+                            Some((a, b)) if ranges => (206, a, b.unwrap_or(len - 1).min(len - 1)),
+                            _ => (200, 0, len - 1),
+                        };
+                        let slice =
+                            &body[usize::try_from(a).expect("a")..=usize::try_from(b).expect("b")];
+                        let mut head =
+                            format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\n", slice.len());
+                        if status == 206 {
+                            head.push_str(&format!("Content-Range: bytes {a}-{b}/{len}\r\n"));
+                        }
+                        head.push_str("\r\n");
+                        if w.write_all(head.as_bytes()).is_err() {
+                            return;
+                        }
+                        for chunk in slice.chunks(bytes_per_sec / 20) {
+                            if w.write_all(chunk).is_err() {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                });
+            }
+        });
+        Origin { port, hits }
+    }
+
+    fn body(n: usize) -> Vec<u8> {
+        (0..n).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect()
+    }
+
+    /// The mda001 condition: one flow at ~40 KB/s takes ~20 s for a 780 KB
+    /// segment (0.3x real time for 5.6 s of media). Parallel ranges must fetch
+    /// it intact several times faster.
+    #[test]
+    fn parallel_ranges_beat_a_slow_single_flow() {
+        let data = body(780_000);
+        let o = origin(data.clone(), 40_000, Duration::from_millis(150), true);
+        let url = format!("http://[::1]:{}/seg.ts", o.port);
+        let stop = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let (got, ranged) = fetch_segment(
+            &agent(),
+            &url,
+            Instant::now() + Duration::from_secs(60),
+            &stop,
+        )
+        .expect("fetch");
+        let wall = t0.elapsed();
+        assert!(ranged);
+        assert_eq!(got, data, "reassembled intact");
+        assert_eq!(o.hits.load(Ordering::SeqCst), 7, "probe + 6 ranges");
+        // Single flow: ~19.5 s. Probe (~1.8 s) + 6 parallel (~3 s) ≈ 5 s.
+        assert!(wall < Duration::from_secs(8), "took {wall:?}");
+    }
+
+    #[test]
+    fn an_origin_without_ranges_is_fetched_whole() {
+        let data = body(200_000);
+        let o = origin(data.clone(), 2_000_000, Duration::ZERO, false);
+        let url = format!("http://[::1]:{}/seg.ts", o.port);
+        let stop = AtomicBool::new(false);
+        let (got, ranged) = fetch_segment(
+            &agent(),
+            &url,
+            Instant::now() + Duration::from_secs(20),
+            &stop,
+        )
+        .expect("fetch");
+        assert!(!ranged);
+        assert_eq!(got, data);
+        assert_eq!(o.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_local_server_serves_the_window_with_ranges() {
+        let shared = Arc::new(Shared {
+            window: Mutex::new(Window {
+                target_duration: 5.6,
+                segments: VecDeque::new(),
+                next_local: 0,
+                failed: None,
+            }),
+            ready: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        for i in 0..(WINDOW + 2) {
+            shared.publish(5.6, i == 3, vec![u8::try_from(i).unwrap_or(0); 10]);
+        }
+        let listener = TcpListener::bind("[::1]:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        spawn_server("t", listener, Arc::clone(&shared)).expect("server");
+        let a = agent();
+        let (s, _, pl) =
+            get(&a, &format!("http://[::1]:{port}/live.m3u8"), None).expect("playlist");
+        assert_eq!(s, 200);
+        let pl = String::from_utf8(pl).expect("utf8");
+        assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:2\n"), "{pl}");
+        assert!(pl.contains("#EXT-X-TARGETDURATION:6\n"), "{pl}");
+        assert!(
+            pl.contains("#EXT-X-DISCONTINUITY\n#EXTINF:5.600000,\n/s/3.ts"),
+            "{pl}"
+        );
+        assert_eq!(pl.matches("#EXTINF").count(), WINDOW, "bounded window");
+        shared.fail("origin gone".to_owned());
+        let (gone, _, _) = get(&a, &format!("http://[::1]:{port}/live.m3u8"), None).expect("gone");
+        assert_eq!(
+            gone, 404,
+            "a failed fetcher fails libav's reload, forcing a reconnect"
+        );
+        shared.lock().failed = None;
+        let (s, _, seg) = get(&a, &format!("http://[::1]:{port}/s/9.ts"), None).expect("seg");
+        assert_eq!((s, seg), (200, vec![9_u8; 10]));
+        let (s, total, part) =
+            get(&a, &format!("http://[::1]:{port}/s/9.ts"), Some((4, 99))).expect("range");
+        assert_eq!((s, total, part.len()), (206, Some(10), 6));
+        let (s, _, _) = get(&a, &format!("http://[::1]:{port}/s/0.ts"), None).expect("evicted");
+        assert_eq!(s, 404, "evicted segments are gone");
+        shared.stop.store(true, Ordering::Release);
+    }
+}
