@@ -9269,27 +9269,36 @@ pub(crate) fn resolve_hls_variant_url(
 
 /// The HLS URL to open for a source's **audio** decode.
 ///
-/// Pinning a variant isolates the demuxer from a master's `WebVTT` renditions
-/// (one bad `.vtt` fails the whole open). But a variant can be video-only, with
-/// audio in a separate `EXT-X-MEDIA` rendition — pinning that leaves the audio
-/// decode with no audio stream. So pin only when the master actually declares
-/// subtitle renditions; otherwise open the master and let libav select the audio.
+/// Always pins ONE media playlist when the URL is a master
+/// ([`MasterPlaylist::pick_audio_uri`](multiview_input::hls::MasterPlaylist::pick_audio_uri)):
+/// a separate `TYPE=AUDIO` rendition if the master declares one, else the best
+/// variant that carries audio (never a video-only rung). Opening the master
+/// instead made libav fetch EVERY variant's segments serially (cnn-na: four
+/// rungs, four 6 s segments per 6 s), which on a slow or ad-inserting origin
+/// outran real time and starved the audio (~40-60 % audible). A pinned media
+/// playlist also carries no `WebVTT` rendition (ADR-T011). Best-effort: `None`
+/// opens the original URL.
 pub(crate) fn resolve_hls_audio_url(master_url: &str) -> Option<String> {
-    use crate::captions::PlaylistFetcher as _;
-    let playlist = crate::captions::LibavFetcher.fetch(master_url).ok()?;
+    resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher)
+}
+
+/// [`resolve_hls_audio_url`] with an injectable fetcher (offline tests).
+fn resolve_hls_audio_url_with(
+    master_url: &str,
+    fetcher: &dyn crate::captions::PlaylistFetcher,
+) -> Option<String> {
+    let playlist = match fetcher.fetch(master_url) {
+        Ok(playlist) => playlist,
+        Err(reason) => {
+            tracing::warn!(%master_url, %reason, "could not fetch HLS master for audio pin; opening URL as-is");
+            return None;
+        }
+    };
     let master = multiview_input::hls::MasterPlaylist::parse(&playlist.body).ok()?;
-    let has_subtitles = master
-        .renditions
-        .iter()
-        .any(|r| r.media_type == multiview_input::hls::MediaType::Subtitles);
-    if !has_subtitles {
-        return None;
-    }
-    let variant = master.pick_video_variant(None)?;
-    Some(crate::captions::resolve_rendition_uri(
-        &playlist.url,
-        &variant.uri,
-    ))
+    let uri = master.pick_audio_uri()?;
+    let audio_url = crate::captions::resolve_rendition_uri(&playlist.url, uri);
+    tracing::info!(%master_url, %audio_url, "pinned HLS audio decode to one media playlist");
+    Some(audio_url)
 }
 
 /// [`resolve_hls_variant_url`] with an injectable [`PlaylistFetcher`](crate::captions::PlaylistFetcher)
@@ -12603,6 +12612,7 @@ mod reconnect_tests {
 /// exercised offline with a canned master (no network, no FFI).
 #[cfg(test)]
 mod variant_pin_tests {
+    use super::resolve_hls_audio_url_with;
     use super::resolve_hls_variant_url_with;
     use crate::captions::{FetchedPlaylist, PlaylistFetcher};
 
@@ -12647,6 +12657,42 @@ mod variant_pin_tests {
         "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,SUBTITLES=\"subs\"\n",
         "index_2.m3u8\n",
     );
+
+    /// cnn-na's shape (`MediaTailor`, four muxed A/V rungs, NO subtitles): the
+    /// audio decode must still pin ONE variant. Opening the master made libav
+    /// fetch all four rungs' segments per segment and starve the audio.
+    #[test]
+    fn audio_pins_one_variant_of_a_subtitle_free_abr_master() {
+        let fetcher = CannedFetcher(Ok(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=1020588\n",
+            "../m/0.m3u8\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=4715744\n",
+            "../m/3.m3u8\n",
+        )
+        .to_owned()));
+        assert_eq!(
+            resolve_hls_audio_url_with("https://cf.test/v1/master/x.m3u8", &fetcher).as_deref(),
+            Some("https://cf.test/v1/m/3.m3u8")
+        );
+    }
+
+    /// cnn-usa's shape: the audio pin never lands on a video-only rung.
+    #[test]
+    fn audio_pin_skips_a_video_only_variant() {
+        let fetcher = CannedFetcher(Ok(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS=\"hvc1.2.2.L120.90\"\n",
+            "tracks-v1/mono.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1390000,CODECS=\"hvc1.2.2.L120.90,mp4a.40.2\"\n",
+            "tracks-v1a1/mono.m3u8\n",
+        )
+        .to_owned()));
+        assert_eq!(
+            resolve_hls_audio_url_with("http://o.test/cnn/index.m3u8", &fetcher).as_deref(),
+            Some("http://o.test/cnn/tracks-v1a1/mono.m3u8")
+        );
+    }
 
     #[test]
     fn pins_the_main_demuxer_to_a_video_variant_url_for_the_tile_height() {

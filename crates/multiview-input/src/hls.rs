@@ -125,6 +125,26 @@ pub struct VariantStream {
     /// pick the variant nearest the displayed tile height
     /// (decode-at-display-resolution, invariant #6).
     pub resolution_height: Option<u32>,
+    /// `AUDIO="group"` — the audio rendition group this variant uses, if any.
+    pub audio_group: Option<String>,
+    /// `CODECS` — the declared codec list (e.g. `avc1.4d4028,mp4a.40.2`).
+    pub codecs: Option<String>,
+}
+
+impl VariantStream {
+    /// Whether the variant's `CODECS` declares an audio codec (AAC, AC-3,
+    /// E-AC-3, Opus, MP3, FLAC). `None` when no `CODECS` attribute is present
+    /// (unknown — the caller decides).
+    #[must_use]
+    pub fn declares_audio(&self) -> Option<bool> {
+        let codecs = self.codecs.as_deref()?;
+        Some(codecs.split(',').map(str::trim).any(|c| {
+            let c = c.to_ascii_lowercase();
+            ["mp4a", "ac-3", "ec-3", "opus", "mp3", "flac"]
+                .iter()
+                .any(|p| c.starts_with(p))
+        }))
+    }
 }
 
 /// A parsed HLS master playlist: its renditions and variant streams.
@@ -182,6 +202,8 @@ impl MasterPlaylist {
                     bandwidth: attr_value(attrs, "BANDWIDTH").and_then(|v| v.parse().ok()),
                     resolution_height: attr_value(attrs, "RESOLUTION")
                         .and_then(|v| parse_resolution_height(&v)),
+                    audio_group: attr_value(attrs, "AUDIO"),
+                    codecs: attr_value(attrs, "CODECS"),
                 });
             } else if line.starts_with('#') {
                 // Any other tag — ignore, but do not consume a pending variant.
@@ -191,6 +213,8 @@ impl MasterPlaylist {
                     subtitles_group: pending.subtitles_group,
                     bandwidth: pending.bandwidth,
                     resolution_height: pending.resolution_height,
+                    audio_group: pending.audio_group,
+                    codecs: pending.codecs,
                 });
             }
             // A bare URI with no pending STREAM-INF is ignored (not a variant).
@@ -257,6 +281,54 @@ impl MasterPlaylist {
             .filter(|v| v.bandwidth.is_some())
             .max_by_key(|v| v.bandwidth.unwrap_or(0))
             .or_else(|| self.variants.first())
+    }
+
+    /// Pick the ONE media playlist URI an **audio-only** decode should open.
+    ///
+    /// Opening a master hands libav every variant: it then downloads every
+    /// variant's segments (an N-rung ABR ladder fetches N× the data per segment),
+    /// and on a slow or ad-inserting origin that serial fetch outruns the segment
+    /// duration — the audio decode starves and the source cuts in and out. One
+    /// media playlist fetches one segment per segment.
+    ///
+    /// * A variant that references an `AUDIO="group"` with a matching
+    ///   `TYPE=AUDIO` rendition carrying a `URI` → that rendition's URI (the
+    ///   `DEFAULT=YES` one if several) — audio lives in its own playlist.
+    /// * Otherwise the **highest-`BANDWIDTH`** variant whose `CODECS` declares an
+    ///   audio codec (or declares no `CODECS` at all — unknown is kept), so
+    ///   a video-only rung is never picked.
+    /// * `None` when the playlist has no variants (already a media playlist) or no
+    ///   variant can carry audio — the caller then opens the URL unchanged.
+    #[must_use]
+    pub fn pick_audio_uri(&self) -> Option<&str> {
+        let grouped = self
+            .variants
+            .iter()
+            .filter_map(|v| v.audio_group.as_deref());
+        let mut rendition: Option<&MediaRendition> = None;
+        for group in grouped {
+            for r in self.renditions.iter().filter(|r| {
+                r.media_type == MediaType::Audio && r.group_id == group && r.uri.is_some()
+            }) {
+                if rendition.is_none() || (r.default && !rendition.is_some_and(|c| c.default)) {
+                    rendition = Some(r);
+                }
+            }
+        }
+        if let Some(uri) = rendition.and_then(|r| r.uri.as_deref()) {
+            return Some(uri);
+        }
+        let mut best: Option<&VariantStream> = None;
+        for v in self
+            .variants
+            .iter()
+            .filter(|v| v.declares_audio() != Some(false))
+        {
+            if best.is_none_or(|b| v.bandwidth.unwrap_or(0) > b.bandwidth.unwrap_or(0)) {
+                best = Some(v);
+            }
+        }
+        best.map(|v| v.uri.as_str())
     }
 
     /// Iterate the `TYPE=SUBTITLES` renditions.
@@ -404,6 +476,10 @@ struct PendingVariant {
     bandwidth: Option<u64>,
     /// The `h` of `RESOLUTION=wxh`, if declared.
     resolution_height: Option<u32>,
+    /// `AUDIO="group"`, if declared.
+    audio_group: Option<String>,
+    /// `CODECS`, if declared.
+    codecs: Option<String>,
 }
 
 /// Parse the vertical resolution (the `h`) from a `RESOLUTION=wxh` attribute value
@@ -934,6 +1010,67 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// cnn-na (MediaTailor): four muxed A/V rungs. An audio decode must open ONE
+    /// of them (the best audio), never the master (which fetches all four).
+    #[test]
+    fn audio_pick_takes_one_muxed_variant_not_the_whole_ladder() {
+        let m = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=1020588,RESOLUTION=640x360\n",
+            "a/0.m3u8\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=4715744,RESOLUTION=1920x1080\n",
+            "a/3.m3u8\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=2657019,RESOLUTION=1280x720\n",
+            "a/2.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(m.pick_audio_uri(), Some("a/3.m3u8"));
+    }
+
+    /// A video-only rung (cnn-usa's `tracks-v1`) is never the audio pick.
+    #[test]
+    fn audio_pick_skips_a_video_only_variant() {
+        let m = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS=\"hvc1.2.2.L120.90\"\n",
+            "tracks-v1/mono.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1390000,CODECS=\"hvc1.2.2.L120.90,mp4a.40.2\"\n",
+            "tracks-v1a1/mono.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(m.pick_audio_uri(), Some("tracks-v1a1/mono.m3u8"));
+        let video_only = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS=\"avc1.640028\"\n",
+            "v.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(video_only.pick_audio_uri(), None);
+    }
+
+    /// Audio in a separate `EXT-X-MEDIA` rendition: open that rendition (the
+    /// DEFAULT one), not a (video) variant.
+    #[test]
+    fn audio_pick_prefers_the_default_audio_rendition() {
+        let m = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"es\",URI=\"tracks-a2/mono.m3u8\"\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"tracks-a1/mono.m3u8\"\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1390000,CODECS=\"hvc1.2.2.L120.90,mp4a.40.2\",AUDIO=\"aud\"\n",
+            "tracks-v1/mono.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(m.pick_audio_uri(), Some("tracks-a1/mono.m3u8"));
+    }
+
+    /// A media playlist (no variants) has nothing to pin.
+    #[test]
+    fn audio_pick_on_a_media_playlist_is_none() {
+        let m = MasterPlaylist::parse("#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n").unwrap();
+        assert_eq!(m.pick_audio_uri(), None);
+    }
+
     use super::*;
 
     /// A representative Apple-style master playlist with audio + a subtitles

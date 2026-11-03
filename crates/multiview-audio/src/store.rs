@@ -697,25 +697,36 @@ impl AudioStore {
     }
 }
 
+/// Lock, recovering a poisoned guard: a panic elsewhere must never wedge the
+/// audio path.
+fn lock<T>(q: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    q.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How far ahead of its PTS-due time a decoded block may be published into the
+/// store (the store-side cushion; the store holds 4 s).
+pub const PUBLISH_LEAD: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How much decoded audio may wait (unpublished) between the decoder and the
+/// pacer. While this is full the *decoder* waits — never the engine.
+pub const MAX_QUEUED_AUDIO: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Consecutive decode errors tolerated before a connection is abandoned. A
+/// single corrupt packet (an ad-splice, a truncated segment) must not drop the
+/// source into a reconnect backoff.
+const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 32;
+
 /// Run a source's audio decode loop: open the file/URL at `path`, decode and
 /// resample each block to the store's canonical 48 kHz / `layout` / `f32`
 /// format, and publish into `store` until end-of-stream or until `stop` is
-/// raised — the audio peer of the video decode thread (and of `multiview-cli`'s
-/// `synth::generator_loop`).
+/// raised — the audio peer of the video decode thread.
 ///
-/// The decoder is **opened on this (the worker) thread** and never crosses a
-/// thread boundary: the underlying libav context is not `Send`, so — exactly as
-/// `multiview-cli`'s `ingest_loop` does for video — the caller spawns this loop
-/// with the `Send` description (`path`, `layout`) and the loop builds the
-/// non-`Send` decoder itself. The caller signals teardown via `stop`; the loop
-/// polls it between blocks so a wedged or long-running source can never delay a
-/// join past one decoded block. It never paces the engine (the engine samples
-/// the store independently) and never blocks it (the store is non-blocking).
+/// The decoder is opened on THIS thread (the libav context is not `Send`). The
+/// decode/publish split is described on [`paced_publish_loop`].
 ///
-/// An open failure or a mid-stream decode error logs and ends the loop: the
-/// source's tile simply rides silence (the store's [`read`](AudioStore::read)
-/// yields silence past what was published), keeping the sampled track gap-free
-/// (ADR-R005 §4.1) and the output clock independent of the input (invariant #1).
+/// An open failure logs and returns: the source rides silence (the store's
+/// [`read`](AudioStore::read) silence-fills), keeping the output clock
+/// independent of the input (invariant #1).
 #[cfg(feature = "ffmpeg")]
 pub fn audio_decode_loop(
     path: impl AsRef<std::path::Path>,
@@ -734,59 +745,152 @@ pub fn audio_decode_loop(
             return;
         }
     };
-    // Pace publishes to wall clock by PTS (invariant #4, the audio twin of the
-    // video `PtsWallClock`): a live HLS reader bursts several segments on
-    // connect and at each catch-up; publishing them unpaced overruns the bounded
-    // ring, so the consumer's cursor and the window drift apart and the source
-    // cuts in and out. The lead is the cushion that rides out a segment fetch.
-    let mut pace: Option<(std::time::Instant, multiview_core::time::MediaTime)> = None;
-    let lead = std::time::Duration::from_secs(2);
-    while !stop.load(Ordering::Acquire) {
-        match decoder.next_decoded() {
-            Ok(Some(unit)) => {
-                let block = unit.block;
-                match pace {
-                    Some((t0, p0)) if unit.pts >= p0 => {
-                        let off =
-                            u64::try_from(unit.pts.saturating_sub(p0).as_nanos()).unwrap_or(0);
-                        let due = t0 + std::time::Duration::from_nanos(off);
-                        let now = std::time::Instant::now();
-                        if due > now + lead {
-                            let wait = due.saturating_duration_since(now).saturating_sub(lead);
-                            // A gap larger than a few seconds is a discontinuity:
-                            // re-anchor rather than sleep through it.
-                            if wait > std::time::Duration::from_secs(5) {
-                                pace = Some((now, unit.pts));
-                            } else {
-                                let mut remaining = wait;
-                                while remaining > std::time::Duration::ZERO
-                                    && !stop.load(Ordering::Acquire)
-                                {
-                                    let slice = remaining.min(std::time::Duration::from_millis(50));
-                                    std::thread::sleep(slice);
-                                    remaining = remaining.saturating_sub(slice);
-                                }
-                            }
+    paced_publish_loop(
+        || {
+            decoder
+                .next_decoded()
+                .map(|unit| unit.map(|u| (u.block, u.pts)))
+        },
+        store,
+        stop,
+        PUBLISH_LEAD,
+        MAX_QUEUED_AUDIO,
+    );
+}
+
+/// Drive `next` (a decoder) on THIS thread and publish its blocks into `store`
+/// from a separate **pacer** thread, paced to wall clock by PTS.
+///
+/// Why two threads: a live HLS read blocks inside libav for a whole segment
+/// fetch (3-27 s on a slow origin). When the same thread also slept to pace
+/// publication, the next fetch only *started* once playback was within `lead`
+/// of the end of the previous segment — so every fetch longer than the 2 s lead
+/// was heard as a gap (cnn-usa / cnn-na: ~40-65 % audible). Here the decoder
+/// reads as fast as the network delivers into a bounded queue
+/// (`max_queued` of audio; while it is full the decoder waits), and the pacer
+/// publishes each block when it is within `lead` of its due time. A fetch stall
+/// is then absorbed by everything already queued.
+///
+/// Pacing: anchored at the first block; a backwards PTS or a forward jump more
+/// than 5 s past the lead (a discontinuity / skipped segments) re-anchors.
+/// A transient decode error is skipped; only [`MAX_CONSECUTIVE_DECODE_ERRORS`]
+/// in a row end the connection. Returns at end-of-stream (after the queue has
+/// drained into the store) or promptly once `stop` is raised. Neither thread is
+/// on the output clock, and the store is never blocked (invariants #1/#10).
+pub fn paced_publish_loop(
+    mut next: impl FnMut() -> Result<Option<(AudioBlock, multiview_core::time::MediaTime)>>,
+    store: &AudioStore,
+    stop: &std::sync::atomic::AtomicBool,
+    lead: std::time::Duration,
+    max_queued: std::time::Duration,
+) {
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    let rate = u128::from(store.format().sample_rate().max(1));
+    let max_queued_frames =
+        usize::try_from(max_queued.as_nanos().saturating_mul(rate) / 1_000_000_000)
+            .unwrap_or(usize::MAX)
+            .max(1);
+    // (queued blocks, queued frames). Only the decoder and the pacer touch it;
+    // neither is the output clock.
+    let queue: Mutex<(
+        VecDeque<(AudioBlock, multiview_core::time::MediaTime)>,
+        usize,
+    )> = Mutex::new((VecDeque::new(), 0));
+    let producer_done = AtomicBool::new(false);
+    let fatal = AtomicBool::new(false);
+
+    std::thread::scope(|scope| {
+        // The pacer: publish each block when it is within `lead` of its due time.
+        scope.spawn(|| {
+            let mut pace: Option<(Instant, multiview_core::time::MediaTime)> = None;
+            loop {
+                if stop.load(Ordering::Acquire) || fatal.load(Ordering::Acquire) {
+                    return;
+                }
+                let front = lock(&queue).0.front().map(|b| b.1);
+                let Some(pts) = front else {
+                    if producer_done.load(Ordering::Acquire) && lock(&queue).0.is_empty() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let now = Instant::now();
+                let wait = match pace {
+                    Some((t0, p0)) if pts >= p0 => {
+                        let off = u64::try_from(pts.saturating_sub(p0).as_nanos()).unwrap_or(0);
+                        let due = t0 + Duration::from_nanos(off);
+                        let wait = due.saturating_duration_since(now).saturating_sub(lead);
+                        if wait > Duration::from_secs(5) {
+                            // A discontinuity: re-anchor rather than sleep through it.
+                            pace = Some((now, pts));
+                            Duration::ZERO
+                        } else {
+                            wait
                         }
                     }
                     // First block, or backwards PTS (wrap / discontinuity): (re-)anchor.
-                    None | Some(_) => pace = Some((std::time::Instant::now(), unit.pts)),
+                    None | Some(_) => {
+                        pace = Some((now, pts));
+                        Duration::ZERO
+                    }
+                };
+                if wait > Duration::ZERO {
+                    std::thread::sleep(wait.min(Duration::from_millis(20)));
+                    continue;
                 }
-                if let Err(error) = store.publish(&block) {
-                    // A format mismatch here is a programming error (the decoder
-                    // and store share the same canonical format); log and stop
-                    // rather than busy-loop.
-                    tracing::error!(%error, "audio decode loop: publish rejected; stopping");
-                    break;
+                let block = {
+                    let mut q = lock(&queue);
+                    let block = q.0.pop_front();
+                    if let Some(b) = &block {
+                        q.1 = q.1.saturating_sub(b.0.frame_count());
+                    }
+                    block
+                };
+                if let Some(block) = block {
+                    if let Err(error) = store.publish(&block.0) {
+                        // A format mismatch is a programming error (decoder and
+                        // store share the canonical format); stop, don't busy-loop.
+                        tracing::error!(%error, "audio decode loop: publish rejected; stopping");
+                        fatal.store(true, Ordering::Release);
+                        return;
+                    }
                 }
             }
-            Ok(None) => break, // end-of-stream: the store rides silence-fill
-            Err(error) => {
-                tracing::warn!(%error, "audio decode loop: decode error; stopping source");
-                break;
+        });
+
+        // The decoder: read as fast as the source delivers, bounded by the queue.
+        let mut consecutive_errors: u32 = 0;
+        while !stop.load(Ordering::Acquire) && !fatal.load(Ordering::Acquire) {
+            if lock(&queue).1 >= max_queued_frames {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            match next() {
+                Ok(Some(unit)) => {
+                    consecutive_errors = 0;
+                    let mut q = lock(&queue);
+                    q.1 = q.1.saturating_add(unit.0.frame_count());
+                    q.0.push_back(unit);
+                }
+                Ok(None) => break, // end-of-stream: the pacer drains the queue
+                Err(error) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                        tracing::warn!(%error, consecutive_errors, "audio decode loop: repeated decode errors; ending connection");
+                        break;
+                    }
+                    if consecutive_errors == 1 {
+                        tracing::warn!(%error, "audio decode loop: decode error; skipping");
+                    }
+                }
             }
         }
-    }
+        producer_done.store(true, Ordering::Release);
+    });
 }
 
 #[cfg(test)]
@@ -866,6 +970,61 @@ mod resync_tests {
             transitions, 1,
             "silent once while re-buffering, then continuous"
         );
+    }
+
+    /// A live HLS source: each 1 s "segment" takes 0.8 s to fetch (a slow
+    /// origin; real time is kept on average). The decoder must start the next
+    /// fetch while the previous segment is still being paced out, so the bus
+    /// never runs dry. (Regression: pacing sleeps on the decode thread deferred
+    /// every fetch until playback was within the lead of the end, so each fetch
+    /// longer than the lead was heard as a gap — cnn-usa / cnn-na.)
+    #[test]
+    fn a_slow_segment_fetch_does_not_gap_the_paced_audio() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::live(format, 192_000, 14_400); // 0.3 s cushion
+        let stop = AtomicBool::new(false);
+        let block_frames = 4_800; // 100 ms
+        let mut n: i64 = 0;
+        let next = || {
+            if n % 10 == 0 {
+                std::thread::sleep(Duration::from_millis(800)); // fetch the next segment
+            }
+            let pts = multiview_core::time::MediaTime::from_nanos(n * 100_000_000);
+            n += 1;
+            let block = AudioBlock::from_interleaved(format, vec![0.5f32; block_frames * 2])?;
+            Ok(Some((block, pts)))
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                paced_publish_loop(
+                    next,
+                    &store,
+                    &stop,
+                    Duration::from_millis(500),
+                    Duration::from_secs(20),
+                );
+            });
+            let start = Instant::now();
+            let tick = Duration::from_nanos(1_000_000_000 / 30);
+            let mut started = false;
+            let mut gaps = 0;
+            for i in 1..=180u32 {
+                if let Some(d) = (start + tick * i).checked_duration_since(Instant::now()) {
+                    std::thread::sleep(d);
+                }
+                let heard = audible(&store.read(TICK));
+                if heard {
+                    started = true;
+                } else if started {
+                    gaps += 1;
+                }
+            }
+            stop.store(true, Ordering::Release);
+            assert!(started, "audio never started");
+            assert_eq!(gaps, 0, "silent ticks after audio started");
+        });
     }
 
     #[test]
