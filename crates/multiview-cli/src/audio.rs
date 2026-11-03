@@ -317,6 +317,7 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
                 store,
                 stop,
                 &|| video_anchor(&slot),
+                Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
             );
         } else {
             audio_decode_loop(location, ChannelLayout::Stereo, store, stop);

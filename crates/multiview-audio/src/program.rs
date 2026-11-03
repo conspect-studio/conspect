@@ -99,6 +99,8 @@ impl SwitchTier {
 pub struct ProgramBus {
     mixer: Mixer,
     clock: SampleClock,
+    /// The output cadence the bus is paced by.
+    cadence: Rational,
     /// Per routed source: its mixer route point + the store the output clock
     /// pulls from. Shared (`Arc`) with the source's decode thread, which
     /// publishes into the same store.
@@ -119,6 +121,7 @@ impl ProgramBus {
         Self {
             mixer: Mixer::new(format),
             clock: SampleClock::new(format.sample_rate(), fps),
+            cadence: fps,
             routes: Vec::new(),
             fading_out: Vec::new(),
             format,
@@ -326,6 +329,30 @@ impl ProgramBus {
         let start = self.clock_frame();
         let frames = self.clock.next_tick();
         self.mix(start, frames)
+    }
+
+    /// The output-timeline frame of output tick `tick` (`total_at(tick)`): where
+    /// the bus reads timeline stores for that tick.
+    #[must_use]
+    pub fn position_at(&self, tick: u64) -> i64 {
+        i64::try_from(self.clock.total_at(tick)).unwrap_or(i64::MAX)
+    }
+
+    /// The output cadence this bus is paced by.
+    #[must_use]
+    pub const fn cadence(&self) -> Rational {
+        self.cadence
+    }
+
+    /// The ids of the routed sources whose store is a timeline store (locked to
+    /// vision).
+    #[must_use]
+    pub fn timeline_source_ids(&self) -> Vec<String> {
+        self.routes
+            .iter()
+            .filter(|(_, store)| store.is_timeline())
+            .filter_map(|(point, _)| self.mixer.input_id(*point).map(str::to_owned))
+            .collect()
     }
 
     /// The bus's absolute sample position: the output-timeline frame the next

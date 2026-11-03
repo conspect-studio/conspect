@@ -68,6 +68,7 @@ pub fn log_ring() -> Option<std::sync::Arc<multiview_telemetry::LogRing>> {
 /// software/CPU adapter (the silent CPU fallback) and emit a latched, actionable
 /// `gpu-present-no-vulkan-adapter` warning through the engine's drop-oldest
 /// publisher. A thin seam over the pure hal cross-check + the control emit helper.
+pub mod av_sync;
 pub mod boot;
 pub mod capability_warn;
 pub mod cli;

@@ -843,6 +843,7 @@ pub fn audio_decode_loop_anchored(
     store: &AudioStore,
     stop: &std::sync::atomic::AtomicBool,
     anchor: &(dyn Fn() -> Option<PtsAnchor> + Sync),
+    log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
 ) {
     if stop.load(Ordering::Acquire) {
         return;
@@ -865,6 +866,7 @@ pub fn audio_decode_loop_anchored(
         anchor,
         ANCHORED_LEAD,
         MAX_QUEUED_AUDIO,
+        log,
     );
 }
 
@@ -1108,6 +1110,7 @@ pub struct Placer {
     wait: std::time::Duration,
     held_since: Option<std::time::Instant>,
     warned_unlocked: bool,
+    log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
 }
 
 impl Placer {
@@ -1123,7 +1126,16 @@ impl Placer {
             wait,
             held_since: None,
             warned_unlocked: false,
+            log: None,
         }
+    }
+
+    /// Record every placement (and clear) into `log`, for on-air A/V offset
+    /// measurement.
+    #[must_use]
+    pub fn with_log(mut self, log: Option<std::sync::Arc<crate::sync_log::SyncLog>>) -> Self {
+        self.log = log;
+        self
     }
 
     /// One placement pass at bus `cursor`: take every queued block due within
@@ -1178,6 +1190,9 @@ impl Placer {
         }
         if changed {
             let _ = store.publish_window(cursor, &[]);
+            if let Some(log) = &self.log {
+                log.cleared(cursor);
+            }
             let retained: Vec<PendingBlock> = self.history.iter().cloned().collect();
             self.place(store, &queue.epochs, cursor, &retained);
         }
@@ -1217,6 +1232,9 @@ impl Placer {
             if at.saturating_add(frames) <= cursor {
                 continue;
             }
+            if let Some(log) = &self.log {
+                log.placed(at, frames, unit.raw_ns);
+            }
             let run_end = run_at.saturating_add(i64::try_from(run.len() / channels).unwrap_or(0));
             if run.is_empty() || at.saturating_sub(run_end).abs() > 2 {
                 flush(&mut run, run_at);
@@ -1250,6 +1268,7 @@ pub fn anchored_publish_loop(
     anchor: &(dyn Fn() -> Option<PtsAnchor> + Sync),
     lead: std::time::Duration,
     max_queued: std::time::Duration,
+    log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
 ) {
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -1268,7 +1287,7 @@ pub fn anchored_publish_loop(
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            let mut placer = Placer::new(rate, lead_frames, ANCHOR_WAIT);
+            let mut placer = Placer::new(rate, lead_frames, ANCHOR_WAIT).with_log(log);
             while !stop.load(Ordering::Acquire) {
                 {
                     let mut q = lock(&queue);
@@ -1771,6 +1790,7 @@ mod resync_tests {
             &|| None,
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(20),
+            None,
         );
         assert_eq!(calls, 1);
     }

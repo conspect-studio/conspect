@@ -899,6 +899,7 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
         .map(|(id, &state)| (id.as_str(), state))
         .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let offsets = crate::av_sync::offsets();
     let tiles: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(id, state)| {
@@ -908,7 +909,14 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
             // plane skips rather than panicking on the publish path.
             let state = serde_json::to_value(multiview_events::LifecycleState::from(state))
                 .unwrap_or(serde_json::Value::Null);
-            serde_json::json!({ "id": id, "state": state })
+            let mut tile = serde_json::json!({ "id": id, "state": state });
+            // On-air lip-sync error of a live source (video raw PTS − audio raw
+            // PTS at the same output instant, ms; + = audio early). Absent until
+            // measured.
+            if let (Some(o), Some(obj)) = (offsets.get(id), tile.as_object_mut()) {
+                obj.insert("av_offset_ms".to_owned(), serde_json::json!(o));
+            }
+            tile
         })
         .collect();
     obj.insert("tiles".to_owned(), serde_json::Value::Array(tiles));

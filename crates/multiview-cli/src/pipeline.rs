@@ -4745,6 +4745,14 @@ fn consumer_main(
     // Per-input peak/RMS meters (tracks 1..), fed from each routed source's
     // discrete pre-mix block.
     let mut input_meters = crate::meter_telemetry::InputMeters::new();
+    // On-air A/V offset for live (timeline) sources, measured per tick.
+    let av_ids: Vec<String> = audio_bus
+        .as_ref()
+        .map(multiview_audio::program::ProgramBus::timeline_source_ids)
+        .unwrap_or_default();
+    let mut av_meter = audio_bus
+        .as_ref()
+        .map(|bus| crate::av_sync::AvMeter::new(bus.cadence(), bus.format().sample_rate()));
     // Track which sinks are still live (their receiver has not hung up) so a sink
     // that ended early does not wedge or repeatedly error the consumer.
     let mut live: Vec<bool> = vec![true; sink_txs.len()];
@@ -4781,7 +4789,13 @@ fn consumer_main(
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
             }
+            // The bus sample position of THIS tick (before the advance): the
+            // output frame whose audio the bus is about to read.
+            let tick_frame = bus.position_at(item.tick_index);
             let block = drive_audio_for_item(bus, item.tick_index);
+            if let Some(meter) = av_meter.as_mut() {
+                meter.sample(&av_ids, item.tick_index, tick_frame);
+            }
             // EBU R128 loudness normalisation of the PROGRAM bus (AUD-6), still off
             // the engine hot loop (this bake-consumer thread): a smoothed makeup
             // gain toward the target LUFS with a true-peak limiter clamping to the
@@ -10634,6 +10648,8 @@ fn open_and_stream(
     let mut pacer = PtsWallClock::new();
     // Live frames go onto the output timeline with a jitter hold (see `LiveStamper`).
     let mut stamper = LiveStamper::new();
+    // On-air A/V offset probe for this source (see `crate::av_sync`).
+    let av_probe = crate::av_sync::probe(&plan.id);
 
     // MEDIA-PLAYER CHANNEL (ADR-0057 / ADR-0097): when this source is a player,
     // run the transport-driven decode loop instead of the plain pump. It owns
@@ -10739,6 +10755,13 @@ fn open_and_stream(
                 pacer.publish_time(pts)
             };
             plan.store.publish(image, at);
+            if plan.live {
+                crate::av_sync::record_video(
+                    &av_probe,
+                    at,
+                    decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base)),
+                );
+            }
         }
         if drained {
             return Ok(());

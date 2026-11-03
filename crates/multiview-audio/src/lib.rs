@@ -77,6 +77,7 @@ pub mod mixer;
 pub mod probe;
 pub mod program;
 pub mod store;
+pub mod sync_log;
 pub mod tone;
 pub mod truepeak;
 
