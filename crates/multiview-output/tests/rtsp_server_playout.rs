@@ -35,7 +35,7 @@ use multiview_output::rtsp_server::{BoundedPacketQueue, RtspCodec, RtspMount, Rt
 /// `RtspServerSink` feeds the same bounded queue the serving side drains —
 /// without the producer ever blocking.
 ///
-/// Ignored by default: requires GStreamer + `gst-rtsp-server` plugins + a free
+/// Ignored by default: requires `GStreamer` + `gst-rtsp-server` plugins + a free
 /// port.
 #[test]
 #[ignore = "requires the GStreamer/gst-rtsp-server C stack + plugins (not in CI); run with --ignored on a gst-equipped runner"]
