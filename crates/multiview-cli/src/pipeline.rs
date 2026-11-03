@@ -10657,6 +10657,27 @@ fn open_and_stream(
             Err(other) => Some(ReadItem::Error(other.to_string())),
         }
     })?;
+    // A live source queues about a segment before pacing starts (see
+    // `LIVE_PREBUFFER`); a file/VOD starts at once.
+    let mut pending = if plan.live {
+        let tb_num = i128::from(time_base.num);
+        let tb_den = i128::from(time_base.den);
+        prebuffer(
+            &reader,
+            |p: &ffmpeg::codec::packet::Packet| {
+                if p.stream() != stream_index || tb_den <= 0 {
+                    return None;
+                }
+                let ts = p.pts().or_else(|| p.dts())?;
+                i64::try_from(i128::from(ts) * 1_000_000_000 * tb_num / tb_den).ok()
+            },
+            LIVE_PREBUFFER,
+            LIVE_PREBUFFER_DEADLINE,
+            stop,
+        )
+    } else {
+        std::collections::VecDeque::new()
+    };
 
     // Pump packets, publishing each decoded+scaled frame into the store.
     let mut drained = false;
@@ -10703,7 +10724,10 @@ fn open_and_stream(
         }
         // Wait in short slices so `stop` stays responsive while the origin is
         // slow; a dead read still surfaces within `rw_timeout` as an error.
-        let Some(item) = reader.next(Duration::from_millis(100)) else {
+        let Some(item) = pending
+            .pop_front()
+            .or_else(|| reader.next(Duration::from_millis(100)))
+        else {
             continue;
         };
         match item {
@@ -11713,6 +11737,56 @@ where
         })
         .map_err(|e| format!("spawn live read-ahead thread: {e}"))?;
     Ok(PacketReader { rx, cancel })
+}
+
+/// Media a live source queues before its first frame is paced. The pacer anchors
+/// on its first frame, so with an empty queue the next slow segment fetch makes
+/// every later frame late (measured on cnn-usa: up to 7 s behind in the first
+/// 25 s, until the backlog builds). About one HLS segment of prebuffer makes the
+/// cushion exist from the first frame. The tile shows NO SIGNAL meanwhile, as it
+/// does for any connect.
+const LIVE_PREBUFFER: Duration = Duration::from_secs(6);
+
+/// The longest a live connect waits for [`LIVE_PREBUFFER`] before starting with
+/// whatever has arrived.
+const LIVE_PREBUFFER_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Pull from `reader` until the queued packets span `target` of media (by
+/// `media_ns`, `None` for packets without a timestamp or of another stream),
+/// a terminal item arrives, `deadline` passes, or `stop` is raised. Returns the
+/// items in order, for the caller to process before reading on.
+fn prebuffer<P>(
+    reader: &PacketReader<P>,
+    media_ns: impl Fn(&P) -> Option<i64>,
+    target: Duration,
+    deadline: Duration,
+    stop: &AtomicBool,
+) -> std::collections::VecDeque<ReadItem<P>> {
+    let mut queued = std::collections::VecDeque::new();
+    let end = Instant::now() + deadline;
+    let want = i64::try_from(target.as_nanos()).unwrap_or(i64::MAX);
+    let mut first: Option<i64> = None;
+    while !stop.load(Ordering::Acquire) {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Some(item) = reader.next(left.min(Duration::from_millis(100))) else {
+            continue;
+        };
+        let span = match &item {
+            ReadItem::Packet(p) => media_ns(p).map(|t| t.saturating_sub(*first.get_or_insert(t))),
+            ReadItem::Eof | ReadItem::Error(_) => {
+                queued.push_back(item);
+                break;
+            }
+        };
+        queued.push_back(item);
+        if span.is_some_and(|s| s >= want) {
+            break;
+        }
+    }
+    queued
 }
 
 /// How far ahead of the output clock a live frame is placed (its jitter hold).
@@ -16099,7 +16173,7 @@ mod packet_reader_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{spawn_packet_reader, ReadItem};
+    use super::{prebuffer, spawn_packet_reader, ReadItem};
 
     fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let end = Instant::now() + deadline;
@@ -16137,6 +16211,89 @@ mod packet_reader_tests {
                 _ => panic!("expected packet {want}"),
             }
         }
+    }
+
+    /// A live connect queues about a segment of media before pacing starts, so
+    /// the first slow fetch is covered by a backlog rather than making frames
+    /// late.
+    #[test]
+    fn prebuffer_collects_the_target_media_span_then_returns() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        // One packet per 100 ms of media; packet 3 carries no timestamp.
+        let reader = spawn_packet_reader("t", 64, move || {
+            let i = c.fetch_add(1, Ordering::SeqCst);
+            Some(ReadItem::Packet(i))
+        })
+        .expect("spawn");
+        let stop = AtomicBool::new(false);
+        let got = prebuffer(
+            &reader,
+            |i: &usize| (*i != 3).then(|| i64::try_from(*i).unwrap() * 100_000_000),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            &stop,
+        );
+        let ids: Vec<usize> = got
+            .iter()
+            .map(|it| match it {
+                ReadItem::Packet(i) => *i,
+                _ => panic!("only packets expected"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            (0..=10).collect::<Vec<_>>(),
+            "stops once 1 s is spanned"
+        );
+        // Nothing is lost: the next read continues after the prebuffer.
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Packet(11))
+        ));
+    }
+
+    #[test]
+    fn prebuffer_gives_up_at_the_deadline_or_a_terminal_item() {
+        let reader = spawn_packet_reader("t", 4, move || {
+            std::thread::sleep(Duration::from_millis(20));
+            None::<ReadItem<u8>>
+        })
+        .expect("spawn");
+        let stop = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let got = prebuffer(
+            &reader,
+            |_| Some(0),
+            Duration::from_secs(6),
+            Duration::from_millis(200),
+            &stop,
+        );
+        assert!(got.is_empty());
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "bounded by the deadline"
+        );
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        let eof = spawn_packet_reader("t", 4, move || {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                Some(ReadItem::Packet(1_u8))
+            } else {
+                Some(ReadItem::Eof)
+            }
+        })
+        .expect("spawn");
+        let got = prebuffer(
+            &eof,
+            |_| Some(0),
+            Duration::from_secs(6),
+            Duration::from_secs(5),
+            &stop,
+        );
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got.back(), Some(ReadItem::Eof)));
     }
 
     #[test]
