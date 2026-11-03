@@ -232,6 +232,7 @@ async fn run_software(
     let cadence = engine.cadence();
     let report = if let Some(ticks) = args.tick_budget(cadence) {
         tracing::info!(ticks, "software run: bounded");
+        multiview_cli::run::warn_if_control_plane_configured_on_bounded_run(config, ticks);
         engine
             .run_for_realtime(ticks)
             .await
@@ -291,6 +292,7 @@ async fn run_pipeline(
 
     let report = if let Some(ticks) = args.tick_budget(cadence) {
         tracing::info!(ticks, "pipeline run: bounded");
+        multiview_cli::run::warn_if_control_plane_configured_on_bounded_run(config, ticks);
         pipeline
             .run_for(ticks)
             .await

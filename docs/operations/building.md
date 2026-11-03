@@ -203,7 +203,17 @@ cargo run --release -p multiview-cli -- run examples/multiview.toml
 
 The control plane (REST `/api/v1`, WebSocket `/api/v1/ws`, interactive docs at `/docs`) and the
 embedded SPA are served by `multiview-control`. Health probes (`/livez`, `/readyz`) run on a separate
-lightweight runtime so they never contend with the video threads. See the
+lightweight runtime so they never contend with the video threads. Every configured HLS/LL-HLS output
+is **also served over this same listener**, nested at `/hls/{output-id}/` (`multiview-output`'s
+`hls::http::hls_router`, ADR-0032 §6) — no external web server/reverse proxy is required for HLS
+delivery; one is only a deployment option (e.g. fronting with TLS or a CDN).
+
+**A bounded run (`--ticks`/`--duration`) never starts this control plane** (ADR-W020 §9 / ADR-W024
+§8: it is the output-clock smoke test, not a serving deployment) — a configured `[control]` section's
+REST/WebUI API *and* the `/hls/{output-id}/` HLS mounts above are unreachable for a bounded run's
+whole duration, even though the segmenter still writes `index.m3u8`/`seg*.ts` to disk. `multiview run`
+warns loudly at startup when `[control]` is configured on a bounded invocation; omit both flags (run
+until Ctrl-C/SIGTERM) to serve the API/WebUI/HLS. See the
 [example configs](../../examples/) and [io/inputs.md](../io/inputs.md).
 
 ---
