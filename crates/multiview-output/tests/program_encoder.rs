@@ -250,3 +250,29 @@ impl multiview_output::sink::PacketSource for VecPackets {
         Ok(self.packets.next())
     }
 }
+
+/// A live run sheds ticks under overload (`DropOnOverload`): the consumer only
+/// sees the SURVIVING frames. Video PTS must follow the absolute output tick, the
+/// same clock the program audio is driven by (`bus.tick_to(tick_index + 1)`), or
+/// every dropped tick puts the video one frame further behind the audio and A/V
+/// sync drifts for the life of the run.
+#[test]
+fn video_pts_follows_the_tick_index_across_dropped_ticks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("src.ts");
+    generate_clip(&clip, 2, 10);
+    let mut encoder = ProgramEncoder::new(&config(10, 10)).expect("open ProgramEncoder");
+    let mut decode = DecodeSource::open(&clip);
+    // Ticks 0..=4 survive, 5..=9 are shed, 10.. survive.
+    let ticks: Vec<u64> = (0..5).chain(10..20).collect();
+    let mut packets = Vec::new();
+    for &tick in &ticks {
+        let frame = decode.next_frame().expect("frame");
+        packets.extend(encoder.encode_frame_at(frame, tick).expect("encode"));
+    }
+    packets.extend(encoder.finish().expect("finish"));
+    let mut pts: Vec<i64> = packets.iter().filter_map(EncodedPacket::pts).collect();
+    pts.sort_unstable();
+    let expected: Vec<i64> = ticks.iter().map(|&t| i64::try_from(t).unwrap()).collect();
+    assert_eq!(pts, expected, "video PTS must equal the output tick index");
+}

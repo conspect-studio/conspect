@@ -578,14 +578,36 @@ impl ProgramEncoder {
     /// Returns [`Error::Output`] if called after [`finish`](Self::finish), or if
     /// the format conversion or the encode fails.
     pub fn encode_frame(&mut self, frame: DecodedVideoFrame) -> Result<Vec<EncodedPacket>> {
+        let tick = u64::try_from(self.tick).unwrap_or(0);
+        self.encode_frame_at(frame, tick)
+    }
+
+    /// Encode one baked canvas `frame` stamped at the absolute output tick
+    /// `tick` (`out_pts = f(tick)`, inv #3).
+    ///
+    /// A live run sheds frames under overload, so the consumer only sees the
+    /// surviving ticks. Stamping from the tick index (not a count of encoded
+    /// frames) keeps video on the same clock the program audio is driven by
+    /// (`ProgramBus::tick_to(tick + 1)`): a shed tick leaves a PTS gap, never an
+    /// accumulating A/V offset. A `tick` at or before the previous one is stamped
+    /// one past it, so PTS stays strictly increasing.
+    ///
+    /// # Errors
+    /// As [`encode_frame`](Self::encode_frame).
+    pub fn encode_frame_at(
+        &mut self,
+        frame: DecodedVideoFrame,
+        tick: u64,
+    ) -> Result<Vec<EncodedPacket>> {
         if self.finished {
             return Err(Error::Output(
                 "ProgramEncoder::encode_frame called after finish".to_owned(),
             ));
         }
-        let prepared = self.converter.prepare(frame.frame, self.tick)?;
+        let pts = i64::try_from(tick).unwrap_or(i64::MAX).max(self.tick);
+        let prepared = self.converter.prepare(frame.frame, pts)?;
         self.encoder.send_frame(&prepared).map_err(ff)?;
-        self.tick = self.tick.saturating_add(1);
+        self.tick = pts.saturating_add(1);
         self.drain()
     }
 

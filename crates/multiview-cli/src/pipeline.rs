@@ -4780,8 +4780,10 @@ fn consumer_main(
         // Bridge once + encode once (invariant #7): the canvas is encoded a SINGLE
         // time here, never once per sink.
         let frame = nv12_to_decoded(&overlaid)?;
+        // Stamp video at the absolute output tick, the clock the program audio is
+        // driven by (`drive_audio_for_item`), so shed ticks cannot drift A/V.
         let packets = encoder
-            .encode_frame(frame)
+            .encode_frame_at(frame, item.tick_index)
             .map_err(|e| PipelineError::Output {
                 kind: "encode",
                 reason: e.to_string(),
