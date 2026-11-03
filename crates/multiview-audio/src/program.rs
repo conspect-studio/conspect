@@ -273,6 +273,67 @@ impl ProgramBus {
         Ok(SwitchTier::ClickFree)
     }
 
+    /// Move a route's steady program gain to `gain` (linear) over `ramp_frames`
+    /// with a per-sample envelope — the click-free live re-gain (include/exclude,
+    /// `gain_db`, `mute` are all gain changes: every input rides the bus, an
+    /// unrouted one at zero gain).
+    ///
+    /// The ramp starts from the route's **current effective** gain (including any
+    /// in-flight ramp's position), so a re-gain issued mid-fade is continuous. The
+    /// mixer's envelope is bounded to `[0, 1]`, so the strip's base is set to the
+    /// larger endpoint and the envelope runs between the two ratios; on
+    /// completion the steady gain settles at exactly `gain`. `ramp_frames == 0`
+    /// (or an unchanged gain) is an immediate set. Does no I/O and cannot block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::UnknownInput`](crate::error::AudioError::UnknownInput)
+    /// if `point` is not a live route on this bus.
+    pub fn set_program_gain_ramped(
+        &mut self,
+        point: RoutePoint,
+        gain: f64,
+        ramp_frames: usize,
+    ) -> crate::error::Result<()> {
+        if !self.routes.iter().any(|(p, _)| *p == point) {
+            return Err(crate::error::AudioError::UnknownInput(point.index()));
+        }
+        let target = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
+        let base = self.mixer.program_gain(point).unwrap_or(0.0);
+        let current = match self.mixer.gain_ramp(point) {
+            Some(ramp) => base * f64::from(ramp.envelope_at(ramp.frames_done)),
+            None => base,
+        };
+        let hi = current.max(target);
+        if ramp_frames == 0 || hi <= 0.0 || (current - target).abs() < 1e-9 {
+            self.mixer.clear_gain_ramp(point);
+            self.mixer.route_to_program(point, target);
+            return Ok(());
+        }
+        self.mixer.route_to_program(point, hi);
+        self.mixer.set_gain_ramp(
+            point,
+            GainRamp {
+                from: current / hi,
+                to: target / hi,
+                frames_total: ramp_frames,
+                frames_done: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// The steady program gain of a route (the endpoint any in-flight ramp
+    /// settles at is applied on completion), or `None` for an unknown route.
+    #[must_use]
+    pub fn program_gain(&self, point: RoutePoint) -> Option<f64> {
+        let base = self.mixer.program_gain(point)?;
+        Some(match self.mixer.gain_ramp(point) {
+            Some(ramp) => base * f64::from(ramp.envelope_at(ramp.frames_total)),
+            None => base,
+        })
+    }
+
     /// The program-bus format.
     #[must_use]
     pub const fn format(&self) -> AudioFormat {

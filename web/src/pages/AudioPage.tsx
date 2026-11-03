@@ -5,9 +5,11 @@
 // optional discrete track + language/title). The page also LISTS the resulting
 // selectable tracks — the program bus "prog" plus every declared track —
 // because that is exactly the set each output's audio selection (Outputs page)
-// resolves against. Saves replace the WHOLE document with `If-Match`; stored
-// edits apply via config export + restart (the same honest semantics as the
-// Sources/Outputs pages).
+// resolves against. Saves replace the WHOLE document with `If-Match`. On a run
+// with program audio, program-mix changes (include, gain, mute) apply to the
+// running bus at once on a short click-free ramp; the server's
+// X-Multiview-Apply header says which applied, and the page reports exactly
+// that (a changed sample rate, or an input with no audio, needs a restart).
 import { useState } from 'react';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
@@ -288,7 +290,7 @@ export function AudioPage(): JSX.Element {
   const [edited, setEdited] = useState<AudioFormState | undefined>(undefined);
   const [savedEtag, setSavedEtag] = useState<string | undefined>(undefined);
   const [errors, setErrors] = useState<AudioFormErrors | undefined>(undefined);
-  const [status, setStatus] = useState<'idle' | 'saved' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'live' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = useState<string | undefined>(undefined);
 
   const form =
@@ -323,7 +325,7 @@ export function AudioPage(): JSX.Element {
       {
         onSuccess: (result): void => {
           setSavedEtag(result.etag);
-          setStatus('saved');
+          setStatus(result.apply === 'live' ? 'live' : 'saved');
           setSaveError(undefined);
         },
         onError: (error): void => {
@@ -351,6 +353,16 @@ export function AudioPage(): JSX.Element {
       <ApplySemanticsCallout
         helpTo="/help/features#outputs"
         helpLabel={t`How configuration applies`}
+        message={
+          <Trans>
+            Program-mix changes (on the program mix, gain, mute) apply to the
+            running program audio immediately when saved, with a short fade —
+            no restart. A changed sample rate, or mixing an input that has no
+            audio on this run, is stored and goes live via config export +
+            restart. Each save response declares which applied
+            (X-Multiview-Apply: live or restart).
+          </Trans>
+        }
       />
 
       {routing.isPending || form === undefined ? (
@@ -489,11 +501,20 @@ export function AudioPage(): JSX.Element {
               <Trans>Save audio routing</Trans>
             </Button>
             <p role="status" aria-live="polite" className="text-sm">
+              {status === 'live' ? (
+                <span className="text-muted-foreground">
+                  <Trans>
+                    Saved and applied live: the program mix is now following
+                    the new routing.
+                  </Trans>
+                </span>
+              ) : null}
               {status === 'saved' ? (
                 <span className="text-muted-foreground">
                   <Trans>
-                    Stored. It goes live via config export + restart; the
-                    running engine is unchanged until then.
+                    Stored, not applied live: this change needs a restart (for
+                    example a changed sample rate, or an input with no audio on
+                    this run). The running program mix is unchanged until then.
                   </Trans>
                 </span>
               ) : null}

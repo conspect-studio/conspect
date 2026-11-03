@@ -99,13 +99,25 @@ struct AudioRepoint {
     ramp_frames: usize,
 }
 
+/// The program-bus gain ramp a live routing change rides: 40 ms at 48 kHz —
+/// long enough to be click-free, short enough to land within ~2 output ticks.
+pub(crate) const LIVE_GAIN_RAMP_FRAMES: usize = 1_920;
+
+/// One requested program-bus gain table: `(channel id, linear gain)` pairs.
+type GainTable = Arc<Vec<(String, f64)>>;
+
 /// Non-blocking, bounded drop-oldest mailbox between the control drain and the
 /// bake-consumer-owned program bus. No lock or client is shared with the clock.
 #[derive(Clone)]
 pub struct AudioControlHandle {
     pending: Arc<multiview_framestore::SwapCell<Arc<Vec<AudioRepoint>>>>,
+    /// The latest requested program-bus gain table (`(channel id, linear gain)`).
+    /// Latest-wins: a routing PUT replaces the whole table, so an unapplied older
+    /// table is superseded, never queued (bounded at one table — inv #10).
+    pending_gains: Arc<multiview_framestore::SwapCell<Option<GainTable>>>,
     sources: Arc<std::collections::HashMap<String, Arc<AudioStore>>>,
     channels: Arc<std::collections::HashMap<String, multiview_audio::RoutePoint>>,
+    sample_rate: u32,
 }
 
 impl Default for AudioControlHandle {
@@ -132,9 +144,45 @@ impl AudioControlHandle {
     ) -> Self {
         Self {
             pending: Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new())),
+            pending_gains: Arc::new(multiview_framestore::SwapCell::empty()),
             sources: Arc::new(sources),
             channels: Arc::new(channels),
+            sample_rate: AudioFormat::CANONICAL_RATE,
         }
+    }
+
+    /// Record the running program bus's sample rate (what a routing document's
+    /// `sample_rate_hz` must equal to apply live).
+    #[must_use]
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    /// Apply an `[audio]` routing document to the RUNNING program bus, if it can
+    /// be applied live. Returns `true` when the new gain table was published for
+    /// the bake consumer (it lands at its next tick, ramped click-free), `false`
+    /// when only a restart can honour it: a different `sample_rate_hz` than the
+    /// running bus, or a route that mixes an input with no audio store on this
+    /// run. Wait-free (one `SwapCell` store); never touches the bus (inv #1/#10).
+    #[must_use]
+    pub fn request_routing(&self, routing: &multiview_config::AudioRouting) -> bool {
+        if routing.sample_rate_hz != self.sample_rate {
+            return false;
+        }
+        if routing
+            .routes
+            .iter()
+            .any(|r| r.contributes_to_program() && !self.channels.contains_key(&r.input_id))
+        {
+            return false;
+        }
+        let gains = crate::pipeline::program_bus_gains(
+            self.channels.keys().map(String::as_str),
+            Some(routing),
+        );
+        self.pending_gains.store(Some(Arc::new(gains)));
+        true
     }
 
     /// Resolve a command against the run's actual channels and per-source stores.
@@ -184,6 +232,19 @@ impl AudioControlHandle {
                 applied += 1;
             }
         }
+        if let Some(gains) = self.pending_gains.swap(None) {
+            for (id, gain) in gains.iter() {
+                let Some(&point) = self.channels.get(id) else {
+                    continue;
+                };
+                if let Err(error) = bus.set_program_gain_ramped(point, *gain, LIVE_GAIN_RAMP_FRAMES)
+                {
+                    tracing::warn!(%error, channel = %id, "audio gain held: unknown program channel");
+                } else {
+                    applied += 1;
+                }
+            }
+        }
         applied
     }
 
@@ -191,6 +252,23 @@ impl AudioControlHandle {
     fn pending_len(&self) -> usize {
         self.pending.load().len()
     }
+}
+
+/// The control plane's audio-routing live-apply capability for a run whose
+/// program bus publishes its [`AudioControlHandle`] into `slot` at drive start.
+///
+/// The hook loads the handle (empty ⇒ this run carries no program audio ⇒
+/// honest `restart`) and hands it the new gain table, which the bake consumer
+/// ramps in at its next tick via [`AudioControlHandle::apply_pending`].
+/// Wait-free: a `SwapCell` load + store, never the bus (inv #1/#10).
+#[must_use]
+pub fn routing_live_capability(
+    slot: Arc<multiview_framestore::SwapCell<Option<Arc<AudioControlHandle>>>>,
+) -> multiview_control::AudioRoutingLiveCapability {
+    multiview_control::AudioRoutingLiveCapability::new(move |routing| {
+        slot.load()
+            .is_some_and(|handle| handle.request_routing(routing))
+    })
 }
 
 #[cfg(test)]

@@ -6040,7 +6040,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The replaced document (new ETag in the response header; X-Multiview-Apply: restart — it takes effect via config export + restart). */
+            /** @description The replaced document (new ETag in the response header; X-Multiview-Apply: live when the running program bus applied it, restart when it needs a restart, e.g. a changed sample rate). */
             200: {
                 headers: {
                     [name: string]: unknown;

@@ -182,6 +182,11 @@ proptest = "1.5.0"
 name = "pipeline_ingest"
 required-features = ["ffmpeg"]
 
+# Audio routing applies live to the running program bus (no restart).
+[[test]]
+name = "live_audio_routing_http"
+required-features = ["ffmpeg"]
+
 # The streaming-encode behavioural tests (ADR-0025) drive the bounded
 # bake→encode→fan-out path with injected fake sinks; they need the `ffmpeg`
 # feature (the streaming machinery lives in the `pipeline` module) but no

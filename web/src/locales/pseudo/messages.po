@@ -21,7 +21,7 @@ msgstr ""
 msgid "“prog” is reserved for the program mix — choose another track name."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:831
+#: src/layout/components/GridLayoutEditor.tsx:825
 msgid "({rawCellCount} absolutely-placed cell(s) ride along unchanged — edit them via Convert to free-form.)"
 msgstr ""
 
@@ -37,13 +37,13 @@ msgstr ""
 #. placeholder {0}: names.length
 #. placeholder {1}: editableCells(model).length
 #. placeholder {2}: sourceLabels.size
-#: src/layout/components/GridLayoutEditor.tsx:824
+#: src/layout/components/GridLayoutEditor.tsx:818
 msgid "{0} area(s) · {1} cell(s) · {2} bound to a source"
 msgstr ""
 
 #. placeholder {0}: editor.model.cells.length
 #. placeholder {1}: editor.model.cells.filter((c) => c.sourceId !== undefined).length
-#: src/layout/components/LayoutEditor.tsx:388
+#: src/layout/components/LayoutEditor.tsx:375
 msgid "{0} cell(s) · {1} bound to a source"
 msgstr ""
 
@@ -195,7 +195,7 @@ msgstr ""
 msgid "1. On the Devices page, run \"Scan for devices\" (or skip the scan and adopt by address directly). 2. Press Adopt on a discovered row, or \"Adopt device\" in the header. 3. Give the device a stable identifier and name, check the driver and management address, and optionally set a desired mode and an offline-alarm severity. 4. Confirm. The device is created in ADOPTING and its supervised driver immediately probes it toward ONLINE."
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:98
+#: src/layout/components/LayoutEditor.tsx:99
 msgid "1+5"
 msgstr ""
 
@@ -207,7 +207,7 @@ msgstr ""
 msgid "2. Install the lease"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:94
+#: src/layout/components/LayoutEditor.tsx:95
 msgid "2×2"
 msgstr ""
 
@@ -215,11 +215,11 @@ msgstr ""
 msgid "24-hour HH:MM:SS in the timezone below."
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:96
+#: src/layout/components/LayoutEditor.tsx:97
 msgid "3×3"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:65
+#: src/pages/AudioPage.tsx:67
 msgid "5.1 surround"
 msgstr ""
 
@@ -271,7 +271,7 @@ msgstr ""
 msgid "A file source plays media from disk, paced to real time so it behaves like a live feed on the wall (and can loop). Synthetic sources — color bars, solid fills, and a ticking clock — are generated in-process with no network or decode at all. They are ideal for layout work, burn-in tests, and proving the output path end to end before any real feed is connected."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:288
+#: src/layout/components/GridLayoutEditor.tsx:289
 msgid "A grid layout places cells by named areas on column/row tracks — resize whole rows and columns at once, with even gaps."
 msgstr ""
 
@@ -441,7 +441,7 @@ msgstr ""
 msgid "About display nodes"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:292
+#: src/layout/components/GridLayoutEditor.tsx:293
 #: src/pages/LayoutsPage.tsx:204
 msgid "About layouts"
 msgstr ""
@@ -457,7 +457,7 @@ msgstr ""
 msgid "About output transports"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:346
+#: src/pages/AudioPage.tsx:348
 msgid "About outputs and audio"
 msgstr ""
 
@@ -550,7 +550,7 @@ msgid "Action"
 msgstr ""
 
 #: src/pages/AlarmsPage.tsx:221
-#: src/pages/AudioPage.tsx:431
+#: src/pages/AudioPage.tsx:443
 #: src/pages/CastPage.tsx:320
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/LayoutsPage.tsx:86
@@ -604,12 +604,12 @@ msgstr ""
 msgid "Add at least one member device to the group."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:651
-#: src/layout/components/LayoutEditor.tsx:180
+#: src/layout/components/GridLayoutEditor.tsx:645
+#: src/layout/components/LayoutEditor.tsx:181
 msgid "Add cell"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:422
+#: src/layout/components/GridLayoutEditor.tsx:416
 msgid "Add column"
 msgstr ""
 
@@ -617,11 +617,11 @@ msgstr ""
 msgid "Add member"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:481
+#: src/pages/AudioPage.tsx:493
 msgid "Add route"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:432
+#: src/layout/components/GridLayoutEditor.tsx:426
 msgid "Add row"
 msgstr ""
 
@@ -707,7 +707,7 @@ msgstr ""
 msgid "Advertised NDI name"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:460
+#: src/layout/components/GridLayoutEditor.tsx:454
 msgid "Advisories (saving still allowed):"
 msgstr ""
 
@@ -935,7 +935,7 @@ msgstr ""
 msgid "Apply mode"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:566
+#: src/layout/components/GridLayoutEditor.tsx:560
 msgid "Area cell"
 msgstr ""
 
@@ -943,11 +943,11 @@ msgstr ""
 msgid "Area name"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:567
+#: src/layout/components/GridLayoutEditor.tsx:561
 msgid "Areas"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:548
+#: src/layout/components/GridLayoutEditor.tsx:542
 msgid "Areas & cells"
 msgstr ""
 
@@ -1005,7 +1005,7 @@ msgid "Attached automatically"
 msgstr ""
 
 #: src/app/navigation.tsx:53
-#: src/pages/AudioPage.tsx:340
+#: src/pages/AudioPage.tsx:342
 #: src/pages/OutputsPage.tsx:581
 msgid "Audio"
 msgstr ""
@@ -1014,7 +1014,7 @@ msgstr ""
 msgid "Audio at or below this level counts as silent (e.g. −60)."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:396
+#: src/pages/AudioPage.tsx:408
 msgid "Audio routes"
 msgstr ""
 
@@ -1263,12 +1263,12 @@ msgstr ""
 msgid "Bus"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:216
+#: src/pages/AudioPage.tsx:218
 msgid "Camera 1"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:867
-#: src/layout/components/LayoutEditor.tsx:432
+#: src/layout/components/GridLayoutEditor.tsx:861
+#: src/layout/components/LayoutEditor.tsx:419
 #: src/pages/CastPage.tsx:459
 #: src/pages/CastPage.tsx:520
 #: src/pages/CastPage.tsx:569
@@ -1313,19 +1313,19 @@ msgstr ""
 msgid "Cannot convert this preset to a grid"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:474
+#: src/layout/components/GridLayoutEditor.tsx:468
 msgid "Cannot convert: fix the grid errors first so every area solves to a rectangle."
 msgstr ""
 
 #. placeholder {0}: result.areas.join(', ')
-#: src/layout/components/GridLayoutEditor.tsx:623
+#: src/layout/components/GridLayoutEditor.tsx:617
 msgid "Cannot rename: area(s) {0} would no longer be a rectangle."
 msgstr ""
 
 #: src/docs/registry.ts:128
-#: src/layout/components/GridLayoutEditor.tsx:298
-#: src/layout/components/LayoutEditor.tsx:210
-#: src/layout/components/LayoutEditor.tsx:321
+#: src/layout/components/GridLayoutEditor.tsx:299
+#: src/layout/components/LayoutEditor.tsx:211
+#: src/layout/components/LayoutEditor.tsx:308
 #: src/pages/docs/ConfigPage.tsx:66
 msgid "Canvas"
 msgstr ""
@@ -1424,7 +1424,7 @@ msgstr ""
 msgid "Cell"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:657
+#: src/layout/components/GridLayoutEditor.tsx:651
 msgid "Cell id:"
 msgstr ""
 
@@ -1437,13 +1437,13 @@ msgid "Cell name"
 msgstr ""
 
 #: src/docs/registry.ts:143
-#: src/layout/components/LayoutEditor.tsx:366
+#: src/layout/components/LayoutEditor.tsx:353
 #: src/pages/docs/ConfigPage.tsx:185
 #: src/pages/LayoutsPage.tsx:79
 msgid "Cells"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:324
+#: src/layout/components/LayoutEditor.tsx:311
 msgid "Cells (accessible)"
 msgstr ""
 
@@ -1487,11 +1487,11 @@ msgstr ""
 msgid "Changing the mode restarts the device's own pipeline: its bound sources ride the tile ladder until it returns. No Multiview program output is interrupted."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:409
+#: src/pages/AudioPage.tsx:421
 msgid "Channels"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:140
+#: src/pages/AudioPage.tsx:142
 msgid "Channels (route {row})"
 msgstr ""
 
@@ -1499,7 +1499,7 @@ msgstr ""
 msgid "Checking…"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:115
+#: src/pages/AudioPage.tsx:117
 msgid "Choose an input"
 msgstr ""
 
@@ -1641,11 +1641,11 @@ msgstr ""
 msgid "Colour bars (line-up signal)"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:399
+#: src/layout/components/GridLayoutEditor.tsx:393
 msgid "Column gap"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:421
+#: src/layout/components/GridLayoutEditor.tsx:415
 msgid "Columns"
 msgstr ""
 
@@ -1790,15 +1790,15 @@ msgstr ""
 msgid "Continue past the target"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:870
+#: src/layout/components/GridLayoutEditor.tsx:864
 msgid "Convert"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:850
+#: src/layout/components/GridLayoutEditor.tsx:844
 msgid "Convert to a free-form layout?"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:258
+#: src/layout/components/GridLayoutEditor.tsx:259
 #: src/pages/LayoutEditorPage.tsx:301
 msgid "Convert to free-form"
 msgstr ""
@@ -1996,7 +1996,7 @@ msgstr ""
 msgid "Could not load tally state:"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:359
+#: src/pages/AudioPage.tsx:371
 msgid "Could not load the audio routing:"
 msgstr ""
 
@@ -2083,7 +2083,7 @@ msgstr ""
 msgid "Could not save salvo"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:502
+#: src/pages/AudioPage.tsx:523
 msgid "Could not save the audio routing:"
 msgstr ""
 
@@ -2219,6 +2219,11 @@ msgstr ""
 msgid "Custom codec name"
 msgstr ""
 
+#: src/layout/components/FrameRateField.tsx:63
+msgid "Custom frame rate (num/den)"
+msgstr ""
+
+#: src/layout/components/FrameRateField.tsx:57
 #: src/pages/OutputsPage.tsx:527
 msgid "Custom…"
 msgstr ""
@@ -2301,7 +2306,7 @@ msgstr ""
 msgid "Default (colour bars)"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:725
+#: src/layout/components/GridLayoutEditor.tsx:719
 msgid "Default (contain)"
 msgstr ""
 
@@ -2524,11 +2529,11 @@ msgstr ""
 msgid "Discovery scans are untrusted hints; adoption is always an explicit operator confirmation."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:421
+#: src/pages/AudioPage.tsx:433
 msgid "Discrete track"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:188
+#: src/pages/AudioPage.tsx:190
 msgid "Discrete track name (route {row})"
 msgstr ""
 
@@ -2600,7 +2605,7 @@ msgstr ""
 msgid "Drag cancelled."
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:330
+#: src/layout/components/LayoutEditor.tsx:317
 msgid "Drag, resize and rotate cells on the canvas, or drop a source from the palette. The same cells are fully editable on the Cells tab without a pointer."
 msgstr ""
 
@@ -2683,7 +2688,7 @@ msgstr ""
 msgid "e.g. cam-north"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:191
+#: src/pages/AudioPage.tsx:193
 msgid "e.g. cam1-clean"
 msgstr ""
 
@@ -2719,8 +2724,8 @@ msgstr ""
 msgid "e.g. lobby-wall"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:241
-#: src/layout/components/LayoutEditor.tsx:153
+#: src/layout/components/GridLayoutEditor.tsx:242
+#: src/layout/components/LayoutEditor.tsx:154
 msgid "e.g. Main wall"
 msgstr ""
 
@@ -2796,7 +2801,7 @@ msgstr ""
 msgid "Each input continuously writes its newest decoded frame into a small per-tile store; the compositor reads the latest complete frame from that store at every output tick and never waits for an input. When a source hiccups, the store simply keeps handing out the most recent frame it has — the \"last good\" one. A brief network blip is therefore invisible: the tile holds a fraction-of-a-second-old picture until fresh frames resume."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:267
+#: src/pages/AudioPage.tsx:269
 msgid "Each output picks its audio from this set: “program” mode carries the prog mix; “tracks” mode selects any of the names above. Manage that per-output choice on the Outputs page."
 msgstr ""
 
@@ -2940,7 +2945,7 @@ msgid "Enter a number (decimals allowed, e.g. -23.5)."
 msgstr ""
 
 #: src/layout/components/AreaMatrixEditor.tsx:165
-#: src/layout/components/GridLayoutEditor.tsx:620
+#: src/layout/components/GridLayoutEditor.tsx:614
 msgid "Enter a single-word area name (no spaces)."
 msgstr ""
 
@@ -3006,10 +3011,6 @@ msgstr ""
 
 #: src/pages/docs/concepts/ResiliencePage.tsx:28
 msgid "Every tile rides its own four-state ladder, independently of every other tile. The state is shown as a badge in the UI and decides what the tile draws:"
-msgstr ""
-
-#: src/layout/components/LayoutEditor.tsx:273
-msgid "Exact \"num/den\", e.g. 30/1 or 30000/1001 — never a float."
 msgstr ""
 
 #: src/pages/MonitoringPage.tsx:89
@@ -3133,7 +3134,7 @@ msgid "first declared rendition"
 msgstr ""
 
 #: src/layout/components/CellsForm.tsx:384
-#: src/layout/components/GridLayoutEditor.tsx:704
+#: src/layout/components/GridLayoutEditor.tsx:698
 msgid "Fit"
 msgstr ""
 
@@ -3141,8 +3142,8 @@ msgstr ""
 msgid "Fix the highlighted fields, then save again."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:446
-#: src/layout/components/LayoutEditor.tsx:306
+#: src/layout/components/GridLayoutEditor.tsx:440
+#: src/layout/components/LayoutEditor.tsx:293
 msgid "Fix these before saving:"
 msgstr ""
 
@@ -3162,13 +3163,9 @@ msgstr ""
 msgid "Fractions of the tile, so a static logo or lower-third cannot mask a black or frozen background."
 msgstr ""
 
+#: src/layout/components/FrameRateField.tsx:35
 #: src/pages/DashboardPage.tsx:119
 msgid "Frame rate"
-msgstr ""
-
-#: src/layout/components/GridLayoutEditor.tsx:344
-#: src/layout/components/LayoutEditor.tsx:256
-msgid "Frame rate (rational)"
 msgstr ""
 
 #: src/layout/components/validationMessages.tsx:24
@@ -3211,19 +3208,19 @@ msgstr ""
 msgid "Fully deterministic"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:415
+#: src/pages/AudioPage.tsx:427
 msgid "Gain (dB)"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:164
+#: src/pages/AudioPage.tsx:166
 msgid "Gain in dB (route {row})"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:365
+#: src/layout/components/GridLayoutEditor.tsx:359
 msgid "Gap"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:361
+#: src/layout/components/GridLayoutEditor.tsx:355
 msgid "Gaps (px)"
 msgstr ""
 
@@ -3273,7 +3270,7 @@ msgstr ""
 msgid "Glossary"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:247
+#: src/pages/AudioPage.tsx:249
 msgid "Glossary: program bus and tracks"
 msgstr ""
 
@@ -3346,7 +3343,7 @@ msgid "Green"
 msgstr ""
 
 #: src/layout/components/AreaMatrixEditor.tsx:187
-#: src/layout/components/GridLayoutEditor.tsx:557
+#: src/layout/components/GridLayoutEditor.tsx:551
 msgid "Grid areas"
 msgstr ""
 
@@ -3434,8 +3431,8 @@ msgstr ""
 msgid "Height (%)"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:323
-#: src/layout/components/LayoutEditor.tsx:235
+#: src/layout/components/GridLayoutEditor.tsx:324
+#: src/layout/components/LayoutEditor.tsx:236
 #: src/pages/OutputsPage.tsx:475
 msgid "Height (px)"
 msgstr ""
@@ -3497,7 +3494,7 @@ msgstr ""
 msgid "Host memory: ours / used / total"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:353
+#: src/pages/AudioPage.tsx:355
 #: src/pages/OutputsPage.tsx:739
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
@@ -3626,12 +3623,12 @@ msgstr ""
 msgid "Index→cell rules"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:406
+#: src/pages/AudioPage.tsx:418
 msgid "Input"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:111
-#: src/pages/AudioPage.tsx:126
+#: src/pages/AudioPage.tsx:113
+#: src/pages/AudioPage.tsx:128
 msgid "Input (route {row})"
 msgstr ""
 
@@ -3758,12 +3755,12 @@ msgid "LAN / routed networks"
 msgstr ""
 
 #: src/components/LocaleSwitcher.tsx:35
-#: src/pages/AudioPage.tsx:424
+#: src/pages/AudioPage.tsx:436
 #: src/pages/SettingsPage.tsx:172
 msgid "Language"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:201
+#: src/pages/AudioPage.tsx:203
 msgid "Language (route {row})"
 msgstr ""
 
@@ -3845,8 +3842,8 @@ msgstr ""
 msgid "Layout deleted"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:232
-#: src/layout/components/LayoutEditor.tsx:144
+#: src/layout/components/GridLayoutEditor.tsx:233
+#: src/layout/components/LayoutEditor.tsx:145
 msgid "Layout name"
 msgstr ""
 
@@ -4071,7 +4068,7 @@ msgstr ""
 msgid "Loading alarms…"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:364
+#: src/pages/AudioPage.tsx:376
 msgid "Loading audio routing…"
 msgstr ""
 
@@ -4080,7 +4077,7 @@ msgstr ""
 msgid "Loading audit log…"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:349
+#: src/layout/components/LayoutEditor.tsx:336
 msgid "Loading canvas…"
 msgstr ""
 
@@ -4148,7 +4145,7 @@ msgstr ""
 msgid "Loading pending actions…"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:808
+#: src/layout/components/GridLayoutEditor.tsx:802
 msgid "Loading preview…"
 msgstr ""
 
@@ -4418,7 +4415,7 @@ msgid "Minor"
 msgstr ""
 
 #. placeholder {0}: cell.area
-#: src/layout/components/GridLayoutEditor.tsx:499
+#: src/layout/components/GridLayoutEditor.tsx:493
 msgid "missing area: {0}"
 msgstr ""
 
@@ -4464,7 +4461,7 @@ msgstr ""
 msgid "Monitoring cameras where they are installed: RTSP."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:61
+#: src/pages/AudioPage.tsx:63
 msgid "Mono"
 msgstr ""
 
@@ -4481,11 +4478,11 @@ msgstr ""
 msgid "Mount point"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:510
+#: src/layout/components/GridLayoutEditor.tsx:504
 msgid "Move cell to area"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:514
+#: src/layout/components/GridLayoutEditor.tsx:508
 msgid "Move to area…"
 msgstr ""
 
@@ -4564,11 +4561,15 @@ msgstr ""
 msgid "Multiview's own playout endpoints: small computers that turn ordinary displays into managed, frame-accurate wall heads."
 msgstr ""
 
+#: src/layout/components/FrameRateField.tsx:74
+msgid "Must match the running output to apply live (e.g. 29.97 = 30000/1001)."
+msgstr ""
+
 #: src/pages/docs/ApiPage.tsx:73
 msgid "Mutable resources carry an <0>ETag</0>. Send it back as <1>If-Match</1> on a write; a stale tag is rejected with <2>412 Precondition Failed</2> so two editors never silently clobber each other."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:418
+#: src/pages/AudioPage.tsx:430
 msgid "Mute"
 msgstr ""
 
@@ -4576,7 +4577,7 @@ msgstr ""
 msgid "Mute {label}"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:177
+#: src/pages/AudioPage.tsx:179
 msgid "Mute on the program mix (route {row})"
 msgstr ""
 
@@ -4663,7 +4664,7 @@ msgstr ""
 msgid "Never seen."
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:176
+#: src/layout/components/LayoutEditor.tsx:177
 msgid "New cell"
 msgstr ""
 
@@ -4866,7 +4867,7 @@ msgstr ""
 msgid "No results."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:440
+#: src/pages/AudioPage.tsx:452
 msgid "No routes yet — without routes the multiview carries no managed audio."
 msgstr ""
 
@@ -4895,7 +4896,7 @@ msgid "NO SIGNAL"
 msgstr ""
 
 #: src/layout/components/CellsForm.tsx:386
-#: src/layout/components/GridLayoutEditor.tsx:686
+#: src/layout/components/GridLayoutEditor.tsx:680
 msgid "No source"
 msgstr ""
 
@@ -5095,11 +5096,11 @@ msgstr ""
 msgid "on the Licence screen."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:153
+#: src/pages/AudioPage.tsx:155
 msgid "On the program mix (route {row})"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:398
+#: src/pages/AudioPage.tsx:410
 msgid "One route per input. No track name means the input contributes to the program mix only."
 msgstr ""
 
@@ -5197,7 +5198,7 @@ msgstr ""
 msgid "Origin token (optional)"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:483
+#: src/layout/components/GridLayoutEditor.tsx:477
 msgid "Orphaned cells"
 msgstr ""
 
@@ -5371,7 +5372,7 @@ msgstr ""
 msgid "Pin encode to a specific GPU"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:100
+#: src/layout/components/LayoutEditor.tsx:101
 msgid "PIP"
 msgstr ""
 
@@ -5416,7 +5417,7 @@ msgstr ""
 msgid "Present only in the untrusted discovery inventory — not a device yet. Adoption is always an explicit operator action."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:551
+#: src/layout/components/GridLayoutEditor.tsx:545
 msgid "Preview"
 msgstr ""
 
@@ -5494,7 +5495,7 @@ msgstr ""
 msgid "Program meters"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:412
+#: src/pages/AudioPage.tsx:424
 msgid "Program mix"
 msgstr ""
 
@@ -5509,6 +5510,10 @@ msgstr ""
 
 #: src/pages/DeviceDetailPage.tsx:99
 msgid "Program output never depends on this device: if it fails, bound sources ride the tile ladder and outputs ride their failover policy — the multiview keeps running."
+msgstr ""
+
+#: src/pages/AudioPage.tsx:357
+msgid "Program-mix changes (on the program mix, gain, mute) apply to the running program audio immediately when saved, with a short fade — no restart. A changed sample rate, or mixing an input that has no audio on this run, is stored and goes live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr ""
 
 #: src/pages/CastPage.tsx:483
@@ -5717,18 +5722,18 @@ msgid "Remote WHIP endpoint URL"
 msgstr ""
 
 #: src/layout/components/CellsForm.tsx:364
-#: src/layout/components/GridLayoutEditor.tsx:537
+#: src/layout/components/GridLayoutEditor.tsx:531
 #: src/pages/SyncGroupsPage.tsx:170
 msgid "Remove"
 msgstr ""
 
 #: src/layout/components/CellsForm.tsx:388
-#: src/layout/components/GridLayoutEditor.tsx:530
-#: src/layout/components/GridLayoutEditor.tsx:782
+#: src/layout/components/GridLayoutEditor.tsx:524
+#: src/layout/components/GridLayoutEditor.tsx:776
 msgid "Remove cell"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:423
+#: src/layout/components/GridLayoutEditor.tsx:417
 msgid "Remove column"
 msgstr ""
 
@@ -5740,11 +5745,11 @@ msgstr ""
 msgid "Remove member"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:228
+#: src/pages/AudioPage.tsx:230
 msgid "Remove route {row}"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:433
+#: src/layout/components/GridLayoutEditor.tsx:427
 msgid "Remove row"
 msgstr ""
 
@@ -5773,11 +5778,11 @@ msgstr ""
 msgid "Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:628
+#: src/layout/components/GridLayoutEditor.tsx:622
 msgid "Rename"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:595
+#: src/layout/components/GridLayoutEditor.tsx:589
 msgid "Rename area {selectedArea}"
 msgstr ""
 
@@ -5789,11 +5794,11 @@ msgstr ""
 msgid "Renews on"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:442
+#: src/layout/components/LayoutEditor.tsx:429
 msgid "Replace cells"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:416
+#: src/layout/components/LayoutEditor.tsx:403
 msgid "Replace the current cells?"
 msgstr ""
 
@@ -5905,7 +5910,7 @@ msgstr ""
 msgid "Route a source elementary stream onto a destination. Plan classifies the take without applying it; Take applies it — a Class-2 migration is accepted asynchronously and its outcome arrives on the realtime stream."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:343
+#: src/pages/AudioPage.tsx:345
 msgid "Route each input's audio: program-mix membership and discrete tracks."
 msgstr ""
 
@@ -5924,11 +5929,11 @@ msgstr ""
 msgid "Row {0}, column {1}: area {token}"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:382
+#: src/layout/components/GridLayoutEditor.tsx:376
 msgid "Row gap"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:431
+#: src/layout/components/GridLayoutEditor.tsx:425
 msgid "Rows"
 msgstr ""
 
@@ -6013,7 +6018,7 @@ msgstr ""
 msgid "Same machine, multiple outputs"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:372
+#: src/pages/AudioPage.tsx:384
 msgid "Sample rate (Hz)"
 msgstr ""
 
@@ -6024,8 +6029,8 @@ msgstr ""
 msgid "Save"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:281
-#: src/layout/components/LayoutEditor.tsx:201
+#: src/layout/components/GridLayoutEditor.tsx:282
+#: src/layout/components/LayoutEditor.tsx:202
 msgid "Save & apply to engine"
 msgstr ""
 
@@ -6038,17 +6043,21 @@ msgstr ""
 msgid "Save as device"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:489
+#: src/pages/AudioPage.tsx:501
 msgid "Save audio routing"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:268
-#: src/layout/components/LayoutEditor.tsx:189
+#: src/layout/components/GridLayoutEditor.tsx:269
+#: src/layout/components/LayoutEditor.tsx:190
 msgid "Save layout"
 msgstr ""
 
 #: src/resources/CrudPage.tsx:264
 msgid "Saved"
+msgstr ""
+
+#: src/pages/AudioPage.tsx:506
+msgid "Saved and applied live: the program mix is now following the new routing."
 msgstr ""
 
 #. placeholder {0}: result.filename
@@ -6064,8 +6073,8 @@ msgstr ""
 msgid "Saving an overlay through the API or this UI applies it to the running engine at the next frame where the build renders that kind — today an analog-face <0>clock</0> appears, moves, or disappears live. Kinds without a renderer are stored losslessly and take effect via config export + restart; every save response declares which happened in its X-Multiview-Apply header."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:268
-#: src/layout/components/LayoutEditor.tsx:189
+#: src/layout/components/GridLayoutEditor.tsx:269
+#: src/layout/components/LayoutEditor.tsx:190
 msgid "Saving…"
 msgstr ""
 
@@ -6110,15 +6119,15 @@ msgstr ""
 msgid "Secure Reliable Transport — an open-source UDP protocol for carrying streams across unmanaged networks. It repairs packet loss by retransmission inside a configurable latency window and encrypts with AES, making it the standard choice for contribution over the internet."
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:288
+#: src/layout/components/LayoutEditor.tsx:275
 msgid "Seed cells from preset"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:280
+#: src/layout/components/LayoutEditor.tsx:267
 msgid "Seed from a preset"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:419
+#: src/layout/components/LayoutEditor.tsx:406
 msgid "Seeding from a preset replaces every cell in this draft. Nothing is saved until you save the layout."
 msgstr ""
 
@@ -6134,7 +6143,7 @@ msgstr ""
 msgid "Segment duration (ms, optional)"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:588
+#: src/layout/components/GridLayoutEditor.tsx:582
 msgid "Select an area to edit its cell."
 msgstr ""
 
@@ -6147,7 +6156,7 @@ msgstr ""
 msgid "Select cell"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:244
+#: src/pages/AudioPage.tsx:246
 msgid "Selectable tracks"
 msgstr ""
 
@@ -6271,7 +6280,7 @@ msgstr ""
 msgid "Skip to content"
 msgstr ""
 
-#: src/layout/components/LayoutEditor.tsx:170
+#: src/layout/components/LayoutEditor.tsx:171
 msgid "Snap to grid"
 msgstr ""
 
@@ -6281,7 +6290,7 @@ msgid "Snapshot {0} assembled."
 msgstr ""
 
 #: src/layout/components/CellsForm.tsx:385
-#: src/layout/components/GridLayoutEditor.tsx:666
+#: src/layout/components/GridLayoutEditor.tsx:660
 msgid "Source"
 msgstr ""
 
@@ -6293,7 +6302,7 @@ msgstr ""
 msgid "Source connections are supervised. A stalled read times out rather than hanging forever; the supervisor then reconnects with exponential backoff (so a dead camera is not hammered) and keeps trying indefinitely — sources recover without operator action whenever the far end comes back. Mid-stream surprises that normally break players, like a camera changing resolution or a stream resetting its timestamps, are absorbed inside the tile: the decoder re-initializes behind the frame store while the compositor keeps drawing the last good frame."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:130
+#: src/pages/AudioPage.tsx:132
 msgid "source id"
 msgstr ""
 
@@ -6406,7 +6415,7 @@ msgstr ""
 msgid "Staying off"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:63
+#: src/pages/AudioPage.tsx:65
 msgid "Stereo"
 msgstr ""
 
@@ -6436,6 +6445,10 @@ msgstr ""
 msgid "Stored and applied: the device's supervised driver converges it now. Config export captures it for restarts."
 msgstr ""
 
+#: src/pages/AudioPage.tsx:514
+msgid "Stored, not applied live: this change needs a restart (for example a changed sample rate, or an input with no audio on this run). The running program mix is unchanged until then."
+msgstr ""
+
 #: src/pages/OverlaysPage.tsx:247
 msgid "Stored. Analog clock overlays apply to the running engine immediately; other kinds go live via config export + restart."
 msgstr ""
@@ -6444,7 +6457,6 @@ msgstr ""
 msgid "Stored. Drift is measured against the group's target skew; the achieved tier is reported, never over-claimed."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:494
 #: src/pages/OutputsPage.tsx:742
 #: src/pages/ProbesPage.tsx:499
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
@@ -6842,7 +6854,7 @@ msgstr ""
 msgid "The GPU acceleration tier the compositor resolved on this host. A class of “none” means the CPU composite path only."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:795
+#: src/layout/components/GridLayoutEditor.tsx:789
 msgid "The grid cannot be solved yet — fix the validation errors to see the placement preview."
 msgstr ""
 
@@ -6906,7 +6918,7 @@ msgstr ""
 msgid "The minimum monthly contact that keeps your entitlement live. This is the licensing keep-alive — not analytics — so it carries only what licensing needs."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:259
+#: src/pages/AudioPage.tsx:261
 msgid "the mixed program bus, always available"
 msgstr ""
 
@@ -7095,7 +7107,7 @@ msgstr ""
 msgid "The working color space. <0>profile</0> names a preset (e.g. <1>sdr-bt709-limited</1>); <2>custom</2> lets you set primaries, transfer, matrix, and range explicitly."
 msgstr ""
 
-#: src/pages/AudioPage.tsx:379
+#: src/pages/AudioPage.tsx:391
 msgid "The working rate every input is resampled to (48000 is the broadcast default)."
 msgstr ""
 
@@ -7123,11 +7135,11 @@ msgstr ""
 msgid "These are classes, not promises — encoder settings (especially keyframe interval), network conditions, and the viewer's player all move the number."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:487
+#: src/layout/components/GridLayoutEditor.tsx:481
 msgid "These cells reference areas that are no longer in the grid. Move each to a live area (its source binding is kept) or remove it."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:640
+#: src/layout/components/GridLayoutEditor.tsx:634
 msgid "This area has no cell yet."
 msgstr ""
 
@@ -7179,7 +7191,7 @@ msgstr ""
 msgid "This is one of the most common picture-quality bugs in any video chain. Multiview expands each tile's range exactly once on ingest, composites in a common working space, and compresses exactly once on output — and tags the result, because an untagged-but-correct stream still gets guessed wrong by some players."
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:853
+#: src/layout/components/GridLayoutEditor.tsx:847
 msgid "This is one-way: the grid's tracks and areas become fixed rectangles you move and resize individually. Nothing is saved until you save the layout."
 msgstr ""
 
@@ -7315,7 +7327,7 @@ msgstr ""
 msgid "Timing & sync"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:427
+#: src/pages/AudioPage.tsx:439
 msgid "Title"
 msgstr ""
 
@@ -7327,7 +7339,7 @@ msgstr ""
 msgid "Track id or language tag"
 msgstr ""
 
-#: src/pages/AudioPage.tsx:213
+#: src/pages/AudioPage.tsx:215
 msgid "Track title (route {row})"
 msgstr ""
 
@@ -7808,8 +7820,8 @@ msgid "Width (%)"
 msgstr ""
 
 #: src/layout/components/CellPropertiesPanel.tsx:266
-#: src/layout/components/GridLayoutEditor.tsx:302
-#: src/layout/components/LayoutEditor.tsx:214
+#: src/layout/components/GridLayoutEditor.tsx:303
+#: src/layout/components/LayoutEditor.tsx:215
 #: src/pages/OutputsPage.tsx:463
 msgid "Width (px)"
 msgstr ""
@@ -7873,7 +7885,7 @@ msgstr ""
 msgid "z = {0}"
 msgstr ""
 
-#: src/layout/components/GridLayoutEditor.tsx:738
+#: src/layout/components/GridLayoutEditor.tsx:732
 msgid "Z order"
 msgstr ""
 

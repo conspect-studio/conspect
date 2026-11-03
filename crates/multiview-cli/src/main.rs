@@ -626,6 +626,14 @@ async fn run_pipeline_until_ctrl_c(
         );
         #[cfg(not(feature = "overlay"))]
         let live_apply = multiview_control::LiveApplyCaps::default();
+        // Audio routing applies to the RUNNING program bus (no restart): the
+        // hook loads the run's audio control handle (published at drive start;
+        // empty when this run carries no program audio → honest `restart`) and
+        // hands it the new gain table, which the bake consumer ramps in at its
+        // next tick. Wait-free: a SwapCell load + store (inv #1/#10).
+        let live_apply = live_apply.with_audio_routing(
+            multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
+        );
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
             start,

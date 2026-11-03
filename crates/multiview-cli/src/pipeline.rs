@@ -3431,7 +3431,8 @@ impl Pipeline {
                 }
             }
             self.audio_route.store(Some(Arc::new(
-                crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels),
+                crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels)
+                    .with_sample_rate(cfg.sample_rate),
             )));
             bus
         });
@@ -11988,7 +11989,7 @@ impl LiveStamper {
 /// (linear). Every other store still joins the bus at zero gain so its discrete
 /// track is metered (mute ≠ unroute; an operator routes by the meter). With no
 /// routes, every store rides at unity. Sorted by id.
-fn program_bus_gains<'a>(
+pub(crate) fn program_bus_gains<'a>(
     ids: impl Iterator<Item = &'a str>,
     routing: Option<&multiview_config::AudioRouting>,
 ) -> Vec<(String, f64)> {

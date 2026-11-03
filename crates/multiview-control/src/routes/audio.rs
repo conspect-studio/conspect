@@ -22,8 +22,13 @@
 //! concurrency (ADR-W006; `428` without a precondition, `412` when stale —
 //! enforced atomically by
 //! [`AudioRoutingStore::replace_if`](crate::audio_routing::AudioRoutingStore::replace_if)),
-//! RBAC, an audit record after a successful write, and
-//! `X-Multiview-Apply: restart` apply semantics (ADR-W015 §4).
+//! RBAC, an audit record after a successful write, and honest
+//! `X-Multiview-Apply` semantics (ADR-W015 §4): `live` when the running
+//! program bus accepted the new gain table (include/exclude, `gain_db`, `mute`
+//! land within a couple of ticks on a short click-free ramp), `restart` when
+//! only a restart can honour it (no program bus running, a changed
+//! `sample_rate_hz`, or a mixed input with no audio store on this run). Either
+//! way the stored document is persisted to `active.toml`.
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -36,7 +41,7 @@ use crate::auth::{Action, Principal};
 use crate::concurrency::{IfMatch, Version};
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
-use crate::typed_resources::with_apply_restart;
+use crate::typed_resources::{with_apply, ApplyMode};
 use multiview_config::{AudioRouting, PROGRAM_TRACK};
 
 /// The wire envelope both verbs return: whether a document is configured, the
@@ -153,7 +158,7 @@ pub(crate) async fn get_audio_routing(
         tag = "audio",
         request_body = crate::openapi_schemas::AudioRoutingDoc,
         responses(
-            (status = 200, description = "The replaced document (new ETag in the response header; X-Multiview-Apply: restart — it takes effect via config export + restart).", body = crate::openapi_schemas::AudioRoutingStateDoc),
+            (status = 200, description = "The replaced document (new ETag in the response header; X-Multiview-Apply: live when the running program bus applied it, restart when it needs a restart, e.g. a changed sample rate).", body = crate::openapi_schemas::AudioRoutingStateDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to write.", body = crate::problem::Problem),
             (status = 412, description = "If-Match precondition failed.", body = crate::problem::Problem),
@@ -169,6 +174,10 @@ pub(crate) async fn put_audio_routing(
     Json(body): Json<serde_json::Value>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
+    // Serialize against every other config mutation so two racing PUTs reach
+    // the engine in the same order they won the store (the lock is control-
+    // plane only; the engine never takes it).
+    let _mutation = state.lock_config_mutation().await;
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a missing/stale `If-Match` is reported even when the body is invalid.
     let current = state.audio_routing.version();
@@ -192,9 +201,14 @@ pub(crate) async fn put_audio_routing(
         AUDIO_ROUTING_ID,
         serde_json::to_value(&routing).ok(),
     );
-    Ok(with_apply_restart(state_response(
-        StatusCode::OK,
-        Some(routing),
-        version,
-    )))
+    // Hand the new table to the running bus's bounded mailbox (wait-free; the
+    // bake consumer applies it at its next tick). Never touches the bus here.
+    let mode = match state.live_apply.audio_routing.as_ref() {
+        Some(capability) if capability.apply(&routing) => ApplyMode::Live,
+        _ => ApplyMode::Restart,
+    };
+    Ok(with_apply(
+        mode,
+        state_response(StatusCode::OK, Some(routing), version),
+    ))
 }
