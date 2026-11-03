@@ -221,7 +221,7 @@ where
     let mut state = AppState::new(
         publisher,
         commands,
-        layout_repository(boot_model.as_deref()).await,
+        Arc::new(InMemoryRepository::new()),
         Arc::new(api_keys),
     )
     .with_seeded_resources(seeded)
@@ -231,6 +231,10 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    // Stored layouts persist across restarts (#176): seeding installs a fresh
+    // in-memory store holding the config's working layout; move that layout into
+    // the persistent store (if any) and serve from it.
+    state.repository = persist_layouts(&state.repository, boot_model.as_deref()).await;
     if let Some(whep) = whep {
         state = state.with_whep(whep);
     }
@@ -2252,7 +2256,8 @@ fn salvo_event(salvo: String, phase: SalvoPhase, head: Option<String>) -> SalvoE
     not(feature = "sqlite"),
     allow(clippy::unused_async, reason = "awaits only the sqlite open")
 )]
-async fn layout_repository(
+async fn persist_layouts(
+    seeded: &Arc<dyn multiview_control::repository::Repository>,
     boot_model: Option<&multiview_control::boot_model::BootModel>,
 ) -> Arc<dyn multiview_control::repository::Repository> {
     #[cfg(feature = "sqlite")]
@@ -2265,6 +2270,25 @@ async fn layout_repository(
             let url = format!("sqlite://{}?mode=rwc", path.display());
             match multiview_control::sqlite::SqliteRepository::connect(&url).await {
                 Ok(repo) => {
+                    // Refresh the config's working layout from the boot file
+                    // (it mirrors the loaded config), keep every operator layout.
+                    if let Ok(working) = seeded.list_layouts() {
+                        for layout in working {
+                            let id = layout.layout.id.clone();
+                            let input = multiview_control::repository::LayoutInput {
+                                name: layout.layout.name.clone(),
+                                body: layout.layout.body.clone(),
+                            };
+                            let _ = multiview_control::repository::Repository::delete_layout(
+                                &repo, &id,
+                            );
+                            if let Err(e) = multiview_control::repository::Repository::create_layout(
+                                &repo, &id, input,
+                            ) {
+                                tracing::warn!(error = %e, layout = %id, "cannot persist the working layout");
+                            }
+                        }
+                    }
                     tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
                     return Arc::new(repo);
                 }
@@ -2276,7 +2300,7 @@ async fn layout_repository(
     }
     #[cfg(not(feature = "sqlite"))]
     let _ = boot_model;
-    Arc::new(InMemoryRepository::new())
+    Arc::clone(seeded)
 }
 
 #[cfg(test)]
