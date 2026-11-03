@@ -1,11 +1,11 @@
 //! The `gst-rtsp-server` serving implementation (behind the `rtsp-server`
 //! feature).
 //!
-//! This module owns the actual GStreamer wiring for the OUT-2 in-process RTSP
+//! This module owns the actual `GStreamer` wiring for the OUT-2 in-process RTSP
 //! server (ADR-0006 primary path):
 //!
 //! - a [`glib::MainLoop`] driven on its **own thread**, bridged to the rest of
-//!   the engine only through the bounded drop-oldest queue (so the GLib loop can
+//!   the engine only through the bounded drop-oldest queue (so the `GLib` loop can
 //!   never back-pressure the output clock — invariants #1/#10);
 //! - an `RTSPServer` bound to a host + port, with one shared
 //!   [`RTSPMediaFactory`](gstreamer_rtsp_server::RTSPMediaFactory) per mount built
@@ -16,9 +16,9 @@
 //!   `appsrc` with the packet's already-tick-stamped PTS/duration (invariant #3,
 //!   **no re-encode** — `h264parse`/`h265parse` only fixes up stream-format).
 //!
-//! Because GStreamer (and the GLib main loop) are not present in CI, building
-//! this module requires the GStreamer dev libraries; it is exercised by the
-//! ignored-by-default live `tests/rtsp_server_playout.rs` on a GStreamer-equipped
+//! Because `GStreamer` (and the `GLib` main loop) are not present in CI, building
+//! this module requires the `GStreamer` dev libraries; it is exercised by the
+//! ignored-by-default live `tests/rtsp_server_playout.rs` on a `GStreamer`-equipped
 //! runner. The pure seam ([`super::BoundedPacketQueue`], [`super::RtspServerSink`],
 //! [`super::RtspMount`], [`super::RtspCodec`]) is always compiled and CI-tested.
 
@@ -70,10 +70,10 @@ impl RtspServerConfig {
     }
 }
 
-/// A running in-process RTSP server: the GLib main loop on its own thread plus
+/// A running in-process RTSP server: the `GLib` main loop on its own thread plus
 /// the shared media factory feeding clients from [`RtspServerHandle::queue`].
 ///
-/// Dropping the handle stops the GLib main loop and joins the serving thread (a
+/// Dropping the handle stops the `GLib` main loop and joins the serving thread (a
 /// host-side teardown that never touches the engine hot path).
 pub struct RtspServerHandle {
     queue: Arc<BoundedPacketQueue>,
@@ -92,11 +92,11 @@ impl RtspServerHandle {
     ///
     /// The `appsrc` buffer the server drains is the shared, bounded drop-oldest
     /// queue, so a slow/absent client never reaches back to the producer
-    /// (invariants #1/#10). The serving GLib loop runs on its own thread.
+    /// (invariants #1/#10). The serving `GLib` loop runs on its own thread.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Output`] if GStreamer cannot be initialized, an element
+    /// Returns [`Error::Output`] if `GStreamer` cannot be initialized, an element
     /// in the launch pipeline is unavailable (`appsrc`, `h264parse`/`h265parse`,
     /// `rtph264pay`/`rtph265pay` not installed), or the server cannot bind the
     /// configured host/port.
@@ -175,7 +175,7 @@ impl RtspServerHandle {
         &self.served_url
     }
 
-    /// Stop the GLib main loop and join the serving thread. Idempotent.
+    /// Stop the `GLib` main loop and join the serving thread. Idempotent.
     pub fn stop(&mut self) {
         self.main_loop.quit();
         if let Some(handle) = self.thread.take() {
@@ -214,31 +214,47 @@ fn serve(
     ready_tx: &std::sync::mpsc::SyncSender<Result<()>>,
 ) {
     // A fresh main context for this thread; the `MainLoop` was created with the
-    // default `None` context, so make this one the thread-default before running.
+    // default `None` context, so make this one the thread-default (via the
+    // panic-safe `with_thread_default` guard/closure API — glib 0.22 removed the
+    // old push/pop pair) before building, attaching and running on it.
     let context = glib::MainContext::new();
-    context.push_thread_default();
+    let push_result = context.with_thread_default(|| {
+        let result = build_and_attach(config, &context, queue);
+        let attached = match result {
+            Ok(source_id) => {
+                // Signal success; keep `source_id` alive for the loop's lifetime so
+                // the server stays attached (dropping it would detach the listener).
+                let _ = ready_tx.send(Ok(()));
+                Some(source_id)
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                None
+            }
+        };
 
-    let result = build_and_attach(config, &context, queue);
-    let attached = match result {
-        Ok(source_id) => {
-            // Signal success; keep `source_id` alive for the loop's lifetime so the
-            // server stays attached (dropping it would detach the listener).
-            let _ = ready_tx.send(Ok(()));
-            Some(source_id)
+        if attached.is_some() {
+            main_loop.run();
         }
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            None
-        }
-    };
 
-    if attached.is_some() {
-        main_loop.run();
+        // Loop has quit (or never ran): detach the source before the thread-default
+        // context is restored. `SourceId::remove()` always targets the *default*
+        // main context (`g_source_remove`), but this source is attached to our
+        // own non-default `context` — look it up there and destroy it directly
+        // (`g_source_destroy`), which works for a source on any context.
+        if let Some(source_id) = attached {
+            if let Some(source) = context.find_source_by_id(&source_id) {
+                source.destroy();
+            }
+        }
+    });
+
+    if let Err(e) = push_result {
+        tracing::warn!(%e, "rtsp main context could not become thread-default");
+        let _ = ready_tx.send(Err(Error::Output(format!(
+            "rtsp main context could not become thread-default: {e}"
+        ))));
     }
-
-    // Loop has quit (or never ran): detach the source and restore the context.
-    drop(attached);
-    context.pop_thread_default();
 }
 
 /// Construct the `RTSPServer` + shared media factory, register the mount, and
@@ -249,7 +265,12 @@ fn build_and_attach(
     queue: &Arc<BoundedPacketQueue>,
 ) -> Result<glib::SourceId> {
     let server = RTSPServer::new();
-    server.set_address(&config.host);
+    // `RTSPServerConfig::host` is the bracketed-for-URLs literal used by
+    // `served_url` (`"[::1]"`, `"[::]"`); `gst_rtsp_server_set_address` resolves
+    // its argument through `GNetworkAddress`, which expects a bare address/host
+    // (no URI-style brackets), so strip them here before handing it to the
+    // server. A plain IPv4/hostname (no brackets) passes through unchanged.
+    server.set_address(strip_literal_brackets(&config.host));
     server.set_service(&config.port.to_string());
 
     let factory = RTSPMediaFactory::new();
@@ -280,6 +301,17 @@ fn build_and_attach(
         .map_err(|e| Error::Output(format!("rtsp server bind failed: {e}")))
 }
 
+/// Strip one matching pair of surrounding `[`/`]` URI-style brackets from an
+/// IPv6 literal (`"[::1]"` -> `"::1"`), so it can be handed to APIs (like
+/// `gst_rtsp_server_set_address`, via `GNetworkAddress`) that parse a bare
+/// address/hostname rather than a URI authority. A string that is not
+/// bracketed this way (an IPv4 literal or hostname) passes through unchanged.
+fn strip_literal_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 /// Wire one client media's `appsrc`: set its caps + live timing properties and
 /// install the `need-data` pump that drains `queue` into the source.
 fn configure_media(
@@ -288,10 +320,9 @@ fn configure_media(
     timebase: (u32, u32),
     queue: &Arc<BoundedPacketQueue>,
 ) {
-    let Some(element) = media.element() else {
-        tracing::warn!("rtsp media has no element; cannot configure appsrc");
-        return;
-    };
+    // `RTSPMedia::element` returns the (always-present) pipeline `Element`
+    // directly in gstreamer-rtsp-server 0.25 (no longer `Option<Element>`).
+    let element = media.element();
     let Some(bin) = element.dynamic_cast::<gstreamer::Bin>().ok() else {
         tracing::warn!("rtsp media element is not a bin; cannot find appsrc");
         return;
@@ -360,7 +391,7 @@ fn build_buffer(packet: &Arc<EncodedPacket>, timebase: (u32, u32)) -> gstreamer:
 
 /// A zero-copy `AsRef<[u8]>` view over an `Arc<EncodedPacket>` so the buffer
 /// shares the same encoded allocation (encode-once, invariant #7) rather than
-/// copying the NAL bytes into the GStreamer buffer.
+/// copying the NAL bytes into the `GStreamer` buffer.
 struct PacketBytes(Arc<EncodedPacket>);
 
 impl AsRef<[u8]> for PacketBytes {
@@ -369,7 +400,7 @@ impl AsRef<[u8]> for PacketBytes {
     }
 }
 
-/// Convert a non-negative timebase-unit count to a GStreamer [`ClockTime`],
+/// Convert a non-negative timebase-unit count to a `GStreamer` [`ClockTime`],
 /// applying the `(num, den)` seconds timebase (`ns = units * 1e9 * num / den`).
 ///
 /// Negative values (which should never reach here — output PTS are re-stamped
