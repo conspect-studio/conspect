@@ -44,6 +44,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Upper bound for one HTTP call. Generous: a no-`Range` origin sends a whole
 /// segment in one call at single-flow speed.
 const CALL_TIMEOUT: Duration = Duration::from_secs(40);
+/// Default pause after a 429/503 without a usable `Retry-After`, and the cap on
+/// any pause, so a bad header cannot silence a source for long.
+const THROTTLE_DEFAULT: Duration = Duration::from_secs(5);
+const THROTTLE_MAX: Duration = Duration::from_secs(60);
+/// Clean segments before parallelism steps back up one level.
+const CLEAN_TO_RECOVER: u64 = 10;
+/// Pause between probes of a listed segment that is not on the origin yet.
+const RETRY_PAUSE_MAX_MS: u64 = 1_000;
 /// The largest segment accepted.
 const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// With nothing published for this long the origin counts as gone: the local
@@ -164,6 +172,105 @@ fn content_range_total(value: &str) -> Option<u64> {
     value.rsplit('/').next()?.trim().parse().ok()
 }
 
+/// Per-source politeness toward the origin. A 429 or 503 pauses every request
+/// for this source (honouring `Retry-After`) and halves its parallelism; clean
+/// segments restore it slowly. Kept across reconnects, so a reconnect does not
+/// reset a rate limit.
+#[derive(Debug, Default)]
+pub struct Throttle {
+    /// Halvings of [`RANGE_PARTS`] in force: 0 → 6 parts, 1 → 3, 2 → one whole GET.
+    level: AtomicU64,
+    clean: AtomicU64,
+    until: Mutex<Option<Instant>>,
+    /// 429/503 responses seen.
+    pub limited: AtomicU64,
+}
+
+impl Throttle {
+    /// Parallel ranges per segment right now.
+    fn parts(&self) -> u64 {
+        match self.level.load(Ordering::Relaxed) {
+            0 => RANGE_PARTS,
+            1 => RANGE_PARTS / 2,
+            _ => 1,
+        }
+    }
+
+    /// Segments in flight right now.
+    fn in_flight(&self) -> usize {
+        match self.level.load(Ordering::Relaxed) {
+            0 => IN_FLIGHT,
+            1 => 2,
+            _ => 1,
+        }
+    }
+
+    /// The origin told us to slow down.
+    fn penalize(&self, retry_after: Option<Duration>) {
+        self.limited.fetch_add(1, Ordering::Relaxed);
+        self.clean.store(0, Ordering::Relaxed);
+        let pause = retry_after.unwrap_or(THROTTLE_DEFAULT).min(THROTTLE_MAX);
+        let mut until = self.until.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        // Concurrent 429s from one burst are one event: halve only once per pause.
+        if until.is_none_or(|u| u <= now) {
+            let level = self.level.load(Ordering::Relaxed);
+            self.level.store((level + 1).min(2), Ordering::Relaxed);
+        }
+        let end = now + pause;
+        *until = Some(until.map_or(end, |u| u.max(end)));
+    }
+
+    /// A segment finished cleanly.
+    fn segment_ok(&self) {
+        if self.clean.fetch_add(1, Ordering::Relaxed) + 1 >= CLEAN_TO_RECOVER {
+            self.clean.store(0, Ordering::Relaxed);
+            let level = self.level.load(Ordering::Relaxed);
+            self.level.store(level.saturating_sub(1), Ordering::Relaxed);
+        }
+    }
+
+    /// How long requests must still wait.
+    fn remaining(&self) -> Duration {
+        self.until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map_or(Duration::ZERO, |u| {
+                u.saturating_duration_since(Instant::now())
+            })
+    }
+}
+
+/// Parse a `Retry-After` in seconds (the HTTP-date form falls back to the default).
+fn retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse().ok().map(Duration::from_secs)
+}
+
+/// A failed attempt, and whether trying again can help.
+#[derive(Debug)]
+struct Failure {
+    message: String,
+    fatal: bool,
+}
+
+impl Failure {
+    fn retry(message: String) -> Self {
+        Self {
+            message,
+            fatal: false,
+        }
+    }
+
+    /// From a status. Other 4xx (403, 410, ...) are final: repeating them only
+    /// looks like abuse. 404 is retried: a new segment can lag its playlist.
+    fn status(what: &str, status: u16) -> Self {
+        Self {
+            message: format!("{what}: http {status}"),
+            fatal: (400..500).contains(&status) && !matches!(status, 404 | 408 | 429),
+        }
+    }
+}
+
 /// Live fetch statistics for one source (lock-free; read by reporting).
 #[derive(Debug, Default)]
 pub struct FetchStats {
@@ -183,6 +290,8 @@ pub struct FetchStats {
     /// open it directly (then the flag clears), so a fetcher-specific failure
     /// cannot keep a source down.
     pub bypass_next: AtomicBool,
+    /// Politeness state toward this origin.
+    pub throttle: Throttle,
 }
 
 impl FetchStats {
@@ -217,6 +326,22 @@ pub fn stats(id: &str) -> Arc<FetchStats> {
     let map = STATS.get_or_init(Default::default);
     let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
     Arc::clone(map.entry(id.to_owned()).or_default())
+}
+
+fn urls() -> &'static Mutex<HashMap<String, String>> {
+    static URLS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    URLS.get_or_init(Default::default)
+}
+
+/// The loopback playlist of source `id`'s running fetcher, if it has one, so
+/// another reader (the audio ingest) shares the one fetched copy.
+#[must_use]
+pub fn shared_url(id: &str) -> Option<String> {
+    urls()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(id)
+        .cloned()
 }
 
 /// A completed segment in the local window.
@@ -303,6 +428,7 @@ impl Shared {
 /// coordinator and the loopback server.
 pub(crate) struct HlsFetcher {
     shared: Arc<Shared>,
+    source_id: String,
     local_url: String,
 }
 
@@ -310,6 +436,11 @@ impl Drop for HlsFetcher {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.ready.notify_all();
+        // Only our own entry: a replacement may already have registered.
+        let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
+        if map.get(&self.source_id) == Some(&self.local_url) {
+            map.remove(&self.source_id);
+        }
     }
 }
 
@@ -331,7 +462,7 @@ impl HlsFetcher {
         let agent = agent();
         // Probe the playlist once synchronously so an unsupported one falls back
         // before any thread starts.
-        let (first, final_url) = fetch_playlist(&agent, base.as_str())?;
+        let (first, final_url) = fetch_playlist(&agent, base.as_str(), &st.throttle)?;
         // Segment URIs resolve against the playlist's final URL (RFC 8216 §4.1),
         // which differs from the request URL after a redirect.
         let segment_base = url::Url::parse(&final_url).unwrap_or_else(|_| base.clone());
@@ -363,7 +494,11 @@ impl HlsFetcher {
                 coordinate(&origin, first, &coord_shared, &st);
             })
             .map_err(|e| format!("spawn hls coordinator: {e}"))?;
-        let fetcher = Self { shared, local_url };
+        let fetcher = Self {
+            shared,
+            source_id: source_id.to_owned(),
+            local_url,
+        };
         // Wait for the first segment (stop-responsive).
         let deadline = Instant::now() + FIRST_SEGMENT_DEADLINE;
         let mut w = fetcher.shared.lock();
@@ -387,6 +522,10 @@ impl HlsFetcher {
                 .0;
         }
         drop(w);
+        urls()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(source_id.to_owned(), fetcher.local_url.clone());
         Ok(fetcher)
     }
 
@@ -409,12 +548,20 @@ fn agent() -> ureq::Agent {
 const RANGE_PARTS_USIZE: usize = 6;
 
 /// Fetch and parse the playlist; returns it with its final URL (after redirects).
-fn fetch_playlist(agent: &ureq::Agent, url: &str) -> Result<(OriginPlaylist, String), String> {
+fn fetch_playlist(
+    agent: &ureq::Agent,
+    url: &str,
+    throttle: &Throttle,
+) -> Result<(OriginPlaylist, String), String> {
     use ureq::ResponseExt as _;
     let mut last = String::new();
     for attempt in 0..3 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(300));
+        }
+        // Never queue behind a rate limit here: the caller reloads later.
+        if !throttle.remaining().is_zero() {
+            return Err("rate limited".to_owned());
         }
         match agent.get(url).call() {
             Ok(resp) if resp.status().as_u16() == 200 => {
@@ -429,25 +576,47 @@ fn fetch_playlist(agent: &ureq::Agent, url: &str) -> Result<(OriginPlaylist, Str
                     .map_err(|u| format!("unsupported playlist: {u:?}"))?;
                 return Ok((parsed, final_url));
             }
-            Ok(resp) => last = format!("playlist http {}", resp.status().as_u16()),
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if matches!(status, 429 | 503) {
+                    throttle.penalize(header_retry_after(&resp));
+                }
+                let failure = Failure::status("playlist", status);
+                if failure.fatal || status == 429 {
+                    return Err(failure.message);
+                }
+                last = failure.message;
+            }
             Err(e) => last = format!("playlist: {e}"),
         }
     }
     Err(last)
 }
 
-/// One HTTP GET, optionally ranged. Returns `(status, content-range total, body)`.
+fn header_retry_after(resp: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
+    resp.headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(retry_after)
+}
+
+/// One HTTP GET, optionally ranged, after any rate-limit pause. Returns
+/// `(status, content-range total, body)`.
 fn get(
     agent: &ureq::Agent,
     url: &str,
     range: Option<(u64, u64)>,
+    throttle: &Throttle,
 ) -> Result<(u16, Option<u64>, Vec<u8>), String> {
-    let mut req = agent.get(url);
+    let mut req = agent.get(url).header("Accept-Encoding", "identity");
     if let Some((a, b)) = range {
         req = req.header("Range", &format!("bytes={a}-{b}"));
     }
     let resp = req.call().map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
+    if matches!(status, 429 | 503) {
+        throttle.penalize(header_retry_after(&resp));
+    }
     let total = resp
         .headers()
         .get("content-range")
@@ -462,45 +631,65 @@ fn get(
     Ok((status, total, body))
 }
 
-/// Retry `f` up to `attempts` times while `deadline` allows.
+/// Retry `f` up to `attempts` times while `deadline` allows, waiting out any
+/// rate-limit pause first. A fatal failure stops at once.
 fn with_retries<T>(
     attempts: u32,
     deadline: Instant,
     stop: &AtomicBool,
-    mut f: impl FnMut() -> Result<T, String>,
+    throttle: &Throttle,
+    mut f: impl FnMut() -> Result<T, Failure>,
 ) -> Result<T, String> {
     let mut last = String::from("no attempt");
     for attempt in 0..attempts {
+        if attempt > 0 {
+            let ms = (250 * u64::from(attempt.min(4))).min(RETRY_PAUSE_MAX_MS);
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        loop {
+            let pause = throttle.remaining();
+            if pause.is_zero() || stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(pause.min(Duration::from_millis(100)));
+        }
         if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
             break;
         }
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(250 * u64::from(attempt.min(4))));
-        }
         match f() {
             Ok(v) => return Ok(v),
-            Err(e) => last = e,
+            Err(e) if e.fatal => return Err(e.message),
+            Err(e) => last = e.message,
         }
     }
     Err(last)
 }
 
 /// Fetch one segment: a probe range, then the rest as parallel ranges (or the
-/// whole body when the origin ignores `Range`). Returns `(bytes, ranged)`.
+/// whole body when the origin ignores `Range`, or when throttled down to one
+/// connection). Returns `(bytes, ranged)`.
 pub(crate) fn fetch_segment(
     agent: &ureq::Agent,
     url: &str,
     deadline: Instant,
     stop: &AtomicBool,
+    throttle: &Throttle,
 ) -> Result<(Vec<u8>, bool), String> {
+    if throttle.parts() == 1 {
+        return with_retries(u32::MAX, deadline, stop, throttle, || {
+            match get(agent, url, None, throttle).map_err(Failure::retry)? {
+                (200, _, body) => Ok((body, false)),
+                (s, _, _) => Err(Failure::status("segment", s)),
+            }
+        });
+    }
     // The newest listed segment can 404 briefly: keep asking until the deadline
     // rather than skip real media.
-    let (status, total, probe) = with_retries(u32::MAX, deadline, stop, || {
-        let r = get(agent, url, Some((0, PROBE_BYTES - 1)))?;
+    let (status, total, probe) = with_retries(u32::MAX, deadline, stop, throttle, || {
+        let r = get(agent, url, Some((0, PROBE_BYTES - 1)), throttle).map_err(Failure::retry)?;
         match r.0 {
             200 | 206 => Ok(r),
-            // A segment listed but not yet on the edge cache: retry shortly.
-            s => Err(format!("segment http {s}")),
+            s => Err(Failure::status("segment", s)),
         }
     })?;
     if status == 200 {
@@ -515,19 +704,25 @@ pub(crate) fn fetch_segment(
     if have >= total {
         return Ok((probe, true));
     }
-    let ranges = split_ranges(have, total, RANGE_PARTS);
+    let ranges = split_ranges(have, total, throttle.parts());
     let parts: Vec<Result<Vec<u8>, String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = ranges
             .iter()
             .map(|&(a, b)| {
                 scope.spawn(move || {
-                    with_retries(RANGE_ATTEMPTS, deadline, stop, || {
-                        let (s, _, body) = get(agent, url, Some((a, b)))?;
+                    with_retries(RANGE_ATTEMPTS, deadline, stop, throttle, || {
+                        let (s, _, body) =
+                            get(agent, url, Some((a, b)), throttle).map_err(Failure::retry)?;
                         let want = usize::try_from(b - a + 1).unwrap_or(usize::MAX);
                         if s == 206 && body.len() == want {
                             Ok(body)
+                        } else if s == 206 {
+                            Err(Failure::retry(format!(
+                                "range {a}-{b}: {} bytes",
+                                body.len()
+                            )))
                         } else {
-                            Err(format!("range {a}-{b}: http {s}, {} bytes", body.len()))
+                            Err(Failure::status("range", s))
                         }
                     })
                 })
@@ -647,7 +842,7 @@ fn coordinate(
     while !shared.stop.load(Ordering::Acquire) {
         // (1) Playlist reload.
         if playlist.is_none() && Instant::now() >= next_reload {
-            match fetch_playlist(origin.agent, origin.playlist.as_str()) {
+            match fetch_playlist(origin.agent, origin.playlist.as_str(), &stats.throttle) {
                 Ok((p, _)) => playlist = Some(p),
                 Err(e) => {
                     tracing::warn!(source = %id, error = %e, "hls fetch: playlist reload failed");
@@ -670,7 +865,7 @@ fn coordinate(
             next_reload = Instant::now() + Duration::from_secs_f64((target / 2.0).max(1.0));
         }
         // (2) Keep segments in flight.
-        while in_flight < IN_FLIGHT {
+        while in_flight < stats.throttle.in_flight() {
             let Some(seg) = sched.queued.pop_front() else {
                 break;
             };
@@ -683,6 +878,7 @@ fn coordinate(
             let agent = origin.agent.clone();
             let tx = tx.clone();
             let shared = Arc::clone(shared);
+            let stats = Arc::clone(stats);
             // A segment older than ~3 target durations has left the playlist.
             let deadline = Instant::now() + Duration::from_secs_f64(target * 3.0);
             let seq = seg.seq;
@@ -691,8 +887,14 @@ fn coordinate(
                 .name(format!("multiview-hls-seg-{id}"))
                 .spawn(move || {
                     let t0 = Instant::now();
-                    let r = fetch_segment(&agent, url.as_str(), deadline, &shared.stop)
-                        .map(|(b, ranged)| (b, ranged, t0.elapsed()));
+                    let r = fetch_segment(
+                        &agent,
+                        url.as_str(),
+                        deadline,
+                        &shared.stop,
+                        &stats.throttle,
+                    )
+                    .map(|(b, ranged)| (b, ranged, t0.elapsed()));
                     let _ = tx.send((seq, r));
                 });
             if spawned.is_err() {
@@ -719,6 +921,7 @@ fn coordinate(
             match result {
                 Ok((bytes, ranged, wall)) => {
                     stats.record(bytes.len(), seg.duration, wall, ranged);
+                    stats.throttle.segment_ok();
                     let gap = std::mem::take(&mut sched.gap);
                     shared.publish(seg.duration, seg.discontinuity || gap, bytes);
                     last_progress = Instant::now();
@@ -1009,6 +1212,191 @@ mod tests {
         assert_eq!(sched.pop_ready().map(|(seg, _)| seg.seq), Some(2));
     }
 
+    /// A one-route origin answering every request with `respond(n)` (the
+    /// request number), counting requests.
+    fn scripted(respond: impl Fn(u64) -> Vec<u8> + Send + Sync + 'static) -> (u16, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("[::1]:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&hits);
+        let respond = Arc::new(respond);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let count = Arc::clone(&count);
+                let respond = Arc::clone(&respond);
+                std::thread::spawn(move || {
+                    let Ok(mut out) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut input = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        if input.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        loop {
+                            let mut header = String::new();
+                            if input.read_line(&mut header).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if header.trim_end().is_empty() {
+                                break;
+                            }
+                        }
+                        let n = count.fetch_add(1, Ordering::SeqCst);
+                        if out.write_all(&respond(n)).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    fn reply(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut v = format!("{head}\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// bbc-news gzips its playlists even to clients that did not ask.
+    #[test]
+    fn a_gzipped_playlist_is_decoded() {
+        let gz: Vec<u8> = vec![
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 83, 118, 141, 8, 241, 53, 14, 229, 82, 6, 210, 186,
+            17, 186, 33, 142, 65, 238, 174, 33, 46, 161, 65, 142, 33, 158, 254, 126, 86, 166, 48,
+            113, 95, 87, 23, 79, 71, 221, 96, 215, 192, 80, 87, 63, 103, 87, 43, 115, 176, 184,
+            167, 159, 155, 149, 169, 158, 129, 14, 87, 162, 94, 73, 49, 23, 0, 175, 59, 19, 114,
+            74, 0, 0, 0,
+        ];
+        let (port, _) = scripted(move |_| reply("HTTP/1.1 200 OK\r\nContent-Encoding: gzip", &gz));
+        let (pl, _) = fetch_playlist(
+            &agent(),
+            &format!("http://[::1]:{port}/p.m3u8"),
+            &Throttle::default(),
+        )
+        .expect("decoded");
+        assert_eq!(pl.segments.len(), 1);
+        assert_eq!(pl.segments[0].seq, 7);
+    }
+
+    #[test]
+    fn a_429_pauses_requests_for_retry_after_and_halves_parallelism() {
+        let (port, hits) = scripted(|n| {
+            if n == 0 {
+                reply("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1", b"")
+            } else {
+                reply("HTTP/1.1 200 OK", b"segment")
+            }
+        });
+        let throttle = Throttle::default();
+        assert_eq!(
+            (throttle.parts(), throttle.in_flight()),
+            (RANGE_PARTS, IN_FLIGHT)
+        );
+        let stop = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let (body, _) = fetch_segment(
+            &agent(),
+            &format!("http://[::1]:{port}/s.ts"),
+            Instant::now() + Duration::from_secs(10),
+            &stop,
+            &throttle,
+        )
+        .expect("fetched after the pause");
+        assert_eq!(body, b"segment");
+        assert!(
+            t0.elapsed() >= Duration::from_secs(1),
+            "waited out Retry-After"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "no request during the pause"
+        );
+        assert_eq!(throttle.limited.load(Ordering::Relaxed), 1);
+        assert_eq!((throttle.parts(), throttle.in_flight()), (3, 2));
+        for _ in 0..CLEAN_TO_RECOVER {
+            throttle.segment_ok();
+        }
+        assert_eq!(throttle.parts(), RANGE_PARTS, "clean segments restore it");
+    }
+
+    #[test]
+    fn a_403_is_not_retried() {
+        let (port, hits) = scripted(|_| reply("HTTP/1.1 403 Forbidden", b""));
+        let stop = AtomicBool::new(false);
+        let err = fetch_segment(
+            &agent(),
+            &format!("http://[::1]:{port}/s.ts"),
+            Instant::now() + Duration::from_secs(10),
+            &stop,
+            &Throttle::default(),
+        )
+        .expect_err("forbidden");
+        assert!(err.contains("403"), "{err}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "one request, not a retry storm"
+        );
+    }
+
+    #[test]
+    fn throttle_halves_at_most_once_per_pause_and_bottoms_out() {
+        let throttle = Throttle::default();
+        throttle.penalize(Some(Duration::from_secs(5)));
+        throttle.penalize(Some(Duration::from_secs(5)));
+        assert_eq!(throttle.parts(), 3, "one burst, one halving");
+        *throttle.until.lock().expect("lock") = None;
+        throttle.penalize(None);
+        *throttle.until.lock().expect("lock") = None;
+        throttle.penalize(Some(Duration::from_secs(3_600)));
+        assert_eq!((throttle.parts(), throttle.in_flight()), (1, 1));
+        assert!(
+            throttle.remaining() <= THROTTLE_MAX,
+            "a huge Retry-After is capped"
+        );
+        assert_eq!(retry_after(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn shared_url_tracks_the_running_fetcher_only() {
+        let shared = Arc::new(Shared {
+            window: Mutex::new(Window {
+                target_duration: 6.0,
+                segments: VecDeque::new(),
+                next_local: 0,
+                failed: None,
+            }),
+            ready: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let id = "shared-url-test";
+        let old = HlsFetcher {
+            shared: Arc::clone(&shared),
+            source_id: id.to_owned(),
+            local_url: "http://[::1]:1/live.m3u8".to_owned(),
+        };
+        urls()
+            .lock()
+            .expect("lock")
+            .insert(id.to_owned(), old.local_url.clone());
+        assert_eq!(shared_url(id).as_deref(), Some("http://[::1]:1/live.m3u8"));
+        // A reconnect registered its replacement before the old one dropped.
+        urls()
+            .lock()
+            .expect("lock")
+            .insert(id.to_owned(), "http://[::1]:2/live.m3u8".to_owned());
+        drop(old);
+        assert_eq!(shared_url(id).as_deref(), Some("http://[::1]:2/live.m3u8"));
+        assert!(shared.stop.load(Ordering::Acquire));
+        urls().lock().expect("lock").remove(id);
+        assert_eq!(shared_url(id), None);
+    }
+
     /// A per-connection bandwidth-limited origin, like one TCP flow over the
     /// lossy 300 ms path from mda001: each connection sends at most
     /// `bytes_per_sec`, after `latency` per request.
@@ -1104,6 +1492,7 @@ mod tests {
             &url,
             Instant::now() + Duration::from_secs(60),
             &stop,
+            &Throttle::default(),
         )
         .expect("fetch");
         let wall = t0.elapsed();
@@ -1125,6 +1514,7 @@ mod tests {
             &url,
             Instant::now() + Duration::from_secs(20),
             &stop,
+            &Throttle::default(),
         )
         .expect("fetch");
         assert!(!ranged);
@@ -1151,8 +1541,13 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         spawn_server("t", listener, Arc::clone(&shared)).expect("server");
         let a = agent();
-        let (s, _, pl) =
-            get(&a, &format!("http://[::1]:{port}/live.m3u8"), None).expect("playlist");
+        let (s, _, pl) = get(
+            &a,
+            &format!("http://[::1]:{port}/live.m3u8"),
+            None,
+            &Throttle::default(),
+        )
+        .expect("playlist");
         assert_eq!(s, 200);
         let pl = String::from_utf8(pl).expect("utf8");
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:2\n"), "{pl}");
@@ -1163,18 +1558,41 @@ mod tests {
         );
         assert_eq!(pl.matches("#EXTINF").count(), WINDOW, "bounded window");
         shared.fail("origin gone".to_owned());
-        let (gone, _, _) = get(&a, &format!("http://[::1]:{port}/live.m3u8"), None).expect("gone");
+        let (gone, _, _) = get(
+            &a,
+            &format!("http://[::1]:{port}/live.m3u8"),
+            None,
+            &Throttle::default(),
+        )
+        .expect("gone");
         assert_eq!(
             gone, 404,
             "a failed fetcher fails libav's reload, forcing a reconnect"
         );
         shared.lock().failed = None;
-        let (s, _, seg) = get(&a, &format!("http://[::1]:{port}/s/9.ts"), None).expect("seg");
+        let (s, _, seg) = get(
+            &a,
+            &format!("http://[::1]:{port}/s/9.ts"),
+            None,
+            &Throttle::default(),
+        )
+        .expect("seg");
         assert_eq!((s, seg), (200, vec![9_u8; 10]));
-        let (s, total, part) =
-            get(&a, &format!("http://[::1]:{port}/s/9.ts"), Some((4, 99))).expect("range");
+        let (s, total, part) = get(
+            &a,
+            &format!("http://[::1]:{port}/s/9.ts"),
+            Some((4, 99)),
+            &Throttle::default(),
+        )
+        .expect("range");
         assert_eq!((s, total, part.len()), (206, Some(10), 6));
-        let (s, _, _) = get(&a, &format!("http://[::1]:{port}/s/0.ts"), None).expect("evicted");
+        let (s, _, _) = get(
+            &a,
+            &format!("http://[::1]:{port}/s/0.ts"),
+            None,
+            &Throttle::default(),
+        )
+        .expect("evicted");
         assert_eq!(s, 404, "evicted segments are gone");
         shared.stop.store(true, Ordering::Release);
     }
