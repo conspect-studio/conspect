@@ -11632,10 +11632,11 @@ impl LiveStamper {
 /// The `(source id, linear program gain)` pairs the program bus is built from.
 ///
 /// When the document's `[audio]` block declares routes they are authoritative
-/// (ADR-R005 §4.1 / ADR-0059 §4): a store joins only if its route sets
-/// `include_in_program_bus`, at that route's `gain_db` (linear); a `mute`d route
-/// joins at zero gain (mute ≠ unroute). A source without a route contributes
-/// nothing. With no routes, every store rides at unity. Sorted by id.
+/// (ADR-R005 §4.1 / ADR-0059 §4): a store is MIXED only if its route sets
+/// `include_in_program_bus` and is not `mute`d, at that route's `gain_db`
+/// (linear). Every other store still joins the bus at zero gain so its discrete
+/// track is metered (mute ≠ unroute; an operator routes by the meter). With no
+/// routes, every store rides at unity. Sorted by id.
 fn program_bus_gains<'a>(
     ids: impl Iterator<Item = &'a str>,
     routing: Option<&multiview_config::AudioRouting>,
@@ -11647,16 +11648,17 @@ fn program_bus_gains<'a>(
         return ids.into_iter().map(|id| (id.to_owned(), 1.0)).collect();
     }
     ids.into_iter()
-        .filter_map(|id| {
-            let route = routes
+        .map(|id| {
+            // Every input is on the bus so it is METERED (an operator picks what
+            // to route by its meter), but only an included, unmuted route is
+            // MIXED: everything else rides at zero program gain.
+            let gain = routes
                 .iter()
-                .find(|r| r.input_id == id && r.include_in_program_bus)?;
-            let gain = if route.mute {
-                0.0
-            } else {
-                10f64.powf(f64::from(route.gain_db.clamp(-96.0, 24.0)) / 20.0)
-            };
-            Some((id.to_owned(), gain))
+                .find(|r| r.input_id == id && r.include_in_program_bus && !r.mute)
+                .map_or(0.0, |r| {
+                    10f64.powf(f64::from(r.gain_db.clamp(-96.0, 24.0)) / 20.0)
+                });
+            (id.to_owned(), gain)
         })
         .collect()
 }
@@ -15928,13 +15930,20 @@ mod program_bus_gain_tests {
             ]
         }));
         let got = program_bus_gains(["abc", "bbc", "cnn", "unrouted"].into_iter(), Some(&r));
-        assert_eq!(got.len(), 2, "only included routes join: {got:?}");
+        // Every input stays on the bus (metered); only cnn is mixed.
+        assert_eq!(got.len(), 4, "all inputs metered: {got:?}");
+        assert_eq!(got[0], ("abc".to_owned(), 0.0), "muted: metered, not mixed");
         assert_eq!(
-            got[0],
-            ("abc".to_owned(), 0.0),
-            "muted = routed at zero gain"
+            got[1],
+            ("bbc".to_owned(), 0.0),
+            "excluded: metered, not mixed"
         );
-        assert_eq!(got[1].0, "cnn");
-        assert!((got[1].1 - 0.501_187).abs() < 1e-5, "-6 dB is about 0.501");
+        assert_eq!(got[2].0, "cnn");
+        assert!((got[2].1 - 0.501_187).abs() < 1e-5, "-6 dB is about 0.501");
+        assert_eq!(
+            got[3],
+            ("unrouted".to_owned(), 0.0),
+            "no route: metered, not mixed"
+        );
     }
 }
