@@ -916,10 +916,60 @@ pub const MAX_QUEUED_AUDIO: std::time::Duration = std::time::Duration::from_secs
 /// The decode queue's hard bound in frames (20 s at 48 kHz).
 pub const DECODED_QUEUE_CAP: usize = 960_000;
 
+/// Offset a block's original timestamp by an exact integer sample count.
+/// Compute every chunk from its absolute offset to avoid cumulative rounding.
+fn chunk_pts(
+    pts: multiview_core::time::MediaTime,
+    frame_offset: usize,
+    rate: u32,
+) -> multiview_core::time::MediaTime {
+    let offset_ns = i128::try_from(frame_offset)
+        .unwrap_or(i128::MAX)
+        .saturating_mul(1_000_000_000)
+        / i128::from(rate.max(1));
+    let offset_ns = i64::try_from(offset_ns).unwrap_or(i64::MAX);
+    pts.saturating_add(multiview_core::time::MediaTime::from_nanos(offset_ns))
+}
+
+fn take_audio_chunk(
+    pending: &mut PendingAudio,
+    max_frames: usize,
+    rate: u32,
+) -> Result<(AudioBlock, multiview_core::time::MediaTime, bool)> {
+    let remaining = pending
+        .block
+        .frame_count()
+        .saturating_sub(pending.offset_frames);
+    let frames = remaining.min(max_frames.max(1));
+    let channels = pending.block.format().channel_count();
+    let from = pending.offset_frames.saturating_mul(channels);
+    let to = from.saturating_add(frames.saturating_mul(channels));
+    let pts = chunk_pts(pending.pts, pending.offset_frames, rate);
+    let samples = pending
+        .block
+        .interleaved()
+        .get(from..to)
+        .unwrap_or(&[])
+        .to_vec();
+    let chunk = AudioBlock::from_interleaved(pending.block.format(), samples)?;
+    pending.offset_frames = pending.offset_frames.saturating_add(frames);
+    Ok((
+        chunk,
+        pts,
+        pending.offset_frames >= pending.block.frame_count(),
+    ))
+}
+
 /// Consecutive decode errors tolerated before a connection is abandoned. A
 /// single corrupt packet (an ad-splice, a truncated segment) must not drop the
 /// source into a reconnect backoff.
 const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 32;
+
+struct PendingAudio {
+    block: AudioBlock,
+    pts: multiview_core::time::MediaTime,
+    offset_frames: usize,
+}
 
 /// Run a source's audio decode loop: open the file/URL at `path`, decode and
 /// resample each block to the store's canonical 48 kHz / `layout` / `f32`
@@ -1777,10 +1827,7 @@ pub fn paced_publish_loop(
             .max(1);
     // (queued blocks, queued frames). Only the decoder and the pacer touch it;
     // neither is the output clock.
-    let queue: Mutex<(
-        VecDeque<(AudioBlock, multiview_core::time::MediaTime)>,
-        usize,
-    )> = Mutex::new((VecDeque::new(), 0));
+    let queue: Mutex<(VecDeque<PendingAudio>, usize)> = Mutex::new((VecDeque::new(), 0));
     let producer_done = AtomicBool::new(false);
     let fatal = AtomicBool::new(false);
 
@@ -1792,8 +1839,15 @@ pub fn paced_publish_loop(
                 if stop.load(Ordering::Acquire) || fatal.load(Ordering::Acquire) {
                     return;
                 }
-                let front = lock(&queue).0.front().map(|b| (b.0.frame_count(), b.1));
-                let Some((front_frames, pts)) = front else {
+                let front = {
+                    let q = lock(&queue);
+                    q.0.front().map(|b| {
+                        let remaining = b.block.frame_count().saturating_sub(b.offset_frames);
+                        let pts = chunk_pts(b.pts, b.offset_frames, store.format().sample_rate());
+                        (remaining, pts)
+                    })
+                };
+                let Some((_front_frames, pts)) = front else {
                     if producer_done.load(Ordering::Acquire) && lock(&queue).0.is_empty() {
                         return;
                     }
@@ -1826,16 +1880,41 @@ pub fn paced_publish_loop(
                 }
                 let block = {
                     let mut q = lock(&queue);
-                    // Finite sources must not overwrite unread history. Keep a bounded
-                    // lead from the consumer; wait here on the decoder/pacer thread,
-                    // never on the bus or output clock. Live sources keep edge-following.
-                    let file_has_room = store.finite_append_has_room(front_frames);
-                    if file_has_room {
-                        let block = q.0.pop_front();
-                        if let Some(b) = &block {
-                            q.1 = q.1.saturating_sub(b.0.frame_count());
+                    // Split finite input into bounded pieces so even one decoder
+                    // packet larger than the ring can make progress without overwrite.
+                    let piece_limit = if store.is_finite_file() {
+                        store.capacity_frames
+                    } else {
+                        usize::MAX
+                    };
+                    let Some(front) = q.0.front_mut() else {
+                        continue;
+                    };
+                    let remaining = front
+                        .block
+                        .frame_count()
+                        .saturating_sub(front.offset_frames);
+                    let piece_frames = remaining.min(piece_limit);
+                    let can_publish =
+                        !store.is_finite_file() || store.finite_append_has_room(piece_frames);
+                    if can_publish {
+                        let (chunk, pts, finished) = match take_audio_chunk(
+                            front,
+                            piece_frames,
+                            store.format().sample_rate(),
+                        ) {
+                            Ok(chunk) => chunk,
+                            Err(error) => {
+                                tracing::error!(%error, "audio decode loop: audio chunk invalid");
+                                fatal.store(true, Ordering::Release);
+                                return;
+                            }
+                        };
+                        q.1 = q.1.saturating_sub(piece_frames);
+                        if finished {
+                            q.0.pop_front();
                         }
-                        block
+                        Some((chunk, pts))
                     } else {
                         None
                     }
@@ -1844,8 +1923,8 @@ pub fn paced_publish_loop(
                     std::thread::sleep(Duration::from_millis(2));
                     continue;
                 }
-                if let Some(block) = block {
-                    if let Err(error) = store.publish(&block.0) {
+                if let Some((block, _pts)) = block {
+                    if let Err(error) = store.publish(&block) {
                         // A format mismatch is a programming error (decoder and
                         // store share the canonical format); stop, don't busy-loop.
                         tracing::error!(%error, "audio decode loop: publish rejected; stopping");
@@ -1868,7 +1947,11 @@ pub fn paced_publish_loop(
                     consecutive_errors = 0;
                     let mut q = lock(&queue);
                     q.1 = q.1.saturating_add(unit.0.frame_count());
-                    q.0.push_back(unit);
+                    q.0.push_back(PendingAudio {
+                        block: unit.0,
+                        pts: unit.1,
+                        offset_frames: 0,
+                    });
                 }
                 Ok(None) => break, // end-of-stream: the pacer drains the queue
                 Err(AudioError::Stalled(reason)) => {
@@ -2062,6 +2145,81 @@ mod resync_tests {
                 audible_ticks >= 98,
                 "must drain the full four-second file, got {audible_ticks} ticks"
             );
+        });
+    }
+
+    #[test]
+    fn oversized_file_block_chunks_preserve_samples_and_absolute_pts() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let capacity = 96_000;
+        for frames in [capacity + 1, capacity * 2 + 17] {
+            let samples: Vec<f32> = (0..frames * 2)
+                .map(|i| i.to_string().parse::<f32>().unwrap())
+                .collect();
+            let block = AudioBlock::from_interleaved(format, samples.clone()).unwrap();
+            let original_pts = multiview_core::time::MediaTime::from_nanos(123_456_789);
+            let mut pending = PendingAudio {
+                block,
+                pts: original_pts,
+                offset_frames: 0,
+            };
+            let mut emitted = Vec::new();
+            let mut total = 0;
+            while pending.offset_frames < frames {
+                let (chunk, pts, done) = take_audio_chunk(&mut pending, capacity, 48_000).unwrap();
+                assert!(chunk.frame_count() <= capacity);
+                assert_eq!(
+                    pts,
+                    chunk_pts(original_pts, total, 48_000),
+                    "each chunk PTS derives from absolute frame offset"
+                );
+                total += chunk.frame_count();
+                emitted.extend_from_slice(chunk.interleaved());
+                assert_eq!(done, pending.offset_frames == frames);
+            }
+            assert_eq!(total, frames);
+            assert_eq!(
+                emitted, samples,
+                "split must neither lose nor duplicate samples"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_file_wait_is_stop_cancellable() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let capacity = 96_000;
+        let store = AudioStore::finite_file(format, capacity);
+        let stop = AtomicBool::new(false);
+        let oversized =
+            AudioBlock::from_interleaved(format, vec![0.25; (capacity * 2 + 1) * 2]).unwrap();
+        let mut emitted = false;
+        let next = || {
+            if emitted {
+                Ok(None)
+            } else {
+                emitted = true;
+                Ok(Some((
+                    oversized.clone(),
+                    multiview_core::time::MediaTime::ZERO,
+                )))
+            }
+        };
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                paced_publish_loop(next, &store, &stop, Duration::ZERO, Duration::from_secs(20));
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while store.buffered_frames() < capacity && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(store.buffered_frames(), capacity);
+            stop.store(true, Ordering::Release);
+            worker
+                .join()
+                .expect("stop must release paced worker promptly");
         });
     }
 
