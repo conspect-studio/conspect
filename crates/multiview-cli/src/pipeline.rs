@@ -1595,6 +1595,8 @@ pub struct Pipeline {
     /// than showing a fabricated constant.
     #[cfg(feature = "overlay")]
     meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
+    #[cfg(feature = "overlay")]
+    meter_channel_timelines: std::collections::HashMap<String, Vec<crate::overlays::MeterChannels>>,
     /// Per-source human label (`display_name`, or the id when unnamed), keyed by
     /// source id — the text drawn bottom-left of each tile.
     #[cfg(feature = "overlay")]
@@ -2465,7 +2467,7 @@ impl Pipeline {
         // rides its floor — no fabricated constant). This never touches the hot
         // path: it is computed once at build time.
         #[cfg(feature = "overlay")]
-        let meter_db_timelines = build_meter_timelines(config, cadence);
+        let (meter_db_timelines, meter_channel_timelines) = build_meter_timelines(config, cadence);
         #[cfg(feature = "overlay")]
         let tile_labels = config
             .sources
@@ -2560,6 +2562,8 @@ impl Pipeline {
             sidecar_target,
             #[cfg(feature = "overlay")]
             meter_db_timelines,
+            #[cfg(feature = "overlay")]
+            meter_channel_timelines,
             #[cfg(feature = "overlay")]
             tile_labels,
             #[cfg(feature = "overlay")]
@@ -3970,6 +3974,7 @@ impl Pipeline {
             tile_specs: self.tile_specs(),
             tile_spec_apply: Arc::clone(&self.tile_spec_apply),
             meter_db_timelines: self.meter_db_timelines.clone(),
+            meter_channel_timelines: self.meter_channel_timelines.clone(),
             subtitles: self.subtitles.clone(),
             sidecar_target: self.sidecar_target.clone(),
             analog_clocks: self.analog_clocks.clone(),
@@ -4005,6 +4010,8 @@ struct BakeContext {
     /// Build-time per-source per-tick loudness timelines (dBFS) for the meters.
     #[cfg(feature = "overlay")]
     meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
+    #[cfg(feature = "overlay")]
+    meter_channel_timelines: std::collections::HashMap<String, Vec<crate::overlays::MeterChannels>>,
     /// The optional legacy `--subtitles` sidecar track (burned into its target).
     #[cfg(feature = "overlay")]
     subtitles: Option<multiview_overlay::subtitle::CueTrack>,
@@ -4085,7 +4092,7 @@ struct StreamBaker {
     /// Last tile snapshot from the active drive, to avoid resetting meter state.
     tile_snapshot: Arc<Vec<crate::overlays::TileSpec>>,
     /// Last per-input audio peak observed by the consumer's live bus meter.
-    live_meter_db: std::collections::HashMap<String, f64>,
+    live_meter_db: std::collections::HashMap<String, crate::overlays::MeterChannels>,
     /// Bounded per-input peak/RMS sampler shared with audio telemetry.
     input_meters: crate::meter_telemetry::InputMeters,
 }
@@ -4165,12 +4172,10 @@ impl StreamBaker {
         let samples = self.input_meters.push(&bus.input_tracks(), now_ns);
         for sample in &samples {
             if let Some(id) = sample.input_id.as_ref() {
-                let peak = sample
-                    .peak_db
-                    .iter()
-                    .copied()
-                    .fold(f32::NEG_INFINITY, f32::max);
-                self.live_meter_db.insert(id.clone(), f64::from(peak));
+                self.live_meter_db.insert(
+                    id.clone(),
+                    crate::overlays::MeterChannels::from_db(&sample.peak_db),
+                );
             }
         }
         samples
@@ -4214,11 +4219,23 @@ impl StreamBaker {
             dynamics.insert(
                 spec.source_id.clone(),
                 crate::overlays::TileDynamics {
-                    meter_db: self
+                    meter_db: self.meter.meter_db_for(&spec.source_id, i),
+                    channels: self
                         .live_meter_db
                         .get(&spec.source_id)
                         .copied()
-                        .unwrap_or_else(|| self.meter.meter_db_for(&spec.source_id, i)),
+                        .or_else(|| {
+                            self.meter
+                                .meter_channel_timelines
+                                .get(&spec.source_id)
+                                .and_then(|timeline| {
+                                    timeline
+                                        .get(i)
+                                        .copied()
+                                        .or_else(|| timeline.last().copied())
+                                })
+                        })
+                        .unwrap_or(crate::overlays::MeterChannels::EMPTY),
                     state,
                     fault,
                 },
@@ -6898,19 +6915,37 @@ fn ticks_per_second(cadence: Rational) -> u32 {
 fn build_meter_timelines(
     config: &MultiviewConfig,
     cadence: Rational,
-) -> std::collections::HashMap<String, Vec<f64>> {
-    let mut timelines = std::collections::HashMap::new();
+) -> (
+    std::collections::HashMap<String, Vec<f64>>,
+    std::collections::HashMap<String, Vec<crate::overlays::MeterChannels>>,
+) {
+    let mut scalar = std::collections::HashMap::new();
+    let mut channels = std::collections::HashMap::new();
     for source in &config.sources {
-        // Only a file-backed source has decodable audio to pre-measure here.
-        // Synthetic (bars/solid/clock) carry no audio; live URLs never EOF and are
-        // not pre-decoded; NDI/unknown carry no file. None get a build-time meter.
         let path = match &source.kind {
             SourceKind::File { path } => PathBuf::from(path),
             _ => continue,
         };
         match meter_timeline_for_file(&path, cadence) {
             Ok(timeline) if !timeline.is_empty() => {
-                timelines.insert(source.id.clone(), timeline);
+                scalar.insert(
+                    source.id.clone(),
+                    timeline
+                        .iter()
+                        .map(|reading| {
+                            f64::from(
+                                reading
+                                    .db
+                                    .get(..reading.count)
+                                    .unwrap_or(&[])
+                                    .iter()
+                                    .copied()
+                                    .fold(-120.0_f32, f32::max),
+                            )
+                        })
+                        .collect(),
+                );
+                channels.insert(source.id.clone(), timeline);
             }
             Ok(_) => {}
             Err(reason) => {
@@ -6918,57 +6953,74 @@ fn build_meter_timelines(
             }
         }
     }
-    timelines
+    (scalar, channels)
 }
 
-/// Decode `path`'s audio and snapshot a sample-peak meter at each output-tick
-/// boundary, yielding one dBFS reading per tick.
+/// The file decoder normalizes into stereo PCM; L/R describe its output, not the
+/// original source channel count or layout. Sample peaks never downmix L/R.
 #[cfg(feature = "overlay")]
-fn meter_timeline_for_file(path: &Path, cadence: Rational) -> Result<Vec<f64>, String> {
+fn meter_timeline_for_file(
+    path: &Path,
+    cadence: Rational,
+) -> Result<Vec<crate::overlays::MeterChannels>, String> {
     use multiview_audio::decode::AudioFileDecoder;
     use multiview_audio::{Ballistics, ChannelLayout, MeterScale, PeakMode};
-
     let mut decoder =
         AudioFileDecoder::open(path, ChannelLayout::Stereo).map_err(|e| e.to_string())?;
     let format = decoder.format();
     let rate = format.sample_rate();
-    let channels = format.channel_count().max(1);
-    let mut meter = Ballistics::new(rate, MeterScale::SamplePeak(PeakMode::Sample));
-
-    // Samples per output tick = sample_rate * den / num (exact integer; never
-    // float fps). At least one sample per tick so a tick always advances.
+    let channels = format
+        .channel_count()
+        .min(crate::overlays::MAX_METER_CHANNELS);
+    let mut meters =
+        vec![Ballistics::new(rate, MeterScale::SamplePeak(PeakMode::Sample)); channels];
     let num = i128::from(cadence.num).max(1);
     let den = i128::from(cadence.den).max(1);
-    let samples_per_tick = (i128::from(rate).saturating_mul(den) / num).max(1);
-
+    let mut next_tick = 1_i128;
+    let mut frames = 0_i128;
     let mut timeline = Vec::new();
-    // Drive the meter sample-by-sample (downmix to mono by averaging the frame's
-    // channels — the meter wants a single program-loudness reading), emitting the
-    // reading each time we cross a tick boundary in input samples.
-    let mut samples_since_tick: i128 = 0;
     while let Some(block) = decoder.next_block().map_err(|e| e.to_string())? {
         for frame in block.interleaved().chunks_exact(channels) {
-            let sum: f32 = frame.iter().copied().sum();
-            let mono = f64::from(sum) / f64::from(u32_from_usize_audio(channels));
-            meter.push(mono);
-            samples_since_tick = samples_since_tick.saturating_add(1);
-            if samples_since_tick >= samples_per_tick {
-                timeline.push(meter.reading_db());
-                samples_since_tick = 0;
+            for (meter, &sample) in meters.iter_mut().zip(frame) {
+                meter.push(f64::from(sample));
+            }
+            frames = frames.saturating_add(1);
+            if frames.saturating_mul(num)
+                >= next_tick
+                    .saturating_mul(i128::from(rate))
+                    .saturating_mul(den)
+            {
+                timeline.push(crate::overlays::MeterChannels::from_db(
+                    &meters
+                        .iter()
+                        .map(|meter| {
+                            meter
+                                .reading_db()
+                                .to_string()
+                                .parse::<f32>()
+                                .unwrap_or(-120.0)
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+                next_tick = next_tick.saturating_add(1);
             }
         }
     }
-    // Flush a final partial tick so a short clip still contributes a reading.
-    if samples_since_tick > 0 {
-        timeline.push(meter.reading_db());
+    if timeline.is_empty() && frames > 0 {
+        timeline.push(crate::overlays::MeterChannels::from_db(
+            &meters
+                .iter()
+                .map(|meter| {
+                    meter
+                        .reading_db()
+                        .to_string()
+                        .parse::<f32>()
+                        .unwrap_or(-120.0)
+                })
+                .collect::<Vec<_>>(),
+        ));
     }
     Ok(timeline)
-}
-
-/// Saturating `usize` → `u32` for the audio-channel divisor (no `as`).
-#[cfg(feature = "overlay")]
-fn u32_from_usize_audio(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// The codec token a config output names, if it carries one.
@@ -14810,6 +14862,7 @@ mod live_overlay_bake_tests {
             tile_specs: Vec::new(),
             tile_spec_apply: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
             meter_db_timelines: HashMap::new(),
+            meter_channel_timelines: HashMap::new(),
             subtitles: None,
             sidecar_target: None,
             analog_clocks: Vec::new(),
@@ -14849,8 +14902,11 @@ mod live_overlay_bake_tests {
         );
         let cnn = crate::audio::new_store();
         let bbc = crate::audio::new_store();
-        cnn.publish_samples(&vec![0.5; 2_000 * 2])
-            .expect("cnn samples");
+        let mut unequal = Vec::with_capacity(2_000 * 2);
+        for _ in 0..2_000 {
+            unequal.extend_from_slice(&[0.5, 0.0]);
+        }
+        cnn.publish_samples(&unequal).expect("cnn samples");
         bbc.publish_samples(&vec![0.0; 2_000 * 2])
             .expect("bbc silence");
         bus.add_source("cnn", cnn, 0.0);
@@ -14859,12 +14915,17 @@ mod live_overlay_bake_tests {
         assert_eq!(block.frame_count(), 1_920);
         let samples = baker.sample_input_meters(&bus, std::time::Duration::from_millis(40));
         assert_eq!(samples.len(), 2);
+        assert_eq!(baker.live_meter_db["cnn"].count, 2);
         assert!(
-            baker.live_meter_db["cnn"] > -9.0,
-            "CNN tile follows its live audio"
+            baker.live_meter_db["cnn"].db[0] > -9.0,
+            "CNN left follows pre-gain audio"
         );
         assert!(
-            baker.live_meter_db["bbc"] < -50.0,
+            baker.live_meter_db["cnn"].db[1] < -50.0,
+            "CNN right stays silent"
+        );
+        assert!(
+            baker.live_meter_db["bbc"].db[0] < -50.0,
             "BBC tile stays at floor"
         );
     }

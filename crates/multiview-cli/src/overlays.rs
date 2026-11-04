@@ -33,7 +33,41 @@
 
 use std::collections::HashMap;
 
-use multiview_audio::meterdata::{Conflator, MeterSample};
+use multiview_audio::meterdata::Conflator;
+
+/// At most six discrete channels are represented by the audio format (5.1).
+/// Current CLI source decode and program-bus paths normalize to stereo PCM.
+pub const MAX_METER_CHANNELS: usize = 6;
+
+/// Measured channels of the canonical PCM block. These are *post-decode* channels:
+/// a decoder can have remixed the original stream before this measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterChannels {
+    /// Number of measured channels in `db`.
+    pub count: usize,
+    /// dBFS sample peaks in canonical PCM order; unused slots have the floor.
+    pub db: [f32; MAX_METER_CHANNELS],
+}
+
+impl MeterChannels {
+    /// No available measurement (not a claim that the source is mono).
+    pub const EMPTY: Self = Self {
+        count: 0,
+        db: [-120.0; MAX_METER_CHANNELS],
+    };
+
+    /// Copy up to six discrete channel peaks without downmixing.
+    #[must_use]
+    pub fn from_db(values: &[f32]) -> Self {
+        let mut out = Self::EMPTY;
+        out.count = values.len().min(MAX_METER_CHANNELS);
+        for (dest, value) in out.db.iter_mut().zip(values.iter()).take(out.count) {
+            *dest = *value;
+        }
+        out
+    }
+}
+
 use multiview_compositor::overlay::meters::{MeterBar, MeterScale};
 use multiview_compositor::overlay::subpass::{
     clock_face, ClockFaceStyle, HandAngles, OverlayColor, OverlayDrawList, OverlayPrimitive,
@@ -171,8 +205,11 @@ impl TileFault {
 /// is `NO_SIGNAL`; a healthy tile carries [`TileFault::None`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TileDynamics {
-    /// The source's current program loudness in dBFS (its own audio).
+    /// Legacy maximum source peak in dBFS for non-channel fault consumers; the
+    /// visible meter reads `channels`, not this aggregate.
     pub meter_db: f64,
+    /// Discrete decoded channels, if a pre-route source measurement exists.
+    pub channels: MeterChannels,
     /// The tile's lifecycle state sampled this tick.
     pub state: SourceState,
     /// The tile's detected content fault sampled this tick (distinct from
@@ -183,15 +220,23 @@ pub struct TileDynamics {
 /// The per-tile peak-hold meter + conflator state, kept across frames so the
 /// vertical bar tracks the source's own audio and the held peak decays smoothly.
 struct TileMeter {
-    bar: MeterBar,
-    conflator: Conflator<MeterSample>,
+    bars: [MeterBar; MAX_METER_CHANNELS],
+    count: usize,
+    conflator: Conflator<MeterChannels>,
+    last_ns: Option<i64>,
+    peak_hold_until_ns: [i64; MAX_METER_CHANNELS],
+    clip_until_ns: [i64; MAX_METER_CHANNELS],
 }
 
 impl TileMeter {
     fn new() -> Self {
         Self {
-            bar: MeterBar::new(MeterScale::default()),
+            bars: [MeterBar::new(MeterScale::default()); MAX_METER_CHANNELS],
+            count: 0,
             conflator: Conflator::with_rate(multiview_audio::meterdata::DISPLAY_HZ),
+            last_ns: None,
+            peak_hold_until_ns: [0; MAX_METER_CHANNELS],
+            clip_until_ns: [0; MAX_METER_CHANNELS],
         }
     }
 }
@@ -432,6 +477,7 @@ impl OverlayBaker {
     ///
     /// Returns the compositor [`CompositorError`] only if a glyph cannot fit the
     /// atlas (a degenerate font/size); text that simply does not ink is skipped.
+    #[allow(clippy::too_many_lines)] // Overlay draw list also owns caption and clock chrome.
     pub fn draw_list(
         &mut self,
         pts: MediaTime,
@@ -452,21 +498,55 @@ impl OverlayBaker {
             };
             let dyn_ = dynamics.get(&source_id).copied().unwrap_or(TileDynamics {
                 meter_db: multiview_audio::Ballistics::FLOOR_DB,
+                channels: MeterChannels::EMPTY,
                 state: SourceState::NoSignal,
                 fault: TileFault::None,
             });
 
             // Advance this tile's meter from its own audio (conflated ~30 Hz).
             if let Some(meter) = self.meters.get_mut(i) {
-                meter.conflator.accept(MeterSample { db: dyn_.meter_db });
+                let channels = dyn_.channels;
+                meter.conflator.accept(channels);
                 if let Some(sample) = meter.conflator.poll(now_ns) {
-                    meter.bar.observe_db(sample.db_f32());
+                    meter.count = sample.count.min(MAX_METER_CHANNELS);
+                    for ch in 0..meter.count {
+                        if let (Some(bar), Some(&db), Some(hold), Some(clip)) = (
+                            meter.bars.get_mut(ch),
+                            sample.db.get(ch),
+                            meter.peak_hold_until_ns.get_mut(ch),
+                            meter.clip_until_ns.get_mut(ch),
+                        ) {
+                            let previous = bar.peak();
+                            bar.observe_db(db);
+                            if bar.peak() > previous {
+                                *hold = now_ns.saturating_add(250_000_000);
+                            }
+                            if db >= 0.0 {
+                                *clip = now_ns.saturating_add(1_000_000_000);
+                            }
+                        }
+                    }
                 }
-                meter.bar.decay_peak(0.02);
+                // Decay by elapsed output time, not by the number of draw calls.
+                let dt = meter.last_ns.map_or(0, |last| {
+                    now_ns.saturating_sub(last).clamp(0, 1_000_000_000)
+                });
+                meter.last_ns = Some(now_ns);
+                for (ch, bar) in meter.bars.iter_mut().enumerate() {
+                    if now_ns > meter.peak_hold_until_ns.get(ch).copied().unwrap_or(0) {
+                        let ms = u16::try_from(dt / 1_000_000).unwrap_or(1_000);
+                        bar.decay_peak(f32::from(ms) * 0.0005);
+                    }
+                }
             }
-            let bar = self.meters.get(i).map(|m| m.bar);
+            let bars = self
+                .meters
+                .get(i)
+                .map(|m| (m.bars, m.count, m.clip_until_ns));
 
-            self.draw_tile(&mut list, &label, rect, dyn_.state, dyn_.fault, bar)?;
+            self.draw_tile(
+                &mut list, &label, rect, dyn_.state, dyn_.fault, bars, now_ns,
+            )?;
 
             // Burn this source's active caption (if any) into THIS tile's cell
             // rect, bottom-centre — never canvas-wide.
@@ -621,6 +701,7 @@ impl OverlayBaker {
     /// Draw one tile's overlay surface inside its cell `rect`: optional safe-area,
     /// the source's vertical dB meter (right edge), a bottom-left input label, and
     /// a top-left state/fault flag.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // Tile chrome and meter share the clipped cell.
     fn draw_tile(
         &mut self,
         list: &mut OverlayDrawList,
@@ -628,7 +709,12 @@ impl OverlayBaker {
         rect: PixelRect,
         state: SourceState,
         fault: TileFault,
-        bar: Option<MeterBar>,
+        bars: Option<(
+            [MeterBar; MAX_METER_CHANNELS],
+            usize,
+            [i64; MAX_METER_CHANNELS],
+        )>,
+        now_ns: i64,
     ) -> Result<(), CompositorError> {
         let geom = TileGeometry::resolve(rect);
         if geom.width < MIN_TILE_PX || geom.height < MIN_TILE_PX {
@@ -654,9 +740,132 @@ impl OverlayBaker {
 
         // The per-input dB meter: a vertical peak-held bar down the tile's RIGHT
         // edge, fed by THAT input's own audio.
-        if let Some(bar) = bar {
+        if let Some((bars, count, clips)) = bars {
             let track = geom.meter_track();
-            bar.push_into(list, track, true, GREEN, AMBER);
+            let count = count.min(usize::try_from(track.width / 2).unwrap_or(0));
+            if count > 0 && track.height > 0 {
+                let stride = track.width / u32_from_usize(count);
+                let scale = MeterScale::default();
+                for ch in 0..count {
+                    let left = track
+                        .x
+                        .saturating_add(i32_dim(u32_from_usize(ch).saturating_mul(stride)));
+                    let width = if ch + 1 == count {
+                        track
+                            .width
+                            .saturating_sub(u32_from_usize(ch).saturating_mul(stride))
+                    } else {
+                        stride
+                    };
+                    let lane = OverlayRect::new(
+                        left,
+                        track.y,
+                        width.saturating_sub(1).max(1),
+                        track.height,
+                    );
+                    let Some(bar) = bars.get(ch).copied() else {
+                        continue;
+                    };
+                    push_filled_rect(list, lane, CHROME_BG);
+                    // -18 and -6 dBFS zone transitions; the colour follows the
+                    // level through all three regions, not just its top pixel.
+                    for (lo, hi, color) in [
+                        (-60.0, -18.0, GREEN),
+                        (-18.0, -6.0, AMBER),
+                        (-6.0, 0.0, RED),
+                    ] {
+                        let bottom = scale.deflection(lo).min(bar.level());
+                        let top = scale.deflection(hi).min(bar.level());
+                        let y0 = lane.y.saturating_add(i32_dim(
+                            lane.height.saturating_sub(meter_pixels(lane.height, top)),
+                        ));
+                        let y1 = lane.y.saturating_add(i32_dim(
+                            lane.height
+                                .saturating_sub(meter_pixels(lane.height, bottom)),
+                        ));
+                        if y1 > y0 {
+                            push_filled_rect(
+                                list,
+                                OverlayRect::new(
+                                    lane.x,
+                                    y0,
+                                    lane.width,
+                                    u32::try_from(y1 - y0).unwrap_or(0),
+                                ),
+                                color,
+                            );
+                        }
+                    }
+                    if bar.peak() > 0.0 {
+                        let y = lane.y.saturating_add(i32_dim(
+                            lane.height
+                                .saturating_sub(meter_pixels(lane.height, bar.peak())),
+                        ));
+                        push_filled_rect(list, OverlayRect::new(lane.x, y, lane.width, 1), WHITE);
+                    }
+                    if clips.get(ch).copied().unwrap_or(0) > now_ns {
+                        push_filled_rect(
+                            list,
+                            OverlayRect::new(lane.x, lane.y, lane.width, 2.min(lane.height)),
+                            RED,
+                        );
+                    }
+                }
+                // A readable dBFS scale belongs to the meter, not the canvas.
+                // Suppress it on compact cells rather than obscure their video.
+                if geom.width >= 400 && geom.height >= 400 && track.height >= 120 {
+                    for (db, text) in [(0.0, "0"), (-6.0, "-6"), (-18.0, "-18"), (-60.0, "-60")] {
+                        let y = track.y.saturating_add(i32_dim(
+                            track
+                                .height
+                                .saturating_sub(meter_pixels(track.height, scale.deflection(db))),
+                        ));
+                        let x = track.x.saturating_sub(27);
+                        self.push_text_clipped(
+                            list,
+                            text,
+                            TextRun {
+                                family: FontFamily::Mono,
+                                size_px: 9.0,
+                                x,
+                                y: y.saturating_sub(5),
+                                color: WHITE,
+                            },
+                            geom.clip_rect(),
+                        )?;
+                    }
+                }
+                // The decoded PCM layout is known; do not claim the original
+                // stream layout survives decoder normalization.
+                if track.height >= 36 && stride >= 5 {
+                    for ch in 0..count {
+                        let text = match (count, ch) {
+                            (1, _) => "M",
+                            (2 | 6, 0) => "L",
+                            (2 | 6, 1) => "R",
+                            (6, 2) => "C",
+                            (6, 3) => "F",
+                            (6, 4) => "S",
+                            (6, _) => "s",
+                            _ => "?",
+                        };
+                        self.push_text_clipped(
+                            list,
+                            text,
+                            TextRun {
+                                family: FontFamily::Mono,
+                                size_px: 8.0,
+                                x: track.x.saturating_add(i32_dim(
+                                    u32_from_usize(ch).saturating_mul(stride),
+                                )),
+                                y: track.y.saturating_add(3),
+                                color: WHITE,
+                            },
+                            geom.clip_rect(),
+                        )?;
+                    }
+                }
+            }
         }
 
         // The state / fault flag: a top-left badge whose TEXT names the state, on
@@ -1311,6 +1520,22 @@ fn i32_dim(value: u32) -> i32 {
 }
 
 /// Saturating `usize` → `u32`, no `as`.
+fn meter_pixels(height: u32, fraction: f32) -> u32 {
+    let height = height.min(65_535);
+    let target = f64::from(height) * f64::from(fraction.clamp(0.0, 1.0));
+    let mut lo = 0_u32;
+    let mut hi = height;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if f64::from(mid) < target {
+            lo = mid.saturating_add(1);
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 fn u32_from_usize(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -1432,6 +1657,10 @@ mod tests {
                     (*id).to_owned(),
                     TileDynamics {
                         meter_db: *db,
+                        channels: MeterChannels::from_db(&[db
+                            .to_string()
+                            .parse::<f32>()
+                            .unwrap_or(-120.0)]),
                         state: *state,
                         fault: TileFault::None,
                     },
@@ -1452,6 +1681,10 @@ mod tests {
                     (*id).to_owned(),
                     TileDynamics {
                         meter_db: *db,
+                        channels: MeterChannels::from_db(&[db
+                            .to_string()
+                            .parse::<f32>()
+                            .unwrap_or(-120.0)]),
                         state: *state,
                         fault: *fault,
                     },
@@ -1499,12 +1732,7 @@ mod tests {
             .count()
     }
 
-    /// The **live green fill** rectangles in the tile's right-edge meter column.
-    ///
-    /// The meter draws three primitives per track: a dim (low-alpha) green
-    /// background spanning the whole track, the live opaque-green fill, and an
-    /// amber 1px peak tick. We keep only the live fill (opaque green) so its
-    /// height is a faithful proxy for the source's loudness deflection.
+    /// The opaque coloured live fill zones in the tile's meter column.
     fn meter_fill_in(list: &OverlayDrawList, geom: TileGeometry) -> Vec<OverlayRect> {
         let track = geom.meter_track();
         let cell_top = geom.y;
@@ -1519,10 +1747,9 @@ mod tests {
                         // tile sharing the meter column is not miscounted.
                         && rect.y >= cell_top
                         && rect.y <= cell_bottom
-                        // Opaque green live fill only (exclude the dim background
-                        // and the amber peak tick).
-                        && (color.a - GREEN.a).abs() < 0.01
-                        && (color.g - GREEN.g).abs() < 0.01 =>
+                        // All opaque coloured live zones; exclude the backing,
+                        // white peak marker, and channel label glyphs.
+                        && [GREEN, AMBER, RED].contains(color) =>
                 {
                     Some(*rect)
                 }
@@ -1532,6 +1759,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end geometry fixture covers both unequal cells.
     fn live_relayout_confines_badges_labels_and_meters_to_unequal_tiles() {
         let mut baker = OverlayBaker::new(
             vec![TileSpec::new(
@@ -1569,6 +1797,7 @@ mod tests {
             "cnn".to_owned(),
             TileDynamics {
                 meter_db: -3.0,
+                channels: MeterChannels::from_db(&[-3.0]),
                 state: SourceState::Live,
                 fault: TileFault::Silent,
             },
@@ -1577,6 +1806,7 @@ mod tests {
             "bbc".to_owned(),
             TileDynamics {
                 meter_db: -9.0,
+                channels: MeterChannels::from_db(&[-9.0]),
                 state: SourceState::Live,
                 fault: TileFault::None,
             },
@@ -1679,9 +1909,9 @@ mod tests {
         // silent tile (in_b): the per-input meter reflects THAT input's audio.
         let geom_a = TileGeometry::resolve(tiles[0].rect);
         let geom_b = TileGeometry::resolve(tiles[1].rect);
-        let tallest = |rects: &[OverlayRect]| rects.iter().map(|r| r.height).max().unwrap_or(0);
-        let a_fill = tallest(&meter_fill_in(&list, geom_a));
-        let b_fill = tallest(&meter_fill_in(&list, geom_b));
+        let total = |rects: &[OverlayRect]| rects.iter().map(|r| r.height).sum::<u32>();
+        let a_fill = total(&meter_fill_in(&list, geom_a));
+        let b_fill = total(&meter_fill_in(&list, geom_b));
         assert!(
             a_fill > b_fill + 10,
             "loud tile meter fill ({a_fill}) must exceed silent tile fill ({b_fill})"
@@ -1974,6 +2204,146 @@ mod tests {
     }
 
     #[test]
+    fn separate_channels_zones_clip_and_peak_decay_stay_in_tile() {
+        let rect = PixelRect {
+            x: 13.0,
+            y: 7.0,
+            width: 180.0,
+            height: 150.0,
+        };
+        let mut baker =
+            OverlayBaker::new(vec![TileSpec::new("stereo", "Stereo", rect)], epoch_clock())
+                .unwrap()
+                .with_clock(None);
+        let mut dynamics = HashMap::from([(
+            "stereo".to_owned(),
+            TileDynamics {
+                meter_db: -6.0,
+                channels: MeterChannels::from_db(&[0.0, -120.0]),
+                state: SourceState::Live,
+                fault: TileFault::None,
+            },
+        )]);
+        let first = baker
+            .draw_list(
+                MediaTime::from_nanos(0),
+                &dynamics,
+                &HashMap::new(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        let track = TileGeometry::resolve(rect).meter_track();
+        let lane = |list: &OverlayDrawList,
+                    channel: usize,
+                    color: OverlayColor|
+         -> Vec<OverlayRect> {
+            list.primitives
+                .iter()
+                .filter_map(|p| match p {
+                    OverlayPrimitive::FilledRect { rect, color: c, .. }
+                        if *c == color
+                            && rect.x
+                                >= track.x
+                                    + i32_dim(u32_from_usize(channel) * (track.width / 2))
+                            && rect.x
+                                < track.x
+                                    + i32_dim(u32_from_usize(channel + 1) * (track.width / 2))
+                            && rect.y >= track.y
+                            && rect.y < track.y + i32_dim(track.height) =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        for color in [GREEN, AMBER, RED] {
+            assert!(
+                !lane(&first, 0, color).is_empty(),
+                "left has every full-scale zone"
+            );
+        }
+        assert!(
+            lane(&first, 1, GREEN).is_empty(),
+            "right silence cannot borrow left signal"
+        );
+        assert_eq!(baker.meters[0].clip_until_ns[0], 1_000_000_000);
+        assert_eq!(baker.meters[0].clip_until_ns[1], 0);
+        let peak = baker.meters[0].bars[0].peak();
+        dynamics.get_mut("stereo").unwrap().channels = MeterChannels::from_db(&[-120.0, -20.0]);
+        baker
+            .draw_list(
+                MediaTime::from_nanos(200_000_000),
+                &dynamics,
+                &HashMap::new(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        assert_eq!(
+            baker.meters[0].bars[0].peak(),
+            peak,
+            "peak holds for 250 ms"
+        );
+        baker
+            .draw_list(
+                MediaTime::from_nanos(2_000_000_000),
+                &dynamics,
+                &HashMap::new(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        assert!(baker.meters[0].clip_until_ns[0] < 2_000_000_000);
+        assert!(baker.meters[0].bars[0].peak() < peak);
+    }
+
+    #[test]
+    fn channel_count_is_bounded_and_tiny_cell_meter_is_confined() {
+        let data = MeterChannels::from_db(&[0.0, -6.0, -18.0, -30.0, -40.0, -60.0, 10.0]);
+        assert_eq!(data.count, MAX_METER_CHANNELS);
+        assert_eq!(data.db[5], -60.0);
+        let rect = PixelRect {
+            x: 21.0,
+            y: 13.0,
+            width: 49.0,
+            height: 49.0,
+        };
+        let mut baker = OverlayBaker::new(vec![TileSpec::new("six", "Six", rect)], epoch_clock())
+            .unwrap()
+            .with_clock(None);
+        let dynamics = HashMap::from([(
+            "six".to_owned(),
+            TileDynamics {
+                meter_db: 0.0,
+                channels: data,
+                state: SourceState::Live,
+                fault: TileFault::None,
+            },
+        )]);
+        let list = baker
+            .draw_list(
+                MediaTime::from_nanos(0),
+                &dynamics,
+                &HashMap::new(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        let geom = TileGeometry::resolve(rect);
+        for primitive in &list.primitives {
+            if let OverlayPrimitive::FilledRect { rect: r, .. } = primitive {
+                assert!(
+                    r.x >= geom.x
+                        && r.y >= geom.y
+                        && r.x.saturating_add(i32_dim(r.width))
+                            <= geom.x.saturating_add(i32_dim(geom.width))
+                        && r.y.saturating_add(i32_dim(r.height))
+                            <= geom.y.saturating_add(i32_dim(geom.height)),
+                    "{r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn normal_tile_keeps_full_no_audio_badge_text() {
         let rect = PixelRect {
             x: 30.0,
@@ -1989,6 +2359,7 @@ mod tests {
             "source".to_owned(),
             TileDynamics {
                 meter_db: -3.0,
+                channels: MeterChannels::from_db(&[-3.0]),
                 state: SourceState::Live,
                 fault: TileFault::Silent,
             },
@@ -2101,6 +2472,7 @@ mod tests {
                 "dw".to_owned(),
                 TileDynamics {
                     meter_db: -3.0,
+                    channels: MeterChannels::from_db(&[-3.0, -120.0]),
                     state: SourceState::Live,
                     fault: TileFault::Silent,
                 },
@@ -2108,6 +2480,22 @@ mod tests {
             let list = baker
                 .draw_list(MediaTime::ZERO, &dynamics, &no_captions(), &no_bitmaps())
                 .unwrap();
+            // One rendered output proves shaped final ink and distinct source L/R
+            // levels survive together. The silent R channel never inherits L.
+            let track = geom.meter_track();
+            let green_left = list.primitives.iter().any(|p| matches!(p,
+                OverlayPrimitive::FilledRect { rect, color, .. }
+                if *color == GREEN && rect.x == track.x && rect.y >= track.y && rect.y < track.y + i32_dim(track.height)));
+            let green_right = list.primitives.iter().any(|p| {
+                matches!(p,
+                OverlayPrimitive::FilledRect { rect, color, .. }
+                if *color == GREEN && rect.x == track.x + i32_dim(track.width / 2)
+                    && rect.y >= track.y && rect.y < track.y + i32_dim(track.height))
+            });
+            assert!(
+                green_left && !green_right,
+                "shaped DW News chrome and unequal L/R bars coexist"
+            );
             let label_y = geom.y + i32_dim(geom.height - geom.chip_height());
             assert_final_glyph_unclipped(
                 &list,
@@ -2196,6 +2584,7 @@ mod tests {
                 "source".to_owned(),
                 TileDynamics {
                     meter_db: -3.0,
+                    channels: MeterChannels::from_db(&[-3.0]),
                     state: SourceState::Live,
                     fault: TileFault::Silent,
                 },
