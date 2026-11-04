@@ -345,6 +345,12 @@ impl Demuxer {
         format_context_addr(&self.input)
     }
 
+    /// The opened path or URL.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     /// Snapshot every stream's parameters.
     #[must_use]
     pub fn streams(&self) -> Vec<StreamParams> {

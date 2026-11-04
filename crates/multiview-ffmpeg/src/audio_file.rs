@@ -99,7 +99,33 @@ pub struct AudioFileDecoder {
     finished: bool,
     /// Pending input packets have all been sent; only draining remains.
     eof_sent: bool,
+    /// Live inputs only: follow the audio onto a new stream when it moves, and
+    /// report a connection that has lost its audio ([`FfmpegError::AudioStarved`]).
+    live: bool,
+    /// Consecutive packets read since the last packet of the selected stream.
+    since_ours: u32,
+    /// Packets per other audio stream within the current `since_ours` run.
+    other_audio: Vec<(usize, u32)>,
+    /// Media time (ns) elapsed on non-audio streams since the last audio
+    /// packet, with the latest PTS per stream it was measured from.
+    quiet_ns: i64,
+    quiet_last: Vec<(usize, i64)>,
 }
+
+/// A live audio stream that delivers no packet for this many reads while
+/// another audio stream delivers [`SWITCH_AFTER`] has moved (an ad splice or
+/// origin switch onto new PIDs).
+const SWITCH_AFTER: u32 = 100;
+
+/// Stream time (other streams' packet PTS) with no audio on any stream before a
+/// live input counts as having lost its audio. Measured in media time, not
+/// wall time or packet count, so a slow origin or a low frame rate cannot
+/// trigger it.
+const STARVED_AFTER_NS: i64 = 30_000_000_000;
+
+/// The largest PTS step between two packets of one stream that still counts
+/// as elapsed time (well over a frame at any rate; far under a splice).
+const MAX_PTS_STEP_NS: i64 = 1_000_000_000;
 
 impl AudioFileDecoder {
     /// Open `path`, select its best audio stream, and prepare to decode it to
@@ -136,11 +162,13 @@ impl AudioFileDecoder {
                 ("protocol_whitelist", "file,http,https,tcp,tls,crypto,data"),
             ]);
         }
-        Self::from_demuxer(
+        let mut decoder = Self::from_demuxer(
             Demuxer::open_with_interrupt(path, options)?,
             target_rate,
             target_channels,
-        )
+        )?;
+        decoder.live = true;
+        Ok(decoder)
     }
 
     /// Select `demuxer`'s best audio stream and build the decoder.
@@ -183,7 +211,119 @@ impl AudioFileDecoder {
             source_spec: None,
             finished: false,
             eof_sent: false,
+            live: false,
+            since_ours: 0,
+            other_audio: Vec::new(),
+            quiet_ns: 0,
+            quiet_last: Vec::new(),
         })
+    }
+
+    /// Read the next packet of the selected audio stream (live: following a
+    /// move to another audio stream), or `None` at end-of-stream.
+    fn next_audio_packet(&mut self) -> Result<Option<crate::demux::ReadPacket>> {
+        if !self.live {
+            return self.demuxer.read_packet_for(self.stream_index);
+        }
+        loop {
+            let Some(pkt) = self.demuxer.read_packet()? else {
+                return Ok(None);
+            };
+            if pkt.stream_index == self.stream_index {
+                self.since_ours = 0;
+                self.other_audio.clear();
+                self.quiet_ns = 0;
+                self.quiet_last.clear();
+                return Ok(Some(pkt));
+            }
+            self.since_ours = self.since_ours.saturating_add(1);
+            let stream = self
+                .demuxer
+                .streams()
+                .into_iter()
+                .find(|st| st.index == pkt.stream_index);
+            let is_audio = stream
+                .as_ref()
+                .is_some_and(|st| st.kind == MediaKind::Audio);
+            if is_audio {
+                self.quiet_ns = 0;
+                self.quiet_last.clear();
+                let count = if let Some((_, n)) = self
+                    .other_audio
+                    .iter_mut()
+                    .find(|(i, _)| *i == pkt.stream_index)
+                {
+                    *n = n.saturating_add(1);
+                    *n
+                } else {
+                    self.other_audio.push((pkt.stream_index, 1));
+                    1
+                };
+                if count >= SWITCH_AFTER && self.switch_to(pkt.stream_index) {
+                    return Ok(Some(pkt));
+                }
+            } else if let (Some(st), Some(pts)) = (stream, pkt.pts()) {
+                let ns = multiview_core::time::rescale(
+                    pts,
+                    st.time_base,
+                    multiview_core::time::Rational::new(1, 1_000_000_000),
+                );
+                // Count only small forward steps: a PTS jump (a splice, a
+                // wrap, the next segment's offset) is not elapsed media time.
+                match self
+                    .quiet_last
+                    .iter_mut()
+                    .find(|(i, _)| *i == pkt.stream_index)
+                {
+                    Some((_, last)) => {
+                        let step = ns.saturating_sub(*last);
+                        if (0..=MAX_PTS_STEP_NS).contains(&step) {
+                            self.quiet_ns = self.quiet_ns.saturating_add(step);
+                        }
+                        *last = ns;
+                    }
+                    None => self.quiet_last.push((pkt.stream_index, ns)),
+                }
+                if self.quiet_ns >= STARVED_AFTER_NS {
+                    return Err(FfmpegError::AudioStarved {
+                        path: self.demuxer.source().to_owned(),
+                        packets: self.since_ours,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Move decoding onto audio stream `index`; `false` if it cannot be
+    /// decoded (the caller keeps looking).
+    fn switch_to(&mut self, index: usize) -> bool {
+        let Some(parameters) = self.demuxer.stream_parameters(index) else {
+            return false;
+        };
+        let Some(time_base) = self
+            .demuxer
+            .streams()
+            .into_iter()
+            .find(|st| st.index == index)
+            .map(|st| st.time_base)
+        else {
+            return false;
+        };
+        let Ok(decoder) = StreamAudioDecoder::new(parameters, time_base) else {
+            return false;
+        };
+        tracing::info!(
+            from = self.stream_index,
+            to = index,
+            "live audio: audio moved to another stream; following it"
+        );
+        self.decoder = decoder;
+        self.stream_index = index;
+        self.resampler = None;
+        self.source_spec = None;
+        self.since_ours = 0;
+        self.other_audio.clear();
+        true
     }
 
     /// The target sample rate in Hz.
@@ -229,7 +369,7 @@ impl AudioFileDecoder {
 
             // Need more input: feed the next packet for our stream, or signal
             // EOF when the demuxer is exhausted.
-            if let Some(pkt) = self.demuxer.read_packet_for(self.stream_index)? {
+            if let Some(pkt) = self.next_audio_packet()? {
                 self.decoder.send_packet(&pkt.packet)?;
             } else {
                 self.decoder.send_eof()?;

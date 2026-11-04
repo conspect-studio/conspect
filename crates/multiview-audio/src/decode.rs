@@ -39,9 +39,14 @@ pub struct DecodedBlock {
     pub pts: MediaTime,
 }
 
-/// A read timeout is a dead input, not a decode error.
+/// A read timeout, or a live input that has lost its audio, is a dead
+/// connection (reconnect), not a decode error.
 fn map_ffmpeg_error(source: &multiview_ffmpeg::FfmpegError) -> AudioError {
-    if matches!(source, multiview_ffmpeg::FfmpegError::ReadTimeout { .. }) {
+    if matches!(
+        source,
+        multiview_ffmpeg::FfmpegError::ReadTimeout { .. }
+            | multiview_ffmpeg::FfmpegError::AudioStarved { .. }
+    ) {
         AudioError::Stalled(source.to_string())
     } else {
         AudioError::Decode(source.to_string())
