@@ -12,7 +12,7 @@ import {
   useReactTable,
 } from '@tanstack/react-table';
 import type { ColumnDef } from '@tanstack/react-table';
-import { Pencil, Plus, Send, Trash2 } from 'lucide-react';
+import { MonitorPlay, Pencil, Plus, Send, Trash2 } from 'lucide-react';
 
 import { createApiClient } from '../api/client';
 import { useDeleteLayout, useLayouts } from '../api/queries';
@@ -197,20 +197,29 @@ export function LayoutsPage(): JSX.Element {
         description={
           <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
             <Trans>
-              Multiview layouts. The accessible editor offers a form-based path
-              equivalent to the drag-and-drop canvas. Apply is live on the
-              running engine.
+              Sources → Layouts → Outputs. The accessible editor offers a
+              form-based path equivalent to the drag-and-drop canvas. Save keeps
+              a layout; apply asks the running engine to use it now. Saved
+              layouts are not separate live renderers.
             </Trans>
             <HelpLink to="/help/features#layouts" label={t`About layouts`} />
           </span>
         }
         actions={
-          <Button asChild>
+          <div className="flex flex-wrap gap-2">
+            <Button asChild variant="outline">
+              <Link to="/monitoring">
+                <MonitorPlay aria-hidden="true" />
+                <Trans>View current engine program</Trans>
+              </Link>
+            </Button>
+            <Button asChild>
             <Link to="/layouts/new">
               <Plus aria-hidden="true" />
               <Trans>New layout</Trans>
             </Link>
-          </Button>
+            </Button>
+          </div>
         }
       />
 

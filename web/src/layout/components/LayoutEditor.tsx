@@ -158,7 +158,7 @@ export function LayoutEditor({
           />
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"
@@ -204,6 +204,13 @@ export function LayoutEditor({
           ) : null}
         </div>
       </div>
+      <p className="-mt-4 text-sm text-muted-foreground">
+        <Trans>
+          Save stores this layout for later use. Save &amp; apply stores it,
+          then asks the running engine to use it now. Saved layouts are not
+          separate live renderers.
+        </Trans>
+      </p>
 
       <div className="flex flex-wrap items-end gap-6">
         <fieldset className="flex flex-wrap items-end gap-3">
@@ -381,7 +388,7 @@ export function LayoutEditor({
           {editor.model.cells
             .map((c) =>
               c.sourceId !== undefined
-                ? (sourceNames.get(c.sourceId) ?? c.sourceId)
+                ? (sourceNames.get(c.sourceId) ?? `${t`Missing source`}: ${c.sourceId}`)
                 : '',
             )
             .filter((name) => name !== '')

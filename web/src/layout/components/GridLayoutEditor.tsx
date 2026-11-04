@@ -246,7 +246,7 @@ export function GridLayoutEditor({
           />
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <Button
             type="button"
             variant="outline"
@@ -284,6 +284,13 @@ export function GridLayoutEditor({
           ) : null}
         </div>
       </div>
+      <p className="-mt-4 text-sm text-muted-foreground">
+        <Trans>
+          Save stores this layout for later use. Save &amp; apply stores it,
+          then asks the running engine to use it now. Saved layouts are not
+          separate live renderers.
+        </Trans>
+      </p>
 
       <p className="text-sm text-muted-foreground">
         <Trans>
@@ -691,6 +698,20 @@ export function GridLayoutEditor({
                               ))}
                             </SelectContent>
                           </Select>
+                          {selectedCell.sourceId !== undefined &&
+                          !sources.some((source) => source.id === selectedCell.sourceId) ? (
+                            <p role="alert" className="text-xs text-destructive">
+                              <Trans>Missing source:</Trans>{' '}
+                              <code>{selectedCell.sourceId}</code>
+                            </p>
+                          ) : selectedCell.sourceId !== undefined ? (
+                            <p className="text-xs text-muted-foreground">
+                              <Trans>Bound source:</Trans>{' '}
+                              <span lang="" dir="auto">
+                                {sources.find((source) => source.id === selectedCell.sourceId)?.name}
+                              </span>
+                            </p>
+                          ) : null}
                         </div>
 
                         <div className="flex flex-col gap-1">
