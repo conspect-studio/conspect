@@ -66,6 +66,51 @@ fn a_routed_source_is_mixed_into_the_program_bus() {
 }
 
 #[test]
+fn synthetic_tone_ignores_paused_producer_and_keeps_fractional_phase() {
+    let fmt = stereo48();
+    let tone = Arc::new(AudioStore::line_up_tone(fmt));
+    let mut bus = ProgramBus::new(fmt, Rational::new(30_000, 1001));
+    let point = bus.add_source("bars", Arc::clone(&tone), 1.0);
+    // The obsolete producer could be paused forever. No write is made here.
+    for tick in [0_u64, 1, 2, 13, 29, 300] {
+        let start = tone.read_cursor();
+        let rendered = bus.tick_to(tick + 1);
+        let mut reference = multiview_audio::ToneGenerator::line_up(fmt);
+        reference.seek_to_frame(u64::try_from(start).unwrap());
+        let expected = reference.next_block(rendered.frame_count()).unwrap();
+        assert_eq!(
+            rendered.interleaved(),
+            expected.interleaved(),
+            "sample phase at tick {tick}"
+        );
+        assert!(rendered
+            .interleaved()
+            .iter()
+            .any(|sample| sample.abs() > 0.01));
+        assert_eq!(tone.read_cursor(), bus.position_at(tick + 1));
+    }
+    bus.set_program_gain_ramped(point, 0.0, 0).unwrap();
+    let muted = bus.tick();
+    assert!(muted.interleaved().iter().all(|sample| *sample == 0.0));
+    assert!(
+        bus.input_tracks()[0]
+            .1
+            .interleaved()
+            .iter()
+            .any(|sample| sample.abs() > 0.01),
+        "pre-route meter stays audible"
+    );
+    bus.set_program_gain_ramped(point, 1.0, 0).unwrap();
+    assert!(bus
+        .tick()
+        .interleaved()
+        .iter()
+        .any(|sample| sample.abs() > 0.01));
+    assert!(bus.remove_source(point));
+    assert!(bus.tick().interleaved().iter().all(|sample| *sample == 0.0));
+}
+
+#[test]
 fn a_dropped_source_yields_silence_never_absent() {
     // A source whose decode stalled (an empty store, nothing ever published)
     // still yields an exact-budget block of silence every tick — never absent.

@@ -481,7 +481,7 @@ impl ProgramBus {
                 // format (= the bus format), so `submit` cannot fail on a format
                 // mismatch; a (impossible) error degrades to dropping that input
                 // this tick rather than panicking on the hot loop.
-                if store.is_timeline() {
+                if store.is_timeline() || store.is_line_up_tone() {
                     store.seek_to(start);
                 }
                 let block = store.read(frames);

@@ -1719,12 +1719,9 @@ pub struct Pipeline {
     /// Built only for libav-openable (file/URL) sources; empty when this run did
     /// not opt into program audio.
     audio_ingest_plans: Vec<crate::audio::AudioIngestPlan>,
-    /// Per-source synthetic **tone** plans (AUD-5): the `bars` line-up tone
-    /// companion. The drive starts one tone publish thread per plan, writing the
-    /// 1 kHz reference sine into that source's [`Self::audio_stores`] entry (which
-    /// is routed onto the program bus exactly like a decoded source's audio).
-    /// Built only for `bars` synthetic sources; empty when this run did not opt
-    /// into program audio.
+    /// Legacy asynchronous tone-plan slot, empty in the scheduling-independent
+    /// bars path. Kept for the supervisor interface until that legacy thread path
+    /// is removed separately; bars now read a pure tone store on the consumer.
     tone_ingest_plans: Vec<crate::audio::ToneIngestPlan>,
     /// Media-player channel **audio loop** plans (ADR-T019): how to prime + loop
     /// each player's embedded audio onto the program bus on the same wrap instant
@@ -2210,7 +2207,7 @@ impl Pipeline {
         > = std::collections::HashMap::new();
         let mut audio_ingest_plans: Vec<crate::audio::AudioIngestPlan> = Vec::new();
         // AUD-5: synthetic line-up tone plans (the `bars` source's 1 kHz companion).
-        let mut tone_ingest_plans: Vec<crate::audio::ToneIngestPlan> = Vec::new();
+        let tone_ingest_plans: Vec<crate::audio::ToneIngestPlan> = Vec::new();
         // #103: AES67 / ST 2110-30 audio RX plans. Each `SourceKind::Aes67` source
         // is AUDIO-ONLY — the source loop below SKIPS the entire video path for it
         // (no TileStore, no registry entry, no ingest plan) and queues one RX plan
@@ -2363,15 +2360,14 @@ impl Pipeline {
             }
             // AUD-5: the `bars` synthetic source emits a 1 kHz line-up tone (its
             // colour-bars companion), so it contributes a real audio store on the
-            // bus rather than silence. Build the store the same way an audio-bearing
-            // source does (so the existing bus-routing below picks it up) and queue
-            // a tone publish plan; a tone thread fills the store at cadence. `solid`
-            // / `clock` synthetic sources carry no audio and stay silent.
-            if let Some(tone_plan) = tone_ingest_plan_for(source, cadence) {
+            // bus rather than silence. Its pure tone store is pulled by the bake
+            // consumer, without a producer thread. Other synthetic sources stay silent.
+            if let Some(_tone_plan) = tone_ingest_plan_for(source, cadence) {
                 audio_stores
                     .entry(source.id.clone())
-                    .or_insert_with(crate::audio::new_store);
-                tone_ingest_plans.push(tone_plan);
+                    .or_insert_with(crate::audio::new_tone_store);
+                // No asynchronous publisher: the bus consumer pulls the tone at
+                // its exact sample index, including any skipped output ticks.
             }
         }
 
@@ -6830,6 +6826,9 @@ fn spawn_live_audio(
     lifecycle: u64,
     anchor_floor: u64,
 ) -> Option<Arc<multiview_audio::store::AudioStore>> {
+    if matches!(source.kind, SourceKind::Bars) {
+        return Some(crate::audio::new_tone_store());
+    }
     let mut plan = audio_ingest_plan_for(source)?;
     plan.lifecycle = lifecycle;
     plan.anchor_floor = anchor_floor;
@@ -7747,7 +7746,7 @@ mod live_audio_spawn_tests {
             .is_ok_and(|map| map.contains_key("live-audio-1/audio")));
     }
 
-    /// A synthetic source has no decode path: it must not claim an audio store.
+    /// A runtime bars edit gets a synchronous tone, not a decode worker.
     #[test]
     fn a_runtime_synthetic_source_has_no_audio_decode() {
         let source: Source =
@@ -7755,7 +7754,22 @@ mod live_audio_spawn_tests {
                 .expect("test source parses");
         let registry = crate::live_sources::stop_registry();
         let stop = Arc::new(AtomicBool::new(true));
-        assert!(spawn_live_audio(&source, &stop, &registry, 0, 0).is_none());
+        let store = spawn_live_audio(&source, &stop, &registry, 0, 0)
+            .expect("bars gets a scheduling-independent tone");
+        assert!(store.is_line_up_tone());
+        assert!(!store.is_timeline());
+        assert!(
+            registry.lock().is_ok_and(|map| map.is_empty()),
+            "no decoder thread registered"
+        );
+        let solid: Source = serde_json::from_value(serde_json::json!({
+            "id": "silent-solid", "kind": "solid", "color": "#101014"
+        }))
+        .expect("solid source parses");
+        assert!(
+            spawn_live_audio(&solid, &stop, &registry, 0, 0).is_none(),
+            "a non-bars synthetic source must not inherit the tone"
+        );
     }
 }
 

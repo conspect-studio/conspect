@@ -74,6 +74,12 @@ pub(crate) fn new_file_store() -> Arc<AudioStore> {
     ))
 }
 
+/// Scheduling-independent bars source tone, pulled at the consumer sample index.
+#[must_use]
+pub(crate) fn new_tone_store() -> Arc<AudioStore> {
+    Arc::new(AudioStore::line_up_tone(canonical_format()))
+}
+
 /// A store for a **live network** source's decoded audio, locked to its video:
 /// a [`timeline`](AudioStore::timeline) store whose frames are output-timeline
 /// positions. The decode places each block where the source's video stamper

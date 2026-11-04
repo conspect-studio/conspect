@@ -190,6 +190,8 @@ pub struct AudioStore {
     /// A finite-file append store retains its earliest unread data when the
     /// consumer is delayed. Live append stores instead re-sync to their edge.
     finite_file: std::sync::atomic::AtomicBool,
+    /// Pure synthetic line-up tone generated from the absolute read cursor.
+    line_up_tone: bool,
 }
 
 /// The writer-side reusable snapshot pool for [`AudioStore::publish_window`].
@@ -288,7 +290,23 @@ impl AudioStore {
             window_pool: Mutex::new(WindowPool::default()),
             timeline: false,
             finite_file: std::sync::atomic::AtomicBool::new(false),
+            line_up_tone: false,
         }
+    }
+
+    /// A synthetic line-up tone that follows the bus's exact sample cursor.
+    /// No producer thread, buffering or output-clock wait is involved.
+    #[must_use]
+    pub fn line_up_tone(format: AudioFormat) -> Self {
+        let mut store = Self::new(format, 1);
+        store.line_up_tone = true;
+        store
+    }
+
+    /// Whether this store generates the synthetic tone on each read.
+    #[must_use]
+    pub const fn is_line_up_tone(&self) -> bool {
+        self.line_up_tone
     }
 
     /// A store whose frames are **output-timeline** positions (audio locked to
@@ -794,6 +812,16 @@ impl AudioStore {
     /// #10), so it can run on the output clock (invariant #1).
     #[must_use]
     pub fn read(&self, frames: usize) -> AudioBlock {
+        if self.line_up_tone {
+            let start = self
+                .read_frame
+                .fetch_add(i64::try_from(frames).unwrap_or(i64::MAX), Ordering::Relaxed);
+            let mut generator = crate::tone::ToneGenerator::line_up(self.format);
+            generator.seek_to_frame(u64::try_from(start).unwrap_or(0));
+            return generator
+                .next_block(frames)
+                .unwrap_or_else(|_| AudioBlock::silence(self.format, frames));
+        }
         let channels = self.format.channel_count();
         let mut start = self.read_frame.load(Ordering::Relaxed);
         // Re-sync a cursor that has fallen entirely behind the retained window:
