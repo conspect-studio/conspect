@@ -1191,6 +1191,7 @@ pub fn command_drain_with_seams(
     >,
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     overlays: crate::live_overlays::OverlayApplySlot,
+    tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<
         String,
@@ -1201,6 +1202,7 @@ pub fn command_drain_with_seams(
         .with_subtitle_route(subtitle_route)
         .with_audio_route(audio_route)
         .with_live_overlays(overlays)
+        .with_tile_spec_apply(tiles)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
     move |drive: &mut CompositorDrive<Nv12Image>| {
@@ -1308,6 +1310,10 @@ pub struct CommandDrain {
     /// state from. `None` ⇒ `UpsertOverlay`/`RemoveOverlay` are surfaced held
     /// actions (never a silent drop).
     live_overlays: Option<crate::live_overlays::OverlayApplySlot>,
+    /// Published active tile placements for the off-clock overlay consumer.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    tile_spec_apply:
+        Option<Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>>,
     /// The media-player transport seam (ADR-0057 / ADR-0097): the per-player
     /// bounded [`TransportMailbox`](crate::player::TransportMailbox) the running
     /// player ingest thread drains between frames, keyed by player id. A
@@ -1348,6 +1354,8 @@ impl CommandDrain {
             audio_route: None,
             live_sources: None,
             live_overlays: None,
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+            tile_spec_apply: None,
             player_mailboxes: std::collections::HashMap::new(),
             cell_ids_set: false,
             #[cfg(test)]
@@ -1387,6 +1395,17 @@ impl CommandDrain {
     #[must_use]
     fn with_live_overlays(mut self, overlays: crate::live_overlays::OverlayApplySlot) -> Self {
         self.live_overlays = Some(overlays);
+        self
+    }
+
+    /// Thread in the active tile placement slot for the off-clock baker.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    #[must_use]
+    fn with_tile_spec_apply(
+        mut self,
+        tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    ) -> Self {
+        self.tile_spec_apply = Some(tiles);
         self
     }
 
@@ -1458,7 +1477,14 @@ impl CommandDrain {
 
         // Drain the bus, routing commands. Video re-points are enqueued (batched +
         // bounded); every other command is applied immediately as before.
+        let mut tile_binding_changed = false;
         for command in self.commands.try_drain() {
+            tile_binding_changed |= matches!(
+                &command,
+                Command::ApplyLayout { .. }
+                    | Command::UpsertSource { .. }
+                    | Command::RemoveSource { .. }
+            );
             self.route_command(command, drive);
         }
 
@@ -1484,7 +1510,39 @@ impl CommandDrain {
             }
             applied = applied.saturating_add(1);
         }
+        if tile_binding_changed || applied != 0 {
+            self.publish_tile_specs(drive);
+        }
         applied
+    }
+
+    /// Publish only when the active placements differ from the baker's snapshot.
+    /// This happens on the frame boundary after layout or video-route changes;
+    /// steady-state ticks do not allocate or wait on the bake consumer.
+    fn publish_tile_specs(&self, drive: &CompositorDrive<Nv12Image>) {
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+        if let Some(slot) = &self.tile_spec_apply {
+            let labels = self
+                .config
+                .sources
+                .iter()
+                .map(|source| {
+                    (
+                        source.id.clone(),
+                        source
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| source.id.clone()),
+                    )
+                })
+                .collect();
+            let tiles = crate::pipeline::tile_specs_for_layout(drive.layout(), &labels);
+            if *slot.load().as_ref() != tiles {
+                slot.store(Arc::new(tiles));
+            }
+        }
+        #[cfg(not(all(feature = "ffmpeg", feature = "overlay")))]
+        let _ = drive;
     }
 
     /// Enqueue a VIDEO→cell route intent, bounded drop-oldest (safety rule §5).
@@ -2569,6 +2627,80 @@ input_id = "in_b"
     /// The matching canvas for `TWO_CELL_DOC` (64x64 @ 25/1).
     fn matching_canvas() -> serde_json::Value {
         serde_json::json!({ "width": 64, "height": 64, "fps": "25/1" })
+    }
+
+    /// A stored NewsOne-like layout replaces the boot tile chrome, not just the
+    /// video geometry; a later video route updates the same cell's label.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    #[test]
+    fn live_layout_publishes_unequal_tile_overlay_placements_and_routes() {
+        let config = test_config();
+        let boot = config.solve_layout().expect("boot layout");
+        let labels = std::collections::HashMap::from([
+            ("in_a".to_owned(), "CNN".to_owned()),
+            ("in_b".to_owned(), "BBC".to_owned()),
+        ]);
+        let tiles = Arc::new(multiview_framestore::SwapCell::new(Arc::new(
+            crate::pipeline::tile_specs_for_layout(&boot, &labels),
+        )));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_tile_spec_apply(Arc::clone(&tiles));
+        let mut drive = test_drive(&test_config());
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "hero", "rect": { "x": 0.0, "y": 0.0, "w": 0.75, "h": 1.0 },
+                  "source": { "input_id": "in_a" } },
+                { "id": "side", "rect": { "x": 0.75, "y": 0.25, "w": 0.25, "h": 0.5 },
+                  "source": { "input_id": "in_b" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("stored doc");
+        let solved = document.solve_named("NewsOne").expect("stored layout");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "NewsOne".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("apply layout");
+        drain.apply(&mut drive);
+        let active = tiles.load();
+        assert_eq!(active.len(), 2, "each source-bound tile receives chrome");
+        assert_eq!(
+            (
+                active[0].source_id.as_str(),
+                active[0].rect.x,
+                active[0].rect.width
+            ),
+            ("in_a", 0.0, 48.0)
+        );
+        assert_eq!(
+            (
+                active[1].source_id.as_str(),
+                active[1].rect.x,
+                active[1].rect.y,
+                active[1].rect.width,
+                active[1].rect.height
+            ),
+            ("in_b", 48.0, 16.0, 16.0, 32.0)
+        );
+        sender
+            .try_submit(Command::SwapSource {
+                op: OperationId::new(),
+                tile: "side".to_owned(),
+                source: "in_a".to_owned(),
+            })
+            .expect("route side");
+        drain.apply(&mut drive);
+        let rerouted = tiles.load();
+        assert_eq!(rerouted[1].source_id, "in_a");
+        assert_eq!(rerouted[1].rect, active[1].rect);
     }
 
     /// A real command drained on the clock publishes a resolved re-point to the

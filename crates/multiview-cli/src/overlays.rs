@@ -387,6 +387,28 @@ impl OverlayBaker {
         self.analog_clocks = specs;
     }
 
+    /// Replace the tile placements after a live layout or video-route change.
+    /// Retain meter ballistics for cells that keep the same source binding.
+    pub fn set_tiles(&mut self, tiles: Vec<TileSpec>) {
+        let mut old: Vec<Option<TileMeter>> = self.meters.drain(..).map(Some).collect();
+        let meters = tiles
+            .iter()
+            .map(|tile| {
+                self.tiles
+                    .iter()
+                    .enumerate()
+                    .find(|(index, previous)| {
+                        previous.source_id == tile.source_id
+                            && old.get(*index).is_some_and(Option::is_some)
+                    })
+                    .and_then(|(index, _)| old.get_mut(index).and_then(Option::take))
+                    .unwrap_or_else(TileMeter::new)
+            })
+            .collect();
+        self.tiles = tiles;
+        self.meters = meters;
+    }
+
     /// The tiles this baker draws (their static placement), in declaration order.
     #[must_use]
     pub fn tiles(&self) -> &[TileSpec] {
@@ -1400,6 +1422,109 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn live_relayout_confines_badges_labels_and_meters_to_unequal_tiles() {
+        let mut baker = OverlayBaker::new(
+            vec![TileSpec::new(
+                "cnn",
+                "CNN",
+                PixelRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 320.0,
+                    height: 180.0,
+                },
+            )],
+            epoch_clock(),
+        )
+        .unwrap()
+        .with_clock(None);
+        let hero = PixelRect {
+            x: 0.0,
+            y: 0.0,
+            width: 240.0,
+            height: 180.0,
+        };
+        let small = PixelRect {
+            x: 240.0,
+            y: 45.0,
+            width: 80.0,
+            height: 90.0,
+        };
+        baker.set_tiles(vec![
+            TileSpec::new("cnn", "CNN", hero),
+            TileSpec::new("bbc", "BBC", small),
+        ]);
+        let mut dynamics = HashMap::new();
+        dynamics.insert(
+            "cnn".to_owned(),
+            TileDynamics {
+                meter_db: -3.0,
+                state: SourceState::Live,
+                fault: TileFault::Silent,
+            },
+        );
+        dynamics.insert(
+            "bbc".to_owned(),
+            TileDynamics {
+                meter_db: -9.0,
+                state: SourceState::Live,
+                fault: TileFault::None,
+            },
+        );
+        let list = baker
+            .draw_list(
+                MediaTime::from_nanos(40_000_000),
+                &dynamics,
+                &HashMap::new(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        let hero_geom = TileGeometry::resolve(hero);
+        let small_geom = TileGeometry::resolve(small);
+        assert!(
+            !meter_fill_in(&list, hero_geom).is_empty(),
+            "CNN has its meter"
+        );
+        assert!(
+            !meter_fill_in(&list, small_geom).is_empty(),
+            "BBC has its meter"
+        );
+        assert!(
+            glyphs_in(&list, OverlayRect::new(0, 0, 240, 180)) > 0,
+            "CNN has badges and label"
+        );
+        assert!(
+            glyphs_in(&list, OverlayRect::new(240, 45, 80, 90)) > 0,
+            "BBC has badges and label"
+        );
+        for primitive in &list.primitives {
+            let rect = match primitive {
+                OverlayPrimitive::FilledRect { rect, .. } => *rect,
+                OverlayPrimitive::Glyph {
+                    dest_x,
+                    dest_y,
+                    width,
+                    height,
+                    ..
+                } => OverlayRect::new(*dest_x, *dest_y, *width, *height),
+                _ => continue,
+            };
+            let in_hero = rect.x >= 0
+                && rect.y >= 0
+                && i64::from(rect.x) + i64::from(rect.width) <= 240
+                && i64::from(rect.y) + i64::from(rect.height) <= 180;
+            let in_small = rect.x >= 240
+                && rect.y >= 45
+                && i64::from(rect.x) + i64::from(rect.width) <= 320
+                && i64::from(rect.y) + i64::from(rect.height) <= 135;
+            assert!(
+                in_hero || in_small,
+                "tile chrome escaped its cell: {rect:?}"
+            );
+        }
     }
 
     #[test]

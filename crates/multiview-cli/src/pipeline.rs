@@ -1599,6 +1599,9 @@ pub struct Pipeline {
     /// source id — the text drawn bottom-left of each tile.
     #[cfg(feature = "overlay")]
     tile_labels: std::collections::HashMap<String, String>,
+    /// Frame-boundary tile geometry and bindings for the off-clock bake consumer.
+    #[cfg(feature = "overlay")]
+    tile_spec_apply: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
     /// Operator-declared content-fault probes, resolved from `config.probes`
     /// (M10). Each probe `watches` a cell; this resolves that cell to its bound
     /// **source** so the per-tick [`FaultDetector`] can build that source's fault
@@ -2472,6 +2475,10 @@ impl Pipeline {
                 (s.id.clone(), label)
             })
             .collect();
+        #[cfg(feature = "overlay")]
+        let tile_spec_apply = Arc::new(multiview_framestore::SwapCell::new(Arc::new(
+            tile_specs_for_layout(&layout, &tile_labels),
+        )));
         // Read the analog clock faces from the `[[overlays]]` clock entries.
         #[cfg(feature = "overlay")]
         let analog_clocks =
@@ -2555,6 +2562,8 @@ impl Pipeline {
             meter_db_timelines,
             #[cfg(feature = "overlay")]
             tile_labels,
+            #[cfg(feature = "overlay")]
+            tile_spec_apply,
             #[cfg(feature = "overlay")]
             declared_probes: config.probes.clone(),
             #[cfg(feature = "overlay")]
@@ -3540,6 +3549,8 @@ impl Pipeline {
         // overlay baker from it, plus the single `ProgramEncoder`; the bake +
         // encode math moved off the hot loop, never onto it.
         let bake_ctx = self.bake_context();
+        #[cfg(feature = "overlay")]
+        let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
@@ -3722,6 +3733,8 @@ impl Pipeline {
                 tick_index: frame.tick.index,
                 #[cfg(feature = "overlay")]
                 source_states: frame.source_states.clone(),
+                #[cfg(feature = "overlay")]
+                tile_specs: tile_spec_apply.load(),
                 #[cfg(feature = "overlay")]
                 captions,
                 #[cfg(feature = "overlay")]
@@ -3930,27 +3943,17 @@ impl Pipeline {
     /// pixel rectangle and the source's display label.
     #[cfg(feature = "overlay")]
     fn tile_specs(&self) -> Vec<crate::overlays::TileSpec> {
-        use multiview_overlay::geometry::PixelRect;
-        let (cw, ch) = (self.layout.canvas.width, self.layout.canvas.height);
-        let mut specs = Vec::new();
-        for cell in &self.layout.cells {
-            let Some(id) = cell.source.as_deref() else {
-                continue;
-            };
-            let label = self
-                .tile_labels
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| id.to_owned());
-            let rect = PixelRect {
-                x: norm_to_px_f32(cell.x, cw),
-                y: norm_to_px_f32(cell.y, ch),
-                width: norm_to_px_f32(cell.w, cw),
-                height: norm_to_px_f32(cell.h, ch),
-            };
-            specs.push(crate::overlays::TileSpec::new(id, label, rect));
-        }
-        specs
+        tile_specs_for_layout(&self.layout, &self.tile_labels)
+    }
+
+    /// The command drain publishes active cell placements after live layout and
+    /// video-route changes. The bake consumer samples the slot off the clock.
+    #[cfg(feature = "overlay")]
+    #[must_use]
+    pub fn tile_spec_apply_slot(
+        &self,
+    ) -> Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>> {
+        Arc::clone(&self.tile_spec_apply)
     }
 
     /// Extract the **`Send`** bake context the off-hot-path consumer thread owns
@@ -3964,6 +3967,7 @@ impl Pipeline {
     fn bake_context(&self) -> BakeContext {
         BakeContext {
             tile_specs: self.tile_specs(),
+            tile_spec_apply: Arc::clone(&self.tile_spec_apply),
             meter_db_timelines: self.meter_db_timelines.clone(),
             subtitles: self.subtitles.clone(),
             sidecar_target: self.sidecar_target.clone(),
@@ -3995,6 +3999,8 @@ struct BakeContext {
     /// The per-tile overlay placements (cell rect + label per source-bound cell).
     #[cfg(feature = "overlay")]
     tile_specs: Vec<crate::overlays::TileSpec>,
+    #[cfg(feature = "overlay")]
+    tile_spec_apply: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
     /// Build-time per-source per-tick loudness timelines (dBFS) for the meters.
     #[cfg(feature = "overlay")]
     meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
@@ -4075,6 +4081,12 @@ struct StreamBaker {
     /// state from (ADR-W022). `None` until the first bake, so a wired slot's
     /// seeded set drives the very first frame (one truth: the slot).
     overlay_generation: Option<u64>,
+    /// Last tile snapshot from the active drive, to avoid resetting meter state.
+    tile_snapshot: Arc<Vec<crate::overlays::TileSpec>>,
+    /// Last per-input audio peak observed by the consumer's live bus meter.
+    live_meter_db: std::collections::HashMap<String, f64>,
+    /// Bounded per-input peak/RMS sampler shared with audio telemetry.
+    input_meters: crate::meter_telemetry::InputMeters,
 }
 
 #[cfg(not(feature = "overlay"))]
@@ -4104,8 +4116,12 @@ impl StreamBaker {
         if let Some(signal) = ctx.watermark_signal.clone() {
             baker = baker.with_watermark(signal, ctx.canvas_width, ctx.canvas_height);
         }
+        let tile_snapshot = ctx.tile_spec_apply.load();
         Ok(Self {
             baker,
+            tile_snapshot,
+            live_meter_db: std::collections::HashMap::new(),
+            input_meters: crate::meter_telemetry::InputMeters::new(),
             canvas_color: ctx.canvas_color,
             cadence: ctx.cadence,
             meter: ctx,
@@ -4136,6 +4152,29 @@ impl StreamBaker {
         self.overlay_generation = Some(set.generation());
     }
 
+    /// Sample the pre-mix audio of every routed source for its own tile meter.
+    /// The sample is shared with existing input telemetry; it never reads an
+    /// input or waits for a decoder on the protected output clock.
+    fn sample_input_meters(
+        &mut self,
+        bus: &multiview_audio::program::ProgramBus,
+        elapsed: Duration,
+    ) -> Vec<multiview_events::AudioMeter> {
+        let now_ns = i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
+        let samples = self.input_meters.push(&bus.input_tracks(), now_ns);
+        for sample in &samples {
+            if let Some(id) = sample.input_id.as_ref() {
+                let peak = sample
+                    .peak_db
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                self.live_meter_db.insert(id.clone(), f64::from(peak));
+            }
+        }
+        samples
+    }
+
     /// Bake one streamed tick's overlays into its canvas, returning the overlaid
     /// `Arc<Nv12Image>` — the SAME math as the old post-loop `bake_overlays`, run
     /// once per received item off the hot loop.
@@ -4148,6 +4187,10 @@ impl StreamBaker {
         // ADR-W022: pick up a live overlay-set change before drawing, so this
         // frame is baked entirely from one set (frame-boundary apply).
         self.refresh_overlays(item.canvas.width(), item.canvas.height());
+        if !Arc::ptr_eq(&item.tile_specs, &self.tile_snapshot) {
+            self.baker.set_tiles(item.tile_specs.as_ref().clone());
+            self.tile_snapshot = Arc::clone(&item.tile_specs);
+        }
 
         let i = usize::try_from(item.tick_index).unwrap_or(usize::MAX);
         let pts = MediaTime::from_tick(i64::try_from(i).unwrap_or(i64::MAX), self.cadence);
@@ -4170,7 +4213,11 @@ impl StreamBaker {
             dynamics.insert(
                 spec.source_id.clone(),
                 crate::overlays::TileDynamics {
-                    meter_db: self.meter.meter_db_for(&spec.source_id, i),
+                    meter_db: self
+                        .live_meter_db
+                        .get(&spec.source_id)
+                        .copied()
+                        .unwrap_or_else(|| self.meter.meter_db_for(&spec.source_id, i)),
                     state,
                     fault,
                 },
@@ -4226,6 +4273,9 @@ struct StreamItem {
     /// source absent here is treated as `NO_SIGNAL` by the baker.
     #[cfg(feature = "overlay")]
     source_states: std::collections::HashMap<String, multiview_core::traits::SourceState>,
+    /// Exact active placement snapshot from this frame's compositor boundary.
+    #[cfg(feature = "overlay")]
+    tile_specs: Arc<Vec<crate::overlays::TileSpec>>,
     /// Per-source active caption lines sampled from the cue stores at THIS tick's
     /// pts (`source_id -> on-screen lines`). Sampled on the hot loop because the
     /// bounded drop-oldest cue store only holds a small live window — sampling it
@@ -4730,7 +4780,7 @@ fn drive_audio_for_item(
 /// # Errors
 /// Returns [`PipelineError`] if building the baker, baking a frame, or the single
 /// encode fails.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 // reason: the consumer owns each pipeline tail input distinctly (encode, audio bus + loudnorm + loudness meter + publisher, display feed, in-flight counter); bundling them would only obscure the data flow.
 #[allow(clippy::needless_pass_by_value)] // reason: `loudness_publisher` is owned BY VALUE so it lives in the consumer thread's frame for the whole run (it cannot borrow from `drive_streaming`, which returns before this thread joins); the body only needs `&` access but the ownership is load-bearing.
 fn consumer_main(
@@ -4757,8 +4807,8 @@ fn consumer_main(
     // built lazily from the first emitted block's channel count. Same thread and
     // same non-blocking drop-oldest publisher as the loudness lane (inv #10).
     let mut audio_meter: Option<crate::meter_telemetry::MeterTelemetry> = None;
-    // Per-input peak/RMS meters (tracks 1..), fed from each routed source's
-    // discrete pre-mix block.
+    // Without overlay support, keep the telemetry meter on this consumer.
+    #[cfg(not(feature = "overlay"))]
     let mut input_meters = crate::meter_telemetry::InputMeters::new();
     // On-air A/V offset for live (timeline) sources, measured per tick.
     let av_ids: Vec<String> = audio_bus
@@ -4776,6 +4826,28 @@ fn consumer_main(
     while let Ok(item) = hot_rx.recv() {
         // One frame left the queue.
         in_flight.fetch_sub(1, Ordering::AcqRel);
+        // Consume input audio for this tick before the overlay draw so source
+        // bars represent the same output instant, never the preceding frame.
+        #[cfg(feature = "overlay")]
+        let early_audio_block = if let Some(bus) = audio_bus.as_mut() {
+            if let Some(handle) = audio_route.as_ref() {
+                handle.apply_pending(bus);
+            }
+            let tick_frame = bus.position_at(item.tick_index);
+            let input_block = drive_audio_for_item(bus, item.tick_index);
+            if let Some(meter) = av_meter.as_mut() {
+                meter.sample(&av_ids, item.tick_index, tick_frame);
+            }
+            let samples = baker.sample_input_meters(bus, loudness_epoch.elapsed());
+            if let Some(publisher) = loudness_publisher.as_ref() {
+                for sample in samples {
+                    publisher.publish_event(Event::AudioMeter(sample));
+                }
+            }
+            Some(input_block)
+        } else {
+            None
+        };
         let overlaid = baker.bake(&item)?;
         // Bridge once + encode once (invariant #7): the canvas is encoded a SINGLE
         // time here, never once per sink.
@@ -4799,17 +4871,31 @@ fn consumer_main(
         // The pull does no I/O and cannot block (inv #1/#10); the encode runs here on
         // the bake consumer, never on the output-clock loop. `None` (audio off) skips
         // this entirely — the run is video-only as before.
-        if let Some(bus) = audio_bus.as_mut() {
+        if audio_bus.is_some() {
+            #[cfg(not(feature = "overlay"))]
+            let Some(bus) = audio_bus.as_mut() else {
+                continue;
+            };
             // Apply resolved operator commands at this sample boundary before
             // advancing the absolute tick clock. A stalled consumer merely sheds
             // bounded pending commands; it never holds the output clock (#1/#10).
+            #[cfg(not(feature = "overlay"))]
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
             }
             // The bus sample position of THIS tick (before the advance): the
             // output frame whose audio the bus is about to read.
+            #[cfg(not(feature = "overlay"))]
             let tick_frame = bus.position_at(item.tick_index);
+            #[cfg(not(feature = "overlay"))]
             let block = drive_audio_for_item(bus, item.tick_index);
+            #[cfg(feature = "overlay")]
+            let block = early_audio_block.ok_or_else(|| {
+                PipelineError::Engine(
+                    "audio bus advanced without a matching output block".to_owned(),
+                )
+            })?;
+            #[cfg(not(feature = "overlay"))]
             if let Some(meter) = av_meter.as_mut() {
                 meter.sample(&av_ids, item.tick_index, tick_frame);
             }
@@ -4851,6 +4937,7 @@ fn consumer_main(
                 if let Some(sample) = peak_rms.push(&block, now_ns) {
                     publisher.publish_event(Event::AudioMeter(sample));
                 }
+                #[cfg(not(feature = "overlay"))]
                 if let Some(bus) = audio_bus.as_ref() {
                     for sample in input_meters.push(&bus.input_tracks(), now_ns) {
                         publisher.publish_event(Event::AudioMeter(sample));
@@ -6663,6 +6750,40 @@ fn frac_to_px(frac: f32, extent: u32) -> u32 {
         }
     }
     lo
+}
+
+/// Resolve source-bound cells into canvas-space tile chrome, in cell order.
+#[cfg(feature = "overlay")]
+pub(crate) fn tile_specs_for_layout(
+    layout: &Layout,
+    labels: &std::collections::HashMap<String, String>,
+) -> Vec<crate::overlays::TileSpec> {
+    use multiview_overlay::geometry::PixelRect;
+    let (cw, ch) = (layout.canvas.width, layout.canvas.height);
+    layout
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            let id = cell.source.as_deref()?;
+            let label = labels.get(id).cloned().unwrap_or_else(|| id.to_owned());
+            // Match the compositor's normalized endpoint quantization, not an
+            // independent truncation of width/height that can spill a pixel.
+            let x = norm_to_px_f32(cell.x, cw);
+            let y = norm_to_px_f32(cell.y, ch);
+            let right = norm_to_px_f32(cell.x + cell.w, cw);
+            let bottom = norm_to_px_f32(cell.y + cell.h, ch);
+            Some(crate::overlays::TileSpec::new(
+                id,
+                label,
+                PixelRect {
+                    x,
+                    y,
+                    width: right - x,
+                    height: bottom - y,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Convert a normalized fraction in `[0,1]` to a pixel coordinate `f32` against
@@ -14261,14 +14382,13 @@ mod live_overlay_bake_tests {
     fn bake_context(slot: &crate::live_overlays::OverlayApplySlot) -> BakeContext {
         BakeContext {
             tile_specs: Vec::new(),
+            tile_spec_apply: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
             meter_db_timelines: HashMap::new(),
             subtitles: None,
             sidecar_target: None,
             analog_clocks: Vec::new(),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
-            output_origin: crate::timing_status::anchor_slot(),
-            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
             // No Conspect watermark in these pixel tests: the asserted face
             // regions must change ONLY with the live overlay slot (S3 has its
             // own coverage), and the 320x180 test canvas matches `item`.
@@ -14286,10 +14406,90 @@ mod live_overlay_bake_tests {
             canvas: Arc::new(Nv12Image::solid(320, 180, 16, 128, 128, tag).expect("solid")),
             tick_index,
             source_states: HashMap::new(),
+            tile_specs: Arc::new(Vec::new()),
             captions: HashMap::new(),
             caption_bitmaps: HashMap::new(),
             faults: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn source_audio_drives_its_own_live_tile_meter_without_program_gain() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let mut bus = multiview_audio::ProgramBus::new(
+            crate::audio::canonical_format(),
+            Rational::new(25, 1),
+        );
+        let cnn = crate::audio::new_store();
+        let bbc = crate::audio::new_store();
+        cnn.publish_samples(&vec![0.5; 2_000 * 2])
+            .expect("cnn samples");
+        bbc.publish_samples(&vec![0.0; 2_000 * 2])
+            .expect("bbc silence");
+        bus.add_source("cnn", cnn, 0.0);
+        bus.add_source("bbc", bbc, 0.0);
+        let block = super::drive_audio_for_item(&mut bus, 0);
+        assert_eq!(block.frame_count(), 1_920);
+        let samples = baker.sample_input_meters(&bus, std::time::Duration::from_millis(40));
+        assert_eq!(samples.len(), 2);
+        assert!(
+            baker.live_meter_db["cnn"] > -9.0,
+            "CNN tile follows its live audio"
+        );
+        assert!(
+            baker.live_meter_db["bbc"] < -50.0,
+            "BBC tile stays at floor"
+        );
+    }
+
+    #[test]
+    fn stream_baker_uses_each_frames_layout_snapshot_not_the_latest_slot() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut context = bake_context(&slot);
+        let fullscreen = crate::overlays::TileSpec::new(
+            "cnn",
+            "CNN",
+            multiview_overlay::geometry::PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        context.tile_specs = vec![fullscreen.clone()];
+        context
+            .tile_spec_apply
+            .store(Arc::new(vec![fullscreen.clone()]));
+        let mut baker = StreamBaker::new(context).expect("baker");
+        let hero = crate::overlays::TileSpec::new(
+            "cnn",
+            "CNN",
+            multiview_overlay::geometry::PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 240.0,
+                height: 180.0,
+            },
+        );
+        let side = crate::overlays::TileSpec::new(
+            "bbc",
+            "BBC",
+            multiview_overlay::geometry::PixelRect {
+                x: 240.0,
+                y: 45.0,
+                width: 80.0,
+                height: 90.0,
+            },
+        );
+        let mut old_frame = item(0);
+        old_frame.tile_specs = Arc::new(vec![fullscreen]);
+        let mut new_frame = item(1);
+        new_frame.tile_specs = Arc::new(vec![hero.clone(), side.clone()]);
+        baker.bake(&old_frame).expect("old frame");
+        assert_eq!(baker.baker.tiles().len(), 1);
+        baker.bake(&new_frame).expect("new frame");
+        assert_eq!(baker.baker.tiles(), &[hero, side]);
     }
 
     /// An analog wall-clock overlay document at the given placement.

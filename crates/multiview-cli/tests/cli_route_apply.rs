@@ -304,6 +304,7 @@ async fn run_capturing(
         subtitle_slot,
         pipeline.audio_route_slot(),
         pipeline.overlay_apply_slot(),
+        pipeline.tile_spec_apply_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
     );
@@ -437,6 +438,7 @@ async fn run_command_to_hls(pipeline: &mut Pipeline, config: &MultiviewConfig, c
         subtitle_slot,
         pipeline.audio_route_slot(),
         pipeline.overlay_apply_slot(),
+        pipeline.tile_spec_apply_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
     );
