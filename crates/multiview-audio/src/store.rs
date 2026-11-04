@@ -1458,8 +1458,9 @@ impl Placer {
                         .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
                 }
             } else {
-                let since = *self.held_since.get_or_insert(now);
-                if self.require_video_anchor || now.saturating_duration_since(since) < self.wait {
+                if self.require_video_anchor
+                    || now.saturating_duration_since(front.enqueued_at) < self.wait
+                {
                     self.stats.held_steps = self.stats.held_steps.saturating_add(1);
                     break;
                 }
@@ -2543,6 +2544,7 @@ mod resync_tests {
             std::time::Duration::from_secs(20),
             None,
             "test",
+            false,
         );
         assert_eq!(calls, 601);
         assert!(start.elapsed() < std::time::Duration::from_secs(3));
@@ -2580,6 +2582,7 @@ mod resync_tests {
             std::time::Duration::from_secs(20),
             None,
             "test",
+            false,
         );
         assert_eq!(calls, 2);
         assert_eq!(
@@ -2617,6 +2620,7 @@ mod resync_tests {
             std::time::Duration::from_secs(20),
             None,
             "test",
+            false,
         );
         assert_eq!(raw_at(&store, 0), 0.5);
     }

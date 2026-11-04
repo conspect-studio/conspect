@@ -4886,6 +4886,10 @@ fn consumer_main(
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
             }
+            if bus.live_strip_count() != av_strips {
+                av_strips = bus.live_strip_count();
+                av_ids = bus.timeline_source_ids();
+            }
             let tick_frame = bus.position_at(item.tick_index);
             let input_block = drive_audio_for_item(bus, item.tick_index);
             if let Some(meter) = av_meter.as_mut() {
@@ -4936,6 +4940,7 @@ fn consumer_main(
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
             }
+            #[cfg(not(feature = "overlay"))]
             if bus.live_strip_count() != av_strips {
                 av_strips = bus.live_strip_count();
                 av_ids = bus.timeline_source_ids();
@@ -15955,9 +15960,6 @@ mod live_overlay_bake_tests {
             analog_clocks: Vec::new(),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
-            output_origin: crate::timing_status::anchor_slot(),
-            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
-            lifecycle: 0,
             // No Conspect watermark in these pixel tests: the asserted face
             // regions must change ONLY with the live overlay slot (S3 has its
             // own coverage), and the 320x180 test canvas matches `item`.
