@@ -826,8 +826,8 @@ pub fn output_ns_to_frame(ns: i64, rate: u32) -> i64 {
 /// [`TIMELINE_CAPACITY`] frames keeps the placed lead plus a margin).
 pub const ANCHORED_LEAD: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Maximum time to retain audio with no usable video anchor before dropping
-/// the queued block. Audio stays silent until its picture supplies a lock.
+/// Maximum age of a decoded block with no usable video anchor before dropping
+/// it. All expired blocks drop in one pass; audio stays silent without a lock.
 pub const ANCHOR_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Frames a live timeline store retains: 30 s at 48 kHz.
@@ -1118,6 +1118,7 @@ pub struct PendingBlock {
     block: AudioBlock,
     raw_ns: i64,
     epoch: u64,
+    enqueued_at: std::time::Instant,
 }
 
 /// The decoder → placer hand-off: decoded blocks, their total frames, and the
@@ -1151,6 +1152,7 @@ impl DecodedQueue {
             block,
             raw_ns,
             epoch,
+            enqueued_at: std::time::Instant::now(),
         });
         while self.frames > max_frames {
             let Some(old) = self.units.pop_front() else {
@@ -1179,7 +1181,6 @@ pub struct Placer {
     history_frames: usize,
     lead_frames: i64,
     wait: std::time::Duration,
-    held_since: Option<std::time::Instant>,
     log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
     source: String,
     /// The lock state last logged (`None` before the first placement).
@@ -1208,7 +1209,7 @@ struct PlacerStats {
 
 impl Placer {
     /// A placer at `rate` placing up to `lead_frames` ahead of the cursor, and
-    /// dropping queued blocks without a usable video anchor after `wait`.
+    /// dropping each queued block without a usable video anchor at age `wait`.
     #[must_use]
     pub const fn new(rate: u32, lead_frames: i64, wait: std::time::Duration) -> Self {
         Self {
@@ -1217,7 +1218,6 @@ impl Placer {
             history_frames: 0,
             lead_frames,
             wait,
-            held_since: None,
             log: None,
             source: String::new(),
             locked: None,
@@ -1273,7 +1273,6 @@ impl Placer {
                 .map
                 .map(front.raw_ns, front.epoch, &queue.epochs, cursor);
             if let Mapped::Video(at) | Mapped::Unlocked(at) = mapped {
-                self.held_since = None;
                 let locked = matches!(mapped, Mapped::Video(_));
                 if self.locked != Some(locked) {
                     self.locked = Some(locked);
@@ -1304,7 +1303,6 @@ impl Placer {
                 queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
                 batch.push(unit);
             } else if mapped == Mapped::Skipped {
-                self.held_since = None;
                 if let Some(unit) = queue.units.pop_front() {
                     queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
                     self.stats.skipped = self
@@ -1313,8 +1311,7 @@ impl Placer {
                         .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
                 }
             } else {
-                let since = *self.held_since.get_or_insert(now);
-                if now.saturating_duration_since(since) < self.wait {
+                if now.saturating_duration_since(front.enqueued_at) < self.wait {
                     self.stats.held_steps = self.stats.held_steps.saturating_add(1);
                     break;
                 }
@@ -1332,7 +1329,6 @@ impl Placer {
                         .skipped
                         .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
                 }
-                self.held_since = None;
             }
         }
         if changed {
@@ -1432,14 +1428,15 @@ impl Placer {
 /// network read is never stalled), and run a [`Placer`] on a separate thread
 /// every 50 ms against the bus cursor and the source's latest video anchor.
 ///
-/// * No usable anchor for a block's clock span: it waits (bounded). After
-///   [`ANCHOR_WAIT`] the held block drops; audio remains silent until a usable
-///   video anchor arrives.
+/// * No usable anchor for a block's clock span: it waits (bounded by age).
+///   After [`ANCHOR_WAIT`], all expired blocks drop in one pass; audio remains
+///   silent until a usable video anchor arrives.
 /// * A raw jump over [`SPLICE_NS`] starts a new clock span: audio after it is
 ///   only mapped by anchors whose raw time lies in its span.
 /// * A new anchor generation re-places the retained unplayed audio.
-/// * A stalled input ([`AudioError::Stalled`]) ends the connection at once; a
-///   transient decode error is skipped.
+/// * A stalled input ([`AudioError::Stalled`]) ends the connection and drops
+///   queued and placed PCM promptly; a transient decode error is skipped.
+///   Finite EOF preserves its valid anchored drain.
 ///
 /// Neither thread is on the output clock and the store is never blocked
 /// (invariants #1/#10).
@@ -1468,6 +1465,7 @@ pub fn anchored_publish_loop(
         .max(1);
     let queue: Mutex<DecodedQueue> = Mutex::new(DecodedQueue::default());
     let producer_done = AtomicBool::new(false);
+    let producer_failed = AtomicBool::new(false);
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -1477,8 +1475,20 @@ pub fn anchored_publish_loop(
             while !stop.load(Ordering::Acquire) {
                 {
                     let mut q = lock(&queue);
-                    if producer_done.load(Ordering::Acquire) && q.is_empty() {
-                        return;
+                    if producer_done.load(Ordering::Acquire) {
+                        if producer_failed.load(Ordering::Acquire) {
+                            // A disconnected live source must not hold an old epoch
+                            // for another anchor wait, or place it under a new one.
+                            q.units.clear();
+                            q.frames = 0;
+                            // The store may already contain a lead of PCM from
+                            // this connection. Do not air it after the failure.
+                            let _ = store.publish_window(store.read_cursor(), &[]);
+                            return;
+                        }
+                        if q.is_empty() {
+                            return;
+                        }
                     }
                     placer.step(store, &mut q, anchor(), store.read_cursor(), Instant::now());
                 }
@@ -1514,12 +1524,14 @@ pub fn anchored_publish_loop(
                 }
                 Err(AudioError::Stalled(reason)) => {
                     tracing::warn!(%reason, "audio decode loop: input stalled; ending connection");
+                    producer_failed.store(true, Ordering::Release);
                     break;
                 }
                 Err(error) => {
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
                         tracing::warn!(%error, consecutive_errors, "audio decode loop: repeated decode errors; ending connection");
+                        producer_failed.store(true, Ordering::Release);
                         break;
                     }
                     if consecutive_errors == 1 {
@@ -2032,7 +2044,7 @@ mod resync_tests {
             &mut q,
             None,
             10 * RATE,
-            t0 + std::time::Duration::from_secs(16),
+            t0 + std::time::Duration::from_secs(14),
         );
         assert_eq!(store.buffered_frames(), 0, "no unlocked audio may air");
         assert_eq!(raw_at(&store, 13 * RATE), 0.0, "silence before video lock");
@@ -2043,7 +2055,7 @@ mod resync_tests {
             &mut q,
             Some(g1),
             12 * RATE,
-            t0 + std::time::Duration::from_secs(17),
+            t0 + std::time::Duration::from_secs(14),
         );
         assert_eq!(
             raw_at(&store, video_frame(&g1, 502 * SEC)),
@@ -2162,6 +2174,151 @@ mod resync_tests {
         assert_eq!(raw_at(&store, 3 * RATE), 0.0);
         assert_eq!(store.buffered_frames(), 0);
         assert!(q.frames < 20 * 4_800, "expired audio must drain");
+    }
+
+    /// Every old unanchored AAC block expires in one pass, not one wait per
+    /// block. A new clock span can then lock without an old epoch in front.
+    #[test]
+    fn queued_unanchored_blocks_expire_together_before_new_anchor() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut q = DecodedQueue::default();
+        let old = 100 * SEC;
+        for i in 0..900 {
+            let raw = old + i * 1_024 * SEC / RATE;
+            q.push(stamped(format, raw), raw, 48_000, usize::MAX);
+        }
+        let now = std::time::Instant::now();
+        let mut placer = Placer::new(48_000, 3 * RATE, std::time::Duration::from_secs(15));
+        placer.step(&store, &mut q, None, 0, now);
+        assert_eq!(q.units.len(), 900);
+        let fresh = 200 * SEC;
+        q.push(stamped(format, fresh), fresh, 48_000, usize::MAX);
+        let fresh_epoch = q.units.back().unwrap().epoch;
+        q.units.back_mut().unwrap().enqueued_at = now + std::time::Duration::from_secs(16);
+        placer.step(
+            &store,
+            &mut q,
+            None,
+            0,
+            now + std::time::Duration::from_secs(16),
+        );
+        assert_eq!(q.units.len(), 1, "all old blocks must expire in one pass");
+        assert_eq!(q.units.front().unwrap().epoch, fresh_epoch);
+        assert_eq!(store.buffered_frames(), 0, "no unlocked PCM may air");
+        let a = anchor(1, 0, fresh);
+        placer.step(&store, &mut q, Some(a), 0, now);
+        assert!(q.is_empty(), "fresh PCM must not wait behind the old epoch");
+        assert_eq!(raw_at(&store, 0), ms_of(fresh));
+    }
+
+    /// A stalled decoder discards its backlog and releases the reconnect path
+    /// without a per-block anchor wait or an output-clock wait.
+    #[test]
+    fn stalled_decoder_with_unanchored_backlog_returns_promptly() {
+        use std::sync::atomic::AtomicBool;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let stop = AtomicBool::new(false);
+        let mut calls = 0;
+        let start = std::time::Instant::now();
+        anchored_publish_loop(
+            || {
+                let i = calls;
+                calls += 1;
+                if i == 600 {
+                    return Err(AudioError::Stalled("read timeout".to_owned()));
+                }
+                let raw = 100 * SEC + i * 1_024 * SEC / RATE;
+                let block = AudioBlock::from_interleaved(format, vec![0.5; 2 * 1_024])?;
+                Ok(Some((
+                    block,
+                    multiview_core::time::MediaTime::from_nanos(raw),
+                )))
+            },
+            &store,
+            &stop,
+            &|| None,
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(20),
+            None,
+            "test",
+        );
+        assert_eq!(calls, 601);
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(store.buffered_frames(), 0);
+    }
+
+    /// The old connection cannot leave an already placed lead in the store
+    /// after its decoder fails; a reconnect starts with silence, not old PCM.
+    #[test]
+    fn stalled_decoder_clears_previously_placed_audio() {
+        use std::sync::atomic::AtomicBool;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let stop = AtomicBool::new(false);
+        let raw = 100 * SEC;
+        let mut calls = 0;
+        anchored_publish_loop(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    let block = AudioBlock::from_interleaved(format, vec![0.5; 2 * 1_024])?;
+                    return Ok(Some((
+                        block,
+                        multiview_core::time::MediaTime::from_nanos(raw),
+                    )));
+                }
+                // Give the placer time to write this block before the stall.
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                Err(AudioError::Stalled("read timeout".to_owned()))
+            },
+            &store,
+            &stop,
+            &|| Some(anchor(1, 0, raw)),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(20),
+            None,
+            "test",
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            store.buffered_frames(),
+            0,
+            "old PCM must not survive a stall"
+        );
+    }
+
+    /// A finite stream still drains audio that already has a video mapping.
+    #[test]
+    fn finite_anchored_stream_drains_before_return() {
+        use std::sync::atomic::AtomicBool;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let stop = AtomicBool::new(false);
+        let mut sent = false;
+        let raw = 100 * SEC;
+        anchored_publish_loop(
+            || {
+                if sent {
+                    return Ok(None);
+                }
+                sent = true;
+                let block = AudioBlock::from_interleaved(format, vec![0.5; 2 * 1_024])?;
+                Ok(Some((
+                    block,
+                    multiview_core::time::MediaTime::from_nanos(raw),
+                )))
+            },
+            &store,
+            &stop,
+            &|| Some(anchor(1, 0, raw)),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(20),
+            None,
+            "test",
+        );
+        assert_eq!(raw_at(&store, 0), 0.5);
     }
 
     /// A stalled decoder ends the connection instead of retrying 32 read
