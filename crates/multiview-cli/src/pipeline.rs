@@ -5052,9 +5052,15 @@ fn consumer_main(
             // #152: discrete tracks, same tick, same sample budget (inv #3).
             let selected_tracks = track_inputs.load();
             if !selected_tracks.is_empty() {
+                #[cfg(feature = "overlay")]
+                let track_bus = audio_bus
+                    .as_mut()
+                    .ok_or_else(|| PipelineError::Engine("audio track bus missing".to_owned()))?;
+                #[cfg(not(feature = "overlay"))]
+                let track_bus = bus;
                 let packets = encode_discrete_tracks(
                     &mut encoder,
-                    bus,
+                    track_bus,
                     &selected_tracks,
                     block.frame_count(),
                 )?;
