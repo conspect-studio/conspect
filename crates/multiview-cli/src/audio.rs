@@ -408,6 +408,19 @@ fn await_shared_url(
 /// (invariant #10); a wedged libav network call is bounded by the supervisor's
 /// detach-on-grace teardown, exactly as for video.
 pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop: &AtomicBool) {
+    // Name this source on every line the audio thread emits: our own (the span)
+    // and libav's synchronous lines (the thread-local resource context the log
+    // bridge resolves), exactly as the video `ingest_loop` does (ADR-0060). The
+    // `rail = "audio"` field keeps the audio connection distinguishable.
+    let _span = tracing::info_span!(
+        "source",
+        resource_kind = "source",
+        resource_id = %plan.id,
+        rail = "audio",
+    )
+    .entered();
+    let _resource =
+        multiview_ffmpeg::ResourceGuard::enter(multiview_ffmpeg::ResourceContext::source(&plan.id));
     let mut attempt: u32 = 0;
     let mut jitter = JitterRng::seeded(&plan.id);
     loop {
