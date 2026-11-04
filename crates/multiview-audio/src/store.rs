@@ -827,8 +827,15 @@ pub const ANCHORED_LEAD: std::time::Duration = std::time::Duration::from_secs(3)
 /// to itself (an audio-only or video-dead source still plays, unlocked).
 pub const ANCHOR_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Frames a live timeline store retains (6 s at 48 kHz).
-pub const TIMELINE_CAPACITY: usize = 288_000;
+/// Frames a live timeline store retains: 30 s at 48 kHz.
+///
+/// Audio is placed ahead of the bus cursor by the lead plus up to a whole HLS
+/// segment, because a segment is delivered at once. Segments of 9-10 s
+/// (e.g. msnow at 9.176 s) put the first block of a burst ~10 s ahead, and a
+/// slow origin delivers late segments in bursts. 6 s evicted that audio before
+/// playout (heard as long silences); 30 s covers segments up to ~25 s, the
+/// RFC 8216 practical maximum. Bounded: ~11.5 MB per source (stereo f32).
+pub const TIMELINE_CAPACITY: usize = 1_440_000;
 
 /// [`audio_decode_loop`] for a LIVE source whose audio is **locked to its
 /// video**: each decoded block is placed with
@@ -2041,5 +2048,48 @@ mod resync_tests {
         // And the following read continues contiguously (no repeat).
         let next = store.read(1_600);
         assert!(next.interleaved().iter().any(|&s| s != 0.0) || store.buffered_frames() > 0);
+    }
+}
+
+#[cfg(test)]
+mod timeline_capacity_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::format::{AudioFormat, ChannelLayout};
+
+    /// A live HLS source delivers a whole segment at once, so its audio is
+    /// placed up to (lead + one segment) ahead of the bus cursor. msnow's
+    /// segments are 9.2 s: the first block of a burst lands ~9.5 s ahead. The
+    /// timeline store must keep everything placed until the cursor reads it;
+    /// evicting it plays as silence (seen on air: msnow mostly silent,
+    /// cnn-usa brief dropouts at 5.6 s segments + 2 s lead).
+    #[test]
+    fn audio_placed_a_whole_long_segment_ahead_is_played_not_evicted() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, TIMELINE_CAPACITY);
+        let rate = 48_000_i64;
+        // Place 9.5 s of tone starting at the cursor (0), in 100 ms blocks,
+        // all before the bus reads anything.
+        let block_frames = 4_800_usize;
+        let tone = AudioBlock::from_interleaved(format, vec![0.5_f32; block_frames * 2]).unwrap();
+        let blocks = (95 * rate / 10) / i64::try_from(block_frames).unwrap();
+        for i in 0..blocks {
+            store
+                .publish_at(i * i64::try_from(block_frames).unwrap(), &tone)
+                .unwrap();
+        }
+        // The bus now reads from the start, one 1600-frame tick at a time.
+        store.seek_to(0);
+        let ticks = usize::try_from(blocks).unwrap() * block_frames / 1_600;
+        let mut silent = 0;
+        for _ in 0..ticks {
+            if store.read(1_600).interleaved().iter().all(|&v| v == 0.0) {
+                silent += 1;
+            }
+        }
+        assert_eq!(
+            silent, 0,
+            "{silent}/{ticks} ticks of placed audio were evicted before playout"
+        );
     }
 }
