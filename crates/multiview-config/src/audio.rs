@@ -302,6 +302,9 @@ pub const PROGRAM_TRACK: &str = "prog";
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum OutputAudioMode {
+    /// Carry the mixed program bus **plus every declared discrete track**
+    /// (`[audio]` routes with a `target_track`). The `tracks` list is ignored.
+    Auto,
     /// Carry only the mixed program bus.
     Program,
     /// Carry an explicit list of selectable tracks.
@@ -340,7 +343,7 @@ impl OutputAudio {
         output_label: &str,
         selectable_tracks: &[&str],
     ) -> Result<(), ConfigError> {
-        if self.mode == OutputAudioMode::Program {
+        if self.mode != OutputAudioMode::Tracks {
             return Ok(());
         }
         if self.tracks.is_empty() {
@@ -375,7 +378,9 @@ impl OutputAudio {
     /// rejects a selection whose discrete count exceeds its capacity.
     #[must_use]
     pub fn discrete_track_count(&self) -> u32 {
-        if self.mode == OutputAudioMode::Program {
+        if self.mode != OutputAudioMode::Tracks {
+            // `auto` adapts to what the transport carries (resolved at run
+            // build), so it never fails the capability gate; `program` is 0.
             return 0;
         }
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.tracks.len());
@@ -391,6 +396,25 @@ impl OutputAudio {
             }
         }
         count
+    }
+
+    /// Resolve this selection against the document's `declared` discrete track
+    /// names (in route order, excluding [`PROGRAM_TRACK`]): whether the output
+    /// carries the program bus, and which discrete tracks (in declared order).
+    #[must_use]
+    pub fn resolve<'a>(&self, declared: &[&'a str]) -> (bool, Vec<&'a str>) {
+        match self.mode {
+            OutputAudioMode::Program => (true, Vec::new()),
+            OutputAudioMode::Auto => (true, declared.to_vec()),
+            OutputAudioMode::Tracks => (
+                self.tracks.iter().any(|t| t == PROGRAM_TRACK),
+                declared
+                    .iter()
+                    .copied()
+                    .filter(|d| self.tracks.iter().any(|t| t == d))
+                    .collect(),
+            ),
+        }
     }
 
     /// Validate this output's audio selection against the transport's

@@ -172,6 +172,11 @@ pub struct AudioControlHandle {
     /// The latest routing document, so a source joining later rides its gain.
     routing: Arc<multiview_framestore::SwapCell<Option<Arc<multiview_config::AudioRouting>>>>,
     sample_rate: u32,
+    /// Output tracks are pinned to source ids at startup until the discrete
+    /// encoder's route table accepts live updates.
+    declared_tracks: std::collections::HashMap<String, usize>,
+    /// Shared stable-index source list read by the bake consumer each tick.
+    live_track_inputs: Option<Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>>,
 }
 
 /// The consumer owns this guard from thread spawn through normal or panic exit.
@@ -244,6 +249,8 @@ impl AudioControlHandle {
             known: shared_map(known),
             routing: Arc::new(multiview_framestore::SwapCell::empty()),
             sample_rate: AudioFormat::CANONICAL_RATE,
+            declared_tracks: std::collections::HashMap::new(),
+            live_track_inputs: None,
         }
     }
 
@@ -367,6 +374,27 @@ impl AudioControlHandle {
         self.push_member(MemberChange::Leave { id: id.to_owned() })
     }
 
+    /// Capture the output's startup-pinned track-to-source wiring.
+    #[must_use]
+    pub fn with_declared_tracks(
+        mut self,
+        routing: Option<&multiview_config::AudioRouting>,
+        live_track_inputs: Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>,
+    ) -> Self {
+        self.declared_tracks = routing
+            .map(|r| {
+                r.routes
+                    .iter()
+                    .filter_map(|route| route.target_track.as_deref())
+                    .enumerate()
+                    .map(|(index, name)| (name.to_owned(), index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.live_track_inputs = Some(live_track_inputs);
+        self
+    }
+
     /// Apply an `[audio]` routing document to the RUNNING program bus, if it can
     /// be applied live. Returns `true` when the new gain table was published for
     /// the bake consumer (it lands at its next tick, ramped click-free), `false`
@@ -379,6 +407,25 @@ impl AudioControlHandle {
             return false;
         }
         let known = self.known.load();
+        let requested: Vec<(&str, &str)> = routing
+            .routes
+            .iter()
+            .filter_map(|route| {
+                route
+                    .target_track
+                    .as_deref()
+                    .map(|name| (name, route.input_id.as_str()))
+            })
+            .collect();
+        if requested.len() != self.declared_tracks.len()
+            || requested.iter().enumerate().any(|(index, (name, source))| {
+                self.declared_tracks.get(*name) != Some(&index) || !known.contains_key(*source)
+            })
+        {
+            // An added/removed/reordered output track needs output-only
+            // reconfiguration; a source absent from the live registry cannot be routed.
+            return false;
+        }
         if routing
             .routes
             .iter()
@@ -386,13 +433,22 @@ impl AudioControlHandle {
         {
             return false;
         }
-        self.routing.store(Some(Arc::new(routing.clone())));
         let channels = self
             .channels
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let gains =
             crate::pipeline::program_bus_gains(channels.keys().map(String::as_str), Some(routing));
+        drop(channels);
+        self.routing.store(Some(Arc::new(routing.clone())));
+        if let Some(live) = &self.live_track_inputs {
+            live.store(Arc::new(
+                requested
+                    .iter()
+                    .map(|(_, source)| (*source).to_owned())
+                    .collect(),
+            ));
+        }
         self.pending_gains.store(Some(Arc::new(gains)));
         true
     }
@@ -586,6 +642,35 @@ pub fn routing_live_capability(
 mod route_seam_tests {
     use super::*;
     use multiview_audio::program::ProgramBus;
+
+    #[test]
+    fn changed_discrete_track_source_does_not_claim_live_apply() {
+        let routing = |source: &str| {
+            let doc = format!("schema_version = 1\n[canvas]\nwidth = 640\nheight = 360\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"grid\"\ncolumns = [\"1fr\"]\nrows = [\"1fr\"]\nareas = [\"a\"]\n[[sources]]\nid = \"{source}\"\nkind = \"bars\"\n[[cells]]\nid = \"cell\"\narea = \"a\"\n[cells.source]\ninput_id = \"{source}\"\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"{source}\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"clean\"\n");
+            multiview_config::MultiviewConfig::load_from_toml(&doc)
+                .expect("route fixture")
+                .audio
+                .expect("audio routing")
+        };
+        let live = Arc::new(multiview_framestore::SwapCell::from_pointee(vec![
+            "old".to_owned()
+        ]));
+        let mut sources = std::collections::HashMap::new();
+        sources.insert("old".to_owned(), new_store());
+        let handle = AudioControlHandle::from_sources(sources, std::collections::HashMap::new())
+            .with_startup(Some(&routing("old")), ["old".to_owned(), "new".to_owned()])
+            .with_declared_tracks(Some(&routing("old")), Arc::clone(&live));
+        // A known source without a decoded store is still a valid silent track.
+        assert!(handle.request_routing(&routing("new")));
+        assert_eq!(live.load().as_slice(), &["new".to_owned()]);
+        assert!(!handle.request_routing(&routing("missing")));
+        assert_eq!(live.load().as_slice(), &["new".to_owned()]);
+        assert!(handle.remove_source("new"));
+        assert!(!handle.request_routing(&routing("new")));
+        assert_eq!(live.load().as_slice(), &["new".to_owned()]);
+        assert!(handle.set_source_audio("new", Some(new_store())));
+        assert!(handle.request_routing(&routing("new")));
+    }
 
     #[test]
     fn route_audio_reaches_crossfade_at_sample_boundary_without_losing_ticks() {

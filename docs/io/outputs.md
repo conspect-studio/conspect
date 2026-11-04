@@ -226,6 +226,17 @@ Audio mirrors video PTS rebasing onto the program clock. Two destinations: a **p
 | **MPEG-TS / SRT / RIST** | **Yes, N** (best general carrier) | one audio ES per PID; `-streamid` (base-10). SRT/RIST receiver may select only first PID. |
 | **RTSP / SDP** | **Yes, N simultaneous** | each track = its own RTP subsession. |
 | **HLS / LL-HLS / DASH** | **Yes, N — select-one** | `EXT-X-MEDIA TYPE=AUDIO` by GROUP-ID → UI is a *selector*, not simultaneous monitor. |
+
+For the current MPEG-TS HLS output, `index.m3u8` remains the legacy A/V media playlist.
+When an output selects discrete audio, `master.m3u8` references `video.m3u8`,
+`audio-program.m3u8` (if program is selected), and one `audio-trackN.m3u8` per
+selected track. Each rendition contains only its named elementary stream. The
+control Cast delivery URL uses the master for these outputs; old direct media
+links remain valid. Segment names and media sequences advance across restarts;
+the first restarted segment marks a discontinuity. Route edits to an existing
+track name and index can switch its source live if the source audio store exists.
+Adding, removing, or reordering tracks requires output reconfiguration; the
+routing API reports restart instead of incorrectly reporting a live change.
 | **NDI** | **No tracks — channels only** | one stream ≤255 ch (Opus) / unlimited (PCM); AAC ≤2 ch; planar FLTP. Channel-map or multi-sender. |
 | **RTMP / FLV** | **Tiered** | legacy = 1; E-RTMP v2 = N via `audioTrackId` — **endpoint-gated** (Twitch ≤2; YouTube ignores). |
 | **MP4 / MKV** (file) | Yes, N — select-one | multiple tracks; VOD/archive only. |

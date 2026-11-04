@@ -11607,7 +11607,7 @@
         "properties": {
           "mode": {
             "$ref": "#/components/schemas/OutputAudioModeDoc",
-            "description": "`program` (mixed bus) or `tracks` (explicit selection)."
+            "description": "`auto` (program + every declared track), `program` (mixed bus) or\n`tracks` (explicit selection)."
           },
           "tracks": {
             "type": "array",
@@ -11623,6 +11623,7 @@
         "type": "string",
         "description": "`OpenAPI` mirror of `multiview_config::audio::OutputAudioMode`.",
         "enum": [
+          "auto",
           "program",
           "tracks"
         ]
