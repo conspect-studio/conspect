@@ -736,6 +736,9 @@ pub const PUBLISH_LEAD: std::time::Duration = std::time::Duration::from_secs(2);
 /// pacer. While this is full the *decoder* waits — never the engine.
 pub const MAX_QUEUED_AUDIO: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The decode queue's hard bound in frames (20 s at 48 kHz).
+pub const DECODED_QUEUE_CAP: usize = 960_000;
+
 /// Consecutive decode errors tolerated before a connection is abandoned. A
 /// single corrupt packet (an ad-splice, a truncated segment) must not drop the
 /// source into a reconnect backoff.
@@ -1123,6 +1126,10 @@ pub struct DecodedQueue {
     units: VecDeque<PendingBlock>,
     frames: usize,
     epochs: EpochLog,
+    /// Frames decoded into the queue (telemetry).
+    pub decoded_frames: u64,
+    /// Frames dropped because the queue was full (telemetry).
+    pub overflow_frames: u64,
 }
 
 impl DecodedQueue {
@@ -1136,6 +1143,9 @@ impl DecodedQueue {
             / i64::from(rate.max(1));
         let epoch = self.epochs.push(raw_ns, raw_ns.saturating_add(dur));
         self.frames = self.frames.saturating_add(frames);
+        self.decoded_frames = self
+            .decoded_frames
+            .saturating_add(u64::try_from(frames).unwrap_or(0));
         self.units.push_back(PendingBlock {
             block,
             raw_ns,
@@ -1146,6 +1156,9 @@ impl DecodedQueue {
                 break;
             };
             self.frames = self.frames.saturating_sub(old.block.frame_count());
+            self.overflow_frames = self
+                .overflow_frames
+                .saturating_add(u64::try_from(old.block.frame_count()).unwrap_or(0));
         }
     }
 
@@ -1172,6 +1185,24 @@ pub struct Placer {
     locked: Option<bool>,
     /// Blocks dropped as late (behind the picture).
     late_dropped: u64,
+    /// Per-window telemetry, summarised every [`STATS_PERIOD`].
+    stats: PlacerStats,
+}
+
+/// How often the placer logs its per-source summary.
+const STATS_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Frame counts for one telemetry window, so a source that decodes audio but
+/// airs little of it shows *where* the audio went.
+#[derive(Debug, Default)]
+struct PlacerStats {
+    since: Option<std::time::Instant>,
+    placed: u64,
+    late: u64,
+    skipped: u64,
+    held_steps: u64,
+    generations: u64,
+    replaces: u64,
 }
 
 impl Placer {
@@ -1190,6 +1221,15 @@ impl Placer {
             source: String::new(),
             locked: None,
             late_dropped: 0,
+            stats: PlacerStats {
+                since: None,
+                placed: 0,
+                late: 0,
+                skipped: 0,
+                held_steps: 0,
+                generations: 0,
+                replaces: 0,
+            },
         }
     }
 
@@ -1223,6 +1263,9 @@ impl Placer {
         now: std::time::Instant,
     ) {
         let changed = self.map.observe(latest);
+        if changed {
+            self.stats.generations = self.stats.generations.saturating_add(1);
+        }
         let mut batch: Vec<PendingBlock> = Vec::new();
         while let Some(front) = queue.units.front() {
             let mapped = self
@@ -1244,6 +1287,10 @@ impl Placer {
                     }
                     if let Some(unit) = queue.units.pop_front() {
                         queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
+                        self.stats.late = self
+                            .stats
+                            .late
+                            .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
                     }
                     continue;
                 }
@@ -1259,10 +1306,15 @@ impl Placer {
                 self.held_since = None;
                 if let Some(unit) = queue.units.pop_front() {
                     queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
+                    self.stats.skipped = self
+                        .stats
+                        .skipped
+                        .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
                 }
             } else {
                 let since = *self.held_since.get_or_insert(now);
                 if now.saturating_duration_since(since) < self.wait {
+                    self.stats.held_steps = self.stats.held_steps.saturating_add(1);
                     break;
                 }
                 tracing::warn!(
@@ -1278,6 +1330,7 @@ impl Placer {
             }
         }
         if changed {
+            self.stats.replaces = self.stats.replaces.saturating_add(1);
             let _ = store.publish_window(cursor, &[]);
             if let Some(log) = &self.log {
                 log.cleared(cursor);
@@ -1286,6 +1339,13 @@ impl Placer {
             self.place(store, &queue.epochs, cursor, &retained);
         }
         self.place(store, &queue.epochs, cursor, &batch);
+        self.stats.placed = self.stats.placed.saturating_add(
+            batch
+                .iter()
+                .map(|u| u64::try_from(u.block.frame_count()).unwrap_or(0))
+                .sum(),
+        );
+        self.log_window(queue, cursor, now);
         for unit in batch {
             self.history_frames = self.history_frames.saturating_add(unit.block.frame_count());
             self.history.push_back(unit);
@@ -1296,6 +1356,33 @@ impl Placer {
             };
             self.history_frames = self.history_frames.saturating_sub(old.block.frame_count());
         }
+    }
+
+    /// Log the window's frame counts every [`STATS_PERIOD`] and start a new one.
+    fn log_window(&mut self, queue: &DecodedQueue, cursor: i64, now: std::time::Instant) {
+        let since = *self.stats.since.get_or_insert(now);
+        if now.saturating_duration_since(since) < STATS_PERIOD {
+            return;
+        }
+        let s = &self.stats;
+        tracing::info!(
+            source = %self.source,
+            decoded_frames = queue.decoded_frames,
+            overflow_frames = queue.overflow_frames,
+            queued_frames = queue.frames,
+            placed = s.placed,
+            late = s.late,
+            skipped = s.skipped,
+            held_steps = s.held_steps,
+            generations = s.generations,
+            replaces = s.replaces,
+            cursor,
+            "live audio: placer window"
+        );
+        self.stats = PlacerStats {
+            since: Some(now),
+            ..PlacerStats::default()
+        };
     }
 
     /// Write `units` (raw order) at their mapped frames, coalescing runs that
@@ -1395,10 +1482,25 @@ pub fn anchored_publish_loop(
 
         let mut consecutive_errors: u32 = 0;
         while !stop.load(Ordering::Acquire) {
+            // A full queue means the decoder is `max_queued` ahead of the
+            // picture: wait for the placer to take what is due, never evict it
+            // (evicting the front threw away the audio due NOW). This waits on
+            // the audio decode thread only; the output clock never waits, and
+            // libav's per-read timeout is armed only inside a read.
+            if lock(&queue).frames >= max_queued_frames {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             match next() {
                 Ok(Some((block, pts))) => {
                     consecutive_errors = 0;
-                    lock(&queue).push(block, pts.as_nanos(), rate, max_queued_frames);
+                    // Eviction sits one second ABOVE the wait threshold, so the
+                    // wait always fires first. With the two equal, eviction
+                    // held the queue just under the threshold and the wait
+                    // never ran. The push eviction remains only as a backstop.
+                    let evict_at =
+                        max_queued_frames.saturating_add(usize::try_from(rate).unwrap_or(0));
+                    lock(&queue).push(block, pts.as_nanos(), rate, evict_at);
                 }
                 Ok(None) => {
                     tracing::info!(source, "live audio: end of stream; ending connection");
@@ -1960,6 +2062,73 @@ mod resync_tests {
             ms_of(509 * SEC),
             "audio follows the gap close"
         );
+    }
+
+    /// msnow: the decoder reads faster than real time (the fetcher serves
+    /// whole 9.2 s segments from memory), so it fills the 20 s queue, and the
+    /// old loop then evicted the queue FRONT, the audio due NOW, on every
+    /// block. Measured in a 5 min run: 13.5 M frames decoded vs 4.6 M placed,
+    /// with zero late or skipped drops. Here the decoder offers 40 s at once;
+    /// the audio due now must be placed, so the decoder waits for room.
+    #[test]
+    fn the_loop_places_due_audio_when_the_decoder_runs_far_ahead() {
+        use std::sync::atomic::AtomicBool;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let stop = AtomicBool::new(false);
+        let mut i: i64 = 0;
+        let raw_of = |k: i64| 100 * SEC + k * 1_024 * SEC / RATE;
+        // Video shows raw 100 s at output 0.
+        let a = anchor(1, 0, 100 * SEC);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                anchored_publish_loop(
+                    || {
+                        // Real AAC block size: 1,024 frames. A 4,800-frame block
+                        // lands exactly on the cap and hid the bug this guards.
+                        if i >= 1_875 {
+                            return Ok(None);
+                        }
+                        let r = raw_of(i);
+                        i += 1;
+                        let ms = ms_of(r);
+                        let block = AudioBlock::from_interleaved(format, vec![ms; 1_024 * 2])?;
+                        Ok(Some((
+                            block,
+                            multiview_core::time::MediaTime::from_nanos(r),
+                        )))
+                    },
+                    &store,
+                    &stop,
+                    &|| Some(a),
+                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(20),
+                    None,
+                    "test",
+                );
+            });
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let first = raw_at(&store, 0);
+            let mid = raw_at(&store, 2 * RATE);
+            stop.store(true, Ordering::Release);
+            assert_eq!(first, ms_of(raw_of(0)), "the audio due now was evicted");
+            assert_eq!(mid, ms_of(raw_of(93)));
+        });
+    }
+
+    /// The queue is still bounded: pushing past the cap drops the oldest audio
+    /// rather than growing (invariant #10). The loop waits for room before it
+    /// pushes, so this is only the backstop.
+    #[test]
+    fn the_decode_queue_is_still_bounded() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let mut q = DecodedQueue::default();
+        for i in 0..3_000 {
+            let r = 100 * SEC + i * SEC / 10;
+            q.push(stamped(format, r), r, 48_000, DECODED_QUEUE_CAP);
+        }
+        assert!(q.frames <= DECODED_QUEUE_CAP);
+        assert!(q.overflow_frames > 0);
     }
 
     /// No video anchor at all: the audio waits, then plays unlocked.
