@@ -36,7 +36,8 @@ fn measured_pcm_requires_full_coverage_and_preserves_cursor() {
     assert_eq!(
         store.measure_pcm(0, 4),
         PcmMeasurement::Measured {
-            rms_dbfs: f64::NEG_INFINITY
+            rms_dbfs: f64::NEG_INFINITY,
+            peak_dbfs: f64::NEG_INFINITY
         }
     );
     assert_eq!(store.measure_pcm(2, 4), PcmMeasurement::Unknown);
@@ -48,7 +49,7 @@ fn measured_pcm_requires_full_coverage_and_preserves_cursor() {
         "zero-filled hole is not covered PCM"
     );
     assert!(
-        matches!(store.measure_pcm(6, 4), PcmMeasurement::Measured { rms_dbfs } if rms_dbfs > -10.0)
+        matches!(store.measure_pcm(6, 4), PcmMeasurement::Measured { rms_dbfs, peak_dbfs } if rms_dbfs > -10.0 && peak_dbfs > -10.0)
     );
     store.publish_at(4, &quiet).unwrap();
     assert!(matches!(
@@ -65,6 +66,26 @@ fn measured_pcm_requires_full_coverage_and_preserves_cursor() {
         123,
         "observation must not consume source PCM"
     );
+}
+
+#[test]
+fn measured_pcm_reports_sparse_peak_independently_of_rms() {
+    let store = AudioStore::timeline(stereo(), 1920);
+    let mut samples = vec![0.0; 1920 * 2];
+    samples[0] = 0.01;
+    store
+        .publish_at(0, &AudioBlock::from_interleaved(stereo(), samples).unwrap())
+        .unwrap();
+    let PcmMeasurement::Measured {
+        rms_dbfs,
+        peak_dbfs,
+    } = store.measure_pcm(0, 1920)
+    else {
+        panic!("published PCM must be fully covered");
+    };
+    assert!((peak_dbfs + 40.0).abs() < 0.01);
+    assert!(rms_dbfs < -70.0);
+    assert_eq!(store.measure_pcm(0, 1921), PcmMeasurement::Unknown);
 }
 
 use multiview_audio::{AudioBlock, AudioFormat, ChannelLayout};

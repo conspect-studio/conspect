@@ -79,10 +79,12 @@ struct RingSnapshot {
 pub enum PcmMeasurement {
     /// Part or all of the requested span was never published or was evicted.
     Unknown,
-    /// The entire requested span was published; its RMS is in dBFS.
+    /// The entire requested span was published; its RMS and sample peak are in dBFS.
     Measured {
         /// Root-mean-square power of the fully covered PCM span.
         rms_dbfs: f64,
+        /// Maximum sample magnitude across the fully covered PCM span.
+        peak_dbfs: f64,
     },
 }
 
@@ -730,9 +732,18 @@ impl AudioStore {
             .map(|sample| f64::from(*sample).powi(2))
             .sum::<f64>()
             / f64::from(u32::try_from(samples.len()).unwrap_or(u32::MAX));
+        let peak = samples
+            .iter()
+            .map(|sample| f64::from(*sample).abs())
+            .fold(0.0_f64, f64::max);
         PcmMeasurement::Measured {
             rms_dbfs: if power > 0.0 {
                 10.0 * power.log10()
+            } else {
+                f64::NEG_INFINITY
+            },
+            peak_dbfs: if peak > 0.0 {
+                20.0 * peak.log10()
             } else {
                 f64::NEG_INFINITY
             },

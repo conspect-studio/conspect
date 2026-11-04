@@ -6145,18 +6145,21 @@ impl FaultDetector {
             // Measure exactly this tick on the output sample clock, not a route cursor.
             let rate = store.format().sample_rate();
             let start = multiview_audio::store::output_ns_to_frame(pts.as_nanos(), rate);
-            let next_ns = pts.as_nanos().saturating_add(
-                i64::try_from(
-                    (1_000_000_000_i128 * i128::from(self.cadence.den))
-                        / i128::from(self.cadence.num.max(1)),
-                )
-                .unwrap_or(i64::MAX),
+            // Each tick boundary comes from its integer index. Adding a truncated
+            // period to this tick's truncated PTS can omit its final PCM sample
+            // at fractional cadences (e.g. 30000/1001, tick 14).
+            let next = MediaTime::from_tick(
+                i64::try_from(index.saturating_add(1)).unwrap_or(i64::MAX),
+                self.cadence,
             );
-            let end = multiview_audio::store::output_ns_to_frame(next_ns, rate);
+            let end = multiview_audio::store::output_ns_to_frame(next.as_nanos(), rate);
             let frames = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
             return match store.measure_pcm(start, frames) {
-                multiview_audio::store::PcmMeasurement::Measured { rms_dbfs } => {
-                    Some(rms_dbfs <= floor)
+                // Silence detection uses the covered span's sample peak, not RMS:
+                // a short audible burst must not read silent when the same PCM's
+                // tick-wide RMS falls below the operator's level floor.
+                multiview_audio::store::PcmMeasurement::Measured { peak_dbfs, .. } => {
+                    Some(peak_dbfs <= floor)
                 }
                 multiview_audio::store::PcmMeasurement::Unknown => None,
             };
@@ -12724,6 +12727,60 @@ mod fault_detector_tests {
             std::collections::HashMap::new(),
         );
         (det, video, audio)
+    }
+
+    #[test]
+    fn fractional_tick_requires_its_final_sample_for_measured_silence() {
+        let (mut det, video, audio) = live_audio_detector();
+        det.cadence = Rational::new(30_000, 1_001);
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let index = 14;
+        let pts = MediaTime::from_tick(index, det.cadence);
+        let next = MediaTime::from_tick(index + 1, det.cadence);
+        let start = multiview_audio::store::output_ns_to_frame(pts.as_nanos(), 48_000);
+        let end = multiview_audio::store::output_ns_to_frame(next.as_nanos(), 48_000);
+        assert_eq!((start, end), (22_422, 24_024));
+        audio
+            .publish_at(start, &AudioBlock::silence(format, 1601))
+            .unwrap();
+        video.publish(moving(14), pts);
+        assert_eq!(det.silence_now("live-hls", 14, pts), None);
+        audio
+            .publish_at(end - 1, &AudioBlock::silence(format, 1))
+            .unwrap();
+        assert_eq!(det.silence_now("live-hls", 14, pts), Some(true));
+        audio
+            .publish_at(
+                end - 1,
+                &AudioBlock::from_interleaved(format, vec![0.01; 2]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(det.silence_now("live-hls", 14, pts), Some(false));
+    }
+
+    #[test]
+    fn sparse_near_floor_live_burst_is_audible() {
+        let (mut det, video, audio) = live_audio_detector();
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        for i in 0..20 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            let mut samples = vec![0.0; 1920 * 2];
+            for frame in samples.chunks_exact_mut(2).take(19) {
+                frame.fill(0.01); // -40 dBFS peak, approximately -60 dBFS RMS.
+            }
+            audio
+                .publish_at(at, &AudioBlock::from_interleaved(format, samples).unwrap())
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            assert_eq!(det.silence_now("live-hls", i, pts_of(i)), Some(false));
+            assert_ne!(
+                det.sample(pts_of(i), i, &live_states("live-hls"))
+                    .get("live-hls")
+                    .copied(),
+                Some(TileFault::Silent),
+                "a sparse audible burst must not raise a silence badge"
+            );
+        }
     }
 
     #[test]
