@@ -29,6 +29,52 @@ fn touch_segment(dir: &std::path::Path, name: &str) -> PathBuf {
 }
 
 #[test]
+fn failed_publish_preserves_previous_manifest_and_all_its_segments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("index.m3u8");
+    let mut live = LivePlaylist::new(manifest.clone(), 2);
+    for index in 0..4 {
+        let name = format!("seg{index}.ts");
+        let path = touch_segment(dir.path(), &name);
+        live.push_closed_segment(name, path, 2.0, index * 2_000_000_000)
+            .expect("publish");
+    }
+    let original = std::fs::read_to_string(&manifest).expect("original manifest");
+    // The same-directory temp name is a directory: File::create fails before rename.
+    std::fs::create_dir(manifest.with_file_name("index.m3u8.tmp")).expect("inject failure");
+    let next = touch_segment(dir.path(), "seg4.ts");
+    assert!(live
+        .push_closed_segment("seg4.ts", next, 2.0, 8_000_000_000)
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&manifest).unwrap(), original);
+    for uri in original
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        assert!(
+            dir.path().join(uri).is_file(),
+            "published URI {uri} must exist"
+        );
+    }
+    std::fs::remove_dir(manifest.with_file_name("index.m3u8.tmp")).unwrap();
+    let next = touch_segment(dir.path(), "seg5.ts");
+    live.push_closed_segment("seg5.ts", next, 2.0, 10_000_000_000)
+        .expect("publish after recovery");
+    let current = std::fs::read_to_string(&manifest).unwrap();
+    assert!(current.contains("seg5.ts"));
+    assert!(!current.contains("seg4.ts"));
+    for uri in current
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        assert!(
+            dir.path().join(uri).is_file(),
+            "published URI {uri} must exist"
+        );
+    }
+}
+
+#[test]
 fn restarted_audio_and_video_playlists_advance_together_with_discontinuity() {
     let dir = tempfile::tempdir().expect("tempdir");
     for name in ["index.m3u8", "audio-program.m3u8", "audio-track0.m3u8"] {
@@ -49,7 +95,10 @@ fn restarted_audio_and_video_playlists_advance_together_with_discontinuity() {
         let text = std::fs::read_to_string(dir.path().join(name)).expect("manifest");
         assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:18"), "{text}");
         assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"), "{text}");
-        assert!(!dir.path().join(format!("{name}-17.ts")).exists());
+        assert!(
+            dir.path().join(format!("{name}-17.ts")).exists(),
+            "client grace keeps the old segment"
+        );
     }
 }
 
@@ -60,7 +109,7 @@ fn restarted_audio_and_video_playlists_advance_together_with_discontinuity() {
 #[test]
 fn rolling_live_playlist_windows_publishes_and_prunes() {
     const WINDOW: usize = 6;
-    const TOTAL: usize = 10;
+    const TOTAL: usize = 16;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let playlist_path = dir.path().join("multiview.m3u8");
@@ -96,7 +145,7 @@ fn rolling_live_playlist_windows_publishes_and_prunes() {
         WINDOW,
         "the live playlist must list exactly the window size, got {listed:?}"
     );
-    // The window holds the most recent WINDOW segments: seg4.ts..seg9.ts.
+    // The window holds the most recent WINDOW segments.
     let expected: Vec<String> = (TOTAL - WINDOW..TOTAL)
         .map(|i| format!("seg{i}.ts"))
         .collect();
@@ -119,10 +168,10 @@ fn rolling_live_playlist_windows_publishes_and_prunes() {
         "a live (unfinished) playlist must NOT carry #EXT-X-ENDLIST; playlist was:\n{text}"
     );
 
-    // Evicted `.ts` files (the first N - window) must be deleted from disk; the
-    // windowed ones must remain.
+    // A complete previous window remains available for clients that hold its
+    // manifest; older segments expire, keeping disk bounded to two windows.
     for (i, path) in seg_paths.iter().enumerate() {
-        if i < TOTAL - WINDOW {
+        if i < TOTAL - 2 * WINDOW {
             assert!(
                 !path.exists(),
                 "evicted segment {} must be deleted from disk (bounded disk)",

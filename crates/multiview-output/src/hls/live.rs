@@ -7,7 +7,7 @@
 //! rolling driver that fixes both: on **each** closed segment it pushes the
 //! segment into a windowed [`MediaPlaylist`], re-renders, and publishes the
 //! manifest to disk **atomically** (same-dir `.tmp` → fsync → `rename(2)`), then
-//! prunes the `.ts` file evicted from the window so disk stays bounded.
+//! retains evicted `.ts` files for one further bounded client-grace window.
 //!
 //! This module is **pure Rust** — it performs only filesystem I/O and drives the
 //! pure-text [`MediaPlaylist`] generator; it pulls no native dependency and is
@@ -39,17 +39,17 @@ use crate::error::{Error, Result};
 pub struct LivePlaylist {
     /// Where the rendered `.m3u8` is published (atomically) on every close.
     playlist_path: PathBuf,
-    /// The bounded segment window (number of segments kept in the playlist and on
-    /// disk).
+    /// The listed window; one additional window remains on disk as client grace.
     window: usize,
     /// The windowed media playlist; `set_window(window)` is applied at
     /// construction so [`MediaPlaylist::push_segment`] evicts + advances the media
     /// (and discontinuity) sequence per RFC 8216bis §6.2.2.
     playlist: MediaPlaylist,
-    /// The on-disk paths of the segments currently inside the window, oldest at
-    /// the front. When the count exceeds `window` the front path is popped and
-    /// the corresponding `.ts` file unlinked (best-effort) so disk stays bounded.
+    /// Published segments currently listed in the manifest, oldest first.
     seg_paths: VecDeque<PathBuf>,
+    /// Recently retired segments remain available through one complete playlist
+    /// window (at least three segment closes). This queue is bounded separately.
+    retired_paths: VecDeque<PathBuf>,
     /// The shared outbound presentation epoch (ADR-M010, DEV-C1). When set
     /// **and** the cell carries an epoch, each closed segment is stamped with
     /// `EXT-X-PROGRAM-DATE-TIME: epoch.wall_at(segment first PTS)` — the same
@@ -80,6 +80,7 @@ impl LivePlaylist {
             window,
             playlist,
             seg_paths: VecDeque::new(),
+            retired_paths: VecDeque::new(),
             epoch: None,
             epoch_generation: None,
             initial_discontinuity: false,
@@ -117,8 +118,8 @@ impl LivePlaylist {
     /// `EXTINF` seconds, `start_pts_ns` the output PTS of its first sample on
     /// the tick-derived internal timeline), recompute `EXT-X-TARGETDURATION`,
     /// and atomically re-publish the manifest to disk. The segment's on-disk
-    /// `path` is tracked so that, once it ages out of the window, its `.ts`
-    /// file is pruned.
+    /// `path` is tracked so that, once it ages beyond the client-grace window,
+    /// its `.ts` file is pruned.
     ///
     /// When an epoch source is attached ([`set_epoch_source`]) and carries an
     /// epoch, the segment is stamped `EXT-X-PROGRAM-DATE-TIME:
@@ -139,8 +140,7 @@ impl LivePlaylist {
     /// # Errors
     /// Returns [`Error::Output`] if the manifest could not be atomically written
     /// (the temp write, fsync, or rename failed). Pruning an aged-out segment is
-    /// best-effort and never surfaces an error (a one-refresh-behind client 404 is
-    /// acceptable; a missing file is ignored).
+    /// best-effort and never surfaces an error; a missing file is ignored.
     pub fn push_closed_segment(
         &mut self,
         uri: impl Into<String>,
@@ -149,10 +149,8 @@ impl LivePlaylist {
         start_pts_ns: i64,
     ) -> Result<()> {
         let mut segment = Segment::new(uri, duration);
-        if self.initial_discontinuity {
-            segment.discontinuity = true;
-            self.initial_discontinuity = false;
-        }
+        segment.discontinuity = self.initial_discontinuity;
+        let mut next_generation = self.epoch_generation;
         // PDT from the shared epoch (ADR-M010): segment first-sample wall time
         // = wall_at(first PTS). An unset source or a still-empty cell stamps
         // nothing — never a fabricated wall time.
@@ -172,26 +170,35 @@ impl LivePlaylist {
             {
                 segment.discontinuity = true;
             }
-            self.epoch_generation = Some(generation);
+            next_generation = Some(generation);
         }
+        // Prepare a candidate, but do not change committed state until the
+        // atomic rename succeeds. A failed write must leave every old URI valid.
+        let mut next_playlist = self.playlist.clone();
         // Append to the windowed playlist; `push_segment` auto-evicts the oldest
         // beyond the window and advances EXT-X-MEDIA-SEQUENCE / -DISCONTINUITY-
         // SEQUENCE (RFC 8216bis §6.2.2) — we never touch those counters by hand.
-        self.playlist.push_segment(segment);
+        next_playlist.push_segment(segment);
         // TARGETDURATION must be >= every EXTINF still listed, as an integer.
-        self.playlist.recompute_target_duration();
-
-        // Track the new segment file and prune any that just aged out of the
-        // window so disk stays bounded (the playlist already dropped them).
+        next_playlist.recompute_target_duration();
+        atomic_write(&self.playlist_path, next_playlist.render().as_bytes())?;
+        self.playlist = next_playlist;
+        self.initial_discontinuity = false;
+        self.epoch_generation = next_generation;
         self.seg_paths.push_back(path);
         while self.seg_paths.len() > self.window {
             if let Some(evicted) = self.seg_paths.pop_front() {
-                prune_segment(&evicted);
+                self.retired_paths.push_back(evicted);
             }
         }
-
-        // Atomically publish the rolling manifest (no ENDLIST while live).
-        self.publish()
+        // An old client can still hold a recently superseded manifest. Retain
+        // one further full window before unlinking, without unbounded growth.
+        while self.retired_paths.len() > self.window.max(3) {
+            if let Some(expired) = self.retired_paths.pop_front() {
+                prune_segment(&expired);
+            }
+        }
+        Ok(())
     }
 
     /// Finalize the live playlist at end-of-run: mark it finished
@@ -215,9 +222,8 @@ impl LivePlaylist {
 
 /// Best-effort unlink of an evicted segment file. The result is deliberately
 /// discarded: a `NotFound` means the file is already gone, and any other unlink
-/// error is swallowed rather than failing the live run — bounding disk is
-/// best-effort here (a one-refresh-behind client 404 is acceptable, and a proper
-/// grace-period reaper is HLS-2-full). The deliberate non-propagation keeps a
+/// error is swallowed rather than failing the live run. A complete additional
+/// playlist window has elapsed before this unlink. The non-propagation keeps a
 /// transient filesystem hiccup from stalling the rolling publish (invariant #1);
 /// a failed unlink merely leaves the file lingering until process exit.
 fn prune_segment(path: &Path) {

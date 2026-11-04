@@ -73,13 +73,17 @@ fn gray_frame(pts: i64) -> Video {
 /// kind-tagged video packets plus the codec-params snapshot + time-base a mux
 /// sink registers its video stream from.
 fn encode_video() -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
+    encode_video_at(2_000_000)
+}
+
+fn encode_video_at(bit_rate: usize) -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
     let target = VideoEncodeTarget {
         codec_name: "mpeg2video".to_owned(),
         width: WIDTH,
         height: HEIGHT,
         format: Pixel::YUV420P,
         time_base: Rational::new(1, FPS),
-        bit_rate: 2_000_000,
+        bit_rate,
         gop: GOP,
         cuda_device: None,
     };
@@ -127,12 +131,16 @@ fn tone_frame(samples: usize, pts: i64) -> Audio {
 /// Encode roughly the video duration of `aac` audio once, returning the
 /// kind-tagged audio packets plus its codec-params snapshot + time-base.
 fn encode_audio() -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
+    encode_audio_at(128_000)
+}
+
+fn encode_audio_at(bit_rate: usize) -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
     let target = AudioEncodeTarget {
         codec_name: "aac".to_owned(),
         format: Sample::F32(SampleType::Planar),
         channel_layout: ChannelLayout::STEREO,
         sample_rate: SAMPLE_RATE,
-        bit_rate: 128_000,
+        bit_rate,
     };
     let mut encoder = AudioEncoder::new(&target).expect("open aac encoder");
     let time_base = encoder.time_base();
@@ -330,6 +338,147 @@ fn live_renditions_prune_and_restart_without_stale_segment_urls() {
             }
         }
     }
+}
+
+#[test]
+fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (video, v_params, v_tb) = encode_video_at(900_000);
+    let (audio, a_params, a_tb) = encode_audio_at(96_000);
+    let combined = interleave(video, v_tb, audio, a_tb);
+    let mut track_packets = Vec::new();
+    for packet in combined {
+        if packet.kind() == multiview_ffmpeg::StreamKind::Audio {
+            track_packets.push(EncodedPacket::with_kind(
+                packet.to_owned_packet(),
+                multiview_ffmpeg::StreamKind::AudioTrack(0),
+            ));
+        } else {
+            track_packets.push(packet);
+        }
+    }
+    let mut first = VecPackets {
+        packets: track_packets.into_iter(),
+    };
+    let sink = PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .with_audio_selection(AudioSelection {
+        program: false,
+        tracks: vec![TrackSelection {
+            index: 0,
+            language: None,
+            title: Some("Old".into()),
+        }],
+    });
+    sink.run_av_tracks(
+        &mut first,
+        MuxStream::new(&v_params, v_tb),
+        None,
+        &[MuxStream::new(&a_params, a_tb)],
+    )
+    .unwrap();
+    let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+    assert!(master.contains("BANDWIDTH=996000"), "{master}");
+    assert!(master.contains("RESOLUTION=160x120"), "{master}");
+    assert!(master.contains("FRAME-RATE=30.000"), "{master}");
+    assert!(master.contains("CODECS=\"mp2v,mp4a.40.2\""), "{master}");
+    assert!(master.contains("audio-track0.m3u8"), "{master}");
+    assert!(dir.path().join("audio-track0.m3u8").exists());
+    let first_track = std::fs::read_to_string(dir.path().join("audio-track0.m3u8")).unwrap();
+    let first_index = first_track
+        .lines()
+        .find(|line| line.starts_with("#EXT-X-MEDIA-SEQUENCE:"))
+        .unwrap();
+
+    let (video, v_params, v_tb) = encode_video_at(750_000);
+    let mut second = VecPackets {
+        packets: video.into_iter(),
+    };
+    let sink = PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    );
+    sink.run_av_tracks(&mut second, MuxStream::new(&v_params, v_tb), None, &[])
+        .unwrap();
+    let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+    assert!(master.contains("BANDWIDTH=750000"), "{master}");
+    assert!(
+        !master.contains("AUDIO=\"audio\""),
+        "video-only master must not reference an audio group: {master}"
+    );
+    assert!(
+        !master.contains("audio-track0.m3u8"),
+        "removed track must not be advertised: {master}"
+    );
+    assert!(
+        !dir.path().join("audio-track0.m3u8").exists(),
+        "removed track must not be advertised"
+    );
+    assert!(
+        dir.path().join("index.m3u8").exists(),
+        "legacy index must remain"
+    );
+    let (video, v_params, v_tb) = encode_video_at(1_100_000);
+    let (audio, a_params, a_tb) = encode_audio_at(128_000);
+    let packets = interleave(video, v_tb, audio, a_tb)
+        .into_iter()
+        .map(|packet| {
+            if packet.kind() == multiview_ffmpeg::StreamKind::Audio {
+                EncodedPacket::with_kind(
+                    packet.to_owned_packet(),
+                    multiview_ffmpeg::StreamKind::AudioTrack(0),
+                )
+            } else {
+                packet
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut third = VecPackets {
+        packets: packets.into_iter(),
+    };
+    let sink = PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .with_audio_selection(AudioSelection {
+        program: false,
+        tracks: vec![TrackSelection {
+            index: 0,
+            language: None,
+            title: Some("New".into()),
+        }],
+    });
+    sink.run_av_tracks(
+        &mut third,
+        MuxStream::new(&v_params, v_tb),
+        None,
+        &[MuxStream::new(&a_params, a_tb)],
+    )
+    .unwrap();
+    let track = std::fs::read_to_string(dir.path().join("audio-track0.m3u8")).unwrap();
+    assert!(track.contains("#EXT-X-DISCONTINUITY"), "{track}");
+    assert_ne!(
+        first_index,
+        track
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-MEDIA-SEQUENCE:"))
+            .unwrap()
+    );
+    let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+    assert!(master.contains("BANDWIDTH=1228000"), "{master}");
+    assert!(master.contains("NAME=\"New\""), "{master}");
+    assert!(!master.contains("NAME=\"Old\""), "{master}");
 }
 
 #[test]

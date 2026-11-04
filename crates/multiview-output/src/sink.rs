@@ -1743,9 +1743,10 @@ impl PacketMuxSink {
                 // PDT-stamped from the shared outbound epoch (ADR-M010).
                 let mut live = LivePlaylist::new(playlist_path.clone(), *window);
                 live.set_epoch_source(epoch.clone());
-                // Keep both the sequence and filename generation ahead of old
-                // segments so a restart cannot serve stale cached bytes.
+                // Keep every rendition's sequence and filename generation ahead
+                // of its prior run, including a track absent from the old run.
                 let next = next_segment_index(dir, prefix)?;
+                retire_old_master(playlist_path)?;
                 live.set_media_sequence(next);
                 if next != 0 {
                     live.set_initial_discontinuity();
@@ -1759,7 +1760,7 @@ impl PacketMuxSink {
                     video,
                     audio,
                     track_streams,
-                )?;
+                );
                 let driven = state.drive_from_packets(source);
                 finish_segments(state, driven, video.time_base)
                     .map(|result| PacketMuxOutcome::Segment(Box::new(result)))
@@ -1920,6 +1921,9 @@ impl<'a> SegmentState<'a> {
     }
 
     /// Build independent audio-only renditions from the same encoded packets.
+    #[allow(clippy::too_many_lines)]
+    // reason: initialization joins rendition selection, video metadata, and the
+    // master; keep these states together so publication order stays coherent.
     fn set_audio_renditions(
         &mut self,
         playlist_path: &Path,
@@ -1928,16 +1932,11 @@ impl<'a> SegmentState<'a> {
         video: MuxStream<'a>,
         audio: Option<MuxStream<'a>>,
         tracks: &'a [MuxStream<'a>],
-    ) -> Result<()> {
-        if self
+    ) {
+        let default_selection = AudioSelection::default();
+        let selection = self
             .tracks
-            .is_none_or(|(selection, _)| selection.tracks.is_empty())
-        {
-            return Ok(());
-        }
-        let (selection, _) = self
-            .tracks
-            .ok_or_else(|| Error::Output("missing track selection".to_owned()))?;
+            .map_or(&default_selection, |(selection, _)| selection);
         let mut master = MasterPlaylist::new();
         let mut states = Vec::new();
         let parent = playlist_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1993,16 +1992,52 @@ impl<'a> SegmentState<'a> {
                 current: None,
             });
         }
-        if states.is_empty() {
-            return Ok(());
-        }
         let mut video_live = LivePlaylist::new(parent.join("video.m3u8"), window);
         video_live.set_epoch_source(epoch);
         video_live.set_media_sequence(self.seg_index);
         if self.seg_index != 0 {
             video_live.set_initial_discontinuity();
         }
-        master.push_variant(VariantStream::new("video.m3u8", 4_000_000));
+        let max_audio_rate = states
+            .iter()
+            .filter_map(|state| state.stream.params.bit_rate())
+            .max()
+            .unwrap_or(0);
+        let bandwidth = video
+            .params
+            .bit_rate()
+            .unwrap_or(1)
+            .saturating_add(max_audio_rate);
+        let mut variant = VariantStream::new("video.m3u8", bandwidth);
+        if let Some((width, height)) = video.params.video_dimensions() {
+            variant = variant.with_resolution(width, height);
+        }
+        if let Some(video_codec) = video.params.hls_codec() {
+            if states.is_empty() {
+                variant = variant.with_codecs(video_codec);
+            } else if let Some(audio_codec) = states
+                .first()
+                .and_then(|state| state.stream.params.hls_codec())
+            {
+                if states
+                    .iter()
+                    .all(|state| state.stream.params.hls_codec() == Some(audio_codec))
+                {
+                    variant = variant.with_codecs(format!("{video_codec},{audio_codec}"));
+                }
+            }
+        }
+        if video.time_base.num > 0 && video.time_base.den > 0 {
+            let numerator = u32::try_from(video.time_base.den).ok();
+            let denominator = u32::try_from(video.time_base.num).ok();
+            if let (Some(numerator), Some(denominator)) = (numerator, denominator) {
+                let fps = f64::from(numerator) / f64::from(denominator);
+                if (0.0..=120.0).contains(&fps) && fps > 0.0 {
+                    variant = variant.with_frame_rate(fps);
+                }
+            }
+        }
+        master.push_variant(variant);
         // Publish only after the first complete media segment exists.
         self.renditions = Some(AudioRenditions {
             states,
@@ -2016,7 +2051,6 @@ impl<'a> SegmentState<'a> {
             master: parent.join("master.m3u8"),
             master_text: master.render(),
         });
-        Ok(())
     }
 
     fn open_audio_segments(&mut self, index: u64) -> Result<()> {
@@ -2458,6 +2492,44 @@ impl<'a> SegmentState<'a> {
     }
 }
 
+/// Remove the old multivariant entry point before any replacement renditions
+/// publish. No master may advertise the prior run's removed tracks meanwhile.
+fn retire_old_master(playlist_path: &Path) -> Result<()> {
+    let parent = playlist_path.parent().unwrap_or_else(|| Path::new("."));
+    let master = parent.join("master.m3u8");
+    match std::fs::remove_file(&master) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::Output(format!(
+                "retiring {}: {error}",
+                master.display()
+            )))
+        }
+    }
+    // The legacy index remains in place. Remove only the dedicated rendition
+    // manifests, never their segment files (old clients can still request them).
+    let entries = std::fs::read_dir(parent)
+        .map_err(|error| Error::Output(format!("reading HLS renditions: {error}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| Error::Output(format!("reading HLS entry: {error}")))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == "video.m3u8"
+            || name == "audio-program.m3u8"
+            || (name.starts_with("audio-track")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8")))
+        {
+            std::fs::remove_file(entry.path()).map_err(|error| {
+                Error::Output(format!("retiring HLS rendition {name}: {error}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Highest previous segment number plus one, shared by all audio/video tracks.
 fn next_segment_index(dir: &Path, prefix: &str) -> Result<u64> {
     let entries = std::fs::read_dir(dir)
@@ -2467,12 +2539,18 @@ fn next_segment_index(dir: &Path, prefix: &str) -> Result<u64> {
         let entry = entry.map_err(|e| Error::Output(format!("reading HLS segment entry: {e}")))?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(number) = name
-            .strip_prefix(prefix)
-            .and_then(|s| s.strip_suffix(".ts"))
-        else {
+        let Some(stem) = name.strip_suffix(".ts") else {
             continue;
         };
+        let number = stem
+            .strip_prefix(prefix)
+            .or_else(|| stem.strip_prefix("video-"))
+            .or_else(|| stem.strip_prefix("audio-program-"))
+            .or_else(|| {
+                stem.strip_prefix("audio-track")
+                    .and_then(|s| s.split_once('-').map(|(_, number)| number))
+            });
+        let Some(number) = number else { continue };
         if let Ok(index) = number.parse::<u64>() {
             next = next.max(index.saturating_add(1));
         }
