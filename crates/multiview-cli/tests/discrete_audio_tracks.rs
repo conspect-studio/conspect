@@ -184,10 +184,8 @@ fn tone_power(samples: &[f32], hz: f64) -> f64 {
     s1 * s1 + s2 * s2 - coeff * s1 * s2
 }
 
-/// `(power at 440 Hz, power at 1 kHz)` of a decoded stream: which input it
-/// carries, robust to the phase jumps a faster-than-real-time file decode can
-/// leave in its store.
-fn tone_powers(path: &Path, stream: &str) -> (f64, f64) {
+/// Decode the complete stream; never discard its startup or segment boundaries.
+fn decode_audio(path: &Path, stream: &str) -> Vec<f32> {
     let out = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(path)
@@ -197,59 +195,51 @@ fn tone_powers(path: &Path, stream: &str) -> (f64, f64) {
         .output()
         .expect("spawn ffmpeg decode");
     assert!(out.status.success(), "decode of {stream} failed");
-    let samples: Vec<f32> = out
-        .stdout
+    assert_eq!(out.stdout.len() % 4, 0, "incomplete PCM sample");
+    out.stdout
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    assert!(samples.len() > 48_000, "too few samples in {stream}");
-    // Sum local powers instead of one whole-run phasor: AAC segment boundaries
-    // reset phase, so a correct tone can cancel across the joined TS stream.
-    let powers = samples[12_000..]
-        .chunks(4_800)
-        .filter(|chunk| chunk.len() == 4_800);
-    powers.fold((0.0, 0.0), |(track, program), chunk| {
-        (
-            track + tone_power(chunk, f64::from(TRACK_HZ)),
-            program + tone_power(chunk, 1000.0),
-        )
-    })
+        .collect()
 }
 
-fn dominant_hz(path: &Path, stream: &str) -> f64 {
-    let out = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(path)
-        .args([
-            "-map", stream, "-f", "f32le", "-ac", "1", "-ar", "48000", "pipe:1",
-        ])
-        .output()
-        .expect("spawn ffmpeg decode");
-    assert!(out.status.success(), "decode of {stream} failed");
-    let samples: Vec<f32> = out
-        .stdout
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    assert!(samples.len() > 48_000, "too few samples in {stream}");
-    // Measure over VOICED 10 ms windows only: a file source's decode thread can
-    // trail the clock on a loaded host, and the store silence-fills that span;
-    // silence carries no zero-crossings and would bias the estimate low. The
-    // voiced fraction is reported so a mostly-silent track still fails.
-    let body = &samples[12_000..];
-    let mut crossings = 0usize;
+/// Complete-signal coverage plus local spectral identity. A one-window tone
+/// cannot satisfy the duration, voiced-fraction, and maximum-gap checks.
+#[allow(clippy::print_stdout)] // Expose decoded PCM metrics for the targeted release proof.
+fn assert_audible_tone(
+    samples: &[f32],
+    label: &str,
+    expected_hz: f64,
+    other_hz: f64,
+    expected_duration: f64,
+) {
+    const WINDOW: usize = 480; // 10 ms; also bounds the gap measurement.
+    let duration = samples.len() as f64 / 48_000.0;
     let mut voiced = 0usize;
-    for window in body.chunks(480) {
-        let energy: f32 = window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32;
+    let mut gap = 0usize;
+    let mut max_gap = 0usize;
+    let mut expected_power = 0.0;
+    let mut other_power = 0.0;
+    let mut crossings = 0usize;
+    for window in samples.chunks(WINDOW) {
+        let energy = window
+            .iter()
+            .map(|s| f64::from(*s) * f64::from(*s))
+            .sum::<f64>()
+            / window.len() as f64;
         if energy < 1e-6 {
+            gap += window.len();
+            max_gap = max_gap.max(gap);
             continue;
         }
         voiced += window.len();
+        gap = 0;
+        expected_power += tone_power(window, expected_hz) / (window.len() * window.len()) as f64;
+        other_power += tone_power(window, other_hz) / (window.len() * window.len()) as f64;
         let mut prev = 0i32;
-        for &s in window {
-            let sign = if s > 1e-4 {
+        for &sample in window {
+            let sign = if sample > 1e-4 {
                 1
-            } else if s < -1e-4 {
+            } else if sample < -1e-4 {
                 -1
             } else {
                 prev
@@ -262,12 +252,62 @@ fn dominant_hz(path: &Path, stream: &str) -> f64 {
             }
         }
     }
-    let fraction = voiced as f64 / body.len() as f64;
+    let fraction = voiced as f64 / samples.len().max(1) as f64;
+    let max_gap_s = max_gap as f64 / 48_000.0;
+    let observed_hz = crossings as f64 / (2.0 * voiced.max(1) as f64 / 48_000.0);
+    println!("{label}: decoded_pcm_duration={duration:.3}s voiced_fraction={fraction:.4} max_gap={max_gap_s:.3}s frequency={observed_hz:.1}Hz");
     assert!(
-        fraction > 0.5,
-        "{stream} is mostly silent ({fraction:.3} voiced)"
+        (expected_duration - 0.05..=expected_duration + 0.15).contains(&duration),
+        "{label}: wrong decoded duration {duration:.3}s"
     );
-    crossings as f64 / (2.0 * voiced as f64 / 48_000.0)
+    // AAC's one-frame encoder priming and tail permit at most two frames total.
+    // The six-second source remains continuous throughout the four-second run.
+    assert!(
+        fraction > 0.98,
+        "{label}: insufficient voiced coverage {fraction:.4}"
+    );
+    assert!(
+        max_gap_s <= 2.0 * AAC_FRAME_S,
+        "{label}: silence gap {max_gap_s:.3}s"
+    );
+    assert!(
+        (observed_hz - expected_hz).abs() < 50.0,
+        "{label}: expected {expected_hz}Hz, got {observed_hz}Hz"
+    );
+    assert!(
+        expected_power > 10.0 * other_power,
+        "{label}: wrong tone ({expected_power:.3e} vs {other_power:.3e})"
+    );
+}
+
+#[test]
+fn audio_detector_rejects_short_or_wrong_tones_and_accepts_phase_changes() {
+    let mut good: Vec<f32> = (0..192_000)
+        .map(|i| (0.1 * (std::f64::consts::TAU * 440.0 * f64::from(i) / 48_000.0).sin()) as f32)
+        .collect();
+    for (index, sample) in good.iter_mut().enumerate().skip(96_000) {
+        *sample =
+            (0.1 * (std::f64::consts::TAU * 440.0 * index as f64 / 48_000.0 + 1.0).sin()) as f32;
+    }
+    assert_audible_tone(&good, "phase-varied positive", 440.0, 1000.0, 4.0);
+    let mut mostly_silent = good.clone();
+    mostly_silent[4_800..].fill(0.0);
+    assert!(std::panic::catch_unwind(|| assert_audible_tone(
+        &mostly_silent,
+        "mostly silent negative",
+        440.0,
+        1000.0,
+        4.0
+    ))
+    .is_err());
+    assert!(std::panic::catch_unwind(|| assert_audible_tone(
+        &good,
+        "wrong tone negative",
+        1000.0,
+        440.0,
+        4.0
+    ))
+    .is_err());
 }
 
 async fn run(output_audio: &str) -> (tempfile::TempDir, PathBuf) {
@@ -299,6 +339,7 @@ async fn assert_two_audio_streams(output_audio: &str) {
     let segs = segments(&out_dir);
     assert!(!segs.is_empty(), "no segments written");
     let mut joined = Vec::new();
+    let mut segment_samples: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
     for seg in &segs {
         let streams = probe_streams(seg);
         let kinds: Vec<&str> = streams.iter().map(|s| s.0.as_str()).collect();
@@ -315,25 +356,64 @@ async fn assert_two_audio_streams(output_audio: &str) {
             "program/track start PTS skew {skew} s in {}",
             seg.display()
         );
+        for (index, label, hz, other) in [
+            (0, "program", 1000.0, 440.0),
+            (1, "discrete", 440.0, 1000.0),
+        ] {
+            let pcm = decode_audio(seg, &format!("0:a:{index}"));
+            let duration = pcm.len() as f64 / 48_000.0;
+            assert!(
+                duration >= 0.94,
+                "{label}: short segment {} duration={duration:.3}s",
+                seg.display()
+            );
+            // The final segment can contain fewer than 25 video frames; AAC
+            // sample count, rather than TS byte count, proves occupancy.
+            let voiced = pcm
+                .chunks(480)
+                .filter(|window| {
+                    window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32 >= 1e-6
+                })
+                .count();
+            let occupancy = voiced as f64 / pcm.len().div_ceil(480) as f64;
+            assert!(
+                occupancy > 0.95,
+                "{label}: segment {} voiced fraction={occupancy:.4}",
+                seg.display()
+            );
+            let expected = tone_power(&pcm, hz);
+            let wrong = tone_power(&pcm, other);
+            assert!(
+                expected > 10.0 * wrong,
+                "{label}: wrong tone in {}",
+                seg.display()
+            );
+            segment_samples[index].push(pcm.len());
+        }
         joined.extend(std::fs::read(seg).expect("read segment"));
     }
     let all = out_dir.join("joined.bin");
     std::fs::write(&all, joined).expect("write joined");
-    let program_hz = dominant_hz(&all, "0:a:0");
-    assert!(
-        (program_hz - 1000.0).abs() < 50.0,
-        "program must stay the 1 kHz mix, got {program_hz}"
-    );
-    let (track_440, track_1k) = tone_powers(&all, "0:a:1");
-    assert!(
-        track_440 > 1e4,
-        "muted -18 dB program route must retain a clean, audible discrete track"
-    );
-    assert!(
-        track_440 > 10.0 * track_1k,
-        "track must carry the discrete 440 Hz input, not the 1 kHz program \
-         (440 Hz power {track_440:.3e}, 1 kHz power {track_1k:.3e})"
-    );
+    for (index, label, hz, other) in [
+        (0, "program", 1000.0, 440.0),
+        (1, "discrete", 440.0, 1000.0),
+    ] {
+        let pcm = decode_audio(&all, &format!("0:a:{index}"));
+        // Inspect the join in the continuous decoder, not isolated AAC
+        // decoders whose priming creates a false sample-to-sample jump.
+        let mut offset = 0usize;
+        for &segment_len in segment_samples[index].iter().take(segs.len() - 1) {
+            offset += segment_len;
+            let before = *pcm.get(offset - 1).expect("joined segment end");
+            let after = *pcm.get(offset).expect("joined segment start");
+            let jump = (before - after).abs();
+            assert!(
+                jump < 0.05,
+                "{label}: joined PCM phase jump {jump:.4} at sample {offset}"
+            );
+        }
+        assert_audible_tone(&pcm, label, hz, other, 4.0);
+    }
 }
 
 #[tokio::test]
@@ -412,19 +492,17 @@ async fn master_resolves_playable_distinct_audio_only_renditions() {
         }
         let joined = dir.join(format!("{playlist}.ts"));
         std::fs::write(&joined, bytes).expect("joined audio");
-        let (track, program) = tone_powers(&joined, "0:a:0");
-        let (expected, other) = if (frequency - 1000.0_f64).abs() < 1.0 {
-            (program, track)
+        let other = if (frequency - 1000.0_f64).abs() < 1.0 {
+            440.0
         } else {
-            (track, program)
+            1000.0
         };
-        assert!(
-            expected > 1e4,
-            "{playlist}: expected {frequency} Hz is inaudible"
-        );
-        assert!(
-            expected > 10.0 * other,
-            "{playlist}: expected {frequency} Hz power {expected:.3e}, other {other:.3e}"
+        assert_audible_tone(
+            &decode_audio(&joined, "0:a:0"),
+            playlist,
+            frequency,
+            other,
+            4.0,
         );
     }
     let legacy = std::fs::read_to_string(dir.join("index.m3u8")).expect("legacy media playlist");
