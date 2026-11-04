@@ -10690,6 +10690,8 @@ fn open_and_stream(
     let mut pacer = PtsWallClock::new();
     // Live frames go onto the output timeline with a jitter hold (see `LiveStamper`).
     let mut stamper = LiveStamper::new();
+    // The raw-to-output mapping (`at - raw`) at the last anchor publish.
+    let mut last_raw_offset: Option<i64> = None;
     // On-air A/V offset probe for this source (see `crate::av_sync`).
     let av_probe = crate::av_sync::probe(&plan.id);
 
@@ -10787,10 +10789,16 @@ fn open_and_stream(
             // source-relative stamp (it plays from its own start).
             let at = if plan.live {
                 let at = stamper.stamp(&plan.output_origin, pts, pacer.publish_time(pts));
-                // Expose the (re-)anchor for audio-to-vision lock.
-                if let Some(anchor) = stamper.take_reanchored() {
-                    let raw_ns = decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base));
-                    publish_live_anchor(&plan.live_anchor, anchor, raw_ns);
+                // Expose the A/V anchor on a (re-)anchor, and when the raw clock
+                // moved under a continuous video timeline (see `anchor_due`).
+                // Always rebased on THIS frame: (at, pts, its raw PTS).
+                let raw_ns = decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base));
+                let reanchored = stamper.take_reanchored().is_some();
+                if anchor_due(reanchored, last_raw_offset, raw_ns, at) {
+                    publish_live_anchor(&plan.live_anchor, (at, pts), raw_ns);
+                    if let Some(raw) = raw_ns {
+                        last_raw_offset = Some(at.as_nanos().saturating_sub(raw));
+                    }
                 }
                 at
             } else {
@@ -11954,6 +11962,28 @@ fn ticks_to_ns(ticks: i64, time_base: Rational) -> Option<i64> {
     let ns =
         i128::from(ticks) * 1_000_000_000 * i128::from(time_base.num) / i128::from(time_base.den);
     i64::try_from(ns).ok()
+}
+
+/// Whether the A/V anchor must be republished for a frame stamped `at` with raw
+/// PTS `raw_ns`: on a (re-)anchor, or when the frame's raw-to-output mapping
+/// (`at - raw`) moved by more than tick rounding since the last publish. The
+/// second case is a raw-PTS jump the video normalizer absorbed without a
+/// re-anchor (an ad splice, an origin restart, a 33-bit wrap): video stays
+/// continuous, but audio mapped through the old anchor lands seconds off.
+fn anchor_due(
+    reanchored: bool,
+    last_offset: Option<i64>,
+    raw_ns: Option<i64>,
+    at: MediaTime,
+) -> bool {
+    const TOLERANCE_NS: i64 = 1_000_000;
+    if reanchored {
+        return true;
+    }
+    match (last_offset, raw_ns) {
+        (Some(prev), Some(raw)) => (at.as_nanos().saturating_sub(raw) - prev).abs() > TOLERANCE_NS,
+        _ => false,
+    }
 }
 
 /// Publish a fresh anchor into `slot`, bumping its generation.
@@ -16252,6 +16282,50 @@ a=mediaclk:direct=0\r\n"
             build_aes67_output(&aes67_output_value_with_ptime(0)).is_err(),
             "a zero packet time is a typed refusal, not a silent coercion to 1 frame"
         );
+    }
+}
+
+#[cfg(test)]
+mod anchor_due_tests {
+    use multiview_core::time::MediaTime;
+
+    use super::anchor_due;
+
+    const MS: i64 = 1_000_000;
+
+    fn at(ms: i64) -> MediaTime {
+        MediaTime::from_nanos(ms * MS)
+    }
+
+    #[test]
+    fn steady_frames_do_not_republish() {
+        // Mapping at - raw = 2_000 ms, frame after frame.
+        let offset = Some(2_000 * MS);
+        for k in 0..1_000 {
+            let raw = Some(k * 33 * MS);
+            assert!(
+                !anchor_due(false, offset, raw, at(2_000 + k * 33)),
+                "frame {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_jump_the_normalizer_absorbed_republishes() {
+        // Video continues at 2_033 ms, but the raw clock jumped 12 s ahead.
+        assert!(anchor_due(
+            false,
+            Some(2_000 * MS),
+            Some(12_033 * MS),
+            at(2_033)
+        ));
+    }
+
+    #[test]
+    fn a_reanchor_always_republishes_and_no_raw_never_does() {
+        assert!(anchor_due(true, Some(0), None, at(0)));
+        assert!(!anchor_due(false, Some(0), None, at(5)));
+        assert!(!anchor_due(false, None, Some(0), at(5)));
     }
 }
 
