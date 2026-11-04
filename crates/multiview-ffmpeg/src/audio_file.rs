@@ -137,21 +137,6 @@ fn audio_starved(media_ns: i64, elapsed: std::time::Duration) -> bool {
     media_ns >= STARVED_AFTER_NS || elapsed >= STARVED_AFTER_WALL
 }
 
-#[cfg(test)]
-mod starvation_tests {
-    use super::*;
-
-    #[test]
-    fn continuing_video_without_timestamps_cannot_extend_selected_audio_deadline() {
-        assert!(!audio_starved(
-            0,
-            STARVED_AFTER_WALL - std::time::Duration::from_nanos(1)
-        ));
-        assert!(audio_starved(0, STARVED_AFTER_WALL));
-        assert!(audio_starved(STARVED_AFTER_NS, std::time::Duration::ZERO));
-    }
-}
-
 impl AudioFileDecoder {
     /// Open `path`, select its best audio stream, and prepare to decode it to
     /// interleaved `f32` at `target_rate` Hz / `target_channels` channels.
@@ -508,6 +493,23 @@ pub(crate) fn interleave_fltp(frame: &Audio, channels: u16) -> Result<Vec<f32>> 
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod starvation_tests {
+    use super::*;
+
+    #[test]
+    fn continuing_video_without_timestamps_cannot_extend_selected_audio_deadline() {
+        assert!(!audio_starved(
+            0,
+            STARVED_AFTER_WALL
+                .checked_sub(std::time::Duration::from_nanos(1))
+                .unwrap()
+        ));
+        assert!(audio_starved(0, STARVED_AFTER_WALL));
+        assert!(audio_starved(STARVED_AFTER_NS, std::time::Duration::ZERO));
+    }
 }
 
 // `AudioFileDecoder` owns libav contexts that must not be shared across threads

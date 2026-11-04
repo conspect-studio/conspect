@@ -1941,7 +1941,10 @@ mod resync_tests {
             std::time::Instant::now(),
         );
         assert_eq!(placer.locked, Some(true));
-        assert_eq!(placer.held_since, None);
+        assert!(
+            placer.map.unlocked.is_empty(),
+            "audio must remain video-locked"
+        );
         assert!(queue.is_empty());
         store.seek_to(first_at);
         assert_eq!(store.read(expected.len() / 2).interleaved(), expected);
