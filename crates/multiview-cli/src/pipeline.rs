@@ -5803,6 +5803,32 @@ struct SourceFaultMachines {
     black: multiview_engine::AlarmStateMachine,
     freeze: multiview_engine::AlarmStateMachine,
     silence: multiview_engine::AlarmStateMachine,
+    /// Silence alone uses an evidence clock; unknown PCM must not advance either
+    /// pending raise or pending clear dwell. Other fault machines keep raw PTS.
+    silence_evidence_pts: MediaTime,
+    last_silence_pts: Option<MediaTime>,
+    previous_silence_known: bool,
+}
+
+#[cfg(feature = "overlay")]
+impl SourceFaultMachines {
+    fn observe_silence(&mut self, measured: Option<bool>, pts: MediaTime) {
+        if let Some(condition) = measured {
+            if self.previous_silence_known {
+                if let Some(last) = self.last_silence_pts {
+                    let delta = pts.saturating_sub(last);
+                    if delta.as_nanos() > 0 {
+                        self.silence_evidence_pts = self.silence_evidence_pts.saturating_add(delta);
+                    }
+                }
+            }
+            self.silence.observe(condition, self.silence_evidence_pts);
+        }
+        // The first covered sample after an unknown window has no proven
+        // intervening time; only consecutive covered samples accrue evidence.
+        self.previous_silence_known = measured.is_some();
+        self.last_silence_pts = Some(pts);
+    }
 }
 
 #[cfg(feature = "overlay")]
@@ -5955,6 +5981,9 @@ impl FaultDetector {
                     PerceivedSeverity::Minor,
                     hs,
                 ),
+                silence_evidence_pts: MediaTime::ZERO,
+                last_silence_pts: None,
+                previous_silence_known: false,
             }
         })
     }
@@ -6013,7 +6042,7 @@ impl FaultDetector {
             let machines = self.machines_for(&id);
             machines.black.observe(black_now, pts);
             machines.freeze.observe(freeze_debounced, pts);
-            machines.silence.observe(silence_now, pts);
+            machines.observe_silence(silence_now, pts);
 
             // Precedence: black > freeze > silence (a black picture is the most
             // specific/severe content fault; a still or silent tile is lesser).
@@ -6095,13 +6124,14 @@ impl FaultDetector {
         }
     }
 
-    /// The instantaneous silence condition for `id` at tick `index`: the source's
-    /// build-time meter reading is at/below its silence floor. The floor is the
-    /// operator-declared `level_dbfs` when this source has a declared silence probe
+    /// The instantaneous silence condition for `id` at tick `index`. Timeline
+    /// PCM with incomplete published coverage is unknown (`None`), not audible.
+    /// The source's build-time meter reading is at/below its silence floor. The
+    /// floor is operator-declared `level_dbfs` when this source has a silence probe
     /// (M10), otherwise the shared default [`SILENCE_FLOOR_DB`]. A source with no
     /// meter timeline rides the meter floor (which is below either silence floor),
     /// so an audio-free tile reads silent.
-    fn silence_now(&self, id: &str, index: u64, pts: MediaTime) -> bool {
+    fn silence_now(&self, id: &str, index: u64, pts: MediaTime) -> Option<bool> {
         let floor = self
             .declared_silence_floor
             .get(id)
@@ -6124,8 +6154,12 @@ impl FaultDetector {
             );
             let end = multiview_audio::store::output_ns_to_frame(next_ns, rate);
             let frames = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
-            return matches!(store.measure_pcm(start, frames),
-                multiview_audio::store::PcmMeasurement::Measured { rms_dbfs } if rms_dbfs <= floor);
+            return match store.measure_pcm(start, frames) {
+                multiview_audio::store::PcmMeasurement::Measured { rms_dbfs } => {
+                    Some(rms_dbfs <= floor)
+                }
+                multiview_audio::store::PcmMeasurement::Unknown => None,
+            };
         }
         let db = match self.meter_db_timelines.get(id) {
             Some(timeline) => {
@@ -6138,7 +6172,7 @@ impl FaultDetector {
             }
             None => multiview_audio::Ballistics::FLOOR_DB,
         };
-        db <= floor
+        Some(db <= floor)
     }
 }
 
@@ -12641,6 +12675,148 @@ mod fault_detector_tests {
                 "Y=80 is above the default black threshold (16) → no BLACK fault for an undeclared source"
             );
         }
+    }
+
+    /// Publish exactly one measured tick; `None` leaves the PCM window uncovered.
+    fn live_audio_tick(
+        det: &mut FaultDetector,
+        video: &TileStore<Nv12Image>,
+        audio: &multiview_audio::store::AudioStore,
+        id: &str,
+        i: u64,
+        level: Option<f32>,
+    ) -> TileFault {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        if let Some(level) = level {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(
+                    at,
+                    &AudioBlock::from_interleaved(format, vec![level; 3840]).unwrap(),
+                )
+                .unwrap();
+        }
+        video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+        det.sample(pts_of(i), i, &live_states(id))
+            .get(id)
+            .copied()
+            .unwrap_or(TileFault::None)
+    }
+
+    fn live_audio_detector() -> (
+        FaultDetector,
+        Arc<TileStore<Nv12Image>>,
+        Arc<multiview_audio::store::AudioStore>,
+    ) {
+        let id = "live-hls";
+        let (stores, video) = store_for(id);
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            48_000,
+        ));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let det = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            std::collections::HashMap::new(),
+        );
+        (det, video, audio)
+    }
+
+    #[test]
+    fn active_live_silence_survives_unknown_pcm_beyond_clear_dwell() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..15 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        for i in 15..35 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, None),
+                TileFault::Silent,
+                "unpublished PCM must not clear an already active silence alarm"
+            );
+        }
+        for i in 35..44 {
+            let fault = live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.2));
+            if i < 43 {
+                assert_eq!(fault, TileFault::Silent);
+            } else {
+                assert_eq!(fault, TileFault::None, "covered audio clears normally");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_live_silence_does_not_count_unknown_pcm_toward_raise() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..5 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None
+            );
+        }
+        for i in 5..30 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, None),
+                TileFault::None
+            );
+        }
+        for i in 30..39 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None,
+                "unknown duration cannot satisfy pending raise dwell"
+            );
+        }
+        for i in 39..45 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 45, Some(0.0)),
+            TileFault::Silent,
+            "covered silence still raises after enough actual evidence"
+        );
+    }
+
+    #[test]
+    fn clearing_live_silence_does_not_count_unknown_pcm_toward_clear() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..15 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 15, Some(0.2)),
+            TileFault::Silent
+        );
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 16, Some(0.2)),
+            TileFault::Silent
+        );
+        for i in 17..40 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, None),
+                TileFault::Silent
+            );
+        }
+        for i in 40..46 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.2)),
+                TileFault::Silent,
+                "unknown duration cannot satisfy pending clear dwell"
+            );
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 46, Some(0.2)),
+            TileFault::Silent
+        );
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 47, Some(0.2)),
+            TileFault::None,
+            "covered audible PCM still clears after sufficient evidence"
+        );
     }
 
     #[test]
