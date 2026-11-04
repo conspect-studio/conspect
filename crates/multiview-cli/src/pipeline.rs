@@ -5807,14 +5807,20 @@ struct SourceFaultMachines {
     /// pending raise or pending clear dwell. Other fault machines keep raw PTS.
     silence_evidence_pts: MediaTime,
     last_silence_pts: Option<MediaTime>,
+    last_silence_index: Option<u64>,
     previous_silence_known: bool,
 }
 
 #[cfg(feature = "overlay")]
 impl SourceFaultMachines {
-    fn observe_silence(&mut self, measured: Option<bool>, pts: MediaTime) {
+    fn observe_silence(&mut self, measured: Option<bool>, pts: MediaTime, index: u64) {
         if let Some(condition) = measured {
-            if self.previous_silence_known {
+            // The detector does not sample runtime repeat frames or skipped ticks.
+            // Even two known samples cannot prove the intervening audio when
+            // their tick indexes are not adjacent.
+            if self.previous_silence_known
+                && self.last_silence_index.and_then(|last| last.checked_add(1)) == Some(index)
+            {
                 if let Some(last) = self.last_silence_pts {
                     let delta = pts.saturating_sub(last);
                     if delta.as_nanos() > 0 {
@@ -5828,6 +5834,7 @@ impl SourceFaultMachines {
         // intervening time; only consecutive covered samples accrue evidence.
         self.previous_silence_known = measured.is_some();
         self.last_silence_pts = Some(pts);
+        self.last_silence_index = Some(index);
     }
 }
 
@@ -5983,6 +5990,7 @@ impl FaultDetector {
                 ),
                 silence_evidence_pts: MediaTime::ZERO,
                 last_silence_pts: None,
+                last_silence_index: None,
                 previous_silence_known: false,
             }
         })
@@ -6042,7 +6050,7 @@ impl FaultDetector {
             let machines = self.machines_for(&id);
             machines.black.observe(black_now, pts);
             machines.freeze.observe(freeze_debounced, pts);
-            machines.observe_silence(silence_now, pts);
+            machines.observe_silence(silence_now, pts, index);
 
             // Precedence: black > freeze > silence (a black picture is the most
             // specific/severe content fault; a still or silent tile is lesser).
@@ -12873,6 +12881,71 @@ mod fault_detector_tests {
             live_audio_tick(&mut det, &video, &audio, "live-hls", 47, Some(0.2)),
             TileFault::None,
             "covered audible PCM still clears after sufficient evidence"
+        );
+    }
+
+    #[test]
+    fn skipped_and_repeated_ticks_do_not_raise_silence_without_contiguous_evidence() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..5 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None
+            );
+        }
+        // Ticks 5 and 6 were repeats with no detector sample. Tick 7 alone
+        // cannot prove that either intervening audio interval was silent.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 7, Some(0.0)),
+            TileFault::None
+        );
+        // A skipped output-clock interval is likewise unknown, even if the
+        // resumed tick has fully covered PCM.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 100, Some(0.0)),
+            TileFault::None
+        );
+        for i in 101..109 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None
+            );
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 109, Some(0.0)),
+            TileFault::Silent
+        );
+    }
+
+    #[test]
+    fn skipped_and_repeated_ticks_do_not_clear_silence_without_contiguous_evidence() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..15 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 15, Some(0.2)),
+            TileFault::Silent
+        );
+        // Repeat ticks 16 and 17 have no audio observation.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 18, Some(0.2)),
+            TileFault::Silent
+        );
+        // A long skip is also unknown; its first covered sample must not clear.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 100, Some(0.2)),
+            TileFault::Silent
+        );
+        for i in 101..108 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.2)),
+                TileFault::Silent
+            );
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 108, Some(0.2)),
+            TileFault::None
         );
     }
 
