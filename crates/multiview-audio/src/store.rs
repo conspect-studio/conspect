@@ -826,8 +826,8 @@ pub fn output_ns_to_frame(ns: i64, rate: u32) -> i64 {
 /// [`TIMELINE_CAPACITY`] frames keeps the placed lead plus a margin).
 pub const ANCHORED_LEAD: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// A source with decoded audio but no video anchor this long anchors its audio
-/// to itself (an audio-only or video-dead source still plays, unlocked).
+/// Maximum time to retain audio with no usable video anchor before dropping
+/// the queued block. Audio stays silent until its picture supplies a lock.
 pub const ANCHOR_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Frames a live timeline store retains: 30 s at 48 kHz.
@@ -984,7 +984,8 @@ pub struct AnchorMap {
     /// Mappings further than this from the bus cursor are treated as wrong.
     far_frames: i64,
     anchors: VecDeque<PtsAnchor>,
-    /// Fallback per-span anchors, used when video never anchored that span.
+    /// Legacy self-anchors are never installed by live ingestion: audio must
+    /// stay silent until a video anchor maps its clock span.
     unlocked: Vec<(u64, PtsAnchor)>,
 }
 
@@ -1207,7 +1208,7 @@ struct PlacerStats {
 
 impl Placer {
     /// A placer at `rate` placing up to `lead_frames` ahead of the cursor, and
-    /// giving up on a video anchor after `wait`.
+    /// dropping queued blocks without a usable video anchor after `wait`.
     #[must_use]
     pub const fn new(rate: u32, lead_frames: i64, wait: std::time::Duration) -> Self {
         Self {
@@ -1322,11 +1323,16 @@ impl Placer {
                     raw_ns = front.raw_ns,
                     cursor,
                     latest = ?latest,
-                    "live audio: no usable video anchor; playing audio unlocked"
+                    "live audio: no usable video anchor; dropping held audio, retaining silence"
                 );
-                let (raw, epoch) = (front.raw_ns, front.epoch);
-                self.map
-                    .play_unlocked(epoch, raw, cursor.saturating_add(self.lead_frames));
+                if let Some(unit) = queue.units.pop_front() {
+                    queue.frames = queue.frames.saturating_sub(unit.block.frame_count());
+                    self.stats.skipped = self
+                        .stats
+                        .skipped
+                        .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
+                }
+                self.held_since = None;
             }
         }
         if changed {
@@ -1427,8 +1433,8 @@ impl Placer {
 /// every 50 ms against the bus cursor and the source's latest video anchor.
 ///
 /// * No usable anchor for a block's clock span: it waits (bounded). After
-///   [`ANCHOR_WAIT`] that span plays **unlocked** (self-anchored), so an
-///   audio-only source still plays; a video anchor for the span later wins.
+///   [`ANCHOR_WAIT`] the held block drops; audio remains silent until a usable
+///   video anchor arrives.
 /// * A raw jump over [`SPLICE_NS`] starts a new clock span: audio after it is
 ///   only mapped by anchors whose raw time lies in its span.
 /// * A new anchor generation re-places the retained unplayed audio.
@@ -2007,11 +2013,10 @@ mod resync_tests {
         assert_eq!(store.buffered_frames(), 0, "late audio must not be placed");
     }
 
-    /// A source that played unlocked (video had never anchored) must follow the
-    /// picture as soon as video anchors, and keep following every later video
-    /// generation (here a 5.6 s gap close).
+    /// No audio airs without a video anchor. Once video anchors, audio follows
+    /// its raw clock across a later 5.6 s gap close.
     #[test]
-    fn unlocked_audio_locks_when_video_anchors_and_follows_later_generations() {
+    fn silent_audio_locks_when_video_anchors_and_follows_later_generations() {
         let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
         let store = AudioStore::timeline(format, 288_000);
         let mut q = DecodedQueue::default();
@@ -2029,11 +2034,8 @@ mod resync_tests {
             10 * RATE,
             t0 + std::time::Duration::from_secs(16),
         );
-        assert_eq!(
-            raw_at(&store, 13 * RATE),
-            ms_of(500 * SEC),
-            "unlocked at cursor + lead"
-        );
+        assert_eq!(store.buffered_frames(), 0, "no unlocked audio may air");
+        assert_eq!(raw_at(&store, 13 * RATE), 0.0, "silence before video lock");
         // Video anchors: raw 501 s at 14 s.
         let g1 = anchor(1, 14 * SEC, 501 * SEC);
         placer.step(
@@ -2131,9 +2133,10 @@ mod resync_tests {
         assert!(q.overflow_frames > 0);
     }
 
-    /// No video anchor at all: the audio waits, then plays unlocked.
+    /// No video anchor at all: the audio waits, then stays silent even after
+    /// the wait expires; queued blocks can drain without blocking the clock.
     #[test]
-    fn audio_without_a_video_anchor_plays_unlocked_after_the_wait() {
+    fn audio_without_a_video_anchor_stays_silent_after_the_wait() {
         let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
         let store = AudioStore::timeline(format, 288_000);
         let mut q = DecodedQueue::default();
@@ -2156,7 +2159,9 @@ mod resync_tests {
             0,
             t0 + std::time::Duration::from_secs(16),
         );
-        assert_eq!(raw_at(&store, 3 * RATE), 7_000.0);
+        assert_eq!(raw_at(&store, 3 * RATE), 0.0);
+        assert_eq!(store.buffered_frames(), 0);
+        assert!(q.frames < 20 * 4_800, "expired audio must drain");
     }
 
     /// A stalled decoder ends the connection instead of retrying 32 read

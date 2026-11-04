@@ -110,6 +110,8 @@ pub struct AudioFileDecoder {
     /// packet, with the latest PTS per stream it was measured from.
     quiet_ns: i64,
     quiet_last: Vec<(usize, i64)>,
+    /// Every non-audio packet cannot reset the selected-audio starvation clock.
+    last_audio_packet: std::time::Instant,
 }
 
 /// A live audio stream that delivers no packet for this many reads while
@@ -123,9 +125,32 @@ const SWITCH_AFTER: u32 = 100;
 /// trigger it.
 const STARVED_AFTER_NS: i64 = 30_000_000_000;
 
+/// Bound selected-audio starvation even when continuing video has no usable
+/// timestamps. The per-read I/O timeout alone resets on every video packet.
+const STARVED_AFTER_WALL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The largest PTS step between two packets of one stream that still counts
 /// as elapsed time (well over a frame at any rate; far under a splice).
 const MAX_PTS_STEP_NS: i64 = 1_000_000_000;
+
+fn audio_starved(media_ns: i64, elapsed: std::time::Duration) -> bool {
+    media_ns >= STARVED_AFTER_NS || elapsed >= STARVED_AFTER_WALL
+}
+
+#[cfg(test)]
+mod starvation_tests {
+    use super::*;
+
+    #[test]
+    fn continuing_video_without_timestamps_cannot_extend_selected_audio_deadline() {
+        assert!(!audio_starved(
+            0,
+            STARVED_AFTER_WALL - std::time::Duration::from_nanos(1)
+        ));
+        assert!(audio_starved(0, STARVED_AFTER_WALL));
+        assert!(audio_starved(STARVED_AFTER_NS, std::time::Duration::ZERO));
+    }
+}
 
 impl AudioFileDecoder {
     /// Open `path`, select its best audio stream, and prepare to decode it to
@@ -216,6 +241,7 @@ impl AudioFileDecoder {
             other_audio: Vec::new(),
             quiet_ns: 0,
             quiet_last: Vec::new(),
+            last_audio_packet: std::time::Instant::now(),
         })
     }
 
@@ -234,6 +260,7 @@ impl AudioFileDecoder {
                 self.other_audio.clear();
                 self.quiet_ns = 0;
                 self.quiet_last.clear();
+                self.last_audio_packet = std::time::Instant::now();
                 return Ok(Some(pkt));
             }
             self.since_ours = self.since_ours.saturating_add(1);
@@ -260,6 +287,7 @@ impl AudioFileDecoder {
                     1
                 };
                 if count >= SWITCH_AFTER && self.switch_to(pkt.stream_index) {
+                    self.last_audio_packet = std::time::Instant::now();
                     return Ok(Some(pkt));
                 }
             } else if let (Some(st), Some(pts)) = (stream, pkt.pts()) {
@@ -284,12 +312,12 @@ impl AudioFileDecoder {
                     }
                     None => self.quiet_last.push((pkt.stream_index, ns)),
                 }
-                if self.quiet_ns >= STARVED_AFTER_NS {
-                    return Err(FfmpegError::AudioStarved {
-                        path: self.demuxer.source().to_owned(),
-                        packets: self.since_ours,
-                    });
-                }
+            }
+            if audio_starved(self.quiet_ns, self.last_audio_packet.elapsed()) {
+                return Err(FfmpegError::AudioStarved {
+                    path: self.demuxer.source().to_owned(),
+                    packets: self.since_ours,
+                });
             }
         }
     }
