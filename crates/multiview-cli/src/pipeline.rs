@@ -3459,6 +3459,8 @@ impl Pipeline {
         // the bake consumer (it is `Send`); it is ticked off the hot path, never on
         // the output-clock loop. `None` (audio off) means the consumer encodes no
         // audio at all, so the run is byte-identical to the video-only path.
+        let live_track_inputs =
+            Arc::new(multiview_framestore::SwapCell::from_pointee(track_inputs));
         let audio_bus = self.encode_cfg.audio.as_ref().map(|cfg| {
             let mut bus = program_audio_bus(cfg, self.cadence);
             // Route every per-source store onto the program bus at unity gain. The
@@ -3479,7 +3481,11 @@ impl Pipeline {
             }
             self.audio_route.store(Some(Arc::new(
                 crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels)
-                    .with_sample_rate(cfg.sample_rate),
+                    .with_sample_rate(cfg.sample_rate)
+                    .with_declared_tracks(
+                        self.audio_routing.as_ref(),
+                        Arc::clone(&live_track_inputs),
+                    ),
             )));
             bus
         });
@@ -3601,7 +3607,7 @@ impl Pipeline {
             loudness_publisher,
             display_audio,
             self.program_audio_preview.clone(),
-            track_inputs,
+            live_track_inputs,
             #[cfg(feature = "aes67")]
             aes67_send_handles,
         );
@@ -4508,7 +4514,7 @@ impl StreamEgress {
         loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
         display_audio: DisplayAudioFeed,
         program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
-        track_inputs: Vec<String>,
+        track_inputs: Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>,
         #[cfg(feature = "aes67")] aes67_send_handles: Vec<
             multiview_output::aes67::Aes67SenderHandle,
         >,
@@ -4854,7 +4860,7 @@ fn consumer_main(
     loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
     mut display_audio: DisplayAudioFeed,
     program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
-    track_inputs: &[String],
+    track_inputs: &multiview_framestore::SwapCell<Arc<Vec<String>>>,
     #[cfg(feature = "aes67")] aes67_send_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
     in_flight: &AtomicI64,
 ) -> Result<(), PipelineError> {
@@ -5046,9 +5052,14 @@ fn consumer_main(
                 })?;
             fan_packets(&sink_txs, &mut live, audio_packets);
             // #152: discrete tracks, same tick, same sample budget (inv #3).
-            if !track_inputs.is_empty() {
-                let packets =
-                    encode_discrete_tracks(&mut encoder, bus, track_inputs, block.frame_count())?;
+            let selected_tracks = track_inputs.load();
+            if !selected_tracks.is_empty() {
+                let packets = encode_discrete_tracks(
+                    &mut encoder,
+                    bus,
+                    &selected_tracks,
+                    block.frame_count(),
+                )?;
                 fan_packets(&sink_txs, &mut live, packets);
             }
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {

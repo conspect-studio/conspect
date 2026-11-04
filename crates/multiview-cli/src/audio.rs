@@ -118,6 +118,11 @@ pub struct AudioControlHandle {
     sources: Arc<std::collections::HashMap<String, Arc<AudioStore>>>,
     channels: Arc<std::collections::HashMap<String, multiview_audio::RoutePoint>>,
     sample_rate: u32,
+    /// Output tracks are pinned to source ids at startup until the discrete
+    /// encoder's route table accepts live updates.
+    declared_tracks: std::collections::HashMap<String, usize>,
+    /// Shared stable-index source list read by the bake consumer each tick.
+    live_track_inputs: Option<Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>>,
 }
 
 impl Default for AudioControlHandle {
@@ -148,6 +153,8 @@ impl AudioControlHandle {
             sources: Arc::new(sources),
             channels: Arc::new(channels),
             sample_rate: AudioFormat::CANONICAL_RATE,
+            declared_tracks: std::collections::HashMap::new(),
+            live_track_inputs: None,
         }
     }
 
@@ -156,6 +163,27 @@ impl AudioControlHandle {
     #[must_use]
     pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
+        self
+    }
+
+    /// Capture the output's startup-pinned track-to-source wiring.
+    #[must_use]
+    pub fn with_declared_tracks(
+        mut self,
+        routing: Option<&multiview_config::AudioRouting>,
+        live_track_inputs: Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>,
+    ) -> Self {
+        self.declared_tracks = routing
+            .map(|r| {
+                r.routes
+                    .iter()
+                    .filter_map(|route| route.target_track.as_deref())
+                    .enumerate()
+                    .map(|(index, name)| (name.to_owned(), index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.live_track_inputs = Some(live_track_inputs);
         self
     }
 
@@ -170,6 +198,26 @@ impl AudioControlHandle {
         if routing.sample_rate_hz != self.sample_rate {
             return false;
         }
+        let requested: Vec<(&str, &str)> = routing
+            .routes
+            .iter()
+            .filter_map(|route| {
+                route
+                    .target_track
+                    .as_deref()
+                    .map(|name| (name, route.input_id.as_str()))
+            })
+            .collect();
+        if requested.len() != self.declared_tracks.len()
+            || requested.iter().enumerate().any(|(index, (name, source))| {
+                self.declared_tracks.get(*name) != Some(&index)
+                    || !self.sources.contains_key(*source)
+            })
+        {
+            // An added/removed/reordered output track needs output-only
+            // reconfiguration; a missing input store cannot be routed live.
+            return false;
+        }
         if routing
             .routes
             .iter()
@@ -181,6 +229,14 @@ impl AudioControlHandle {
             self.channels.keys().map(String::as_str),
             Some(routing),
         );
+        if let Some(live) = &self.live_track_inputs {
+            live.store(Arc::new(
+                requested
+                    .iter()
+                    .map(|(_, source)| (*source).to_owned())
+                    .collect(),
+            ));
+        }
         self.pending_gains.store(Some(Arc::new(gains)));
         true
     }
@@ -275,6 +331,28 @@ pub fn routing_live_capability(
 mod route_seam_tests {
     use super::*;
     use multiview_audio::program::ProgramBus;
+
+    #[test]
+    fn changed_discrete_track_source_does_not_claim_live_apply() {
+        let routing = |source: &str| {
+            let doc = format!("schema_version = 1\n[canvas]\nwidth = 640\nheight = 360\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"grid\"\ncolumns = [\"1fr\"]\nrows = [\"1fr\"]\nareas = [\"a\"]\n[[sources]]\nid = \"{source}\"\nkind = \"bars\"\n[[cells]]\nid = \"cell\"\narea = \"a\"\n[cells.source]\ninput_id = \"{source}\"\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"{source}\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"clean\"\n");
+            multiview_config::MultiviewConfig::load_from_toml(&doc)
+                .expect("route fixture")
+                .audio
+                .expect("audio routing")
+        };
+        let live = Arc::new(multiview_framestore::SwapCell::from_pointee(vec![
+            "old".to_owned()
+        ]));
+        let mut sources = std::collections::HashMap::new();
+        sources.insert("old".to_owned(), new_store());
+        sources.insert("new".to_owned(), new_store());
+        let handle = AudioControlHandle::from_sources(sources, std::collections::HashMap::new())
+            .with_declared_tracks(Some(&routing("old")), Arc::clone(&live));
+        assert!(handle.request_routing(&routing("new")));
+        assert_eq!(live.load().as_slice(), &["new".to_owned()]);
+        assert!(!handle.request_routing(&routing("missing")));
+    }
 
     #[test]
     fn route_audio_reaches_crossfade_at_sample_boundary_without_losing_ticks() {

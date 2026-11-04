@@ -35,8 +35,11 @@ use multiview_ffmpeg::{
     AudioEncodeTarget, AudioEncoder, EncodedPacket, StreamCodecParameters, VideoEncodeTarget,
     VideoEncoder,
 };
-use multiview_output::sink::{MuxStream, PacketMuxOutcome, PacketMuxSink, PacketSource};
+use multiview_output::sink::{
+    AudioSelection, MuxStream, PacketMuxOutcome, PacketMuxSink, PacketSource, TrackSelection,
+};
 use multiview_output::Result;
+use multiview_output::SharedEpoch;
 
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 120;
@@ -250,6 +253,83 @@ fn assert_one_video_one_audio(path: &Path) {
         "exactly one audio stream in {}: {audio:?}",
         path.display()
     );
+}
+
+#[test]
+fn live_renditions_prune_and_restart_without_stale_segment_urls() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for run in 0..2 {
+        let (video, video_params, video_tb) = encode_video();
+        let (audio, audio_params, audio_tb) = encode_audio();
+        let packets = interleave(video, video_tb, audio, audio_tb);
+        let mut source = VecPackets {
+            packets: packets.into_iter(),
+        };
+        let sink = PacketMuxSink::segment_live(
+            dir.path(),
+            "seg",
+            dir.path().join("index.m3u8"),
+            2,
+            SharedEpoch::new(),
+        )
+        .with_audio_selection(AudioSelection {
+            program: true,
+            tracks: vec![TrackSelection {
+                index: 0,
+                language: None,
+                title: Some("Clean".to_owned()),
+            }],
+        });
+        // The same AAC packets feed the program and the clean track for this
+        // lifecycle test; the CLI test checks distinct decoded content.
+        let mut combined = Vec::new();
+        for packet in source.packets {
+            if packet.kind() == multiview_ffmpeg::StreamKind::Audio {
+                combined.push(EncodedPacket::with_kind(
+                    packet.to_owned_packet(),
+                    multiview_ffmpeg::StreamKind::AudioTrack(0),
+                ));
+            }
+            combined.push(packet);
+        }
+        source = VecPackets {
+            packets: combined.into_iter(),
+        };
+        sink.run_av_tracks(
+            &mut source,
+            MuxStream::new(&video_params, video_tb),
+            Some(MuxStream::new(&audio_params, audio_tb)),
+            &[MuxStream::new(&audio_params, audio_tb)],
+        )
+        .expect("live run");
+        for playlist in [
+            "index.m3u8",
+            "video.m3u8",
+            "audio-program.m3u8",
+            "audio-track0.m3u8",
+        ] {
+            let text = std::fs::read_to_string(dir.path().join(playlist)).expect("playlist");
+            let referenced: Vec<_> = text
+                .lines()
+                .filter(|line| {
+                    Path::new(line)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+                })
+                .collect();
+            assert_eq!(referenced.len(), 2, "{playlist}: {text}");
+            for uri in referenced {
+                assert!(
+                    dir.path().join(uri).exists(),
+                    "{playlist} references missing {uri}"
+                );
+            }
+            if run == 1 {
+                assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"), "{text}");
+                assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:4"), "{text}");
+            }
+        }
+    }
 }
 
 #[test]

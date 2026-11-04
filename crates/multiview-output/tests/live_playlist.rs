@@ -28,6 +28,31 @@ fn touch_segment(dir: &std::path::Path, name: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn restarted_audio_and_video_playlists_advance_together_with_discontinuity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for name in ["index.m3u8", "audio-program.m3u8", "audio-track0.m3u8"] {
+        let mut playlist = LivePlaylist::new(dir.path().join(name), 2);
+        playlist.set_media_sequence(17);
+        playlist.set_initial_discontinuity();
+        for index in 17..20 {
+            let segment = touch_segment(dir.path(), &format!("{name}-{index}.ts"));
+            playlist
+                .push_closed_segment(
+                    segment.file_name().unwrap().to_string_lossy(),
+                    segment.clone(),
+                    1.0,
+                    index * 1_000_000_000,
+                )
+                .expect("publish");
+        }
+        let text = std::fs::read_to_string(dir.path().join(name)).expect("manifest");
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:18"), "{text}");
+        assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"), "{text}");
+        assert!(!dir.path().join(format!("{name}-17.ts")).exists());
+    }
+}
+
 /// Feeding N > window segment closes into the rolling driver must leave an
 /// on-disk playlist that lists exactly `window` segments, advances
 /// `EXT-X-MEDIA-SEQUENCE` to `N - window`, carries NO `EXT-X-ENDLIST` while the

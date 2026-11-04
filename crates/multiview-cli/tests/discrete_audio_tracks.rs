@@ -326,6 +326,92 @@ async fn assert_two_audio_streams(output_audio: &str) {
 }
 
 #[tokio::test]
+async fn master_resolves_playable_distinct_audio_only_renditions() {
+    let (_guard, dir) = run("[outputs.audio]\nmode = \"auto\"").await;
+    let master = std::fs::read_to_string(dir.join("master.m3u8")).expect("master");
+    assert!(master.contains("NAME=\"Program\",DEFAULT=YES"), "{master}");
+    assert!(master.contains("NAME=\"AU ABC\",DEFAULT=NO"), "{master}");
+    assert!(master.contains("LANGUAGE=\"eng\""), "{master}");
+    assert!(master.contains("AUDIO=\"audio\""), "{master}");
+    assert!(master.lines().any(|line| line == "video.m3u8"));
+    let playable_master = probe_streams(&dir.join("master.m3u8"));
+    assert!(
+        playable_master.iter().any(|stream| stream.0 == "video"),
+        "master lacks video"
+    );
+    assert!(
+        playable_master.iter().any(|stream| stream.0 == "audio"),
+        "master lacks default audio"
+    );
+    let video = std::fs::read_to_string(dir.join("video.m3u8")).expect("video media playlist");
+    for uri in video.lines().filter(|line| {
+        Path::new(line)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+    }) {
+        assert_eq!(
+            probe_streams(&dir.join(uri))
+                .iter()
+                .map(|s| s.0.as_str())
+                .collect::<Vec<_>>(),
+            ["video"]
+        );
+    }
+    for (playlist, frequency) in [("audio-program.m3u8", 1000.0), ("audio-track0.m3u8", 440.0)] {
+        assert!(master.contains(&format!("URI=\"{playlist}\"")));
+        let media = std::fs::read_to_string(dir.join(playlist)).expect("audio media playlist");
+        let paths: Vec<_> = media
+            .lines()
+            .filter(|line| {
+                Path::new(line)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+            })
+            .map(|line| dir.join(line))
+            .collect();
+        assert!(!paths.is_empty(), "empty {playlist}");
+        let mut bytes = Vec::new();
+        for path in paths {
+            assert_eq!(
+                probe_streams(&path)
+                    .iter()
+                    .map(|s| s.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["audio"],
+                "{}",
+                path.display()
+            );
+            bytes.extend(std::fs::read(path).expect("rendition segment"));
+        }
+        let joined = dir.join(format!("{playlist}.ts"));
+        std::fs::write(&joined, bytes).expect("joined audio");
+        let actual = dominant_hz(&joined, "0:a:0");
+        assert!(
+            (actual - frequency).abs() < 50.0,
+            "{playlist}: {actual} Hz, expected {frequency} Hz"
+        );
+    }
+    let legacy = std::fs::read_to_string(dir.join("index.m3u8")).expect("legacy media playlist");
+    assert!(legacy.contains("#EXTINF:"));
+    assert!(!legacy.contains("#EXT-X-STREAM-INF"));
+    let legacy_segment = legacy
+        .lines()
+        .find(|line| {
+            Path::new(line)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+        })
+        .expect("legacy TS URI");
+    assert_eq!(
+        probe_streams(&dir.join(legacy_segment))
+            .iter()
+            .map(|s| s.0.as_str())
+            .collect::<Vec<_>>(),
+        ["video", "audio", "audio"]
+    );
+}
+
+#[tokio::test]
 async fn tracks_mode_muxes_a_discrete_track_into_every_segment() {
     assert_two_audio_streams("[outputs.audio]\nmode = \"tracks\"\ntracks = [\"prog\", \"au-abc\"]")
         .await;

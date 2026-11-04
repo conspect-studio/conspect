@@ -749,10 +749,33 @@ pub fn cast_delivery(
             );
             continue;
         };
+        // A configured discrete track has a separate audio-only rendition.
+        // Cast LOAD must use the master to expose its player audio menu;
+        // the legacy media playlist stays reachable unchanged.
+        let selectable = config
+            .outputs
+            .iter()
+            .find(|output| output.id() == mount.output_id)
+            .and_then(multiview_config::Output::audio)
+            .is_some_and(|selection| {
+                let names: Vec<&str> = config
+                    .audio
+                    .as_ref()
+                    .map(|audio| {
+                        audio
+                            .routes
+                            .iter()
+                            .filter_map(|route| route.target_track.as_deref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                !selection.resolve(&names).1.is_empty()
+            });
+        let playback = if selectable { "master.m3u8" } else { &playlist };
         delivery.insert(
             &mount.output_id,
             CastMediaTarget {
-                url: base.join(&mount.route, &playlist),
+                url: base.join(&mount.route, playback),
                 format: HlsSegmentFormat::MpegTs,
             },
         );
@@ -3533,6 +3556,30 @@ input_id = "in_a"
             );
         }
         MultiviewConfig::load_from_toml(&doc).expect("parse HLS-outputs config")
+    }
+
+    #[test]
+    fn cast_uses_master_for_selected_tracks_and_keeps_legacy_program_url() {
+        let base = config_with_hls_outputs(&[("program", "/srv/hls/index.m3u8")]);
+        let mut doc = base.to_toml().expect("serialize config");
+        doc.push_str("\n[control]\nlisten = \"[::]:8080\"\ncast_media_base = \"http://[2001:db8::1]:8080\"\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"in_a\"\nchannels = { kind = \"stereo\" }\ntarget_track = \"clean\"\n");
+        let legacy = MultiviewConfig::load_from_toml(&doc).expect("legacy config");
+        let url = cast_delivery(&legacy)
+            .expect("cast delivery")
+            .for_output("program")
+            .expect("output")
+            .url
+            .clone();
+        assert!(url.ends_with("/index.m3u8"), "{url}");
+        doc.push_str("\n[outputs.audio]\nmode = \"auto\"\n");
+        let selected = MultiviewConfig::load_from_toml(&doc).expect("selected config");
+        let url = cast_delivery(&selected)
+            .expect("cast delivery")
+            .for_output("program")
+            .expect("output")
+            .url
+            .clone();
+        assert!(url.ends_with("/master.m3u8"), "{url}");
     }
 
     /// Two outputs whose **distinct** ids sanitise to the SAME URL segment get

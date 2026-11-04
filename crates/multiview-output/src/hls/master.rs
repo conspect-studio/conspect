@@ -9,6 +9,10 @@
 //! resolution, or bitrate differ — never per tile.
 use std::fmt::Write as _;
 
+fn escape_attribute(value: &str) -> String {
+    value.replace(['"', '\r', '\n'], "")
+}
+
 /// One variant (rendition) entry in a master playlist.
 #[derive(Debug, Clone)]
 pub struct VariantStream {
@@ -87,6 +91,20 @@ impl VariantStream {
 #[derive(Debug, Clone, Default)]
 pub struct MasterPlaylist {
     variants: Vec<VariantStream>,
+    audio: Vec<AudioRendition>,
+}
+
+/// A separately playable audio-only rendition in an HLS audio group.
+#[derive(Debug, Clone)]
+pub struct AudioRendition {
+    /// Human-readable player menu label.
+    pub name: String,
+    /// Media playlist URI relative to the master.
+    pub uri: String,
+    /// Optional BCP-47 language tag.
+    pub language: Option<String>,
+    /// Whether this is the selected audio on first playback.
+    pub default: bool,
 }
 
 impl MasterPlaylist {
@@ -99,6 +117,11 @@ impl MasterPlaylist {
     /// Append a variant rendition (renders in insertion order).
     pub fn push_variant(&mut self, variant: VariantStream) {
         self.variants.push(variant);
+    }
+
+    /// Add a separately playable audio-only media playlist.
+    pub fn push_audio(&mut self, rendition: AudioRendition) {
+        self.audio.push(rendition);
     }
 
     /// Number of variants listed.
@@ -115,8 +138,26 @@ impl MasterPlaylist {
         let _ = writeln!(out, "#EXTM3U");
         let _ = writeln!(out, "#EXT-X-VERSION:7");
         let _ = writeln!(out, "#EXT-X-INDEPENDENT-SEGMENTS");
+        for audio in &self.audio {
+            let language = audio.language.as_ref().map_or_else(String::new, |tag| {
+                format!(",LANGUAGE=\"{}\"", escape_attribute(tag))
+            });
+            let _ = writeln!(
+                out,
+                "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\",DEFAULT={},AUTOSELECT={},URI=\"{}\"{}",
+                escape_attribute(&audio.name),
+                if audio.default { "YES" } else { "NO" },
+                if audio.default { "YES" } else { "NO" },
+                escape_attribute(&audio.uri),
+                language
+            );
+        }
         for variant in &self.variants {
-            let _ = writeln!(out, "{}", variant.render_stream_inf());
+            let mut inf = variant.render_stream_inf();
+            if !self.audio.is_empty() {
+                inf.push_str(",AUDIO=\"audio\"");
+            }
+            let _ = writeln!(out, "{inf}");
             let _ = writeln!(out, "{}", variant.uri);
         }
         out

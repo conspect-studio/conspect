@@ -49,7 +49,10 @@ use multiview_ffmpeg::{
 
 use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
-use crate::hls::{LivePlaylist, MediaPlaylist, Segment, SegmentType};
+use crate::hls::{
+    atomic_write, AudioRendition, LivePlaylist, MasterPlaylist, MediaPlaylist, Segment,
+    SegmentType, VariantStream,
+};
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
 
 /// Nanoseconds in one second (the internal timeline unit, invariant #3).
@@ -1740,7 +1743,23 @@ impl PacketMuxSink {
                 // PDT-stamped from the shared outbound epoch (ADR-M010).
                 let mut live = LivePlaylist::new(playlist_path.clone(), *window);
                 live.set_epoch_source(epoch.clone());
+                // Keep both the sequence and filename generation ahead of old
+                // segments so a restart cannot serve stale cached bytes.
+                let next = next_segment_index(dir, prefix)?;
+                live.set_media_sequence(next);
+                if next != 0 {
+                    live.set_initial_discontinuity();
+                }
+                state.seg_index = next;
                 state.live = Some(live);
+                state.set_audio_renditions(
+                    playlist_path,
+                    *window,
+                    epoch.clone(),
+                    video,
+                    audio,
+                    track_streams,
+                )?;
                 let driven = state.drive_from_packets(source);
                 finish_segments(state, driven, video.time_base)
                     .map(|result| PacketMuxOutcome::Segment(Box::new(result)))
@@ -1818,9 +1837,35 @@ struct SegmentState<'a> {
     /// (the default, and always for the encoder-fed `SegmentSink`) ⇒ no metadata
     /// to apply, byte-identical to before this field existed.
     meta: Option<(&'a MuxMetadata, Option<DisplayMatrix>)>,
+    /// Audio-only rendition muxers mirror video GOP boundaries off the hot path.
+    renditions: Option<AudioRenditions<'a>>,
     /// The discrete tracks (#152) registered into every segment muxer after
     /// the program audio, plus the per-track seeds. Empty ⇒ unchanged layout.
     tracks: Option<(&'a AudioSelection, &'a [MuxStream<'a>])>,
+}
+
+/// One audio-only MPEG-TS muxer, opened at the same video GOP boundary.
+struct AudioSegment {
+    muxer: Muxer,
+    stream_index: usize,
+    path: PathBuf,
+    write_path: PathBuf,
+    packets: u64,
+}
+
+struct AudioRenditionState<'a> {
+    kind: StreamKind,
+    stream: MuxStream<'a>,
+    live: LivePlaylist,
+    prefix: String,
+    current: Option<AudioSegment>,
+}
+
+struct AudioRenditions<'a> {
+    states: Vec<AudioRenditionState<'a>>,
+    video: AudioRenditionState<'a>,
+    master: PathBuf,
+    master_text: String,
 }
 
 /// An in-progress segment: its muxer, registered stream index, file path, and
@@ -1870,7 +1915,191 @@ impl<'a> SegmentState<'a> {
             seg_index: 0,
             meta: None,
             tracks: None,
+            renditions: None,
         }
+    }
+
+    /// Build independent audio-only renditions from the same encoded packets.
+    fn set_audio_renditions(
+        &mut self,
+        playlist_path: &Path,
+        window: usize,
+        epoch: SharedEpoch,
+        video: MuxStream<'a>,
+        audio: Option<MuxStream<'a>>,
+        tracks: &'a [MuxStream<'a>],
+    ) -> Result<()> {
+        if self
+            .tracks
+            .is_none_or(|(selection, _)| selection.tracks.is_empty())
+        {
+            return Ok(());
+        }
+        let (selection, _) = self
+            .tracks
+            .ok_or_else(|| Error::Output("missing track selection".to_owned()))?;
+        let mut master = MasterPlaylist::new();
+        let mut states = Vec::new();
+        let parent = playlist_path.parent().unwrap_or_else(|| Path::new("."));
+        if selection.program {
+            if let Some(stream) = audio {
+                let mut live = LivePlaylist::new(parent.join("audio-program.m3u8"), window);
+                live.set_epoch_source(epoch.clone());
+                live.set_media_sequence(self.seg_index);
+                if self.seg_index != 0 {
+                    live.set_initial_discontinuity();
+                }
+                master.push_audio(AudioRendition {
+                    name: "Program".to_owned(),
+                    uri: "audio-program.m3u8".to_owned(),
+                    language: None,
+                    default: true,
+                });
+                states.push(AudioRenditionState {
+                    kind: StreamKind::Audio,
+                    stream,
+                    live,
+                    prefix: "audio-program-".to_owned(),
+                    current: None,
+                });
+            }
+        }
+        for track in &selection.tracks {
+            let Some(stream) = tracks.get(usize::from(track.index)).copied() else {
+                continue;
+            };
+            let prefix = format!("audio-track{}-", track.index);
+            let uri = format!("audio-track{}.m3u8", track.index);
+            let mut live = LivePlaylist::new(parent.join(&uri), window);
+            live.set_epoch_source(epoch.clone());
+            live.set_media_sequence(self.seg_index);
+            if self.seg_index != 0 {
+                live.set_initial_discontinuity();
+            }
+            master.push_audio(AudioRendition {
+                name: track
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("Track {}", track.index)),
+                uri,
+                language: track.language.clone(),
+                default: states.is_empty(),
+            });
+            states.push(AudioRenditionState {
+                kind: StreamKind::AudioTrack(track.index),
+                stream,
+                live,
+                prefix,
+                current: None,
+            });
+        }
+        if states.is_empty() {
+            return Ok(());
+        }
+        let mut video_live = LivePlaylist::new(parent.join("video.m3u8"), window);
+        video_live.set_epoch_source(epoch);
+        video_live.set_media_sequence(self.seg_index);
+        if self.seg_index != 0 {
+            video_live.set_initial_discontinuity();
+        }
+        master.push_variant(VariantStream::new("video.m3u8", 4_000_000));
+        // Publish only after the first complete media segment exists.
+        self.renditions = Some(AudioRenditions {
+            states,
+            video: AudioRenditionState {
+                kind: StreamKind::Video,
+                stream: video,
+                live: video_live,
+                prefix: "video-".to_owned(),
+                current: None,
+            },
+            master: parent.join("master.m3u8"),
+            master_text: master.render(),
+        });
+        Ok(())
+    }
+
+    fn open_audio_segments(&mut self, index: u64) -> Result<()> {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return Ok(());
+        };
+        for state in renditions
+            .states
+            .iter_mut()
+            .chain(std::iter::once(&mut renditions.video))
+        {
+            let path = self.dir.join(format!("{}{index}.ts", state.prefix));
+            let write_path = segment_temp_path(&path);
+            let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+            let stream_index = muxer
+                .add_stream_from_parameters(state.stream.params, state.stream.time_base)
+                .map_err(ff)?;
+            muxer.write_header().map_err(ff)?;
+            state.current = Some(AudioSegment {
+                muxer,
+                stream_index,
+                path,
+                write_path,
+                packets: 0,
+            });
+        }
+        Ok(())
+    }
+
+    fn write_audio_rendition(&mut self, packet: &EncodedPacket) -> Result<()> {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return Ok(());
+        };
+        let Some(state) = renditions
+            .states
+            .iter_mut()
+            .chain(std::iter::once(&mut renditions.video))
+            .find(|state| state.kind == packet.kind())
+        else {
+            return Ok(());
+        };
+        if let Some(segment) = state.current.as_mut() {
+            segment
+                .muxer
+                .write_packet(segment.stream_index, packet.to_owned_packet())
+                .map_err(ff)?;
+            segment.packets = segment.packets.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn close_audio_segments(&mut self, duration: f64, start_pts_ns: i64) -> Result<()> {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return Ok(());
+        };
+        for state in renditions
+            .states
+            .iter_mut()
+            .chain(std::iter::once(&mut renditions.video))
+        {
+            let Some(mut segment) = state.current.take() else {
+                continue;
+            };
+            segment.muxer.finish().map_err(ff)?;
+            if segment.packets == 0 {
+                match std::fs::remove_file(&segment.write_path) {
+                    Ok(()) | Err(_) => {}
+                }
+                // Never list an empty audio segment as a playable rendition.
+                continue;
+            }
+            std::fs::rename(&segment.write_path, &segment.path)
+                .map_err(|e| Error::Output(format!("publishing audio segment: {e}")))?;
+            let uri = segment
+                .path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .ok_or_else(|| Error::Output("audio segment lacks filename".to_owned()))?;
+            state
+                .live
+                .push_closed_segment(uri, segment.path.clone(), duration, start_pts_ns)?;
+        }
+        Ok(())
     }
 
     /// Attach the discrete-track selection + seeds (#152) every segment muxer
@@ -1968,12 +2197,14 @@ impl<'a> SegmentState<'a> {
                     if is_key {
                         self.start_segment(pts)?;
                     }
+                    self.write_audio_rendition(&packet)?;
                     let owned = packet.into_owned_packet();
                     let (muxer, index) = self.current_muxer()?;
                     muxer.write_packet(index, owned).map_err(ff)?;
                     self.record(is_key, pts);
                 }
                 StreamKind::AudioTrack(track) => {
+                    self.write_audio_rendition(&packet)?;
                     // A discrete track joins the current segment like program
                     // audio; a track this sink does not carry is dropped.
                     let index = self
@@ -1990,6 +2221,7 @@ impl<'a> SegmentState<'a> {
                     self.record(false, pts);
                 }
                 StreamKind::Audio => {
+                    self.write_audio_rendition(&packet)?;
                     // Audio never rotates a segment — it joins the current one.
                     // Audio that arrives before the first video keyframe (no
                     // segment open yet) or for a video-only run (no audio stream
@@ -2085,6 +2317,7 @@ impl<'a> SegmentState<'a> {
         // rotation tag — validated at config time) so it is a no-op here.
         self.apply_segment_meta(&mut muxer, stream_index)?;
         muxer.write_header().map_err(ff)?;
+        self.open_audio_segments(index)?;
         self.current = Some(OpenSegment {
             muxer,
             stream_index,
@@ -2141,6 +2374,7 @@ impl<'a> SegmentState<'a> {
             .saturating_sub(segment.start_pts.as_nanos());
         let frame_ns = rescale(1, self.time_base, Rational::new(1, NANOS_PER_SEC));
         let duration = seconds_from_ns(span_ns.max(frame_ns));
+        self.close_audio_segments(duration, segment.start_pts.as_nanos())?;
         // Live atomic publish: the muxer wrote to `<seg>.tmp`; rename it onto its
         // final path now that the trailer is durable, then roll the playlist.
         if let Some(live) = self.live.as_mut() {
@@ -2166,6 +2400,17 @@ impl<'a> SegmentState<'a> {
                 duration,
                 segment.start_pts.as_nanos(),
             )?;
+        }
+        if let Some(renditions) = self.renditions.as_ref() {
+            // Publish master last, after video and every audio playlist exist.
+            if renditions
+                .states
+                .iter()
+                .all(|state| state.live.playlist_path().exists())
+                && renditions.video.live.playlist_path().exists()
+            {
+                atomic_write(&renditions.master, renditions.master_text.as_bytes())?;
+            }
         }
         self.done.push((segment.path, duration));
         Ok(())
@@ -2195,6 +2440,15 @@ impl<'a> SegmentState<'a> {
         if let Some(live) = self.live.as_mut() {
             live.finalize()?;
         }
+        if let Some(renditions) = self.renditions.as_mut() {
+            for state in renditions
+                .states
+                .iter_mut()
+                .chain(std::iter::once(&mut renditions.video))
+            {
+                state.live.finalize()?;
+            }
+        }
         Ok(())
     }
 
@@ -2202,6 +2456,28 @@ impl<'a> SegmentState<'a> {
     fn into_segment_paths(self) -> Vec<PathBuf> {
         self.done.into_iter().map(|(path, _)| path).collect()
     }
+}
+
+/// Highest previous segment number plus one, shared by all audio/video tracks.
+fn next_segment_index(dir: &Path, prefix: &str) -> Result<u64> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| Error::Output(format!("reading HLS segment directory: {e}")))?;
+    let mut next = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Output(format!("reading HLS segment entry: {e}")))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(number) = name
+            .strip_prefix(prefix)
+            .and_then(|s| s.strip_suffix(".ts"))
+        else {
+            continue;
+        };
+        if let Ok(index) = number.parse::<u64>() {
+            next = next.max(index.saturating_add(1));
+        }
+    }
+    Ok(next)
 }
 
 /// Derive the same-directory temp path a live segment is muxed to before being

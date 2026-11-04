@@ -63,6 +63,8 @@ pub struct LivePlaylist {
     /// `EXT-X-DISCONTINUITY`. Hold/slew updates keep the generation, so they
     /// mark nothing.
     epoch_generation: Option<u64>,
+    /// A new encoder run starts an independent timestamp sequence.
+    initial_discontinuity: bool,
 }
 
 impl LivePlaylist {
@@ -80,7 +82,18 @@ impl LivePlaylist {
             seg_paths: VecDeque::new(),
             epoch: None,
             epoch_generation: None,
+            initial_discontinuity: false,
         }
+    }
+
+    /// Set the next media sequence when a restarted run uses non-reused segment names.
+    pub fn set_media_sequence(&mut self, sequence: u64) {
+        self.playlist.set_media_sequence(sequence);
+    }
+
+    /// Mark the first segment after a restarted encoder as discontinuous.
+    pub fn set_initial_discontinuity(&mut self) {
+        self.initial_discontinuity = true;
     }
 
     /// The on-disk path the manifest is published to.
@@ -136,6 +149,10 @@ impl LivePlaylist {
         start_pts_ns: i64,
     ) -> Result<()> {
         let mut segment = Segment::new(uri, duration);
+        if self.initial_discontinuity {
+            segment.discontinuity = true;
+            self.initial_discontinuity = false;
+        }
         // PDT from the shared epoch (ADR-M010): segment first-sample wall time
         // = wall_at(first PTS). An unset source or a still-empty cell stamps
         // nothing — never a fabricated wall time.
@@ -220,7 +237,7 @@ fn prune_segment(path: &Path) {
 /// # Errors
 /// Returns [`Error::Output`] if the temp file cannot be created/written/synced or
 /// the rename fails.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = temp_path(path);
     // Scope the file handle so it is flushed/closed before the rename.
     {

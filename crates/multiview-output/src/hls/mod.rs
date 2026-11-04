@@ -32,7 +32,9 @@ mod master;
 mod media;
 mod pdt;
 
+#[cfg(feature = "ffmpeg")]
+pub(crate) use live::atomic_write;
 pub use live::LivePlaylist;
-pub use master::{MasterPlaylist, VariantStream};
+pub use master::{AudioRendition, MasterPlaylist, VariantStream};
 pub use media::{MediaPlaylist, Part, Segment, SegmentType, ServerControl};
 pub use pdt::format_program_date_time;
