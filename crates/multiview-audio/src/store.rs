@@ -1387,9 +1387,9 @@ impl Placer {
         };
     }
 
-    /// Write `units` (raw order) at their mapped frames, coalescing runs that
-    /// are contiguous within 2 frames into one write and skipping blocks
-    /// wholly behind `cursor` (late).
+    /// Write `units` (raw order) at their mapped frames, coalescing only
+    /// exactly contiguous runs and skipping blocks wholly behind `cursor`
+    /// (late). Overlaps and gaps retain their mapped positions.
     fn place(&self, store: &AudioStore, epochs: &EpochLog, cursor: i64, units: &[PendingBlock]) {
         let channels = store.format().channel_count().max(1);
         let mut run: Vec<f32> = Vec::new();
@@ -1414,7 +1414,7 @@ impl Placer {
                 log.placed(at, frames, unit.raw_ns);
             }
             let run_end = run_at.saturating_add(i64::try_from(run.len() / channels).unwrap_or(0));
-            if run.is_empty() || at.saturating_sub(run_end).abs() > 2 {
+            if run.is_empty() || at != run_end {
                 flush(&mut run, run_at);
                 run_at = at;
             }
@@ -1827,6 +1827,124 @@ mod resync_tests {
             out0_ns,
             raw_pts0_ns: raw0_ns,
         }
+    }
+
+    /// A deterministic sample ramp that exposes frame placement and channel order.
+    fn ramp(format: AudioFormat, start: f32, frames: usize) -> AudioBlock {
+        let channels = format.channel_count();
+        let samples = (0..frames)
+            .flat_map(|frame| {
+                (0..channels).map(move |channel| {
+                    start
+                        + f32::from(u16::try_from(frame).unwrap()) * 0.01
+                        + f32::from(u16::try_from(channel).unwrap()) * 10.0
+                })
+            })
+            .collect();
+        AudioBlock::from_interleaved(format, samples).unwrap()
+    }
+
+    /// The placer must retain the earliest mapped start when it coalesces
+    /// blocks; it must not concatenate shifted blocks as though their starts
+    /// matched. One-frame timestamp offsets can mean a deliberate overlap or gap
+    /// on the video timeline, not an instruction to move samples.
+    #[test]
+    fn placer_coalescing_preserves_exact_mapped_starts_and_channels() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let anchor = anchor(1, 10 * SEC, 100 * SEC);
+        let frames = 16;
+        for offset in [-3_i64, -2, -1, 0, 1, 2, 3] {
+            let store = AudioStore::timeline(format, 128);
+            let mut queue = DecodedQueue::default();
+            let first_raw = 100 * SEC;
+            let second_raw = first_raw
+                + (i64::try_from(frames).unwrap() + offset)
+                    .saturating_mul(SEC)
+                    .saturating_add(RATE - 1)
+                    / RATE;
+            queue.push(ramp(format, 0.0, frames), first_raw, 48_000, usize::MAX);
+            queue.push(ramp(format, 100.0, frames), second_raw, 48_000, usize::MAX);
+            let mut placer = Placer::new(48_000, 128, std::time::Duration::from_secs(15));
+            let first_at = video_frame(&anchor, first_raw);
+            placer.step(
+                &store,
+                &mut queue,
+                Some(anchor),
+                first_at,
+                std::time::Instant::now(),
+            );
+
+            let second_at = video_frame(&anchor, second_raw);
+            let end = (first_at + i64::try_from(frames).unwrap())
+                .max(second_at + i64::try_from(frames).unwrap());
+            for at in first_at.min(second_at)..end {
+                let expected = if at >= second_at && at < second_at + i64::try_from(frames).unwrap()
+                {
+                    let source = usize::try_from(at - second_at).unwrap();
+                    let value = f32::from(u16::try_from(source).unwrap()) * 0.01;
+                    (100.0 + value, 110.0 + value)
+                } else if at >= first_at && at < first_at + i64::try_from(frames).unwrap() {
+                    let source = usize::try_from(at - first_at).unwrap();
+                    let value = f32::from(u16::try_from(source).unwrap()) * 0.01;
+                    (value, 10.0 + value)
+                } else {
+                    (0.0, 0.0)
+                };
+                store.seek_to(at);
+                let actual = store.read(1).interleaved().to_vec();
+                assert_eq!(
+                    actual,
+                    vec![expected.0, expected.1],
+                    "offset={offset}, frame_at={at}, mapped starts={first_at}/{second_at}"
+                );
+            }
+            let second_tail = second_at + i64::try_from(frames).unwrap() - 1;
+            store.seek_to(second_tail);
+            let tail = store.read(1).interleaved().to_vec();
+            let tail_value = f32::from(u16::try_from(frames - 1).unwrap()) * 0.01;
+            assert_eq!(
+                tail,
+                vec![100.0 + tail_value, 110.0 + tail_value],
+                "offset={offset}: second block tail"
+            );
+        }
+    }
+
+    /// Small timestamp offsets must not accumulate as the run grows. Each
+    /// block keeps its own video-mapped start, including overwrites and holes.
+    #[test]
+    fn placer_repeated_offsets_do_not_drift_or_unlock() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let anchor = anchor(1, 10 * SEC, 100 * SEC);
+        let first_at = video_frame(&anchor, anchor.raw_pts0_ns);
+        let frames = 8;
+        let mut expected = vec![0.0; 64 * frames * 2];
+        let store = AudioStore::timeline(format, 1024);
+        let mut queue = DecodedQueue::default();
+        for index in 0..64 {
+            let offset = [0_i64, 1, -1, 2, -2, 3, -3][index % 7];
+            let mapped = i64::try_from(index * frames).unwrap() + offset;
+            let raw_ns = anchor.raw_pts0_ns + (mapped * SEC + RATE - 1) / RATE;
+            let actual_at = video_frame(&anchor, raw_ns);
+            assert_eq!(actual_at, first_at + mapped);
+            let block = ramp(format, f32::from(u16::try_from(index + 1).unwrap()), frames);
+            let start = usize::try_from(mapped).unwrap() * 2;
+            expected[start..start + frames * 2].copy_from_slice(block.interleaved());
+            queue.push(block, raw_ns, 48_000, usize::MAX);
+        }
+        let mut placer = Placer::new(48_000, 1024, std::time::Duration::from_secs(15));
+        placer.step(
+            &store,
+            &mut queue,
+            Some(anchor),
+            first_at,
+            std::time::Instant::now(),
+        );
+        assert_eq!(placer.locked, Some(true));
+        assert_eq!(placer.held_since, None);
+        assert!(queue.is_empty());
+        store.seek_to(first_at);
+        assert_eq!(store.read(expected.len() / 2).interleaved(), expected);
     }
 
     /// Where VIDEO puts a frame at raw `p` under the generation in force for it
