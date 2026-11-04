@@ -3648,6 +3648,7 @@ impl Pipeline {
         let mut fault_detector = FaultDetector::new(
             self.stores.clone(),
             self.meter_db_timelines.clone(),
+            self.audio_stores.clone(),
             self.cadence,
             source_probes,
         );
@@ -5736,6 +5737,9 @@ struct FaultDetector {
     stores: HashMapStores,
     /// Build-time per-source per-tick loudness timelines (dBFS) for silence.
     meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
+    /// Source PCM before program routing, gain or mute.
+    audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+    cadence: Rational,
     /// Per-source dwell/hysteresis state machines for each fault class.
     machines: std::collections::HashMap<String, SourceFaultMachines>,
     /// The stateless black probe (default broadcast threshold).
@@ -5810,7 +5814,8 @@ impl FaultDetector {
     fn new(
         stores: HashMapStores,
         meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
-        _cadence: Rational,
+        audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+        cadence: Rational,
         source_probes: std::collections::HashMap<String, SourceProbeOverride>,
     ) -> Self {
         use multiview_engine::{
@@ -5883,6 +5888,8 @@ impl FaultDetector {
         Self {
             stores,
             meter_db_timelines,
+            audio_stores,
+            cadence,
             machines: std::collections::HashMap::new(),
             black: BlackProbe::new(BlackConfig::default()),
             freeze: FreezeProbe::new(freeze_cfg),
@@ -5996,7 +6003,7 @@ impl FaultDetector {
                 self.freeze_window.remove(&id);
             }
             // Instantaneous silence from the per-input meter timeline.
-            let silence_now = self.silence_now(&id, index);
+            let silence_now = self.silence_now(&id, index, pts);
 
             // Debounce the freeze condition over a short window so a single noisy
             // GOP-boundary / warm-up frame cannot reset the 2 s freeze dwell.
@@ -6094,7 +6101,32 @@ impl FaultDetector {
     /// (M10), otherwise the shared default [`SILENCE_FLOOR_DB`]. A source with no
     /// meter timeline rides the meter floor (which is below either silence floor),
     /// so an audio-free tile reads silent.
-    fn silence_now(&self, id: &str, index: u64) -> bool {
+    fn silence_now(&self, id: &str, index: u64, pts: MediaTime) -> bool {
+        let floor = self
+            .declared_silence_floor
+            .get(id)
+            .copied()
+            .unwrap_or(SILENCE_FLOOR_DB);
+        if let Some(store) = self
+            .audio_stores
+            .get(id)
+            .filter(|store| store.is_timeline())
+        {
+            // Measure exactly this tick on the output sample clock, not a route cursor.
+            let rate = store.format().sample_rate();
+            let start = multiview_audio::store::output_ns_to_frame(pts.as_nanos(), rate);
+            let next_ns = pts.as_nanos().saturating_add(
+                i64::try_from(
+                    (1_000_000_000_i128 * i128::from(self.cadence.den))
+                        / i128::from(self.cadence.num.max(1)),
+                )
+                .unwrap_or(i64::MAX),
+            );
+            let end = multiview_audio::store::output_ns_to_frame(next_ns, rate);
+            let frames = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
+            return matches!(store.measure_pcm(start, frames),
+                multiview_audio::store::PcmMeasurement::Measured { rms_dbfs } if rms_dbfs <= floor);
+        }
         let db = match self.meter_db_timelines.get(id) {
             Some(timeline) => {
                 let i = usize::try_from(index).unwrap_or(usize::MAX);
@@ -6106,11 +6138,6 @@ impl FaultDetector {
             }
             None => multiview_audio::Ballistics::FLOOR_DB,
         };
-        let floor = self
-            .declared_silence_floor
-            .get(id)
-            .copied()
-            .unwrap_or(SILENCE_FLOOR_DB);
         db <= floor
     }
 }
@@ -12388,6 +12415,7 @@ mod fault_detector_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::overlays::TileFault;
+    use multiview_audio::{AudioBlock, AudioFormat, ChannelLayout};
 
     /// A 25/1 fps cadence (40 ms per tick), so the dwell windows below convert to
     /// a small, deterministic number of ticks.
@@ -12554,6 +12582,7 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
             cadence(),
             source_probes_for(id, &[probe]),
         );
@@ -12598,6 +12627,7 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
         );
@@ -12614,11 +12644,95 @@ mod fault_detector_tests {
     }
 
     #[test]
+    fn audible_live_source_without_file_meter_must_not_raise_no_audio() {
+        let id = "live-hls";
+        let (stores, video) = store_for(id);
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(format, 48_000));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let mut det = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            std::collections::HashMap::new(),
+        );
+        let states = live_states(id);
+        let mut last = TileFault::None;
+        for i in 0..20 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(
+                    at,
+                    &AudioBlock::from_interleaved(format, vec![0.2; 3840]).unwrap(),
+                )
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_ne!(last, TileFault::Silent);
+        for i in 20..42 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(at, &AudioBlock::silence(format, 1920))
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_eq!(last, TileFault::Silent);
+        for i in 42..55 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(
+                    at,
+                    &AudioBlock::from_interleaved(format, vec![0.2; 3840]).unwrap(),
+                )
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_ne!(last, TileFault::Silent);
+        // Every tick overlaps published silence but only half is covered.
+        // Zero-fill in the uncovered half must not raise a false badge.
+        for i in 55..78 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(at, &AudioBlock::silence(format, 960))
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_ne!(
+            last,
+            TileFault::Silent,
+            "partial overlap is unknown, not measured silence"
+        );
+    }
+
+    #[test]
     fn sustained_all_black_frames_raise_a_black_fault() {
         let id = "blk";
         let (stores, store) = store_for(id);
         let mut det = FaultDetector::new(
             stores,
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
@@ -12645,6 +12759,7 @@ mod fault_detector_tests {
         let (stores, store) = store_for(id);
         let mut det = FaultDetector::new(
             stores,
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
@@ -12676,6 +12791,7 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
         );
@@ -12705,6 +12821,7 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
         );
@@ -12739,6 +12856,7 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
         );
@@ -12771,6 +12889,7 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
         );
@@ -12799,6 +12918,7 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
             std::collections::HashMap::new(),
         );

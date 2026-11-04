@@ -70,6 +70,20 @@ struct RingSnapshot {
     /// Interleaved PCM for `[base_frame, base_frame + frames)`. Length is always
     /// a whole multiple of the format's channel count.
     samples: Vec<f32>,
+    /// Non-overlapping published spans, excluding zero-filled holes.
+    covered: Vec<(i64, i64)>,
+}
+
+/// A bounded, non-consuming measurement of source PCM at output sample positions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PcmMeasurement {
+    /// Part or all of the requested span was never published or was evicted.
+    Unknown,
+    /// The entire requested span was published; its RMS is in dBFS.
+    Measured {
+        /// Root-mean-square power of the fully covered PCM span.
+        rms_dbfs: f64,
+    },
 }
 
 impl RingSnapshot {
@@ -198,6 +212,7 @@ impl Default for WindowPool {
             buffers.push(Arc::new(RingSnapshot {
                 base_frame: 0,
                 samples: Vec::new(),
+                covered: Vec::new(),
             }));
         }
         Self { buffers }
@@ -217,6 +232,7 @@ impl WindowPool {
         Arc::new(RingSnapshot {
             base_frame: 0,
             samples: Vec::new(),
+            covered: Vec::new(),
         })
     }
 
@@ -258,6 +274,7 @@ impl AudioStore {
             window: SwapCell::from_pointee(RingSnapshot {
                 base_frame: 0,
                 samples: Vec::new(),
+                covered: Vec::new(),
             }),
             read_frame: AtomicI64::new(0),
             live_append: std::sync::atomic::AtomicBool::new(false),
@@ -432,9 +449,26 @@ impl AudioStore {
             base_frame = base_frame.saturating_add(evicted_frames);
         }
 
+        let head =
+            base_frame.saturating_add(i64::try_from(next.len() / channels).unwrap_or(i64::MAX));
+        let mut covered: Vec<(i64, i64)> = current
+            .covered
+            .iter()
+            .filter_map(|&(lo, hi)| (hi > base_frame).then_some((lo.max(base_frame), hi.min(head))))
+            .filter(|(lo, hi)| lo < hi)
+            .collect();
+        let appended_start = current.head_frame(channels).max(base_frame);
+        if appended_start < head {
+            if let Some(last) = covered.last_mut().filter(|last| last.1 == appended_start) {
+                last.1 = head;
+            } else {
+                covered.push((appended_start, head));
+            }
+        }
         self.window.store(Arc::new(RingSnapshot {
             base_frame,
             samples: next,
+            covered,
         }));
         Ok(())
     }
@@ -523,9 +557,32 @@ impl AudioStore {
         );
         overlay_from(&mut merged, incoming, at, new_base, channels);
 
+        let mut covered = current
+            .covered
+            .iter()
+            .copied()
+            .chain(std::iter::once((at, block_end)))
+            .filter_map(|(start, end)| {
+                let start = start.max(new_base);
+                let end = end.min(new_head);
+                (start < end).then_some((start, end))
+            })
+            .collect::<Vec<_>>();
+        covered.sort_unstable();
+        let mut joined: Vec<(i64, i64)> = Vec::with_capacity(covered.len());
+        for (start, end) in covered {
+            if let Some(last) = joined.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            joined.push((start, end));
+        }
         self.window.store(Arc::new(RingSnapshot {
             base_frame: new_base,
             samples: merged,
+            covered: joined,
         }));
         Ok(())
     }
@@ -588,12 +645,24 @@ impl AudioStore {
             inner.base_frame = base_frame;
             inner.samples.clear();
             inner.samples.extend_from_slice(samples);
+            inner.covered.clear();
+            inner.covered.push((
+                base_frame,
+                base_frame
+                    .saturating_add(i64::try_from(samples.len() / channels).unwrap_or(i64::MAX)),
+            ));
         } else {
             // Defensive (never reached in SPSC — `take_reusable` guarantees count 1):
             // build a fresh snapshot rather than corrupt a shared one.
             snapshot = Arc::new(RingSnapshot {
                 base_frame,
                 samples: samples.to_vec(),
+                covered: vec![(
+                    base_frame,
+                    base_frame.saturating_add(
+                        i64::try_from(samples.len() / channels).unwrap_or(i64::MAX),
+                    ),
+                )],
             });
         }
         // Publish the new window; the displaced window returns to the pool for reuse
@@ -612,6 +681,62 @@ impl AudioStore {
     #[allow(clippy::as_conversions)] // reason: a pointer→usize identity cast for a test-only buffer-reuse probe; `ptr::addr`/`expose_provenance` are unstable, and no arithmetic is done on the value.
     pub fn window_backing_ptr(&self) -> usize {
         self.window.load().samples.as_ptr() as usize
+    }
+
+    /// Measure a bounded span of published PCM without moving the read cursor.
+    /// A partly covered span is unknown, even if its zero-filled gaps look silent.
+    /// Spans larger than the store's capacity are unknown rather than costly.
+    #[must_use]
+    pub fn measure_pcm(&self, start: i64, frames: usize) -> PcmMeasurement {
+        if frames == 0 || frames > self.capacity_frames {
+            return PcmMeasurement::Unknown;
+        }
+        let channels = self.format.channel_count();
+        if channels == 0 {
+            return PcmMeasurement::Unknown;
+        }
+        let Some(end) = i64::try_from(frames)
+            .ok()
+            .and_then(|n| start.checked_add(n))
+        else {
+            return PcmMeasurement::Unknown;
+        };
+        let snapshot = self.window.load();
+        let mut cursor = start;
+        for &(lo, hi) in &snapshot.covered {
+            if lo > cursor {
+                return PcmMeasurement::Unknown;
+            }
+            if hi > cursor {
+                cursor = hi;
+            }
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end || start < snapshot.base_frame || end > snapshot.head_frame(channels) {
+            return PcmMeasurement::Unknown;
+        }
+        let Ok(offset) = usize::try_from(start.saturating_sub(snapshot.base_frame)) else {
+            return PcmMeasurement::Unknown;
+        };
+        let Some(samples) = snapshot.samples.get(
+            offset.saturating_mul(channels)..offset.saturating_add(frames).saturating_mul(channels),
+        ) else {
+            return PcmMeasurement::Unknown;
+        };
+        let power = samples
+            .iter()
+            .map(|sample| f64::from(*sample).powi(2))
+            .sum::<f64>()
+            / f64::from(u32::try_from(samples.len()).unwrap_or(u32::MAX));
+        PcmMeasurement::Measured {
+            rms_dbfs: if power > 0.0 {
+                10.0 * power.log10()
+            } else {
+                f64::NEG_INFINITY
+            },
+        }
     }
 
     /// Sample exactly `frames` contiguous frames starting at the read cursor,
