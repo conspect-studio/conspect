@@ -48,21 +48,69 @@ fn sibling_manifest_pins_retired_segment_until_sibling_retires() {
 }
 
 #[test]
+fn query_fragment_and_encoded_sibling_uris_pin_exact_retired_segments() {
+    for (uri, pinned) in [
+        ("video-0.ts?token=x", "video-0.ts"),
+        ("video-0.ts#fragment", "video-0.ts"),
+        ("video%2D0.ts?token=x#fragment", "video-0.ts"),
+        ("video%20old.ts", "video old.ts"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("audio-program-g0.m3u8"),
+            format!("#EXTM3U\n{uri}\n"),
+        )
+        .unwrap();
+        let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
+        for index in 0..10 {
+            let name = if index == 0 {
+                pinned.to_owned()
+            } else {
+                format!("video-{index}.ts")
+            };
+            let path = touch_segment(dir.path(), &name);
+            live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
+                .unwrap();
+        }
+        assert!(dir.path().join(pinned).exists(), "URI {uri} lost {pinned}");
+        assert!(
+            !dir.path().join("video-1.ts").exists(),
+            "URI {uri} blocked safe GC"
+        );
+    }
+}
+
+#[test]
 fn malformed_sibling_uri_cannot_traverse_or_authorize_pruning() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("audio-program-g0.m3u8"),
-        "#EXTM3U\n../video-0.ts\n",
-    )
-    .unwrap();
-    let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
-    for index in 0..10 {
-        let name = format!("video-{index}.ts");
-        let path = touch_segment(dir.path(), &name);
-        live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
-            .unwrap();
+    for uri in [
+        "../video-0.ts",
+        "/video-0.ts",
+        "https://example.test/video-0.ts",
+        "video%2F0.ts",
+        "video%252F0.ts",
+        "%2E%2E%2Fvideo-0.ts",
+        "video-%ZZ.ts",
+        "video-0.ts?token=%ZZ",
+        "video-0.ts#fragment%ZZ",
+    ] {
+        std::fs::write(
+            dir.path().join("audio-program-g0.m3u8"),
+            format!("#EXTM3U\n{uri}\n"),
+        )
+        .unwrap();
+        let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
+        for index in 0..10 {
+            let name = format!("video-{index}.ts");
+            let path = touch_segment(dir.path(), &name);
+            live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
+                .unwrap();
+        }
+        assert!(
+            dir.path().join("video-0.ts").is_file(),
+            "URI {uri} allowed GC"
+        );
     }
-    assert!(dir.path().join("video-0.ts").is_file());
 }
 
 #[test]

@@ -229,10 +229,73 @@ impl LivePlaylist {
     }
 }
 
+/// Parse every media URI line before checking its extension. A non-TS URI in
+/// a TS media playlist is uncertain, not proof that no TS is referenced.
+/// Unknown URI forms fail closed so neither cleanup path can unlink media.
+pub(crate) fn media_segment_uris(text: &str) -> Option<Vec<String>> {
+    let mut uris = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let (path, suffix) = line.split_once(['?', '#']).unwrap_or((line, ""));
+        // Query and fragment may include escaped values, but malformed percent
+        // escapes or control bytes leave the reference uncertain.
+        if suffix.bytes().any(|byte| byte.is_ascii_control()) || !valid_escapes(suffix) {
+            return None;
+        }
+        let mut decoded = Vec::with_capacity(path.len());
+        let mut bytes = path.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                let high = bytes.next().and_then(hex_digit)?;
+                let low = bytes.next().and_then(hex_digit)?;
+                decoded.push((high << 4) | low);
+            } else {
+                decoded.push(byte);
+            }
+        }
+        let name = String::from_utf8(decoded).ok()?;
+        // Reject separators, URI schemes, drive syntax and any remaining '%':
+        // a second decode must never turn a basename into traversal.
+        if name.is_empty()
+            || matches!(name.as_str(), "." | "..")
+            || name.contains(['/', '\\', ':', '%', '?', '#'])
+            || name.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return None;
+        }
+        match Path::new(&name).extension() {
+            Some(ext) if ext.eq_ignore_ascii_case("ts") => uris.push(name),
+            // Master playlists list media playlists, not media segments.
+            Some(ext) if ext.eq_ignore_ascii_case("m3u8") => {}
+            _ => return None,
+        }
+    }
+    Some(uris)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte)
+        .to_digit(16)
+        .and_then(|digit| u8::try_from(digit).ok())
+}
+
+fn valid_escapes(input: &str) -> bool {
+    let mut bytes = input.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%'
+            && (bytes.next().and_then(hex_digit).is_none()
+                || bytes.next().and_then(hex_digit).is_none())
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Exact same-directory TS basenames named by any still-present media manifest.
-/// Fail closed on unreadable manifests: callers must not unlink uncertain media.
-/// Never join a manifest URI to a filesystem path; reject path separators, query
-/// strings and traversal so untrusted playlist text cannot escape the directory.
+/// Fail closed on unreadable or uncertain manifests: callers must not unlink.
 pub(crate) fn media_segment_references(dir: &Path) -> Option<HashSet<OsString>> {
     let mut references = HashSet::new();
     for entry in std::fs::read_dir(dir).ok()? {
@@ -245,21 +308,7 @@ pub(crate) fn media_segment_references(dir: &Path) -> Option<HashSet<OsString>> 
             continue;
         }
         let text = std::fs::read_to_string(entry.path()).ok()?;
-        for line in text.lines().filter(|line| !line.starts_with('#')) {
-            if Path::new(line)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
-            {
-                if line.is_empty()
-                    || line == "."
-                    || line == ".."
-                    || line.contains(['/', '\\', '?', '#'])
-                {
-                    return None;
-                }
-                references.insert(OsString::from(line));
-            }
-        }
+        references.extend(media_segment_uris(&text)?.into_iter().map(OsString::from));
     }
     Some(references)
 }

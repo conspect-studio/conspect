@@ -50,8 +50,8 @@ use multiview_ffmpeg::{
 use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 use crate::hls::{
-    atomic_write, media_segment_references, AudioRendition, LivePlaylist, MasterPlaylist,
-    MediaPlaylist, Segment, SegmentType, VariantStream,
+    atomic_write, media_segment_references, media_segment_uris, AudioRendition, LivePlaylist,
+    MasterPlaylist, MediaPlaylist, Segment, SegmentType, VariantStream,
 };
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
 
@@ -2551,6 +2551,10 @@ fn prune_prior_rendition_manifests(dir: &Path, renditions: &AudioRenditions<'_>,
         .chain(std::iter::once(&renditions.video))
         .map(|state| state.live.playlist_path())
         .collect();
+    prune_prior_rendition_manifests_inactive(dir, &active, oldest);
+}
+
+fn prune_prior_rendition_manifests_inactive(dir: &Path, active: &[&Path], oldest: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2573,23 +2577,14 @@ fn prune_prior_rendition_manifests(dir: &Path, renditions: &AudioRenditions<'_>,
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        // Do not interpret an untrusted URI as a path. Invalid manifests stay
-        // on disk and prevent deletion through the fail-closed reference scan.
-        let listed: Vec<_> = text
-            .lines()
-            .filter(|line| {
-                Path::new(line)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
-            })
-            .collect();
-        if listed
-            .iter()
-            .all(|uri| !uri.contains(['/', '\\', '?', '#']))
-            && listed.iter().any(|uri| {
-                segment_number(uri).is_some_and(|index| index < oldest) || !dir.join(uri).exists()
-            })
-        {
+        // Parse through the same fail-closed URI policy as both TS reapers.
+        // Uncertain manifests cannot authorize removal of their own references.
+        let Some(listed) = media_segment_uris(&text) else {
+            continue;
+        };
+        if listed.iter().any(|uri| {
+            segment_number(uri).is_some_and(|index| index < oldest) || !dir.join(uri).exists()
+        }) {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) | Err(_) => {}
             }
@@ -2748,13 +2743,61 @@ mod tests {
     use multiview_ffmpeg::{DecodedVideoFrame, StreamVideoDecoder};
 
     use super::{
-        AudioEncodeConfig, EncodeConfig, Result, SegmentSink, VideoFrameSource,
-        SEED_ENCODER_BUILDS, SEGMENT_FINALIZES,
+        prune_prior_live_segments, prune_prior_rendition_manifests_inactive, AudioEncodeConfig,
+        EncodeConfig, Result, SegmentSink, VideoFrameSource, SEED_ENCODER_BUILDS,
+        SEGMENT_FINALIZES,
     };
     use crate::error::Error;
 
     const WIDTH: u32 = 160;
     const HEIGHT: u32 = 120;
+
+    #[test]
+    fn prior_rendition_retirement_and_ts_reaper_preserve_uri_references() {
+        for (uri, pinned, fail_closed) in [
+            ("video-0.ts?token=x", "video-0.ts", false),
+            ("video-0.ts#fragment", "video-0.ts", false),
+            ("video%2D0.ts?token=x", "video-0.ts", false),
+            ("/video-0.ts", "video-0.ts", true),
+            ("https://example.test/video-0.ts", "video-0.ts", true),
+            ("../video-0.ts", "video-0.ts", true),
+            ("video%252F0.ts", "video-0.ts", true),
+            ("video-%ZZ.ts", "video-0.ts", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let stale = dir.path().join("audio-program-g0.m3u8");
+            std::fs::write(&stale, format!("#EXTM3U\n{uri}\n")).unwrap();
+            let old = dir.path().join(pinned);
+            std::fs::write(&old, b"retained").unwrap();
+            let unlisted = dir.path().join("video-1.ts");
+            std::fs::write(&unlisted, b"unlisted").unwrap();
+            prune_prior_rendition_manifests_inactive(dir.path(), &[], 0);
+            assert!(stale.exists(), "retired manifest with URI {uri}");
+            prune_prior_live_segments(dir.path(), "seg", 100, 2);
+            assert!(old.exists(), "reaper removed referenced URI {uri}");
+            assert_eq!(unlisted.exists(), fail_closed, "URI {uri} GC behavior");
+        }
+    }
+
+    #[test]
+    fn retirement_uses_normalized_uri_age_without_removing_other_references() {
+        for uri in ["video-0.ts?token=x", "video-0.ts#fragment", "video%2D0.ts"] {
+            let dir = tempfile::tempdir().unwrap();
+            let stale = dir.path().join("audio-program-g0.m3u8");
+            let sibling = dir.path().join("video-g0.m3u8");
+            std::fs::write(&stale, format!("#EXTM3U\n{uri}\n")).unwrap();
+            std::fs::write(&sibling, format!("#EXTM3U\n{uri}\n")).unwrap();
+            let segment = dir.path().join("video-0.ts");
+            std::fs::write(&segment, b"pinned").unwrap();
+            prune_prior_rendition_manifests_inactive(dir.path(), &[sibling.as_path()], 5);
+            assert!(!stale.exists(), "old URI {uri} did not retire");
+            prune_prior_live_segments(dir.path(), "seg", 100, 2);
+            assert!(
+                segment.exists(),
+                "retirement removed sibling reference {uri}"
+            );
+        }
+    }
 
     #[test]
     fn audio_encode_config_maps_to_a_planar_float_target() {
