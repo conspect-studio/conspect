@@ -1866,7 +1866,8 @@ struct AudioRenditions<'a> {
     states: Vec<AudioRenditionState<'a>>,
     video: AudioRenditionState<'a>,
     master: PathBuf,
-    master_text: String,
+    master_text: Option<String>,
+    retention_window: usize,
 }
 
 /// An in-progress segment: its muxer, registered stream index, file path, and
@@ -2003,12 +2004,14 @@ impl<'a> SegmentState<'a> {
             .filter_map(|state| state.stream.params.bit_rate())
             .max()
             .unwrap_or(0);
+        // BANDWIDTH is mandatory for a listed variant. With no configured
+        // video rate, keep the master absent rather than advertise a lie.
         let bandwidth = video
             .params
             .bit_rate()
-            .unwrap_or(1)
-            .saturating_add(max_audio_rate);
-        let mut variant = VariantStream::new("video.m3u8", bandwidth);
+            .filter(|rate| *rate > 0)
+            .map(|rate| rate.saturating_add(max_audio_rate));
+        let mut variant = VariantStream::new("video.m3u8", bandwidth.unwrap_or(0));
         if let Some((width, height)) = video.params.video_dimensions() {
             variant = variant.with_resolution(width, height);
         }
@@ -2049,7 +2052,8 @@ impl<'a> SegmentState<'a> {
                 current: None,
             },
             master: parent.join("master.m3u8"),
-            master_text: master.render(),
+            master_text: bandwidth.map(|_| master.render()),
+            retention_window: window,
         });
     }
 
@@ -2437,14 +2441,28 @@ impl<'a> SegmentState<'a> {
         }
         if let Some(renditions) = self.renditions.as_ref() {
             // Publish master last, after video and every audio playlist exist.
-            if renditions
-                .states
-                .iter()
-                .all(|state| state.live.playlist_path().exists())
-                && renditions.video.live.playlist_path().exists()
-            {
-                atomic_write(&renditions.master, renditions.master_text.as_bytes())?;
+            // A run without valid video bitrate metadata still serves the legacy
+            // index and media playlists, but never publishes a false BANDWIDTH.
+            if let Some(master_text) = renditions.master_text.as_ref() {
+                if renditions
+                    .states
+                    .iter()
+                    .all(|state| state.live.playlist_path().exists())
+                    && renditions.video.live.playlist_path().exists()
+                {
+                    atomic_write(&renditions.master, master_text.as_bytes())?;
+                }
             }
+        }
+        if let Some(renditions) = self.renditions.as_ref() {
+            // The new playlists are already durable. Reap files left by prior
+            // runs outside two complete client windows plus a small grace span.
+            prune_prior_live_segments(
+                self.dir,
+                self.prefix,
+                self.seg_index,
+                renditions.retention_window,
+            );
         }
         self.done.push((segment.path, duration));
         Ok(())
@@ -2528,6 +2546,45 @@ fn retire_old_master(playlist_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reap prior-run TS files after the new manifests have advanced beyond them.
+/// Keep the current listed window and another window for clients with an old
+/// manifest. An extra three segments cover slow readers with short windows.
+fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize) {
+    let grace = u64::try_from(window)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .max(3);
+    let oldest = next.saturating_sub(grace);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".ts") else {
+            continue;
+        };
+        let number = stem
+            .strip_prefix(prefix)
+            .or_else(|| stem.strip_prefix("video-"))
+            .or_else(|| stem.strip_prefix("audio-program-"))
+            .or_else(|| {
+                stem.strip_prefix("audio-track").and_then(|s| {
+                    s.split_once('-')
+                        .and_then(|(track, index)| track.parse::<u16>().ok().map(|_| index))
+                })
+            });
+        if number
+            .and_then(|index| index.parse::<u64>().ok())
+            .is_some_and(|index| index < oldest)
+        {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
 }
 
 /// Highest previous segment number plus one, shared by all audio/video tracks.

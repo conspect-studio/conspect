@@ -341,6 +341,7 @@ fn live_renditions_prune_and_restart_without_stale_segment_urls() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // reason: one complete three-generation restart scenario.
 fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (video, v_params, v_tb) = encode_video_at(900_000);
@@ -479,6 +480,68 @@ fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
     assert!(master.contains("BANDWIDTH=1228000"), "{master}");
     assert!(master.contains("NAME=\"New\""), "{master}");
     assert!(!master.contains("NAME=\"Old\""), "{master}");
+}
+
+#[test]
+fn live_restart_reaps_prior_generations_without_erasing_current_window() {
+    let dir = tempfile::tempdir().unwrap();
+    for generation in 0..3 {
+        let (video, v_params, v_tb) = encode_video_at(750_000);
+        let mut source = VecPackets {
+            packets: video.into_iter(),
+        };
+        PacketMuxSink::segment_live(
+            dir.path(),
+            "seg",
+            dir.path().join("index.m3u8"),
+            2,
+            SharedEpoch::new(),
+        )
+        .run_av_tracks(&mut source, MuxStream::new(&v_params, v_tb), None, &[])
+        .unwrap();
+        let ts_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "ts"))
+            .count();
+        assert!(
+            ts_count <= 8,
+            "restart {generation} retained {ts_count} files"
+        );
+        let video_playlist = std::fs::read_to_string(dir.path().join("video.m3u8")).unwrap();
+        for uri in video_playlist.lines().filter(|line| {
+            Path::new(line)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+        }) {
+            assert!(
+                dir.path().join(uri).exists(),
+                "listed segment absent: {uri}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_video_bitrate_omits_master_instead_of_advertising_one_bps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (video, v_params, v_tb) = encode_video_at(0);
+    assert_eq!(v_params.bit_rate(), None);
+    let mut source = VecPackets {
+        packets: video.into_iter(),
+    };
+    PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .run_av_tracks(&mut source, MuxStream::new(&v_params, v_tb), None, &[])
+    .unwrap();
+    assert!(!dir.path().join("master.m3u8").exists());
+    assert!(dir.path().join("index.m3u8").exists());
+    assert!(dir.path().join("video.m3u8").exists());
 }
 
 #[test]

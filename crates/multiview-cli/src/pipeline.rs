@@ -5004,10 +5004,8 @@ fn consumer_main(
                     publisher.publish_event(Event::AudioMeter(sample));
                 }
                 #[cfg(not(feature = "overlay"))]
-                if let Some(bus) = audio_bus.as_ref() {
-                    for sample in input_meters.push(&bus.input_tracks(), now_ns) {
-                        publisher.publish_event(Event::AudioMeter(sample));
-                    }
+                for sample in input_meters.push(&bus.input_tracks(), now_ns) {
+                    publisher.publish_event(Event::AudioMeter(sample));
                 }
             }
             // DEV-B4: the display heads hear the SAME post-loudnorm program
