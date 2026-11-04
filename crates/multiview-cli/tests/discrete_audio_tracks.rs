@@ -35,7 +35,7 @@ fn build_tone_clip(path: &Path, seconds: u32) {
         .arg(format!("testsrc=size=320x240:rate=25:duration={seconds}"))
         .args(["-f", "lavfi", "-i"])
         .arg(format!(
-            "sine=frequency={TRACK_HZ}:sample_rate=48000:duration={seconds}"
+            "sine=frequency={TRACK_HZ}:sample_rate=44100:duration={seconds}"
         ))
         .args(["-c:v", "mpeg2video", "-pix_fmt", "yuv420p", "-c:a", "aac"])
         .arg(path)
@@ -44,8 +44,9 @@ fn build_tone_clip(path: &Path, seconds: u32) {
     assert!(status.success(), "ffmpeg fixture failed");
 }
 
-/// `in_a` (bars, 1 kHz) is the program; `in_b` (a 440 Hz clip, in no cell, not on
-/// the program bus) is the discrete track.
+/// `in_a` (bars, 1 kHz) is the program; `in_b` (a 44.1 kHz 440 Hz clip, in no
+/// cell, muted on the program bus) is decoded and resampled into the 48 kHz
+/// clean discrete track, unaffected by its program-bus gain and mute.
 fn config_text(clip: &Path, playlist: &Path, output_audio: &str) -> String {
     format!(
         r##"
@@ -102,7 +103,9 @@ channels = {{ kind = "stereo" }}
 target_track = "au-abc"
 language = "eng"
 title = "AU ABC"
-include_in_program_bus = false
+include_in_program_bus = true
+gain_db = -18.0
+mute = true
 "##,
         clip = clip.display(),
         playlist = playlist.display(),
@@ -311,6 +314,10 @@ async fn assert_two_audio_streams(output_audio: &str) {
         "program must stay the 1 kHz mix, got {program_hz}"
     );
     let (track_440, track_1k) = tone_powers(&all, "0:a:1");
+    assert!(
+        track_440 > 1e4,
+        "muted -18 dB program route must retain a clean, audible discrete track"
+    );
     assert!(
         track_440 > 10.0 * track_1k,
         "track must carry the discrete 440 Hz input, not the 1 kHz program \
