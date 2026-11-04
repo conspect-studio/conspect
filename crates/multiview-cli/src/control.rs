@@ -1477,14 +1477,18 @@ impl CommandDrain {
 
         // Drain the bus, routing commands. Video re-points are enqueued (batched +
         // bounded); every other command is applied immediately as before.
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         let mut tile_binding_changed = false;
         for command in self.commands.try_drain() {
-            tile_binding_changed |= matches!(
-                &command,
-                Command::ApplyLayout { .. }
-                    | Command::UpsertSource { .. }
-                    | Command::RemoveSource { .. }
-            );
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+            {
+                tile_binding_changed |= matches!(
+                    &command,
+                    Command::ApplyLayout { .. }
+                        | Command::UpsertSource { .. }
+                        | Command::RemoveSource { .. }
+                );
+            }
             self.route_command(command, drive);
         }
 
@@ -1510,6 +1514,7 @@ impl CommandDrain {
             }
             applied = applied.saturating_add(1);
         }
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         if tile_binding_changed || applied != 0 {
             self.publish_tile_specs(drive);
         }
@@ -1519,8 +1524,8 @@ impl CommandDrain {
     /// Publish only when the active placements differ from the baker's snapshot.
     /// This happens on the frame boundary after layout or video-route changes;
     /// steady-state ticks do not allocate or wait on the bake consumer.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
     fn publish_tile_specs(&self, drive: &CompositorDrive<Nv12Image>) {
-        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         if let Some(slot) = &self.tile_spec_apply {
             let labels = self
                 .config
@@ -1541,8 +1546,6 @@ impl CommandDrain {
                 slot.store(Arc::new(tiles));
             }
         }
-        #[cfg(not(all(feature = "ffmpeg", feature = "overlay")))]
-        let _ = drive;
     }
 
     /// Enqueue a VIDEO→cell route intent, bounded drop-oldest (safety rule §5).
