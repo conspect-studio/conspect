@@ -496,11 +496,11 @@ impl OverlayBaker {
                 // whatever sits beneath it — in particular the top-left tile's
                 // own state flag would otherwise bleed green through the white
                 // digits (#38). Meaning is the text; the chip is contrast only,
-                // sized to the coarse mono advance like the other chrome chips.
+                // sized to the rasterized text ink like the other chrome chips.
                 const CLOCK_SIZE_PX: f32 = 26.0;
                 const CLOCK_PAD: u32 = 4;
-                let clock_w = u32_from_usize(text.chars().count())
-                    .saturating_mul(quantize_advance(CLOCK_SIZE_PX))
+                let clock_w = self
+                    .text_ink_width(&text, FontFamily::Mono, CLOCK_SIZE_PX)?
                     .saturating_add(CLOCK_PAD.saturating_mul(2));
                 let clock_h = round_dim(CLOCK_SIZE_PX).saturating_add(CLOCK_PAD.saturating_mul(2));
                 push_filled_rect(
@@ -598,10 +598,9 @@ impl OverlayBaker {
         for (i, line) in cue_lines.iter().enumerate() {
             let line_y =
                 base_y.saturating_add(i32_dim(u32_from_usize(i).saturating_mul(line_step)));
-            // Centre each line within the cell using the coarse advance estimate.
-            let approx_w =
-                u32_from_usize(line.chars().count()).saturating_mul(quantize_advance(size));
-            let x_off = geom.width.saturating_sub(approx_w.min(geom.width)) / 2;
+            // Use the shaped, rasterized ink extent, not a character-count estimate.
+            let ink_w = self.text_ink_width(line, FontFamily::Sans, size)?;
+            let x_off = geom.width.saturating_sub(ink_w.min(geom.width)) / 2;
             let x = geom.x.saturating_add(i32_dim(x_off));
             self.push_text_clipped(
                 list,
@@ -666,7 +665,7 @@ impl OverlayBaker {
         let flag_color = state_flag_color(state);
         let flag_h = geom.chip_height();
         let flag_w = geom
-            .flag_width(flag_text.chars().count())
+            .flag_width(self.text_ink_width(flag_text, FontFamily::Sans, geom.chip_text_px())?)
             .min(geom.meter_left());
         push_filled_rect(
             list,
@@ -700,7 +699,7 @@ impl OverlayBaker {
             let badge_left = geom.x.saturating_add(i32_dim(flag_w));
             let available = badge_right.saturating_sub(badge_left);
             let badge_w = geom
-                .flag_width(badge.chars().count())
+                .flag_width(self.text_ink_width(badge, FontFamily::Sans, geom.chip_text_px())?)
                 .min(u32::try_from(available).unwrap_or(0));
             let badge_x = badge_right.saturating_sub(i32_dim(badge_w));
             if badge_w > 0 {
@@ -727,7 +726,7 @@ impl OverlayBaker {
         // The input label: bottom-left of the tile, on a translucent backing.
         let label_h = geom.chip_height();
         let label_w = geom
-            .flag_width(label.chars().count())
+            .flag_width(self.text_ink_width(label, FontFamily::Sans, geom.chip_text_px())?)
             .min(geom.meter_left());
         let label_y = geom
             .y
@@ -772,12 +771,12 @@ impl OverlayBaker {
     ) -> Result<(), CompositorError> {
         let badge = format!("{} {}", time_ref.status.glyph(), time_ref.status_text());
         // Chrome backing so the badge reads over any underlying picture (the
-        // meaning is the glyph + text, not the colour). A fixed legible band sized
-        // to the coarse glyph advance, with a small pad around the text origin.
+        // meaning is the glyph + text, not the colour). Size its band to the
+        // rasterized ink, with a small pad around the text origin.
         let size_px = 16.0;
         let pad: u32 = 3;
-        let approx_w = u32_from_usize(badge.chars().count())
-            .saturating_mul(quantize_advance(size_px))
+        let badge_w = self
+            .text_ink_width(&badge, FontFamily::Sans, size_px)?
             .saturating_add(pad.saturating_mul(2));
         let band_h = round_dim(size_px).saturating_add(pad.saturating_mul(2));
         push_filled_rect(
@@ -785,7 +784,7 @@ impl OverlayBaker {
             OverlayRect::new(
                 x.saturating_sub(i32_dim(pad)),
                 y.saturating_sub(i32_dim(pad)),
-                approx_w,
+                badge_w,
                 band_h,
             ),
             CHROME_BG,
@@ -806,6 +805,35 @@ impl OverlayBaker {
                 color,
             },
         )
+    }
+
+    /// Return the actual horizontal ink extent after shaping, scaling and rasterization.
+    /// Include the last glyph's right bearing, which a character-count estimate misses.
+    fn text_ink_bounds(
+        &mut self,
+        text: &str,
+        family: FontFamily,
+        size_px: f32,
+    ) -> Result<(i32, i32), CompositorError> {
+        let shaped = self.engine.prepare_run(text, family, size_px, [1.0; 4])?;
+        let left = shaped.glyphs().iter().map(|g| g.dest_x).min().unwrap_or(0);
+        let right = shaped
+            .glyphs()
+            .iter()
+            .map(|g| g.dest_x.saturating_add(i32_dim(g.width)))
+            .max()
+            .unwrap_or(0);
+        Ok((left.min(0), right.max(0)))
+    }
+
+    fn text_ink_width(
+        &mut self,
+        text: &str,
+        family: FontFamily,
+        size_px: f32,
+    ) -> Result<u32, CompositorError> {
+        let (left, right) = self.text_ink_bounds(text, family, size_px)?;
+        Ok(u32::try_from(right.saturating_sub(left)).unwrap_or(u32::MAX))
     }
 
     /// Shape `text` per `run` and append its glyph quads to `list`, tinted by the
@@ -1062,12 +1090,10 @@ impl TileGeometry {
         f32_dim(h.clamp(10, 30))
     }
 
-    /// The width (px) of a chip holding `glyphs` characters at the chip text size,
-    /// clamped to the cell width.
-    fn flag_width(self, glyphs: usize) -> u32 {
-        let advance = quantize_advance(self.chip_text_px());
-        let text = u32_from_usize(glyphs).saturating_mul(advance);
-        text.saturating_add(self.pad().saturating_mul(2))
+    /// The width of a chip holding its measured rasterized ink and both pads.
+    fn flag_width(self, ink_width: u32) -> u32 {
+        ink_width
+            .saturating_add(self.pad().saturating_mul(2))
             .clamp(self.pad().saturating_mul(2).max(1), self.width)
     }
 
@@ -1229,12 +1255,6 @@ fn hand_angles(hands: AnalogHands) -> HandAngles {
         minute_deg: hands.minute_deg,
         second_deg: hands.second_deg,
     }
-}
-
-/// A coarse per-glyph advance estimate for sizing chrome (px); good enough for
-/// placement (exact measuring would re-shape the run, unnecessary here).
-fn quantize_advance(size_px: f32) -> u32 {
-    round_dim(size_px * 0.55).max(1)
 }
 
 /// Round a non-negative `f32` pixel measure to `u32` (saturating), no `as`.
@@ -1978,7 +1998,11 @@ mod tests {
             .unwrap();
         let geom = TileGeometry::resolve(rect);
         let badge = "NO AUDIO";
-        let badge_width = geom.flag_width(badge.chars().count());
+        let badge_width = geom.flag_width(
+            baker
+                .text_ink_width(badge, FontFamily::Sans, geom.chip_text_px())
+                .unwrap(),
+        );
         let expected_x = geom.x + i32_dim(geom.meter_left() - badge_width);
         assert!(list.primitives.iter().any(|p| matches!(p,
             OverlayPrimitive::FilledRect { rect, .. }
@@ -2013,6 +2037,113 @@ mod tests {
             badge_ink >= badge.chars().filter(|c| !c.is_whitespace()).count(),
             "full NO AUDIO text must remain visible: {badge_ink} inked glyphs"
         );
+        assert_final_glyph_unclipped(
+            &list,
+            &mut baker,
+            badge,
+            geom.chip_text_px(),
+            expected_x + geom.pad_i32(),
+            geom.y + geom.pad_i32() / 2,
+            RED,
+        );
+    }
+
+    /// Compare every coverage pixel in the final glyph with its uncut rasterized
+    /// reference, not merely the count of glyph quads (a partial O still counts).
+    fn assert_final_glyph_unclipped(
+        list: &OverlayDrawList,
+        baker: &mut OverlayBaker,
+        text: &str,
+        size: f32,
+        x: i32,
+        y: i32,
+        color: OverlayColor,
+    ) {
+        let reference = baker
+            .engine
+            .rasterize_run(text, FontFamily::Sans, size, [1.0; 4])
+            .unwrap();
+        let final_glyph = reference.glyphs().last().expect("the final glyph has ink");
+        let expected_x = x + final_glyph.dest_x;
+        let expected_y = y + final_glyph.dest_y;
+        let expected: Vec<_> = final_glyph
+            .premultiplied_rgba
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .collect();
+        assert!(expected.iter().any(|alpha| *alpha != 0));
+        assert!(list.primitives.iter().any(|primitive| matches!(primitive,
+            OverlayPrimitive::Glyph { dest_x, dest_y, width, height, coverage, color: actual_color }
+            if *actual_color == color && *dest_x == expected_x && *dest_y == expected_y
+                && *width == final_glyph.width && *height == final_glyph.height && *coverage == expected
+        )), "{text:?} final glyph lost ink at ({expected_x}, {expected_y}), size {size}");
+    }
+
+    #[test]
+    fn normal_and_unequal_tile_labels_and_faults_preserve_final_ink() {
+        for (width, height, label) in [
+            (320.0, 180.0, "DW News"),
+            (640.0, 360.0, "DW News"),
+            (224.0, 120.0, "DW News"),
+        ] {
+            let rect = PixelRect {
+                x: 19.0,
+                y: 11.0,
+                width,
+                height,
+            };
+            let geom = TileGeometry::resolve(rect);
+            let mut baker =
+                OverlayBaker::new(vec![TileSpec::new("dw", label, rect)], epoch_clock())
+                    .unwrap()
+                    .with_clock(None);
+            let dynamics = HashMap::from([(
+                "dw".to_owned(),
+                TileDynamics {
+                    meter_db: -3.0,
+                    state: SourceState::Live,
+                    fault: TileFault::Silent,
+                },
+            )]);
+            let list = baker
+                .draw_list(MediaTime::ZERO, &dynamics, &no_captions(), &no_bitmaps())
+                .unwrap();
+            let label_y = geom.y + i32_dim(geom.height - geom.chip_height());
+            assert_final_glyph_unclipped(
+                &list,
+                &mut baker,
+                label,
+                geom.chip_text_px(),
+                geom.x + geom.pad_i32(),
+                label_y + geom.pad_i32() / 2,
+                WHITE,
+            );
+            let badge = "NO AUDIO";
+            let badge_w = geom.flag_width(
+                baker
+                    .text_ink_width(badge, FontFamily::Sans, geom.chip_text_px())
+                    .unwrap(),
+            );
+            let badge_x = geom.x + i32_dim(geom.meter_left() - badge_w);
+            assert_final_glyph_unclipped(
+                &list,
+                &mut baker,
+                badge,
+                geom.chip_text_px(),
+                badge_x + geom.pad_i32(),
+                geom.y + geom.pad_i32() / 2,
+                RED,
+            );
+            assert_final_glyph_unclipped(
+                &list,
+                &mut baker,
+                "LIVE",
+                geom.chip_text_px(),
+                geom.x + geom.pad_i32(),
+                geom.y + geom.pad_i32() / 2,
+                GREEN,
+            );
+        }
     }
 
     #[test]
@@ -2094,6 +2225,18 @@ mod tests {
                 }
             }
             assert!(ink > 0, "each tile must draw visible chrome");
+            // This label really cannot fit. Preserve deliberate truncation instead
+            // of shrinking the font or widening the clip beyond the cell.
+            let reference = baker
+                .engine
+                .rasterize_run(label, FontFamily::Sans, cell.chip_text_px(), [1.0; 4])
+                .unwrap();
+            let final_glyph = reference.glyphs().last().unwrap();
+            assert!(final_glyph.dest_x >= i32_dim(cell.meter_left()));
+            assert!(!list.primitives.iter().any(|primitive| matches!(primitive,
+                OverlayPrimitive::Glyph { dest_x, color, .. }
+                if *color == WHITE && *dest_x == cell.x + cell.pad_i32() + final_glyph.dest_x
+            )));
         }
     }
 
