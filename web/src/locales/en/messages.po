@@ -554,7 +554,7 @@ msgstr "Action"
 #: src/pages/CastPage.tsx:320
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/LayoutsPage.tsx:86
-#: src/pages/OutputsPage.tsx:710
+#: src/pages/OutputsPage.tsx:712
 #: src/pages/OverlaysPage.tsx:194
 #: src/pages/ProbesPage.tsx:452
 #: src/pages/SourcesPage.tsx:871
@@ -808,7 +808,7 @@ msgstr "An ordinary managed output was created carrying device_ref {deviceId}; t
 msgid "An ordinary managed source was created carrying device_ref {deviceId}."
 msgstr "An ordinary managed source was created carrying device_ref {deviceId}."
 
-#: src/pages/OutputsPage.tsx:745
+#: src/pages/OutputsPage.tsx:747
 msgid "An output is a sink/server that publishes the program."
 msgstr "An output is a sink/server that publishes the program."
 
@@ -1602,7 +1602,7 @@ msgid "Code:"
 msgstr "Code:"
 
 #: src/pages/OutputsPage.tsx:525
-#: src/pages/OutputsPage.tsx:675
+#: src/pages/OutputsPage.tsx:676
 msgid "Codec"
 msgstr "Codec"
 
@@ -1739,7 +1739,7 @@ msgstr "Configuration exported"
 msgid "Configuration file"
 msgstr "Configuration file"
 
-#: src/pages/OutputsPage.tsx:735
+#: src/pages/OutputsPage.tsx:737
 msgid "Configure output servers and renditions."
 msgstr "Configure output servers and renditions."
 
@@ -1759,7 +1759,7 @@ msgstr "Configured ingest sources."
 msgid "Configured multiview layouts."
 msgstr "Configured multiview layouts."
 
-#: src/pages/OutputsPage.tsx:746
+#: src/pages/OutputsPage.tsx:748
 msgid "Configured output sinks."
 msgstr "Configured output sinks."
 
@@ -1957,7 +1957,7 @@ msgstr "Could not load layouts:"
 msgid "Could not load media players:"
 msgstr "Could not load media players:"
 
-#: src/pages/OutputsPage.tsx:749
+#: src/pages/OutputsPage.tsx:751
 msgid "Could not load outputs:"
 msgstr "Could not load outputs:"
 
@@ -2359,7 +2359,7 @@ msgstr "Delete layout"
 msgid "Delete layout?"
 msgstr "Delete layout?"
 
-#: src/pages/OutputsPage.tsx:716
+#: src/pages/OutputsPage.tsx:718
 msgid "Delete output"
 msgstr "Delete output"
 
@@ -2416,7 +2416,7 @@ msgstr "Design pillars"
 msgid "Desired mode (optional)"
 msgstr "Desired mode (optional)"
 
-#: src/pages/OutputsPage.tsx:666
+#: src/pages/OutputsPage.tsx:667
 msgid "Destination"
 msgstr "Destination"
 
@@ -2742,7 +2742,7 @@ msgstr "e.g. ON AIR IN"
 msgid "e.g. out-foyer"
 msgstr "e.g. out-foyer"
 
-#: src/pages/OutputsPage.tsx:787
+#: src/pages/OutputsPage.tsx:789
 msgid "e.g. program-hls"
 msgstr "e.g. program-hls"
 
@@ -2837,8 +2837,8 @@ msgstr "Edit device"
 msgid "Edit layout"
 msgstr "Edit layout"
 
-#: src/pages/OutputsPage.tsx:715
-#: src/pages/OutputsPage.tsx:744
+#: src/pages/OutputsPage.tsx:717
+#: src/pages/OutputsPage.tsx:746
 msgid "Edit output"
 msgstr "Edit output"
 
@@ -3483,7 +3483,11 @@ msgstr "HLS / LL-HLS"
 msgid "HLS and LL-HLS"
 msgstr "HLS and LL-HLS"
 
-#: src/preview/HlsPlayer.tsx:34
+#: src/pages/OutputsPage.tsx:705
+msgid "HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order."
+msgstr "HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order."
+
+#: src/preview/HlsPlayer.tsx:47
 msgid "HLS output — delayed by the output buffer, not a low-latency preview."
 msgstr "HLS output — delayed by the output buffer, not a low-latency preview."
 
@@ -3508,7 +3512,7 @@ msgid "Host memory: ours / used / total"
 msgstr "Host memory: ours / used / total"
 
 #: src/pages/AudioPage.tsx:355
-#: src/pages/OutputsPage.tsx:754
+#: src/pages/OutputsPage.tsx:756
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
 #: src/pages/SourcesPage.tsx:912
@@ -3564,7 +3568,7 @@ msgstr "Idempotency"
 #: src/pages/DeviceDetailPage.tsx:1134
 #: src/pages/DevicesPage.tsx:113
 #: src/pages/LayoutsPage.tsx:70
-#: src/pages/OutputsPage.tsx:783
+#: src/pages/OutputsPage.tsx:785
 #: src/pages/OverlaysPage.tsx:268
 #: src/pages/ProbesPage.tsx:520
 #: src/pages/SalvosPage.tsx:211
@@ -3742,7 +3746,7 @@ msgid "Kind"
 msgstr "Kind"
 
 #. placeholder {0}: ctx.row.original.rawKind
-#: src/pages/OutputsPage.tsx:720
+#: src/pages/OutputsPage.tsx:722
 #: src/pages/OverlaysPage.tsx:204
 #: src/pages/ProbesPage.tsx:462
 #: src/pages/SourcesPage.tsx:881
@@ -3826,7 +3830,7 @@ msgstr "latched"
 msgid "Latency"
 msgstr "Latency"
 
-#: src/pages/OutputsPage.tsx:738
+#: src/pages/OutputsPage.tsx:740
 msgid "Latency & protocol guide"
 msgstr "Latency & protocol guide"
 
@@ -4133,7 +4137,7 @@ msgstr "Loading logs…"
 msgid "Loading media players…"
 msgstr "Loading media players…"
 
-#: src/pages/OutputsPage.tsx:748
+#: src/pages/OutputsPage.tsx:750
 msgid "Loading outputs…"
 msgstr "Loading outputs…"
 
@@ -4613,8 +4617,8 @@ msgstr "Mute on the program mix (route {row})"
 #: src/pages/DevicesPage.tsx:125
 #: src/pages/DevicesPage.tsx:533
 #: src/pages/LayoutsPage.tsx:61
-#: src/pages/OutputsPage.tsx:656
-#: src/pages/OutputsPage.tsx:795
+#: src/pages/OutputsPage.tsx:657
+#: src/pages/OutputsPage.tsx:797
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
 #: src/pages/ProbesPage.tsx:414
@@ -4706,8 +4710,8 @@ msgstr "New instances blocked"
 msgid "New layout"
 msgstr "New layout"
 
-#: src/pages/OutputsPage.tsx:742
-#: src/pages/OutputsPage.tsx:743
+#: src/pages/OutputsPage.tsx:744
+#: src/pages/OutputsPage.tsx:745
 msgid "New output"
 msgstr "New output"
 
@@ -4864,7 +4868,7 @@ msgstr "No mode reported."
 msgid "No offline alarm"
 msgstr "No offline alarm"
 
-#: src/pages/OutputsPage.tsx:747
+#: src/pages/OutputsPage.tsx:749
 msgid "No outputs configured."
 msgstr "No outputs configured."
 
@@ -5153,7 +5157,7 @@ msgstr "Open a ticket to read and reply to its thread."
 msgid "open documentation"
 msgstr "open documentation"
 
-#: src/pages/OutputsPage.tsx:703
+#: src/pages/OutputsPage.tsx:704
 msgid "Open HLS playlist"
 msgstr "Open HLS playlist"
 
@@ -5273,7 +5277,7 @@ msgstr "Output path"
 #: src/docs/registry.ts:237
 #: src/pages/docs/ConfigPage.tsx:258
 #: src/pages/docs/FeaturesPage.tsx:65
-#: src/pages/OutputsPage.tsx:732
+#: src/pages/OutputsPage.tsx:734
 msgid "Outputs"
 msgstr "Outputs"
 
@@ -5425,7 +5429,7 @@ msgstr "Play"
 msgid "Play player"
 msgstr "Play player"
 
-#: src/pages/OutputsPage.tsx:698
+#: src/pages/OutputsPage.tsx:699
 msgid "Playback"
 msgstr "Playback"
 
@@ -5433,7 +5437,7 @@ msgstr "Playback"
 msgid "Playback transport"
 msgstr "Playback transport"
 
-#: src/preview/HlsPlayer.tsx:36
+#: src/preview/HlsPlayer.tsx:49
 msgid "Playback unavailable. The output may not be active, or this browser may not support its codec."
 msgstr "Playback unavailable. The output may not be active, or this browser may not support its codec."
 
@@ -5817,7 +5821,7 @@ msgstr "removed from the registry"
 msgid "Removed from the registry. A device still referenced by a Source or Output (device_ref) is refused with a conflict instead."
 msgstr "Removed from the registry. A device still referenced by a Source or Output (device_ref) is refused with a conflict instead."
 
-#: src/pages/OutputsPage.tsx:758
+#: src/pages/OutputsPage.tsx:760
 #: src/pages/ProbesPage.tsx:500
 msgid "Removed from the store. The running engine is unchanged until a config export + restart."
 msgstr "Removed from the store. The running engine is unchanged until a config export + restart."
@@ -5874,7 +5878,7 @@ msgstr "Requests will be unauthenticated."
 msgid "Requires a display-kms build"
 msgstr "Requires a display-kms build"
 
-#: src/pages/OutputsPage.tsx:704
+#: src/pages/OutputsPage.tsx:706
 msgid "Requires an active output; saved settings do not confirm playback."
 msgstr "Requires an active output; saved settings do not confirm playback."
 
@@ -6480,7 +6484,7 @@ msgstr "Static source hint"
 
 #: src/pages/DataPage.tsx:88
 #: src/pages/MeshPage.tsx:62
-#: src/pages/OutputsPage.tsx:684
+#: src/pages/OutputsPage.tsx:685
 msgid "Status"
 msgstr "Status"
 
@@ -6538,7 +6542,7 @@ msgstr "Stored. Analog clock overlays apply to the running engine immediately; o
 msgid "Stored. Drift is measured against the group's target skew; the achieved tier is reported, never over-claimed."
 msgstr "Stored. Drift is measured against the group's target skew; the achieved tier is reported, never over-claimed."
 
-#: src/pages/OutputsPage.tsx:757
+#: src/pages/OutputsPage.tsx:759
 #: src/pages/ProbesPage.tsx:499
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
 msgstr "Stored. It goes live via config export + restart; the running engine is unchanged until then."
@@ -7466,8 +7470,8 @@ msgstr "Transfer ownership"
 #: src/pages/docs/concepts/TransportsPage.tsx:257
 #: src/pages/LicencePage.tsx:247
 #: src/pages/MediaPlayersPage.tsx:259
-#: src/pages/OutputsPage.tsx:661
-#: src/pages/OutputsPage.tsx:804
+#: src/pages/OutputsPage.tsx:662
+#: src/pages/OutputsPage.tsx:806
 msgid "Transport"
 msgstr "Transport"
 
@@ -7736,7 +7740,7 @@ msgstr "Warning"
 msgid "Watch / live / channel URL"
 msgstr "Watch / live / channel URL"
 
-#: src/pages/OutputsPage.tsx:702
+#: src/pages/OutputsPage.tsx:703
 msgid "Watch program"
 msgstr "Watch program"
 
