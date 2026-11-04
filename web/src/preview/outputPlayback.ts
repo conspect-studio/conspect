@@ -15,7 +15,7 @@ export function hlsPlaybackCollisionIds(outputs: readonly OutputView[]): Readonl
     // Runtime-added suffixes are numeric (and can chain); a distinct
     // nonnumeric ID such as "a-b-preview" retains its own stable mount.
     return mount === base || (mount.startsWith(`${base}-`) &&
-      mount.slice(base.length + 1).split('-').every((part) => /^[0-9]+$/.test(part) && Number(part) >= 2));
+      mount.slice(base.length + 1).split('-').every((part) => /^[2-9][0-9]*$/.test(part) || /^[1-9][0-9]+$/.test(part)));
   })).map((output) => output.id));
 }
 

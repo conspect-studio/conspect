@@ -15,6 +15,11 @@ describe('HLS playback delivery paths', () => {
     expect(paths.has('a-b')).toBe(false);
     expect([...hlsPlaybackCollisionIds([output('a b'), output('a-b'), output('a-b-preview')])].sort()).toEqual(['a b', 'a-b']);
   });
+  it('does not mistake a non-runtime numeric spelling for a dedupe suffix', () => {
+    const outputs = [output('a b'), output('a-b'), output('a-b-02')];
+    expect(hlsPlaybackPaths(outputs).get('a-b-02')).toBe('/hls/a-b-02/program.m3u8');
+    expect(hlsPlaybackCollisionIds(outputs).has('a-b-02')).toBe(false);
+  });
   it('does not guess colliding mounts or directory targets', () => {
     const outputs = [output('a b'), output('a-b'), output('a-b-2'), output('directory', '/srv/hls/')];
     expect(hlsPlaybackPaths(outputs).size).toBe(0);
