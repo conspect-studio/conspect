@@ -72,6 +72,98 @@ fn vivid_input(w: u32, h: u32) -> Nv12Image {
 }
 
 #[test]
+fn sparse_bake_covers_news_style_badges_meters_glyphs_and_clipped_captions() {
+    let input = vivid_input(1920, 1080);
+    let mut list = OverlayDrawList::new();
+    for (x, y) in [(7, 11), (501, 15), (1003, 541), (1677, 925)] {
+        list.push(OverlayPrimitive::FilledRect {
+            rect: OverlayRect::new(x, y, 110, 33),
+            corner_radius: 4,
+            color: OverlayColor::new(0.1, 0.3, 0.8, 0.7),
+        });
+        list.push(OverlayPrimitive::Glyph {
+            dest_x: x + 4,
+            dest_y: y + 3,
+            width: 17,
+            height: 13,
+            coverage: (0..221).map(|i| (i * 37 % 256) as u8).collect(),
+            color: OverlayColor::opaque(1.0, 1.0, 1.0),
+        });
+        list.push(OverlayPrimitive::FilledRect {
+            rect: OverlayRect::new(x + 3, y + 23, 92, 5),
+            corner_radius: 0,
+            color: OverlayColor::new(0.0, 1.0, 0.0, 0.8),
+        });
+    }
+    list.push(OverlayPrimitive::Image {
+        dest: OverlayRect::new(-10, 1050, 220, 48),
+        src_width: 2,
+        src_height: 2,
+        rgba: vec![
+            120, 50, 25, 180, 0, 0, 0, 0, 40, 80, 100, 200, 90, 20, 10, 120,
+        ],
+        alpha: 0.7,
+    });
+    let canvas = CanvasColor::default();
+    let out = apply_overlays_to_nv12(&input, &list, canvas).unwrap();
+    let reference = apply_overlays_to_nv12_reference(&input, &list, canvas).unwrap();
+    // An untouched sample passes through. A sample inside any even-aligned
+    // footprint matches the full-frame oracle, even where primitives overlap.
+    // Check Y and both chroma bytes in every NV12 block.
+    let rects = [
+        (7, 11, 110, 33),
+        (501, 15, 110, 33),
+        (1003, 541, 110, 33),
+        (1677, 925, 110, 33),
+        (11, 14, 17, 13),
+        (505, 18, 17, 13),
+        (1007, 544, 17, 13),
+        (1681, 928, 17, 13),
+        (10, 34, 92, 5),
+        (504, 38, 92, 5),
+        (1006, 564, 92, 5),
+        (1680, 948, 92, 5),
+        (-10, 1050, 220, 48),
+    ];
+    for y in 0..1080usize {
+        for x in 0..1920usize {
+            let inside = rects.iter().any(|&(rx, ry, rw, rh)| {
+                let x = x as i32;
+                let y = y as i32;
+                x >= (rx & !1)
+                    && x < ((rx + rw + 1) & !1)
+                    && y >= (ry & !1)
+                    && y < ((ry + rh + 1) & !1)
+            });
+            let index = y * 1920 + x;
+            assert_eq!(
+                out.y_plane()[index],
+                if inside {
+                    reference.y_plane()[index]
+                } else {
+                    input.y_plane()[index]
+                },
+                "Y ({x},{y})"
+            );
+            if x % 2 == 0 && y % 2 == 0 {
+                let uv_index = y / 2 * 1920 + x;
+                for i in 0..2 {
+                    assert_eq!(
+                        out.uv_plane()[uv_index + i],
+                        if inside {
+                            reference.uv_plane()[uv_index + i]
+                        } else {
+                            input.uv_plane()[uv_index + i]
+                        },
+                        "UV ({x},{y}) channel {i}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn bake_with_no_overlays_is_a_byte_identical_no_op() {
     let input = vivid_input(32, 16);
     let list = OverlayDrawList::new();

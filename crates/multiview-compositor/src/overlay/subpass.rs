@@ -524,7 +524,13 @@ impl OverlayDrawList {
 pub struct LinearCanvasBuffer {
     width: u32,
     height: u32,
-    /// Row-major premultiplied-linear RGBA, `width * height` pixels.
+    /// Global origin of a compact dirty-region accumulator. The public canvas
+    /// constructors use zero; overlay bake uses one bounded allocation per rect.
+    origin_x: u32,
+    origin_y: u32,
+    stride: u32,
+    region_height: u32,
+    /// Row-major premultiplied-linear RGBA, `stride * region_height` pixels.
     pixels: Vec<[f32; 4]>,
 }
 
@@ -539,8 +545,23 @@ impl LinearCanvasBuffer {
         Self {
             width,
             height,
+            origin_x: 0,
+            origin_y: 0,
+            stride: width,
+            region_height: height,
             pixels: vec![[0.0; 4]; count],
         }
+    }
+
+    /// Compact accumulator for one clipped dirty rectangle. Coordinates passed
+    /// to blend routines remain global, so their rasterization stays identical.
+    fn region(rect: DirtyRect) -> Self {
+        let mut buffer = Self::transparent(rect.x1 - rect.x0, rect.y1 - rect.y0);
+        buffer.origin_x = rect.x0;
+        buffer.origin_y = rect.y0;
+        buffer.width = rect.x1;
+        buffer.height = rect.y1;
+        buffer
     }
 
     /// A canvas filled with one premultiplied-linear background color.
@@ -594,12 +615,14 @@ impl LinearCanvasBuffer {
 
     /// Linear index of `(x, y)` within bounds.
     fn index(&self, x: u32, y: u32) -> Option<usize> {
-        if x >= self.width || y >= self.height {
+        let local_x = x.checked_sub(self.origin_x)?;
+        let local_y = y.checked_sub(self.origin_y)?;
+        if local_x >= self.stride || local_y >= self.region_height {
             return None;
         }
-        let w = usize::try_from(self.width).ok()?;
-        let xi = usize::try_from(x).ok()?;
-        let yi = usize::try_from(y).ok()?;
+        let w = usize::try_from(self.stride).ok()?;
+        let xi = usize::try_from(local_x).ok()?;
+        let yi = usize::try_from(local_y).ok()?;
         yi.checked_mul(w)?.checked_add(xi)
     }
 
@@ -1216,8 +1239,9 @@ pub fn apply_overlays_to_nv12(
     // read. The rects are even-aligned (whole NV12 2×2 chroma blocks) and walked
     // in raster order, so `write_nv12_pixel`'s last-writer-wins chroma matches the
     // reference exactly; overlapping rects re-process the same value (idempotent).
-    let mut buffer = LinearCanvasBuffer::transparent(width, height);
+    let w = usize::try_from(width).unwrap_or(0);
     for rect in &rects {
+        let mut buffer = LinearCanvasBuffer::region(*rect);
         for y in rect.y0..rect.y1 {
             for x in rect.x0..rect.x1 {
                 let Some((y8, cb8, cr8)) = image.sample(x, y) else {
@@ -1231,12 +1255,16 @@ pub fn apply_overlays_to_nv12(
                 }
             }
         }
-    }
+        // Preserve primitive order for source-over, but never re-rasterize
+        // unrelated glyphs/meters once for every other dirty rectangle.
+        for primitive in &list.primitives {
+            if primitive_dirty_rect(primitive, width, height)
+                .is_some_and(|footprint| footprint.intersects(*rect))
+            {
+                blend_primitive(&mut buffer, primitive);
+            }
+        }
 
-    blend_overlays(&mut buffer, list);
-
-    let w = usize::try_from(width).unwrap_or(0);
-    for rect in &rects {
         for y in rect.y0..rect.y1 {
             for x in rect.x0..rect.x1 {
                 let premul = buffer.pixel(x, y).unwrap_or(PremulRgba::TRANSPARENT);
@@ -1258,6 +1286,12 @@ struct DirtyRect {
     y0: u32,
     x1: u32,
     y1: u32,
+}
+
+impl DirtyRect {
+    fn intersects(self, other: Self) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
 }
 
 /// One even-aligned, canvas-clamped dirty rect **per primitive footprint** (not

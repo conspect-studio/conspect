@@ -253,6 +253,49 @@ fn bench_region_limited_bake(c: &mut Criterion) {
          reference ({reference:?}) for a small overlay on a 1280x720 canvas (ADR-0023)"
     );
 
+    // Full-HD NewsOne-style spread: badges and meters on four tiles, sparse
+    // glyph coverage, and a clipped lower-third caption. Time the complete
+    // NV12 bake against the original full-canvas oracle at equal dimensions.
+    let hd = Nv12Image::solid(1920, 1080, 128, 128, 128, canvas.output_tag()).expect("hd nv12");
+    let mut news = multiview_compositor::overlay::subpass::OverlayDrawList::new();
+    for (x, y) in [(8, 8), (500, 8), (995, 535), (1540, 900)] {
+        news.push(OverlayPrimitive::FilledRect {
+            rect: OverlayRect::new(x, y, 110, 30),
+            corner_radius: 4,
+            color: GREEN,
+        });
+        news.push(OverlayPrimitive::Glyph {
+            dest_x: x + 4,
+            dest_y: y + 3,
+            width: 17,
+            height: 13,
+            coverage: vec![200; 17 * 13],
+            color: GREEN,
+        });
+        news.push(OverlayPrimitive::FilledRect {
+            rect: OverlayRect::new(x, y + 32, 90, 8),
+            corner_radius: 0,
+            color: GREEN,
+        });
+    }
+    news.push(OverlayPrimitive::Image {
+        dest: OverlayRect::new(-8, 1040, 220, 55),
+        src_width: 2,
+        src_height: 2,
+        rgba: [100, 50, 20, 180].repeat(4),
+        alpha: 0.7,
+    });
+    let hd_optimized = time_avg(3, || {
+        std::hint::black_box(apply_overlays_to_nv12(&hd, &news, canvas).expect("hd bake"));
+    });
+    let hd_reference = time_avg(3, || {
+        std::hint::black_box(apply_overlays_to_nv12_reference(&hd, &news, canvas).expect("hd ref"));
+    });
+    assert!(
+        hd_optimized * 3 < hd_reference,
+        "1080p sparse bake {hd_optimized:?} must beat full-frame reference {hd_reference:?} by >3x"
+    );
+
     c.bench_function("overlay/bake_region_limited", |b| {
         b.iter(|| {
             std::hint::black_box(apply_overlays_to_nv12(&image, &list, canvas).expect("bake"))
