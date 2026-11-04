@@ -362,6 +362,82 @@ segment_ms = 1000
     )
 }
 
+/// Decode all samples from program audio as mono `f32` at 48 kHz.
+fn output_audio_samples(path: &Path) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map", "a:0", "-f", "f32le", "-ac", "1", "-ar", "48000", "pipe:1",
+        ])
+        .output()
+        .expect("decode program audio samples");
+    assert!(
+        out.status.success(),
+        "ffmpeg failed to decode program audio"
+    );
+    out.stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// File output keeps most of a long file through decode bursts and EOF.
+#[tokio::test]
+async fn finite_file_audio_preserves_coverage_through_eof() {
+    if !ffmpeg_cli_available() {
+        eprintln!("ffmpeg CLI unavailable; skipping finite file continuity test");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("four-seconds.ts");
+    build_av_fixture(&clip, 4.0);
+    let out_dir = dir.path().join("out");
+    let playlist = out_dir.join("index.m3u8");
+    let config = MultiviewConfig::load_from_toml(&file_source_config_text(&clip, &playlist))
+        .expect("parse config");
+    config.validate().expect("config validates");
+    let mut pipeline = Pipeline::build(&config).expect("build pipeline");
+    pipeline.enable_program_audio();
+    let report = pipeline
+        .run_for(100)
+        .await
+        .expect("four second file render");
+    assert_eq!(report.frames, 100);
+    assert!(!report.faltered);
+
+    let samples = output_audio_samples(&out_dir.join("program.ts"));
+    let expected = 4 * 48_000_usize;
+    let mut present = vec![false; expected];
+    for (i, sample) in samples.iter().take(expected).enumerate() {
+        present[i] = sample.abs() > 1e-5;
+    }
+    let covered = present.iter().filter(|&&v| v).count();
+    assert!(
+        covered >= expected * 98 / 100,
+        "coverage {covered}/{expected}"
+    );
+    let dominant_hz = output_audio_dominant_hz(&out_dir.join("program.ts"));
+    assert!(
+        (990.0..=1_010.0).contains(&dominant_hz),
+        "finite file tone frequency {dominant_hz} Hz"
+    );
+    let max_gap = present
+        .iter()
+        .fold((0usize, 0usize), |(longest, run), &heard| {
+            if heard {
+                (longest.max(run), 0)
+            } else {
+                (longest, run + 1)
+            }
+        })
+        .0;
+    assert!(
+        max_gap <= 1_920,
+        "largest internal silence gap is {max_gap} samples"
+    );
+}
+
 /// The load-bearing AUD-2 proof: a source whose container carries a real audio
 /// tone, decoded on its own thread into the per-source `AudioStore`, routed onto
 /// the program bus, mixed per tick, and AAC-encoded into the output — so the

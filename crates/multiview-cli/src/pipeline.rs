@@ -2356,7 +2356,7 @@ impl Pipeline {
                 let store = if audio_plan.live {
                     crate::audio::new_live_store()
                 } else {
-                    crate::audio::new_store()
+                    crate::audio::new_file_store()
                 };
                 audio_stores.insert(source.id.clone(), store);
                 audio_ingest_plans.push(audio_plan);
@@ -6836,7 +6836,7 @@ fn spawn_live_audio(
     let store = if plan.live {
         crate::audio::new_live_store()
     } else {
-        crate::audio::new_store()
+        crate::audio::new_file_store()
     };
     let id = plan.id.clone();
     let exited = crate::live_sources::register_stop(registry, &format!("{id}/audio"), stop);

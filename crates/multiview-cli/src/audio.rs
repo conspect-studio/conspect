@@ -64,6 +64,16 @@ pub(crate) fn new_store() -> Arc<AudioStore> {
     Arc::new(AudioStore::new(canonical_format(), STORE_CAPACITY_FRAMES))
 }
 
+/// Build a finite-file store. It preserves retained PCM instead of re-syncing
+/// to the append edge; the decode pacer bounds producer lead off the output clock.
+#[must_use]
+pub(crate) fn new_file_store() -> Arc<AudioStore> {
+    Arc::new(AudioStore::finite_file(
+        canonical_format(),
+        STORE_CAPACITY_FRAMES,
+    ))
+}
+
 /// A store for a **live network** source's decoded audio, locked to its video:
 /// a [`timeline`](AudioStore::timeline) store whose frames are output-timeline
 /// positions. The decode places each block where the source's video stamper

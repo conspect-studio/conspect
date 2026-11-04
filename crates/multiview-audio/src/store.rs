@@ -187,6 +187,9 @@ pub struct AudioStore {
     /// absolute frames of the OUTPUT timeline (frame = output time × rate), so
     /// the read cursor is owned by the bus clock and never jumps to a live edge.
     timeline: bool,
+    /// A finite-file append store retains its earliest unread data when the
+    /// consumer is delayed. Live append stores instead re-sync to their edge.
+    finite_file: std::sync::atomic::AtomicBool,
 }
 
 /// The writer-side reusable snapshot pool for [`AudioStore::publish_window`].
@@ -284,6 +287,7 @@ impl AudioStore {
             buffering: std::sync::atomic::AtomicBool::new(true),
             window_pool: Mutex::new(WindowPool::default()),
             timeline: false,
+            finite_file: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -299,12 +303,41 @@ impl AudioStore {
         store
     }
 
+    /// Mark an append store as finite-file audio. Reads resume at the oldest
+    /// retained frame, while the off-clock pacer limits unread data to capacity.
+    /// The consumer never waits.
+    #[must_use]
+    pub fn finite_file(format: AudioFormat, capacity_frames: usize) -> Self {
+        let store = Self::new(format, capacity_frames);
+        store.finite_file.store(true, Ordering::Relaxed);
+        store
+    }
+
     /// Whether this is a [`timeline`](AudioStore::timeline) store: the bus must
     /// position its cursor at the bus sample-clock position (absolute output
     /// frames), never at the live edge.
     #[must_use]
     pub const fn is_timeline(&self) -> bool {
         self.timeline
+    }
+
+    /// Whether a finite-file append producer must preserve unread PCM.
+    #[must_use]
+    pub fn is_finite_file(&self) -> bool {
+        self.finite_file.load(Ordering::Relaxed)
+    }
+
+    fn finite_append_has_room(&self, next_frames: usize) -> bool {
+        if !self.is_finite_file() {
+            return true;
+        }
+        let channels = self.format.channel_count().max(1);
+        let head = self.window.load().head_frame(channels);
+        let cursor = self.read_cursor();
+        let capacity = i64::try_from(self.capacity_frames).unwrap_or(i64::MAX);
+        head.saturating_sub(cursor)
+            .saturating_add(i64::try_from(next_frames).unwrap_or(i64::MAX))
+            <= capacity
     }
 
     /// The store's working format (the format every published block must match
@@ -780,11 +813,19 @@ impl AudioStore {
             // — never, for a restarted generation. Same re-sync to the edge.
             let ahead_by = start.saturating_sub(head);
             let capacity = i64::try_from(self.capacity_frames).unwrap_or(i64::MAX);
+            let finite_file = self.finite_file.load(Ordering::Relaxed);
+            let behind_retained = start.saturating_add(want) <= snapshot.base_frame;
+            let finite_started_late = finite_file && start > head;
+            let stranded_live = !finite_file && ahead_by > capacity;
             if self.live_append.load(Ordering::Relaxed)
                 && head > snapshot.base_frame
-                && (start.saturating_add(want) <= snapshot.base_frame || ahead_by > capacity)
+                && (behind_retained || finite_started_late || stranded_live)
             {
-                start = head.saturating_sub(want).max(snapshot.base_frame);
+                start = if finite_file {
+                    snapshot.base_frame
+                } else {
+                    head.saturating_sub(want).max(snapshot.base_frame)
+                };
             }
         }
         let want = i64::try_from(frames).unwrap_or(i64::MAX);
@@ -1717,6 +1758,7 @@ pub fn anchored_publish_loop(
 /// in a row end the connection. Returns at end-of-stream (after the queue has
 /// drained into the store) or promptly once `stop` is raised. Neither thread is
 /// on the output clock, and the store is never blocked (invariants #1/#10).
+#[allow(clippy::too_many_lines)] // Finite and live append pacing share one explicit path.
 pub fn paced_publish_loop(
     mut next: impl FnMut() -> Result<Option<(AudioBlock, multiview_core::time::MediaTime)>>,
     store: &AudioStore,
@@ -1750,8 +1792,8 @@ pub fn paced_publish_loop(
                 if stop.load(Ordering::Acquire) || fatal.load(Ordering::Acquire) {
                     return;
                 }
-                let front = lock(&queue).0.front().map(|b| b.1);
-                let Some(pts) = front else {
+                let front = lock(&queue).0.front().map(|b| (b.0.frame_count(), b.1));
+                let Some((front_frames, pts)) = front else {
                     if producer_done.load(Ordering::Acquire) && lock(&queue).0.is_empty() {
                         return;
                     }
@@ -1784,12 +1826,24 @@ pub fn paced_publish_loop(
                 }
                 let block = {
                     let mut q = lock(&queue);
-                    let block = q.0.pop_front();
-                    if let Some(b) = &block {
-                        q.1 = q.1.saturating_sub(b.0.frame_count());
+                    // Finite sources must not overwrite unread history. Keep a bounded
+                    // lead from the consumer; wait here on the decoder/pacer thread,
+                    // never on the bus or output clock. Live sources keep edge-following.
+                    let file_has_room = store.finite_append_has_room(front_frames);
+                    if file_has_room {
+                        let block = q.0.pop_front();
+                        if let Some(b) = &block {
+                            q.1 = q.1.saturating_sub(b.0.frame_count());
+                        }
+                        block
+                    } else {
+                        None
                     }
-                    block
                 };
+                if store.is_finite_file() && block.is_none() {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
                 if let Some(block) = block {
                     if let Err(error) = store.publish(&block.0) {
                         // A format mismatch is a programming error (decoder and
@@ -1914,6 +1968,101 @@ mod resync_tests {
             transitions, 1,
             "silent once while re-buffering, then continuous"
         );
+    }
+
+    #[test]
+    fn finite_file_delay_resyncs_to_oldest_retained_ramp_and_drains_eof() {
+        const TICK25: usize = 1_920;
+        const TICK25_I64: i64 = 1_920;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::finite_file(format, 96_000);
+        for tick in 0..51 {
+            let amplitude = (tick + 1).to_string().parse::<f32>().unwrap() / 100.0;
+            store
+                .publish(
+                    &AudioBlock::from_interleaved(format, vec![amplitude; TICK25 * 2]).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.read_cursor(), 0);
+        assert_eq!(store.window.load().base_frame, TICK25_I64);
+        // File stores resume at the first contiguous retained sample, not the edge.
+        let first = store.read(TICK25);
+        assert_eq!(first.interleaved().first().copied(), Some(0.02));
+        assert_eq!(store.read_cursor(), TICK25_I64 * 2);
+        // Drain every retained tick in order; no skipped interior ramp values.
+        for tick in 2..=50 {
+            let block = store.read(TICK25);
+            let expected = (tick + 1).to_string().parse::<f32>().unwrap() / 100.0;
+            assert_eq!(
+                block.interleaved().first().copied(),
+                Some(expected),
+                "tick {tick}"
+            );
+        }
+        let eof = store.read(TICK25);
+        assert!(eof.interleaved().iter().all(|sample| *sample == 0.0));
+        assert_eq!(store.read_cursor(), 52 * TICK25_I64);
+    }
+
+    #[test]
+    fn finite_file_pacer_bounds_unread_lead_while_consumer_is_delayed() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        const BLOCK: usize = 1_920;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::finite_file(format, 96_000);
+        let stop = AtomicBool::new(false);
+        let mut tick = 0_i64;
+        let next = || {
+            let current = tick;
+            tick += 1;
+            if current == 100 {
+                return Ok(None);
+            }
+            let level = (current + 1).to_string().parse::<f32>().unwrap() / 101.0;
+            let pts = multiview_core::time::MediaTime::from_nanos(current * 40_000_000);
+            Ok(Some((
+                AudioBlock::from_interleaved(format, vec![level; BLOCK * 2])?,
+                pts,
+            )))
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                paced_publish_loop(
+                    next,
+                    &store,
+                    &stop,
+                    Duration::from_secs(2),
+                    Duration::from_secs(20),
+                );
+            });
+            // Delay the consumer while the off-clock writer reaches its bounded lead.
+            std::thread::sleep(Duration::from_millis(700));
+            let start = std::time::Instant::now();
+            let mut last = 0.0_f32;
+            let mut audible_ticks = 0;
+            while start.elapsed() < Duration::from_secs(8) && audible_ticks < 100 {
+                let block = store.read(BLOCK);
+                let level = block.interleaved().first().copied().unwrap_or(0.0);
+                if level == 0.0 {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                assert!(
+                    level > last,
+                    "file ramp must remain ordered: {last} -> {level}"
+                );
+                last = level;
+                audible_ticks += 1;
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            stop.store(true, Ordering::Release);
+            assert!(
+                audible_ticks >= 98,
+                "must drain the full four-second file, got {audible_ticks} ticks"
+            );
+        });
     }
 
     /// A live HLS source: each 1 s "segment" takes 0.8 s to fetch (a slow
