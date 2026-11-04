@@ -603,7 +603,7 @@ impl OverlayBaker {
                 u32_from_usize(line.chars().count()).saturating_mul(quantize_advance(size));
             let x_off = geom.width.saturating_sub(approx_w.min(geom.width)) / 2;
             let x = geom.x.saturating_add(i32_dim(x_off));
-            self.push_text(
+            self.push_text_clipped(
                 list,
                 line,
                 TextRun {
@@ -613,6 +613,7 @@ impl OverlayBaker {
                     y: line_y,
                     color: AMBER,
                 },
+                geom.clip_rect(),
             )?;
         }
         Ok(())
@@ -664,13 +665,15 @@ impl OverlayBaker {
         let flag_text = state_flag_text(state);
         let flag_color = state_flag_color(state);
         let flag_h = geom.chip_height();
-        let flag_w = geom.flag_width(flag_text.chars().count());
+        let flag_w = geom
+            .flag_width(flag_text.chars().count())
+            .min(geom.meter_left());
         push_filled_rect(
             list,
             OverlayRect::new(geom.x, geom.y, flag_w, flag_h),
             CHROME_BG,
         );
-        self.push_text(
+        self.push_text_clipped(
             list,
             flag_text,
             TextRun {
@@ -680,6 +683,7 @@ impl OverlayBaker {
                 y: geom.y.saturating_add(geom.pad_i32() / 2),
                 color: flag_color,
             },
+            OverlayRect::new(geom.x, geom.y, flag_w, flag_h),
         )?;
 
         // The per-tile content-fault badge: a TOP-RIGHT chip whose TEXT names the
@@ -690,26 +694,34 @@ impl OverlayBaker {
         // right-edge meter. Meaning is the text; the warning colour reinforces it.
         if let Some(badge) = fault.badge_text() {
             let badge_h = geom.chip_height();
-            let badge_w = geom.flag_width(badge.chars().count());
-            // Right-align within the cell, clear of the right-edge meter track.
+            // Reserve the state flag and meter. Narrow tiles show only the
+            // visible part of this badge; neither its backing nor glyphs escape.
             let badge_right = geom.x.saturating_add(i32_dim(geom.meter_left()));
-            let badge_x = badge_right.saturating_sub(i32_dim(badge_w)).max(geom.x);
-            push_filled_rect(
-                list,
-                OverlayRect::new(badge_x, geom.y, badge_w, badge_h),
-                CHROME_BG,
-            );
-            self.push_text(
-                list,
-                badge,
-                TextRun {
-                    family: FontFamily::Sans,
-                    size_px: geom.chip_text_px(),
-                    x: badge_x.saturating_add(geom.pad_i32()),
-                    y: geom.y.saturating_add(geom.pad_i32() / 2),
-                    color: RED,
-                },
-            )?;
+            let badge_left = geom.x.saturating_add(i32_dim(flag_w));
+            let available = badge_right.saturating_sub(badge_left);
+            let badge_w = geom
+                .flag_width(badge.chars().count())
+                .min(u32::try_from(available).unwrap_or(0));
+            let badge_x = badge_right.saturating_sub(i32_dim(badge_w));
+            if badge_w > 0 {
+                push_filled_rect(
+                    list,
+                    OverlayRect::new(badge_x, geom.y, badge_w, badge_h),
+                    CHROME_BG,
+                );
+                self.push_text_clipped(
+                    list,
+                    badge,
+                    TextRun {
+                        family: FontFamily::Sans,
+                        size_px: geom.chip_text_px(),
+                        x: badge_x.saturating_add(geom.pad_i32()),
+                        y: geom.y.saturating_add(geom.pad_i32() / 2),
+                        color: RED,
+                    },
+                    OverlayRect::new(badge_x, geom.y, badge_w, badge_h),
+                )?;
+            }
         }
 
         // The input label: bottom-left of the tile, on a translucent backing.
@@ -725,7 +737,7 @@ impl OverlayBaker {
             OverlayRect::new(geom.x, label_y, label_w, label_h),
             CHROME_BG,
         );
-        self.push_text(
+        self.push_text_clipped(
             list,
             label,
             TextRun {
@@ -735,6 +747,7 @@ impl OverlayBaker {
                 y: label_y.saturating_add(geom.pad_i32() / 2),
                 color: WHITE,
             },
+            OverlayRect::new(geom.x, label_y, label_w, label_h),
         )?;
 
         Ok(())
@@ -804,6 +817,28 @@ impl OverlayBaker {
         text: &str,
         run: TextRun,
     ) -> Result<(), CompositorError> {
+        self.push_text_with_clip(list, text, run, None)
+    }
+
+    /// Clip both the glyph destination and its coverage bitmap to the cell.
+    /// The sub-pass receives only contained pixels, even for partial glyphs.
+    fn push_text_clipped(
+        &mut self,
+        list: &mut OverlayDrawList,
+        text: &str,
+        run: TextRun,
+        clip: OverlayRect,
+    ) -> Result<(), CompositorError> {
+        self.push_text_with_clip(list, text, run, Some(clip))
+    }
+
+    fn push_text_with_clip(
+        &mut self,
+        list: &mut OverlayDrawList,
+        text: &str,
+        run: TextRun,
+        clip: Option<OverlayRect>,
+    ) -> Result<(), CompositorError> {
         let color = run.color;
         let rasterized = self.engine.rasterize_run(
             text,
@@ -812,21 +847,69 @@ impl OverlayBaker {
             [color.r, color.g, color.b, color.a],
         )?;
         for glyph in rasterized.glyphs() {
+            let x = run.x.saturating_add(glyph.dest_x);
+            let y = run.y.saturating_add(glyph.dest_y);
+            let coverage: Vec<u8> = glyph
+                .premultiplied_rgba
+                .chunks_exact(4)
+                .filter_map(|px| px.get(3).copied())
+                .collect();
+            let (dest_x, dest_y, width, height, coverage) = if let Some(clip) = clip {
+                let Some(clipped) = clip_glyph(x, y, glyph.width, glyph.height, &coverage, clip)
+                else {
+                    continue;
+                };
+                clipped
+            } else {
+                (x, y, glyph.width, glyph.height, coverage)
+            };
             list.push(OverlayPrimitive::Glyph {
-                dest_x: run.x.saturating_add(glyph.dest_x),
-                dest_y: run.y.saturating_add(glyph.dest_y),
-                width: glyph.width,
-                height: glyph.height,
-                coverage: glyph
-                    .premultiplied_rgba
-                    .chunks_exact(4)
-                    .filter_map(|px| px.get(3).copied())
-                    .collect(),
+                dest_x,
+                dest_y,
+                width,
+                height,
+                coverage,
                 color,
             });
         }
         Ok(())
     }
+}
+
+/// Intersect a glyph's pixel coverage with its clip rectangle. Crop the source
+/// rows too: a smaller destination with the old coverage would distort glyphs.
+fn clip_glyph(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    coverage: &[u8],
+    clip: OverlayRect,
+) -> Option<(i32, i32, u32, u32, Vec<u8>)> {
+    let left = i64::from(x).max(i64::from(clip.x));
+    let top = i64::from(y).max(i64::from(clip.y));
+    let right = (i64::from(x) + i64::from(width)).min(i64::from(clip.x) + i64::from(clip.width));
+    let bottom = (i64::from(y) + i64::from(height)).min(i64::from(clip.y) + i64::from(clip.height));
+    if left >= right || top >= bottom {
+        return None;
+    }
+    let clipped_w = usize::try_from(right - left).ok()?;
+    let clipped_h = usize::try_from(bottom - top).ok()?;
+    let stride = usize::try_from(width).ok()?;
+    let x_off = usize::try_from(left - i64::from(x)).ok()?;
+    let y_off = usize::try_from(top - i64::from(y)).ok()?;
+    let mut pixels = Vec::with_capacity(clipped_w.checked_mul(clipped_h)?);
+    for row in y_off..y_off.checked_add(clipped_h)? {
+        let start = row.checked_mul(stride)?.checked_add(x_off)?;
+        pixels.extend_from_slice(coverage.get(start..start.checked_add(clipped_w)?)?);
+    }
+    Some((
+        i32::try_from(left).ok()?,
+        i32::try_from(top).ok()?,
+        u32::try_from(clipped_w).ok()?,
+        u32::try_from(clipped_h).ok()?,
+        pixels,
+    ))
 }
 
 /// Burn a **bitmap caption cue** (DVB-sub) into the cell `rect`, bottom-anchored
@@ -953,6 +1036,10 @@ impl TileGeometry {
             width: round_dim(rect.width),
             height: round_dim(rect.height),
         }
+    }
+
+    fn clip_rect(self) -> OverlayRect {
+        OverlayRect::new(self.x, self.y, self.width, self.height)
     }
 
     /// The pad (px) for chrome inside the cell — a small fraction of the cell.
@@ -1864,6 +1951,150 @@ mod tests {
             );
         }
         assert!(!fills.is_empty(), "tile A drew no meter fill at 0 dBFS");
+    }
+
+    #[test]
+    fn normal_tile_keeps_full_no_audio_badge_text() {
+        let rect = PixelRect {
+            x: 30.0,
+            y: 20.0,
+            width: 320.0,
+            height: 180.0,
+        };
+        let mut baker =
+            OverlayBaker::new(vec![TileSpec::new("source", "CNN", rect)], epoch_clock())
+                .unwrap()
+                .with_clock(None);
+        let dynamics = HashMap::from([(
+            "source".to_owned(),
+            TileDynamics {
+                meter_db: -3.0,
+                state: SourceState::Live,
+                fault: TileFault::Silent,
+            },
+        )]);
+        let list = baker
+            .draw_list(MediaTime::ZERO, &dynamics, &no_captions(), &no_bitmaps())
+            .unwrap();
+        let geom = TileGeometry::resolve(rect);
+        let badge = "NO AUDIO";
+        let badge_width = geom.flag_width(badge.chars().count());
+        let expected_x = geom.x + i32_dim(geom.meter_left() - badge_width);
+        assert!(list.primitives.iter().any(|p| matches!(p,
+            OverlayPrimitive::FilledRect { rect, .. }
+            if rect.x == expected_x && rect.y == geom.y
+                && rect.width == badge_width && rect.height == geom.chip_height()
+        )));
+        let mut badge_ink = 0;
+        for p in &list.primitives {
+            if let OverlayPrimitive::Glyph {
+                dest_x,
+                dest_y,
+                width,
+                height,
+                coverage,
+                color,
+            } = p
+            {
+                if *color == RED && coverage.iter().any(|alpha| *alpha > 0) {
+                    badge_ink += 1;
+                    assert!(
+                        *dest_x >= expected_x
+                            && *dest_x + i32_dim(*width) <= expected_x + i32_dim(badge_width)
+                    );
+                    assert!(
+                        *dest_y >= geom.y
+                            && *dest_y + i32_dim(*height) <= geom.y + i32_dim(geom.chip_height())
+                    );
+                }
+            }
+        }
+        assert!(
+            badge_ink >= badge.chars().filter(|c| !c.is_whitespace()).count(),
+            "full NO AUDIO text must remain visible: {badge_ink} inked glyphs"
+        );
+    }
+
+    #[test]
+    fn clipped_glyph_preserves_the_source_coverage_pixels() {
+        let source: Vec<u8> = (0..24).collect();
+        let result = clip_glyph(5, 7, 6, 4, &source, OverlayRect::new(7, 8, 3, 2));
+        assert_eq!(result, Some((7, 8, 3, 2, vec![8, 9, 10, 14, 15, 16])));
+        assert!(clip_glyph(5, 7, 6, 4, &source, OverlayRect::new(11, 8, 3, 2)).is_none());
+    }
+
+    #[test]
+    fn tile_chrome_inks_only_inside_unequal_tiny_and_edge_cells() {
+        use multiview_compositor::overlay::{blend_overlays, LinearCanvasBuffer};
+
+        let cases = [
+            (
+                PixelRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 48.0,
+                },
+                "LONG CNN NEWS NETWORK DISPLAY NAME",
+            ),
+            (
+                PixelRect {
+                    x: 80.0,
+                    y: 13.0,
+                    width: 51.0,
+                    height: 93.0,
+                },
+                "BBC VERY LONG LABEL",
+            ),
+            (
+                PixelRect {
+                    x: 131.0,
+                    y: 42.0,
+                    width: 49.0,
+                    height: 48.0,
+                },
+                "EDGE LONG LABEL",
+            ),
+        ];
+        for (rect, label) in cases {
+            let mut baker =
+                OverlayBaker::new(vec![TileSpec::new("source", label, rect)], epoch_clock())
+                    .unwrap()
+                    .with_clock(None);
+            let dynamics = HashMap::from([(
+                "source".to_owned(),
+                TileDynamics {
+                    meter_db: -3.0,
+                    state: SourceState::Live,
+                    fault: TileFault::Silent,
+                },
+            )]);
+            let list = baker
+                .draw_list(MediaTime::ZERO, &dynamics, &no_captions(), &no_bitmaps())
+                .unwrap();
+            // Inspect rendered pixels, not only the background rectangles: the
+            // old code emitted full glyph quads outside a clamped chip.
+            let mut canvas = LinearCanvasBuffer::transparent(180, 120);
+            blend_overlays(&mut canvas, &list);
+            let cell = TileGeometry::resolve(rect);
+            let mut ink = 0;
+            for y in 0..120 {
+                for x in 0..180 {
+                    let alpha = canvas.pixel(x, y).unwrap().a;
+                    if alpha > 0.0 {
+                        ink += 1;
+                        assert!(
+                            i64::from(x) >= i64::from(cell.x)
+                                && i64::from(x) < i64::from(cell.x) + i64::from(cell.width)
+                                && i64::from(y) >= i64::from(cell.y)
+                                && i64::from(y) < i64::from(cell.y) + i64::from(cell.height),
+                            "chrome ink escaped cell {cell:?} at ({x},{y})"
+                        );
+                    }
+                }
+            }
+            assert!(ink > 0, "each tile must draw visible chrome");
+        }
     }
 
     #[test]
