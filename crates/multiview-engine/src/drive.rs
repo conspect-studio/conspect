@@ -68,6 +68,9 @@ pub struct CompositedFrame {
     ///
     /// Includes every cell-bound source; a cell with no bound source is omitted.
     pub source_states: HashMap<String, SourceState>,
+    /// Original source time of the picture actually selected for each visible tile.
+    /// Missing metadata means captions stay hidden rather than follow output time.
+    pub source_times: HashMap<String, multiview_framestore::tile::SourceFrameTime>,
     /// `true` when this is a **last-good repeat** the cadence-hold path re-emitted
     /// under a fresh tick (ADR-T018) rather than a fresh composite. A per-tick
     /// projection with an expensive stage (content-fault probes) should skip that
@@ -474,6 +477,7 @@ impl CompositorDrive<Nv12Image> {
         // The result `source_states` is the frame's OUTPUT (moved to the consumer
         // downstream), so it is genuinely produced each tick — not scratch.
         let mut source_states: HashMap<String, SourceState> = HashMap::new();
+        let mut source_times = HashMap::new();
 
         // Draw order: ascending z (lower z first / bottom). Sort cell indices.
         order.extend(0..cell_count);
@@ -483,9 +487,12 @@ impl CompositorDrive<Nv12Image> {
             let Some(cell) = self.layout.cells.get(i) else {
                 continue;
             };
-            let (image, state) = self.sample_cell(i, cell, now);
+            let (image, state, source_time) = self.sample_cell(i, cell, now);
             if let Some(source) = &cell.source {
                 source_states.insert(source.clone(), state);
+                if let Some(source_time) = source_time {
+                    source_times.insert(source.clone(), source_time);
+                }
             }
             let (dst_x, dst_y, dst_w, dst_h) = cell_dst_rect(cell, canvas.width, canvas.height);
             held.push(image);
@@ -553,6 +560,7 @@ impl CompositorDrive<Nv12Image> {
             tick,
             canvas: canvas_image,
             source_states,
+            source_times,
             repeat: false,
         })
     }
@@ -569,13 +577,17 @@ impl CompositorDrive<Nv12Image> {
         index: usize,
         cell: &multiview_core::layout::Cell,
         now: MediaTime,
-    ) -> (Arc<Nv12Image>, SourceState) {
+    ) -> (
+        Arc<Nv12Image>,
+        SourceState,
+        Option<multiview_framestore::tile::SourceFrameTime>,
+    ) {
         let Some(source) = &cell.source else {
             // An unbound cell always shows the slate.
-            return (self.slate_for_cell(index), SourceState::NoSignal);
+            return (self.slate_for_cell(index), SourceState::NoSignal, None);
         };
         let Some(store) = self.stores.get(source) else {
-            return (self.slate_for_cell(index), SourceState::NoSignal);
+            return (self.slate_for_cell(index), SourceState::NoSignal, None);
         };
         // Latch-on-tick: sample by the OUTPUT media instant `now`, selecting the
         // source frame nearest-but-not-after it (streaming-gotchas §1). This is
@@ -583,11 +595,11 @@ impl CompositorDrive<Nv12Image> {
         // loop momentarily runs slower than real-time and the producer decoded
         // ahead — a plain latest-wins read would race the tile to the newest
         // decoded frame.
-        let read = store.read_at(now);
+        let (read, source_time) = store.read_at_with_source_time(now);
         let state = read.state();
         match read.frame() {
-            Some(frame) => (Arc::clone(frame), state),
-            None => (self.slate_for_cell(index), state),
+            Some(frame) => (Arc::clone(frame), state, source_time),
+            None => (self.slate_for_cell(index), state, None),
         }
     }
 

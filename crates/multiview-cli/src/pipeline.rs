@@ -1564,6 +1564,11 @@ pub struct Pipeline {
     /// feature to render, so the stores are only built/sampled under it.
     #[cfg(feature = "overlay")]
     caption_stores: std::collections::HashMap<String, Arc<crate::captions::CueStore>>,
+    #[cfg(feature = "overlay")]
+    caption_generations:
+        Arc<multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, u64>>>>,
+    #[cfg(feature = "overlay")]
+    live_caption_stores: crate::captions::LiveCaptionStores,
     /// RT-10b: the live subtitle re-point handle, published when a `drive` begins
     /// (the hot-loop-owned [`SubtitleRouter`](crate::captions::SubtitleRouter) builds
     /// its [`SubtitleRouteHandle`](crate::captions::SubtitleRouteHandle) into this
@@ -1581,6 +1586,9 @@ pub struct Pipeline {
     /// ingest plans. Empty ⇒ no native caption readers.
     #[cfg(feature = "overlay")]
     caption_plans: Vec<crate::captions::CaptionPlan>,
+    /// Latest picture time per caption reader, published without a clock wait.
+    #[cfg(feature = "overlay")]
+    caption_display_times: crate::captions::DisplayCursors,
     /// An optional legacy `--subtitles` sidecar track, routed through the SAME
     /// per-tile burn-in path as native captions: its active cue is sampled per
     /// tick and burned into [`Self::sidecar_target`]'s tile. `None` ⇒ no sidecar.
@@ -1911,7 +1919,7 @@ struct IngestPlan {
     /// [`LiveAnchor`]) for the audio rail; [`live_anchor_slot`] of the source id
     /// for config sources.
     live_anchor: LiveAnchorSlot,
-    /// Source lifecycle token; old detached producers cannot republish after edit.
+    /// Authoritative source lifecycle shared by video, audio and captions.
     lifecycle: u64,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
@@ -2534,6 +2542,12 @@ impl Pipeline {
             config.outputs.clone(),
         );
 
+        #[cfg(feature = "overlay")]
+        let caption_generations = ingest_plans
+            .iter()
+            .map(|plan| (plan.id.clone(), plan.lifecycle))
+            .collect();
+
         Ok(Self {
             layout,
             cadence,
@@ -2561,9 +2575,24 @@ impl Pipeline {
             aes67_rx_plans,
             inventories,
             #[cfg(feature = "overlay")]
+            caption_generations: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                caption_generations,
+            )),
+            #[cfg(feature = "overlay")]
+            live_caption_stores: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                caption_stores.clone(),
+            )),
+            #[cfg(feature = "overlay")]
             caption_stores,
             #[cfg(feature = "overlay")]
             subtitle_route: Arc::new(multiview_framestore::SwapCell::empty()),
+            #[cfg(feature = "overlay")]
+            caption_display_times: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                caption_plans
+                    .iter()
+                    .map(|p| (p.id.clone(), Arc::clone(&p.displayed_time)))
+                    .collect(),
+            )),
             #[cfg(feature = "overlay")]
             caption_plans,
             canvas_color,
@@ -2661,7 +2690,20 @@ impl Pipeline {
         store: Arc<crate::captions::CueStore>,
     ) -> Arc<crate::captions::CueStore> {
         let id = source_id.into();
-        self.caption_stores.insert(id, Arc::clone(&store));
+        // A test or caller attaching a store after build must share the source
+        // lifecycle selected by its video plan, not the store's default token.
+        if let Some(plan) = self.ingest_plans.iter().find(|plan| plan.id == id) {
+            if store.generation() != plan.lifecycle {
+                store.begin_generation(plan.lifecycle);
+            }
+        }
+        self.caption_stores.insert(id.clone(), Arc::clone(&store));
+        let shared = Arc::clone(&store);
+        self.live_caption_stores.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert(id.clone(), Arc::clone(&shared));
+            next
+        });
         store
     }
 
@@ -2751,6 +2793,12 @@ impl Pipeline {
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
             audio_route: Arc::clone(&self.audio_route),
+            #[cfg(feature = "overlay")]
+            caption_stores: Arc::clone(&self.live_caption_stores),
+            #[cfg(feature = "overlay")]
+            caption_generations: Arc::clone(&self.caption_generations),
+            #[cfg(feature = "overlay")]
+            caption_display_times: Arc::clone(&self.caption_display_times),
             #[cfg(feature = "gpu")]
             island: Arc::clone(&self.live_island),
             #[cfg(feature = "gpu")]
@@ -3679,7 +3727,9 @@ impl Pipeline {
         // build-time per-source meter timeline (for silence). Sampling-only and
         // non-blocking. Only built under `overlay` (the badge renderer).
         #[cfg(feature = "overlay")]
-        let caption_stores = self.caption_stores.clone();
+        let caption_stores = Arc::clone(&self.live_caption_stores);
+        #[cfg(feature = "overlay")]
+        let caption_display_times = Arc::clone(&self.caption_display_times);
         // RT-10b: the per-layer subtitle crosspoint. One re-pointable
         // `SubtitleLayer` per source-bound caption store (identity routing by
         // default), sampled per output tick via `active_at(now)` so subtitle
@@ -3692,9 +3742,11 @@ impl Pipeline {
         #[cfg(feature = "overlay")]
         let mut subtitle_router = crate::captions::SubtitleRouter::from_stores(
             caption_stores
+                .load()
                 .iter()
                 .map(|(id, store)| (id.clone(), Arc::clone(store))),
-        );
+        )
+        .with_registry(Arc::clone(&caption_stores));
         #[cfg(feature = "overlay")]
         self.subtitle_route
             .store(Some(Arc::new(subtitle_router.handle())));
@@ -3753,9 +3805,14 @@ impl Pipeline {
             // per-source path below (the text-layer primitive RT-10a built is
             // text-only).
             #[cfg(feature = "overlay")]
-            let captions = subtitle_router.sample(frame.pts());
+            for (id, cursor) in caption_display_times.load().iter() {
+                cursor.store(frame.source_times.get(id).copied().map(Arc::new));
+            }
             #[cfg(feature = "overlay")]
-            let caption_bitmaps = sample_caption_bitmaps(&caption_stores, frame.pts());
+            let captions = subtitle_router.sample_selected(&frame.source_times);
+            #[cfg(feature = "overlay")]
+            let caption_bitmaps =
+                sample_caption_bitmaps(&caption_stores.load(), &frame.source_times);
             #[cfg(feature = "overlay")]
             let faults = if frame.repeat {
                 last_faults.clone()
@@ -5763,12 +5820,15 @@ fn run_push_output(
 #[cfg(feature = "overlay")]
 fn sample_caption_bitmaps(
     stores: &std::collections::HashMap<String, Arc<crate::captions::CueStore>>,
-    pts: MediaTime,
+    times: &std::collections::HashMap<String, multiview_framestore::tile::SourceFrameTime>,
 ) -> std::collections::HashMap<String, multiview_ffmpeg::caption::CueBitmap> {
     let mut out = std::collections::HashMap::new();
     for (id, store) in stores {
+        let Some(selected) = times.get(id) else {
+            continue;
+        };
         if let Some(multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. }) =
-            store.active_at(pts)
+            store.active_at_generation(selected.pts, selected.generation)
         {
             out.insert(id.clone(), bitmap);
         }
@@ -6751,9 +6811,15 @@ struct LiveIngestSpawner {
     cadence: Rational,
     /// The run's output-clock origin slot (see [`IngestPlan::output_origin`]).
     output_origin: crate::timing_status::EpochAnchorSlot,
-    /// The running program bus's control handle (empty when this run carries
-    /// no program audio): a spawned source's audio joins the bus through it.
+    /// The running program bus control handle.
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    #[cfg(feature = "overlay")]
+    caption_stores: crate::captions::LiveCaptionStores,
+    #[cfg(feature = "overlay")]
+    caption_generations:
+        Arc<multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, u64>>>>,
+    #[cfg(feature = "overlay")]
+    caption_display_times: crate::captions::DisplayCursors,
     /// The pinned island slot `drive_streaming` publishes (ADR-W018 §7).
     #[cfg(feature = "gpu")]
     island: LiveIslandSlot,
@@ -6763,7 +6829,41 @@ struct LiveIngestSpawner {
     load_source: Box<dyn multiview_hal::LoadSource + Send + Sync>,
 }
 
+#[cfg(feature = "overlay")]
+impl LiveIngestSpawner {
+    /// Apply the source lifecycle token that the video coordinator already
+    /// allocated. Never independently increment a caption epoch.
+    fn set_caption_generation(&self, id: &str, generation: u64) {
+        self.caption_generations.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert(id.to_owned(), generation);
+            next
+        });
+        if let Some(store) = self.caption_stores.load().get(id) {
+            store.begin_generation(generation);
+        }
+    }
+
+    /// Reuse the already-advanced video lifecycle for synthetic/remove clear.
+    fn clear_captions_for_lifecycle(&self, id: &str, generation: u64) {
+        self.set_caption_generation(id, generation);
+        self.caption_stores.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.remove(id);
+            next
+        });
+        self.caption_display_times.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.remove(id);
+            next
+        });
+    }
+}
+
 impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
+    #[allow(clippy::too_many_lines)]
+    // reason: the hub worker configures separate native caption forms and the
+    // video producer together; no part of this runs on the output clock.
     fn spawn(
         &self,
         spawn: crate::live_sources::SourceSpawn,
@@ -6793,7 +6893,11 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
 
     fn source_without_audio(&self, id: &str) {
         // A timed-out decoded producer must not publish after HLS -> synthetic.
-        begin_live_lifecycle(id);
+        let lifecycle = begin_live_lifecycle(id);
+        #[cfg(feature = "overlay")]
+        self.clear_captions_for_lifecycle(id, lifecycle);
+        #[cfg(not(feature = "overlay"))]
+        let _ = lifecycle;
         if let Some(handle) = self.audio_route.load() {
             if !handle.set_source_audio(id, None) {
                 tracing::warn!(source = %id, "audio membership rejected: consumer closed");
@@ -6802,7 +6906,11 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
-        begin_live_lifecycle(id);
+        let lifecycle = begin_live_lifecycle(id);
+        #[cfg(feature = "overlay")]
+        self.clear_captions_for_lifecycle(id, lifecycle);
+        #[cfg(not(feature = "overlay"))]
+        let _ = lifecycle;
         if let Some(handle) = self.audio_route.load() {
             if !handle.remove_source(id) {
                 tracing::warn!(source = %id, "audio removal rejected: consumer closed");
@@ -6858,6 +6966,8 @@ fn spawn_live_audio(
 
 impl LiveIngestSpawner {
     /// The video half of [`crate::live_sources::IngestSpawner::spawn`].
+    #[allow(clippy::too_many_lines)]
+    // reason: live caption setup shares source planning but runs only on the hub worker.
     fn spawn_video(
         &self,
         source: &Source,
@@ -6889,6 +6999,93 @@ impl LiveIngestSpawner {
         };
         plan.output_origin = Arc::clone(&self.output_origin);
         plan.lifecycle = lifecycle;
+        #[cfg(feature = "overlay")]
+        {
+            // The hub worker stopped old readers. Use the SAME lifecycle token
+            // already assigned to video and audio, never increment a caption-only
+            // clock. Caption work is off the output clock.
+            let id = source.id.clone();
+            let existing = self.caption_stores.load().get(&id).cloned();
+            self.set_caption_generation(&id, lifecycle);
+            let generation = lifecycle;
+            let caption_plan = caption_plan_for_generation(&source, existing.clone(), generation);
+            if caption_plan.is_none() {
+                if let Some(selector) = source.captions.as_ref() {
+                    if let Some(channel) =
+                        crate::captions::embedded_cc_channel(&source.kind, selector)
+                    {
+                        let store = existing
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(crate::captions::CueStore::new()));
+                        store.begin_generation(generation);
+                        plan.embedded_cc = Some(EmbeddedCcRoute {
+                            channel,
+                            store: Arc::clone(&store),
+                        });
+                        self.caption_stores.rcu(|current| {
+                            let mut next = current.as_ref().clone();
+                            next.insert(id.clone(), Arc::clone(&store));
+                            next
+                        });
+                    } else if crate::captions::incontainer_selector_active(&source.kind, selector) {
+                        if let Some((mut route, fresh)) =
+                            resolve_incontainer_sub_route(&source, selector, &plan.location)
+                        {
+                            let store = existing.clone().unwrap_or(fresh);
+                            store.begin_generation(generation);
+                            route.store = Arc::clone(&store);
+                            plan.incontainer_sub = Some(route);
+                            self.caption_stores.rcu(|current| {
+                                let mut next = current.as_ref().clone();
+                                next.insert(id.clone(), Arc::clone(&store));
+                                next
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(ref captions) = caption_plan {
+                let cue_store = Arc::clone(&captions.store);
+                self.caption_stores.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.insert(id.clone(), Arc::clone(&cue_store));
+                    next
+                });
+                let cursor = Arc::clone(&captions.displayed_time);
+                self.caption_display_times.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.insert(id.clone(), Arc::clone(&cursor));
+                    next
+                });
+                let stop = Arc::new(AtomicBool::new(false));
+                let exited =
+                    crate::live_sources::register_stop(registry, &format!("{id}/captions"), &stop);
+                let guard = crate::live_sources::ExitGuard::new(&exited);
+                let thread_stop = Arc::clone(&stop);
+                let builder = std::thread::Builder::new().name(format!("multiview-captions-{id}"));
+                if let Err(error) = builder.spawn(move || {
+                    let _exit = guard;
+                    if let Some(captions) = caption_plan {
+                        crate::captions::caption_loop(&captions, &thread_stop);
+                    }
+                }) {
+                    tracing::warn!(%id, %error, "caption reader spawn failed; video continues");
+                }
+            } else if plan.embedded_cc.is_none() && plan.incontainer_sub.is_none() {
+                // An edited source with captions off must not retain its former
+                // layer, even if the old selected picture is still held.
+                self.caption_stores.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.remove(&id);
+                    next
+                });
+                self.caption_display_times.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.remove(&id);
+                    next
+                });
+            }
+        }
         // Hardware re-assessment on every change (ADR-W018 §7), under `gpu`.
         #[cfg(feature = "gpu")]
         {
@@ -7134,6 +7331,7 @@ mod live_edit_audio_regression_tests {
                     &slot_a,
                     image(),
                     MediaTime::from_nanos(100),
+                    MediaTime::from_nanos(11),
                     Some((MediaTime::ZERO, Some(11))),
                 ));
             });
@@ -7146,11 +7344,21 @@ mod live_edit_audio_regression_tests {
                 &slot,
                 image(),
                 MediaTime::from_nanos(200),
+                MediaTime::from_nanos(22),
                 Some((MediaTime::ZERO, Some(22))),
             ));
             resume_tx.send(()).unwrap();
         });
         assert_eq!(store.sequence(), 1, "A must not mutate B's reused store");
+        let (_, selected) = store.read_at_with_source_time(MediaTime::from_nanos(200));
+        assert_eq!(
+            selected,
+            Some(multiview_framestore::tile::SourceFrameTime {
+                pts: MediaTime::from_nanos(22),
+                generation: live_lifecycle(id)
+            }),
+            "B's selected picture keeps B's source PTS and lifecycle"
+        );
         assert_eq!(slot.load().unwrap().raw_pts0_ns, Some(22));
         assert!(matches!(
             store.read_at(MediaTime::from_nanos(200)),
@@ -7165,6 +7373,7 @@ mod live_edit_audio_regression_tests {
             &slot,
             image(),
             MediaTime::from_nanos(300),
+            MediaTime::ZERO,
             Some((MediaTime::ZERO, Some(33))),
         ));
         assert_eq!(store.sequence(), 1);
@@ -7185,6 +7394,8 @@ mod live_edit_audio_regression_tests {
             MediaTime::from_nanos(500),
         ));
         assert_eq!(store.sequence(), 2, "only the new synthetic may publish");
+        let (_, selected) = store.read_at_with_source_time(MediaTime::from_nanos(500));
+        assert_eq!(selected.map(|frame| frame.generation), Some(synthetic));
     }
 
     #[test]
@@ -7203,6 +7414,7 @@ mod live_edit_audio_regression_tests {
             &slot,
             image(),
             MediaTime::ZERO,
+            MediaTime::ZERO,
             Some((MediaTime::ZERO, Some(11)))
         ));
         end_live_lifecycle(id, first);
@@ -7218,6 +7430,7 @@ mod live_edit_audio_regression_tests {
             &slot,
             image(),
             MediaTime::from_nanos(20),
+            MediaTime::from_nanos(20),
             Some((MediaTime::from_nanos(20), Some(22)))
         ));
         assert!(
@@ -7225,12 +7438,15 @@ mod live_edit_audio_regression_tests {
             "audio plan must wait for this run's frame"
         );
         assert_eq!(slot.load().unwrap().raw_pts0_ns, Some(22));
+        let (_, selected) = store.read_at_with_source_time(MediaTime::from_nanos(20));
+        assert_eq!(selected.map(|frame| frame.generation), Some(second));
         assert!(!publish_live_frame_for(
             id,
             first,
             &store,
             &slot,
             image(),
+            MediaTime::from_nanos(30),
             MediaTime::from_nanos(30),
             None
         ));
@@ -10293,6 +10509,24 @@ fn tone_ingest_plan_for(
     }
 }
 
+/// Build an HLS caption plan for a specific source generation. The resolver
+/// returns a new generation-1 store; install the caller's token on the selected
+/// old or new store before any reader can observe it.
+#[cfg(feature = "overlay")]
+fn caption_plan_for_generation(
+    source: &Source,
+    existing: Option<Arc<crate::captions::CueStore>>,
+    generation: u64,
+) -> Option<crate::captions::CaptionPlan> {
+    let mut plan = crate::captions::caption_plan_for(source)?;
+    plan.generation = generation;
+    if let Some(store) = existing {
+        plan.store = store;
+    }
+    plan.store.begin_generation(generation);
+    Some(plan)
+}
+
 /// Resolve every source's HLS `WebVTT` caption plan concurrently (#48) and index
 /// them by source id for the build loop's cheap per-source lookup. The N
 /// network-bound master-fetches overlap off the serial build path. Only under
@@ -10324,7 +10558,9 @@ fn wire_source_captions(
 ) {
     // HLS WebVTT rendition path: take this source's plan, already resolved
     // concurrently off the build path (#48). A cheap map lookup — no network here.
-    if let Some(caption_plan) = prefetched.remove(&source.id) {
+    if let Some(mut caption_plan) = prefetched.remove(&source.id) {
+        caption_plan.generation = plan.lifecycle;
+        caption_plan.store.begin_generation(plan.lifecycle);
         caption_stores.insert(source.id.clone(), Arc::clone(&caption_plan.store));
         caption_plans.push(caption_plan);
     }
@@ -10343,6 +10579,7 @@ fn wire_source_captions(
     if !caption_stores.contains_key(&source.id) {
         if let Some(channel) = crate::captions::embedded_cc_channel(&source.kind, selector) {
             let store = Arc::new(crate::captions::CueStore::new());
+            store.begin_generation(plan.lifecycle);
             caption_stores.insert(source.id.clone(), Arc::clone(&store));
             plan.embedded_cc = Some(EmbeddedCcRoute { channel, store });
             tracing::info!(source = %source.id, "native embedded CEA-608 caption route wired");
@@ -10362,6 +10599,7 @@ fn wire_source_captions(
         if let Some((route, cue_store)) =
             resolve_incontainer_sub_route(source, selector, &plan.location)
         {
+            cue_store.begin_generation(plan.lifecycle);
             caption_stores.insert(source.id.clone(), cue_store);
             plan.incontainer_sub = Some(route);
         }
@@ -11494,7 +11732,14 @@ fn publish_webrtc_video(
                 // Stamp publish with the source-relative instant; the OUTPUT clock
                 // paces emission, never this stamp (inputs are sampled, inv #1).
                 let _ = start;
-                plan.store.publish(image, pts);
+                plan.store.publish_arc_with_source_time(
+                    Arc::new(image),
+                    pts,
+                    Some(multiview_framestore::tile::SourceFrameTime {
+                        pts,
+                        generation: plan.lifecycle,
+                    }),
+                );
             }
             Ok(None) => return, // decoder needs more input.
             Err(err) => {
@@ -12230,6 +12475,7 @@ fn open_and_stream(
                     &plan.live_anchor,
                     image,
                     at,
+                    pts,
                     due.then_some((pts, raw_ns)),
                 ) {
                     if due {
@@ -12243,7 +12489,14 @@ fn open_and_stream(
             } else {
                 pacer.publish_time(pts)
             };
-            plan.store.publish(image, at);
+            plan.store.publish_arc_with_source_time(
+                Arc::new(image),
+                at,
+                Some(multiview_framestore::tile::SourceFrameTime {
+                    pts,
+                    generation: plan.lifecycle,
+                }),
+            );
         }
         if drained {
             return Ok(());
@@ -12414,6 +12667,7 @@ fn stream_player(
     // bump), never a pixel-plane copy — no per-frame heap allocation on the hold
     // path (bounded-memory data plane, inv #5 / rule 22).
     let mut last_image: Option<Arc<Nv12Image>> = None;
+    let mut last_source_pts: Option<MediaTime> = None;
     // Whether the decoder has been fully drained (EOF reached with no loop, or a
     // fail-safe gave up): the loop falls through to `heartbeat_player_hold`, which
     // holds last-good forever — the tile rides the framestore state machine and
@@ -12550,7 +12804,15 @@ fn stream_player(
                     }
                     let image = Arc::new(image);
                     last_image = Some(Arc::clone(&image));
-                    plan.store.publish_arc(image, at);
+                    last_source_pts = Some(decoded.meta.pts);
+                    plan.store.publish_arc_with_source_time(
+                        image,
+                        at,
+                        last_source_pts.map(|pts| multiview_framestore::tile::SourceFrameTime {
+                            pts,
+                            generation: plan.lifecycle,
+                        }),
+                    );
                     // Track the video's output media-time for the audio exit anchor
                     // (ADR-T019 §1): the audio arms its exit at the next vamp
                     // boundary at-or-after this same media-time.
@@ -12581,7 +12843,16 @@ fn stream_player(
                         if stop.load(Ordering::Acquire) {
                             return Ok(());
                         }
-                        plan.store.publish_arc(Arc::clone(image), at);
+                        plan.store.publish_arc_with_source_time(
+                            Arc::clone(image),
+                            at,
+                            last_source_pts.map(|pts| {
+                                multiview_framestore::tile::SourceFrameTime {
+                                    pts,
+                                    generation: plan.lifecycle,
+                                }
+                            }),
+                        );
                     }
                 }
                 PlayerAction::Ended => {
@@ -12638,7 +12909,14 @@ fn stream_player(
             // would have re-seeded packets). Hold the tile LIVE: a finite,
             // non-looping play-through keeps republishing its terminal frame at
             // cadence via the heartbeat below until `stop`.
-            heartbeat_player_hold(plan, &mut player, last_image.as_ref(), pacer, stop);
+            heartbeat_player_hold(
+                plan,
+                &mut player,
+                last_image.as_ref(),
+                last_source_pts,
+                pacer,
+                stop,
+            );
             return Ok(());
         }
 
@@ -12922,6 +13200,7 @@ fn heartbeat_player_hold(
     plan: &IngestPlan,
     player: &mut crate::player::MediaPlayer,
     last_image: Option<&Arc<Nv12Image>>,
+    last_source_pts: Option<MediaTime>,
     pacer: &mut PtsWallClock,
     stop: &AtomicBool,
 ) {
@@ -12946,7 +13225,14 @@ fn heartbeat_player_hold(
         }
         // Republish the held handle — an `Arc::clone` (refcount bump), never a
         // pixel-plane copy.
-        plan.store.publish_arc(Arc::clone(image), at);
+        plan.store.publish_arc_with_source_time(
+            Arc::clone(image),
+            at,
+            last_source_pts.map(|pts| multiview_framestore::tile::SourceFrameTime {
+                pts,
+                generation: plan.lifecycle,
+            }),
+        );
     }
 }
 
@@ -13039,7 +13325,9 @@ fn pump_incontainer_sub(
         return;
     }
     match decoder.decode(packet) {
-        Ok(cues) => crate::captions::publish_window_cues(&route.store, cues),
+        Ok(cues) => {
+            crate::captions::publish_window_cues_for_generation(&route.store, plan.lifecycle, cues);
+        }
         Err(err) => {
             tracing::debug!(source = %plan.id, error = %err, "in-container subtitle packet decode error");
         }
@@ -13088,7 +13376,9 @@ fn pump_embedded_cc(
         return;
     };
     match decoder.decode_bytes(bytes, frame.raw_pts) {
-        Ok(cues) => crate::captions::publish_window_cues(&route.store, cues),
+        Ok(cues) => {
+            crate::captions::publish_window_cues_for_generation(&route.store, plan.lifecycle, cues);
+        }
         Err(err) => {
             tracing::debug!(source = %plan.id, error = %err, "embedded-CC A53 decode error");
         }
@@ -13506,12 +13796,22 @@ pub(crate) fn publish_live_synth_frame_for(
     if tokens.get(id).copied().unwrap_or(0) != lifecycle {
         return false;
     }
-    store.publish_arc(image, at);
+    store.publish_arc_with_source_time(
+        image,
+        at,
+        Some(multiview_framestore::tile::SourceFrameTime {
+            pts: at,
+            generation: lifecycle,
+        }),
+    );
     true
 }
 
 /// Atomically fence the video image and its source-PTS metadata against the
 /// existing lifecycle token. This runs only in the producer, never output-clock.
+#[allow(clippy::too_many_arguments)]
+// reason: frame source time is distinct from its output stamp and anchor, and all
+// three are published inside one lifecycle fence without adding a heap wrapper.
 fn publish_live_frame_for(
     id: &str,
     lifecycle: u64,
@@ -13519,6 +13819,7 @@ fn publish_live_frame_for(
     slot: &LiveAnchorSlot,
     image: Nv12Image,
     at: MediaTime,
+    source_pts: MediaTime,
     anchor: Option<(MediaTime, Option<i64>)>,
 ) -> bool {
     let tokens = anchor_lifecycle()
@@ -13527,7 +13828,14 @@ fn publish_live_frame_for(
     if tokens.get(id).copied().unwrap_or(0) != lifecycle {
         return false;
     }
-    store.publish(image, at);
+    store.publish_arc_with_source_time(
+        Arc::new(image),
+        at,
+        Some(multiview_framestore::tile::SourceFrameTime {
+            pts: source_pts,
+            generation: lifecycle,
+        }),
+    );
     if let Some((pts, raw)) = anchor {
         publish_live_anchor(slot, (at, pts), raw);
     }
@@ -16003,9 +16311,184 @@ segment_ms = 1000
         supervisor.shutdown();
     }
 
-    /// M1: the caption reader registers under the derived `{id}/captions` key,
-    /// so a live edit/remove of the source also stops its caption reader (the
-    /// hub raises every `{id}`-rooted flag).
+    /// A same-id caption-off transition advances the lifecycle before new cues.
+    #[test]
+    fn caption_generation_survives_caption_off_and_rejects_old_frame() {
+        use multiview_core::time::MediaTime;
+        use multiview_framestore::tile::SourceFrameTime;
+        let config = rtsp_config();
+        let pipeline = super::Pipeline::build(&config).expect("pipeline");
+        let spawner = pipeline.live_ingest_spawner();
+        let store = Arc::new(crate::captions::CueStore::new());
+        let original = super::live_lifecycle("net1");
+        store.begin_generation(original);
+        let cue = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::ZERO,
+            MediaTime::from_nanos(10_000),
+            vec!["old".to_owned()],
+            None,
+        )
+        .expect("cue");
+        store.publish(cue.start(), cue.end(), cue);
+        pipeline.live_caption_stores.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert("net1".to_owned(), Arc::clone(&store));
+            next
+        });
+        let before = super::live_lifecycle("net1");
+        spawner.source_without_audio("net1"); // synthetic edit: shared lifecycle advances once
+        assert_eq!(
+            pipeline.caption_generations.load().get("net1"),
+            Some(&super::live_lifecycle("net1"))
+        );
+        assert_eq!(super::live_lifecycle("net1"), before.saturating_add(1));
+        assert!(pipeline.live_caption_stores.load().get("net1").is_none());
+        assert!(store
+            .active_at_generation(MediaTime::from_nanos(1), original)
+            .is_none());
+        // The same id reappears with captions. Its token must not reset,
+        // or a held old picture could render its new cue.
+        let token = pipeline
+            .caption_generations
+            .load()
+            .get("net1")
+            .copied()
+            .unwrap_or_default();
+        let old_picture = SourceFrameTime {
+            pts: MediaTime::from_nanos(1),
+            generation: original,
+        };
+        let fresh = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::ZERO,
+            MediaTime::from_nanos(10_000),
+            vec!["new".to_owned()],
+            None,
+        )
+        .expect("cue");
+        store.publish_for_generation(token, fresh.start(), fresh.end(), fresh);
+        assert!(store
+            .active_at_generation(old_picture.pts, old_picture.generation)
+            .is_none());
+        assert!(store.active_at_generation(old_picture.pts, token).is_some());
+    }
+
+    /// Real local HLS `WebVTT` survives captions-on → off → on with a fresh store.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    // reason: one offline test creates a real master, transitions source identity,
+    // runs the isolated reader, and verifies the held old picture independently.
+    fn hls_caption_off_on_initializes_fresh_store_before_reader_spawn() {
+        use multiview_core::time::MediaTime;
+        use multiview_framestore::tile::SourceFrameTime;
+        let dir = tempfile::tempdir().expect("fixture directory");
+        multiview_ffmpeg::test_fixtures::generate_hls_with_valid_webvtt(dir.path())
+            .expect("local HLS master and WebVTT rendition");
+        let source = {
+            let doc = format!(
+                r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "net1"
+kind = "hls"
+url = "{}/master.m3u8"
+[sources.captions]
+mode = "auto"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "net1"
+"##,
+                dir.path().display()
+            );
+            MultiviewConfig::load_from_toml(&doc)
+                .expect("local HLS source config")
+                .sources
+                .remove(0)
+        };
+        let old = super::caption_plan_for_generation(&source, None, 1).expect("old caption plan");
+        let old_store = Arc::clone(&old.store);
+        let old_cue = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::from_nanos(1_000_000_000),
+            MediaTime::from_nanos(3_000_000_000),
+            vec!["old".to_owned()],
+            None,
+        )
+        .expect("valid old cue");
+        old_store.publish_for_generation(1, old_cue.start(), old_cue.end(), old_cue);
+        // Captions-off removes the registered store and advances the token.
+        old_store.begin_generation(2);
+        let fresh = super::caption_plan_for_generation(&source, None, 3)
+            .expect("caption plan after re-enable");
+        assert!(!Arc::ptr_eq(&old_store, &fresh.store));
+        assert_eq!(fresh.generation, 3);
+        assert_eq!(
+            fresh.store.generation(),
+            3,
+            "new plan must not retain generation 1"
+        );
+        let held_old = SourceFrameTime {
+            pts: MediaTime::from_nanos(1_500_000_000),
+            generation: 1,
+        };
+        let new_store = Arc::clone(&fresh.store);
+        let new_cursor = Arc::clone(&fresh.displayed_time);
+        new_cursor.store(Some(Arc::new(SourceFrameTime {
+            pts: held_old.pts,
+            generation: 3,
+        })));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let reader =
+            std::thread::spawn(move || crate::captions::caption_loop(&fresh, &reader_stop));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while new_store.active_at_generation(held_old.pts, 3).is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        reader.join().expect("isolated reader stopped");
+        let actual = new_store.active_at_generation(held_old.pts, 3);
+        assert!(
+            actual.is_some(),
+            "reader must publish the real local WebVTT cue"
+        );
+        assert!(
+            new_store.active_at_generation(held_old.pts, 1).is_none(),
+            "old held picture must not show the new cue"
+        );
+        assert!(
+            old_store.active_at_generation(held_old.pts, 1).is_none(),
+            "captions-off must clear the previous cue"
+        );
+        let detached = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::from_nanos(1_000_000_000),
+            MediaTime::from_nanos(3_000_000_000),
+            vec!["detached".to_owned()],
+            None,
+        )
+        .expect("valid detached cue");
+        old_store.publish_for_generation(1, detached.start(), detached.end(), detached);
+        assert!(
+            old_store.active_at_generation(held_old.pts, 1).is_none(),
+            "detached previous reader cannot revive old cues"
+        );
+    }
+
+    /// M1: the caption reader registers under `{id}/captions` so edits stop it.
     #[test]
     fn caption_reader_registers_a_prefixed_stop_flag() {
         let plan = crate::captions::CaptionPlan {
@@ -16013,6 +16496,8 @@ segment_ms = 1000
             rendition_url: "http://[::1]:1/never/subs.m3u8".to_owned(),
             store: Arc::new(crate::captions::CueStore::new()),
             live: true,
+            generation: 1,
+            displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let registry = stop_registry();
         let supervisor = IngestSupervisor::start(

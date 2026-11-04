@@ -247,14 +247,12 @@ segment_ms = 1000
 }
 
 /// A native caption cue store carrying one text cue over `[start, end)` seconds.
-fn caption_store(start_s: f64, end_s: f64, line: &str) -> Arc<CueStore> {
-    let store = Arc::new(CueStore::new());
+fn publish_cue(store: &CueStore, start_s: f64, end_s: f64, line: &str) {
     let start = MediaTime::from_nanos((start_s * 1e9) as i64);
     let end = MediaTime::from_nanos((end_s * 1e9) as i64);
     let cue =
         CaptionCue::try_text(start, end, vec![line.to_owned()], None).expect("valid text cue");
     store.publish(start, end, cue);
-    store
 }
 
 /// Build a pipeline for `name` whose cell is bound to `cell_source`, returning it
@@ -487,7 +485,8 @@ async fn route_subtitle_repoints_the_layer_in_the_running_pipeline() {
 
     // The displayed source (in_dark, the dark slate — a clean band to render onto)
     // carries a wide active cue; the spare has none.
-    pipeline.attach_caption_store("in_dark", caption_store(0.0, 8.0, "BEFORE REPOINT"));
+    let store = pipeline.attach_caption_store("in_dark", Arc::new(CueStore::new()));
+    publish_cue(&store, 0.0, 8.0, "BEFORE REPOINT");
     pipeline.attach_caption_store("spare", Arc::new(CueStore::new()));
 
     let command = Command::RouteSubtitle {

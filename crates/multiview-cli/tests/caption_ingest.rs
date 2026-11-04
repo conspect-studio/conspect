@@ -100,6 +100,12 @@ fn bipbop_english_webvtt_cue_decodes_into_the_store() {
     );
 
     let store = Arc::clone(&plan.store);
+    plan.displayed_time.store(Some(Arc::new(
+        multiview_framestore::tile::SourceFrameTime {
+            pts: MediaTime::from_nanos(1_500_000_000),
+            generation: 1,
+        },
+    )));
 
     // Run the reader on its own thread and SAMPLE the store concurrently — exactly
     // how the real pipeline works (the off-hot-path baker samples `active_at(pts)`
@@ -158,6 +164,8 @@ fn plan_for(rendition_url: String, live: bool) -> CaptionPlan {
         rendition_url,
         store: Arc::new(CueStore::new()),
         live,
+        generation: 1,
+        displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
     }
 }
 
@@ -175,6 +183,12 @@ fn valid_webvtt_cue_lands_via_isolated_reader() {
     // cue and returns at EOF.
     let plan = plan_for(rendition, false);
     let store = Arc::clone(&plan.store);
+    plan.displayed_time.store(Some(Arc::new(
+        multiview_framestore::tile::SourceFrameTime {
+            pts: MediaTime::from_nanos(1_500_000_000),
+            generation: 1,
+        },
+    )));
 
     let stop = Arc::new(AtomicBool::new(false));
     let reader = {
@@ -211,6 +225,50 @@ fn valid_webvtt_cue_lands_via_isolated_reader() {
         joined.contains(WEBVTT_CUE_TEXT),
         "the decoded cue must contain the fixture's known text (got {joined:?})"
     );
+}
+
+#[test]
+fn rendition_waits_for_displayed_video_not_arrival_clock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    generate_hls_with_valid_webvtt(dir.path()).expect("offline WebVTT fixture");
+    let rendition = format!("file://{}/subs.m3u8", dir.path().display());
+    let plan = plan_for(rendition, false);
+    let store = Arc::clone(&plan.store);
+    let cursor = Arc::clone(&plan.displayed_time);
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || caption_loop(&plan, &stop))
+    };
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(
+        store
+            .active_at(MediaTime::from_nanos(1_500_000_000))
+            .is_none(),
+        "no video picture means no cue release"
+    );
+    cursor.store(Some(Arc::new(
+        multiview_framestore::tile::SourceFrameTime {
+            pts: MediaTime::from_nanos(1_500_000_000),
+            generation: 1,
+        },
+    )));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store
+        .active_at(MediaTime::from_nanos(1_500_000_000))
+        .is_none()
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        store
+            .active_at(MediaTime::from_nanos(1_500_000_000))
+            .is_some(),
+        "cue follows displayed video"
+    );
+    stop.store(true, Ordering::Release);
+    reader.join().expect("reader terminates");
 }
 
 #[test]

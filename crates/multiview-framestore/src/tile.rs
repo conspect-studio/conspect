@@ -81,6 +81,21 @@ struct RingEntry<T> {
     /// frames.
     seq: u64,
     frame: Arc<T>,
+    /// Source clock and lifecycle of the actual picture, not its output stamp.
+    source_time: Option<SourceFrameTime>,
+}
+
+/// Source media time of the picture selected by the output compositor.
+///
+/// A held picture retains this metadata even while output ticks advance. The
+/// generation prevents a replacement source with the same id from showing cues
+/// from the previous connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceFrameTime {
+    /// Original source-media timestamp of the selected picture.
+    pub pts: MediaTime,
+    /// Lifecycle token of the source connection (not the output tick).
+    pub generation: u64,
 }
 
 impl<T> Clone for RingEntry<T> {
@@ -89,6 +104,7 @@ impl<T> Clone for RingEntry<T> {
             at: self.at,
             seq: self.seq,
             frame: Arc::clone(&self.frame),
+            source_time: self.source_time,
         }
     }
 }
@@ -297,6 +313,17 @@ impl<T> TileStore<T> {
     /// As [`publish`](TileStore::publish), for a frame already wrapped in an
     /// [`Arc`].
     pub fn publish_arc(&self, frame: Arc<T>, at: MediaTime) -> u64 {
+        self.publish_arc_with_source_time(frame, at, None)
+    }
+
+    /// Publish a frame with the media time of its actual picture. A repeated
+    /// frame must retain its original source time, even at a newer output stamp.
+    pub fn publish_arc_with_source_time(
+        &self,
+        frame: Arc<T>,
+        at: MediaTime,
+        source_time: Option<SourceFrameTime>,
+    ) -> u64 {
         let seq = self.slot.publish_arc(Arc::clone(&frame));
         // Append to the media-time ring (drop-oldest, bounded — invariant: queues
         // drop, never grow). The ring backs the latch-on-tick `read_at`. A frame
@@ -323,7 +350,12 @@ impl<T> TileStore<T> {
         // cross-generation `fetch_max` can only leave the watermark *below* them
         // and the `retain` keeps them (see the `latch_watermark_seq` field).
         let watermark_seq = self.latch_watermark_seq.load(Ordering::Relaxed);
-        let entry = RingEntry { at, seq, frame };
+        let entry = RingEntry {
+            at,
+            seq,
+            frame,
+            source_time,
+        };
         self.ring.rcu(|current| {
             let mut next: Vec<RingEntry<T>> = if current.last().is_some_and(|tail| at < tail.at) {
                 // Backwards stamp: discard the now-superseded future and restart
@@ -530,6 +562,16 @@ impl<T> TileStore<T> {
     /// Never blocks: it reads an atomic snapshot of the bounded ring.
     #[must_use]
     pub fn read_at(&self, now: MediaTime) -> TileRead<T> {
+        self.read_at_with_source_time(now).0
+    }
+
+    /// Select the picture and its immutable source timestamp in one ring read.
+    /// No source timestamp means captions must remain hidden, not follow output time.
+    #[must_use]
+    pub fn read_at_with_source_time(
+        &self,
+        now: MediaTime,
+    ) -> (TileRead<T>, Option<SourceFrameTime>) {
         let ring = self.ring.load();
         // Selecting the latched frame also advances the prune watermark (see
         // `latch_and_advance`), so the producer's next publish can drop consumed
@@ -537,10 +579,11 @@ impl<T> TileStore<T> {
         // per-tick cost on the read path is that one relaxed-atomic `fetch_max` —
         // no lock, no allocation.
         let Some((selected, state)) = self.latch_and_advance(&ring, now) else {
-            return TileRead::NoSignal;
+            return (TileRead::NoSignal, None);
         };
         let frame = Arc::clone(&selected.frame);
-        match state {
+        let source_time = selected.source_time;
+        let read = match state {
             SourceState::Live => TileRead::Fresh { frame },
             SourceState::Stale | SourceState::Reconnecting => TileRead::Held { frame, state },
             SourceState::NoSignal => match self.policy {
@@ -556,7 +599,13 @@ impl<T> TileStore<T> {
                 NoSignalPolicy::HoldForever => TileRead::Held { frame, state },
                 NoSignalPolicy::Slate => TileRead::NoSignal,
             },
-        }
+        };
+        let source_time = if read.frame().is_some() {
+            source_time
+        } else {
+            None
+        };
+        (read, source_time)
     }
 
     /// The most recent slot sequence number (`0` if nothing published).

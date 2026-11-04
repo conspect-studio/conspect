@@ -23,6 +23,7 @@ use multiview_core::time::{MediaTime, Rational};
 use multiview_core::traits::SourceState;
 use multiview_engine::clock::Tick;
 use multiview_engine::{CompositorDrive, OutputClock};
+use multiview_framestore::tile::SourceFrameTime;
 use multiview_framestore::{TileStore, TileThresholds};
 
 fn resolved_color() -> ColorInfo {
@@ -314,6 +315,60 @@ fn sample_states_uses_the_latched_frame_age_not_producer_liveness() {
         "sample_states and compose must report the same latched-frame state"
     );
     assert_eq!(composed.source_states.get("cam-b"), states.get("cam-b"),);
+}
+
+#[test]
+fn displayed_picture_retains_source_time_across_hold_and_layout_rebind() {
+    let (w, h) = (640, 480);
+    let a = Arc::new(TileStore::with_defaults("cam-a"));
+    let b = Arc::new(TileStore::with_defaults("cam-b"));
+    let source_a = SourceFrameTime {
+        pts: MediaTime::from_nanos(1_000_000_000),
+        generation: 4,
+    };
+    let source_b = SourceFrameTime {
+        pts: MediaTime::from_nanos(8_000_000_000),
+        generation: 7,
+    };
+    a.publish_arc_with_source_time(
+        Arc::new(solid(w / 2, h, 200)),
+        MediaTime::ZERO,
+        Some(source_a),
+    );
+    b.publish_arc_with_source_time(
+        Arc::new(solid(w / 2, h, 50)),
+        MediaTime::ZERO,
+        Some(source_b),
+    );
+    let mut stores = HashMap::new();
+    stores.insert("cam-a".to_owned(), Arc::clone(&a));
+    stores.insert("cam-b".to_owned(), Arc::clone(&b));
+    let mut drive = make_drive(two_cell_layout(w, h), stores, w, h);
+    for tick in [0, 1, 2] {
+        let frame = drive.compose(tick_at(tick)).unwrap();
+        assert_eq!(frame.source_times.get("cam-a"), Some(&source_a));
+        assert_eq!(frame.source_times.get("cam-b"), Some(&source_b));
+    }
+    let mut rebound = two_cell_layout(w, h);
+    rebound.cells[0].source = Some("cam-b".to_owned());
+    rebound.cells[1].source = None;
+    drive.set_layout(Arc::new(rebound)).unwrap();
+    let frame = drive.compose(tick_at(3)).unwrap();
+    assert!(!frame.source_times.contains_key("cam-a"));
+    assert_eq!(frame.source_times.get("cam-b"), Some(&source_b));
+    b.publish_arc_with_source_time(
+        Arc::new(solid(w / 2, h, 60)),
+        tick_at(4).pts,
+        Some(SourceFrameTime {
+            generation: 8,
+            ..source_b
+        }),
+    );
+    let frame = drive.compose(tick_at(4)).unwrap();
+    assert_eq!(
+        frame.source_times.get("cam-b").map(|t| t.generation),
+        Some(8)
+    );
 }
 
 #[test]

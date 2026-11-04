@@ -15,7 +15,7 @@ import type { SaveResourceVars } from '../resources/queries';
 import type { SourceView } from '../resources/types';
 import { SOURCE_KINDS } from '../resources/types';
 import {
-  CAPTION_MODES,
+  captionModesForValue,
   CLOCK_FACES,
   emptySourceForm,
   IANA_TIMEZONES,
@@ -634,9 +634,9 @@ function SourceAdvancedFields({
       case 'track':
         return <Trans>Subtitle track (id / language)</Trans>;
       case 'embedded_cc':
-        return <Trans>Embedded CEA-608/708</Trans>;
+        return <Trans>Embedded CEA-608 (CC1–CC4 only)</Trans>;
       case 'sidecar':
-        return <Trans>Sidecar file (SRT/WebVTT)</Trans>;
+        return <Trans>Stored sidecar (not decoded per source)</Trans>;
     }
   };
   const wallclockLabel = (choice: WallClockChoice): JSX.Element => {
@@ -654,7 +654,7 @@ function SourceAdvancedFields({
       <SelectField<CaptionsMode>
         label={t`Captions`}
         value={form.captionsMode}
-        options={CAPTION_MODES}
+        options={captionModesForValue(form.captionsMode)}
         optionLabel={captionLabel}
         onChange={(next): void => {
           setForm({ ...form, captionsMode: next });
@@ -668,7 +668,7 @@ function SourceAdvancedFields({
           value={form.captionsPage}
           placeholder="801"
           error={errors.captionsPage}
-          hint={<Trans>Magazine-addressed page, 100–899.</Trans>}
+          hint={<Trans>Available for local TS/file sources with a teletext stream; page 100–899.</Trans>}
           onChange={(next): void => {
             setForm({ ...form, captionsPage: next });
           }}
@@ -693,6 +693,7 @@ function SourceAdvancedFields({
           value={form.captionsField}
           placeholder="cc1"
           error={errors.captionsField}
+          hint={<Trans>Only CEA-608 fields cc1, cc2, cc3 and cc4 decode. CEA-708 services are not supported.</Trans>}
           onChange={(next): void => {
             setForm({ ...form, captionsField: next });
           }}
@@ -705,6 +706,7 @@ function SourceAdvancedFields({
           value={form.captionsPath}
           placeholder="/subs/program.vtt"
           error={errors.captionsPath}
+          hint={<Trans>This stored sidecar is not decoded per source. Use the legacy command-line subtitle option instead.</Trans>}
           onChange={(next): void => {
             setForm({ ...form, captionsPath: next });
           }}

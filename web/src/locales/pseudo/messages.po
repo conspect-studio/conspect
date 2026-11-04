@@ -348,7 +348,7 @@ msgid "A receiver address is required"
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:194
-#: src/pages/SourcesPage.tsx:810
+#: src/pages/SourcesPage.tsx:812
 msgid "A reference only — never a plaintext secret. Leave blank for none."
 msgstr ""
 
@@ -388,7 +388,7 @@ msgstr ""
 msgid "A source is a managed input. Each one owns its ingest, decode, color handling, and reconnect behaviour, and is referenced by tiles via a stable id. Supported kinds include RTSP, HLS, MPEG-TS, SRT, RTMP, NDI, file, and a built-in synthetic test pattern. When a source stops delivering frames, its tile holds the last good frame and moves through a clear state machine — live, stale, reconnecting, no-signal — while the engine reconnects without disturbing the rest of the wall."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:903
+#: src/pages/SourcesPage.tsx:905
 msgid "A source is an ingest input bound into the multiview by id."
 msgstr ""
 
@@ -472,8 +472,8 @@ msgid "About probes and alarms"
 msgstr ""
 
 #: src/pages/docs/FeaturesPage.tsx:53
-#: src/pages/SourcesPage.tsx:897
-#: src/pages/SourcesPage.tsx:980
+#: src/pages/SourcesPage.tsx:899
+#: src/pages/SourcesPage.tsx:982
 msgid "About source transports"
 msgstr ""
 
@@ -499,7 +499,7 @@ msgid "About the tile lifecycle"
 msgstr ""
 
 #: src/pages/MonitoringPage.tsx:170
-#: src/pages/SourcesPage.tsx:855
+#: src/pages/SourcesPage.tsx:857
 msgid "About tile lifecycle states"
 msgstr ""
 
@@ -557,7 +557,7 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:713
 #: src/pages/OverlaysPage.tsx:194
 #: src/pages/ProbesPage.tsx:452
-#: src/pages/SourcesPage.tsx:871
+#: src/pages/SourcesPage.tsx:873
 #: src/pages/SyncGroupsPage.tsx:295
 #: src/pages/TallyPage.tsx:367
 msgid "Actions"
@@ -592,7 +592,7 @@ msgstr ""
 msgid "Add"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:896
+#: src/pages/SourcesPage.tsx:898
 msgid "Add and manage live ingest sources."
 msgstr ""
 
@@ -1078,6 +1078,10 @@ msgstr ""
 #: src/pages/CapabilitiesPage.tsx:93
 #: src/pages/docs/components.tsx:143
 msgid "Available"
+msgstr ""
+
+#: src/pages/SourcesPage.tsx:671
+msgid "Available for local TS/file sources with a teletext stream; page 100–899."
 msgstr ""
 
 #: src/pages/NotFoundPage.tsx:19
@@ -1751,7 +1755,7 @@ msgstr ""
 msgid "Configured fail-state probes."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:904
+#: src/pages/SourcesPage.tsx:906
 msgid "Configured ingest sources."
 msgstr ""
 
@@ -1985,7 +1989,7 @@ msgstr ""
 msgid "Could not load salvos:"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:907
+#: src/pages/SourcesPage.tsx:909
 msgid "Could not load sources:"
 msgstr ""
 
@@ -2186,7 +2190,7 @@ msgid "Credentials are referenced, never inlined: <0>auth</0> holds a <1>secret_
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:191
-#: src/pages/SourcesPage.tsx:807
+#: src/pages/SourcesPage.tsx:809
 msgid "Credentials secret reference"
 msgstr ""
 
@@ -2383,7 +2387,7 @@ msgstr ""
 msgid "Delete salvo?"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:877
+#: src/pages/SourcesPage.tsx:879
 msgid "Delete source"
 msgstr ""
 
@@ -2689,7 +2693,7 @@ msgstr ""
 
 #: src/devices/InputStreamsInspector.tsx:62
 #: src/pages/RoutingPage.tsx:280
-#: src/pages/SourcesPage.tsx:957
+#: src/pages/SourcesPage.tsx:959
 msgid "e.g. cam-north"
 msgstr ""
 
@@ -2857,8 +2861,8 @@ msgstr ""
 msgid "Edit salvo"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:876
-#: src/pages/SourcesPage.tsx:902
+#: src/pages/SourcesPage.tsx:878
+#: src/pages/SourcesPage.tsx:904
 msgid "Edit source"
 msgstr ""
 
@@ -2876,7 +2880,7 @@ msgid "Element name"
 msgstr ""
 
 #: src/pages/SourcesPage.tsx:637
-msgid "Embedded CEA-608/708"
+msgid "Embedded CEA-608 (CC1–CC4 only)"
 msgstr ""
 
 #: src/docs/registry.ts:538
@@ -3327,7 +3331,7 @@ msgid "GPU overlays"
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:620
-#: src/pages/SourcesPage.tsx:774
+#: src/pages/SourcesPage.tsx:776
 msgid "GPU vendor"
 msgstr ""
 
@@ -3515,7 +3519,7 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:757
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
-#: src/pages/SourcesPage.tsx:912
+#: src/pages/SourcesPage.tsx:914
 msgid "How configuration applies"
 msgstr ""
 
@@ -3573,7 +3577,7 @@ msgstr ""
 #: src/pages/ProbesPage.tsx:520
 #: src/pages/SalvosPage.tsx:211
 #: src/pages/SalvosPage.tsx:341
-#: src/pages/SourcesPage.tsx:953
+#: src/pages/SourcesPage.tsx:955
 #: src/pages/SyncGroupsPage.tsx:379
 #: src/pages/TallyPage.tsx:364
 msgid "Identifier"
@@ -3739,8 +3743,8 @@ msgstr ""
 #: src/pages/OverlaysPage.tsx:289
 #: src/pages/ProbesPage.tsx:419
 #: src/pages/ProbesPage.tsx:542
-#: src/pages/SourcesPage.tsx:836
-#: src/pages/SourcesPage.tsx:974
+#: src/pages/SourcesPage.tsx:838
+#: src/pages/SourcesPage.tsx:976
 #: src/pages/SystemActionsPage.tsx:234
 msgid "Kind"
 msgstr ""
@@ -3749,7 +3753,7 @@ msgstr ""
 #: src/pages/OutputsPage.tsx:723
 #: src/pages/OverlaysPage.tsx:204
 #: src/pages/ProbesPage.tsx:462
-#: src/pages/SourcesPage.tsx:881
+#: src/pages/SourcesPage.tsx:883
 msgid "kind \"{0}\" isn't editable in this UI; the document is preserved as authored"
 msgstr ""
 
@@ -4034,7 +4038,7 @@ msgstr ""
 msgid "Live sessions"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:852
+#: src/pages/SourcesPage.tsx:854
 msgid "Live status"
 msgstr ""
 
@@ -4173,7 +4177,7 @@ msgstr ""
 msgid "Loading salvos…"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:906
+#: src/pages/SourcesPage.tsx:908
 msgid "Loading sources…"
 msgstr ""
 
@@ -4214,7 +4218,7 @@ msgstr ""
 msgid "Locale"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:841
+#: src/pages/SourcesPage.tsx:843
 msgid "Locator"
 msgstr ""
 
@@ -4275,10 +4279,6 @@ msgstr ""
 msgid "Machines discovered on the local network. This inventory is untrusted and read-only — a peer is never auto-trusted."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:671
-msgid "Magazine-addressed page, 100–899."
-msgstr ""
-
 #: src/pages/DeviceDetailPage.tsx:450
 msgid "Maintenance"
 msgstr ""
@@ -4335,7 +4335,7 @@ msgstr ""
 msgid "Manual override"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:744
+#: src/pages/SourcesPage.tsx:746
 msgid "Matrix"
 msgstr ""
 
@@ -4624,8 +4624,8 @@ msgstr ""
 #: src/pages/ProbesPage.tsx:414
 #: src/pages/ProbesPage.tsx:532
 #: src/pages/SalvosPage.tsx:210
-#: src/pages/SourcesPage.tsx:831
-#: src/pages/SourcesPage.tsx:965
+#: src/pages/SourcesPage.tsx:833
+#: src/pages/SourcesPage.tsx:967
 #: src/pages/SyncGroupsPage.tsx:234
 #: src/pages/SyncGroupsPage.tsx:391
 #: src/pages/TallyPage.tsx:241
@@ -4730,8 +4730,8 @@ msgstr ""
 msgid "New salvo"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:900
-#: src/pages/SourcesPage.tsx:901
+#: src/pages/SourcesPage.tsx:902
+#: src/pages/SourcesPage.tsx:903
 msgid "New source"
 msgstr ""
 
@@ -4929,7 +4929,7 @@ msgstr ""
 msgid "No source"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:905
+#: src/pages/SourcesPage.tsx:907
 msgid "No sources configured."
 msgstr ""
 
@@ -5141,6 +5141,10 @@ msgstr ""
 msgid "ONLINE / DEGRADED"
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:696
+msgid "Only CEA-608 fields cc1, cc2, cc3 and cc4 decode. CEA-708 services are not supported."
+msgstr ""
+
 #: src/layout/components/CellPropertiesPanel.tsx:186
 msgid "Opacity (0–1)"
 msgstr ""
@@ -5319,7 +5323,7 @@ msgstr ""
 msgid "Override failed"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:716
+#: src/pages/SourcesPage.tsx:718
 msgid "Override the detected colour metadata"
 msgstr ""
 
@@ -5401,7 +5405,7 @@ msgstr ""
 msgid "Picked up {0}."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:765
+#: src/pages/SourcesPage.tsx:767
 msgid "Pin decode to a specific GPU"
 msgstr ""
 
@@ -5467,7 +5471,7 @@ msgid "Present only in the untrusted discovery inventory — not a device yet. A
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:552
-#: src/pages/SourcesPage.tsx:866
+#: src/pages/SourcesPage.tsx:868
 #: src/preview/SourcePreviewButton.tsx:15
 msgid "Preview"
 msgstr ""
@@ -5491,7 +5495,7 @@ msgstr ""
 msgid "Preview: {name}"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:726
+#: src/pages/SourcesPage.tsx:728
 msgid "Primaries"
 msgstr ""
 
@@ -5644,7 +5648,7 @@ msgstr ""
 msgid "Raise ticket"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:753
+#: src/pages/SourcesPage.tsx:755
 msgid "Range"
 msgstr ""
 
@@ -5838,7 +5842,7 @@ msgstr ""
 msgid "Removed. Member devices keep running; only the alignment grouping is gone."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:928
+#: src/pages/SourcesPage.tsx:930
 msgid "Removed. The running engine drops the source immediately (the response header confirms) — tiles bound to it show the no-signal slate until re-routed."
 msgstr ""
 
@@ -6328,11 +6332,7 @@ msgstr ""
 msgid "Shown past the target. Blank uses the default “+”."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:639
-msgid "Sidecar file (SRT/WebVTT)"
-msgstr ""
-
-#: src/pages/SourcesPage.tsx:704
+#: src/pages/SourcesPage.tsx:705
 msgid "Sidecar file path"
 msgstr ""
 
@@ -6398,7 +6398,7 @@ msgstr ""
 #: src/layout/components/SourcePalette.tsx:203
 #: src/pages/docs/ConfigPage.tsx:141
 #: src/pages/docs/FeaturesPage.tsx:38
-#: src/pages/SourcesPage.tsx:893
+#: src/pages/SourcesPage.tsx:895
 msgid "Sources"
 msgstr ""
 
@@ -6427,7 +6427,7 @@ msgid "SRT (Secure Reliable Transport) is an open-source UDP transport built for
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:629
-#: src/pages/SourcesPage.tsx:783
+#: src/pages/SourcesPage.tsx:785
 msgid "Stable device id"
 msgstr ""
 
@@ -6534,6 +6534,10 @@ msgstr ""
 msgid "Stored and applied: the device's supervised driver converges it now. Config export captures it for restarts."
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:639
+msgid "Stored sidecar (not decoded per source)"
+msgstr ""
+
 #: src/pages/AudioPage.tsx:514
 msgid "Stored, not applied live: this change needs a restart (for example a changed sample rate, or an input with no audio on this run). The running program mix is unchanged until then."
 msgstr ""
@@ -6551,7 +6555,7 @@ msgstr ""
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:927
+#: src/pages/SourcesPage.tsx:929
 msgid "Stored. Synthetic sources (bars, solid colour, clock, timer) and — on a full-engine run — network/file sources apply to the running engine immediately; NDI / YouTube / AES67 (and any kind on the software engine) go live via config export + restart. The response header declares which applied."
 msgstr ""
 
@@ -6660,7 +6664,7 @@ msgstr ""
 msgid "Synchronized output"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:914
+#: src/pages/SourcesPage.tsx:916
 msgid "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr ""
 
@@ -7184,7 +7188,7 @@ msgid "The vendor does not document this mount, so the URL is operator-supplied 
 msgstr ""
 
 #: src/pages/OutputsPage.tsx:633
-#: src/pages/SourcesPage.tsx:787
+#: src/pages/SourcesPage.tsx:789
 msgid "The vendor's stable handle (UUID / PCI bus id), never the index."
 msgstr ""
 
@@ -7360,6 +7364,10 @@ msgstr ""
 msgid "This source is not part of the running engine, so it has no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart."
 msgstr ""
 
+#: src/pages/SourcesPage.tsx:709
+msgid "This stored sidecar is not decoded per source. Use the legacy command-line subtitle option instead."
+msgstr ""
+
 #: src/pages/RoutingPage.tsx:411
 msgid "This take would be coerced to Class-1 with degradation (a pinned-layout mix)."
 msgstr ""
@@ -7462,7 +7470,7 @@ msgstr ""
 msgid "Transcoding is decoding compressed video back to raw pictures and recompressing it — usually into a different codec, size, or bitrate. Every transcode costs three things: <0>quality</0> (each recompression is a new lossy generation), <1>latency</1> (decoding and re-encoding both buffer frames), and <2>compute</2> (encoding is by far the most expensive step in a video pipeline). Good systems therefore transcode only when they must, and exactly once."
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:735
+#: src/pages/SourcesPage.tsx:737
 msgid "Transfer"
 msgstr ""
 
@@ -7721,7 +7729,7 @@ msgstr ""
 msgid "Waiting for the first metrics sample…"
 msgstr ""
 
-#: src/pages/SourcesPage.tsx:796
+#: src/pages/SourcesPage.tsx:798
 msgid "Wall-clock handling"
 msgstr ""
 

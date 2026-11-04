@@ -202,12 +202,10 @@ pub trait IngestSpawner: Send + Sync {
     /// rides the slate honestly).
     fn spawn(&self, spawn: SourceSpawn, registry: &StopRegistry) -> Option<SpawnedProducer>;
 
-    /// A source now running without decoded audio (a synthetic add/edit): it
-    /// exists on the run, carrying silence. Called on the hub worker, so every
-    /// program-bus membership change is ordered with the spawns and teardowns.
+    /// A source now running without decoded audio. Hub worker only.
     fn source_without_audio(&self, _id: &str) {}
 
-    /// A source left the run: its program-bus point goes too. Hub worker only.
+    /// A source left the run. Hub worker only.
     fn source_removed(&self, _id: &str) {}
 }
 

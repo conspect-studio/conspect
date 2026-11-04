@@ -34,11 +34,18 @@ struct Entry<C> {
     cue: C,
 }
 
+/// One atomic snapshot of the cue window and its connection identity.
+#[derive(Debug, Clone)]
+struct CueWindow<C> {
+    generation: u64,
+    entries: Vec<Entry<C>>,
+}
+
 /// A lock-free, bounded, media-time-ordered store of caption cues for one
 /// source. Cheap to clone-on-write because cues are sparse.
 #[derive(Debug)]
 pub struct CaptionCueStore<C> {
-    entries: SwapCell<Arc<Vec<Entry<C>>>>,
+    window: SwapCell<Arc<CueWindow<C>>>,
     capacity: usize,
 }
 
@@ -53,9 +60,33 @@ impl<C: Clone> CaptionCueStore<C> {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: SwapCell::from_pointee(Vec::new()),
+            window: SwapCell::from_pointee(CueWindow {
+                generation: 1,
+                entries: Vec::new(),
+            }),
             capacity: capacity.max(1),
         }
+    }
+
+    /// Begin a new connection. All previous cues become invisible immediately.
+    /// A detached previous writer cannot revive its cues after this transition.
+    pub fn begin_generation(&self, generation: u64) {
+        self.window.rcu(|current| {
+            if current.generation >= generation {
+                current.as_ref().clone()
+            } else {
+                CueWindow {
+                    generation,
+                    entries: Vec::new(),
+                }
+            }
+        });
+    }
+
+    /// The active source lifecycle token.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.window.load().generation
     }
 
     /// Publish a decoded cue active over `[start, end)`.
@@ -64,20 +95,45 @@ impl<C: Clone> CaptionCueStore<C> {
     /// the buffer sorted by `start`; once `capacity` is exceeded the oldest cue
     /// is dropped (drop-oldest, never grow — bounded memory).
     pub fn publish(&self, start: MediaTime, end: MediaTime, cue: C) {
-        if end <= start {
+        self.publish_for_generation(self.generation(), start, end, cue);
+    }
+
+    /// Publish only for the lifecycle token that owns this decoder.
+    pub fn publish_for_generation(
+        &self,
+        generation: u64,
+        start: MediaTime,
+        end: MediaTime,
+        cue: C,
+    ) {
+        if end <= start || self.generation() != generation {
             return;
         }
-        let current = self.entries.load();
-        let mut next: Vec<Entry<C>> = current.as_ref().clone();
-        let pos = next
-            .iter()
-            .position(|e| e.start > start)
-            .unwrap_or(next.len());
-        next.insert(pos, Entry { start, end, cue });
-        while next.len() > self.capacity {
-            next.remove(0);
-        }
-        self.entries.store(Arc::new(next));
+        self.window.rcu(|current| {
+            if current.generation != generation {
+                return current.as_ref().clone();
+            }
+            let mut entries = current.entries.clone();
+            let pos = entries
+                .iter()
+                .position(|e| e.start > start)
+                .unwrap_or(entries.len());
+            entries.insert(
+                pos,
+                Entry {
+                    start,
+                    end,
+                    cue: cue.clone(),
+                },
+            );
+            while entries.len() > self.capacity {
+                entries.remove(0);
+            }
+            CueWindow {
+                generation,
+                entries,
+            }
+        });
     }
 
     /// The cue active at `now` (`start <= now < end`), latest-starting on
@@ -85,10 +141,20 @@ impl<C: Clone> CaptionCueStore<C> {
     /// writer.
     #[must_use]
     pub fn active_at(&self, now: MediaTime) -> Option<C> {
-        let entries = self.entries.load();
-        entries
+        self.active_at_generation(now, self.generation())
+    }
+
+    /// Sample a cue only when its lifecycle matches the selected video frame.
+    #[must_use]
+    pub fn active_at_generation(&self, now: MediaTime, generation: u64) -> Option<C> {
+        let window = self.window.load();
+        if window.generation != generation {
+            return None;
+        }
+        window
+            .entries
             .iter()
-            .rev() // ascending by start → reverse yields latest-starting first
+            .rev()
             .find(|e| e.start <= now && now < e.end)
             .map(|e| e.cue.clone())
     }
@@ -108,6 +174,21 @@ mod tests {
     /// Build a `MediaTime` from a nanosecond count (test ergonomics).
     fn mt(ns: i64) -> MediaTime {
         MediaTime::from_nanos(ns)
+    }
+
+    #[test]
+    fn source_replacement_clears_old_cues_and_refuses_detached_writer() {
+        let store = CaptionCueStore::<&str>::new();
+        store.publish_for_generation(1, mt(10), mt(30), "old");
+        assert_eq!(store.active_at_generation(mt(20), 1), Some("old"));
+        store.begin_generation(2);
+        assert_eq!(store.active_at_generation(mt(20), 1), None);
+        assert_eq!(store.active_at_generation(mt(20), 2), None);
+        store.publish_for_generation(1, mt(10), mt(30), "stale writer");
+        assert_eq!(store.active_at_generation(mt(20), 2), None);
+        store.publish_for_generation(2, mt(15), mt(25), "new");
+        assert_eq!(store.active_at_generation(mt(20), 2), Some("new"));
+        assert_eq!(store.active_at_generation(mt(25), 2), None);
     }
 
     /// Publishes per store in the cross-instance test.

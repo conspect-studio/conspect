@@ -1865,6 +1865,58 @@ mod tests {
     }
 
     #[test]
+    fn caption_after_live_relayout_stays_inside_unequal_tiles() {
+        let mut baker = OverlayBaker::new(quad_tiles(), epoch_clock())
+            .unwrap()
+            .with_clock(None);
+        let hero = PixelRect {
+            x: 0.0,
+            y: 0.0,
+            width: 240.0,
+            height: 180.0,
+        };
+        let small = PixelRect {
+            x: 240.0,
+            y: 45.0,
+            width: 80.0,
+            height: 90.0,
+        };
+        baker.set_tiles(vec![
+            TileSpec::new("cnn", "CNN", hero),
+            TileSpec::new("bbc", "BBC", small),
+        ]);
+        let rendered = baker
+            .draw_list(
+                MediaTime::from_nanos(1_500_000_000),
+                &HashMap::new(),
+                &captions(&[
+                    ("cnn", &["Long live subtitle in hero tile"]),
+                    ("bbc", &["small tile subtitle"]),
+                ]),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        for primitive in &rendered.primitives {
+            if let OverlayPrimitive::Glyph {
+                dest_x,
+                dest_y,
+                width,
+                height,
+                ..
+            } = primitive
+            {
+                let right = i64::from(*dest_x) + i64::from(*width);
+                let bottom = i64::from(*dest_y) + i64::from(*height);
+                let hero_bound = *dest_x >= 0 && *dest_y >= 0 && right <= 240 && bottom <= 180;
+                let small_bound = *dest_x >= 240 && *dest_y >= 45 && right <= 320 && bottom <= 135;
+                assert!(hero_bound || small_bound, "caption glyph escapes cell");
+            }
+        }
+        assert!(caption_glyphs_centred_in_cell(&rendered, TileGeometry::resolve(hero)) > 0);
+        assert!(caption_glyphs_centred_in_cell(&rendered, TileGeometry::resolve(small)) > 0);
+    }
+
+    #[test]
     fn resolver_emits_label_meter_and_flag_per_cell() {
         let tiles = quad_tiles();
         let mut baker = OverlayBaker::new(tiles.clone(), epoch_clock()).unwrap();
