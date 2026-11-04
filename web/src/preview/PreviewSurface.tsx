@@ -88,7 +88,11 @@ function JpegRung({
             </Button>
           ) : null}
         </div>
-      ) : null}
+      ) : (
+        <p data-testid="still-preview-label" className="px-3 py-2 text-xs text-muted-foreground">
+          <Trans>Still preview (~1 fps) — live video is unavailable for this preview.</Trans>
+        </p>
+      )}
     </div>
   );
 }

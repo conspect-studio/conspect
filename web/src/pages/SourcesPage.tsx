@@ -47,6 +47,7 @@ import type {
   WallClockChoice,
 } from '../resources/forms';
 import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
+import { SourcePreviewButton } from '../preview/SourcePreviewButton';
 import {
   AdvancedSection,
   ApplySemanticsCallout,
@@ -859,6 +860,11 @@ export function SourcesPage(): JSX.Element {
       cell: (ctx): JSX.Element => (
         <SourceStatusCell tile={tileForSource(tiles, ctx.row.original.id)} />
       ),
+    },
+    {
+      id: 'preview',
+      header: t`Preview`,
+      cell: (ctx): JSX.Element => <SourcePreviewButton id={ctx.row.original.id} name={ctx.row.original.name} />,
     },
     {
       id: 'actions',

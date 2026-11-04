@@ -58,6 +58,14 @@ afterEach(() => {
 });
 
 describe('useJpegPreview', () => {
+  it('does not poll while disabled and aborts when the focus player opens', () => {
+    const { rerender } = renderHook(({ enabled }) => useJpegPreview('/preview/a.jpg', 1000, enabled), { initialProps: { enabled: false } });
+    expect(requests).toHaveLength(0);
+    rerender({ enabled: true });
+    expect(requests).toHaveLength(1);
+    rerender({ enabled: false });
+    expect(requests[0]?.signal?.aborted).toBe(true);
+  });
   it('keeps at most one request in flight and resumes after completion', async () => {
     const { result } = renderHook(() => useJpegPreview('/preview/a.jpg', 1000));
     expect(requests).toHaveLength(1);
@@ -96,6 +104,19 @@ describe('useJpegPreview', () => {
       await Promise.resolve();
     });
     expect(createdUrls).toEqual(revokedUrls);
+  });
+
+  it('does not show a previous source frame under a new source path', async () => {
+    const { result, rerender } = renderHook(({ path }) => useJpegPreview(path, 1000), { initialProps: { path: '/preview/a.jpg' } });
+    await act(async () => {
+      resolveResponse(requests[0], 'first');
+      await Promise.resolve();
+      requests[0]?.finishBlob?.();
+      await Promise.resolve();
+    });
+    expect(result.current).toBe('blob:preview-0');
+    rerender({ path: '/preview/b.jpg' });
+    expect(result.current).toBeUndefined();
   });
 
   it('aborts the old source and ignores its late completion', async () => {

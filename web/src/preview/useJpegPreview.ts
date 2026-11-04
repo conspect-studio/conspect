@@ -15,11 +15,12 @@ import { getStoredToken } from '../api/token';
  * refreshed every `refreshMs`. Returns `undefined` until a frame arrives (the
  * endpoint answers 503 when the engine has produced none yet).
  */
-export function useJpegPreview(path: string, refreshMs: number): string | undefined {
-  const [url, setUrl] = useState<string | undefined>(undefined);
+export function useJpegPreview(path: string, refreshMs: number, enabled = true): string | undefined {
+  const [frame, setFrame] = useState<{ path: string; url: string }>();
   const current = useRef<string | undefined>(undefined);
 
   useEffect(() => {
+    if (!enabled) return;
     let inFlight = false;
     let controller: AbortController | undefined;
 
@@ -31,7 +32,7 @@ export function useJpegPreview(path: string, refreshMs: number): string | undefi
     };
 
     const tick = async (): Promise<void> => {
-      if (inFlight) {
+      if (inFlight || document.visibilityState === 'hidden') {
         return;
       }
       inFlight = true;
@@ -59,7 +60,7 @@ export function useJpegPreview(path: string, refreshMs: number): string | undefi
         }
         revoke();
         current.current = next;
-        setUrl(next);
+        setFrame({ path, url: next });
       } catch {
         // Best-effort preview; a failed fetch just keeps the last frame.
       } finally {
@@ -78,7 +79,7 @@ export function useJpegPreview(path: string, refreshMs: number): string | undefi
       controller = undefined;
       revoke();
     };
-  }, [path, refreshMs]);
+  }, [path, refreshMs, enabled]);
 
-  return url;
+  return frame?.path === path ? frame.url : undefined;
 }

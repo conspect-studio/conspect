@@ -11,6 +11,10 @@
 // (`useEngineEvents`). All reads are best-effort and never block the engine
 // (invariant #10).
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import { HlsPlayer } from '../preview/HlsPlayer';
+import { hlsPlaybackPaths } from '../preview/outputPlayback';
+import { whepAvailable } from '../preview/capabilities';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useQuery } from '@tanstack/react-query';
@@ -107,6 +111,9 @@ export function MonitoringPage(): JSX.Element {
   const tiles = useLiveTiles();
   const outputs = useOutputs();
   const fidelity = programFidelity(capabilities.data);
+  const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
+  const [hlsOutput, setHlsOutput] = useState<string>('');
+  const hlsPath = playbackPaths.get(hlsOutput);
 
   // The served WebRTC (WHEP) outputs — previewable via their OUTPUT scope tap.
   const webrtcOutputs = (outputs.data ?? []).filter((output) => output.kind === 'webrtc');
@@ -129,10 +136,10 @@ export function MonitoringPage(): JSX.Element {
           <h2 id="program-heading" className="text-lg font-semibold">
             <Trans>Program</Trans>
           </h2>
-          {fidelity !== undefined ? <FidelityLabel fidelity={fidelity} /> : null}
+          {hlsPath === undefined && fidelity !== undefined && whepAvailable(capabilities.data, 'program') ? <FidelityLabel fidelity={fidelity} /> : null}
         </div>
         <Card className="overflow-hidden">
-          <PreviewSurface
+          {hlsPath !== undefined ? <HlsPlayer key={hlsPath} url={hlsPath} label={t`Program HLS output`} /> : <PreviewSurface
             scope="program"
             whepEndpoint="/api/v1/preview/program/whep"
             jpegPath="/api/v1/preview/program.jpg"
@@ -140,13 +147,24 @@ export function MonitoringPage(): JSX.Element {
             capabilities={capabilities.data}
             audio
             className="aspect-video w-full bg-black object-contain"
-          />
+          />}
+          <CardContent className="space-y-2 py-3">
+            <p className="text-sm text-muted-foreground"><Trans>This is the current engine program. Saved and unsaved layouts do not have separate live outputs.</Trans></p>
+            {playbackPaths.size > 0 ? <label className="flex flex-wrap items-center gap-2 text-sm">
+              <Trans>Playback transport</Trans>
+              <select className="rounded-md border bg-background p-2" value={hlsOutput} onChange={(event) => { setHlsOutput(event.target.value); }}>
+                <option value="">{whepAvailable(capabilities.data, 'program') ? t`WebRTC preview (low latency)` : t`Still preview (~1 fps)`}</option>
+                {(outputs.data ?? []).filter((output) => playbackPaths.has(output.id)).map((output) => <option key={output.id} value={output.id}>{t`HLS video (buffered)`}: {output.name}</option>)}
+              </select>
+            </label> : null}
+            <div className="flex flex-wrap gap-3 text-sm underline"><Link to="/layouts"><Trans>Manage layouts</Trans></Link><Link to="/sources"><Trans>Manage sources</Trans></Link><Link to="/outputs"><Trans>Manage outputs</Trans></Link></div>
+          </CardContent>
         </Card>
       </section>
 
       <section aria-labelledby="inputs-heading" className="mt-8">
         <h2 id="inputs-heading" className="mb-3 flex items-center gap-2 text-lg font-semibold">
-          <Trans>Inputs</Trans>
+          <Trans>Inputs — still thumbnails (~1 fps)</Trans>
           <HelpLink
             to="/help/concepts/resilience#tile-lifecycle"
             label={t`About tile lifecycle states`}
@@ -213,7 +231,7 @@ function InputThumbnail(props: {
 }): JSX.Element {
   const { t } = useLingui();
   const [open, setOpen] = useState(false);
-  const src = useJpegPreview(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000);
+  const src = useJpegPreview(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000, !open);
   return (
     <li>
       <Card className="overflow-hidden">
@@ -228,7 +246,7 @@ function InputThumbnail(props: {
             variant="secondary"
             size="icon"
             className="absolute right-2 top-2"
-            aria-label={t`Open live preview of input ${props.id}`}
+            aria-label={t`Open preview of input ${props.id}`}
             onClick={(): void => {
               setOpen(true);
             }}
@@ -248,7 +266,7 @@ function InputThumbnail(props: {
         <DialogContent className="max-w-3xl">
           <DialogHeader>
             <DialogTitle>
-              <Trans>Live preview — input {props.id}</Trans>
+              <Trans>Preview — input {props.id}</Trans>
             </DialogTitle>
           </DialogHeader>
           {open ? (

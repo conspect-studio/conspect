@@ -100,9 +100,19 @@ The operator's "is everything alive?" view. Per-tile FPS / bitrate / up-down, th
 SLO** (zero-gap / PTS continuity / TR 101 290), active alerts, and the **adaptation panel** showing
 the live degradation-ladder position + active lever + the *"why"* sensor reading. Audio meters
 (EBU R128, true-peak) render from a conflated **10–25 Hz** numeric stream — never the raw audio rate.
-A **live multiview preview** uses WHEP `<video>` for sub-second motion with a graceful MJPEG fallback
-that always ships (works where UDP/TURN is blocked). All cards are SSE/WS-driven into the TanStack
-Query cache — read-only, drop-oldest, never blocking.
+The implemented preview selects WHEP `<video>` only when the server advertises that scope.
+Otherwise it explicitly labels the JPEG still preview (~1 fps); this is not live video.
+Monitoring also offers opt-in buffered HLS playback for configured HLS/LL-HLS outputs with
+unambiguous delivery paths and playlist filenames. These are configuration-derived candidates,
+not runtime availability claims: a stopped output or unsupported codec shows an unavailable
+message. The player consumes the existing encoded output; it does not start another encode.
+The UI does not infer selectable-audio master playlists. Source previews open on demand from
+Sources; source WHEP remains video-only where the backend does not provide input audio.
+JPEG polling permits one in-flight request per mounted preview, aborts on cleanup, and pauses
+in hidden tabs. Opening an input focus pauses that thumbnail's poll.
+Saved layouts are documents, not separate live renderers: apply a saved layout to the engine,
+then inspect the current program on Monitoring. Save and Save & apply remain distinct actions.
+Numeric state uses SSE/WS and the TanStack Query cache — read-only, drop-oldest, never blocking.
 
 ### 4.2 Sources
 

@@ -111,7 +111,8 @@ describe('<PreviewSurface>', () => {
       />,
     );
     expect(getByTestId('jpeg-rung')).toBeInTheDocument();
-    // No degradation: JPEG is the deployment's primary, not a fallback.
+    // A primary still preview is labeled too; it is not live video.
+    expect(getByTestId('still-preview-label')).toHaveTextContent('Still preview (~1 fps)');
     expect(queryByTestId('fallback-badge')).toBeNull();
     // The WHEP player was never mounted.
     expect(queryByTestId('whep-player')).toBeNull();
