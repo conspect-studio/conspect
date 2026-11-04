@@ -16,7 +16,8 @@
 //! it runs entirely on the off-hot-path egress thread and never blocks the output
 //! clock or back-pressures the engine.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -193,9 +194,17 @@ impl LivePlaylist {
         }
         // An old client can still hold a recently superseded manifest. Retain
         // one further full window before unlinking, without unbounded growth.
+        let references = self
+            .playlist_path
+            .parent()
+            .and_then(media_segment_references);
         while self.retired_paths.len() > self.window.max(3) {
-            if let Some(expired) = self.retired_paths.pop_front() {
-                prune_segment(&expired);
+            if let (Some(expired), Some(references)) = (self.retired_paths.pop_front(), &references)
+            {
+                // An old generation or a stalled sibling can still list this TS.
+                if !references.contains(&expired.file_name().unwrap_or_default().to_os_string()) {
+                    prune_segment(&expired);
+                }
             }
         }
         Ok(())
@@ -218,6 +227,41 @@ impl LivePlaylist {
         let text = self.playlist.render();
         atomic_write(&self.playlist_path, text.as_bytes())
     }
+}
+
+/// Exact same-directory TS basenames named by any still-present media manifest.
+/// Fail closed on unreadable manifests: callers must not unlink uncertain media.
+/// Never join a manifest URI to a filesystem path; reject path separators, query
+/// strings and traversal so untrusted playlist text cannot escape the directory.
+pub(crate) fn media_segment_references(dir: &Path) -> Option<HashSet<OsString>> {
+    let mut references = HashSet::new();
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if !entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"))
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(entry.path()).ok()?;
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            if Path::new(line)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+            {
+                if line.is_empty()
+                    || line == "."
+                    || line == ".."
+                    || line.contains(['/', '\\', '?', '#'])
+                {
+                    return None;
+                }
+                references.insert(OsString::from(line));
+            }
+        }
+    }
+    Some(references)
 }
 
 /// Best-effort unlink of an evicted segment file. The result is deliberately

@@ -50,8 +50,8 @@ use multiview_ffmpeg::{
 use crate::epoch::SharedEpoch;
 use crate::error::{Error, Result};
 use crate::hls::{
-    atomic_write, AudioRendition, LivePlaylist, MasterPlaylist, MediaPlaylist, Segment,
-    SegmentType, VariantStream,
+    atomic_write, media_segment_references, AudioRendition, LivePlaylist, MasterPlaylist,
+    MediaPlaylist, Segment, SegmentType, VariantStream,
 };
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
 
@@ -2573,6 +2573,8 @@ fn prune_prior_rendition_manifests(dir: &Path, renditions: &AudioRenditions<'_>,
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
+        // Do not interpret an untrusted URI as a path. Invalid manifests stay
+        // on disk and prevent deletion through the fail-closed reference scan.
         let listed: Vec<_> = text
             .lines()
             .filter(|line| {
@@ -2581,7 +2583,9 @@ fn prune_prior_rendition_manifests(dir: &Path, renditions: &AudioRenditions<'_>,
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
             })
             .collect();
-        if !listed.is_empty()
+        if listed
+            .iter()
+            .all(|uri| !uri.contains(['/', '\\', '?', '#']))
             && listed.iter().any(|uri| {
                 segment_number(uri).is_some_and(|index| index < oldest) || !dir.join(uri).exists()
             })
@@ -2608,6 +2612,11 @@ fn segment_number(uri: &str) -> Option<u64> {
 
 fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize) {
     let oldest = next.saturating_sub(segment_grace(window));
+    // Snapshot after expired manifests have been retired. An unreadable or
+    // malformed playlist makes deletion unsafe, so keep the files instead.
+    let Some(references) = media_segment_references(dir) else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2627,9 +2636,10 @@ fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize)
                         .and_then(|(track, index)| track.parse::<u16>().ok().map(|_| index))
                 })
             });
-        if number
-            .and_then(|index| index.parse::<u64>().ok())
-            .is_some_and(|index| index < oldest)
+        if !references.contains(std::ffi::OsStr::new(name))
+            && number
+                .and_then(|index| index.parse::<u64>().ok())
+                .is_some_and(|index| index < oldest)
         {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) | Err(_) => {}

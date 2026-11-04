@@ -29,6 +29,43 @@ fn touch_segment(dir: &std::path::Path, name: &str) -> PathBuf {
 }
 
 #[test]
+fn sibling_manifest_pins_retired_segment_until_sibling_retires() {
+    let dir = tempfile::tempdir().unwrap();
+    let sibling = dir.path().join("audio-program-g0.m3u8");
+    std::fs::write(&sibling, "#EXTM3U\nvideo-0.ts\n").unwrap();
+    let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
+    for index in 0..10 {
+        let name = format!("video-{index}.ts");
+        let path = touch_segment(dir.path(), &name);
+        live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
+            .unwrap();
+    }
+    assert!(dir.path().join("video-0.ts").is_file());
+    assert!(!dir.path().join("video-1.ts").exists());
+    // The sink's sequence reaper collects this deferred TS after retirement.
+    // The local driver must never unlink it while the sibling references it.
+    assert!(sibling.exists());
+}
+
+#[test]
+fn malformed_sibling_uri_cannot_traverse_or_authorize_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("audio-program-g0.m3u8"),
+        "#EXTM3U\n../video-0.ts\n",
+    )
+    .unwrap();
+    let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
+    for index in 0..10 {
+        let name = format!("video-{index}.ts");
+        let path = touch_segment(dir.path(), &name);
+        live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
+            .unwrap();
+    }
+    assert!(dir.path().join("video-0.ts").is_file());
+}
+
+#[test]
 fn failed_publish_preserves_previous_manifest_and_all_its_segments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let manifest = dir.path().join("index.m3u8");

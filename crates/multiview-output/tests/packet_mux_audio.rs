@@ -77,6 +77,13 @@ fn encode_video() -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
 }
 
 fn encode_video_at(bit_rate: usize) -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
+    encode_video_frames(bit_rate, VIDEO_FRAMES)
+}
+
+fn encode_video_frames(
+    bit_rate: usize,
+    frame_count: i64,
+) -> (Vec<EncodedPacket>, StreamCodecParameters, Rational) {
     let target = VideoEncodeTarget {
         codec_name: "mpeg2video".to_owned(),
         width: WIDTH,
@@ -91,7 +98,7 @@ fn encode_video_at(bit_rate: usize) -> (Vec<EncodedPacket>, StreamCodecParameter
     let time_base = encoder.time_base();
     let params = StreamCodecParameters::from_encoder(&encoder);
     let mut packets = Vec::new();
-    for tick in 0..VIDEO_FRAMES {
+    for tick in 0..frame_count {
         encoder
             .send_frame(&gray_frame(tick))
             .expect("send video frame");
@@ -618,6 +625,7 @@ fn failed_master_publish_keeps_old_master_and_all_cached_media() {
     for uri in master_media_uris(&old_master) {
         assert_manifest_and_media_readable(dir.path(), &uri);
     }
+    assert_all_media_references_exist(dir.path());
 }
 
 #[test]
@@ -660,6 +668,166 @@ fn live_restart_reaps_prior_generations_without_erasing_current_window() {
             assert!(
                 dir.path().join(uri).exists(),
                 "listed segment absent: {uri}"
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_master_publish_preserves_sparse_audio_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let (video, v_params, v_tb) = encode_video_frames(750_000, 4 * 35);
+    let (audio, a_params, a_tb) = encode_audio();
+    let audio = audio
+        .into_iter()
+        .filter(|packet| pts_ns(packet, a_tb) < 100_000_000)
+        .collect();
+    let mut source = VecPackets {
+        packets: interleave(video, v_tb, audio, a_tb).into_iter(),
+    };
+    PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .with_audio_selection(AudioSelection {
+        program: true,
+        tracks: vec![],
+    })
+    .run_av_tracks(
+        &mut source,
+        MuxStream::new(&v_params, v_tb),
+        Some(MuxStream::new(&a_params, a_tb)),
+        &[],
+    )
+    .unwrap();
+    let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+    std::fs::create_dir(dir.path().join("master.m3u8.tmp")).unwrap();
+    let (video, v_params, v_tb) = encode_video_frames(850_000, 4 * 35);
+    let mut source = VecPackets {
+        packets: video.into_iter(),
+    };
+    assert!(PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new()
+    )
+    .run_av_tracks(&mut source, MuxStream::new(&v_params, v_tb), None, &[])
+    .is_err());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap(),
+        master
+    );
+    for uri in master_media_uris(&master) {
+        assert_manifest_and_media_readable(dir.path(), &uri);
+    }
+    assert_all_media_references_exist(dir.path());
+}
+
+#[test]
+fn sparse_audio_keeps_all_manifest_references_and_bounds_stalled_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let (video, v_params, v_tb) = encode_video_frames(750_000, 4 * 55);
+    let (audio, a_params, a_tb) = encode_audio();
+    // One audio GOP, then no more audio across several complete grace windows.
+    let audio = audio
+        .into_iter()
+        .filter(|packet| pts_ns(packet, a_tb) < 100_000_000)
+        .collect();
+    let packets = interleave(video, v_tb, audio, a_tb);
+    let mut source = VecPackets {
+        packets: packets.into_iter(),
+    };
+    PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .with_audio_selection(AudioSelection {
+        program: true,
+        tracks: vec![],
+    })
+    .run_av_tracks(
+        &mut source,
+        MuxStream::new(&v_params, v_tb),
+        Some(MuxStream::new(&a_params, a_tb)),
+        &[],
+    )
+    .unwrap();
+    let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+    let audio_uri = master_media_uris(&master)
+        .into_iter()
+        .find(|uri| uri.starts_with("audio-program-g"))
+        .unwrap();
+    let first_audio = std::fs::read_to_string(dir.path().join(&audio_uri)).unwrap();
+    let old_segment = first_audio
+        .lines()
+        .find(|line| Path::new(line).extension().is_some_and(|ext| ext == "ts"))
+        .unwrap();
+    assert!(
+        dir.path().join(old_segment).exists(),
+        "stalled audio manifest lost {old_segment}"
+    );
+    assert_all_media_references_exist(dir.path());
+    let count = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "ts"))
+        .count();
+    assert!(count <= 20, "stalled audio retained {count} segments");
+
+    // Restart with the audio track removed. The old generation remains readable
+    // until its bounded grace expires, then its references retire before TS GC.
+    let (video, v_params, v_tb) = encode_video_frames(750_000, 4 * 55);
+    let mut source = VecPackets {
+        packets: video.into_iter(),
+    };
+    PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .run_av_tracks(&mut source, MuxStream::new(&v_params, v_tb), None, &[])
+    .unwrap();
+    assert_all_media_references_exist(dir.path());
+    assert!(
+        !dir.path().join(&audio_uri).exists(),
+        "expired audio manifest must retire"
+    );
+    assert!(
+        !dir.path().join(old_segment).exists(),
+        "retired audio reference must release TS"
+    );
+    let count = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "ts"))
+        .count();
+    assert!(count <= 20, "retired generation retained {count} segments");
+}
+
+fn assert_all_media_references_exist(dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        if entry.path().extension().is_none_or(|ext| ext != "m3u8") {
+            continue;
+        }
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        for uri in text
+            .lines()
+            .filter(|line| Path::new(line).extension().is_some_and(|ext| ext == "ts"))
+        {
+            assert!(
+                dir.join(uri).is_file(),
+                "{} references missing {uri}",
+                entry.path().display()
             );
         }
     }
