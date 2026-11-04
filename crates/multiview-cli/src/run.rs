@@ -39,7 +39,9 @@ use multiview_engine::{
 use multiview_events::Event;
 use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 
-use crate::synth::{generator_loop, SyntheticKind};
+#[cfg(not(feature = "ffmpeg"))]
+use crate::synth::generator_loop;
+use crate::synth::SyntheticKind;
 
 /// The per-subscriber drop-oldest depth of the engine's outbound event stream.
 /// The software smoke has no consumers, but the publisher still needs a positive
@@ -261,7 +263,7 @@ struct AnimatedSource {
 #[must_use = "the generators run until shutdown; drop without shutdown leaks threads"]
 pub struct GeneratorSupervisor {
     /// One (stop flag, join handle) per spawned generator thread.
-    producers: Vec<(Arc<AtomicBool>, JoinHandle<()>)>,
+    producers: Vec<(Arc<AtomicBool>, JoinHandle<()>, String, u64)>,
 }
 
 impl GeneratorSupervisor {
@@ -272,10 +274,10 @@ impl GeneratorSupervisor {
     /// torn down by a live remove (its flag raised via the registry) has exited;
     /// its join returns immediately.
     pub fn shutdown(self) {
-        for (stop, _) in &self.producers {
+        for (stop, _, _, _) in &self.producers {
             stop.store(true, Ordering::Release);
         }
-        for (_, handle) in self.producers {
+        for (_, handle, id, lifecycle) in self.producers {
             // A generator thread only ever *writes* a lock-free store it shares by
             // `Arc` and owns no external resource, so a join error (a panicked
             // thread) cannot corrupt the produced output; log and continue so one
@@ -283,6 +285,10 @@ impl GeneratorSupervisor {
             if handle.join().is_err() {
                 tracing::error!("a synthetic-source generator thread panicked");
             }
+            #[cfg(feature = "ffmpeg")]
+            crate::pipeline::end_live_lifecycle(&id, lifecycle);
+            #[cfg(not(feature = "ffmpeg"))]
+            let _ = (id, lifecycle);
         }
     }
 }
@@ -505,16 +511,36 @@ impl SoftwareEngine {
             // (ADR-W018 §5).
             let exit_guard = crate::live_sources::ExitGuard::new(&exited);
             let thread_stop = Arc::clone(&stop);
+            #[cfg(feature = "ffmpeg")]
+            let lifecycle = crate::pipeline::begin_live_lifecycle(&id);
+            #[cfg(not(feature = "ffmpeg"))]
+            let lifecycle = 0;
+            #[cfg(feature = "ffmpeg")]
+            let thread_id = id.clone();
             let builder = std::thread::Builder::new().name(format!("multiview-synth-{id}"));
             match builder.spawn(move || {
                 let _exit = exit_guard;
+                #[cfg(feature = "ffmpeg")]
+                crate::synth::generator_loop_fenced(
+                    kind,
+                    &store,
+                    width,
+                    height,
+                    canvas,
+                    cadence,
+                    &thread_stop,
+                    Some((&thread_id, lifecycle)),
+                );
+                #[cfg(not(feature = "ffmpeg"))]
                 generator_loop(kind, &store, width, height, canvas, cadence, &thread_stop);
             }) {
-                Ok(handle) => producers.push((stop, handle)),
+                Ok(handle) => producers.push((stop, handle, id, lifecycle)),
                 Err(e) => {
                     // A generator that cannot spawn is logged and skipped: its tile
                     // simply rides the slate rather than failing the run (invariant
                     // #1 — the output clock is independent of inputs).
+                    #[cfg(feature = "ffmpeg")]
+                    crate::pipeline::end_live_lifecycle(&id, lifecycle);
                     tracing::error!(error = %e, source = %id, "could not spawn synthetic generator thread");
                 }
             }

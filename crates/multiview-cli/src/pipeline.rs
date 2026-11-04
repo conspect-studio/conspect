@@ -2299,6 +2299,9 @@ impl Pipeline {
                 canvas_color,
                 cadence,
             )?;
+            // Reserve the authoritative epoch before either startup rail starts.
+            // Old detached publishers from a previous run retain their old token.
+            plan.lifecycle = begin_live_lifecycle(&source.id);
 
             // Stamp this source's NDI license acceptance from `[system.ndi]`
             // (ADR-0008 §7.5), like `cuda_ordinal` below — the per-source drive
@@ -2326,6 +2329,11 @@ impl Pipeline {
                 &mut prefetched_captions,
             );
 
+            let lifecycle = plan.lifecycle;
+            let anchor_floor = plan
+                .live_anchor
+                .load()
+                .map_or(0, |anchor| anchor.generation);
             stores.insert(source.id.clone(), store);
             ingest_plans.push(plan);
 
@@ -2334,7 +2342,9 @@ impl Pipeline {
             // source yields `None` (no audio thread; it rides silence on the bus).
             // The store is built per audio-bearing source so the bus can route it;
             // it stays empty (silence-filling) until the decode thread fills it.
-            if let Some(audio_plan) = audio_ingest_plan_for(source) {
+            if let Some(mut audio_plan) = audio_ingest_plan_for(source) {
+                audio_plan.lifecycle = lifecycle;
+                audio_plan.anchor_floor = anchor_floor;
                 // A live network source arrives on its own clock: give it the
                 // cushioned store so fetch stalls are inaudible. A file plays
                 // from frame 0 against the output clock: the plain store.
@@ -3298,6 +3308,11 @@ impl Pipeline {
         // plans by value means a second call simply ingests nothing (the stores
         // hold their last frames / slate) rather than double-spawning.
         let mut plans = std::mem::take(&mut self.ingest_plans);
+        let startup_lifecycles: Vec<(String, u64)> = plans
+            .iter()
+            .filter(|plan| plan.player.is_none())
+            .map(|plan| (plan.id.clone(), plan.lifecycle))
+            .collect();
         // Every decode stamps its frames on the run's output timeline once the
         // program seeds (see `IngestPlan::output_origin`).
         for plan in &mut plans {
@@ -3855,6 +3870,11 @@ impl Pipeline {
         // ingest down deterministically (signal + join), then close the egress and
         // finalise. The hot queue is already closed by this point — see below.
         supervisor.shutdown();
+        // Invalidate every startup producer, including any libav worker detached
+        // after the bounded join. No old run may write into a later run's slot.
+        for (id, lifecycle) in startup_lifecycles {
+            end_live_lifecycle(&id, lifecycle);
+        }
         // The engine loop consumed the `state_of` closure (the ONLY owner of the
         // hot sender) when `run_for`/`run` returned above, so the hot queue is
         // already closed → the bake consumer's `recv()` has seen end-of-input,
@@ -4528,9 +4548,13 @@ impl StreamEgress {
 
         let (hot_tx, hot_rx) = std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
         let consumer_in_flight = Arc::clone(&in_flight);
+        // Keep a guard outside the spawn closure too: a failed thread spawn
+        // drops its captured guard and wakes any hub producer already waiting.
+        let consumer_guard = audio_route.as_ref().map(|route| route.consumer_guard());
         let builder = std::thread::Builder::new().name("multiview-bake-consumer".to_owned());
         let consumer = builder
             .spawn(move || {
+                let _consumer_guard = consumer_guard;
                 consumer_main(
                     ctx,
                     &hot_rx,
@@ -6652,7 +6676,9 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             let audio_store = produced.as_ref().and_then(|p| {
                 spawn_live_audio(&source, &p.stop, registry, lifecycle, anchor_floor)
             });
-            handle.set_source_audio(&source.id, audio_store);
+            if !handle.set_source_audio(&source.id, audio_store) {
+                tracing::warn!(source = %source.id, "audio membership rejected: consumer closed");
+            }
         }
         produced
     }
@@ -6661,14 +6687,18 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         // A timed-out decoded producer must not publish after HLS -> synthetic.
         begin_live_lifecycle(id);
         if let Some(handle) = self.audio_route.load() {
-            handle.set_source_audio(id, None);
+            if !handle.set_source_audio(id, None) {
+                tracing::warn!(source = %id, "audio membership rejected: consumer closed");
+            }
         }
     }
 
     fn source_removed(&self, id: &str) {
         begin_live_lifecycle(id);
         if let Some(handle) = self.audio_route.load() {
-            handle.remove_source(id);
+            if !handle.remove_source(id) {
+                tracing::warn!(source = %id, "audio removal rejected: consumer closed");
+            }
         }
     }
 }
@@ -6963,6 +6993,160 @@ mod live_edit_audio_regression_tests {
             Arc::ptr_eq(&slot, &live_anchor_slot("anchor-edit")),
             "audio and replacement video share the anchor slot"
         );
+    }
+
+    #[test]
+    fn paused_a_frame_cannot_overwrite_b_after_replace_or_remove() {
+        use multiview_framestore::{NoSignalPolicy, TileRead, TileThresholds};
+        let id = "paused-frame-epoch";
+        let store = Arc::new(multiview_framestore::TileStore::new(
+            id,
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let slot = live_anchor_slot(id);
+        let a = begin_live_lifecycle(id);
+        let image =
+            || Nv12Image::solid(2, 2, 16, 128, 128, CanvasColor::default().output_tag()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let store_a = Arc::clone(&store);
+            let slot_a = Arc::clone(&slot);
+            scope.spawn(move || {
+                ready_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                assert!(!publish_live_frame_for(
+                    id,
+                    a,
+                    &store_a,
+                    &slot_a,
+                    image(),
+                    MediaTime::from_nanos(100),
+                    Some((MediaTime::ZERO, Some(11))),
+                ));
+            });
+            ready_rx.recv().unwrap(); // A is paused immediately before publish.
+            let b = begin_live_lifecycle(id);
+            assert!(publish_live_frame_for(
+                id,
+                b,
+                &store,
+                &slot,
+                image(),
+                MediaTime::from_nanos(200),
+                Some((MediaTime::ZERO, Some(22))),
+            ));
+            resume_tx.send(()).unwrap();
+        });
+        assert_eq!(store.sequence(), 1, "A must not mutate B's reused store");
+        assert_eq!(slot.load().unwrap().raw_pts0_ns, Some(22));
+        assert!(matches!(
+            store.read_at(MediaTime::from_nanos(200)),
+            TileRead::Fresh { .. }
+        ));
+        let b = live_lifecycle(id);
+        begin_live_lifecycle(id); // B -> removed / synthetic replacement.
+        assert!(!publish_live_frame_for(
+            id,
+            b,
+            &store,
+            &slot,
+            image(),
+            MediaTime::from_nanos(300),
+            Some((MediaTime::ZERO, Some(33))),
+        ));
+        assert_eq!(store.sequence(), 1);
+        assert!(crate::audio::test_video_anchor(&slot).is_none());
+        let synthetic = live_lifecycle(id);
+        assert!(!publish_live_synth_frame_for(
+            id,
+            b,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(400),
+        ));
+        assert!(publish_live_synth_frame_for(
+            id,
+            synthetic,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(500),
+        ));
+        assert_eq!(store.sequence(), 2, "only the new synthetic may publish");
+    }
+
+    #[test]
+    fn two_startup_runs_after_edit_use_fresh_video_audio_and_synthetic_epochs() {
+        use multiview_framestore::{NoSignalPolicy, TileThresholds};
+        let id = "repeated-startup-source";
+        let slot = live_anchor_slot(id);
+        let store = TileStore::new(id, TileThresholds::default(), NoSignalPolicy::HoldForever);
+        let image =
+            || Nv12Image::solid(2, 2, 16, 128, 128, CanvasColor::default().output_tag()).unwrap();
+        let first = begin_live_lifecycle(id);
+        assert!(publish_live_frame_for(
+            id,
+            first,
+            &store,
+            &slot,
+            image(),
+            MediaTime::ZERO,
+            Some((MediaTime::ZERO, Some(11)))
+        ));
+        end_live_lifecycle(id, first);
+        let edited = begin_live_lifecycle(id);
+        end_live_lifecycle(id, edited);
+        let second = begin_live_lifecycle(id);
+        let audio_floor = slot.load().unwrap().generation;
+        assert!(second > edited && audio_floor > 0);
+        assert!(publish_live_frame_for(
+            id,
+            second,
+            &store,
+            &slot,
+            image(),
+            MediaTime::from_nanos(20),
+            Some((MediaTime::from_nanos(20), Some(22)))
+        ));
+        assert!(
+            slot.load().unwrap().generation > audio_floor,
+            "audio plan must wait for this run's frame"
+        );
+        assert_eq!(slot.load().unwrap().raw_pts0_ns, Some(22));
+        assert!(!publish_live_frame_for(
+            id,
+            first,
+            &store,
+            &slot,
+            image(),
+            MediaTime::from_nanos(30),
+            None
+        ));
+        end_live_lifecycle(id, second);
+        let synthetic = begin_live_lifecycle(id);
+        assert!(publish_live_synth_frame_for(
+            id,
+            synthetic,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(40)
+        ));
+        assert!(!publish_live_synth_frame_for(
+            id,
+            second,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(50)
+        ));
+        end_live_lifecycle(id, synthetic);
+        assert!(!publish_live_synth_frame_for(
+            id,
+            synthetic,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(60)
+        ));
     }
 
     #[test]
@@ -10468,7 +10652,7 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
     // Synthetic sources (bars/solid/clock) render in-process — no decode, no
     // reconnect; the generator publishes into the store at cadence until `stop`.
     if let SourceLocation::Synthetic(kind) = &plan.location {
-        crate::synth::generator_loop(
+        crate::synth::generator_loop_fenced(
             kind.clone(),
             &plan.store,
             plan.tile_w,
@@ -10476,6 +10660,7 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
             plan.canvas_color,
             plan.cadence,
             stop,
+            Some((plan.id.as_str(), plan.lifecycle)),
         );
         return;
     }
@@ -11817,30 +12002,32 @@ fn open_and_stream(
                 // Always rebased on THIS frame: (at, pts, its raw PTS).
                 let raw_ns = decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base));
                 let reanchored = stamper.take_reanchored().is_some();
-                if anchor_due(reanchored, last_raw_offset, raw_ns, at) {
-                    publish_live_anchor_for(
-                        &plan.id,
-                        plan.lifecycle,
-                        &plan.live_anchor,
-                        (at, pts),
-                        raw_ns,
-                    );
-                    if let Some(raw) = raw_ns {
-                        last_raw_offset = Some(at.as_nanos().saturating_sub(raw));
+                let due = anchor_due(reanchored, last_raw_offset, raw_ns, at);
+                // Both publications belong to one producer epoch. Keep the
+                // producer-side lifecycle lock across the frame AND its anchor:
+                // teardown may detach a stalled A, but A cannot write into B's
+                // reused TileStore after B begins (nor expose A's anchor).
+                if publish_live_frame_for(
+                    &plan.id,
+                    plan.lifecycle,
+                    &plan.store,
+                    &plan.live_anchor,
+                    image,
+                    at,
+                    due.then_some((pts, raw_ns)),
+                ) {
+                    if due {
+                        if let Some(raw) = raw_ns {
+                            last_raw_offset = Some(at.as_nanos().saturating_sub(raw));
+                        }
                     }
+                    crate::av_sync::record_video(&av_probe, at, raw_ns);
                 }
-                at
+                continue;
             } else {
                 pacer.publish_time(pts)
             };
             plan.store.publish(image, at);
-            if plan.live {
-                crate::av_sync::record_video(
-                    &av_probe,
-                    at,
-                    decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base)),
-                );
-            }
         }
         if drained {
             return Ok(());
@@ -12998,12 +13185,19 @@ pub(crate) fn live_lifecycle(id: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn begin_live_lifecycle(id: &str) -> u64 {
+pub(crate) fn begin_live_lifecycle(id: &str) -> u64 {
     let mut tokens = anchor_lifecycle()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    advance_live_lifecycle(id, &mut tokens)
+}
+
+#[allow(clippy::expect_used)] // 2^64 lifecycle replacements cannot safely reuse a token; fail closed before ABA.
+fn advance_live_lifecycle(id: &str, tokens: &mut std::collections::HashMap<String, u64>) -> u64 {
     let token = tokens.entry(id.to_owned()).or_default();
-    *token = token.saturating_add(1);
+    *token = token
+        .checked_add(1)
+        .expect("source lifecycle epoch exhausted");
     let slot = live_anchor_slot(id);
     let generation = slot
         .load()
@@ -13017,6 +13211,17 @@ fn begin_live_lifecycle(id: &str) -> u64 {
     })));
     crate::hls_fetch::begin_generation(id);
     *token
+}
+
+/// Invalidate an ending run only if its startup producer still owns this id.
+/// A later runtime replacement must keep its newer epoch.
+pub(crate) fn end_live_lifecycle(id: &str, lifecycle: u64) {
+    let mut tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied() == Some(lifecycle) {
+        advance_live_lifecycle(id, &mut tokens);
+    }
 }
 
 /// `ticks` of `time_base` in nanoseconds (exact integer math, `None` on a
@@ -13054,6 +13259,7 @@ fn anchor_due(
 
 /// Publish only when this producer still owns the source lifecycle. The lock
 /// covers both the ownership check and store, excluding replacement races.
+#[cfg(test)]
 fn publish_live_anchor_for(
     id: &str,
     lifecycle: u64,
@@ -13067,6 +13273,49 @@ fn publish_live_anchor_for(
     if tokens.get(id).copied().unwrap_or(0) == lifecycle {
         publish_live_anchor(slot, at, raw_pts0_ns);
     }
+}
+
+/// Fence a synthetic producer's image against the same lifecycle as decoded
+/// video. Called only from the generator thread (never from the output clock).
+pub(crate) fn publish_live_synth_frame_for(
+    id: &str,
+    lifecycle: u64,
+    store: &multiview_framestore::TileStore<Nv12Image>,
+    image: Arc<Nv12Image>,
+    at: MediaTime,
+) -> bool {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied().unwrap_or(0) != lifecycle {
+        return false;
+    }
+    store.publish_arc(image, at);
+    true
+}
+
+/// Atomically fence the video image and its source-PTS metadata against the
+/// existing lifecycle token. This runs only in the producer, never output-clock.
+fn publish_live_frame_for(
+    id: &str,
+    lifecycle: u64,
+    store: &multiview_framestore::TileStore<Nv12Image>,
+    slot: &LiveAnchorSlot,
+    image: Nv12Image,
+    at: MediaTime,
+    anchor: Option<(MediaTime, Option<i64>)>,
+) -> bool {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied().unwrap_or(0) != lifecycle {
+        return false;
+    }
+    store.publish(image, at);
+    if let Some((pts, raw)) = anchor {
+        publish_live_anchor(slot, (at, pts), raw);
+    }
+    true
 }
 
 /// Publish a fresh anchor into `slot`, bumping its generation.

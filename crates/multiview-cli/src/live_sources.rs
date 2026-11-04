@@ -495,6 +495,8 @@ fn spawn_synth(
         preview_insert(preview, &id, &store);
         return;
     }
+    #[cfg(feature = "ffmpeg")]
+    let lifecycle = crate::pipeline::begin_live_lifecycle(&id);
     let stop = Arc::new(AtomicBool::new(false));
     let exited = register_stop(registry, &id, &stop);
     // ExitGuard built BEFORE spawn: its Drop flips `exited` on thread exit OR if
@@ -504,9 +506,23 @@ fn spawn_synth(
     preview_insert(preview, &id, &store);
     let thread_stop = Arc::clone(&stop);
     let thread_store = Arc::clone(&store);
+    #[cfg(feature = "ffmpeg")]
+    let thread_id = id.clone();
     let builder = std::thread::Builder::new().name(format!("multiview-synth-live-{id}"));
     match builder.spawn(move || {
         let _exit = exit_guard;
+        #[cfg(feature = "ffmpeg")]
+        crate::synth::generator_loop_fenced(
+            kind,
+            &thread_store,
+            width,
+            height,
+            canvas,
+            cadence,
+            &thread_stop,
+            Some((&thread_id, lifecycle)),
+        );
+        #[cfg(not(feature = "ffmpeg"))]
         crate::synth::generator_loop(
             kind,
             &thread_store,

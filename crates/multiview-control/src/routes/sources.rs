@@ -60,6 +60,17 @@ fn live_apply_upsert(
         return ApplyMode::Restart;
     };
     if state.live_sources.is_live(&source.kind) {
+        // The running registry, not merely the durable source collection,
+        // defines live admission. A stored restart-only source may already be
+        // outside the adopted set. Never report `live` for an over-cap add.
+        if let Some(model) = state.boot_model.as_ref() {
+            let adopted = model.adopted_sources();
+            if !adopted.iter().any(|entry| entry.id == source.id)
+                && adopted.len() >= multiview_config::MAX_ADMITTED_SOURCES
+            {
+                return ApplyMode::Restart;
+            }
+        }
         let submitted = state
             .commands
             .try_submit(Command::UpsertSource {
@@ -251,6 +262,12 @@ pub(crate) async fn create_source(
     // takes the same lock) can never compose mid-mutation and the adopted
     // snapshot advances atomically with the engine submit.
     let _mutation = state.lock_config_mutation().await;
+    if state.sources.list()?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
+        return Err(crate::error::ControlError::Validation(format!(
+            "sources exceeds the live source capacity of {}",
+            multiview_config::MAX_ADMITTED_SOURCES
+        )));
+    }
     let versioned = state.sources.create(&id, input)?;
     state.audit(
         &principal.key_id,

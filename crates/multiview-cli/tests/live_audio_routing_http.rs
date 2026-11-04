@@ -239,8 +239,9 @@ async fn a_source_added_at_runtime_routes_live_and_removal_drops_its_bus_point()
     let live_store = steady_store(0.3, 4);
 
     // The hub registers the new source's store; the bake consumer picks it up.
-    run.handle
-        .set_source_audio("msnow", Some(Arc::clone(&live_store)));
+    assert!(run
+        .handle
+        .set_source_audio("msnow", Some(Arc::clone(&live_store))));
     run.handle.apply_pending(&mut run.bus);
     assert_eq!(
         run.bus.live_strip_count(),
@@ -276,7 +277,7 @@ async fn a_source_added_at_runtime_routes_live_and_removal_drops_its_bus_point()
 
     // Removal: the bus point goes (after a click-free fade), and a route
     // naming it no longer applies live.
-    run.handle.remove_source("msnow");
+    assert!(run.handle.remove_source("msnow"));
     run.handle.apply_pending(&mut run.bus);
     for tick in 6..=9 {
         run.bus.tick_to(tick);
@@ -291,7 +292,7 @@ async fn a_source_added_at_runtime_routes_live_and_removal_drops_its_bus_point()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routing_an_existing_source_without_audio_is_live() {
     let run = running_bus();
-    run.handle.set_source_audio("slate", None);
+    assert!(run.handle.set_source_audio("slate", None));
     let doc = serde_json::json!({
         "sample_rate_hz": 48_000,
         "routes": [

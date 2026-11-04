@@ -919,6 +919,25 @@ pub fn generator_loop(
     cadence: Rational,
     stop: &AtomicBool,
 ) {
+    generator_loop_fenced(kind, store, width, height, canvas, cadence, stop, None);
+}
+
+/// Live generator with a producer lifecycle token; stale detached writers
+/// cannot publish into a replacement's reused tile store.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+// reason: this is the original generator's positional call plus one lifecycle
+// option; the thread owns its kind, and keeping the wrapper preserves existing
+// startup producers and their public API.
+pub(crate) fn generator_loop_fenced(
+    kind: SyntheticKind,
+    store: &TileStore<Nv12Image>,
+    width: u32,
+    height: u32,
+    canvas: CanvasColor,
+    cadence: Rational,
+    stop: &AtomicBool,
+    lifecycle: Option<(&str, u64)>,
+) {
     let interval = tick_interval(cadence);
     let start = Instant::now();
     // (render-key, frame) so a clock re-renders once a second and statics once.
@@ -948,7 +967,19 @@ pub fn generator_loop(
         };
         let elapsed = Instant::now().saturating_duration_since(start);
         let at = MediaTime::from_nanos(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX));
-        store.publish_arc(frame, at);
+        #[cfg(feature = "ffmpeg")]
+        if let Some((id, epoch)) = lifecycle {
+            if !crate::pipeline::publish_live_synth_frame_for(id, epoch, store, frame, at) {
+                return;
+            }
+        } else {
+            store.publish_arc(frame, at);
+        }
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            let _ = lifecycle;
+            store.publish_arc(frame, at);
+        }
         sleep_until(interval, stop);
     }
 }
