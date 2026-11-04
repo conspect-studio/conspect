@@ -1704,6 +1704,11 @@ pub struct Pipeline {
     /// it declares any, they decide program-bus membership (`include_in_program_bus`),
     /// gain (`gain_db`) and `mute` at build; with none, every store rides at unity.
     audio_routing: Option<multiview_config::AudioRouting>,
+    /// The run's declared discrete audio tracks (#152), in `[audio]` route
+    /// order: the source id each track is taken from. Track `i` is encoded as
+    /// [`StreamKind::AudioTrack`](multiview_ffmpeg::StreamKind::AudioTrack)`(i)`.
+    /// Empty when no route names a `target_track`.
+    discrete_track_inputs: Vec<String>,
     /// Published at drive start; control reads without locking or waiting on bake.
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     /// Per-source **audio** ingest plans (AUD-2): how to open + decode each
@@ -2454,10 +2459,16 @@ impl Pipeline {
         let has_display = !built.display.is_empty();
         #[cfg(not(feature = "display-kms"))]
         let has_display = false;
-        let outputs = built.packet;
+        let mut outputs = built.packet;
         if outputs.is_empty() && !has_display {
             return Err(PipelineError::NoOutput("file/HLS"));
         }
+        // #151/#152: resolve each muxing output's audio selection (program bus
+        // and/or discrete tracks) against the declared tracks.
+        let discrete_tracks = declared_discrete_tracks(config.audio.as_ref());
+        let discrete_track_inputs: Vec<String> =
+            discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
+        apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
 
         // Derive the PER-SOURCE per-tick audio-loudness timelines off the
         // build path: decode each file-backed source's OWN audio with
@@ -2531,6 +2542,7 @@ impl Pipeline {
             egress_registry,
             audio_stores,
             audio_routing: config.audio.clone(),
+            discrete_track_inputs,
             audio_route: Arc::new(multiview_framestore::SwapCell::empty()),
             audio_ingest_plans,
             tone_ingest_plans,
@@ -3082,8 +3094,8 @@ impl Pipeline {
         outputs
             .into_iter()
             .map(|output| -> SinkRunner {
-                Box::new(move |rx, params, time_base, audio| {
-                    run_one_output(output, rx, &params, time_base, audio.as_ref())
+                Box::new(move |rx, params, time_base, audio, tracks| {
+                    run_one_output(output, rx, &params, time_base, audio.as_ref(), &tracks)
                 })
             })
             .collect()
@@ -3127,7 +3139,7 @@ impl Pipeline {
                 // The fake sink consumes the coded-packet fan-out channel; it does
                 // not mux, so the seeded codec params + time-base (and the audio
                 // params + time-base) are unused.
-                Box::new(move |rx, _params, _time_base, _audio| {
+                Box::new(move |rx, _params, _time_base, _audio, _tracks| {
                     let outcome = r(rx);
                     Ok(SinkRunOutcome {
                         line: format!("test sink: {} packet(s)", outcome.frames),
@@ -3406,10 +3418,32 @@ impl Pipeline {
 
         // Build the SINGLE program encoder (invariant #7) the consumer owns: the
         // canvas is encoded once and the same packets fan to every mux-only sink.
-        let encoder = ProgramEncoder::new(&self.encode_cfg).map_err(|e| PipelineError::Output {
-            kind: "encode",
-            reason: e.to_string(),
-        })?;
+        let mut encoder =
+            ProgramEncoder::new(&self.encode_cfg).map_err(|e| PipelineError::Output {
+                kind: "encode",
+                reason: e.to_string(),
+            })?;
+        // #152: one encoder per declared discrete track, opened with the
+        // program audio's settings. Tracks need the program-audio bus (their
+        // pre-mix blocks come from it); without it they are reported, not faked.
+        let track_inputs: Vec<String> = if self.discrete_track_inputs.is_empty() {
+            Vec::new()
+        } else if self.encode_cfg.audio.is_none() {
+            tracing::warn!(
+                tracks = self.discrete_track_inputs.len(),
+                "discrete audio tracks declared but program audio is off; not muxing them"
+            );
+            Vec::new()
+        } else {
+            let count = u16::try_from(self.discrete_track_inputs.len()).unwrap_or(u16::MAX);
+            encoder
+                .open_audio_tracks(count)
+                .map_err(|e| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: e.to_string(),
+                })?;
+            self.discrete_track_inputs.clone()
+        };
 
         // The program-audio bus (AUD-4): built ONLY when this run opted into audio
         // (`encode_cfg.audio` is `Some`). It mixes one block per output tick at the
@@ -3567,6 +3601,7 @@ impl Pipeline {
             loudness_publisher,
             display_audio,
             self.program_audio_preview.clone(),
+            track_inputs,
             #[cfg(feature = "aes67")]
             aes67_send_handles,
         );
@@ -4337,6 +4372,7 @@ type SinkRunner = Box<
             StreamCodecParameters,
             Rational,
             Option<(StreamCodecParameters, Rational)>,
+            Vec<(StreamCodecParameters, Rational)>,
         ) -> Result<SinkRunOutcome, PipelineError>
         + Send,
 >;
@@ -4472,6 +4508,7 @@ impl StreamEgress {
         loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
         display_audio: DisplayAudioFeed,
         program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
+        track_inputs: Vec<String>,
         #[cfg(feature = "aes67")] aes67_send_handles: Vec<
             multiview_output::aes67::Aes67SenderHandle,
         >,
@@ -4494,6 +4531,8 @@ impl StreamEgress {
             .audio_codec_params()
             .cloned()
             .zip(encoder.audio_time_base());
+        // The discrete audio tracks' (#152) params + time-bases, by track index.
+        let track_streams = encoder.audio_track_streams();
 
         // One bounded fan-out channel of coded packets + thread per sink. The sink
         // thread drives `PacketMuxSink::run` (or a test fake) over a
@@ -4507,7 +4546,8 @@ impl StreamEgress {
             let builder = std::thread::Builder::new().name(format!("multiview-sink-{i}"));
             let params = params.clone();
             let audio = audio.clone();
-            match builder.spawn(move || runner(rx, params, time_base, audio)) {
+            let tracks = track_streams.clone();
+            match builder.spawn(move || runner(rx, params, time_base, audio, tracks)) {
                 Ok(handle) => sinks.push(handle),
                 Err(e) => {
                     // A sink thread that cannot spawn is a real failure (we cannot
@@ -4537,6 +4577,7 @@ impl StreamEgress {
                     loudness_publisher,
                     display_audio,
                     program_audio_preview,
+                    &track_inputs,
                     #[cfg(feature = "aes67")]
                     aes67_send_handles,
                     &consumer_in_flight,
@@ -4813,6 +4854,7 @@ fn consumer_main(
     loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
     mut display_audio: DisplayAudioFeed,
     program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
+    track_inputs: &[String],
     #[cfg(feature = "aes67")] aes67_send_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
     in_flight: &AtomicI64,
 ) -> Result<(), PipelineError> {
@@ -5003,6 +5045,12 @@ fn consumer_main(
                     reason: e.to_string(),
                 })?;
             fan_packets(&sink_txs, &mut live, audio_packets);
+            // #152: discrete tracks, same tick, same sample budget (inv #3).
+            if !track_inputs.is_empty() {
+                let packets =
+                    encode_discrete_tracks(&mut encoder, bus, track_inputs, block.frame_count())?;
+                fan_packets(&sink_txs, &mut live, packets);
+            }
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
             // dedicated display bus by the same absolute tick index (RT-8b —
@@ -5024,6 +5072,38 @@ fn consumer_main(
     fan_packets(&sink_txs, &mut live, tail);
     drop(sink_txs);
     Ok(())
+}
+
+/// Encode one tick of every discrete track (#152) from its source's pre-mix
+/// block, with exactly the program block's `frames`, so each track's sample
+/// counter (its PTS) equals the program's — locked to vision. A source with no
+/// block this tick (or a block of another length) encodes silence; the track's
+/// clock never skips.
+fn encode_discrete_tracks(
+    encoder: &mut ProgramEncoder,
+    bus: &multiview_audio::program::ProgramBus,
+    track_inputs: &[String],
+    frames: usize,
+) -> Result<Vec<EncodedPacket>, PipelineError> {
+    let inputs = bus.input_tracks();
+    let mut out = Vec::new();
+    for (index, input_id) in track_inputs.iter().enumerate() {
+        let samples = inputs
+            .iter()
+            .find(|(id, _)| *id == input_id.as_str())
+            .map(|(_, b)| *b)
+            .filter(|b| b.frame_count() == frames)
+            .map(multiview_audio::format::AudioBlock::interleaved);
+        out.append(
+            &mut encoder
+                .encode_track_interleaved(index, samples, frames)
+                .map_err(|e| PipelineError::Output {
+                    kind: "encode-audio-track",
+                    reason: e.to_string(),
+                })?,
+        );
+    }
+    Ok(out)
 }
 
 /// Fan each coded packet to every still-live sink as an independently-owned copy
@@ -5109,7 +5189,12 @@ fn run_one_output(
     params: &StreamCodecParameters,
     time_base: Rational,
     audio: Option<&(StreamCodecParameters, Rational)>,
+    tracks: &[(StreamCodecParameters, Rational)],
 ) -> Result<SinkRunOutcome, PipelineError> {
+    let track_mux: Vec<multiview_output::MuxStream<'_>> = tracks
+        .iter()
+        .map(|(p, tb)| multiview_output::MuxStream::new(p, *tb))
+        .collect();
     // ADR-0060: run this sink's mux region inside an `output` resource scope so
     // our own logs (via the span) AND libav's synchronous mux/transport lines
     // (via the thread-local ResourceContext the bridge resolves) name this output
@@ -5128,10 +5213,11 @@ fn run_one_output(
             let mut source = StreamingPacketSource::new(rx);
             let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
             let outcome = sink
-                .run_av(
+                .run_av_tracks(
                     &mut source,
                     multiview_output::MuxStream::new(params, time_base),
                     audio_mux,
+                    &track_mux,
                 )
                 .map_err(|e| PipelineError::Output {
                     kind: "file",
@@ -5158,10 +5244,11 @@ fn run_one_output(
             let mut source = StreamingPacketSource::new(rx);
             let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
             let outcome = sink
-                .run_av(
+                .run_av_tracks(
                     &mut source,
                     multiview_output::MuxStream::new(params, time_base),
                     audio_mux,
+                    &track_mux,
                 )
                 .map_err(|e| PipelineError::Output {
                     kind: "hls",
@@ -5205,7 +5292,12 @@ fn run_one_output(
             label,
             url,
         } => Ok(run_push_output(
-            &sink, label, &url, rx, params, time_base, audio,
+            &sink,
+            label,
+            &url,
+            rx,
+            multiview_output::MuxStream::new(params, time_base),
+            (audio, &track_mux),
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -5566,17 +5658,15 @@ fn run_push_output(
     label: &'static str,
     url: &str,
     rx: Receiver<EncodedPacket>,
-    params: &StreamCodecParameters,
-    time_base: Rational,
-    audio: Option<&(StreamCodecParameters, Rational)>,
+    video: multiview_output::MuxStream<'_>,
+    (audio, tracks): (
+        Option<&(StreamCodecParameters, Rational)>,
+        &[multiview_output::MuxStream<'_>],
+    ),
 ) -> SinkRunOutcome {
     let mut source = StreamingPacketSource::new(rx);
     let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
-    match sink.run_av(
-        &mut source,
-        multiview_output::MuxStream::new(params, time_base),
-        audio_mux,
-    ) {
+    match sink.run_av_tracks(&mut source, video, audio_mux, tracks) {
         Ok(outcome) => {
             let (packets, keyframes) = match &outcome {
                 PacketMuxOutcome::Single(s) => (s.packets, s.keyframes),
@@ -8412,6 +8502,96 @@ fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Ve
         );
     }
     runnable
+}
+
+/// One declared discrete audio track (#152): an `[audio]` route that names a
+/// `target_track`, in route order.
+struct DeclaredTrack {
+    name: String,
+    input_id: String,
+    language: Option<String>,
+    title: Option<String>,
+}
+
+/// The document's declared discrete tracks, in route order (track index = the
+/// position here). Bounded to `u16` indices.
+fn declared_discrete_tracks(
+    routing: Option<&multiview_config::AudioRouting>,
+) -> Vec<DeclaredTrack> {
+    routing
+        .map(|r| r.routes.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|route| {
+            route.target_track.as_ref().map(|name| DeclaredTrack {
+                name: name.clone(),
+                input_id: route.input_id.clone(),
+                language: route.language.clone(),
+                title: route.title.clone().or_else(|| Some(name.clone())),
+            })
+        })
+        .take(usize::from(u16::MAX))
+        .collect()
+}
+
+/// The [`multiview_output::AudioSelection`] for one configured output: absent
+/// `audio` block = program only (unchanged); `auto` = program + every declared
+/// track; `program` = program only; `tracks` = the listed ones (`prog` included
+/// only when listed). `auto` adds tracks only where the transport's capacity is
+/// unlimited (MPEG-TS family: HLS, SRT, RIST); a capped transport (legacy
+/// RTMP/FLV refuses a second audio stream at header time, NDI, WebRTC) keeps
+/// program only, so `auto` can never break an output.
+fn output_audio_selection(
+    output: &Output,
+    tracks: &[DeclaredTrack],
+) -> multiview_output::AudioSelection {
+    let Some(selection) = output.audio() else {
+        return multiview_output::AudioSelection::default();
+    };
+    let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
+    let (program, mut chosen) = selection.resolve(&names);
+    let capacity = output.audio_capability().discrete_capacity;
+    let auto_capped = selection.mode == multiview_config::OutputAudioMode::Auto
+        && capacity != multiview_config::TrackCapacity::Unlimited;
+    if auto_capped || capacity == multiview_config::TrackCapacity::AtMost(0) {
+        chosen.clear();
+    }
+    multiview_output::AudioSelection {
+        program,
+        tracks: tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| chosen.contains(&t.name.as_str()))
+            .filter_map(|(i, t)| {
+                Some(multiview_output::TrackSelection {
+                    index: u16::try_from(i).ok()?,
+                    language: t.language.clone(),
+                    title: t.title.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Apply each configured output's audio selection to its muxing runnable
+/// (matched by stable output id).
+fn apply_output_audio_selections(
+    runnable: &mut [RunnableOutput],
+    outputs: &[Output],
+    tracks: &[DeclaredTrack],
+) {
+    for r in runnable {
+        let (id, sink) = match r {
+            RunnableOutput::File { id, sink, .. }
+            | RunnableOutput::Hls { id, sink, .. }
+            | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
+            #[allow(unreachable_patterns)]
+            _ => continue,
+        };
+        if let Some(output) = outputs.iter().find(|o| o.id() == id) {
+            sink.set_audio_selection(output_audio_selection(output, tracks));
+        }
+    }
 }
 
 /// Split an HLS output `path` into `(segment_dir, segment_prefix, playlist_path)`.

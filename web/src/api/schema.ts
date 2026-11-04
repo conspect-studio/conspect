@@ -3955,7 +3955,10 @@ export interface components {
         OrientationModeDoc: "auto" | "tag" | "pixels";
         /** @description `OpenAPI` mirror of `multiview_config::audio::OutputAudio`. */
         OutputAudioDoc: {
-            /** @description `program` (mixed bus) or `tracks` (explicit selection). */
+            /**
+             * @description `auto` (program + every declared track), `program` (mixed bus) or
+             *     `tracks` (explicit selection).
+             */
             mode: components["schemas"]["OutputAudioModeDoc"];
             /** @description The selectable-track list (used only in `tracks` mode). */
             tracks?: string[];
@@ -3964,7 +3967,7 @@ export interface components {
          * @description `OpenAPI` mirror of `multiview_config::audio::OutputAudioMode`.
          * @enum {string}
          */
-        OutputAudioModeDoc: "program" | "tracks";
+        OutputAudioModeDoc: "auto" | "program" | "tracks";
         /**
          * @description `OpenAPI` mirror of `multiview_config::Output` (tagged by `kind`) — the body
          *     accepted by `POST`/`PUT /api/v1/outputs/{id}`.

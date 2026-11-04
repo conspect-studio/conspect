@@ -44,6 +44,9 @@ pub enum StreamKind {
     Video,
     /// The mixed program audio.
     Audio,
+    /// A discrete (pre-mix) audio track, by its 0-based index in the run's
+    /// declared track list (#152). Muxed as an extra audio PID.
+    AudioTrack(u16),
 }
 
 /// One encoded packet, movable across threads and copyable per consumer.
@@ -78,6 +81,13 @@ impl EncodedPacket {
             packet,
             kind: StreamKind::Audio,
         }
+    }
+
+    /// Wrap an encoded packet with an explicit stream `kind` (e.g. a discrete
+    /// [`StreamKind::AudioTrack`]).
+    #[must_use]
+    pub fn with_kind(packet: codec::packet::Packet, kind: StreamKind) -> Self {
+        Self { packet, kind }
     }
 
     /// Which elementary stream this packet belongs to (video or audio).

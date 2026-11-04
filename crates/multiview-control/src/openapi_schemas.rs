@@ -1060,6 +1060,8 @@ pub struct SourceBodyDoc {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum OutputAudioModeDoc {
+    /// Carry the mixed program bus plus every declared discrete track.
+    Auto,
     /// Carry only the mixed program bus.
     Program,
     /// Carry an explicit list of selectable tracks.
@@ -1071,7 +1073,8 @@ pub enum OutputAudioModeDoc {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct OutputAudioDoc {
-    /// `program` (mixed bus) or `tracks` (explicit selection).
+    /// `auto` (program + every declared track), `program` (mixed bus) or
+    /// `tracks` (explicit selection).
     pub mode: OutputAudioModeDoc,
     /// The selectable-track list (used only in `tracks` mode).
     #[serde(default)]

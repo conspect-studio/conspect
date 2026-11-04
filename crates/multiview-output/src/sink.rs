@@ -155,6 +155,81 @@ impl<'a> MuxStream<'a> {
     }
 }
 
+/// One discrete audio track a mux sink carries (#152): the track's index in the
+/// run's declared track list ([`StreamKind::AudioTrack`]) plus the metadata the
+/// muxer advertises for its PID (`language` = ISO-639, `title`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackSelection {
+    /// Index into the run's declared discrete tracks.
+    pub index: u16,
+    /// ISO-639 language tag for the stream (PMT language descriptor).
+    pub language: Option<String>,
+    /// Human title for the stream.
+    pub title: Option<String>,
+}
+
+/// Which audio a mux sink carries (#151): the program bus and/or a set of
+/// discrete tracks. The default (program only, no tracks) is byte-identical to
+/// the pre-#152 path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioSelection {
+    /// Whether the mixed program audio stream is registered.
+    pub program: bool,
+    /// The discrete tracks registered after it, in this order.
+    pub tracks: Vec<TrackSelection>,
+}
+
+impl Default for AudioSelection {
+    fn default() -> Self {
+        Self {
+            program: true,
+            tracks: Vec::new(),
+        }
+    }
+}
+
+/// The discrete-track streams registered on one muxer: `(track index, muxer
+/// stream index)` pairs.
+type TrackIndices = Vec<(u16, usize)>;
+
+/// Register the selected discrete tracks on `muxer` (after video/program) and
+/// tag each stream's language/title, before the header.
+fn add_track_streams(
+    muxer: &mut Muxer,
+    selection: &AudioSelection,
+    track_streams: &[MuxStream<'_>],
+) -> Result<TrackIndices> {
+    let mut out = Vec::with_capacity(selection.tracks.len());
+    for track in &selection.tracks {
+        let Some(stream) = track_streams.get(usize::from(track.index)) else {
+            // A selection naming a track the encoder did not open is skipped
+            // (never mis-routed); the run keeps its other streams.
+            continue;
+        };
+        let index = muxer
+            .add_stream_from_parameters(stream.params, stream.time_base)
+            .map_err(ff)?;
+        if let Some(language) = &track.language {
+            muxer
+                .set_stream_metadata(index, "language", language)
+                .map_err(ff)?;
+        }
+        if let Some(title) = &track.title {
+            muxer
+                .set_stream_metadata(index, "title", title)
+                .map_err(ff)?;
+        }
+        out.push((track.index, index));
+    }
+    Ok(out)
+}
+
+/// The muxer stream a discrete-track packet writes to, or `None` when this sink
+/// does not carry that track (the packet is dropped for this sink).
+fn track_stream_index(tracks: &TrackIndices, track: u16) -> Option<usize> {
+    tracks.iter().find(|(t, _)| *t == track).map(|(_, i)| *i)
+}
+
 /// Resolve the muxer stream index a kind-tagged packet writes to.
 ///
 /// An audio packet arriving at a sink with no registered audio stream is a
@@ -436,6 +511,9 @@ struct AudioState {
     /// `audio_pts = Σ samples emitted` — the audio analogue of `out_pts = tick`
     /// (invariant #3); every encoded frame is stamped from this, never input PTS.
     audio_pts: i64,
+    /// The stream kind every produced packet is tagged with: the program
+    /// ([`StreamKind::Audio`]) or a discrete track ([`StreamKind::AudioTrack`]).
+    kind: StreamKind,
 }
 
 /// The single **encode-once** program producer.
@@ -452,6 +530,15 @@ pub struct ProgramEncoder {
     /// The optional program-audio encoder + rebuffer (AUD-4). `None` for a
     /// video-only run, so the existing single-stream path is unchanged.
     audio: Option<AudioState>,
+    /// The program-audio encode settings, kept so discrete tracks (#152) are
+    /// opened with exactly the program's codec/rate/layout/bitrate.
+    audio_cfg: Option<AudioEncodeConfig>,
+    /// One encoder per declared discrete audio track (#152), index = the
+    /// [`StreamKind::AudioTrack`] index. Each is fed exactly the program's
+    /// per-tick sample budget, so its sample counter — and therefore its PTS —
+    /// is identical to the program audio's (locked to vision). Empty when no
+    /// tracks are declared (the program-only path is unchanged).
+    tracks: Vec<AudioState>,
     /// The monotonic output tick; each [`encode_frame`](Self::encode_frame)
     /// stamps the frame's PTS with it, then advances it by one.
     tick: i64,
@@ -473,7 +560,7 @@ impl ProgramEncoder {
         let params = StreamCodecParameters::from_encoder(&encoder);
         let time_base = encoder.time_base();
         let audio = match &config.audio {
-            Some(audio_cfg) => Some(AudioState::open(audio_cfg)?),
+            Some(audio_cfg) => Some(AudioState::open(audio_cfg, StreamKind::Audio)?),
             None => None,
         };
         Ok(Self {
@@ -482,9 +569,89 @@ impl ProgramEncoder {
             params,
             time_base,
             audio,
+            audio_cfg: config.audio.clone(),
+            tracks: Vec::new(),
             tick: 0,
             finished: false,
         })
+    }
+
+    /// Open `count` discrete audio-track encoders (#152) with the program
+    /// audio's exact settings. Call before the first encode; a later call
+    /// replaces nothing (it is rejected) so every track's sample counter starts
+    /// at the program's. A no-op for `count == 0`.
+    ///
+    /// # Errors
+    /// [`Error::Output`] if the run carries no program audio, encoding already
+    /// started, tracks were already opened, or an encoder cannot be opened.
+    pub fn open_audio_tracks(&mut self, count: u16) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let cfg = self.audio_cfg.clone().ok_or_else(|| {
+            Error::Output("discrete audio tracks need program audio enabled".to_owned())
+        })?;
+        let started = self.tick != 0 || self.audio.as_ref().is_some_and(|a| a.audio_pts != 0);
+        if started || !self.tracks.is_empty() {
+            return Err(Error::Output(
+                "discrete audio tracks must be opened before encoding starts".to_owned(),
+            ));
+        }
+        for index in 0..count {
+            self.tracks
+                .push(AudioState::open(&cfg, StreamKind::AudioTrack(index))?);
+        }
+        Ok(())
+    }
+
+    /// The `(codec params, time-base)` of each discrete track, in track-index
+    /// order (empty when none are open).
+    #[must_use]
+    pub fn audio_track_streams(&self) -> Vec<(StreamCodecParameters, Rational)> {
+        self.tracks
+            .iter()
+            .map(|t| (t.params.clone(), t.time_base))
+            .collect()
+    }
+
+    /// The number of open discrete audio-track encoders.
+    #[must_use]
+    pub fn audio_track_count(&self) -> usize {
+        self.tracks.len()
+    }
+
+    /// Encode one tick of discrete track `index` (interleaved f32, `frames`
+    /// frames). `None` (the source contributed nothing this tick, or a block of
+    /// the wrong shape) encodes `frames` of silence, so the track's sample clock
+    /// always advances exactly with the program's.
+    ///
+    /// # Errors
+    /// [`Error::Output`] after [`finish`](Self::finish), for an unknown track, or
+    /// if the encode fails.
+    pub fn encode_track_interleaved(
+        &mut self,
+        index: usize,
+        interleaved: Option<&[f32]>,
+        frames: usize,
+    ) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Err(Error::Output(
+                "ProgramEncoder::encode_track_interleaved called after finish".to_owned(),
+            ));
+        }
+        let track = self
+            .tracks
+            .get_mut(index)
+            .ok_or_else(|| Error::Output(format!("unknown discrete audio track {index}")))?;
+        let channels = track.fifo.len();
+        let needed = frames.saturating_mul(channels);
+        match interleaved {
+            Some(samples) if samples.len() >= needed => track.encode_interleaved(samples, frames),
+            _ => {
+                let silence = vec![0.0_f32; needed];
+                track.encode_interleaved(&silence, frames)
+            }
+        }
     }
 
     /// The program-audio codec parameters a mux sink registers its audio stream
@@ -628,6 +795,9 @@ impl ProgramEncoder {
             Some(state) => state.finish()?,
             None => Vec::new(),
         };
+        for track in &mut self.tracks {
+            out.append(&mut track.finish()?);
+        }
         self.encoder.send_eof().map_err(ff)?;
         out.append(&mut self.drain()?);
         Ok(out)
@@ -646,7 +816,7 @@ impl ProgramEncoder {
 
 impl AudioState {
     /// Open the AAC encoder for `config` and seed an empty per-channel FIFO.
-    fn open(config: &AudioEncodeConfig) -> Result<Self> {
+    fn open(config: &AudioEncodeConfig, kind: StreamKind) -> Result<Self> {
         let encoder = AudioEncoder::new(&config.audio_target()).map_err(ff)?;
         let params = StreamCodecParameters::from_audio_encoder(&encoder);
         let time_base = encoder.time_base();
@@ -664,6 +834,7 @@ impl AudioState {
             frame_size,
             fifo: vec![Vec::new(); channels],
             audio_pts: 0,
+            kind,
         })
     }
 
@@ -741,7 +912,7 @@ impl AudioState {
             .audio_pts
             .saturating_add(i64::try_from(count).unwrap_or(0));
         while let Some(packet) = self.encoder.receive_packet().map_err(ff)? {
-            out.push(EncodedPacket::from_audio_packet(packet));
+            out.push(EncodedPacket::with_kind(packet, self.kind));
         }
         Ok(())
     }
@@ -756,7 +927,7 @@ impl AudioState {
         }
         self.encoder.send_eof().map_err(ff)?;
         while let Some(packet) = self.encoder.receive_packet().map_err(ff)? {
-            out.push(EncodedPacket::from_audio_packet(packet));
+            out.push(EncodedPacket::with_kind(packet, self.kind));
         }
         Ok(out)
     }
@@ -936,15 +1107,31 @@ fn drive_to_single_muxer<S: VideoFrameSource>(
 ///
 /// The packet-fed twin of [`drive_to_single_muxer`], shared by the
 /// [`PacketMuxSink`] file and push flavours.
+/// The stream routing of one single-container muxer.
+struct SingleRoutes<'r> {
+    video: usize,
+    audio: Option<usize>,
+    /// The sink deselected the program bus: program-audio packets are dropped
+    /// for it (not an error).
+    drop_program_audio: bool,
+    tracks: &'r TrackIndices,
+}
+
 fn drive_packets_to_single_muxer<P: PacketSource>(
     muxer: &mut Muxer,
-    video_index: usize,
-    audio_index: Option<usize>,
+    routes: &SingleRoutes<'_>,
     source: &mut P,
 ) -> Result<EncodeStats> {
     let mut stats = EncodeStats::default();
     while let Some(packet) = source.next_packet()? {
-        let index = stream_index_for(packet.kind(), video_index, audio_index)?;
+        let index = match packet.kind() {
+            StreamKind::AudioTrack(track) => match track_stream_index(routes.tracks, track) {
+                Some(index) => index,
+                None => continue,
+            },
+            StreamKind::Audio if routes.drop_program_audio => continue,
+            kind => stream_index_for(kind, routes.video, routes.audio)?,
+        };
         // Keyframe stats track the VIDEO GOP only; AAC packets are all flagged
         // key, which would otherwise inflate the count.
         let is_key = matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe();
@@ -1246,6 +1433,8 @@ pub struct PacketMuxSink {
     /// compositor). MPEG-TS carries no rotation tag, so this is only ever set on
     /// a tag-capable container (validated at config time).
     display_matrix: Option<DisplayMatrix>,
+    /// Which audio this sink carries (#151/#152). Default: program only.
+    audio_selection: AudioSelection,
 }
 
 /// The two `PacketMuxSink` flavours (private; the public surface is the
@@ -1288,6 +1477,7 @@ impl PacketMuxSink {
             kind: PacketMuxKind::Single(SingleTarget::File(path.into())),
             metadata: MuxMetadata::new(),
             display_matrix: None,
+            audio_selection: AudioSelection::default(),
         }
     }
 
@@ -1302,6 +1492,7 @@ impl PacketMuxSink {
             }),
             metadata: MuxMetadata::new(),
             display_matrix: None,
+            audio_selection: AudioSelection::default(),
         }
     }
 
@@ -1321,6 +1512,7 @@ impl PacketMuxSink {
             },
             metadata: MuxMetadata::new(),
             display_matrix: None,
+            audio_selection: AudioSelection::default(),
         }
     }
 
@@ -1353,6 +1545,7 @@ impl PacketMuxSink {
             },
             metadata: MuxMetadata::new(),
             display_matrix: None,
+            audio_selection: AudioSelection::default(),
         }
     }
 
@@ -1371,6 +1564,26 @@ impl PacketMuxSink {
         self.metadata = metadata;
         self.display_matrix = display_matrix;
         self
+    }
+
+    /// Select which audio this sink carries (#151/#152): the program bus and/or
+    /// discrete tracks. A builder; the default is the program bus only.
+    #[must_use]
+    pub fn with_audio_selection(mut self, selection: AudioSelection) -> Self {
+        self.audio_selection = selection;
+        self
+    }
+
+    /// Replace the audio selection in place (see
+    /// [`with_audio_selection`](Self::with_audio_selection)).
+    pub fn set_audio_selection(&mut self, selection: AudioSelection) {
+        self.audio_selection = selection;
+    }
+
+    /// The audio this sink carries.
+    #[must_use]
+    pub fn audio_selection(&self) -> &AudioSelection {
+        &self.audio_selection
     }
 
     /// Apply this sink's OUTMETA metadata + display matrix to a freshly-opened
@@ -1438,6 +1651,28 @@ impl PacketMuxSink {
         video: MuxStream<'_>,
         audio: Option<MuxStream<'_>>,
     ) -> Result<PacketMuxOutcome> {
+        self.run_av_tracks(source, video, audio, &[])
+    }
+
+    /// [`run_av`](Self::run_av) plus the run's discrete audio tracks (#152):
+    /// `track_streams[i]` seeds [`StreamKind::AudioTrack`]`(i)`. The sink's
+    /// [`AudioSelection`] decides which are registered (each as its own audio
+    /// PID, tagged with the route's language/title); packets of an unselected
+    /// track — or program audio when the program is deselected — are dropped
+    /// for this sink. With the default selection and no tracks this is exactly
+    /// `run_av`.
+    ///
+    /// # Errors
+    /// As [`run_av`](Self::run_av).
+    pub fn run_av_tracks<P: PacketSource>(
+        &self,
+        source: &mut P,
+        video: MuxStream<'_>,
+        audio: Option<MuxStream<'_>>,
+        track_streams: &[MuxStream<'_>],
+    ) -> Result<PacketMuxOutcome> {
+        let carry_program = self.audio_selection.program;
+        let audio = if carry_program { audio } else { None };
         match &self.kind {
             PacketMuxKind::Single(target) => {
                 let mut muxer = target.open()?;
@@ -1454,12 +1689,18 @@ impl PacketMuxSink {
                     ),
                     None => None,
                 };
+                let tracks = add_track_streams(&mut muxer, &self.audio_selection, track_streams)?;
                 // OUTMETA: tag the container/streams + the display-rotation
                 // matrix before the header is written (ADR-0088/0089).
                 self.apply_metadata(&mut muxer, video_index)?;
                 muxer.write_header().map_err(ff)?;
-                let driven =
-                    drive_packets_to_single_muxer(&mut muxer, video_index, audio_index, source);
+                let routes = SingleRoutes {
+                    video: video_index,
+                    audio: audio_index,
+                    drop_program_audio: !carry_program,
+                    tracks: &tracks,
+                };
+                let driven = drive_packets_to_single_muxer(&mut muxer, &routes, source);
                 // Finalize-on-error: always write the trailer best-effort so a
                 // mid-stream failure still leaves a structurally valid container.
                 finalize_or_propagate(&mut muxer, driven).map(PacketMuxOutcome::Single)
@@ -1473,6 +1714,7 @@ impl PacketMuxSink {
                     prefix,
                 );
                 state.set_meta(&self.metadata, self.display_matrix);
+                state.set_tracks(&self.audio_selection, track_streams);
                 let driven = state.drive_from_packets(source);
                 finish_segments(state, driven, video.time_base)
                     .map(|result| PacketMuxOutcome::Segment(Box::new(result)))
@@ -1492,6 +1734,7 @@ impl PacketMuxSink {
                     prefix,
                 );
                 state.set_meta(&self.metadata, self.display_matrix);
+                state.set_tracks(&self.audio_selection, track_streams);
                 // The rolling-live driver: each closed segment is published into a
                 // windowed `.m3u8` on disk (atomic) and the evicted `.ts` pruned,
                 // PDT-stamped from the shared outbound epoch (ADR-M010).
@@ -1575,6 +1818,9 @@ struct SegmentState<'a> {
     /// (the default, and always for the encoder-fed `SegmentSink`) ⇒ no metadata
     /// to apply, byte-identical to before this field existed.
     meta: Option<(&'a MuxMetadata, Option<DisplayMatrix>)>,
+    /// The discrete tracks (#152) registered into every segment muxer after
+    /// the program audio, plus the per-track seeds. Empty ⇒ unchanged layout.
+    tracks: Option<(&'a AudioSelection, &'a [MuxStream<'a>])>,
 }
 
 /// An in-progress segment: its muxer, registered stream index, file path, and
@@ -1585,6 +1831,8 @@ struct OpenSegment {
     /// The audio stream index registered on this segment muxer, if the run
     /// carries program audio (AUD-4); `None` for a video-only run.
     audio_index: Option<usize>,
+    /// `(track index, stream index)` of each discrete track on this segment.
+    track_indices: TrackIndices,
     /// The **final** path the closed segment is published under (referenced by
     /// the playlist).
     path: PathBuf,
@@ -1621,6 +1869,15 @@ impl<'a> SegmentState<'a> {
             live: None,
             seg_index: 0,
             meta: None,
+            tracks: None,
+        }
+    }
+
+    /// Attach the discrete-track selection + seeds (#152) every segment muxer
+    /// registers after the program audio.
+    fn set_tracks(&mut self, selection: &'a AudioSelection, streams: &'a [MuxStream<'a>]) {
+        if !selection.tracks.is_empty() {
+            self.tracks = Some((selection, streams));
         }
     }
 
@@ -1716,6 +1973,22 @@ impl<'a> SegmentState<'a> {
                     muxer.write_packet(index, owned).map_err(ff)?;
                     self.record(is_key, pts);
                 }
+                StreamKind::AudioTrack(track) => {
+                    // A discrete track joins the current segment like program
+                    // audio; a track this sink does not carry is dropped.
+                    let index = self
+                        .current
+                        .as_ref()
+                        .and_then(|s| track_stream_index(&s.track_indices, track));
+                    let Some(index) = index else {
+                        continue;
+                    };
+                    let owned = packet.into_owned_packet();
+                    if let Some(segment) = self.current.as_mut() {
+                        segment.muxer.write_packet(index, owned).map_err(ff)?;
+                    }
+                    self.record(false, pts);
+                }
                 StreamKind::Audio => {
                     // Audio never rotates a segment — it joins the current one.
                     // Audio that arrives before the first video keyframe (no
@@ -1803,6 +2076,10 @@ impl<'a> SegmentState<'a> {
             ),
             None => None,
         };
+        let track_indices = match self.tracks {
+            Some((selection, streams)) => add_track_streams(&mut muxer, selection, streams)?,
+            None => Vec::new(),
+        };
         // OUTMETA: tag every segment's container/streams (SDT/PMT, …) before its
         // header (ADR-0088 §3); the display matrix is `None` for MPEG-TS (no
         // rotation tag — validated at config time) so it is a no-op here.
@@ -1812,6 +2089,7 @@ impl<'a> SegmentState<'a> {
             muxer,
             stream_index,
             audio_index,
+            track_indices,
             path,
             write_path,
             start_pts,
