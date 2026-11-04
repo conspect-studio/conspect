@@ -21,7 +21,9 @@ test('source preview is opt-in and clearly identifies still fallback', async ({ 
   await expect(page.getByRole('dialog')).toBeVisible();
   await expect(page.getByText(/Still preview \(~1 fps\)/)).toBeVisible();
   await expect.poll(() => polls).toBeGreaterThan(0);
-  await page.screenshot({ path: '../../.scratch/webui-live-workflows/source-preview.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await page.screenshot({ path: '../../.scratch/webui-live-workflows/source-preview-mobile.png', fullPage: true });
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).not.toBeVisible();
 });

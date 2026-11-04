@@ -12,7 +12,10 @@ export function hlsPlaybackCollisionIds(outputs: readonly OutputView[]): Readonl
   const duplicates = bases.filter((base, index) => bases.indexOf(base) !== index);
   return new Set(hls.filter((output) => duplicates.some((base) => {
     const mount = mountOf(output.id);
-    return mount === base || mount.startsWith(`${base}-`);
+    // Runtime-added suffixes are numeric (and can chain); a distinct
+    // nonnumeric ID such as "a-b-preview" retains its own stable mount.
+    return mount === base || (mount.startsWith(`${base}-`) &&
+      mount.slice(base.length + 1).split('-').every((part) => /^[0-9]+$/.test(part) && Number(part) >= 2));
   })).map((output) => output.id));
 }
 

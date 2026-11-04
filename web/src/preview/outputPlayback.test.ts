@@ -9,6 +9,12 @@ describe('HLS playback delivery paths', () => {
   it('encodes playlist filenames and normalizes unsafe mount characters', () => {
     expect(hlsPlaybackPaths([output('a b', '/srv/my output.m3u8')]).get('a b')).toBe('/hls/a-b/my%20output.m3u8');
   });
+  it('keeps distinct nonnumeric suffix mounts beside duplicate bases', () => {
+    const paths = hlsPlaybackPaths([output('a b'), output('a-b'), output('a-b-preview')]);
+    expect(paths.get('a-b-preview')).toBe('/hls/a-b-preview/program.m3u8');
+    expect(paths.has('a-b')).toBe(false);
+    expect([...hlsPlaybackCollisionIds([output('a b'), output('a-b'), output('a-b-preview')])].sort()).toEqual(['a b', 'a-b']);
+  });
   it('does not guess colliding mounts or directory targets', () => {
     const outputs = [output('a b'), output('a-b'), output('a-b-2'), output('directory', '/srv/hls/')];
     expect(hlsPlaybackPaths(outputs).size).toBe(0);
