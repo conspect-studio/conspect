@@ -333,7 +333,15 @@ async fn master_resolves_playable_distinct_audio_only_renditions() {
     assert!(master.contains("NAME=\"AU ABC\",DEFAULT=NO"), "{master}");
     assert!(master.contains("LANGUAGE=\"eng\""), "{master}");
     assert!(master.contains("AUDIO=\"audio\""), "{master}");
-    assert!(master.lines().any(|line| line == "video.m3u8"));
+    let video_uri = master
+        .lines()
+        .find(|line| {
+            line.starts_with("video-g")
+                && Path::new(line)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"))
+        })
+        .expect("generation-scoped video URI");
     let playable_master = probe_streams(&dir.join("master.m3u8"));
     assert!(
         playable_master.iter().any(|stream| stream.0 == "video"),
@@ -343,7 +351,7 @@ async fn master_resolves_playable_distinct_audio_only_renditions() {
         playable_master.iter().any(|stream| stream.0 == "audio"),
         "master lacks default audio"
     );
-    let video = std::fs::read_to_string(dir.join("video.m3u8")).expect("video media playlist");
+    let video = std::fs::read_to_string(dir.join(video_uri)).expect("video media playlist");
     for uri in video.lines().filter(|line| {
         Path::new(line)
             .extension()
@@ -357,8 +365,15 @@ async fn master_resolves_playable_distinct_audio_only_renditions() {
             ["video"]
         );
     }
-    for (playlist, frequency) in [("audio-program.m3u8", 1000.0), ("audio-track0.m3u8", 440.0)] {
-        assert!(master.contains(&format!("URI=\"{playlist}\"")));
+    for (prefix, frequency) in [("audio-program-g", 1000.0), ("audio-track0-g", 440.0)] {
+        let playlist = master
+            .lines()
+            .find(|line| {
+                line.starts_with("#EXT-X-MEDIA:") && line.contains(&format!("URI=\"{prefix}"))
+            })
+            .and_then(|line| line.split("URI=\"").nth(1))
+            .and_then(|uri| uri.split('"').next())
+            .expect("generation-scoped audio URI");
         let media = std::fs::read_to_string(dir.join(playlist)).expect("audio media playlist");
         let paths: Vec<_> = media
             .lines()

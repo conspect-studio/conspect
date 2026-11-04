@@ -310,13 +310,11 @@ fn live_renditions_prune_and_restart_without_stale_segment_urls() {
             &[MuxStream::new(&audio_params, audio_tb)],
         )
         .expect("live run");
-        for playlist in [
-            "index.m3u8",
-            "video.m3u8",
-            "audio-program.m3u8",
-            "audio-track0.m3u8",
-        ] {
-            let text = std::fs::read_to_string(dir.path().join(playlist)).expect("playlist");
+        let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+        let mut playlists = vec!["index.m3u8".to_owned()];
+        playlists.extend(master_media_uris(&master));
+        for playlist in playlists {
+            let text = std::fs::read_to_string(dir.path().join(&playlist)).expect("playlist");
             let referenced: Vec<_> = text
                 .lines()
                 .filter(|line| {
@@ -337,6 +335,47 @@ fn live_renditions_prune_and_restart_without_stale_segment_urls() {
                 assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:4"), "{text}");
             }
         }
+    }
+}
+
+fn master_media_uris(master: &str) -> Vec<String> {
+    master
+        .lines()
+        .filter_map(|line| {
+            if line.starts_with("#EXT-X-MEDIA:") {
+                line.split("URI=\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .map(str::to_owned)
+            } else if !line.starts_with('#')
+                && Path::new(line)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"))
+            {
+                Some(line.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn assert_manifest_and_media_readable(dir: &Path, uri: &str) {
+    let text = std::fs::read_to_string(dir.join(uri)).expect("old rendition manifest must survive");
+    let segments: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            Path::new(line)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+        })
+        .collect();
+    assert!(!segments.is_empty(), "{uri} has no media");
+    for segment in segments {
+        assert!(
+            std::fs::read(dir.join(segment)).is_ok(),
+            "{uri} references missing {segment}"
+        );
     }
 }
 
@@ -388,9 +427,19 @@ fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
     assert!(master.contains("RESOLUTION=160x120"), "{master}");
     assert!(master.contains("FRAME-RATE=30.000"), "{master}");
     assert!(master.contains("CODECS=\"mp2v,mp4a.40.2\""), "{master}");
-    assert!(master.contains("audio-track0.m3u8"), "{master}");
-    assert!(dir.path().join("audio-track0.m3u8").exists());
-    let first_track = std::fs::read_to_string(dir.path().join("audio-track0.m3u8")).unwrap();
+    let first_uris = master_media_uris(&master);
+    assert_eq!(first_uris.len(), 2, "{master}");
+    let old_track_uri = first_uris
+        .iter()
+        .find(|uri| uri.starts_with("audio-track0-g"))
+        .unwrap();
+    let old_video_uri = first_uris
+        .iter()
+        .find(|uri| uri.starts_with("video-g"))
+        .unwrap();
+    assert_manifest_and_media_readable(dir.path(), old_track_uri);
+    assert_manifest_and_media_readable(dir.path(), old_video_uri);
+    let first_track = std::fs::read_to_string(dir.path().join(old_track_uri)).unwrap();
     let first_index = first_track
         .lines()
         .find(|line| line.starts_with("#EXT-X-MEDIA-SEQUENCE:"))
@@ -419,10 +468,8 @@ fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
         !master.contains("audio-track0.m3u8"),
         "removed track must not be advertised: {master}"
     );
-    assert!(
-        !dir.path().join("audio-track0.m3u8").exists(),
-        "removed track must not be advertised"
-    );
+    assert_manifest_and_media_readable(dir.path(), old_track_uri);
+    assert_manifest_and_media_readable(dir.path(), old_video_uri);
     assert!(
         dir.path().join("index.m3u8").exists(),
         "legacy index must remain"
@@ -467,7 +514,13 @@ fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
         &[MuxStream::new(&a_params, a_tb)],
     )
     .unwrap();
-    let track = std::fs::read_to_string(dir.path().join("audio-track0.m3u8")).unwrap();
+    let new_track_uri =
+        master_media_uris(&std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap())
+            .into_iter()
+            .find(|uri| uri.starts_with("audio-track0-g"))
+            .unwrap();
+    assert_ne!(new_track_uri, *old_track_uri);
+    let track = std::fs::read_to_string(dir.path().join(new_track_uri)).unwrap();
     assert!(track.contains("#EXT-X-DISCONTINUITY"), "{track}");
     assert_ne!(
         first_index,
@@ -483,9 +536,94 @@ fn restart_removes_obsolete_track_and_advertises_configured_bandwidth() {
 }
 
 #[test]
+fn failed_restart_retains_prior_master_and_every_cached_media_uri() {
+    struct FailBeforeFirstSegment;
+    impl PacketSource for FailBeforeFirstSegment {
+        fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+            Err(multiview_output::Error::Output(
+                "injected publish failure".into(),
+            ))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (video, params, tb) = encode_video_at(750_000);
+    let mut source = VecPackets {
+        packets: video.into_iter(),
+    };
+    PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .run_av_tracks(&mut source, MuxStream::new(&params, tb), None, &[])
+    .unwrap();
+    let old_master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+    let mut failing = FailBeforeFirstSegment;
+    assert!(PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new()
+    )
+    .run_av_tracks(&mut failing, MuxStream::new(&params, tb), None, &[])
+    .is_err());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap(),
+        old_master
+    );
+    for uri in master_media_uris(&old_master) {
+        assert_manifest_and_media_readable(dir.path(), &uri);
+    }
+}
+
+#[test]
+fn failed_master_publish_keeps_old_master_and_all_cached_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let (video, params, tb) = encode_video_at(750_000);
+    let mut source = VecPackets {
+        packets: video.into_iter(),
+    };
+    PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new(),
+    )
+    .run_av_tracks(&mut source, MuxStream::new(&params, tb), None, &[])
+    .unwrap();
+    let old_master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+    // Block the atomic publisher after the new rendition has been written.
+    std::fs::create_dir(dir.path().join("master.m3u8.tmp")).unwrap();
+    let (video, params, tb) = encode_video_at(850_000);
+    let mut source = VecPackets {
+        packets: video.into_iter(),
+    };
+    assert!(PacketMuxSink::segment_live(
+        dir.path(),
+        "seg",
+        dir.path().join("index.m3u8"),
+        2,
+        SharedEpoch::new()
+    )
+    .run_av_tracks(&mut source, MuxStream::new(&params, tb), None, &[])
+    .is_err());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap(),
+        old_master
+    );
+    for uri in master_media_uris(&old_master) {
+        assert_manifest_and_media_readable(dir.path(), &uri);
+    }
+}
+
+#[test]
 fn live_restart_reaps_prior_generations_without_erasing_current_window() {
     let dir = tempfile::tempdir().unwrap();
-    for generation in 0..3 {
+    for generation in 0..8 {
         let (video, v_params, v_tb) = encode_video_at(750_000);
         let mut source = VecPackets {
             packets: video.into_iter(),
@@ -505,10 +643,15 @@ fn live_restart_reaps_prior_generations_without_erasing_current_window() {
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "ts"))
             .count();
         assert!(
-            ts_count <= 8,
+            ts_count <= 18,
             "restart {generation} retained {ts_count} files"
         );
-        let video_playlist = std::fs::read_to_string(dir.path().join("video.m3u8")).unwrap();
+        let master = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+        let video_uri = master_media_uris(&master)
+            .into_iter()
+            .find(|uri| uri.starts_with("video-g"))
+            .unwrap();
+        let video_playlist = std::fs::read_to_string(dir.path().join(video_uri)).unwrap();
         for uri in video_playlist.lines().filter(|line| {
             Path::new(line)
                 .extension()
@@ -541,7 +684,16 @@ fn unknown_video_bitrate_omits_master_instead_of_advertising_one_bps() {
     .unwrap();
     assert!(!dir.path().join("master.m3u8").exists());
     assert!(dir.path().join("index.m3u8").exists());
-    assert!(dir.path().join("video.m3u8").exists());
+    assert!(
+        !master_media_uris(
+            &std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap_or_default()
+        )
+        .is_empty()
+            || std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("video-g"))
+    );
 }
 
 #[test]

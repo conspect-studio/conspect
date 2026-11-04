@@ -1746,7 +1746,6 @@ impl PacketMuxSink {
                 // Keep every rendition's sequence and filename generation ahead
                 // of its prior run, including a track absent from the old run.
                 let next = next_segment_index(dir, prefix)?;
-                retire_old_master(playlist_path)?;
                 live.set_media_sequence(next);
                 if next != 0 {
                     live.set_initial_discontinuity();
@@ -1941,9 +1940,11 @@ impl<'a> SegmentState<'a> {
         let mut master = MasterPlaylist::new();
         let mut states = Vec::new();
         let parent = playlist_path.parent().unwrap_or_else(|| Path::new("."));
+        let generation = self.seg_index;
         if selection.program {
             if let Some(stream) = audio {
-                let mut live = LivePlaylist::new(parent.join("audio-program.m3u8"), window);
+                let uri = format!("audio-program-g{generation}.m3u8");
+                let mut live = LivePlaylist::new(parent.join(&uri), window);
                 live.set_epoch_source(epoch.clone());
                 live.set_media_sequence(self.seg_index);
                 if self.seg_index != 0 {
@@ -1951,7 +1952,7 @@ impl<'a> SegmentState<'a> {
                 }
                 master.push_audio(AudioRendition {
                     name: "Program".to_owned(),
-                    uri: "audio-program.m3u8".to_owned(),
+                    uri,
                     language: None,
                     default: true,
                 });
@@ -1969,7 +1970,7 @@ impl<'a> SegmentState<'a> {
                 continue;
             };
             let prefix = format!("audio-track{}-", track.index);
-            let uri = format!("audio-track{}.m3u8", track.index);
+            let uri = format!("audio-track{}-g{generation}.m3u8", track.index);
             let mut live = LivePlaylist::new(parent.join(&uri), window);
             live.set_epoch_source(epoch.clone());
             live.set_media_sequence(self.seg_index);
@@ -1993,7 +1994,8 @@ impl<'a> SegmentState<'a> {
                 current: None,
             });
         }
-        let mut video_live = LivePlaylist::new(parent.join("video.m3u8"), window);
+        let video_uri = format!("video-g{generation}.m3u8");
+        let mut video_live = LivePlaylist::new(parent.join(&video_uri), window);
         video_live.set_epoch_source(epoch);
         video_live.set_media_sequence(self.seg_index);
         if self.seg_index != 0 {
@@ -2011,7 +2013,7 @@ impl<'a> SegmentState<'a> {
             .bit_rate()
             .filter(|rate| *rate > 0)
             .map(|rate| rate.saturating_add(max_audio_rate));
-        let mut variant = VariantStream::new("video.m3u8", bandwidth.unwrap_or(0));
+        let mut variant = VariantStream::new(video_uri, bandwidth.unwrap_or(0));
         if let Some((width, height)) = video.params.video_dimensions() {
             variant = variant.with_resolution(width, height);
         }
@@ -2452,17 +2454,37 @@ impl<'a> SegmentState<'a> {
                 {
                     atomic_write(&renditions.master, master_text.as_bytes())?;
                 }
+            } else if renditions.video.live.playlist_path().exists() {
+                // No trustworthy BANDWIDTH: retire the previous master only once
+                // this run has playable media. Never advertise obsolete tracks.
+                match std::fs::remove_file(&renditions.master) {
+                    Ok(()) | Err(_) => {}
+                }
             }
         }
         if let Some(renditions) = self.renditions.as_ref() {
-            // The new playlists are already durable. Reap files left by prior
-            // runs outside two complete client windows plus a small grace span.
-            prune_prior_live_segments(
-                self.dir,
-                self.prefix,
-                self.seg_index,
-                renditions.retention_window,
-            );
+            // Never reap a file named by the still-advertised master when its
+            // replacement could not be published (including unknown bitrate).
+            if current_renditions_ready(renditions) {
+                prune_prior_rendition_manifests(
+                    self.dir,
+                    renditions,
+                    self.seg_index
+                        .saturating_sub(segment_grace(renditions.retention_window)),
+                );
+            }
+        }
+        if let Some(renditions) = self.renditions.as_ref() {
+            // A prior master remains authoritative until the new master exists.
+            // A missing rendition or a failed publication cannot retire its TS.
+            if current_renditions_ready(renditions) {
+                prune_prior_live_segments(
+                    self.dir,
+                    self.prefix,
+                    self.seg_index,
+                    renditions.retention_window,
+                );
+            }
         }
         self.done.push((segment.path, duration));
         Ok(())
@@ -2510,53 +2532,82 @@ impl<'a> SegmentState<'a> {
     }
 }
 
-/// Remove the old multivariant entry point before any replacement renditions
-/// publish. No master may advertise the prior run's removed tracks meanwhile.
-fn retire_old_master(playlist_path: &Path) -> Result<()> {
-    let parent = playlist_path.parent().unwrap_or_else(|| Path::new("."));
-    let master = parent.join("master.m3u8");
-    match std::fs::remove_file(&master) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(Error::Output(format!(
-                "retiring {}: {error}",
-                master.display()
-            )))
+fn current_renditions_ready(renditions: &AudioRenditions<'_>) -> bool {
+    match renditions.master_text.as_ref() {
+        Some(text) => {
+            std::fs::read_to_string(&renditions.master).is_ok_and(|published| published == *text)
         }
+        None => !renditions.master.exists() && renditions.video.live.playlist_path().exists(),
     }
-    // The legacy index remains in place. Remove only the dedicated rendition
-    // manifests, never their segment files (old clients can still request them).
-    let entries = std::fs::read_dir(parent)
-        .map_err(|error| Error::Output(format!("reading HLS renditions: {error}")))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| Error::Output(format!("reading HLS entry: {error}")))?;
+}
+
+/// Retire old rendition manifests only after every segment they list has
+/// passed the same bounded grace as the TS reaper. An old master cached by a
+/// client can continue to load its immutable rendition URI across a restart.
+fn prune_prior_rendition_manifests(dir: &Path, renditions: &AudioRenditions<'_>, oldest: u64) {
+    let active: Vec<&Path> = renditions
+        .states
+        .iter()
+        .chain(std::iter::once(&renditions.video))
+        .map(|state| state.live.playlist_path())
+        .collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name == "video.m3u8"
-            || name == "audio-program.m3u8"
-            || (name.starts_with("audio-track")
-                && Path::new(name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8")))
+        if !Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"))
+            || !(name.starts_with("video-")
+                || name.starts_with("audio-program-")
+                || name.starts_with("audio-track")
+                || matches!(name, "video.m3u8" | "audio-program.m3u8"))
+            || active.contains(&entry.path().as_path())
         {
-            std::fs::remove_file(entry.path()).map_err(|error| {
-                Error::Output(format!("retiring HLS rendition {name}: {error}"))
-            })?;
+            continue;
+        }
+        // Retire a playlist before its first media URI crosses the TS grace
+        // edge. The old master has already been atomically replaced.
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let listed: Vec<_> = text
+            .lines()
+            .filter(|line| {
+                Path::new(line)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+            })
+            .collect();
+        if !listed.is_empty()
+            && listed.iter().any(|uri| {
+                segment_number(uri).is_some_and(|index| index < oldest) || !dir.join(uri).exists()
+            })
+        {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
-    Ok(())
 }
 
 /// Reap prior-run TS files after the new manifests have advanced beyond them.
-/// Keep the current listed window and another window for clients with an old
-/// manifest. An extra three segments cover slow readers with short windows.
-fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize) {
-    let grace = u64::try_from(window)
+/// Keep three playlist windows plus three segment closes for an old client.
+fn segment_grace(window: usize) -> u64 {
+    u64::try_from(window)
         .unwrap_or(u64::MAX)
-        .saturating_mul(2)
-        .max(3);
-    let oldest = next.saturating_sub(grace);
+        .saturating_mul(3)
+        .saturating_add(3)
+}
+
+fn segment_number(uri: &str) -> Option<u64> {
+    uri.strip_suffix(".ts")?.rsplit('-').next()?.parse().ok()
+}
+
+fn prune_prior_live_segments(dir: &Path, prefix: &str, next: u64, window: usize) {
+    let oldest = next.saturating_sub(segment_grace(window));
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
