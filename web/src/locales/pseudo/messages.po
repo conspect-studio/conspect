@@ -554,7 +554,7 @@ msgstr ""
 #: src/pages/CastPage.tsx:320
 #: src/pages/DevicesPage.tsx:634
 #: src/pages/LayoutsPage.tsx:86
-#: src/pages/OutputsPage.tsx:712
+#: src/pages/OutputsPage.tsx:713
 #: src/pages/OverlaysPage.tsx:194
 #: src/pages/ProbesPage.tsx:452
 #: src/pages/SourcesPage.tsx:871
@@ -808,7 +808,7 @@ msgstr ""
 msgid "An ordinary managed source was created carrying device_ref {deviceId}."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:747
+#: src/pages/OutputsPage.tsx:748
 msgid "An output is a sink/server that publishes the program."
 msgstr ""
 
@@ -1739,7 +1739,7 @@ msgstr ""
 msgid "Configuration file"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:737
+#: src/pages/OutputsPage.tsx:738
 msgid "Configure output servers and renditions."
 msgstr ""
 
@@ -1759,7 +1759,7 @@ msgstr ""
 msgid "Configured multiview layouts."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:748
+#: src/pages/OutputsPage.tsx:749
 msgid "Configured output sinks."
 msgstr ""
 
@@ -1957,7 +1957,7 @@ msgstr ""
 msgid "Could not load media players:"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:751
+#: src/pages/OutputsPage.tsx:752
 msgid "Could not load outputs:"
 msgstr ""
 
@@ -2359,7 +2359,7 @@ msgstr ""
 msgid "Delete layout?"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:718
+#: src/pages/OutputsPage.tsx:719
 msgid "Delete output"
 msgstr ""
 
@@ -2742,7 +2742,7 @@ msgstr ""
 msgid "e.g. out-foyer"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:789
+#: src/pages/OutputsPage.tsx:790
 msgid "e.g. program-hls"
 msgstr ""
 
@@ -2837,8 +2837,8 @@ msgstr ""
 msgid "Edit layout"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:717
-#: src/pages/OutputsPage.tsx:746
+#: src/pages/OutputsPage.tsx:718
+#: src/pages/OutputsPage.tsx:747
 msgid "Edit output"
 msgstr ""
 
@@ -3512,7 +3512,7 @@ msgid "Host memory: ours / used / total"
 msgstr ""
 
 #: src/pages/AudioPage.tsx:355
-#: src/pages/OutputsPage.tsx:756
+#: src/pages/OutputsPage.tsx:757
 #: src/pages/OverlaysPage.tsx:234
 #: src/pages/ProbesPage.tsx:496
 #: src/pages/SourcesPage.tsx:912
@@ -3568,7 +3568,7 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1134
 #: src/pages/DevicesPage.tsx:113
 #: src/pages/LayoutsPage.tsx:70
-#: src/pages/OutputsPage.tsx:785
+#: src/pages/OutputsPage.tsx:786
 #: src/pages/OverlaysPage.tsx:268
 #: src/pages/ProbesPage.tsx:520
 #: src/pages/SalvosPage.tsx:211
@@ -3746,7 +3746,7 @@ msgid "Kind"
 msgstr ""
 
 #. placeholder {0}: ctx.row.original.rawKind
-#: src/pages/OutputsPage.tsx:722
+#: src/pages/OutputsPage.tsx:723
 #: src/pages/OverlaysPage.tsx:204
 #: src/pages/ProbesPage.tsx:462
 #: src/pages/SourcesPage.tsx:881
@@ -3830,7 +3830,7 @@ msgstr ""
 msgid "Latency"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:740
+#: src/pages/OutputsPage.tsx:741
 msgid "Latency & protocol guide"
 msgstr ""
 
@@ -4137,7 +4137,7 @@ msgstr ""
 msgid "Loading media players…"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:750
+#: src/pages/OutputsPage.tsx:751
 msgid "Loading outputs…"
 msgstr ""
 
@@ -4618,7 +4618,7 @@ msgstr ""
 #: src/pages/DevicesPage.tsx:533
 #: src/pages/LayoutsPage.tsx:61
 #: src/pages/OutputsPage.tsx:657
-#: src/pages/OutputsPage.tsx:797
+#: src/pages/OutputsPage.tsx:798
 #: src/pages/OverlaysPage.tsx:168
 #: src/pages/OverlaysPage.tsx:280
 #: src/pages/ProbesPage.tsx:414
@@ -4710,8 +4710,8 @@ msgstr ""
 msgid "New layout"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:744
 #: src/pages/OutputsPage.tsx:745
+#: src/pages/OutputsPage.tsx:746
 msgid "New output"
 msgstr ""
 
@@ -4868,7 +4868,7 @@ msgstr ""
 msgid "No offline alarm"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:749
+#: src/pages/OutputsPage.tsx:750
 msgid "No outputs configured."
 msgstr ""
 
@@ -5272,12 +5272,16 @@ msgstr ""
 msgid "Output path"
 msgstr ""
 
+#: src/pages/OutputsPage.tsx:706
+msgid "Output playback unavailable: the configured playlist path is missing."
+msgstr ""
+
 #: src/app/navigation.tsx:51
 #: src/docs/registry.ts:153
 #: src/docs/registry.ts:237
 #: src/pages/docs/ConfigPage.tsx:258
 #: src/pages/docs/FeaturesPage.tsx:65
-#: src/pages/OutputsPage.tsx:734
+#: src/pages/OutputsPage.tsx:735
 msgid "Outputs"
 msgstr ""
 
@@ -5821,7 +5825,7 @@ msgstr ""
 msgid "Removed from the registry. A device still referenced by a Source or Output (device_ref) is refused with a conflict instead."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:760
+#: src/pages/OutputsPage.tsx:761
 #: src/pages/ProbesPage.tsx:500
 msgid "Removed from the store. The running engine is unchanged until a config export + restart."
 msgstr ""
@@ -5878,7 +5882,7 @@ msgstr ""
 msgid "Requires a display-kms build"
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:706
+#: src/pages/OutputsPage.tsx:707
 msgid "Requires an active output; saved settings do not confirm playback."
 msgstr ""
 
@@ -6542,7 +6546,7 @@ msgstr ""
 msgid "Stored. Drift is measured against the group's target skew; the achieved tier is reported, never over-claimed."
 msgstr ""
 
-#: src/pages/OutputsPage.tsx:759
+#: src/pages/OutputsPage.tsx:760
 #: src/pages/ProbesPage.tsx:499
 msgid "Stored. It goes live via config export + restart; the running engine is unchanged until then."
 msgstr ""
@@ -6924,7 +6928,7 @@ msgid "The effective build-profile licence of this artifact (its codec-linking l
 msgstr ""
 
 #: src/preview/SourcePreviewButton.tsx:20
-msgid "The engine must ingest this source before a preview is available. WebRTC is used only when the server supports it."
+msgid "The engine must ingest this source before a preview is available. WebRTC is used only when the server supports it. Source previews are video-only."
 msgstr ""
 
 #: src/pages/docs/ComposePage.tsx:46
@@ -7471,7 +7475,7 @@ msgstr ""
 #: src/pages/LicencePage.tsx:247
 #: src/pages/MediaPlayersPage.tsx:259
 #: src/pages/OutputsPage.tsx:662
-#: src/pages/OutputsPage.tsx:806
+#: src/pages/OutputsPage.tsx:807
 msgid "Transport"
 msgstr ""
 

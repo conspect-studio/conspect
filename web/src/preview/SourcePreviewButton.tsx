@@ -17,7 +17,7 @@ export function SourcePreviewButton({ id, name }: { readonly id: string; readonl
       <DialogContent className="max-w-3xl">
         <DialogHeader>
           <DialogTitle><Trans>Source preview</Trans> — {name}</DialogTitle>
-          <DialogDescription><Trans>The engine must ingest this source before a preview is available. WebRTC is used only when the server supports it.</Trans></DialogDescription>
+          <DialogDescription><Trans>The engine must ingest this source before a preview is available. WebRTC is used only when the server supports it. Source previews are video-only.</Trans></DialogDescription>
         </DialogHeader>
         {open ? <PreviewSurface key={id} scope="input" whepEndpoint={`/api/v1/preview/inputs/${encodeURIComponent(id)}/whep`} jpegPath={`/api/v1/preview/inputs/${encodeURIComponent(id)}.jpg`} label={name} capabilities={capabilities.data} className="aspect-video w-full bg-black object-contain" /> : null}
       </DialogContent>

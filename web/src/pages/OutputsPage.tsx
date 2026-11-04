@@ -703,6 +703,7 @@ export function OutputsPage(): JSX.Element {
           <Link className="underline" to="/monitoring"><Trans>Watch program</Trans></Link>
           {path !== undefined ? <a className="underline" href={path} target="_blank" rel="noreferrer"><Trans>Open HLS playlist</Trans></a> : null}
           {playbackCollisions.has(ctx.row.original.id) ? <span className="text-xs text-muted-foreground"><Trans>HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order.</Trans></span> : null}
+          {path === undefined && !playbackCollisions.has(ctx.row.original.id) && (ctx.row.original.kind === 'hls' || ctx.row.original.kind === 'll-hls') ? <span className="text-xs text-muted-foreground"><Trans>Output playback unavailable: the configured playlist path is missing.</Trans></span> : null}
           <span className="text-xs text-muted-foreground"><Trans>Requires an active output; saved settings do not confirm playback.</Trans></span>
         </div>;
       },
