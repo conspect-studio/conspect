@@ -201,6 +201,14 @@ pub trait IngestSpawner: Send + Sync {
     /// `None` when the spawn failed (logged by the implementation; the tile
     /// rides the slate honestly).
     fn spawn(&self, spawn: SourceSpawn, registry: &StopRegistry) -> Option<SpawnedProducer>;
+
+    /// A source now running without decoded audio (a synthetic add/edit): it
+    /// exists on the run, carrying silence. Called on the hub worker, so every
+    /// program-bus membership change is ordered with the spawns and teardowns.
+    fn source_without_audio(&self, _id: &str) {}
+
+    /// A source left the run: its program-bus point goes too. Hub worker only.
+    fn source_removed(&self, _id: &str) {}
 }
 
 /// A request travelling from the frame-boundary drain to the hub worker.
@@ -390,6 +398,9 @@ fn worker_loop(
                 // producer first, then spawn the replacement into the SAME
                 // store (the drain reused it, so the tile holds last-good).
                 teardown(&spawn.id, &mut owned, registry);
+                if let Some(ingest) = ingest {
+                    ingest.source_without_audio(&spawn.id);
+                }
                 spawn_synth(spawn, &mut owned, registry, preview);
             }
             HubRequest::SpawnSource(spawn) => {
@@ -401,6 +412,9 @@ fn worker_loop(
             }
             HubRequest::Teardown { id } => {
                 teardown(&id, &mut owned, registry);
+                if let Some(ingest) = ingest {
+                    ingest.source_removed(&id);
+                }
                 preview_remove(preview, &id);
             }
             HubRequest::Shutdown => break,

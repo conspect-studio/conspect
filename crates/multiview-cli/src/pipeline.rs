@@ -1184,6 +1184,7 @@ segment_ms = 1000
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
             output_origin: crate::timing_status::anchor_slot(),
+            audio_route: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             // EMPTY island slot — admission named no device.
             island: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             load_source: Box::new(CountingLoadSource {
@@ -1275,6 +1276,7 @@ segment_ms = 1000
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
             output_origin: crate::timing_status::anchor_slot(),
+            audio_route: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             island: std::sync::Arc::new(multiview_framestore::SwapCell::from_some(island(
                 FakeTwoGpu::GPU1_UUID,
                 1,
@@ -1907,6 +1909,8 @@ struct IngestPlan {
     /// [`LiveAnchor`]) for the audio rail; [`live_anchor_slot`] of the source id
     /// for config sources.
     live_anchor: LiveAnchorSlot,
+    /// Source lifecycle token; old detached producers cannot republish after edit.
+    lifecycle: u64,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -2728,6 +2732,7 @@ impl Pipeline {
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
+            audio_route: Arc::clone(&self.audio_route),
             #[cfg(feature = "gpu")]
             island: Arc::clone(&self.live_island),
             #[cfg(feature = "gpu")]
@@ -3445,7 +3450,8 @@ impl Pipeline {
             }
             self.audio_route.store(Some(Arc::new(
                 crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels)
-                    .with_sample_rate(cfg.sample_rate),
+                    .with_sample_rate(cfg.sample_rate)
+                    .with_startup(self.audio_routing.as_ref(), self.stores.keys().cloned()),
             )));
             bus
         });
@@ -4829,10 +4835,15 @@ fn consumer_main(
     #[cfg(not(feature = "overlay"))]
     let mut input_meters = crate::meter_telemetry::InputMeters::new();
     // On-air A/V offset for live (timeline) sources, measured per tick.
-    let av_ids: Vec<String> = audio_bus
+    let mut av_ids: Vec<String> = audio_bus
         .as_ref()
         .map(multiview_audio::program::ProgramBus::timeline_source_ids)
         .unwrap_or_default();
+    // Sources join and leave the running bus: re-read the metered ids when the
+    // strip count moves (a rare, operator-paced change), never per tick.
+    let mut av_strips = audio_bus
+        .as_ref()
+        .map_or(0, multiview_audio::program::ProgramBus::live_strip_count);
     let mut av_meter = audio_bus
         .as_ref()
         .map(|bus| crate::av_sync::AvMeter::new(bus.cadence(), bus.format().sample_rate()));
@@ -4900,6 +4911,10 @@ fn consumer_main(
             #[cfg(not(feature = "overlay"))]
             if let Some(handle) = audio_route.as_ref() {
                 handle.apply_pending(bus);
+            }
+            if bus.live_strip_count() != av_strips {
+                av_strips = bus.live_strip_count();
+                av_ids = bus.timeline_source_ids();
             }
             // The bus sample position of THIS tick (before the advance): the
             // output frame whose audio the bus is about to read.
@@ -6604,6 +6619,9 @@ struct LiveIngestSpawner {
     cadence: Rational,
     /// The run's output-clock origin slot (see [`IngestPlan::output_origin`]).
     output_origin: crate::timing_status::EpochAnchorSlot,
+    /// The running program bus's control handle (empty when this run carries
+    /// no program audio): a spawned source's audio joins the bus through it.
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     /// The pinned island slot `drive_streaming` publishes (ADR-W018 §7).
     #[cfg(feature = "gpu")]
     island: LiveIslandSlot,
@@ -6620,6 +6638,93 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         registry: &crate::live_sources::StopRegistry,
     ) -> Option<crate::live_sources::SpawnedProducer> {
         let crate::live_sources::SourceSpawn { source, store } = spawn;
+        let audio = self.audio_route.load();
+        // The hub has stopped both old rails before this same-id edit. Do not
+        // let the replacement audio decode place B against A's video anchor
+        // while the new fetcher waits for its first segment.
+        let lifecycle = begin_live_lifecycle(&source.id);
+        // Capture the unusable replacement marker before video can publish B.
+        let anchor_floor = live_anchor_slot(&source.id)
+            .load()
+            .map_or(0, |anchor| anchor.generation);
+        let produced = self.spawn_video(&source, store, registry, lifecycle);
+        if let Some(handle) = audio {
+            let audio_store = produced.as_ref().and_then(|p| {
+                spawn_live_audio(&source, &p.stop, registry, lifecycle, anchor_floor)
+            });
+            handle.set_source_audio(&source.id, audio_store);
+        }
+        produced
+    }
+
+    fn source_without_audio(&self, id: &str) {
+        // A timed-out decoded producer must not publish after HLS -> synthetic.
+        begin_live_lifecycle(id);
+        if let Some(handle) = self.audio_route.load() {
+            handle.set_source_audio(id, None);
+        }
+    }
+
+    fn source_removed(&self, id: &str) {
+        begin_live_lifecycle(id);
+        if let Some(handle) = self.audio_route.load() {
+            handle.remove_source(id);
+        }
+    }
+}
+
+/// Spawn a runtime-added source's AUDIO decode exactly as the startup path does
+/// ([`audio_ingest_plan_for`] + [`crate::audio::audio_ingest_loop`] into a
+/// timeline store locked to vision through [`live_anchor_slot`]), returning the
+/// store the program bus should read. It shares the video producer's stop flag
+/// and registers it under `{id}/audio`, so a live edit/remove (which raises
+/// `{id}` and every `{id}/` companion and waits for their exit) and hub shutdown
+/// both stop it. `None` for a source with no audio path, or a failed spawn
+/// (logged; the source rides silence). Hub worker thread only, never the clock.
+fn spawn_live_audio(
+    source: &Source,
+    stop: &Arc<AtomicBool>,
+    registry: &crate::live_sources::StopRegistry,
+    lifecycle: u64,
+    anchor_floor: u64,
+) -> Option<Arc<multiview_audio::store::AudioStore>> {
+    let mut plan = audio_ingest_plan_for(source)?;
+    plan.lifecycle = lifecycle;
+    plan.anchor_floor = anchor_floor;
+    let store = if plan.live {
+        crate::audio::new_live_store()
+    } else {
+        crate::audio::new_store()
+    };
+    let id = plan.id.clone();
+    let exited = crate::live_sources::register_stop(registry, &format!("{id}/audio"), stop);
+    let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+    let thread_stop = Arc::clone(stop);
+    let thread_store = Arc::clone(&store);
+    match std::thread::Builder::new()
+        .name(format!("multiview-audio-{id}"))
+        .spawn(move || {
+            let _exit = exit_guard;
+            crate::audio::audio_ingest_loop(&plan, &thread_store, &thread_stop);
+        }) {
+        Ok(_detached) => Some(store),
+        Err(e) => {
+            tracing::error!(error = %e, source = %id, "could not spawn live audio decode thread");
+            None
+        }
+    }
+}
+
+impl LiveIngestSpawner {
+    /// The video half of [`crate::live_sources::IngestSpawner::spawn`].
+    fn spawn_video(
+        &self,
+        source: &Source,
+        store: Arc<TileStore<Nv12Image>>,
+        registry: &crate::live_sources::StopRegistry,
+        lifecycle: u64,
+    ) -> Option<crate::live_sources::SpawnedProducer> {
+        let source = source.clone();
         let (tile_w, tile_h) = cell_pixel_size(&self.layout, &source.id)
             .unwrap_or((self.layout.canvas.width, self.layout.canvas.height));
         let mut plan = match ingest_plan_for(
@@ -6642,6 +6747,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             }
         };
         plan.output_origin = Arc::clone(&self.output_origin);
+        plan.lifecycle = lifecycle;
         // Hardware re-assessment on every change (ADR-W018 §7), under `gpu`.
         #[cfg(feature = "gpu")]
         {
@@ -6687,6 +6793,673 @@ impl LiveIngestSpawner {
             );
             DecodePlacement::SoftwareOnly
         }
+    }
+}
+
+#[cfg(all(test, feature = "ffmpeg"))]
+#[allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod live_edit_audio_regression_tests {
+    use super::*;
+    use crate::live_sources::{shared_stores, LiveSourceHub, SourceSpawn};
+    use multiview_audio::{AudioFormat, ChannelLayout, ProgramBus};
+    use multiview_framestore::{NoSignalPolicy, TileThresholds};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    fn clip(path: &std::path::Path, frequency: u32) {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=25:d=12",
+                "-f",
+                "lavfi",
+            ])
+            .arg("-i")
+            .arg(format!(
+                "sine=frequency={frequency}:sample_rate=48000:duration=12"
+            ))
+            .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"])
+            .arg(path)
+            .status()
+            .expect("generate local audio/video clip");
+        assert!(status.success(), "ffmpeg fixture generation failed");
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !condition() {
+            assert!(Instant::now() < deadline, "live edit did not make progress");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn source(path: &std::path::Path) -> Source {
+        serde_json::from_value(serde_json::json!({
+            "id": "edited", "kind": "file", "path": path.display().to_string()
+        }))
+        .expect("file source")
+    }
+
+    /// Serve generated MPEG-TS as two live HTTP HLS origins. The production
+    /// fetcher performs real playlist and segment requests, not a mocked URL.
+    fn hls_origin(a: Vec<u8>, b: Vec<u8>) -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("[::1]:0").expect("loopback HLS origin");
+        listener.set_nonblocking(true).expect("nonblocking origin");
+        let url = format!(
+            "http://[::1]:{}",
+            listener.local_addr().expect("address").port()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let thread_stop = Arc::clone(&stop);
+        let thread_hits = Arc::clone(&b_hits);
+        std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                std::thread::spawn({
+                    let a = a.clone();
+                    let b = b.clone();
+                    let hits = Arc::clone(&thread_hits);
+                    move || {
+                        conn.set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("origin read timeout");
+                        let mut request = [0_u8; 4096];
+                        let Ok(n) = conn.read(&mut request) else {
+                            return;
+                        };
+                        let head = String::from_utf8_lossy(&request[..n]);
+                        let path = head.split_whitespace().nth(1).unwrap_or_default();
+                        let body: &[u8] = match path {
+                            "/a.m3u8" => b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:12\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:12.0,\na.ts\n#EXTINF:12.0,\na.ts\n#EXTINF:12.0,\na.ts\n",
+                            "/b.m3u8" => b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:12\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:12.0,\nb.ts\n#EXTINF:12.0,\nb.ts\n#EXTINF:12.0,\nb.ts\n",
+                            "/a.ts" => &a,
+                            "/b.ts" => { hits.fetch_add(1, Ordering::AcqRel); &b },
+                            _ => b"not found",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = conn.write_all(response.as_bytes());
+                        let _ = conn.write_all(body);
+                    }
+                });
+            }
+        });
+        (url, stop, b_hits)
+    }
+
+    /// Same-id URL edits must plan the edited address for both decoders, and
+    /// the audio lookup must observe a re-anchored video connection, not cache A.
+    #[test]
+    fn same_id_network_url_edit_uses_latest_video_anchor_and_audio_location() {
+        let a: Source = serde_json::from_value(serde_json::json!({
+            "id": "anchor-edit", "kind": "hls", "url": "http://[::1]:1234/a.m3u8"
+        }))
+        .expect("A source");
+        let b: Source = serde_json::from_value(serde_json::json!({
+            "id": "anchor-edit", "kind": "hls", "url": "http://[::1]:1234/b.m3u8"
+        }))
+        .expect("B source");
+        let old = audio_ingest_plan_for(&a).expect("A audio plan");
+        let next = audio_ingest_plan_for(&b).expect("B audio plan");
+        assert_eq!(old.location, "http://[::1]:1234/a.m3u8");
+        assert_eq!(next.location, "http://[::1]:1234/b.m3u8");
+        assert!(
+            next.live,
+            "network replacement uses the live timeline store"
+        );
+        let tile = Arc::new(TileStore::new(
+            "anchor-edit",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let video = ingest_plan_for(
+            &b,
+            64,
+            64,
+            tile,
+            CanvasColor::default(),
+            Rational::new(25, 1),
+        )
+        .expect("B video plan");
+        assert!(
+            matches!(&video.location, SourceLocation::Url(url) if url == &next.location),
+            "replacement video and audio must use the same B URL"
+        );
+        let slot = video.live_anchor.clone();
+        publish_live_anchor(
+            &slot,
+            (MediaTime::from_nanos(1_000_000_000), MediaTime::ZERO),
+            Some(11),
+        );
+        let before = slot.load().expect("A anchor");
+        publish_live_anchor(
+            &slot,
+            (MediaTime::from_nanos(4_000_000_000), MediaTime::ZERO),
+            Some(22),
+        );
+        let after = slot.load().expect("B anchor");
+        assert!(after.generation > before.generation);
+        assert_eq!(after.raw_pts0_ns, Some(22));
+        assert_eq!(after.out0, MediaTime::from_nanos(4_000_000_000));
+        let observed = crate::audio::test_video_anchor(&slot).expect("audio reads B anchor");
+        assert_eq!(observed.generation, after.generation);
+        assert_eq!(observed.raw_pts0_ns, 22);
+        assert_eq!(observed.out0_ns, 4_000_000_000);
+        assert!(
+            Arc::ptr_eq(&slot, &live_anchor_slot("anchor-edit")),
+            "audio and replacement video share the anchor slot"
+        );
+    }
+
+    #[test]
+    fn detached_old_producer_cannot_republish_anchor_after_replacement() {
+        let id = "fenced-late-anchor";
+        let slot = live_anchor_slot(id);
+        let a = begin_live_lifecycle(id);
+        publish_live_anchor_for(
+            id,
+            a,
+            &slot,
+            (MediaTime::from_nanos(100), MediaTime::ZERO),
+            Some(11),
+        );
+        assert_eq!(slot.load().and_then(|anchor| anchor.raw_pts0_ns), Some(11));
+        let b = begin_live_lifecycle(id);
+        assert!(
+            crate::audio::test_video_anchor(&slot).is_none(),
+            "B cannot consume A anchor"
+        );
+        let stale = std::thread::spawn({
+            let slot = Arc::clone(&slot);
+            move || {
+                publish_live_anchor_for(
+                    id,
+                    a,
+                    &slot,
+                    (MediaTime::from_nanos(200), MediaTime::ZERO),
+                    Some(11),
+                );
+            }
+        });
+        stale.join().expect("late A writer");
+        assert!(
+            crate::audio::test_video_anchor(&slot).is_none(),
+            "late A stays fenced"
+        );
+        publish_live_anchor_for(
+            id,
+            b,
+            &slot,
+            (MediaTime::from_nanos(300), MediaTime::ZERO),
+            Some(22),
+        );
+        assert_eq!(
+            crate::audio::test_video_anchor(&slot)
+                .expect("B anchor")
+                .raw_pts0_ns,
+            22
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..1000 {
+                    publish_live_anchor_for(
+                        id,
+                        a,
+                        &slot,
+                        (MediaTime::from_nanos(400), MediaTime::ZERO),
+                        Some(11),
+                    );
+                }
+            });
+            for _ in 0..1000 {
+                publish_live_anchor_for(
+                    id,
+                    b,
+                    &slot,
+                    (MediaTime::from_nanos(500), MediaTime::ZERO),
+                    Some(22),
+                );
+            }
+        });
+        assert_eq!(slot.load().and_then(|anchor| anchor.raw_pts0_ns), Some(22));
+    }
+
+    /// A real loopback HLS edit replaces the production fetcher, audio worker,
+    /// video anchor, and running program bus without a process restart.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn same_id_http_hls_edit_replaces_shared_fetch_audio_and_program() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let a = dir.path().join("a.ts");
+        let b = dir.path().join("b.ts");
+        clip(&a, 440);
+        clip(&b, 880);
+        let (origin, origin_stop, b_hits) = hls_origin(
+            std::fs::read(a).expect("A TS"),
+            std::fs::read(b).expect("B TS"),
+        );
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "base"
+kind = "solid"
+color = "#101010"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "base"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            dir.path().join("out/index.m3u8").display()
+        );
+        let pipeline = Pipeline::build(&MultiviewConfig::load_from_toml(&doc).expect("config"))
+            .expect("pipeline");
+        let clock: Arc<dyn multiview_engine::clock::TimeSource> =
+            Arc::new(multiview_engine::clock::MonotonicTimeSource::new());
+        pipeline.epoch_anchor_slot().store(Some(Arc::new(
+            multiview_engine::epoch::EpochAnchor::new(clock, 0),
+        )));
+        let audio = Arc::new(crate::audio::AudioControlHandle::new().with_sample_rate(48_000));
+        pipeline.audio_route_slot().store(Some(Arc::clone(&audio)));
+        let registry = pipeline.stop_registry();
+        let hub = LiveSourceHub::start_with_ingest(
+            Arc::clone(&registry),
+            shared_stores(pipeline.preview_stores()),
+            Some(pipeline.live_ingest_spawner()),
+        );
+        let tile = Arc::new(TileStore::new(
+            "edited-http",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let submit = |name: &str| {
+            let source: Source = serde_json::from_value(serde_json::json!({
+                "id": "edited-http", "kind": "hls", "url": format!("{origin}/{name}.m3u8")
+            }))
+            .expect("HLS source");
+            assert_eq!(
+                hub.handle().request_spawn_source(SourceSpawn {
+                    source,
+                    store: Arc::clone(&tile),
+                }),
+                crate::live_sources::HubSubmit::Accepted
+            );
+        };
+        let mut bus = ProgramBus::new(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            Rational::new(25, 1),
+        );
+        submit("a");
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while crate::hls_fetch::shared_url("edited-http", live_lifecycle("edited-http")).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "A fetcher must publish a shared URL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let a_lifecycle = live_lifecycle("edited-http");
+        let old_url =
+            crate::hls_fetch::shared_url("edited-http", a_lifecycle).expect("A fetcher URL");
+        wait_until(|| audio.test_source_store("edited-http").is_some());
+        let old_store = audio
+            .test_source_store("edited-http")
+            .expect("A audio store");
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while live_anchor_slot("edited-http").load().is_none() {
+            assert!(Instant::now() < deadline, "A video must publish its anchor");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let old_anchor = live_anchor_slot("edited-http")
+            .load()
+            .expect("A video anchor");
+        let old_stop = registry
+            .lock()
+            .expect("registry")
+            .get("edited-http/audio")
+            .expect("A audio worker")
+            .stop
+            .clone();
+        audio.apply_pending(&mut bus);
+        bus.set_program_gain_ramped(
+            audio.test_source_point("edited-http").expect("route"),
+            1.0,
+            0,
+        )
+        .expect("A at unity");
+
+        submit("b");
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while live_lifecycle("edited-http") == a_lifecycle {
+            assert!(Instant::now() < deadline, "B lifecycle must start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let b_lifecycle = live_lifecycle("edited-http");
+        assert_eq!(
+            crate::hls_fetch::shared_url("edited-http", a_lifecycle),
+            None
+        );
+        assert_ne!(
+            crate::hls_fetch::shared_url("edited-http", b_lifecycle).as_deref(),
+            Some(old_url.as_str()),
+            "earliest B lookup must not select A before B publication"
+        );
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while crate::hls_fetch::shared_url("edited-http", b_lifecycle)
+            .as_ref()
+            .is_none_or(|url| url == &old_url)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "B fetcher must replace A shared URL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            b_hits.load(Ordering::Acquire) > 0,
+            "B segments fetched over HTTP"
+        );
+        assert!(old_stop.load(Ordering::Acquire), "A audio worker stopped");
+        let new_stop = registry
+            .lock()
+            .expect("registry")
+            .get("edited-http/audio")
+            .expect("B audio worker")
+            .stop
+            .clone();
+        assert!(
+            !Arc::ptr_eq(&old_stop, &new_stop),
+            "B owns a new audio worker"
+        );
+        assert!(!new_stop.load(Ordering::Acquire), "B audio worker runs");
+        wait_until(|| {
+            audio
+                .test_source_store("edited-http")
+                .is_some_and(|s| !Arc::ptr_eq(&s, &old_store))
+        });
+        let new_store = audio
+            .test_source_store("edited-http")
+            .expect("B audio store");
+        assert!(
+            new_store.is_timeline(),
+            "B worker publishes on the video timeline"
+        );
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while !live_anchor_slot("edited-http")
+            .load()
+            .is_some_and(|anchor| {
+                anchor.generation > old_anchor.generation && anchor.raw_pts0_ns.is_some()
+            })
+        {
+            assert!(Instant::now() < deadline, "B video must replace A anchor");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let new_anchor = live_anchor_slot("edited-http").load().expect("B anchor");
+        assert!(
+            new_anchor.generation > old_anchor.generation,
+            "B replaces A anchor"
+        );
+        assert!(
+            new_anchor.raw_pts0_ns.is_some(),
+            "B video has a usable PTS anchor"
+        );
+        audio.apply_pending(&mut bus);
+        assert_eq!(bus.live_strip_count(), 2, "A crossfades into B");
+        // A live HLS producer stays paced; the bus reads the B store after the
+        // source edit, rather than seeking a finite file back from EOF.
+        // The video anchor includes the two-second jitter hold. Drive the bus
+        // on that output timeline, not from tick zero (which must be silence).
+        let first_tick = u64::try_from(new_anchor.out0.as_nanos() / 40_000_000)
+            .expect("nonnegative video anchor")
+            + 1;
+        let _ = bus.tick_to(first_tick);
+        assert_eq!(bus.live_strip_count(), 1, "old A strip retires");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut crossings = 0;
+        let mut tick = first_tick;
+        while Instant::now() < deadline {
+            // Keep the real bus output clock close to wall time: the placer
+            // places blocks only after its consumer reaches this timeline.
+            tick += 1;
+            let samples: Vec<_> = bus
+                .tick_to(tick)
+                .interleaved()
+                .iter()
+                .step_by(2)
+                .copied()
+                .collect();
+            crossings = samples
+                .windows(2)
+                .filter(|p| p[0] < 0.0 && p[1] >= 0.0)
+                .count();
+            if (25..=45).contains(&crossings) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(
+            (25..=45).contains(&crossings),
+            "program B tone: crossings={crossings}"
+        );
+        hub.shutdown();
+        origin_stop.store(true, Ordering::Release);
+    }
+
+    /// The production hub and pipeline ingest spawner must replace BOTH workers
+    /// under the same id. The actual bus must read the replacement store, not
+    /// the startup map or the earlier live store.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn same_id_file_edit_replaces_audio_worker_and_running_program_store() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let a = dir.path().join("a.ts");
+        let b = dir.path().join("b.ts");
+        clip(&a, 440);
+        clip(&b, 880);
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "base"
+kind = "solid"
+color = "#101010"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "base"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            dir.path().join("out/index.m3u8").display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config");
+        let pipeline = Pipeline::build(&config).expect("pipeline");
+        let audio = Arc::new(crate::audio::AudioControlHandle::new().with_sample_rate(48_000));
+        pipeline.audio_route_slot().store(Some(Arc::clone(&audio)));
+        let registry = pipeline.stop_registry();
+        let hub = LiveSourceHub::start_with_ingest(
+            Arc::clone(&registry),
+            shared_stores(pipeline.preview_stores()),
+            Some(pipeline.live_ingest_spawner()),
+        );
+        let tile = Arc::new(TileStore::new(
+            "edited",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let submit = |path: &std::path::Path| {
+            assert_eq!(
+                hub.handle().request_spawn_source(SourceSpawn {
+                    source: source(path),
+                    store: Arc::clone(&tile),
+                }),
+                crate::live_sources::HubSubmit::Accepted
+            );
+        };
+        let mut bus = ProgramBus::new(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            Rational::new(25, 1),
+        );
+        submit(&a);
+        wait_until(|| audio.test_source_store("edited").is_some());
+        let old = audio.test_source_store("edited").expect("A store");
+        wait_until(|| old.buffered_frames() > 4_800);
+        audio.apply_pending(&mut bus);
+        assert_eq!(bus.live_strip_count(), 1, "A joins the real bus");
+        bus.set_program_gain_ramped(audio.test_source_point("edited").expect("A route"), 1.0, 0)
+            .expect("route A at unity");
+        let first = registry
+            .lock()
+            .expect("registry")
+            .get("edited/audio")
+            .expect("A audio worker")
+            .stop
+            .clone();
+        assert!(!first.load(Ordering::Acquire), "A worker runs before edit");
+
+        submit(&b);
+        wait_until(|| {
+            audio
+                .test_source_store("edited")
+                .is_some_and(|s| !Arc::ptr_eq(&s, &old))
+        });
+        let new = audio.test_source_store("edited").expect("B store");
+        wait_until(|| new.buffered_frames() > 4_800);
+        let second = registry
+            .lock()
+            .expect("registry")
+            .get("edited/audio")
+            .expect("B audio worker")
+            .stop
+            .clone();
+        assert!(
+            first.load(Ordering::Acquire),
+            "same-id edit stops A audio worker"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "B has a fresh worker stop flag"
+        );
+        assert!(!second.load(Ordering::Acquire), "B worker runs after edit");
+        audio.apply_pending(&mut bus); // B repoints the existing bus strip.
+        assert_eq!(
+            bus.live_strip_count(),
+            2,
+            "crossfade briefly retains A until its 10 ms ramp ends"
+        );
+        assert!(Arc::ptr_eq(
+            &new,
+            &audio.test_source_store("edited").expect("bus source is B")
+        ));
+        // The finite FILE decoder may finish all 12 seconds before the bus first
+        // ticks. Park its cursor inside the decoded tail, not past EOF; the
+        // production bus still reads the actual B decode store after its ramp.
+        let decoded_head = new.read_cursor();
+        new.seek_to(decoded_head.saturating_sub(19_200));
+        // A 440 Hz tone and B 880 Hz tone have different zero-crossing counts.
+        // The bus output (not a direct store read) must carry B after its ramp.
+        let mut samples = Vec::new();
+        for tick in 1..=6 {
+            samples.extend(bus.tick_to(tick).interleaved().iter().step_by(2).copied());
+        }
+        assert_eq!(
+            bus.live_strip_count(),
+            1,
+            "A strip retires after the crossfade"
+        );
+        let tail = &samples[samples.len() - 4_800..];
+        let crossings = tail
+            .windows(2)
+            .filter(|pair| pair[0] < 0.0 && pair[1] >= 0.0)
+            .count();
+        assert!(
+            (70..=105).contains(&crossings),
+            "program must carry B's 880 Hz tone, crossings={crossings}"
+        );
+        hub.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod live_audio_spawn_tests {
+    use super::*;
+
+    /// The real spawn seam: a runtime-added network source gets a timeline
+    /// audio store and a decode thread registered under `{id}/audio`, so the
+    /// hub's `{id}` teardown stops it with the video.
+    #[test]
+    fn a_runtime_network_source_gets_a_locked_audio_store_and_a_stoppable_decode() {
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "live-audio-1", "kind": "hls", "url": "http://[::1]:9/none.m3u8"
+        }))
+        .expect("test source parses");
+        let registry = crate::live_sources::stop_registry();
+        let stop = Arc::new(AtomicBool::new(true));
+        let store =
+            spawn_live_audio(&source, &stop, &registry, 0, 0).expect("network source has audio");
+        assert!(store.is_timeline(), "live audio is locked to vision");
+        assert!(registry
+            .lock()
+            .is_ok_and(|map| map.contains_key("live-audio-1/audio")));
+    }
+
+    /// A synthetic source has no decode path: it must not claim an audio store.
+    #[test]
+    fn a_runtime_synthetic_source_has_no_audio_decode() {
+        let source: Source =
+            serde_json::from_value(serde_json::json!({ "id": "live-audio-2", "kind": "bars" }))
+                .expect("test source parses");
+        let registry = crate::live_sources::stop_registry();
+        let stop = Arc::new(AtomicBool::new(true));
+        assert!(spawn_live_audio(&source, &stop, &registry, 0, 0).is_none());
     }
 }
 
@@ -8801,6 +9574,7 @@ fn ingest_plan_for(
         store,
         output_origin: crate::timing_status::anchor_slot(),
         live_anchor: live_anchor_slot(&source.id),
+        lifecycle: 0,
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -9005,6 +9779,7 @@ fn build_media_player_boot(
             store,
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -9092,6 +9867,8 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         id: source.id.clone(),
         location,
         live,
+        lifecycle: 0,
+        anchor_floor: 0,
     })
 }
 
@@ -10800,7 +11577,8 @@ fn open_and_stream(
                 && is_hls_location(&plan.location)
                 && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none()
             {
-                match crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop) {
+                match crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop, plan.lifecycle)
+                {
                     Ok(fetcher) => {
                         let local = fetcher.local_url().to_owned();
                         hls_fetcher = Some(fetcher);
@@ -11040,7 +11818,13 @@ fn open_and_stream(
                 let raw_ns = decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base));
                 let reanchored = stamper.take_reanchored().is_some();
                 if anchor_due(reanchored, last_raw_offset, raw_ns, at) {
-                    publish_live_anchor(&plan.live_anchor, (at, pts), raw_ns);
+                    publish_live_anchor_for(
+                        &plan.id,
+                        plan.lifecycle,
+                        &plan.live_anchor,
+                        (at, pts),
+                        raw_ns,
+                    );
                     if let Some(raw) = raw_ns {
                         last_raw_offset = Some(at.as_nanos().saturating_sub(raw));
                     }
@@ -12198,6 +12982,43 @@ pub fn live_anchor_slot(id: &str) -> LiveAnchorSlot {
     )
 }
 
+/// A detached writer and a replacement synchronize publication under one lock.
+fn anchor_lifecycle() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static TOKENS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    TOKENS.get_or_init(Default::default)
+}
+
+pub(crate) fn live_lifecycle(id: &str) -> u64 {
+    anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn begin_live_lifecycle(id: &str) -> u64 {
+    let mut tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let token = tokens.entry(id.to_owned()).or_default();
+    *token = token.saturating_add(1);
+    let slot = live_anchor_slot(id);
+    let generation = slot
+        .load()
+        .map_or(0, |anchor| anchor.generation)
+        .saturating_add(1);
+    slot.store(Some(Arc::new(LiveAnchor {
+        generation,
+        out0: MediaTime::ZERO,
+        pts0: MediaTime::ZERO,
+        raw_pts0_ns: None,
+    })));
+    crate::hls_fetch::begin_generation(id);
+    *token
+}
+
 /// `ticks` of `time_base` in nanoseconds (exact integer math, `None` on a
 /// degenerate base or overflow).
 fn ticks_to_ns(ticks: i64, time_base: Rational) -> Option<i64> {
@@ -12228,6 +13049,23 @@ fn anchor_due(
     match (last_offset, raw_ns) {
         (Some(prev), Some(raw)) => (at.as_nanos().saturating_sub(raw) - prev).abs() > TOLERANCE_NS,
         _ => false,
+    }
+}
+
+/// Publish only when this producer still owns the source lifecycle. The lock
+/// covers both the ownership check and store, excluding replacement races.
+fn publish_live_anchor_for(
+    id: &str,
+    lifecycle: u64,
+    slot: &LiveAnchorSlot,
+    at: (MediaTime, MediaTime),
+    raw_pts0_ns: Option<i64>,
+) {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied().unwrap_or(0) == lifecycle {
+        publish_live_anchor(slot, at, raw_pts0_ns);
     }
 }
 
@@ -14868,6 +15706,9 @@ mod live_overlay_bake_tests {
             analog_clocks: Vec::new(),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
+            output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             // No Conspect watermark in these pixel tests: the asserted face
             // regions must change ONLY with the live overlay slot (S3 has its
             // own coverage), and the 320x180 test canvas matches `item`.
@@ -15453,6 +16294,7 @@ mod media_player_loop_tests {
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -15619,6 +16461,7 @@ mod media_player_loop_tests {
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -15729,6 +16572,7 @@ mod media_player_loop_tests {
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,

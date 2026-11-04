@@ -328,20 +328,47 @@ pub fn stats(id: &str) -> Arc<FetchStats> {
     Arc::clone(map.entry(id.to_owned()).or_default())
 }
 
-fn urls() -> &'static Mutex<HashMap<String, String>> {
-    static URLS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+#[derive(Default)]
+struct FetchRegistration {
+    generation: u64,
+    url: Option<String>,
+}
+
+fn urls() -> &'static Mutex<HashMap<String, FetchRegistration>> {
+    static URLS: OnceLock<Mutex<HashMap<String, FetchRegistration>>> = OnceLock::new();
     URLS.get_or_init(Default::default)
 }
 
-/// The loopback playlist of source `id`'s running fetcher, if it has one, so
-/// another reader (the audio ingest) shares the one fetched copy.
+/// Invalidate the old fetcher before the replacement audio or video starts.
+/// Publication and invalidation use the same lock: a late A cannot race B.
+pub(crate) fn begin_generation(id: &str) -> u64 {
+    let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
+    let entry = map.entry(id.to_owned()).or_default();
+    entry.generation = entry.generation.saturating_add(1);
+    entry.url = None;
+    entry.generation
+}
+
+/// Install the local fetch only while its lifecycle still owns this id.
+fn publish_url(id: &str, generation: u64, local_url: &str) -> Result<(), String> {
+    let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
+    let entry = map.entry(id.to_owned()).or_default();
+    if entry.generation != generation {
+        return Err("source replaced before fetch publication".to_owned());
+    }
+    entry.url = Some(local_url.to_owned());
+    Ok(())
+}
+
+/// Return only the fetched copy belonging to this exact source lifecycle.
 #[must_use]
-pub fn shared_url(id: &str) -> Option<String> {
+pub fn shared_url(id: &str, generation: u64) -> Option<String> {
     urls()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(id)
-        .cloned()
+        .filter(|entry| entry.generation == generation)
+        .and_then(|entry| entry.url.clone())
 }
 
 /// A completed segment in the local window.
@@ -430,6 +457,7 @@ pub(crate) struct HlsFetcher {
     shared: Arc<Shared>,
     source_id: String,
     local_url: String,
+    generation: u64,
 }
 
 impl Drop for HlsFetcher {
@@ -438,8 +466,10 @@ impl Drop for HlsFetcher {
         self.shared.ready.notify_all();
         // Only our own entry: a replacement may already have registered.
         let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
-        if map.get(&self.source_id) == Some(&self.local_url) {
-            map.remove(&self.source_id);
+        if let Some(entry) = map.get_mut(&self.source_id) {
+            if entry.generation == self.generation && entry.url.as_ref() == Some(&self.local_url) {
+                entry.url = None;
+            }
         }
     }
 }
@@ -453,6 +483,7 @@ impl HlsFetcher {
         source_id: &str,
         playlist_url: &str,
         stop: &AtomicBool,
+        generation: u64,
     ) -> Result<Self, String> {
         let st = stats(source_id);
         if st.bypass_next.swap(false, Ordering::AcqRel) {
@@ -498,6 +529,7 @@ impl HlsFetcher {
             shared,
             source_id: source_id.to_owned(),
             local_url,
+            generation,
         };
         // Wait for the first segment (stop-responsive).
         let deadline = Instant::now() + FIRST_SEGMENT_DEADLINE;
@@ -522,10 +554,7 @@ impl HlsFetcher {
                 .0;
         }
         drop(w);
-        urls()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(source_id.to_owned(), fetcher.local_url.clone());
+        publish_url(source_id, generation, &fetcher.local_url)?;
         Ok(fetcher)
     }
 
@@ -1363,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_url_tracks_the_running_fetcher_only() {
+    fn shared_url_requires_exact_lifecycle_and_old_drop_cannot_erase_new() {
         let shared = Arc::new(Shared {
             window: Mutex::new(Window {
                 target_duration: 6.0,
@@ -1374,27 +1403,34 @@ mod tests {
             ready: Condvar::new(),
             stop: AtomicBool::new(false),
         });
-        let id = "shared-url-test";
+        let id = "shared-url-lifecycle-test";
+        let a = begin_generation(id);
         let old = HlsFetcher {
             shared: Arc::clone(&shared),
             source_id: id.to_owned(),
             local_url: "http://[::1]:1/live.m3u8".to_owned(),
+            generation: a,
         };
-        urls()
-            .lock()
-            .expect("lock")
-            .insert(id.to_owned(), old.local_url.clone());
-        assert_eq!(shared_url(id).as_deref(), Some("http://[::1]:1/live.m3u8"));
-        // A reconnect registered its replacement before the old one dropped.
-        urls()
-            .lock()
-            .expect("lock")
-            .insert(id.to_owned(), "http://[::1]:2/live.m3u8".to_owned());
+        publish_url(id, a, &old.local_url).expect("A publish");
+        assert_eq!(shared_url(id, a).as_deref(), Some(old.local_url.as_str()));
+        let b = begin_generation(id);
+        assert_eq!(
+            shared_url(id, b),
+            None,
+            "B starts before B fetch registration"
+        );
+        assert_eq!(shared_url(id, a), None, "A cannot be selected by B");
+        let b_url = "http://[::1]:2/live.m3u8".to_owned();
+        assert!(
+            publish_url(id, a, &old.local_url).is_err(),
+            "late A publish refused"
+        );
+        assert_eq!(shared_url(id, b), None);
+        publish_url(id, b, &b_url).expect("B publish");
         drop(old);
-        assert_eq!(shared_url(id).as_deref(), Some("http://[::1]:2/live.m3u8"));
+        assert_eq!(shared_url(id, b), Some(b_url));
         assert!(shared.stop.load(Ordering::Acquire));
         urls().lock().expect("lock").remove(id);
-        assert_eq!(shared_url(id), None);
     }
 
     /// A per-connection bandwidth-limited origin, like one TCP flow over the

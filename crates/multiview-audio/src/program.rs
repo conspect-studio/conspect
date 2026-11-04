@@ -149,6 +149,17 @@ impl ProgramBus {
         point
     }
 
+    /// Take a route off the bus (a live source removal): its mixer strip is
+    /// reclaimed (slot reused — invariant #9) and its store is never read
+    /// again. Returns `false` for an unknown/stale point. No I/O, cannot block.
+    pub fn remove_source(&mut self, point: RoutePoint) -> bool {
+        if !self.routes.iter().any(|(p, _)| *p == point) {
+            return false;
+        }
+        self.routes.retain(|(p, _)| *p != point);
+        self.mixer.remove_input(point)
+    }
+
     /// Re-point an **existing** route point onto a different `Arc<AudioStore>`
     /// (replace semantics) — the audio-breakaway primitive (RT-8a).
     ///

@@ -1015,6 +1015,7 @@ pub fn audio_decode_loop_anchored(
         MAX_QUEUED_AUDIO,
         log,
         source,
+        true,
     );
 }
 
@@ -1321,6 +1322,8 @@ pub struct Placer {
     source: String,
     /// The lock state last logged (`None` before the first placement).
     locked: Option<bool>,
+    /// A source with video must never self-anchor audio if video is unavailable.
+    require_video_anchor: bool,
     /// Blocks dropped as late (behind the picture).
     late_dropped: u64,
     /// Per-window telemetry, summarised every [`STATS_PERIOD`].
@@ -1357,6 +1360,7 @@ impl Placer {
             log: None,
             source: String::new(),
             locked: None,
+            require_video_anchor: false,
             late_dropped: 0,
             stats: PlacerStats {
                 since: None,
@@ -1368,6 +1372,13 @@ impl Placer {
                 replaces: 0,
             },
         }
+    }
+
+    /// Require a real video mapping; hold audio as silence if none exists.
+    #[must_use]
+    pub const fn require_video_anchor(mut self) -> Self {
+        self.require_video_anchor = true;
+        self
     }
 
     /// Name the source in this placer's log lines.
@@ -1447,7 +1458,8 @@ impl Placer {
                         .saturating_add(u64::try_from(unit.block.frame_count()).unwrap_or(0));
                 }
             } else {
-                if now.saturating_duration_since(front.enqueued_at) < self.wait {
+                let since = *self.held_since.get_or_insert(now);
+                if self.require_video_anchor || now.saturating_duration_since(since) < self.wait {
                     self.stats.held_steps = self.stats.held_steps.saturating_add(1);
                     break;
                 }
@@ -1586,6 +1598,7 @@ pub fn anchored_publish_loop(
     max_queued: std::time::Duration,
     log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
     source: &str,
+    require_video_anchor: bool,
 ) {
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
@@ -1608,6 +1621,9 @@ pub fn anchored_publish_loop(
             let mut placer = Placer::new(rate, lead_frames, ANCHOR_WAIT)
                 .with_log(log)
                 .with_source(source);
+            if require_video_anchor {
+                placer = placer.require_video_anchor();
+            }
             while !stop.load(Ordering::Acquire) {
                 {
                     let mut q = lock(&queue);
@@ -2376,6 +2392,7 @@ mod resync_tests {
                     std::time::Duration::from_secs(20),
                     None,
                     "test",
+                    false,
                 );
             });
             std::thread::sleep(std::time::Duration::from_millis(600));
@@ -2400,6 +2417,32 @@ mod resync_tests {
         }
         assert!(q.frames <= DECODED_QUEUE_CAP);
         assert!(q.overflow_frames > 0);
+    }
+
+    #[test]
+    fn required_video_anchor_never_self_anchors_after_timeout() {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = AudioStore::timeline(format, 288_000);
+        let mut queue = DecodedQueue::default();
+        queue.push(
+            AudioBlock::from_interleaved(format, vec![0.6; 1_024 * 2]).expect("audio"),
+            100 * SEC,
+            48_000,
+            DECODED_QUEUE_CAP,
+        );
+        let mut placer =
+            Placer::new(48_000, 48_000, std::time::Duration::from_secs(1)).require_video_anchor();
+        let now = std::time::Instant::now();
+        placer.step(&store, &mut queue, None, 0, now);
+        placer.step(
+            &store,
+            &mut queue,
+            None,
+            0,
+            now + std::time::Duration::from_secs(30),
+        );
+        assert_eq!(raw_at(&store, 0), 0.0, "no unlocked audio before B anchor");
+        assert_eq!(queue.units.len(), 1, "the block remains held");
     }
 
     /// No video anchor at all: the audio waits, then stays silent even after
@@ -2599,6 +2642,7 @@ mod resync_tests {
             std::time::Duration::from_secs(20),
             None,
             "test",
+            false,
         );
         assert_eq!(calls, 1);
     }

@@ -229,6 +229,79 @@ async fn a_routing_put_changes_the_running_bus_gains_live_and_click_free() {
     );
 }
 
+/// A source added while the program runs joins the RUNNING bus: at zero gain
+/// until routed, then a routing PUT mixing it answers `live` and the bus gains
+/// change. Removing it takes its bus point away (no restart in either step).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_added_at_runtime_routes_live_and_removal_drops_its_bus_point() {
+    let mut run = running_bus();
+    let strips_before = run.bus.live_strip_count();
+    let live_store = steady_store(0.3, 4);
+
+    // The hub registers the new source's store; the bake consumer picks it up.
+    run.handle
+        .set_source_audio("msnow", Some(Arc::clone(&live_store)));
+    run.handle.apply_pending(&mut run.bus);
+    assert_eq!(
+        run.bus.live_strip_count(),
+        strips_before + 1,
+        "the running bus gained the source"
+    );
+    let unrouted = run.bus.tick_to(1);
+    assert!(
+        (unrouted.interleaved()[0] - 0.2).abs() < 1e-4,
+        "a new source joins at ZERO gain: the program is still cnn alone"
+    );
+
+    let doc = serde_json::json!({
+        "sample_rate_hz": 48_000,
+        "routes": [
+            { "input_id": "cnn", "channels": { "kind": "stereo" }, "include_in_program_bus": false },
+            { "input_id": "msnow", "channels": { "kind": "stereo" }, "include_in_program_bus": true }
+        ]
+    });
+    let (status, header) = put_routing(Arc::clone(&run.slot), &doc).await;
+    assert!(status.contains(" 200"), "PUT must succeed, got {status}");
+    assert_eq!(header.as_deref(), Some("live"));
+    assert!(run.handle.apply_pending(&mut run.bus) >= 1);
+    for tick in 2..=4 {
+        run.bus.tick_to(tick);
+    }
+    let settled = run.bus.tick_to(5);
+    assert!(
+        (settled.interleaved()[0] - 0.3).abs() < 1e-3,
+        "the program now carries the runtime source, got {}",
+        settled.interleaved()[0]
+    );
+
+    // Removal: the bus point goes (after a click-free fade), and a route
+    // naming it no longer applies live.
+    run.handle.remove_source("msnow");
+    run.handle.apply_pending(&mut run.bus);
+    for tick in 6..=9 {
+        run.bus.tick_to(tick);
+    }
+    assert_eq!(run.bus.live_strip_count(), strips_before);
+    let (_, header) = put_routing(Arc::clone(&run.slot), &doc).await;
+    assert_eq!(header.as_deref(), Some("restart"));
+}
+
+/// A source with no audio path (solid colour, NDI on this build) exists on the
+/// run: routing it is applied live as silence. A restart would change nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routing_an_existing_source_without_audio_is_live() {
+    let run = running_bus();
+    run.handle.set_source_audio("slate", None);
+    let doc = serde_json::json!({
+        "sample_rate_hz": 48_000,
+        "routes": [
+            { "input_id": "slate", "channels": { "kind": "stereo" }, "include_in_program_bus": true }
+        ]
+    });
+    let (_, header) = put_routing(Arc::clone(&run.slot), &doc).await;
+    assert_eq!(header.as_deref(), Some("live"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mute_applies_live() {
     let mut run = running_bus();
