@@ -29,6 +29,10 @@ Authorized read API06d7374f and operator Events panel003cb8b2 are committed. Six
 
 Active runtime worker has produced one passing injected-cue -> selected-frame projection -> real StreamBaker NV12 pixel-change/clear regression. Native library check passes, but production main provider wiring is still being completed by a separate worker. This is not live server evidence. HLS generation-fence/completeness repairs have20native tests passed; integration caller compilation remains active.
 
+Native runtime integration now passes31 targeted tests including packet provenance, conservative untimed SCTE/ID3, original HLS bridge, source lifecycle and actual NV12 badge pixels. Main passes real provider; native binary check and library lint pass. HLS bridge3/service9 tests pass, immediate observer-retirement degradation included. Independent review closes packet-wrap and hotpath DTO-copy defects; observations still require final scoped checkpoint review.
+
+Optimized stress (local software fixture, not production soak):64 sources×256events,256queued+1inflight,262208exact rejections,96exact59.94ticks. Full event sample median2.200ms vs empty71.572us; total median14.620ms vs12.273ms; total max19.158ms (baseline max22.174ms), so no all-frame realtime guarantee. Encoder/mux/native server not exercised by this fixture.
+
 Full requested automation remains unfinished: no armed production executor, atomic bars+tone takeover/return, external hooks or persisted rule UI is deployed. These remain mandatory scope, not optional follow-ups.
 
 ## Required integration work
