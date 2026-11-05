@@ -1205,9 +1205,22 @@ pub fn apply_overlays_to_nv12(
     list: &OverlayDrawList,
     canvas: CanvasColor,
 ) -> Result<Nv12Image> {
+    const MAX_PRIMITIVES: usize = 1024;
+    const MAX_REGION_PIXELS: u64 = 2_073_600;
+    const COALESCE_LIMIT: usize = 64;
     let width = image.width();
     let height = image.height();
     let color = image.color();
+    if list.len() > MAX_PRIMITIVES {
+        return Err(crate::error::Error::OverlayBudgetExceeded(
+            "primitive count",
+        ));
+    }
+    if u64::from(width) * u64::from(height) > MAX_REGION_PIXELS && color != canvas.output_tag() {
+        return Err(crate::error::Error::OverlayBudgetExceeded(
+            "full-canvas color conversion pixels",
+        ));
+    }
 
     // Passing untouched pixels through verbatim is colour-correct only when the
     // input already sits in the canvas colour space — which it does: the bake
@@ -1225,7 +1238,34 @@ pub fn apply_overlays_to_nv12(
     // Coalesce intersecting, even-aligned primitive footprints only when their
     // bounding rectangle adds little area. Distant labels and meters retain
     // exact passthrough between regions; dense overlap is decoded fewer times.
-    let rects = coalesce_dirty_rects(overlay_dirty_rects(list, width, height));
+    // Limit worst-case list work and scratch to a fixed, explicit per-frame
+    // budget. Excess cannot silently discard text, captions, or style.
+    let footprints: Vec<_> = list
+        .primitives
+        .iter()
+        .map(|p| primitive_dirty_rect(p, width, height))
+        .collect();
+    let original: Vec<_> = footprints.iter().flatten().copied().collect();
+    // Above 64 footprints, the original-region path has predictable bounded
+    // primitive intersection scans and no restart-scan coalescing.
+    let rects = if original.len() <= COALESCE_LIMIT {
+        coalesce_dirty_rects(original.clone())
+    } else {
+        original.clone()
+    };
+    let processed_pixels: u64 = rects
+        .iter()
+        .map(|r| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0))
+        .sum();
+    let primitive_pixels: u64 = original
+        .iter()
+        .map(|r| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0))
+        .sum();
+    if processed_pixels > MAX_REGION_PIXELS || primitive_pixels > MAX_REGION_PIXELS * 4 {
+        return Err(crate::error::Error::OverlayBudgetExceeded(
+            "processed pixels",
+        ));
+    }
     if rects.is_empty() {
         // Nothing lands on the canvas: the bake is a no-op (planes unchanged).
         return Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag());
@@ -1259,21 +1299,41 @@ pub fn apply_overlays_to_nv12(
         }
         // Preserve primitive order for source-over, but never re-rasterize
         // unrelated glyphs/meters once for every other dirty rectangle.
-        for primitive in &list.primitives {
-            if primitive_dirty_rect(primitive, width, height)
-                .is_some_and(|footprint| footprint.intersects(*rect))
-            {
+        for (primitive, footprint) in list.primitives.iter().zip(&footprints) {
+            if footprint.is_some_and(|footprint| footprint.intersects(*rect)) {
                 blend_primitive(&mut buffer, primitive);
             }
         }
 
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                let premul = buffer.pixel(x, y).unwrap_or(PremulRgba::TRANSPARENT);
-                let straight = premul.unpremultiplied();
-                let out =
-                    canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
-                write_nv12_pixel(&mut y_plane, &mut uv_plane, w, x, y, out);
+        // A merged bounding rectangle may contain holes. Decode can cover the
+        // bounding rectangle, but only original chroma-aligned footprints may
+        // write output; each skipped block retains its input Y and UV bytes.
+        let members: Vec<_> = if original.len() > COALESCE_LIMIT {
+            // The fallback has no merged bounding boxes: this region itself
+            // is an original footprint, with no holes or membership scan.
+            vec![*rect]
+        } else {
+            original
+                .iter()
+                .copied()
+                .filter(|r| r.intersects(*rect))
+                .collect()
+        };
+        for y in (rect.y0..rect.y1).step_by(2) {
+            for x in (rect.x0..rect.x1).step_by(2) {
+                if !members
+                    .iter()
+                    .any(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
+                {
+                    continue;
+                }
+                for (px, py) in [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)] {
+                    let premul = buffer.pixel(px, py).unwrap_or(PremulRgba::TRANSPARENT);
+                    let straight = premul.unpremultiplied();
+                    let out =
+                        canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
+                    write_nv12_pixel(&mut y_plane, &mut uv_plane, w, px, py, out);
+                }
             }
         }
     }
@@ -1300,6 +1360,7 @@ impl DirtyRect {
 /// a single union box — so gaps between spread-out overlays stay exact
 /// passthrough and only the real footprints are colour-processed). Empty when
 /// nothing lands on the canvas.
+#[cfg(test)]
 fn overlay_dirty_rects(list: &OverlayDrawList, width: u32, height: u32) -> Vec<DirtyRect> {
     list.primitives
         .iter()

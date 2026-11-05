@@ -164,6 +164,127 @@ fn sparse_bake_covers_news_style_badges_meters_glyphs_and_clipped_captions() {
 }
 
 #[test]
+fn merged_footprints_keep_both_corner_holes_exact_for_all_sdr_tags() {
+    for (primaries, transfer, matrix, range) in [
+        (
+            ColorPrimaries::Bt709,
+            TransferCharacteristic::Bt709,
+            MatrixCoefficients::Bt709,
+            ColorRange::Limited,
+        ),
+        (
+            ColorPrimaries::Bt709,
+            TransferCharacteristic::Bt709,
+            MatrixCoefficients::Bt709,
+            ColorRange::Full,
+        ),
+        (
+            ColorPrimaries::Bt601_525,
+            TransferCharacteristic::Bt709,
+            MatrixCoefficients::Bt601,
+            ColorRange::Limited,
+        ),
+    ] {
+        let tag = ColorInfo {
+            primaries,
+            transfer,
+            matrix,
+            range,
+        };
+        let w = 48usize;
+        let h = 48usize;
+        let y: Vec<u8> = (0..w * h).map(|i| [0, 255, 16, 235][i % 4]).collect();
+        let uv: Vec<u8> = (0..w * h / 2).map(|i| [0, 255, 16, 240][i % 4]).collect();
+        let input = Nv12Image::new(w as u32, h as u32, y, uv, tag).unwrap();
+        let mut list = OverlayDrawList::new();
+        for (x, y) in [(4, 4), (14, 14)] {
+            list.push(OverlayPrimitive::FilledRect {
+                rect: OverlayRect::new(x, y, 20, 20),
+                corner_radius: 0,
+                color: OverlayColor::new(0.9, 0.2, 0.1, 0.75),
+            });
+        }
+        let canvas = CanvasColor {
+            primaries,
+            transfer,
+            matrix,
+            range,
+        };
+        let output = apply_overlays_to_nv12(&input, &list, canvas).unwrap();
+        let baseline = apply_overlays_to_nv12_reference(&input, &list, canvas).unwrap();
+        let mut inked = false;
+        for by in (0..h).step_by(2) {
+            for bx in (0..w).step_by(2) {
+                let covered = (4..24).contains(&bx) && (4..24).contains(&by)
+                    || (14..34).contains(&bx) && (14..34).contains(&by);
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let i = (by + dy) * w + bx + dx;
+                        assert_eq!(
+                            output.y_plane()[i],
+                            if covered {
+                                baseline.y_plane()[i]
+                            } else {
+                                input.y_plane()[i]
+                            },
+                            "Y tag {tag:?} ({bx},{by})"
+                        );
+                        inked |= covered && output.y_plane()[i] != input.y_plane()[i];
+                    }
+                }
+                let i = by / 2 * w + bx;
+                for k in 0..2 {
+                    assert_eq!(
+                        output.uv_plane()[i + k],
+                        if covered {
+                            baseline.uv_plane()[i + k]
+                        } else {
+                            input.uv_plane()[i + k]
+                        },
+                        "UV tag {tag:?} ({bx},{by})"
+                    );
+                }
+            }
+        }
+        assert!(inked, "visible overlay must survive for {tag:?}");
+    }
+}
+
+#[test]
+fn dense_chain_and_disjoint_lists_have_an_explicit_cpu_bound() {
+    let input = vivid_input(128, 64);
+    for disjoint in [false, true] {
+        let mut list = OverlayDrawList::new();
+        for i in 0..4096 {
+            let x = if disjoint { (i % 64) * 2 } else { (i % 32) * 2 };
+            let y = if disjoint { (i / 64) % 32 * 2 } else { 8 };
+            list.push(OverlayPrimitive::FilledRect {
+                rect: OverlayRect::new(x, y, if disjoint { 2 } else { 8 }, 2),
+                corner_radius: 0,
+                color: OverlayColor::opaque(0.1, 0.8, 0.2),
+            });
+        }
+        let err = apply_overlays_to_nv12(&input, &list, CanvasColor::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("primitive count"),
+            "unexpected budget error: {err}"
+        );
+    }
+    let mut list = OverlayDrawList::new();
+    list.push(OverlayPrimitive::FilledRect {
+        rect: OverlayRect::new(0, 0, 128, 64),
+        corner_radius: 0,
+        color: OverlayColor::opaque(0.1, 0.8, 0.2),
+    });
+    let out = apply_overlays_to_nv12(&input, &list, CanvasColor::default()).unwrap();
+    assert_ne!(
+        out.y_plane(),
+        input.y_plane(),
+        "the admitted style must remain visible"
+    );
+}
+
+#[test]
 fn bake_with_no_overlays_is_a_byte_identical_no_op() {
     let input = vivid_input(32, 16);
     let list = OverlayDrawList::new();
