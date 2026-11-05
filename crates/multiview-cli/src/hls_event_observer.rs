@@ -4,7 +4,7 @@ use multiview_core::source_event::{
     EventBoundary, EventOrigin, SourceEventKey, SourceEventObservation,
 };
 use multiview_input::hls::{CueMetadata, PlaylistCueMetadata, PlaylistCueObservation};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Nonblocking evidence destination. Implementations must never wait for a consumer.
 pub trait HlsEvidenceSink: Send {
@@ -38,7 +38,8 @@ pub struct HlsEventObserver {
     capacity: usize,
     max_string_bytes: usize,
     next: u64,
-    present: BTreeMap<String, String>,
+    // Raw CAID membership -> per-appearance identity and retained display label.
+    present: BTreeMap<String, (String, String)>,
     pending: Vec<PlaylistCueObservation>,
     degraded: bool,
 }
@@ -93,7 +94,7 @@ impl HlsEventObserver {
             self.mark_degraded();
             return;
         }
-        let mut assets = BTreeSet::new();
+        let mut assets = BTreeMap::new();
         let mut pending = Vec::new();
         for item in &snapshot.observations {
             match &item.metadata {
@@ -110,7 +111,10 @@ impl HlsEventObserver {
                         self.mark_degraded();
                         return;
                     }
-                    assets.insert(raw_caid.clone());
+                    let label = decoded_label.as_deref().filter(|label| {
+                        !label.is_empty() && label.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                    }).unwrap_or(raw_caid);
+                    assets.insert(raw_caid.clone(), label.to_owned());
                 }
                 CueMetadata::DateRange { attributes } => {
                     if attributes.len() > 64
@@ -126,7 +130,7 @@ impl HlsEventObserver {
             }
         }
         if assets
-            .iter()
+            .keys()
             .filter(|a| !self.present.contains_key(*a))
             .count()
             + self.present.len()
@@ -141,19 +145,19 @@ impl HlsEventObserver {
             let absent: Vec<_> = self
                 .present
                 .keys()
-                .filter(|a| !assets.contains(*a))
+                .filter(|a| !assets.contains_key(*a))
                 .cloned()
                 .collect();
             for asset in absent {
-                if let Some(id) = self.present.get(&asset).cloned() {
-                    if !self.emit(&asset, &id, EventBoundary::MarkerAbsent) {
+                if let Some((id, label)) = self.present.get(&asset).cloned() {
+                    if !self.emit(&asset, &label, &id, EventBoundary::MarkerAbsent) {
                         return;
                     }
                     self.present.remove(&asset);
                 }
             }
         }
-        for asset in &assets {
+        for (asset, label) in &assets {
             if self.present.contains_key(asset) {
                 continue;
             }
@@ -167,13 +171,13 @@ impl HlsEventObserver {
             };
             self.next = next;
             let id = format!("hls-{}-{}", self.epoch, next);
-            if !self.emit(asset, &id, EventBoundary::MarkerObserved) {
+            if !self.emit(asset, label, &id, EventBoundary::MarkerObserved) {
                 return;
             }
-            self.present.insert(asset.clone(), id);
+            self.present.insert(asset.clone(), (id, label.clone()));
         }
     }
-    fn emit(&mut self, asset: &str, id: &str, boundary: EventBoundary) -> bool {
+    fn emit(&mut self, asset: &str, label: &str, id: &str, boundary: EventBoundary) -> bool {
         let accepted = self.sink.try_observe(SourceEventObservation {
             key: SourceEventKey {
                 source_id: self.source.clone(),
@@ -185,8 +189,8 @@ impl HlsEventObserver {
             },
             revision: 0,
             boundary,
-            correlation_id: None,
-            asset_id: Some(asset.into()),
+            correlation_id: Some(asset.into()),
+            asset_id: Some(label.into()),
         });
         if !accepted {
             self.mark_degraded();

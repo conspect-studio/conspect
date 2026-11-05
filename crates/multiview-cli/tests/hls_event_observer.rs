@@ -96,6 +96,25 @@ fn rejected_sink_latches_loss_without_later_absence() {
 }
 
 #[test]
+fn decoded_asset_label_and_raw_correlation_survive_absence_and_recurrence() {
+    let sink = Sink::default();
+    let mut observer = HlsEventObserver::new("s".into(), 7, sink.clone(), 8, 256);
+    observer.observe(&snapshot(&["0x41442D31", "0x001B"]));
+    observer.observe(&snapshot(&[]));
+    observer.observe(&snapshot(&["0x41442D31"]));
+    let data = sink.0.lock().unwrap();
+    let printable: Vec<_> = data.0.iter().filter(|o| o.correlation_id.as_deref() == Some("0x41442D31")).collect();
+    assert_eq!(printable.len(), 3);
+    assert!(printable.iter().all(|o| o.asset_id.as_deref() == Some("AD-1")));
+    assert_eq!(printable[0].key, printable[1].key);
+    assert_eq!(printable[1].boundary, EventBoundary::MarkerAbsent);
+    assert_ne!(printable[0].key, printable[2].key);
+    let opaque: Vec<_> = data.0.iter().filter(|o| o.correlation_id.as_deref() == Some("0x001B")).collect();
+    assert_eq!(opaque.len(), 2);
+    assert!(opaque.iter().all(|o| o.asset_id.as_deref() == Some("0x001B")));
+}
+
+#[test]
 fn daterange_is_retained_without_fake_timing() {
     let sink = Sink::default();
     let mut observer = HlsEventObserver::new("s".into(), 7, sink.clone(), 8, 256);

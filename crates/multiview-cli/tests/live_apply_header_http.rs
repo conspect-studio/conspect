@@ -105,6 +105,7 @@ async fn header_for(capability: LiveSourceCapability) -> Option<String> {
         multiview_control::LiveApplyCaps::default(),
         capability,
         None, // boot_model (ADR-W024)
+        None, // source_events
         async move {
             let _ = shutdown_rx.await;
         },

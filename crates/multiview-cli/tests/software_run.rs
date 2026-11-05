@@ -237,6 +237,7 @@ async fn software_run_serves_the_control_api_while_running() {
         multiview_control::LiveApplyCaps::default(),
         multiview_control::LiveSourceCapability::synthetic_only(),
         None, // boot_model (ADR-W024)
+        None, // source_events
         async move {
             let _ = shutdown_rx.await;
         },

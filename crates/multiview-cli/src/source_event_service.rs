@@ -164,7 +164,25 @@ pub struct SourceEventProducer {
     tx: SyncSender<(Arc<Generation>, SourceEventObservation)>,
     max_string_bytes: usize,
 }
+/// Non-owning generation-specific evidence-loss signal; never retires a producer.
+#[derive(Clone)]
+pub struct EvidenceLossHandle(std::sync::Weak<Generation>);
+impl EvidenceLossHandle {
+    /// Mark only the original generation incomplete, if it still exists.
+    pub fn mark_degraded(&self) {
+        if let Some(generation) = self.0.upgrade() {
+            generation.degraded.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl SourceEventProducer {
+    /// Share a non-owning loss signal with a connection-scoped metadata observer.
+    #[must_use]
+    pub fn loss_handle(&self) -> EvidenceLossHandle {
+        EvidenceLossHandle(Arc::downgrade(&self.generation))
+    }
+
     /// Latch incomplete upstream evidence without allocating or enqueueing a cue.
     /// A retired handle can only affect its retired generation, never a replacement.
     pub fn mark_degraded(&self) {
@@ -541,5 +559,263 @@ mod tests {
         }
         release.wait();
         service.shutdown().unwrap();
+    }
+}
+
+// R3 stress fixture: test-only access is needed to pause publication without polling.
+#[cfg(test)]
+mod source_event_stress {
+    use super::*;
+    use crate::source_event_runtime::Runtime;
+    use multiview_compositor::{
+        blend::LinearRgba,
+        pipeline::{CanvasColor, Nv12Image},
+    };
+    use multiview_core::{
+        color::ColorInfo,
+        layout::{Canvas, Cell, Layout},
+        source_event::{EventBoundary, SourceEventKey},
+        time::{MediaTime, Rational},
+    };
+    use multiview_engine::{
+        clock::{ManualTimeSource, TimeSource},
+        CompositorDrive, OutputClock,
+    };
+    use multiview_framestore::tile::SourceFrameTime;
+    use std::{collections::HashMap, sync::Barrier, time::Instant};
+
+    const SOURCES: usize = 64;
+    const EVENTS: usize = 256;
+    const TICKS: u64 = 32;
+
+    fn cue(source: &str, epoch: u64, event: usize) -> SourceEventObservation {
+        SourceEventObservation {
+            key: SourceEventKey {
+                source_id: source.into(),
+                epoch,
+                origin: EventOrigin::Scte35,
+                event_id: format!("cue-{event:03}"),
+            },
+            revision: 0,
+            boundary: EventBoundary::Start {
+                pts_ns: Some(0),
+                duration_ns: Some(60_000_000_000),
+            },
+            correlation_id: None,
+            asset_id: Some("stress-asset".into()),
+        }
+    }
+
+    /// A bounded watchdog catches deadlocks, not performance regressions. No sleeps
+    /// or polling: publication and flood interleavings use explicit barriers.
+    #[test]
+    fn r3_max_evidence_flood_stalled_reader_keeps_engine_frames() {
+        let (done, result) = mpsc::sync_channel(1);
+        let task = thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(stress);
+            let _ = done.send(outcome);
+        });
+        match result
+            .recv_timeout(Duration::from_secs(90))
+            .expect("R3 stress deadlocked or exceeded bounded test duration")
+        {
+            Ok(()) => task.join().unwrap(),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    fn stress() {
+        let limits = ServiceLimits::default();
+        assert_eq!(limits.max_sources, SOURCES);
+        assert_eq!(limits.tracker.max_events, EVENTS);
+        assert_eq!(limits.queue_capacity, 256);
+        let runtime = Runtime::new().unwrap();
+        let reader = runtime.reader();
+        let registry = reader.registry();
+        let mut selected = HashMap::new();
+        let mut producers = Vec::new();
+        let mut cells = Vec::new();
+        for source in 0..SOURCES {
+            let id = format!("source-{source:02}");
+            let lease = runtime.activate(&id, 1).unwrap();
+            let (context, producer) = lease.connect().unwrap().register(1).unwrap();
+            selected.insert(
+                id.clone(),
+                SourceFrameTime {
+                    pts: MediaTime::from_nanos(1_000_000_000),
+                    generation: 1,
+                    event_clock: Some(context.clock),
+                },
+            );
+            cells.push(Cell {
+                x: (source % 8) as f32 / 8.0,
+                y: (source / 8) as f32 / 8.0,
+                w: 0.125,
+                h: 0.125,
+                source: Some(id),
+                ..Cell::default()
+            });
+            producers.push(producer);
+        }
+        assert!(runtime.activate("source-over-capacity", 1).is_none());
+        assert_eq!(registry.0.slots.load().len(), SOURCES);
+        let layout = Layout {
+            name: "R3-64-tile".into(),
+            canvas: Canvas {
+                width: 320,
+                height: 192,
+                fps_num: 60000,
+                fps_den: 1001,
+            },
+            cells,
+        };
+        let slate = Nv12Image::solid(
+            40,
+            24,
+            16,
+            128,
+            128,
+            ColorInfo::default().resolve_defaults(320, 192),
+        )
+        .unwrap();
+        let drive = CompositorDrive::new(
+            Arc::new(layout),
+            HashMap::new(),
+            slate,
+            CanvasColor::default(),
+            LinearRgba::TRANSPARENT,
+        )
+        .unwrap();
+        let fake = ManualTimeSource::new();
+        let mut clock = OutputClock::new(Rational::FPS_59_94).unwrap();
+        let mut emitted = 0_u64;
+        let mut run = |expect_overlays: usize, rendezvous: Option<&Barrier>| {
+            let mut costs = Vec::new();
+            let mut sample_costs = Vec::new();
+            for _ in 0..TICKS {
+                if let Some(barrier) = rendezvous {
+                    barrier.wait();
+                }
+                // Independent integer oracle, nearest rounding, not pts_at().
+                let n = i128::from(emitted) * 1_000_000_000 * 1001;
+                let expected = i64::try_from((n + 30000) / 60000).unwrap();
+                fake.set(expected);
+                let start = Instant::now();
+                let tick = clock.tick();
+                assert_eq!(tick.index, emitted);
+                assert_eq!(tick.pts.as_nanos(), fake.now_nanos());
+                let sampling = Instant::now();
+                let overlays = reader.sample(&selected);
+                sample_costs.push(sampling.elapsed());
+                assert_eq!(overlays.len(), expect_overlays);
+                let frame = drive.compose(tick).unwrap();
+                assert_eq!(frame.tick, tick);
+                assert_eq!((frame.canvas.width(), frame.canvas.height()), (320, 192));
+                assert_eq!(frame.canvas.y_plane().len(), 320 * 192);
+                costs.push(start.elapsed());
+                emitted += 1;
+                if let Some(barrier) = rendezvous {
+                    barrier.wait();
+                }
+            }
+            costs.sort();
+            sample_costs.sort();
+            (
+                sample_costs[TICKS as usize / 2],
+                costs[TICKS as usize / 2],
+                *costs.last().unwrap(),
+            )
+        };
+        let baseline = run(0, None);
+        // Seed through the real bounded tracker off-clock. Direct publication is
+        // fixture setup only: public APIs have no flush/ack; sleeps are forbidden.
+        for p in &producers {
+            let mut tracker = SourceEventTracker::new(limits.tracker);
+            for event in 0..EVENTS {
+                tracker.observe(cue(&p.generation.source, p.generation.epoch, event));
+            }
+            assert_eq!(tracker.events().count(), EVENTS);
+            p.generation.snapshot.store(Arc::new(SourceEventSnapshot {
+                source_id: p.generation.source.clone(),
+                epoch: p.generation.epoch,
+                events: tracker.events().cloned().collect(),
+                diagnostics: *tracker.diagnostics(),
+                degraded: false,
+                queue_overflow: 0,
+            }));
+        }
+        let retained: Vec<_> = producers
+            .iter()
+            .map(|p| registry.snapshot(&p.generation.source).unwrap())
+            .collect();
+        assert_eq!(
+            retained.iter().map(|r| r.events.len()).sum::<usize>(),
+            SOURCES * EVENTS
+        );
+        let loaded = run(SOURCES, None);
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *registry.0.publication_hook.lock().unwrap() = Some((entered.clone(), release.clone()));
+        assert_eq!(
+            producers[0].try_observe(cue("source-00", 1, 0)),
+            SubmitOutcome::Queued
+        );
+        entered.wait(); // worker holds exactly one in-flight observation
+        for _ in 0..limits.queue_capacity {
+            assert_eq!(
+                producers[0].try_observe(cue("source-00", 1, 0)),
+                SubmitOutcome::Queued
+            );
+        }
+        // Hold all snapshots and stop all API consumption. The worker cannot drain
+        // the full queue; every subsequent submit must reject, never enqueue.
+        for p in &producers {
+            assert_eq!(
+                p.try_observe(cue(&p.generation.source, p.generation.epoch, 0)),
+                SubmitOutcome::Overflow
+            );
+        }
+        let start = Arc::new(Barrier::new(2));
+        let flood_start = start.clone();
+        let flood = thread::spawn(move || {
+            for _ in 0..TICKS {
+                flood_start.wait();
+                for p in &producers {
+                    for event in 0..128 {
+                        assert_eq!(
+                            p.try_observe(cue(&p.generation.source, p.generation.epoch, event)),
+                            SubmitOutcome::Overflow
+                        );
+                    }
+                }
+                flood_start.wait();
+            }
+            producers
+        });
+        // Barriers are test orchestration outside the timed engine call. Each
+        // frame shares a phase with 8192 attempted submissions, not a scheduler race.
+        let saturated = run(0, Some(&start));
+        let producers = flood.join().unwrap();
+        for (p, old) in producers.iter().zip(&retained) {
+            let current = registry.snapshot(&p.generation.source).unwrap();
+            assert!(current.degraded);
+            assert_eq!(current.queue_overflow, 4097);
+            assert_eq!(current.events.len(), EVENTS);
+            assert!(Arc::ptr_eq(&current.evidence, &old.evidence));
+        }
+        assert_eq!(registry.0.slots.load().len(), SOURCES);
+        assert_eq!(emitted, 3 * TICKS);
+        // Evidence-based budget signal, not a host-speed assertion. Includes a
+        // real software 64-tile slate composition, not encoder/muxer or overlays.
+        let budget = Duration::from_nanos(16_683_333);
+        eprintln!("R3 stress: baseline sample/total median/max={baseline:?}; max-evidence={loaded:?}; saturated={saturated:?}; 59.94fps budget={budget:?}; max-evidence median budget issue={}; frames={emitted}; retained events={}; queue={}+1 in-flight; exact rejections={}", loaded.1 > budget, SOURCES * EVENTS, limits.queue_capacity, SOURCES * 4097);
+        release.wait();
+        runtime.shutdown().unwrap();
+        assert!(registry.is_stopped());
+        // Retained immutable snapshots remain bounded and valid after shutdown.
+        assert_eq!(
+            retained.iter().map(|r| r.events.len()).sum::<usize>(),
+            SOURCES * EVENTS
+        );
     }
 }

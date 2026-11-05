@@ -137,6 +137,7 @@ async fn put_routing(
         caps,
         LiveSourceCapability::synthetic_only(),
         None,
+        None, // source_events
         async move {
             let _ = shutdown_rx.await;
         },
