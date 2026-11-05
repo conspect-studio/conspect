@@ -112,6 +112,7 @@ export function PreviewSurface({
   pcFactory,
   rtcConfig,
   fetchImpl,
+  onSessionReleased,
 }: {
   readonly scope: PreviewScope;
   /** The WHEP endpoint for this scope (e.g. `/api/v1/preview/program/whep`). */
@@ -126,6 +127,7 @@ export function PreviewSurface({
   readonly pcFactory?: PeerConnectionFactory | undefined;
   readonly rtcConfig?: RTCConfiguration | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
+  readonly onSessionReleased?: (() => void) | undefined;
 }): JSX.Element {
   // A monotonically-increasing attempt id: bumping it remounts <WhepPlayer> for
   // a fresh negotiation (the "retry live preview" affordance). `degraded` flips
@@ -167,6 +169,7 @@ export function PreviewSurface({
       {...(pcFactory !== undefined ? { pcFactory } : {})}
       {...(rtcConfig !== undefined ? { rtcConfig } : {})}
       {...(fetchImpl !== undefined ? { fetchImpl } : {})}
+      onSessionReleased={onSessionReleased}
       onFatal={(): void => {
         setDegraded(true);
       }}

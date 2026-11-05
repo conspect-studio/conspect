@@ -78,8 +78,8 @@ class FakePeerConnection extends EventTarget {
   }
 
   /** Test helper: deliver an inbound track. */
-  emitTrack(): void {
-    const event = { track: { kind: 'video' } } as unknown as RTCTrackEvent;
+  emitTrack(kind: 'audio' | 'video' = 'video'): void {
+    const event = { track: { kind } } as unknown as RTCTrackEvent;
     this.ontrack?.(event);
   }
 }
@@ -149,6 +149,54 @@ describe('<WhepPlayer>', () => {
     });
     expect(getByTestId('whep-player').getAttribute('data-status')).toBe('playing');
     expect(onStatus).toHaveBeenCalledWith('playing');
+  });
+
+  it.each([['video', 'audio'], ['audio', 'video']] as const)(
+    'keeps video attached when %s arrives before %s on separate streams',
+    (first, second) => {
+      const { container } = renderWithProviders(
+        <WhepPlayer
+          endpoint="/api/v1/preview/inputs/au-abc-news/whep"
+          label="Input au-abc-news"
+          pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection}
+          fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))}
+        />,
+      );
+      const video = container.querySelector('video');
+      const pc = FakePeerConnection.last;
+      expect(video).not.toBeNull();
+      act(() => { pc?.emitTrack(first); });
+      const attached = video?.srcObject as unknown as FakeMediaStream;
+      expect(attached).toBeInstanceOf(FakeMediaStream);
+      act(() => { pc?.emitTrack(second); });
+      expect(video?.srcObject).toBe(attached);
+      expect(attached.tracks.map((track) => track.kind)).toEqual([first, second]);
+    },
+  );
+
+  it('waits for program DELETE before it signals the next focus', async () => {
+    let finishDelete: ((response: Response) => void) | undefined;
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) =>
+      init?.method === 'DELETE'
+        ? new Promise<Response>((resolve) => { finishDelete = resolve; })
+        : Promise.resolve(sdpResponse(201, 'sessions/abc')),
+    );
+    const onSessionReleased = vi.fn();
+    const { unmount } = renderWithProviders(
+      <WhepPlayer
+        endpoint="/api/v1/preview/program/whep"
+        label="Program"
+        pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={fetchImpl}
+        onSessionReleased={onSessionReleased}
+      />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    unmount();
+    expect(fetchImpl.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(true);
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await act(async () => { finishDelete?.(sdpResponse(204)); await Promise.resolve(); });
+    expect(onSessionReleased).toHaveBeenCalledTimes(1);
   });
 
   it('calls onFatal when the connection state goes to failed', async () => {

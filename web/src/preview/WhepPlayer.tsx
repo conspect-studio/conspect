@@ -24,7 +24,7 @@ import { Volume2, VolumeX } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { defaultPcFactory } from './pcFactory';
 import type { PeerConnectionFactory } from './pcFactory';
-import { deleteWhepSession, postWhepOffer } from './whepSession';
+import { deleteWhepSession, postWhepOffer, releaseWhepSession } from './whepSession';
 
 /** The player's connection lifecycle, surfaced for the surrounding surface. */
 export type WhepPlayerStatus = 'connecting' | 'playing' | 'failed';
@@ -97,6 +97,7 @@ export function WhepPlayer({
   onStatus,
   onFatal,
   fetchImpl,
+  onSessionReleased,
 }: {
   /** The WHEP endpoint to POST the offer to (e.g. `/api/v1/whep/{id}`). */
   readonly endpoint: string;
@@ -115,6 +116,8 @@ export function WhepPlayer({
   readonly onFatal?: (() => void) | undefined;
   /** Overridable fetch (tests inject a mock; default is global fetch). */
   readonly fetchImpl?: typeof fetch | undefined;
+  /** Fires after the teardown request completes, for single-focus handoff. */
+  readonly onSessionReleased?: (() => void) | undefined;
 }): JSX.Element {
   const { t } = useLingui();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -246,14 +249,14 @@ export function WhepPlayer({
       const answer = await postWhepOffer(endpoint, local.sdp, effectiveFetch);
       if (aborted()) {
         // Raced an unmount: release the session we just opened.
-        deleteWhepSession(answer.sessionUrl, effectiveFetch);
+        await releaseWhepSession(answer.sessionUrl, effectiveFetch);
         return;
       }
       sessionUrl = answer.sessionUrl;
       await pc.setRemoteDescription({ type: 'answer', sdp: answer.answerSdp });
     };
 
-    void negotiate().catch(() => {
+    const negotiationDone = negotiate().catch(() => {
       fail();
     });
 
@@ -271,9 +274,16 @@ export function WhepPlayer({
       if (statsTimer !== undefined) {
         window.clearInterval(statsTimer);
       }
-      if (sessionUrl !== undefined) {
-        deleteWhepSession(sessionUrl, effectiveFetch);
-      }
+      // A POST may be in flight at unmount. Await its late-answer DELETE too;
+      // the next focus must not race the lease held by that late answer.
+      void (async (): Promise<void> => {
+        if (sessionUrl !== undefined) {
+          await releaseWhepSession(sessionUrl, effectiveFetch);
+        } else {
+          await negotiationDone;
+        }
+        onSessionReleased?.();
+      })();
       pc.ontrack = null;
       pc.onconnectionstatechange = null;
       pc.close();

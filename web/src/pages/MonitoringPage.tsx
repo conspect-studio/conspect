@@ -54,7 +54,7 @@ function usePreviewInputIds(): readonly string[] {
       }
       const resp = await fetch('/api/v1/preview/inputs', { headers });
       if (!resp.ok) {
-        return [];
+        throw new Error(`Preview input query failed (${String(resp.status)})`);
       }
       const data: unknown = await resp.json();
       return Array.isArray(data) ? data.filter((v): v is string => typeof v === 'string') : [];
@@ -82,6 +82,12 @@ function PreviewImage(props: {
     );
   }
   return <img src={props.src} alt={props.alt} className={props.className} />;
+}
+
+/** Show the current program as a still image while its WHEP focus is released. */
+function ProgramStillPreview({ label }: { readonly label: string }): JSX.Element {
+  const src = useJpegPreview('/api/v1/preview/program.jpg', 1000);
+  return <PreviewImage src={src} alt={label} className="aspect-video w-full bg-black object-contain" />;
 }
 
 /** The honest program fidelity label (ADR-P006), shown when WHEP is live. */
@@ -113,6 +119,10 @@ export function MonitoringPage(): JSX.Element {
   const fidelity = programFidelity(capabilities.data);
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
   const [hlsOutput, setHlsOutput] = useState<string>('');
+  // One WHEP focus is admitted server-wide. Release the automatic program
+  // focus before a user-requested input focus negotiates its session.
+  const [focusedInput, setFocusedInput] = useState<string | undefined>();
+  const [focusReady, setFocusReady] = useState(false);
   const hlsPath = playbackPaths.get(hlsOutput);
 
   // The served WebRTC (WHEP) outputs — previewable via their OUTPUT scope tap.
@@ -139,7 +149,7 @@ export function MonitoringPage(): JSX.Element {
           {hlsPath === undefined && fidelity !== undefined && whepAvailable(capabilities.data, 'program') ? <FidelityLabel fidelity={fidelity} /> : null}
         </div>
         <Card className="overflow-hidden">
-          {hlsPath !== undefined ? <HlsPlayer key={hlsPath} url={hlsPath} label={t`Program HLS output`} /> : <PreviewSurface
+          {hlsPath !== undefined ? <HlsPlayer key={hlsPath} url={hlsPath} label={t`Program HLS output`} /> : focusedInput !== undefined ? <ProgramStillPreview label={t`Program preview paused while input ${focusedInput} is open`} /> : <PreviewSurface
             scope="program"
             whepEndpoint="/api/v1/preview/program/whep"
             jpegPath="/api/v1/preview/program.jpg"
@@ -147,6 +157,7 @@ export function MonitoringPage(): JSX.Element {
             capabilities={capabilities.data}
             audio
             className="aspect-video w-full bg-black object-contain"
+            onSessionReleased={(): void => { setFocusReady(true); }}
           />}
           <CardContent className="space-y-2 py-3">
             <p className="text-sm text-muted-foreground"><Trans>This is the current engine program. Saved and unsaved layouts do not have separate live outputs.</Trans></p>
@@ -183,6 +194,12 @@ export function MonitoringPage(): JSX.Element {
                 id={id}
                 tile={tiles.get(id)}
                 capabilities={capabilities.data}
+                open={focusedInput === id}
+                focusReady={focusReady}
+                onOpenChange={(open): void => {
+                  setFocusReady(false);
+                  setFocusedInput(open ? id : undefined);
+                }}
               />
             ))}
           </ul>
@@ -228,10 +245,12 @@ function InputThumbnail(props: {
   readonly id: string;
   readonly tile: LiveTile | undefined;
   readonly capabilities: ReturnType<typeof usePreviewCapabilities>['data'];
+  readonly open: boolean;
+  readonly focusReady: boolean;
+  readonly onOpenChange: (open: boolean) => void;
 }): JSX.Element {
   const { t } = useLingui();
-  const [open, setOpen] = useState(false);
-  const src = useJpegPreview(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000, !open);
+  const src = useJpegPreview(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000, !props.open);
   return (
     <li>
       <Card className="overflow-hidden">
@@ -248,7 +267,7 @@ function InputThumbnail(props: {
             className="absolute right-2 top-2"
             aria-label={t`Open preview of input ${props.id}`}
             onClick={(): void => {
-              setOpen(true);
+              props.onOpenChange(true);
             }}
           >
             <Maximize2 className="size-4" aria-hidden="true" />
@@ -262,14 +281,14 @@ function InputThumbnail(props: {
         </CardContent>
       </Card>
 
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={props.open} onOpenChange={props.onOpenChange}>
         <DialogContent className="max-w-3xl">
           <DialogHeader>
             <DialogTitle>
               <Trans>Preview — input {props.id}</Trans>
             </DialogTitle>
           </DialogHeader>
-          {open ? (
+          {props.open && props.focusReady ? (
             <PreviewSurface
               scope="input"
               whepEndpoint={`/api/v1/preview/inputs/${encodeURIComponent(props.id)}/whep`}
