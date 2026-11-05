@@ -285,6 +285,18 @@ fn h264_preview_only_answers_constrained_baseline_mode_one() {
 }
 
 #[test]
+fn incompatible_h264_profile_is_not_accepted_as_working_video() {
+    let offer = VIDEO_OFFER
+        .replace("42e01f", "64001f")
+        .replace("SAVPF 96 97", "SAVPF 96");
+    let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
+    let egress = WhepEgress::with_host_candidate("[::1]:8189".parse().unwrap());
+    assert!(egress
+        .accept_session(&offer, PreviewCodec::H264, &media)
+        .is_err());
+}
+
+#[test]
 fn all_concrete_host_candidates_reach_the_answer() {
     let hosts = vec![
         "[2001:db8::1]:8189".parse().unwrap(),

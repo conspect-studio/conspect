@@ -348,6 +348,15 @@ impl WhepEgress {
             .map_err(|_| WhepError::MalformedOffer {
                 reason: "str0m rejected the WHEP offer (no usable media / ICE / DTLS)",
             })?;
+        // str0m can accept an offer while rejecting its video m-line (port 0).
+        // Do not admit a session that cannot carry the selected encoder codec.
+        let video_active = sdp_answer.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some("m=video") && fields.next().is_some_and(|port| port != "0")
+        });
+        if !video_active || !offer_advertises_video(&sdp_answer, codec) {
+            return Err(WhepError::NoSupportedCodec);
+        }
         let attrs = parse_answer_attributes(&sdp_answer)?;
 
         let id = self.mint_id();
