@@ -87,6 +87,16 @@ cd /workspaces/multiview/.claude/worktrees/<lane> \
 Do **not** `cargo clean` the shared root `target/` to "isolate" a build — that nukes
 the cache other co-tenant lanes are using and forces mass rebuilds.
 
+## Disk-capacity lifecycle
+
+Per-worktree isolation prevents cache contention, but abandoned `target/` directories still fill
+shared storage. Follow [workspace disk hygiene](../development/working-in-this-monorepo.md#workspace-disk-hygiene)
+for capacity checks, concurrency limits, ownership checks and post-merge cleanup. Check both bytes
+and inodes before a large build. Do not start another large build when free space is below 20% or
+50 GiB, or cannot cover estimated concurrent peak growth plus 50 GiB. Restore headroom first.
+Never infer that a cache or worktree is disposable from age alone, and never clean the root cache
+or another agent's active lane to make space. This is an agent procedure, not an automated disk quota.
+
 ## Verify
 
 **In a running container that still has the old value:**

@@ -62,6 +62,8 @@ In order: solve it → route around it (do adjacent work, open a tracking issue)
 - Never weaken a test to make a build pass (not deleted, skipped, `#[ignore]`d, or loosened) — stop and ask instead.
 - Never alter legal content as engineering work — `LICENSE*`, `NOTICE`, the CLA, licensing docs.
 - Never commit secrets: `.env` is gitignored and read-denied, secrets live in 1Password; `gitleaks` + GitHub push protection gate this.
+- Work in a task-specific Git worktree, never the root checkout; integrate through a reviewed omnibus PR. Preserve root changes when syncing after merge.
+- Keep workspace disk use bounded: check capacity before builds/fan-out, limit concurrent build lanes, and remove your disposable artifacts and finished worktrees after merge. Never consume the disk until ENOSPC. Follow [workspace disk hygiene](docs/development/working-in-this-monorepo.md#workspace-disk-hygiene); preserve active lanes, uncommitted/untracked/ignored data and unmerged commits. Age alone never proves a directory disposable.
 - Never point a build dir at `/tmp` and never override `CARGO_TARGET_DIR` — a worktree's local `target/` is already isolated.
 - Nested `CLAUDE.md` files (per crate, `web/`, `docs/runbooks/`) carry directory-specific facts and load on reading a file in that directory — not re-injected after `/compact`.
 - Where things are: [conventions.md](docs/architecture/conventions.md) · [codebase-map.md](docs/development/codebase-map.md) · [agent-guardrails.md](docs/development/agent-guardrails.md) · [working-in-this-monorepo.md](docs/development/working-in-this-monorepo.md) · [decisions/](docs/decisions/README.md) · [runbooks/](docs/runbooks/) · [stack.md](docs/stack.md).
