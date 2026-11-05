@@ -10,7 +10,7 @@
 // the pixels, the real per-tile lifecycle state streams over the WebSocket
 // (`useEngineEvents`). All reads are best-effort and never block the engine
 // (invariant #10).
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { HlsPlayer } from '../preview/HlsPlayer';
 import { hlsPlaybackPaths } from '../preview/outputPlayback';
@@ -122,8 +122,36 @@ export function MonitoringPage(): JSX.Element {
   // One WHEP focus is admitted server-wide. Release the automatic program
   // focus before a user-requested input focus negotiates its session.
   const [focusedInput, setFocusedInput] = useState<string | undefined>();
-  const [focusReady, setFocusReady] = useState(false);
+  const desiredInput = useRef<string | undefined>(undefined);
+  const [activeInput, setActiveInput] = useState<string | undefined>();
+  const [inputReleasing, setInputReleasing] = useState(false);
+  const [programReleasing, setProgramReleasing] = useState(false);
   const hlsPath = playbackPaths.get(hlsOutput);
+  const programWhep = hlsPath === undefined && whepAvailable(capabilities.data, 'program');
+  const inputWhep = whepAvailable(capabilities.data, 'input');
+  const paused = focusedInput !== undefined || activeInput !== undefined || programReleasing || inputReleasing;
+  const changeFocus = (id: string, open: boolean): void => {
+    const next = open ? id : undefined;
+    desiredInput.current = next;
+    setFocusedInput(next);
+    if (activeInput !== undefined && next !== activeInput) {
+      if (inputWhep) {
+        setInputReleasing(true);
+      } else {
+        setActiveInput(next);
+      }
+      return;
+    }
+    if (inputReleasing || programReleasing) return;
+    if (next !== undefined && activeInput === undefined) {
+      if (programWhep) {
+        setProgramReleasing(true);
+      } else {
+        setActiveInput(next);
+      }
+    }
+    if (next === undefined && !inputWhep) setActiveInput(undefined);
+  };
 
   // The served WebRTC (WHEP) outputs — previewable via their OUTPUT scope tap.
   const webrtcOutputs = (outputs.data ?? []).filter((output) => output.kind === 'webrtc');
@@ -149,7 +177,7 @@ export function MonitoringPage(): JSX.Element {
           {hlsPath === undefined && fidelity !== undefined && whepAvailable(capabilities.data, 'program') ? <FidelityLabel fidelity={fidelity} /> : null}
         </div>
         <Card className="overflow-hidden">
-          {hlsPath !== undefined ? <HlsPlayer key={hlsPath} url={hlsPath} label={t`Program HLS output`} /> : focusedInput !== undefined ? <ProgramStillPreview label={t`Program preview paused while input ${focusedInput} is open`} /> : <PreviewSurface
+          {hlsPath !== undefined ? <HlsPlayer key={hlsPath} url={hlsPath} label={t`Program HLS output`} /> : paused ? <ProgramStillPreview label={t`Program preview paused while input focus is open`} /> : <PreviewSurface
             scope="program"
             whepEndpoint="/api/v1/preview/program/whep"
             jpegPath="/api/v1/preview/program.jpg"
@@ -157,7 +185,10 @@ export function MonitoringPage(): JSX.Element {
             capabilities={capabilities.data}
             audio
             className="aspect-video w-full bg-black object-contain"
-            onSessionReleased={(): void => { setFocusReady(true); }}
+            onSessionReleased={(): void => {
+              setProgramReleasing(false);
+              setActiveInput(desiredInput.current);
+            }}
           />}
           <CardContent className="space-y-2 py-3">
             <p className="text-sm text-muted-foreground"><Trans>This is the current engine program. Saved and unsaved layouts do not have separate live outputs.</Trans></p>
@@ -195,11 +226,12 @@ export function MonitoringPage(): JSX.Element {
                 tile={tiles.get(id)}
                 capabilities={capabilities.data}
                 open={focusedInput === id}
-                focusReady={focusReady}
-                onOpenChange={(open): void => {
-                  setFocusReady(false);
-                  setFocusedInput(open ? id : undefined);
+                focusReady={activeInput === id && !inputReleasing}
+                onSessionReleased={(): void => {
+                  setInputReleasing(false);
+                  setActiveInput(desiredInput.current);
                 }}
+                onOpenChange={(open): void => { changeFocus(id, open); }}
               />
             ))}
           </ul>
@@ -216,15 +248,7 @@ export function MonitoringPage(): JSX.Element {
             {webrtcOutputs.map((output) => (
               <li key={output.id}>
                 <Card className="overflow-hidden">
-                  <PreviewSurface
-                    scope="output"
-                    whepEndpoint={`/api/v1/preview/outputs/${encodeURIComponent(output.id)}/whep`}
-                    jpegPath="/api/v1/preview/program.jpg"
-                    label={t`Preview of WebRTC output ${output.name}`}
-                    capabilities={capabilities.data}
-                    audio
-                    className="aspect-video w-full bg-black object-contain"
-                  />
+                  <ProgramStillPreview label={t`Preview of WebRTC output ${output.name}`} />
                   <CardContent className="py-2">
                     <code className="truncate text-xs" lang="" dir="auto">
                       {output.name}
@@ -247,6 +271,7 @@ function InputThumbnail(props: {
   readonly capabilities: ReturnType<typeof usePreviewCapabilities>['data'];
   readonly open: boolean;
   readonly focusReady: boolean;
+  readonly onSessionReleased: () => void;
   readonly onOpenChange: (open: boolean) => void;
 }): JSX.Element {
   const { t } = useLingui();
@@ -295,6 +320,7 @@ function InputThumbnail(props: {
               jpegPath={`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`}
               label={t`Live preview of input ${props.id}`}
               capabilities={props.capabilities}
+              onSessionReleased={props.onSessionReleased}
               className="aspect-video w-full bg-black object-contain"
             />
           ) : null}

@@ -199,6 +199,35 @@ describe('<WhepPlayer>', () => {
     expect(onSessionReleased).toHaveBeenCalledTimes(1);
   });
 
+  it('does not release focus until a late POST has its DELETE response', async () => {
+    let finishPost: ((response: Response) => void) | undefined;
+    let finishDelete: ((response: Response) => void) | undefined;
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) =>
+      init?.method === 'DELETE'
+        ? new Promise<Response>((resolve) => { finishDelete = resolve; })
+        : new Promise<Response>((resolve) => { finishPost = resolve; }),
+    );
+    const onSessionReleased = vi.fn();
+    const { unmount } = renderWithProviders(
+      <WhepPlayer
+        endpoint="/api/v1/preview/program/whep"
+        label="Program"
+        pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={fetchImpl}
+        onSessionReleased={onSessionReleased}
+      />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    expect(fetchImpl.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    unmount();
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await act(async () => { finishPost?.(sdpResponse(201, 'sessions/late')); await Promise.resolve(); });
+    expect(fetchImpl.mock.calls.filter(([, init]) => init?.method === 'DELETE')).toHaveLength(1);
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await act(async () => { finishDelete?.(sdpResponse(204)); await Promise.resolve(); });
+    expect(onSessionReleased).toHaveBeenCalledTimes(1);
+  });
+
   it('calls onFatal when the connection state goes to failed', async () => {
     const fetchImpl = makeFetch(() => sdpResponse(201, 'sessions/abc'));
     const onFatal = vi.fn();
