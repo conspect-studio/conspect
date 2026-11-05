@@ -269,6 +269,22 @@ fn selected_encoder_codec_controls_answer_despite_vp8_offer_preference() {
 }
 
 #[test]
+fn h264_preview_only_answers_constrained_baseline_mode_one() {
+    let offer = VIDEO_OFFER.replace("SAVPF 96 97", "SAVPF 98 99 96 97")
+        + "a=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=64001f\r\na=rtpmap:99 H264/90000\r\na=fmtp:99 packetization-mode=0;profile-level-id=42e01f\r\n";
+    let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
+    let egress = WhepEgress::with_host_candidate("[::1]:8189".parse().unwrap());
+    let answer = egress
+        .accept_session(&offer, PreviewCodec::H264, &media)
+        .unwrap();
+    assert!(answer.sdp_answer.contains("packetization-mode=1"));
+    assert!(answer.sdp_answer.contains("profile-level-id=42e01f"));
+    assert!(!answer.sdp_answer.contains("profile-level-id=64001f"));
+    assert!(!answer.sdp_answer.contains("packetization-mode=0"));
+    assert!(answer.sdp_answer.contains("m=video 9 UDP/TLS/RTP/SAVPF 96"));
+}
+
+#[test]
 fn all_concrete_host_candidates_reach_the_answer() {
     let hosts = vec![
         "[2001:db8::1]:8189".parse().unwrap(),

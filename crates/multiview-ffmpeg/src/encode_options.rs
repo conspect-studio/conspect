@@ -165,19 +165,27 @@ pub fn preview_h264_options(encoder_name: &str, fps: Rational) -> CodecOptions {
         .push_literal("g", &gop)
         .push_literal("bf", "0");
     if encoder_name.ends_with("_nvenc") {
-        base.push_literal("tune", "ull")
+        base.push_literal("profile", "baseline")
+            .push_literal("level", "3.1")
+            .push_literal("tune", "ull")
             .push_literal("zerolatency", "1")
             .push_literal("delay", "0")
             .push_literal("rc", "cbr")
             .push_literal("forced-idr", "1")
     } else if encoder_name.ends_with("_vaapi") {
-        base.push_literal("rc_mode", "CBR")
+        base.push_literal("profile", "constrained_baseline")
+            .push_literal("level", "3.1")
+            .push_literal("rc_mode", "CBR")
             .push_literal("async_depth", "1")
     } else if encoder_name.ends_with("_videotoolbox") {
-        base.push_literal("realtime", "1")
+        base.push_literal("profile", "baseline")
+            .push_literal("level", "3.1")
+            .push_literal("realtime", "1")
             .push_literal("prio_speed", "1")
     } else if encoder_name == "libx264" {
-        base.push_literal("tune", "zerolatency")
+        base.push_literal("profile", "baseline")
+            .push_literal("level", "3.1")
+            .push_literal("tune", "zerolatency")
             .push_literal("forced-idr", "1")
     } else {
         base

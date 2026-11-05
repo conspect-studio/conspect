@@ -323,7 +323,7 @@ impl WhepEgress {
             enable_vp8: codec == PreviewCodec::Vp8,
             ..SessionConfig::default()
         };
-        let mut session = Session::new(&config, created_at);
+        let mut session = Session::new_preview(&config, created_at);
         for host in &self.host_candidates {
             session
                 .add_host_candidate(*host)

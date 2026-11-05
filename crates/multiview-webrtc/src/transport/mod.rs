@@ -270,14 +270,30 @@ impl Session {
     /// `now`. Full ICE (never ice-lite) per ADR-0048 §5.
     #[must_use]
     pub fn new(config: &SessionConfig, now: Instant) -> Self {
-        let rtc = Rtc::builder()
+        Self::build(config, now, false)
+    }
+
+    /// Preview H.264 is constrained-baseline level 3.1, mode 1, matching its encoder.
+    #[must_use]
+    pub fn new_preview(config: &SessionConfig, now: Instant) -> Self {
+        Self::build(config, now, config.enable_h264)
+    }
+
+    fn build(config: &SessionConfig, now: Instant, baseline_preview: bool) -> Self {
+        let mut builder = Rtc::builder()
             .set_ice_lite(false)
             .set_rtp_mode(config.rtp_mode)
             .clear_codecs()
             .enable_h264(config.enable_h264)
             .enable_vp8(config.enable_vp8)
-            .enable_opus(config.enable_opus)
-            .build(now);
+            .enable_opus(config.enable_opus);
+        if baseline_preview {
+            builder.codec_config().enable_h264(false);
+            builder
+                .codec_config()
+                .add_h264(96.into(), Some(97.into()), true, 0x0042_e01f);
+        }
+        let rtc = builder.build(now);
         Self {
             rtc,
             pending: None,
