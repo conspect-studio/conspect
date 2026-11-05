@@ -165,6 +165,18 @@ pub struct SourceEventProducer {
     max_string_bytes: usize,
 }
 impl SourceEventProducer {
+    /// Latch incomplete upstream evidence without allocating or enqueueing a cue.
+    /// A retired handle can only affect its retired generation, never a replacement.
+    pub fn mark_degraded(&self) {
+        self.generation.degraded.store(true, Ordering::Release);
+    }
+
+    /// Revoke this generation immediately without joining the worker.
+    /// Already queued work remains isolated in this generation's retired slot.
+    pub fn retire(&self) {
+        self.generation.active.store(false, Ordering::Release);
+    }
+
     /// Validate ownership and payload bounds before attempting a bounded send.
     #[must_use]
     pub fn try_observe(&self, observation: SourceEventObservation) -> SubmitOutcome {

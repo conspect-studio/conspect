@@ -27,6 +27,25 @@ fn wait(mut predicate: impl FnMut() -> bool) {
     }
 }
 #[test]
+fn upstream_degradation_is_immediate_and_generation_scoped() {
+    let service = SourceEventService::new(ServiceLimits::default()).unwrap();
+    let view = service.registry();
+    let old = service.register("a", 1).unwrap();
+    old.mark_degraded();
+    assert!(view.snapshot("a").unwrap().degraded);
+    let new = service.register("a", 2).unwrap();
+    old.mark_degraded();
+    assert!(!view.snapshot("a").unwrap().degraded);
+    old.retire();
+    assert!(view.snapshot("a").is_some());
+    new.retire();
+    assert!(view.snapshot("a").is_none());
+    assert_eq!(new.try_observe(observation("a", 2)), SubmitOutcome::Retired);
+    drop(new);
+    service.shutdown().unwrap();
+}
+
+#[test]
 fn ownership_replacement_drop_and_shutdown() {
     let service = SourceEventService::new(ServiceLimits::default()).unwrap();
     let view = service.registry();
