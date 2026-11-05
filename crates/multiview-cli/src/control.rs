@@ -17,9 +17,9 @@ use std::sync::Arc;
 use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::MultiviewConfig;
 use multiview_control::{
-    provision_admin_keys, run_warning_ingest, AppState, Command, CommandReceiver, CommandSender,
-    EngineStateSnapshot, InMemoryRepository, InMemoryWarningStore, ResolvedLayout, SharedPreview,
-    WarningRepository,
+    AppState, Command, CommandReceiver, CommandSender, EngineStateSnapshot, InMemoryRepository,
+    InMemoryWarningStore, ResolvedLayout, SharedPreview, WarningRepository, provision_admin_keys,
+    run_warning_ingest,
 };
 use multiview_engine::{
     CompositorDrive, EnginePublisher, RouteApplier, RouteIntent, RouteResolution,
@@ -2496,6 +2496,13 @@ async fn persist_layouts(
                         }
                     };
                     let from_desired = desired.is_some();
+                    let desired_ids = desired.as_ref().map(|record| {
+                        record
+                            .layouts
+                            .iter()
+                            .map(|layout| layout.id.clone())
+                            .collect::<std::collections::HashSet<_>>()
+                    });
                     let library = desired.map_or_else(
                         || {
                             seeded
@@ -2541,6 +2548,27 @@ async fn persist_layouts(
                             tracing::error!(%error, layout = %id, "cannot restore accepted layout");
                         }
                     }
+                    if let Some(ids) = desired_ids {
+                        match multiview_control::repository::Repository::list_layouts(&repo) {
+                            Ok(entries) => {
+                                for entry in entries {
+                                    if !ids.contains(&entry.layout.id) {
+                                        if let Err(error) =
+                                            multiview_control::repository::Repository::delete_layout(
+                                                &repo,
+                                                &entry.layout.id,
+                                            )
+                                        {
+                                            tracing::error!(%error, layout = %entry.layout.id, "cannot remove stale derived layout");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "cannot inspect derived layout projection")
+                            }
+                        }
+                    }
                     tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
                     if from_desired {
                         return restore_desired_layouts(model).unwrap_or_else(|| Arc::new(repo));
@@ -2566,7 +2594,7 @@ mod tests {
     use super::*;
     use multiview_compositor::blend::LinearRgba;
     use multiview_compositor::pipeline::CanvasColor;
-    use multiview_control::{command_bus, Command, OperationId};
+    use multiview_control::{Command, OperationId, command_bus};
     use multiview_engine::EnginePublisher;
     use multiview_events::{Event, OutputRunState};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2910,11 +2938,13 @@ input_id = "in_b"
             .expect("fresh audio");
         let block = bus.tick_to(3);
         assert_eq!(block.frame_count(), 5_760);
-        assert!(block
-            .interleaved()
-            .iter()
-            .skip(480 * 2)
-            .all(|sample| (*sample - 0.75).abs() < 0.001));
+        assert!(
+            block
+                .interleaved()
+                .iter()
+                .skip(480 * 2)
+                .all(|sample| (*sample - 0.75).abs() < 0.001)
+        );
     }
 
     /// ADR-W019: an `ApplyLayout` carrying a stored, route-solved document swaps

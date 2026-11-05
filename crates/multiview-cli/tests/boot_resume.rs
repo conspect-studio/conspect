@@ -109,6 +109,9 @@ fn accepted_desired_envelope_restores_config_and_selected_definition() {
         }],
         selected_body: body,
         output_ids: vec!["output-0".into()],
+        layout_versions: Default::default(),
+        resource_versions: Default::default(),
+        resource_names: Default::default(),
     };
     desired.validate().expect("valid envelope");
     std::fs::write(

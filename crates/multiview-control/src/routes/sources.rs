@@ -10,19 +10,19 @@
 //! document is rejected with `422 /problems/validation` naming the field path,
 //! and every accepted mutation declares its apply semantics via
 //! `X-Multiview-Apply`. Errors are RFC 9457 problem documents.
-use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
 use crate::command::{Command, OperationId};
 use crate::concurrency::IfMatch;
 use crate::error::ControlResult;
-use crate::resource_store::{Resource, ResourceInput, VersionedResource, SOURCE_KIND};
+use crate::resource_store::{Resource, ResourceInput, SOURCE_KIND, VersionedResource};
 use crate::state::AppState;
-use crate::typed_resources::{validated_body, with_apply, ApplyMode, TypedCollection};
+use crate::typed_resources::{ApplyMode, TypedCollection, validated_body, with_apply};
 
 /// Parse a stored (already ADR-W015-validated) source body back into the
 /// canonical config type, or `None` for a legacy/foreign document that does
@@ -145,6 +145,22 @@ fn live_apply_remove(state: &AppState, id: &str) -> ApplyMode {
     }
 }
 
+/// Read accepted intent rather than a lagging, fallible SQLite projection.
+fn accepted_sources(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
+    crate::boot_model::accepted_resources(state, "sources")?
+        .map_or_else(|| state.sources.list(), Ok)
+}
+
+fn accepted_source(state: &AppState, id: &str) -> ControlResult<VersionedResource> {
+    accepted_sources(state)?
+        .into_iter()
+        .find(|entry| entry.resource.id == id)
+        .ok_or_else(|| crate::error::ControlError::NotFound {
+            kind: SOURCE_KIND,
+            id: id.into(),
+        })
+}
+
 /// Attach the resource's `ETag` to a successful response carrying a source.
 fn source_response(status: StatusCode, versioned: &VersionedResource) -> Response {
     let etag = versioned.version.to_etag();
@@ -180,9 +196,8 @@ pub(crate) async fn list_sources(
     // embedded out-of-scope `device_ref` on a surviving in-scope row (its
     // device-projection link may point to a device the principal cannot `GET`).
     // Both are no-ops for an unscoped principal.
-    let sources = state
-        .sources
-        .list()?
+    let sources = crate::boot_model::accepted_resources(&state, "sources")?
+        .map_or_else(|| state.sources.list(), Ok)?
         .into_iter()
         .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
         .map(|v| {
@@ -218,7 +233,7 @@ pub(crate) async fn get_source(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let mut versioned = state.sources.get(&id)?;
+    let mut versioned = accepted_source(&state, &id)?;
     // Redact an embedded out-of-scope `device_ref` (BOLA visibility,
     // ADR-W005/ADR-W025): the source itself is in scope (authorized above), but
     // its device-projection link must not leak a device id the principal could
@@ -262,19 +277,39 @@ pub(crate) async fn create_source(
     // takes the same lock) can never compose mid-mutation and the adopted
     // snapshot advances atomically with the engine submit.
     let _mutation = state.lock_config_mutation().await;
-    if state.sources.list()?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
+    if accepted_sources(&state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
         return Err(crate::error::ControlError::Validation(format!(
             "sources exceeds the live source capacity of {}",
             multiview_config::MAX_ADMITTED_SOURCES
         )));
     }
-    if state.sources.get(&id).is_ok() {
+    if accepted_sources(&state)?
+        .iter()
+        .any(|entry| entry.resource.id == id)
+    {
         return Err(crate::error::ControlError::Validation(format!(
             "source {id:?} already exists"
         )));
     }
-    crate::boot_model::commit_resource(&state, "sources", &id, Some(input.body.clone())).await?;
-    let versioned = state.sources.create(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "sources",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.sources.create(&id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
+    }
+    let versioned = accepted_source(&state, &id).map_err(|error| {
+        crate::error::ControlError::CommitIndeterminate(format!(
+            "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
+        ))
+    })?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -323,15 +358,32 @@ pub(crate) async fn update_source(
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
-    let current = state.sources.get(&id)?;
+    let current = accepted_source(&state, &id)?;
     if_match.require(SOURCE_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
     let previous = parse_stored_source(&current.resource.body);
-    crate::boot_model::commit_resource(&state, "sources", &id, Some(input.body.clone())).await?;
-    let versioned = state.sources.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "sources",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.sources.update(&id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
+    }
+    let versioned = accepted_source(&state, &id).map_err(|error| {
+        crate::error::ControlError::CommitIndeterminate(format!(
+            "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
+        ))
+    })?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -378,10 +430,15 @@ pub(crate) async fn delete_source(
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // precondition → store-delete → submit → adopt-snapshot sequence.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.sources.get(&id)?;
+    let current = accepted_source(&state, &id)?;
     if_match.require(SOURCE_KIND, &id, current.version)?;
-    crate::boot_model::commit_resource(&state, "sources", &id, None).await?;
-    state.sources.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "sources", &id, None, None).await?;
+    if let Err(error) = state.sources.delete(&id) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted source deletion committed; store projection failed");
+    }
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

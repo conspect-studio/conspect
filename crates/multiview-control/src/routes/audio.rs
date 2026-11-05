@@ -29,10 +29,10 @@
 //! only a restart can honour it (no program bus running, a changed
 //! `sample_rate_hz`, or a mixed input with no audio store on this run). Either
 //! way the stored document is persisted to `active.toml`.
-use axum::extract::State;
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::audio_routing::{AUDIO_ROUTING_ID, AUDIO_ROUTING_KIND};
@@ -41,7 +41,7 @@ use crate::auth::{Action, Principal};
 use crate::concurrency::{IfMatch, Version};
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
-use crate::typed_resources::{with_apply, ApplyMode};
+use crate::typed_resources::{ApplyMode, with_apply};
 use multiview_config::{AudioRouting, PROGRAM_TRACK};
 
 /// The wire envelope both verbs return: whether a document is configured, the
@@ -144,7 +144,7 @@ pub(crate) async fn get_audio_routing(
     principal: Principal,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
-    let (routing, version) = state.audio_routing.snapshot();
+    let (routing, version) = crate::boot_model::accepted_audio(&state)?;
     Ok(state_response(StatusCode::OK, routing, version))
 }
 
@@ -180,7 +180,7 @@ pub(crate) async fn put_audio_routing(
     let _mutation = state.lock_config_mutation().await;
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a missing/stale `If-Match` is reported even when the body is invalid.
-    let current = state.audio_routing.version();
+    let (_, current) = crate::boot_model::accepted_audio(&state)?;
     if_match.require(AUDIO_ROUTING_KIND, AUDIO_ROUTING_ID, current)?;
     let routing = validated_routing(&body)?;
     // Validate the entire prospective configuration and persist intent before
@@ -198,15 +198,23 @@ pub(crate) async fn put_audio_routing(
     }
     // The compare-and-swap re-checks the version under the store lock, so two
     // racing PUTs that both passed the read above cannot both win.
-    let version = state
-        .audio_routing
-        .replace_if(current, routing.clone())
-        .map_err(|actual| ControlError::VersionConflict {
-            kind: AUDIO_ROUTING_KIND,
-            id: AUDIO_ROUTING_ID.to_owned(),
-            expected: current.get().to_string(),
-            actual: actual.get().to_string(),
-        })?;
+    let projected = state.audio_routing.version();
+    if let Err(actual) = state.audio_routing.replace_if(projected, routing.clone()) {
+        if state.boot_model.is_none() {
+            return Err(ControlError::VersionConflict {
+                kind: AUDIO_ROUTING_KIND,
+                id: AUDIO_ROUTING_ID.to_owned(),
+                expected: projected.get().to_string(),
+                actual: actual.get().to_string(),
+            });
+        }
+        tracing::warn!("accepted audio committed; store projection failed");
+    }
+    let (_, version) = crate::boot_model::accepted_audio(&state).map_err(|error| {
+        ControlError::CommitIndeterminate(format!(
+            "accepted audio cannot be read after commit: {error}"
+        ))
+    })?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
