@@ -251,6 +251,60 @@ fn negotiate(
 }
 
 #[test]
+fn selected_encoder_codec_controls_answer_despite_vp8_offer_preference() {
+    let offer = VIDEO_OFFER.replace("SAVPF 96 97", "SAVPF 97 96");
+    for (codec, expected, rejected) in [
+        (PreviewCodec::H264, "H264/90000", "VP8/90000"),
+        (PreviewCodec::Vp8, "VP8/90000", "H264/90000"),
+    ] {
+        let media = FakeMediaSource::video_only(codec, 4);
+        let egress = WhepEgress::with_host_candidate("[::1]:8189".parse().unwrap());
+        let answer = egress.accept_session(&offer, codec, &media).unwrap();
+        assert!(answer.sdp_answer.contains(expected));
+        assert!(
+            !answer.sdp_answer.contains(rejected),
+            "answer must not label encoder bytes with another codec"
+        );
+    }
+}
+
+#[test]
+fn all_concrete_host_candidates_reach_the_answer() {
+    let hosts = vec![
+        "[2001:db8::1]:8189".parse().unwrap(),
+        "192.0.2.1:8189".parse().unwrap(),
+    ];
+    let egress = WhepEgress::with_host_candidates(hosts);
+    assert!(egress.has_candidates());
+    let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
+    let answer = egress
+        .accept_session(VIDEO_OFFER, PreviewCodec::H264, &media)
+        .unwrap();
+    assert_eq!(answer.transport.candidates.len(), 2);
+    assert!(answer
+        .transport
+        .candidates
+        .iter()
+        .any(|candidate| candidate.contains("2001:db8::1")));
+    assert!(answer
+        .transport
+        .candidates
+        .iter()
+        .any(|candidate| candidate.contains("192.0.2.1")));
+}
+
+#[test]
+fn no_candidate_transport_is_not_available_until_a_relay_is_learned() {
+    let egress = WhepEgress::with_host_candidates(vec!["[::]:8189".parse().unwrap()]);
+    assert!(!egress.has_candidates());
+    egress.learn_relay(
+        "[2001:db8::2]:50000".parse().unwrap(),
+        "[::1]:8189".parse().unwrap(),
+    );
+    assert!(egress.has_candidates());
+}
+
+#[test]
 fn accept_yields_real_ice_dtls_and_created_state() {
     let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
     let egress = WhepEgress::new();

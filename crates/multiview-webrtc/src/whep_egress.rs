@@ -172,7 +172,7 @@ pub struct WhepEgress {
     sessions: Mutex<HashMap<SessionId, EgressSession>>,
     /// The host candidate to gather on each session (the bound socket's reachable
     /// address). `None` for the socket-free shuttle transport.
-    host_candidate: Option<SocketAddr>,
+    host_candidates: Vec<SocketAddr>,
     /// Relay candidates (TURN-allocated) to register on each session, with the
     /// local socket the relayed traffic egresses from (ADR-0048 §5.1).
     ///
@@ -191,7 +191,7 @@ impl std::fmt::Debug for WhepEgress {
         let relays = self.relay_candidates.lock().map_or(0, |r| r.len());
         f.debug_struct("WhepEgress")
             .field("sessions", &live)
-            .field("host_candidate", &self.host_candidate)
+            .field("host_candidates", &self.host_candidates)
             .field("relay_candidates", &relays)
             .finish_non_exhaustive()
     }
@@ -210,7 +210,7 @@ impl WhepEgress {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            host_candidate: None,
+            host_candidates: Vec::new(),
             relay_candidates: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
         }
@@ -222,10 +222,32 @@ impl WhepEgress {
     pub fn with_host_candidate(host: SocketAddr) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            host_candidate: Some(host),
+            host_candidates: vec![host],
             relay_candidates: Mutex::new(Vec::new()),
             next_id: Mutex::new(0),
         }
+    }
+
+    /// Gather all concrete host candidates, preserving IPv6-first order.
+    #[must_use]
+    pub fn with_host_candidates(hosts: Vec<SocketAddr>) -> Self {
+        Self {
+            host_candidates: hosts
+                .into_iter()
+                .filter(|host| !host.ip().is_unspecified())
+                .collect(),
+            ..Self::new()
+        }
+    }
+
+    /// Whether a currently usable host or learned relay candidate exists.
+    #[must_use]
+    pub fn has_candidates(&self) -> bool {
+        !self.host_candidates.is_empty()
+            || self
+                .relay_candidates
+                .lock()
+                .is_ok_and(|relays| !relays.is_empty())
     }
 
     /// Build an egress transport with a host candidate **and** seeded TURN relay
@@ -240,7 +262,7 @@ impl WhepEgress {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            host_candidate: Some(host),
+            host_candidates: vec![host],
             relay_candidates: Mutex::new(relay_candidates),
             next_id: Mutex::new(0),
         }
@@ -296,10 +318,15 @@ impl WhepEgress {
         let opus = offer_advertises_opus(offer);
 
         let created_at = Instant::now();
-        let mut session = Session::new(&SessionConfig::default(), created_at);
-        if let Some(host) = self.host_candidate {
+        let config = SessionConfig {
+            enable_h264: codec == PreviewCodec::H264,
+            enable_vp8: codec == PreviewCodec::Vp8,
+            ..SessionConfig::default()
+        };
+        let mut session = Session::new(&config, created_at);
+        for host in &self.host_candidates {
             session
-                .add_host_candidate(host)
+                .add_host_candidate(*host)
                 .map_err(|_| WhepError::MalformedOffer {
                     reason: "egress could not gather a host candidate",
                 })?;

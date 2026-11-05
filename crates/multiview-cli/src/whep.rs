@@ -593,7 +593,7 @@ impl CliWhepProvider {
 
 impl WhepProvider for CliWhepProvider {
     fn negotiate(&self, scope: &WhepScope, offer: &str) -> Result<WhepAnswer, WhepReject> {
-        if !self.available {
+        if !self.available || !self.egress.has_candidates() {
             return Err(WhepReject::CapacityExceeded {
                 fallback: "jpeg".to_owned(),
             });
@@ -641,7 +641,7 @@ impl WhepProvider for CliWhepProvider {
     }
 
     fn webrtc_available(&self) -> bool {
-        self.available
+        self.available && self.egress.has_candidates()
     }
 }
 
