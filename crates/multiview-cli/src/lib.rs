@@ -122,6 +122,7 @@ pub mod outputs;
 pub mod placement;
 pub mod preview;
 pub mod run;
+pub mod source_event_service;
 /// Map the HAL probe + compiled features + resolved compositor adapter onto the
 /// [`multiview_control::system::SystemCapabilities`] DTO for
 /// `GET /api/v1/system/capabilities` (ADR-W030). A static startup snapshot
