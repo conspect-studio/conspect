@@ -32,6 +32,7 @@ pub mod devices;
 pub mod discovery;
 pub mod health;
 pub mod inputs;
+pub mod source_events;
 pub mod licence;
 pub mod logs;
 pub mod media_players;
@@ -808,6 +809,7 @@ fn resource_router() -> Router<AppState> {
         // Read-only input elementary-stream inventory (RT-3): every stream an
         // input offers, projected from the off-engine cached snapshot (inv #10).
         .route("/inputs/{id}/streams", get(inputs::get_input_streams))
+        .route("/inputs/{id}/events", get(source_events::get_source_events))
         // Outputs resource CRUD (managed sinks/servers), mirroring layouts.
         .route("/outputs", get(outputs::list_outputs))
         .route(

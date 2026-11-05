@@ -813,6 +813,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/inputs/{id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_source_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/inputs/{id}/streams": {
         parameters: {
             query?: never;
@@ -3981,8 +3997,6 @@ export interface components {
             id?: string | null;
             /** @enum {string} */
             kind: "rtsp_server";
-            /** @description Latency profile hint. */
-            latency_profile?: string | null;
             metadata?: null | components["schemas"]["OutputMetadataDoc"];
             /** @description Mount point (e.g. `/multiview`). */
             mount: string;
@@ -3991,11 +4005,6 @@ export interface components {
             audio?: null | components["schemas"]["OutputAudioDoc"];
             /** @description Video codec. */
             codec: string;
-            /**
-             * Format: int32
-             * @description GOP duration (ms).
-             */
-            gop_ms?: number | null;
             gpu_pin?: null | components["schemas"]["DevicePinDoc"];
             /** @description Stable operator id; may be omitted. */
             id?: string | null;
@@ -4003,11 +4012,6 @@ export interface components {
             kind: "ll_hls";
             metadata?: null | components["schemas"]["OutputMetadataDoc"];
             orientation?: null | components["schemas"]["OutputOrientationDoc"];
-            /**
-             * Format: int32
-             * @description Target part duration (ms).
-             */
-            part_target_ms?: number | null;
             /** @description Output path. */
             path: string;
             /**
@@ -4750,11 +4754,6 @@ export interface components {
             /** @description The destination layer id. */
             layer: string;
         };
-        /** @description `OpenAPI` mirror of `multiview_config::RtspOptions`. */
-        RtspOptionsDoc: {
-            /** @description Lower-transport selection (`tcp` / `udp`). */
-            transport: string;
-        };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::Salvo`].
          *
@@ -4944,6 +4943,70 @@ export interface components {
              */
             url?: string | null;
         };
+        /**
+         * @description Availability of the latched presentation clock, not ingest health.
+         * @enum {string}
+         */
+        SourceEventAvailability: "available" | "stale" | "unavailable";
+        /** @description Structured observational row. No raw transport payload is exposed. */
+        SourceEventDto: {
+            /** @description Bounded public asset identity, independent of this occurrence. */
+            asset_id?: string | null;
+            /** @description Bounded public association token; never proof that origins corroborate. */
+            correlation_id?: string | null;
+            /** @description Exact unsigned decimal timeline epoch. */
+            epoch: string;
+            /** @description Public occurrence identity, not an asset identity. */
+            event_id: string;
+            label?: null | components["schemas"]["SourceEventLabel"];
+            /** @description Observational lifecycle, not an automation command. */
+            lifecycle: components["schemas"]["SourceEventLifecycle"];
+            /** @description Evidence origin; vendor markers never imply a splice boundary. */
+            origin: components["schemas"]["SourceEventOrigin"];
+            timer?: null | components["schemas"]["SourceEventTimer"];
+            /** @description Public vendor namespace when applicable. */
+            vendor?: string | null;
+        };
+        /**
+         * @description Semantic badge label, independent of evidence origin.
+         * @enum {string}
+         */
+        SourceEventLabel: "upcoming" | "active" | "ended" | "uncertain" | "overrun" | "observed";
+        /**
+         * @description Source-relative observational lifecycle.
+         * @enum {string}
+         */
+        SourceEventLifecycle: "announced" | "active" | "ended" | "cancelled" | "superseded" | "uncertain" | "observed";
+        /**
+         * @description Independent evidence origin.
+         * @enum {string}
+         */
+        SourceEventOrigin: "scte35" | "timed_id3" | "manifest" | "vendor_marker" | "external";
+        /** @description Exact timer value projected by the server against the selected source frame. */
+        SourceEventTimer: {
+            /** @description Interpretation of the nonnegative duration. */
+            kind: components["schemas"]["SourceEventTimerKind"];
+            /** @description Canonical unsigned decimal nanoseconds, never a floating-point JSON number. */
+            nanoseconds: string;
+        };
+        /**
+         * @description Meaning of a server-projected timer.
+         * @enum {string}
+         */
+        SourceEventTimerKind: "until_start" | "remaining" | "elapsed" | "overrun";
+        /** @description Bounded source snapshot with exact browser-safe epoch identities. */
+        SourceEventsDto: {
+            /** @description Presentation clock availability. */
+            availability: components["schemas"]["SourceEventAvailability"];
+            /** @description True if upstream evidence or this response lost information. */
+            degraded: boolean;
+            /** @description Exact unsigned decimal epoch, including values above 2^53. */
+            epoch: string;
+            /** @description Bounded structured event history; an empty list is valid. */
+            events: components["schemas"]["SourceEventDto"][];
+            /** @description Exact source identity requested by the caller. */
+            source_id: string;
+        };
         /** @description `OpenAPI` mirror of `multiview_config::SourceKind` (tagged by `kind`). */
         SourceKindDoc: {
             /** @enum {string} */
@@ -4998,7 +5061,6 @@ export interface components {
         }) | {
             /** @enum {string} */
             kind: "rtsp";
-            rtsp?: null | components["schemas"]["RtspOptionsDoc"];
             /** @description Source URL. */
             url: string;
         } | {
@@ -7706,6 +7768,65 @@ export interface operations {
             };
             /** @description Authenticated but not authorized to read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_source_events: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact source identity; no suffix normalization */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded observational snapshot (possibly empty). Cache-Control: no-store. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceEventsDto"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source outside principal scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source event provider unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

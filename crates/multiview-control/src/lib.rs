@@ -93,6 +93,8 @@ pub mod whip;
 
 #[cfg(feature = "embed-web")]
 pub mod spa;
+pub mod source_events;
+pub use source_events::{SourceEventProvider, SourceEventsDto, SharedSourceEvents};
 
 #[cfg(feature = "openapi")]
 pub mod openapi;

@@ -2470,6 +2470,82 @@
         }
       }
     },
+    "/api/v1/inputs/{id}/events": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "get_source_events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity; no suffix normalization",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded observational snapshot (possibly empty). Cache-Control: no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceEventsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Source event provider unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/inputs/{id}/streams": {
       "get": {
         "tags": [
@@ -13857,6 +13933,191 @@
               "null"
             ],
             "description": "The served URL, IPv6-first where known. `None` when the vendor does not\ndocument its mount path — the operator supplies it and it is flagged\n[`unverified`](SourceCandidate::unverified)."
+          }
+        }
+      },
+      "SourceEventAvailability": {
+        "type": "string",
+        "description": "Availability of the latched presentation clock, not ingest health.",
+        "enum": [
+          "available",
+          "stale",
+          "unavailable"
+        ]
+      },
+      "SourceEventDto": {
+        "type": "object",
+        "description": "Structured observational row. No raw transport payload is exposed.",
+        "required": [
+          "event_id",
+          "epoch",
+          "origin",
+          "lifecycle"
+        ],
+        "properties": {
+          "asset_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bounded public asset identity, independent of this occurrence.",
+            "maxLength": 256
+          },
+          "correlation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bounded public association token; never proof that origins corroborate.",
+            "maxLength": 256
+          },
+          "epoch": {
+            "type": "string",
+            "description": "Exact unsigned decimal timeline epoch."
+          },
+          "event_id": {
+            "type": "string",
+            "description": "Public occurrence identity, not an asset identity."
+          },
+          "label": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceEventLabel",
+                "description": "Optional semantic display label consistent with lifecycle and timer."
+              }
+            ]
+          },
+          "lifecycle": {
+            "$ref": "#/components/schemas/SourceEventLifecycle",
+            "description": "Observational lifecycle, not an automation command."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/SourceEventOrigin",
+            "description": "Evidence origin; vendor markers never imply a splice boundary."
+          },
+          "timer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceEventTimer",
+                "description": "Server-projected source-media timer; clients must not tick it from receipt time."
+              }
+            ]
+          },
+          "vendor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Public vendor namespace when applicable."
+          }
+        }
+      },
+      "SourceEventLabel": {
+        "type": "string",
+        "description": "Semantic badge label, independent of evidence origin.",
+        "enum": [
+          "upcoming",
+          "active",
+          "ended",
+          "uncertain",
+          "overrun",
+          "observed"
+        ]
+      },
+      "SourceEventLifecycle": {
+        "type": "string",
+        "description": "Source-relative observational lifecycle.",
+        "enum": [
+          "announced",
+          "active",
+          "ended",
+          "cancelled",
+          "superseded",
+          "uncertain",
+          "observed"
+        ]
+      },
+      "SourceEventOrigin": {
+        "type": "string",
+        "description": "Independent evidence origin.",
+        "enum": [
+          "scte35",
+          "timed_id3",
+          "manifest",
+          "vendor_marker",
+          "external"
+        ]
+      },
+      "SourceEventTimer": {
+        "type": "object",
+        "description": "Exact timer value projected by the server against the selected source frame.",
+        "required": [
+          "kind",
+          "nanoseconds"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/SourceEventTimerKind",
+            "description": "Interpretation of the nonnegative duration."
+          },
+          "nanoseconds": {
+            "type": "string",
+            "description": "Canonical unsigned decimal nanoseconds, never a floating-point JSON number.",
+            "maxLength": 20,
+            "pattern": "^(0|[1-9][0-9]{0,19})$"
+          }
+        }
+      },
+      "SourceEventTimerKind": {
+        "type": "string",
+        "description": "Meaning of a server-projected timer.",
+        "enum": [
+          "until_start",
+          "remaining",
+          "elapsed",
+          "overrun"
+        ]
+      },
+      "SourceEventsDto": {
+        "type": "object",
+        "description": "Bounded source snapshot with exact browser-safe epoch identities.",
+        "required": [
+          "source_id",
+          "epoch",
+          "availability",
+          "degraded",
+          "events"
+        ],
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/SourceEventAvailability",
+            "description": "Presentation clock availability."
+          },
+          "degraded": {
+            "type": "boolean",
+            "description": "True if upstream evidence or this response lost information."
+          },
+          "epoch": {
+            "type": "string",
+            "description": "Exact unsigned decimal epoch, including values above 2^53."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceEventDto"
+            },
+            "description": "Bounded structured event history; an empty list is valid.",
+            "maxItems": 256
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Exact source identity requested by the caller."
           }
         }
       },
