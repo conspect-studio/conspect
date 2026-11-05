@@ -323,10 +323,15 @@ fn displayed_picture_retains_source_time_across_hold_and_layout_rebind() {
     let a = Arc::new(TileStore::with_defaults("cam-a"));
     let b = Arc::new(TileStore::with_defaults("cam-b"));
     let source_a = SourceFrameTime {
+        event_clock: None,
         pts: MediaTime::from_nanos(1_000_000_000),
         generation: 4,
     };
     let source_b = SourceFrameTime {
+        event_clock: Some(multiview_framestore::tile::EventClockContext {
+            connection_epoch: 20,
+            mapping_generation: 1,
+        }),
         pts: MediaTime::from_nanos(8_000_000_000),
         generation: 7,
     };
@@ -356,19 +361,41 @@ fn displayed_picture_retains_source_time_across_hold_and_layout_rebind() {
     let frame = drive.compose(tick_at(3)).unwrap();
     assert!(!frame.source_times.contains_key("cam-a"));
     assert_eq!(frame.source_times.get("cam-b"), Some(&source_b));
+    let remapped = SourceFrameTime {
+        event_clock: Some(multiview_framestore::tile::EventClockContext {
+            connection_epoch: 20,
+            mapping_generation: 2,
+        }),
+        ..source_b
+    };
     b.publish_arc_with_source_time(
         Arc::new(solid(w / 2, h, 60)),
         tick_at(4).pts,
-        Some(SourceFrameTime {
-            generation: 8,
-            ..source_b
-        }),
+        Some(remapped),
     );
+    // A future buffered mapping cannot alter the selected held picture.
+    let held = drive.compose(tick_at(3)).unwrap();
+    assert_eq!(held.source_times.get("cam-b"), Some(&source_b));
     let frame = drive.compose(tick_at(4)).unwrap();
-    assert_eq!(
-        frame.source_times.get("cam-b").map(|t| t.generation),
-        Some(8)
+    assert_eq!(frame.source_times.get("cam-b"), Some(&remapped));
+    assert_eq!(remapped.generation, source_b.generation);
+    assert_eq!(remapped.pts, source_b.pts);
+    let reconnected = SourceFrameTime {
+        generation: 8,
+        event_clock: Some(multiview_framestore::tile::EventClockContext {
+            connection_epoch: 21,
+            mapping_generation: 1,
+        }),
+        ..source_b
+    };
+    b.publish_arc_with_source_time(
+        Arc::new(solid(w / 2, h, 70)),
+        tick_at(5).pts,
+        Some(reconnected),
     );
+    let frame = drive.compose(tick_at(5)).unwrap();
+    assert_eq!(frame.source_times.get("cam-b"), Some(&reconnected));
+    assert_eq!(held.source_times.get("cam-b"), Some(&source_b));
 }
 
 #[test]

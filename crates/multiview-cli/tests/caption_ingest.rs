@@ -104,6 +104,7 @@ fn bipbop_english_webvtt_cue_decodes_into_the_store() {
         multiview_framestore::tile::SourceFrameTime {
             pts: MediaTime::from_nanos(1_500_000_000),
             generation: 1,
+            event_clock: None,
         },
     )));
 
@@ -187,6 +188,7 @@ fn valid_webvtt_cue_lands_via_isolated_reader() {
         multiview_framestore::tile::SourceFrameTime {
             pts: MediaTime::from_nanos(1_500_000_000),
             generation: 1,
+            event_clock: None,
         },
     )));
 
@@ -251,6 +253,7 @@ fn rendition_waits_for_displayed_video_not_arrival_clock() {
         multiview_framestore::tile::SourceFrameTime {
             pts: MediaTime::from_nanos(1_500_000_000),
             generation: 1,
+            event_clock: None,
         },
     )));
     let deadline = Instant::now() + Duration::from_secs(5);

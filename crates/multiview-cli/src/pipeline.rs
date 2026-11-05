@@ -7354,6 +7354,7 @@ mod live_edit_audio_regression_tests {
         assert_eq!(
             selected,
             Some(multiview_framestore::tile::SourceFrameTime {
+                event_clock: None,
                 pts: MediaTime::from_nanos(22),
                 generation: live_lifecycle(id)
             }),
@@ -11736,6 +11737,7 @@ fn publish_webrtc_video(
                     Arc::new(image),
                     pts,
                     Some(multiview_framestore::tile::SourceFrameTime {
+                        event_clock: None,
                         pts,
                         generation: plan.lifecycle,
                     }),
@@ -12493,6 +12495,7 @@ fn open_and_stream(
                 Arc::new(image),
                 at,
                 Some(multiview_framestore::tile::SourceFrameTime {
+                    event_clock: None,
                     pts,
                     generation: plan.lifecycle,
                 }),
@@ -12809,6 +12812,7 @@ fn stream_player(
                         image,
                         at,
                         last_source_pts.map(|pts| multiview_framestore::tile::SourceFrameTime {
+                            event_clock: None,
                             pts,
                             generation: plan.lifecycle,
                         }),
@@ -12848,6 +12852,7 @@ fn stream_player(
                             at,
                             last_source_pts.map(|pts| {
                                 multiview_framestore::tile::SourceFrameTime {
+                                    event_clock: None,
                                     pts,
                                     generation: plan.lifecycle,
                                 }
@@ -13229,6 +13234,7 @@ fn heartbeat_player_hold(
             Arc::clone(image),
             at,
             last_source_pts.map(|pts| multiview_framestore::tile::SourceFrameTime {
+                event_clock: None,
                 pts,
                 generation: plan.lifecycle,
             }),
@@ -13800,6 +13806,7 @@ pub(crate) fn publish_live_synth_frame_for(
         image,
         at,
         Some(multiview_framestore::tile::SourceFrameTime {
+            event_clock: None,
             pts: at,
             generation: lifecycle,
         }),
@@ -13832,6 +13839,7 @@ fn publish_live_frame_for(
         Arc::new(image),
         at,
         Some(multiview_framestore::tile::SourceFrameTime {
+            event_clock: None,
             pts: source_pts,
             generation: lifecycle,
         }),
@@ -16355,6 +16363,7 @@ segment_ms = 1000
             .copied()
             .unwrap_or_default();
         let old_picture = SourceFrameTime {
+            event_clock: None,
             pts: MediaTime::from_nanos(1),
             generation: original,
         };
@@ -16440,12 +16449,14 @@ input_id = "net1"
             "new plan must not retain generation 1"
         );
         let held_old = SourceFrameTime {
+            event_clock: None,
             pts: MediaTime::from_nanos(1_500_000_000),
             generation: 1,
         };
         let new_store = Arc::clone(&fresh.store);
         let new_cursor = Arc::clone(&fresh.displayed_time);
         new_cursor.store(Some(Arc::new(SourceFrameTime {
+            event_clock: None,
             pts: held_old.pts,
             generation: 3,
         })));
