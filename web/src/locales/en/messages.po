@@ -5283,6 +5283,10 @@ msgstr "Output bound"
 msgid "Output cadence as a <0>\"num/den\"</0> rational string, for example <1>\"30000/1001\"</1> for exact NTSC 29.97. A bare float is rejected on purpose, because frame rates must be exact."
 msgstr "Output cadence as a <0>\"num/den\"</0> rational string, for example <1>\"30000/1001\"</1> for exact NTSC 29.97. A bare float is rejected on purpose, because frame rates must be exact."
 
+#: src/pages/MonitoringPage.tsx:236
+msgid "Output cards — program still images (JPEG, ~1 fps)"
+msgstr "Output cards — program still images (JPEG, ~1 fps)"
+
 #: src/pages/CastPage.tsx:444
 msgid "Output id (optional)"
 msgstr "Output id (optional)"
@@ -5502,11 +5506,6 @@ msgstr "Preview — input {0}"
 msgid "Preview of input {0}"
 msgstr "Preview of input {0}"
 
-#. placeholder {0}: output.name
-#: src/pages/MonitoringPage.tsx:243
-msgid "Preview of WebRTC output {0}"
-msgstr "Preview of WebRTC output {0}"
-
 #: src/preview/SourcePreviewButton.tsx:15
 msgid "Preview: {name}"
 msgstr "Preview: {name}"
@@ -5599,6 +5598,11 @@ msgstr "Program output never depends on this device: if it fails, bound sources 
 #: src/pages/MonitoringPage.tsx:173
 msgid "Program preview paused while input focus is open"
 msgstr "Program preview paused while input focus is open"
+
+#. placeholder {0}: output.name
+#: src/pages/MonitoringPage.tsx:243
+msgid "Program still image for output {0}"
+msgstr "Program still image for output {0}"
 
 #: src/pages/AudioPage.tsx:357
 msgid "Program-mix changes (on the program mix, gain, mute) apply to the running program audio immediately when saved, with a short fade — no restart. A changed sample rate, or mixing an input that has no audio on this run, is stored and goes live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
@@ -7797,10 +7801,6 @@ msgstr "WebRTC and TURN (ICE servers)"
 #: src/pages/docs/concepts/TransportsPage.tsx:199
 msgid "WebRTC carries sub-second video and audio straight to and from a browser with no plugin. Multiview speaks the two open HTTP signalling profiles built on it: <0>WHIP</0> (WebRTC-HTTP Ingestion Protocol) for a browser or encoder to publish a feed into a <1>webrtc</1> source, and <2>WHEP</2> (WebRTC-HTTP Egress Protocol) for a browser to play a <3>webrtc</3> output or a live preview. Both negotiate once over HTTPS — the client POSTs an SDP offer and gets the answer back — then media flows directly over the negotiated peer connection."
 msgstr "WebRTC carries sub-second video and audio straight to and from a browser with no plugin. Multiview speaks the two open HTTP signalling profiles built on it: <0>WHIP</0> (WebRTC-HTTP Ingestion Protocol) for a browser or encoder to publish a feed into a <1>webrtc</1> source, and <2>WHEP</2> (WebRTC-HTTP Egress Protocol) for a browser to play a <3>webrtc</3> output or a live preview. Both negotiate once over HTTPS — the client POSTs an SDP offer and gets the answer back — then media flows directly over the negotiated peer connection."
-
-#: src/pages/MonitoringPage.tsx:236
-msgid "WebRTC outputs"
-msgstr "WebRTC outputs"
 
 #: src/pages/MonitoringPage.tsx:189
 msgid "WebRTC preview (low latency)"

@@ -5283,6 +5283,10 @@ msgstr ""
 msgid "Output cadence as a <0>\"num/den\"</0> rational string, for example <1>\"30000/1001\"</1> for exact NTSC 29.97. A bare float is rejected on purpose, because frame rates must be exact."
 msgstr ""
 
+#: src/pages/MonitoringPage.tsx:236
+msgid "Output cards — program still images (JPEG, ~1 fps)"
+msgstr ""
+
 #: src/pages/CastPage.tsx:444
 msgid "Output id (optional)"
 msgstr ""
@@ -5502,11 +5506,6 @@ msgstr ""
 msgid "Preview of input {0}"
 msgstr ""
 
-#. placeholder {0}: output.name
-#: src/pages/MonitoringPage.tsx:243
-msgid "Preview of WebRTC output {0}"
-msgstr ""
-
 #: src/preview/SourcePreviewButton.tsx:15
 msgid "Preview: {name}"
 msgstr ""
@@ -5598,6 +5597,11 @@ msgstr ""
 
 #: src/pages/MonitoringPage.tsx:173
 msgid "Program preview paused while input focus is open"
+msgstr ""
+
+#. placeholder {0}: output.name
+#: src/pages/MonitoringPage.tsx:243
+msgid "Program still image for output {0}"
 msgstr ""
 
 #: src/pages/AudioPage.tsx:357
@@ -7796,10 +7800,6 @@ msgstr ""
 
 #: src/pages/docs/concepts/TransportsPage.tsx:199
 msgid "WebRTC carries sub-second video and audio straight to and from a browser with no plugin. Multiview speaks the two open HTTP signalling profiles built on it: <0>WHIP</0> (WebRTC-HTTP Ingestion Protocol) for a browser or encoder to publish a feed into a <1>webrtc</1> source, and <2>WHEP</2> (WebRTC-HTTP Egress Protocol) for a browser to play a <3>webrtc</3> output or a live preview. Both negotiate once over HTTPS — the client POSTs an SDP offer and gets the answer back — then media flows directly over the negotiated peer connection."
-msgstr ""
-
-#: src/pages/MonitoringPage.tsx:236
-msgid "WebRTC outputs"
 msgstr ""
 
 #: src/pages/MonitoringPage.tsx:189
