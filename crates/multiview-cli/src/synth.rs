@@ -1692,6 +1692,144 @@ segment_ms = 1000
 
     #[cfg(feature = "overlay")]
     #[test]
+    fn every_timer_digit_and_colon_uses_a_stable_slot_with_reserved_sign() {
+        use multiview_compositor::overlay::subpass::{OverlayDrawList, OverlayPrimitive};
+        use multiview_compositor::overlay::text::TextEngine;
+        for (width, height) in [(320, 120), (100, 120), (64, 34), (140, 42)] {
+            let positions = |value: &str| {
+                let mut engine = TextEngine::new().expect("font");
+                let mut list = OverlayDrawList::new();
+                draw_fixed_mono_readout(
+                    &mut list,
+                    &mut engine,
+                    value,
+                    width,
+                    (0, height),
+                    [0.95; 4],
+                    Some("+"),
+                )
+                .expect("timer readout");
+                list.primitives
+                    .iter()
+                    .filter_map(|p| match p {
+                        OverlayPrimitive::Glyph {
+                            dest_x,
+                            dest_y,
+                            width: glyph_w,
+                            height: glyph_h,
+                            ..
+                        } => {
+                            assert!(*dest_x >= 0 && *dest_y >= 0);
+                            assert!(dest_x.saturating_add(i32_of(*glyph_w)) <= i32_of(width));
+                            assert!(dest_y.saturating_add(i32_of(*glyph_h)) <= i32_of(height));
+                            Some(*dest_x)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let base = positions("12:18:30");
+            for value in ["11:11:11", "00:00:00"] {
+                let next = positions(value);
+                assert_eq!(
+                    base.len(),
+                    8,
+                    "two digits per field and both colons at {width}"
+                );
+                assert_eq!(next.len(), base.len());
+                for (slot, (a, b)) in base.iter().zip(next.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 2,
+                        "slot {slot} moved for {value} at {width}: {base:?} vs {next:?}"
+                    );
+                }
+            }
+            let overrun = positions("+12:18:30");
+            assert_eq!(overrun.len(), base.len() + 1, "one visible sign");
+            for (slot, (before, after)) in base.iter().zip(overrun[1..].iter()).enumerate() {
+                assert!(
+                    (before - after).abs() <= 2,
+                    "sign changed slot {slot} at {width}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn full_timer_readout_is_visible_in_rendered_pixels_and_png() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let (width, height) = (320, 120);
+        let kind = timer_kind(TimerFormat::HhMmSs, TimerOnTarget::Hold);
+        let seconds = 12 * 3600 + 18 * 60 + 30;
+        let target = 14 * 3600 + 30 * 60;
+        let image = render_at(
+            &kind,
+            width,
+            height,
+            canvas(),
+            WallTime::from_unix_seconds(target - seconds),
+            0,
+            Rational::new(25, 1),
+        )
+        .expect("full timer render");
+        let blank = Nv12Image::solid_rgb(width, height, 8, 8, 12, canvas()).expect("background");
+        // Count every non-background luma pixel across the full readout band;
+        // both edges and the centre must contain visible text, not a cropped substring.
+        let y = image.y_plane();
+        let bg = blank.y_plane();
+        let bands = [(35, 105), (105, 160), (160, 215), (215, 285)];
+        for (left, right) in bands {
+            let pixels = (30..90_u32)
+                .flat_map(|row| {
+                    (left..right).filter_map(move |col| usize::try_from(row * width + col).ok())
+                })
+                .filter(|&offset| y.get(offset) != bg.get(offset))
+                .count();
+            assert!(
+                pixels > 10,
+                "rendered timer readout has no ink in {left}..{right}"
+            );
+        }
+        let dir = tempfile::tempdir().expect("image directory");
+        let path = dir.path().join("timer-full-readout.png");
+        let mut encoder = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "nv12",
+                "-s",
+                "320x120",
+                "-i",
+                "pipe:0",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("png encoder");
+        {
+            let stdin = encoder.stdin.as_mut().expect("encoder stdin");
+            stdin.write_all(image.y_plane()).expect("Y plane");
+            stdin.write_all(image.uv_plane()).expect("UV plane");
+        }
+        assert!(encoder.wait().expect("encoder completion").success());
+        let metadata = std::fs::metadata(&path).expect("PNG artifact");
+        assert!(
+            metadata.len() > 1_000,
+            "full readout PNG must contain visible pixels"
+        );
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
     fn long_timer_formats_and_clock_fit_narrow_cells() {
         use multiview_compositor::overlay::subpass::{OverlayDrawList, OverlayPrimitive};
         use multiview_compositor::overlay::text::TextEngine;
