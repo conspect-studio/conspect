@@ -1,0 +1,11 @@
+# Active runtime wiring handoff
+
+Ingest worker 29cf3da8 owns minimal pipeline/source_event_ingest edits; service and frame context committed and tested. Do not register stale lifecycle producer as a fresh connection. Use existing source lifecycle guard at off-clock ownership boundary. Keep adapter-owned bounded service epoch -> (lifecycle, connection, mapping) tuple for exact selected frame matching unless a reviewed snapshot context extension proves simpler.
+
+Read API worker 0eb3354 owns control optional provider/DTO/auth route GET inputs/{id}/events. UI worker f08e4 owns web/events + minimal SourcesPage action. They must use same DTO; inspect new control/source_events.rs, no invented parallel wire schema.
+
+Compositor renderer API ready: OverlayBaker::draw_list_with_events(pts,dynamics,captions,bitmaps,&HashMap<String,EventOverlay>). Capture source projection using the exact selected frame event_clock; carry immutable projections through StreamItem to delayed baker. No latest registry timestamp used as source media cursor. None context -> unavailable, no marker/time inference.
+
+Lead still owns HLS original metadata publication. Current hls_fetch OriginPlaylist retains bounded cue_metadata but coordinate discards it. Next publication must be source+fetch-generation fenced, outside window/URL/budget locks. Vendor markers require occurrence lifecycle per disappearance/reappearance, never CAID identity or Start/End conversion. DATERANGE SCTE payloads require decode/CRC and source clock mapping. Explicit DATA renditions and libav fallback collection remain open requirements.
+
+Remaining full-scope work after visible event milestone: saved overlay configuration/layout strip/dedicated timer tile, authorized typed inbound/outbound hooks, persistent automation rules/arming/dry-run/audit, atomic video/audio/caption replacement executor with global lease scope CAS, deterministic bars+tone routing and VT readiness/switching integration, R3 chaos/soak, review/CI/release/server verification. Do not imply read-only panel completes these.

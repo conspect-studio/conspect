@@ -17,7 +17,9 @@ See [ADR-0183](../decisions/ADR-0183-source-event-automation.md). Source-owned e
 - Bounded ID3 parser: 6 targeted tests and strict clippy passed. Unknown vendor frames remain metadata, never inferred breaks.
 - CLI original-manifest metadata retention: red missing-field test followed by 17 native HLS fetch tests passed. Observation publication remains pending.
 - Pure armed automation/override lease safety model committed 0f201098 after independent review: 11 tests and strict clippy passed. Source-scoped model, independent monotonic watchdog and revoked-lease tombstones; it does not execute production commands.
-- Initial bounded runtime service committed 37cfce9d (6 GPU-free tests passed), but review requires lightweight snapshot reads and a supervisor registration controller before engine use. Repairs underway; not approved for integration as-is.
+- Bounded runtime service 37cfce9d repaired in a1bcf4ce: lightweight Arc+scalar reads, serialized supervisor registration, 8 integration +3 deterministic race tests passed and strict native CLI clippy passed. Independent scoped review cleared repair; runtime consumer freshness/degradation validation remains required.
+- Optional per-frame event clock context 77e2c164 preserves caption lifecycle; 2 framestore +1 engine metadata tests and 34 caption tests passed (one pre-existing network test ignored).
+- Actual compositor badge renderer 804fc864 accepts same-frame projections, clips glyphs to source tiles and clears on empty input; 30 native overlay tests and strict native CLI clippy passed. Runtime invocation still pending.
 
 These modules alone do not satisfy the feature. Test evidence is local and scoped, not full CI or deployment evidence.
 
