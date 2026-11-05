@@ -1787,6 +1787,10 @@ msgstr ""
 msgid "Connecting…"
 msgstr ""
 
+#: src/preview/PreviewDiagnostics.tsx:14
+msgid "Connection timed out after ICE connected. The cause is unknown."
+msgstr ""
+
 #: src/preview/PreviewDiagnostics.tsx:13
 msgid "Connection timed out. The network cause is unknown."
 msgstr ""
@@ -1836,7 +1840,7 @@ msgstr ""
 msgid "Copy {label}"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:33
+#: src/preview/PreviewDiagnostics.tsx:34
 msgid "Copy diagnostics"
 msgstr ""
 
@@ -1892,7 +1896,7 @@ msgstr ""
 msgid "Could not compose the bundle"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:34
+#: src/preview/PreviewDiagnostics.tsx:35
 msgid "Could not copy diagnostics. Select the safe technical details and copy them manually."
 msgstr ""
 
@@ -2484,7 +2488,7 @@ msgstr ""
 msgid "Devices that need authentication take a secret reference (e.g. <0>op://Site/foyer-decoder/credentials</0>), never a plaintext password: the configuration only ever stores and exports the reference. If a device rejects its credentials it parks in AUTH_FAILED with no blind retries; updating the secret reference re-probes automatically."
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:34
+#: src/preview/PreviewDiagnostics.tsx:35
 msgid "Diagnostics copied."
 msgstr ""
 
@@ -2691,7 +2695,7 @@ msgstr ""
 msgid "DST-correct, preferred over a fixed offset. Leave blank to use a fixed offset instead."
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:16
+#: src/preview/PreviewDiagnostics.tsx:17
 msgid "DTLS transport failed."
 msgstr ""
 
@@ -3584,7 +3588,7 @@ msgstr ""
 msgid "ICE (Interactive Connectivity Establishment)"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:14
+#: src/preview/PreviewDiagnostics.tsx:15
 msgid "ICE connection failed. The network cause is unknown."
 msgstr ""
 
@@ -3652,7 +3656,7 @@ msgstr ""
 msgid "In-facility broadcast distribution"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:19
+#: src/preview/PreviewDiagnostics.tsx:20
 msgid "Inbound video stopped progressing."
 msgstr ""
 
@@ -4646,7 +4650,7 @@ msgstr ""
 msgid "Mute"
 msgstr ""
 
-#: src/preview/WhepPlayer.tsx:360
+#: src/preview/WhepPlayer.tsx:353
 msgid "Mute {label}"
 msgstr ""
 
@@ -4860,7 +4864,7 @@ msgstr ""
 msgid "No host-memory sample."
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:17
+#: src/preview/PreviewDiagnostics.tsx:18
 msgid "No inbound video RTP bytes were reported."
 msgstr ""
 
@@ -5424,7 +5428,7 @@ msgstr ""
 msgid "Peer"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:15
+#: src/preview/PreviewDiagnostics.tsx:16
 msgid "Peer connection failed. The cause is unknown."
 msgstr ""
 
@@ -5537,7 +5541,7 @@ msgstr ""
 msgid "Preview — input {0}"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:24
+#: src/preview/PreviewDiagnostics.tsx:25
 msgid "Preview diagnostics"
 msgstr ""
 
@@ -6126,7 +6130,7 @@ msgstr ""
 msgid "Running in containers"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:27
+#: src/preview/PreviewDiagnostics.tsx:28
 msgid "Safe technical details"
 msgstr ""
 
@@ -6906,7 +6910,7 @@ msgstr ""
 msgid "The API authenticates each request with a bearer token in the <0>Authorization</0> header. A coarse role (admin, operator, or viewer) gates what actions a token may take, and a per-object check confines a token to the resources it owns."
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:21
+#: src/preview/PreviewDiagnostics.tsx:22
 msgid "The browser could not play the preview media."
 msgstr ""
 
@@ -7621,7 +7625,7 @@ msgstr ""
 msgid "Unknown error"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:26
+#: src/preview/PreviewDiagnostics.tsx:27
 msgid "Unknown values mean the browser did not provide evidence. Network blocking is not established."
 msgstr ""
 
@@ -7629,7 +7633,7 @@ msgstr ""
 msgid "unlimited"
 msgstr ""
 
-#: src/preview/WhepPlayer.tsx:360
+#: src/preview/WhepPlayer.tsx:353
 msgid "Unmute {label}"
 msgstr ""
 
@@ -7715,11 +7719,11 @@ msgstr ""
 msgid "Very low (~1 frame)"
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:20
+#: src/preview/PreviewDiagnostics.tsx:21
 msgid "Video progress could not be determined from browser statistics."
 msgstr ""
 
-#: src/preview/PreviewDiagnostics.tsx:18
+#: src/preview/PreviewDiagnostics.tsx:19
 msgid "Video RTP arrived, but no decoded frames were reported."
 msgstr ""
 

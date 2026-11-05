@@ -134,7 +134,8 @@ export function WhepPlayer({
     // literal across an await boundary.
     const aborted = (): boolean => abort.signal.aborted;
     let sessionUrl: string | undefined;
-    let statsTimer: number | undefined;
+    let statsPending = false;
+    let statsEpoch = 0;
     const startedAt = Date.now();
     let connectedAt: number | undefined;
     let signalingMs: number | null = null;
@@ -181,7 +182,7 @@ export function WhepPlayer({
       }
       failed = true;
       window.clearTimeout(connectTimer);
-      window.clearInterval(statsTimer);
+
       setStatusOnce('failed');
       onFatalRef.current?.({ stage, httpStatus, elapsedMs: Date.now() - startedAt,
         signalingMs, connectedMs: connectedAt === undefined ? null : Date.now() - connectedAt,
@@ -192,14 +193,18 @@ export function WhepPlayer({
       if (pc.iceConnectionState === 'failed') fail('ice-failed');
     };
     pc.addEventListener('iceconnectionstatechange', onIceChange);
-    // Capture transport evidence even before connected (notably DTLS failure).
+    // One outstanding stats request across both connection phases. A phase
+    // transition invalidates pending evidence, but never starts a second request.
     const diagnosticTimer = window.setInterval(() => {
-      if (aborted() || failed || connectedAt !== undefined) return;
+      if (aborted() || failed || statsPending) return;
+      statsPending = true;
+      const epoch = statsEpoch;
       void pc.getStats().then((report) => {
-        if (aborted() || failed) return;
+        if (aborted() || failed || epoch !== statsEpoch) return;
         media = safeStats(report);
-        if (media.dtls === 'failed') fail('dtls-failed');
-      }).catch(() => undefined);
+        if (media.dtls === 'failed') { fail('dtls-failed'); return; }
+        if (connectedAt !== undefined) checkProgress();
+      }).catch(() => undefined).finally(() => { statsPending = false; });
     }, STATS_POLL_MS);
 
     // recvonly video + audio so the offer always carries both m-lines.
@@ -219,7 +224,12 @@ export function WhepPlayer({
       if (aborted() || failed) return;
       if (pc.connectionState === 'connected') {
         window.clearTimeout(connectTimer);
-        connectedAt ??= Date.now();
+        if (connectedAt === undefined) {
+          statsEpoch += 1;
+          connectedAt = Date.now();
+          lastProgressAt = connectedAt;
+          lastDecodeAt = connectedAt;
+        }
         setStatusOnce('playing');
         const video = videoRef.current;
         if (video !== null) {
@@ -238,7 +248,7 @@ export function WhepPlayer({
             fail('media-play-error');
           }
         }
-        startStallWatchdog();
+
       } else if (pc.connectionState === 'failed') {
         fail(pc.iceConnectionState === 'failed' ? 'ice-failed' : media.dtls === 'failed' ? 'dtls-failed' : 'peer-failed');
       }
@@ -250,37 +260,21 @@ export function WhepPlayer({
     let lastFrames = 0;
     let lastDecodeAt = Date.now();
     let lastProgressAt = Date.now();
-    const startStallWatchdog = (): void => {
-      if (statsTimer !== undefined) {
-        return;
+    const checkProgress = (): void => {
+      const bytes = media.bytesReceived;
+      if (media.framesDecoded !== null && media.framesDecoded > lastFrames) {
+        lastFrames = media.framesDecoded;
+        lastDecodeAt = Date.now();
       }
-      lastProgressAt = Date.now();
-      lastDecodeAt = Date.now();
-      statsTimer = window.setInterval(() => {
-        void pc
-          .getStats()
-          .then((report) => {
-            if (aborted()) {
-              return;
-            }
-            media = safeStats(report);
-            const bytes = media.bytesReceived;
-            if (media.framesDecoded !== null && media.framesDecoded > lastFrames) {
-              lastFrames = media.framesDecoded;
-              lastDecodeAt = Date.now();
-            }
-            if (bytes !== null && bytes > lastBytes) {
-              lastBytes = bytes;
-              lastProgressAt = Date.now();
-            } else if (Date.now() - lastProgressAt > STALL_TIMEOUT_MS) {
-              fail(failureStage(media));
-            }
-            if (media.framesDecoded === 0 && Date.now() - lastDecodeAt > STALL_TIMEOUT_MS) fail(failureStage(media));
-          })
-          .catch(() => {
-            // A failed getStats is not, on its own, a stall signal.
-          });
-      }, STATS_POLL_MS);
+      if (bytes !== null && bytes > lastBytes) {
+        lastBytes = bytes;
+        lastProgressAt = Date.now();
+      } else if (Date.now() - lastProgressAt > STALL_TIMEOUT_MS) {
+        fail(failureStage(media));
+      }
+      if (media.framesDecoded !== null && Date.now() - lastDecodeAt > STALL_TIMEOUT_MS) {
+        fail(failureStage(media));
+      }
     };
 
     const negotiate = async (): Promise<void> => {
@@ -300,7 +294,8 @@ export function WhepPlayer({
       if (aborted()) return;
       onLeaseState?.('active');
       connectTimer = window.setTimeout(() => {
-        fail(media.dtls === 'failed' ? 'dtls-failed' : 'ice-timeout');
+        fail(media.dtls === 'failed' ? 'dtls-failed' :
+          pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'connection-timeout' : 'ice-timeout');
       }, 15000);
       await pc.setRemoteDescription({ type: 'answer', sdp: answer.answerSdp });
     };
@@ -324,9 +319,7 @@ export function WhepPlayer({
       pc.removeEventListener('iceconnectionstatechange', onIceChange);
       window.clearTimeout(connectTimer);
       window.removeEventListener('pagehide', onPageHide);
-      if (statsTimer !== undefined) {
-        window.clearInterval(statsTimer);
-      }
+
       // A POST may be in flight at unmount. Await its late-answer DELETE too;
       // the next focus must not race the lease held by that late answer.
       void release();

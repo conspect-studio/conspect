@@ -45,7 +45,7 @@ export function safeStats(report?: RTCStatsReport) {
   return { bytesReceived, framesDecoded, width, height, codecMime, codecProfile, dtls, candidates };
 }
 export type SafeStats = ReturnType<typeof safeStats>;
-export type FailureStage = 'http-capacity' | 'http-error' | 'signaling' | 'ice-timeout' | 'ice-failed' | 'peer-failed' | 'dtls-failed' | 'video-no-rtp' | 'video-no-decode' | 'video-stalled' | 'media-unknown' | 'media-play-error';
+export type FailureStage = 'http-capacity' | 'http-error' | 'signaling' | 'ice-timeout' | 'connection-timeout' | 'ice-failed' | 'peer-failed' | 'dtls-failed' | 'video-no-rtp' | 'video-no-decode' | 'video-stalled' | 'media-unknown' | 'media-play-error';
 export interface PreviewDiagnostics {
   stage: FailureStage;
   httpStatus: number | null;

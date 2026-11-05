@@ -11,6 +11,7 @@ export function PreviewDiagnostics({ diagnostics }: { readonly diagnostics: Diag
     'http-error': t`WHEP HTTP request failed.`,
     signaling: t`Preview negotiation failed.`,
     'ice-timeout': t`Connection timed out. The network cause is unknown.`,
+    'connection-timeout': t`Connection timed out after ICE connected. The cause is unknown.`,
     'ice-failed': t`ICE connection failed. The network cause is unknown.`,
     'peer-failed': t`Peer connection failed. The cause is unknown.`,
     'dtls-failed': t`DTLS transport failed.`,
