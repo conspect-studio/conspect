@@ -81,6 +81,8 @@ pub(crate) struct OriginPlaylist {
     pub target_duration: f64,
     /// The listed segments, in order.
     pub segments: Vec<OriginSegment>,
+    /// Bounded original manifest evidence; never inferred splice boundaries.
+    pub cue_metadata: multiview_input::hls::PlaylistCueMetadata,
 }
 
 /// Why a playlist cannot be fetched this way (the caller lets libav open the
@@ -145,6 +147,12 @@ pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsuppo
     Ok(OriginPlaylist {
         target_duration: target_duration.max(1.0),
         segments,
+        cue_metadata: multiview_input::hls::MediaPlaylist::parse_cue_metadata(text).unwrap_or_else(
+            |_| multiview_input::hls::PlaylistCueMetadata {
+                rejected: 1,
+                ..Default::default()
+            },
+        ),
     })
 }
 
@@ -1136,6 +1144,15 @@ mod tests {
     }
 
     #[test]
+    fn retains_original_cue_metadata_without_inventing_boundaries() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:41\n#EXT-X-ASSET:CAID=0x44495343\n#EXTINF:6,\na.ts\n";
+        let p = parse_media_playlist(text).expect("live playlist");
+        assert_eq!(p.cue_metadata.observations.len(), 1);
+        assert_eq!(p.segments[0].seq, 41);
+        assert_eq!(p.segments[0].uri, "a.ts");
+    }
+
+    #[test]
     fn rejects_what_it_cannot_serve() {
         assert_eq!(parse_media_playlist("nope"), Err(Unsupported::NotAPlaylist));
         assert_eq!(
@@ -1175,6 +1192,7 @@ mod tests {
     fn listing(seqs: std::ops::Range<u64>) -> OriginPlaylist {
         OriginPlaylist {
             target_duration: 6.0,
+            cue_metadata: Default::default(),
             segments: seqs
                 .map(|seq| OriginSegment {
                     seq,
