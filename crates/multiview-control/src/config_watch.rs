@@ -1716,10 +1716,16 @@ fn reseed_working_layout(state: &AppState, actor: &str, id: &str, body: &serde_j
         name: id.to_owned(),
         body: body.clone(),
     };
-    let updated = state
-        .repository
-        .update_layout(id, input.clone())
-        .or_else(|_| state.repository.create_layout(id, input));
+    // An operator's saved definition is not the working canvas. A file watch
+    // must not overwrite an existing library ID merely because its old seed
+    // happened to share the same name.
+    let updated = match state.repository.get_layout(id) {
+        Ok(_) => return,
+        Err(crate::error::ControlError::NotFound { .. }) => {
+            state.repository.create_layout(id, input)
+        }
+        Err(error) => Err(error),
+    };
     match updated {
         Ok(_) => {
             state.audit(

@@ -268,6 +268,12 @@ pub(crate) async fn create_source(
             multiview_config::MAX_ADMITTED_SOURCES
         )));
     }
+    if state.sources.get(&id).is_ok() {
+        return Err(crate::error::ControlError::Validation(format!(
+            "source {id:?} already exists"
+        )));
+    }
+    crate::boot_model::commit_resource(&state, "sources", &id, Some(input.body.clone())).await?;
     let versioned = state.sources.create(&id, input)?;
     state.audit(
         &principal.key_id,
@@ -324,6 +330,7 @@ pub(crate) async fn update_source(
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
     let previous = parse_stored_source(&current.resource.body);
+    crate::boot_model::commit_resource(&state, "sources", &id, Some(input.body.clone())).await?;
     let versioned = state.sources.update(&id, input)?;
     state.audit(
         &principal.key_id,
@@ -373,6 +380,7 @@ pub(crate) async fn delete_source(
     let _mutation = state.lock_config_mutation().await;
     let current = state.sources.get(&id)?;
     if_match.require(SOURCE_KIND, &id, current.version)?;
+    crate::boot_model::commit_resource(&state, "sources", &id, None).await?;
     state.sources.delete(&id)?;
     state.audit(
         &principal.key_id,

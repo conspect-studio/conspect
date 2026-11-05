@@ -39,6 +39,380 @@ const STATE_DIR: &str = ".multiview";
 const LOADED_FILE: &str = "loaded.toml";
 /// The persisted Running state's file name.
 const ACTIVE_FILE: &str = "active.toml";
+/// Atomic, authoritative write-ahead record of accepted operator intent.
+const DESIRED_FILE: &str = "desired.json";
+
+/// The complete accepted intent. A library edit and its selected working layout
+/// share one atomic commit with the configuration, rather than racing SQLite
+/// writes or the observational `active.toml` persister.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DesiredState {
+    /// Envelope schema version.
+    pub version: u32,
+    /// Accepted complete configuration.
+    pub config: MultiviewConfig,
+    /// Selected library entry, distinct from the working document.
+    pub selected_layout_id: String,
+    /// Accepted saved layout definitions.
+    pub layouts: Vec<crate::repository::Layout>,
+    /// The exact selected body at apply time, independent of later library edits.
+    pub selected_body: serde_json::Value,
+    /// Stable API identities for output positions in the config schema.
+    #[serde(default)]
+    pub output_ids: Vec<String>,
+}
+
+impl DesiredState {
+    /// Check the envelope and its cross-resource configuration.
+    ///
+    /// # Errors
+    /// Invalid schema versions, references, layout identities or output maps fail.
+    pub fn validate(&self) -> ControlResult<()> {
+        if self.version != 1 {
+            return Err(ControlError::Validation(format!(
+                "unsupported desired-state version {}",
+                self.version
+            )));
+        }
+        self.config
+            .validate()
+            .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
+        if self.output_ids.len() != self.config.outputs.len()
+            || self
+                .output_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != self.output_ids.len()
+        {
+            return Err(ControlError::Validation(
+                "output identity map differs from accepted outputs".into(),
+            ));
+        }
+        self.layouts
+            .iter()
+            .find(|layout| layout.id == self.selected_layout_id)
+            .ok_or_else(|| {
+                ControlError::Validation(
+                    "selected layout is absent from the desired library".into(),
+                )
+            })?;
+        let actual = serde_json::json!({
+            "canvas": self.config.canvas,
+            "layout": self.config.layout,
+            "cells": self.config.cells,
+        });
+        if self.selected_body != actual {
+            return Err(ControlError::Validation(
+                "selected layout body differs from the accepted working canvas".into(),
+            ));
+        }
+        // An authored saved definition can change after apply. The selected
+        // snapshot remains immutable until the next explicit apply command.
+        let mut ids = std::collections::HashSet::new();
+        for layout in &self.layouts {
+            if !ids.insert(&layout.id) {
+                return Err(ControlError::Validation(format!(
+                    "duplicate layout id {:?}",
+                    layout.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Load authoritative accepted intent. A corrupt existing record is an error,
+/// never permission to replace it with an older observational snapshot.
+///
+/// # Errors
+/// A malformed, unreadable or invalid accepted record fails closed.
+pub fn load_desired(boot_path: &Path) -> Result<Option<DesiredState>, String> {
+    let path = state_dir_for(boot_path).join(DESIRED_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    let desired: DesiredState =
+        serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    desired
+        .validate()
+        .map_err(|e| format!("validating {}: {e}", path.display()))?;
+    Ok(Some(desired))
+}
+
+/// Stage an entire prospective desired document before publishing any stores,
+/// versions or commands. Call with the config-mutation lock held.
+///
+/// # Errors
+/// Invalid intent or failed atomic I/O prevents publication.
+pub async fn commit_desired(
+    state: &AppState,
+    config: MultiviewConfig,
+    layouts: Vec<crate::repository::Layout>,
+) -> ControlResult<()> {
+    let Some(model) = &state.boot_model else {
+        return Ok(());
+    };
+    let selected_layout_id = model
+        .selected_layout_id()
+        .or_else(|| state.working_layout_id.clone())
+        .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
+    commit_desired_with_selection(state, config, layouts, selected_layout_id).await
+}
+
+/// Commit a complete prospective record with a new selected identity.
+///
+/// # Errors
+/// Invalid intent or failed atomic I/O prevents publication.
+pub async fn commit_desired_with_selection(
+    state: &AppState,
+    config: MultiviewConfig,
+    layouts: Vec<crate::repository::Layout>,
+    selected_layout_id: String,
+) -> ControlResult<()> {
+    let Some(model) = &state.boot_model else {
+        return Ok(());
+    };
+    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+    let output_ids = previous.as_ref().map_or_else(
+        || {
+            (0..config.outputs.len())
+                .map(|index| format!("output-{index}"))
+                .collect()
+        },
+        |prior| prior.output_ids.clone(),
+    );
+    let selected_body = if let Some(previous) = previous {
+        if previous.selected_layout_id == selected_layout_id {
+            let same_body = previous.config.canvas == config.canvas
+                && previous.config.layout == config.layout
+                && previous.config.cells == config.cells;
+            if same_body {
+                previous.selected_body
+            } else {
+                serde_json::json!({ "canvas": config.canvas, "layout": config.layout, "cells": config.cells })
+            }
+        } else {
+            serde_json::json!({ "canvas": config.canvas, "layout": config.layout, "cells": config.cells })
+        }
+    } else {
+        serde_json::json!({ "canvas": config.canvas, "layout": config.layout, "cells": config.cells })
+    };
+    let desired = DesiredState {
+        version: 1,
+        config,
+        selected_layout_id,
+        layouts,
+        selected_body,
+        output_ids,
+    };
+    write_desired(state, desired).await
+}
+
+async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult<()> {
+    let model = state
+        .boot_model
+        .as_ref()
+        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+    desired.validate()?;
+    let json = serde_json::to_string(&desired)
+        .map_err(|e| ControlError::Repository(format!("serializing desired state: {e}")))?;
+    let model = Arc::clone(model);
+    tokio::task::spawn_blocking(move || {
+        let _serial = model.lock_writes();
+        create_state_dir(&model.state_dir())?;
+        write_atomic(&model.state_dir().join(DESIRED_FILE), &json)
+    })
+    .await
+    .map_err(|e| ControlError::Repository(format!("desired-state write task failed: {e}")))?
+    .map_err(|e| ControlError::Repository(format!("desired-state atomic write failed: {e}")))
+}
+
+/// Read the accepted config, or compose the initial config on migration.
+///
+/// # Errors
+/// An invalid record or a failed store composition returns an error.
+pub fn current_desired_config(state: &AppState) -> ControlResult<serde_json::Value> {
+    if let Some(model) = &state.boot_model {
+        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+            return serde_json::to_value(desired.config).map_err(|e| {
+                ControlError::Repository(format!("serializing accepted config: {e}"))
+            });
+        }
+    }
+    crate::routes::config::compose_document_unredacted(state)
+}
+
+/// Compose a prospective config by replacing the owned section of the settled
+/// store document. The adopted runtime snapshot is deliberately not consulted.
+///
+/// # Errors
+/// An invalid record or malformed prospective document returns an error.
+pub fn prospective_config(
+    state: &AppState,
+    key: &str,
+    value: serde_json::Value,
+) -> ControlResult<MultiviewConfig> {
+    let mut document = current_desired_config(state)?;
+    document
+        .as_object_mut()
+        .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?
+        .insert(key.into(), value);
+    serde_path_to_error::deserialize(document).map_err(|e| {
+        ControlError::Validation(format!(
+            "prospective config at `{}`: {}",
+            e.path(),
+            e.inner()
+        ))
+    })
+}
+
+/// Persist a prospective resource collection before its store changes.
+///
+/// # Errors
+/// Invalid cross-references or failed atomic I/O reject the mutation.
+pub async fn commit_resource(
+    state: &AppState,
+    key: &str,
+    id: &str,
+    replacement: Option<serde_json::Value>,
+) -> ControlResult<()> {
+    if state.boot_model.is_none() {
+        return Ok(());
+    }
+    let mut document = current_desired_config(state)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?;
+    let is_create = replacement.is_some();
+    let entries = object
+        .get_mut(key)
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| ControlError::Validation(format!("{key} is not a collection")))?;
+    if key == "outputs" {
+        let model = state
+            .boot_model
+            .as_ref()
+            .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+        let prior = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+        let ids = prior.map_or_else(
+            || {
+                (0..entries.len())
+                    .map(|index| format!("output-{index}"))
+                    .collect::<Vec<_>>()
+            },
+            |desired| desired.output_ids,
+        );
+        if let Some(index) = ids.iter().position(|existing| existing == id) {
+            if let Some(body) = replacement.clone() {
+                let slot = entries.get_mut(index).ok_or_else(|| {
+                    ControlError::Validation("output identity map is inconsistent".into())
+                })?;
+                *slot = body;
+            } else {
+                entries.remove(index);
+            }
+        } else if let Some(body) = replacement.clone() {
+            entries.push(body);
+        } else {
+            return Err(ControlError::NotFound {
+                kind: "output",
+                id: id.into(),
+            });
+        }
+    } else {
+        entries.retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(id));
+        if let Some(body) = replacement {
+            entries.push(body);
+        }
+    }
+    let config: MultiviewConfig = serde_path_to_error::deserialize(document).map_err(|e| {
+        ControlError::Validation(format!(
+            "prospective configuration at `{}`: {}",
+            e.path(),
+            e.inner()
+        ))
+    })?;
+    let layouts = layout_library(state)?;
+    let model = state
+        .boot_model
+        .as_ref()
+        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+    let mut output_ids = previous.map_or_else(
+        || {
+            (0..state.outputs.list().map_or(0, |items| items.len()))
+                .map(|index| format!("output-{index}"))
+                .collect::<Vec<_>>()
+        },
+        |desired| desired.output_ids,
+    );
+    if key == "outputs" {
+        if !output_ids.iter().any(|existing| existing == id) {
+            if is_create {
+                output_ids.push(id.to_owned());
+            }
+        } else if !is_create {
+            output_ids.retain(|existing| existing != id);
+        }
+    }
+    commit_desired_with_output_ids(state, config, layouts, output_ids).await
+}
+
+/// Commit a prospective output identity map alongside the full config.
+async fn commit_desired_with_output_ids(
+    state: &AppState,
+    config: MultiviewConfig,
+    layouts: Vec<crate::repository::Layout>,
+    output_ids: Vec<String>,
+) -> ControlResult<()> {
+    let model = state
+        .boot_model
+        .as_ref()
+        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+    let selected_layout_id = model
+        .selected_layout_id()
+        .or_else(|| state.working_layout_id.clone())
+        .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
+    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+    let selected_body = previous.as_ref().filter(|prior| prior.config.canvas == config.canvas
+        && prior.config.layout == config.layout && prior.config.cells == config.cells)
+        .map_or_else(|| serde_json::json!({"canvas":config.canvas,"layout":config.layout,"cells":config.cells}),
+            |prior| prior.selected_body.clone());
+    write_desired(
+        state,
+        DesiredState {
+            version: 1,
+            config,
+            selected_layout_id,
+            layouts,
+            selected_body,
+            output_ids,
+        },
+    )
+    .await
+}
+
+/// Read all saved layout definitions, including their identities. SQLite is a
+/// projection of the authoritative record once the first commit has landed.
+///
+/// # Errors
+/// A corrupt desired record or failed repository read returns an error.
+pub fn layout_library(state: &AppState) -> ControlResult<Vec<crate::repository::Layout>> {
+    if let Some(model) = &state.boot_model {
+        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+            return Ok(desired.layouts);
+        }
+    }
+    Ok(state
+        .repository
+        .list_layouts()?
+        .into_iter()
+        .map(|entry| entry.layout)
+        .collect())
+}
 
 /// The run's Boot/Loaded/Running model (ADR-W024): the boot path, the
 /// immutable Loaded snapshot, the cold-start policy, and whether this run
@@ -85,6 +459,7 @@ pub struct BootModel {
     /// [`crate::AppState::lock_config_mutation`], so the inner mutex is plain
     /// interior mutability (the async lock provides the ordering, not this).
     last_adopted: std::sync::Mutex<MultiviewConfig>,
+    selected_layout: std::sync::Mutex<Option<String>>,
 }
 
 impl BootModel {
@@ -114,6 +489,7 @@ impl BootModel {
             write_serial: std::sync::Mutex::new(0),
             write_tickets: AtomicU64::new(0),
             last_adopted: std::sync::Mutex::new(running),
+            selected_layout: std::sync::Mutex::new(None),
         }
     }
 
@@ -246,6 +622,34 @@ impl BootModel {
     /// `PUT /layouts/{id}` + a shed apply); this is called ONLY when the
     /// `ApplyLayout` lands, so the snapshot's canvas/layout/cells stay at the
     /// adopted layout. Call ONLY while holding the config-mutation lock.
+    /// The selected saved layout identity, distinct from the working canvas.
+    pub fn selected_layout_id(&self) -> Option<String> {
+        self.selected_layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set the selected identity after a successful desired commit.
+    pub fn select_layout(&self, id: String) {
+        *self
+            .selected_layout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+    }
+
+    /// Restore selected identity from the authoritative on-disk record.
+    ///
+    /// # Errors
+    /// A corrupt or unreadable desired record prevents startup selection.
+    pub fn restore_desired_layout_id(&self) -> Result<(), String> {
+        if let Some(desired) = load_desired(&self.boot_path)? {
+            self.select_layout(desired.selected_layout_id);
+        }
+        Ok(())
+    }
+
+    /// Observe a landed layout command without replacing accepted intent.
     pub fn adopt_layout(
         &self,
         canvas: multiview_config::Canvas,

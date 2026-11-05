@@ -30,7 +30,7 @@ use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use multiview_config::{ConfigDiff, MultiviewConfig, StartMode};
 use multiview_control::boot_model::{
-    finish_running_persist, load_resume_config, persist_loaded, persist_running_now,
+    finish_running_persist, load_desired, load_resume_config, persist_loaded, persist_running_now,
     spawn_running_persist, write_active_serialized, write_atomic, BootModel,
 };
 use multiview_control::config_watch::{
@@ -211,6 +211,104 @@ async fn recolor_in_a(r: &Rig, color: &str) {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK, "the live edit must land");
+}
+
+/// A refused atomic write preserves the old source version and the live bus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_desired_write_does_not_publish_source_or_command() {
+    let mut r = rig(BOOT_DOC);
+    let state_dir = r.boot_path.parent().expect("parent").join(".multiview");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::create_dir(state_dir.join("desired.json"))
+        .expect("block atomic rename with directory");
+    let before = send(&r.router, get("/api/v1/sources/in_a", OPERATOR_TOKEN)).await;
+    let etag = support::etag(&before).expect("ETag");
+    let response = send(
+        &r.router,
+        put_json(
+            "/api/v1/sources/in_a",
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &serde_json::json!({ "name": "in_a", "body": {
+            "id": "in_a", "kind": "solid", "color": "#919191" } }),
+        ),
+    )
+    .await;
+    assert!(
+        response.status().is_server_error(),
+        "a failed disk write is not acknowledged"
+    );
+    let after = send(&r.router, get("/api/v1/sources/in_a", OPERATOR_TOKEN)).await;
+    assert_eq!(support::etag(&after).as_deref(), Some(etag.as_str()));
+    assert_eq!(stored_color(&r.state).as_deref(), Some("#101418"));
+    assert!(
+        r.commands.try_drain().is_empty(),
+        "no live source command on write failure"
+    );
+}
+
+/// A prospective output cannot select an audio track absent from routing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_track_cross_reference_fails_before_etag_or_desired_commit() {
+    let r = rig(BOOT_DOC);
+    let prior = send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await;
+    let etag = support::etag(&prior).expect("ETag");
+    let mut original = body_json(prior).await;
+    original["body"]["audio"] = serde_json::json!({ "mode": "tracks", "tracks": ["ghost"] });
+    let response = send(
+        &r.router,
+        put_json(
+            "/api/v1/outputs/output-0",
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &serde_json::json!({ "name": "hls", "body": original["body"] }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let after = send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await;
+    assert_eq!(support::etag(&after).as_deref(), Some(etag.as_str()));
+    assert!(load_desired(&r.boot_path)
+        .expect("desired lookup")
+        .is_none());
+}
+
+/// A saved layout edit without apply keeps the selected snapshot unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_layout_edit_without_apply_retains_selected_body() {
+    let r = rig(BOOT_DOC);
+    recolor_in_a(&r, "#909090").await;
+    let selected = r.state.working_layout_id.clone().expect("working layout");
+    let path = format!("/api/v1/layouts/{selected}");
+    let response = send(&r.router, get(&path, OPERATOR_TOKEN)).await;
+    let etag = support::etag(&response).expect("ETag");
+    let old = load_desired(&r.boot_path)
+        .expect("load")
+        .expect("committed");
+    let mut edited = old
+        .layouts
+        .iter()
+        .find(|layout| layout.id == selected)
+        .expect("saved layout")
+        .body
+        .clone();
+    edited["cells"][0]["source"]["input_id"] = serde_json::json!("in_b");
+    let response = send(
+        &r.router,
+        put_json(
+            &path,
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &serde_json::json!({ "name": selected, "body": edited }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored = load_desired(&r.boot_path)
+        .expect("load")
+        .expect("committed");
+    assert_eq!(restored.selected_body, old.selected_body);
+    assert_ne!(restored.layouts[0].body, restored.selected_body);
 }
 
 /// The stored colour of `in_a` in the sources store.
@@ -931,7 +1029,7 @@ async fn the_running_persister_writes_active_toml_on_audited_changes() {
         .expect("read state dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "active.toml" && n != "loaded.toml")
+        .filter(|n| n != "active.toml" && n != "loaded.toml" && n != "desired.json")
         .collect();
     assert!(
         residue.is_empty(),
@@ -1004,7 +1102,7 @@ async fn finish_running_persist_captures_changes_younger_than_the_debounce() {
         .expect("read state dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "active.toml" && n != "loaded.toml")
+        .filter(|n| n != "active.toml" && n != "loaded.toml" && n != "desired.json")
         .collect();
     assert!(
         residue.is_empty(),
@@ -2075,8 +2173,14 @@ async fn shed_delete_then_unrelated_landed_mutation_keeps_the_running_source() {
     let resp = send(&r.router, req).await;
     assert_eq!(
         resp.status(),
-        StatusCode::NO_CONTENT,
-        "the delete succeeds (store)"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a referenced source cannot be removed from the accepted configuration"
+    );
+    assert!(
+        load_desired(&r.boot_path)
+            .expect("desired lookup")
+            .is_none(),
+        "a rejected cross-reference cannot commit desired state"
     );
 
     // Drain the bus so the next, UNRELATED mutation lands live.

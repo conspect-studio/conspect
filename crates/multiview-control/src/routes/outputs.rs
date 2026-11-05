@@ -132,6 +132,13 @@ pub(crate) async fn create_output(
         name: input.name,
         body: validated_body(TypedCollection::Outputs, &id, &input.body)?,
     };
+    let _mutation = state.lock_config_mutation().await;
+    if state.outputs.get(&id).is_ok() {
+        return Err(crate::error::ControlError::Validation(format!(
+            "output {id:?} already exists"
+        )));
+    }
+    crate::boot_model::commit_resource(&state, "outputs", &id, Some(input.body.clone())).await?;
     let versioned = state.outputs.create(&id, input)?;
     state.audit(
         &principal.key_id,
@@ -176,12 +183,14 @@ pub(crate) async fn update_output(
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.outputs.get(&id)?;
     if_match.require(OUTPUT_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
         body: validated_body(TypedCollection::Outputs, &id, &input.body)?,
     };
+    crate::boot_model::commit_resource(&state, "outputs", &id, Some(input.body.clone())).await?;
     let versioned = state.outputs.update(&id, input)?;
     state.audit(
         &principal.key_id,
@@ -221,8 +230,10 @@ pub(crate) async fn delete_output(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
+    let _mutation = state.lock_config_mutation().await;
     let current = state.outputs.get(&id)?;
     if_match.require(OUTPUT_KIND, &id, current.version)?;
+    crate::boot_model::commit_resource(&state, "outputs", &id, None).await?;
     state.outputs.delete(&id)?;
     state.audit(
         &principal.key_id,

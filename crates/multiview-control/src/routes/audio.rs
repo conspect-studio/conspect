@@ -183,6 +183,19 @@ pub(crate) async fn put_audio_routing(
     let current = state.audio_routing.version();
     if_match.require(AUDIO_ROUTING_KIND, AUDIO_ROUTING_ID, current)?;
     let routing = validated_routing(&body)?;
+    // Validate the entire prospective configuration and persist intent before
+    // the store ETag or the live program-bus command can change.
+    if state.boot_model.is_some() {
+        let value = serde_json::to_value(&routing)
+            .map_err(|e| ControlError::Repository(format!("audio serialization: {e}")))?;
+        let prospective = crate::boot_model::prospective_config(&state, "audio", value)?;
+        crate::boot_model::commit_desired(
+            &state,
+            prospective,
+            crate::boot_model::layout_library(&state)?,
+        )
+        .await?;
+    }
     // The compare-and-swap re-checks the version under the store lock, so two
     // racing PUTs that both passed the read above cannot both win.
     let version = state

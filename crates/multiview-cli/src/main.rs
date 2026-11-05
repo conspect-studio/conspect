@@ -197,7 +197,8 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // persisted `active.toml` (with the boot file's restart-only sections
     // spliced in), falling back to boot with a surfaced reason. Loaded stays
     // the boot snapshot in both modes (the revert-to-start target).
-    let start = multiview_cli::boot::resolve_start_config(boot, boot_text, &args.config);
+    let start = multiview_cli::boot::resolve_start_config(boot, boot_text, &args.config)
+        .map_err(anyhow::Error::msg)?;
 
     // A configured `[timing].ptp_phc` in a build without the `ptp` feature is
     // a capability this binary cannot provide: fail the run at startup with a
