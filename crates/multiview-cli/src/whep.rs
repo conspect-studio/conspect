@@ -97,18 +97,24 @@ impl PreviewVideoEncoder {
     /// floor to an even value (NV12 chroma) with a floor of 2.
     fn target_dims(image: &Nv12Image) -> (u32, u32) {
         let (w, h) = (image.width().max(2), image.height().max(2));
-        let longest = w.max(h);
-        if longest <= PREVIEW_LONGEST_EDGE {
-            return (w & !1, h & !1);
+        Self::bounded_dims(w, h)
+    }
+
+    fn bounded_dims(w: u32, h: u32) -> (u32, u32) {
+        let longest = w.max(h).max(2);
+        let mut cap = longest.min(PREVIEW_LONGEST_EDGE) & !1;
+        loop {
+            let scale = |value: u32| {
+                let scaled = u64::from(value).saturating_mul(u64::from(cap)) / u64::from(longest);
+                u32::try_from(scaled).unwrap_or(2).max(2) & !1
+            };
+            let (width, height) = (scale(w), scale(h));
+            // H.264 level 3.1 MaxFS=3600 macroblocks, including padded edges.
+            if width.div_ceil(16) * height.div_ceil(16) <= 3600 || cap <= 2 {
+                return (width, height);
+            }
+            cap -= 2;
         }
-        let cap = u64::from(PREVIEW_LONGEST_EDGE);
-        let long64 = u64::from(longest).max(1);
-        let scale = |v: u32| -> u32 {
-            let scaled = u64::from(v).saturating_mul(cap) / long64;
-            let clamped = u32::try_from(scaled).unwrap_or(PREVIEW_LONGEST_EDGE);
-            (clamped.max(2)) & !1
-        };
-        (scale(w), scale(h))
     }
 
     /// Encode one NV12 frame into an [`EncodedSample`] (or `None` if the encoder
@@ -969,6 +975,32 @@ mod tests {
     use multiview_webrtc::whep_egress::WhepEgress;
 
     use super::pump_turn_relays;
+
+    #[test]
+    fn preview_shapes_fit_negotiated_level_31() {
+        for (width, height) in [
+            (1920, 1080),
+            (1080, 1920),
+            (1280, 1280),
+            (4096, 1024),
+            (3, 5),
+            (1, 1),
+        ] {
+            let (w, h) = super::PreviewVideoEncoder::bounded_dims(width, height);
+            assert!(w >= 2 && h >= 2 && w % 2 == 0 && h % 2 == 0);
+            let macroblocks = w.div_ceil(16) * h.div_ceil(16);
+            assert!(macroblocks <= 3600);
+            assert!(macroblocks * super::PREVIEW_FPS <= 108_000);
+        }
+        assert_eq!(
+            super::PreviewVideoEncoder::bounded_dims(1920, 1080),
+            (1280, 720)
+        );
+        assert_eq!(
+            super::PreviewVideoEncoder::bounded_dims(1080, 1920),
+            (720, 1280)
+        );
+    }
 
     #[test]
     fn live_preview_without_candidates_is_unavailable_and_refuses_session() {
