@@ -48,6 +48,10 @@ Full requested automation remains unfinished: no armed production executor, atom
 9. Add reliable-boundary rules and bars/bars+tone with deterministic AudioStore tone, channel mask and monitoring/program isolation.
 10. Run targeted integration/security/chaos/soak tests, independent implementation review, CI and release integration. Coordinate actual server activation with release lead and prove live UI/event/automation behaviour before completion.
 
+## Release isolation requirement
+
+Release coordinator requires this feature to remain isolated and explicitly disabled by default until safety review and final output interfaces settle. Current runtime checkpoint starts observation automatically; add a persisted explicit enable policy before proposing integration or deployment. Production automation must remain disarmed independently of observation enablement. No live provider wiring or server changes are authorized through this feature branch alone; coordinate the completed release with the existing deployment owner.
+
 ## Coordination constraints
 
 Release lead session owns server deployment. Source-preview work remains separate and must not be overwritten. Existing timer geometry files belong to another release worker. Engine-efficiency session owns HLS fetch capacity/admission/deadline changes; agree exact metadata hook hunks before editing hls_fetch.rs. Do not copy whole files between branches. OpenAI-only constraint prevents cross-vendor review; record limitation rather than claiming that gate passed.
