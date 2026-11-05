@@ -297,6 +297,20 @@ fn incompatible_h264_profile_is_not_accepted_as_working_video() {
 }
 
 #[test]
+fn rejected_or_unlisted_video_payload_is_refused() {
+    for offer in [
+        VIDEO_OFFER.replace("m=video 9", "m=video 0"),
+        VIDEO_OFFER.replace("SAVPF 96 97", "SAVPF 97"),
+    ] {
+        let media = FakeMediaSource::video_only(PreviewCodec::H264, 4);
+        let egress = WhepEgress::with_host_candidate("[::1]:8189".parse().unwrap());
+        assert!(egress
+            .accept_session(&offer, PreviewCodec::H264, &media)
+            .is_err());
+    }
+}
+
+#[test]
 fn all_concrete_host_candidates_reach_the_answer() {
     let hosts = vec![
         "[2001:db8::1]:8189".parse().unwrap(),

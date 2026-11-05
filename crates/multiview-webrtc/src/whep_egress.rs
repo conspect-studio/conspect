@@ -655,17 +655,27 @@ impl WhepTransport for WhepEgress {
 fn offer_advertises_video(offer: &str, codec: PreviewCodec) -> bool {
     let want = codec.rtpmap_name();
     let mut in_video = false;
+    let mut payloads: Vec<&str> = Vec::new();
     for raw in offer.lines() {
         let line = raw.trim();
         if let Some(rest) = line.strip_prefix("m=") {
-            in_video = rest.starts_with("video");
+            let mut fields = rest.split_whitespace();
+            in_video =
+                fields.next() == Some("video") && fields.next().is_some_and(|port| port != "0");
+            let _ = fields.next(); // transport profile
+            payloads = fields.collect();
             continue;
         }
         if !in_video {
             continue;
         }
         if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
-            if let Some(mapping) = rtpmap.split_whitespace().nth(1) {
+            let mut fields = rtpmap.split_whitespace();
+            let payload = fields.next().unwrap_or("");
+            if !payloads.contains(&payload) {
+                continue;
+            }
+            if let Some(mapping) = fields.next() {
                 if let Some(name) = mapping.split('/').next() {
                     if name.eq_ignore_ascii_case(want) {
                         return true;
