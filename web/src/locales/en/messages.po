@@ -4022,8 +4022,12 @@ msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
 #: src/preview/PreviewSurface.tsx:154
-msgid "Live input preview is unavailable. The preview session is busy or failed."
-msgstr "Live input preview is unavailable. The preview session is busy or failed."
+msgid "Live input preview failed."
+msgstr "Live input preview failed."
+
+#: src/preview/PreviewSurface.tsx:154
+msgid "Live input preview is busy. Another viewer has the session."
+msgstr "Live input preview is busy. Another viewer has the session."
 
 #: src/preview/PreviewSurface.tsx:146
 msgid "Live input video is unavailable on this server."

@@ -151,7 +151,7 @@ export function PreviewSurface({
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
     if (scope === 'input') {
-      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable"><Trans>Live input preview is unavailable. The preview session is busy or failed.</Trans>{released ? <Button type="button" onClick={(): void => { setBusy(false); setDegraded(false); setAttempt((n) => n + 1); }}>Retry live preview</Button> : null}</div>;
+      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={(): void => { setBusy(false); setDegraded(false); setAttempt((n) => n + 1); }}>Retry live preview</Button> : null}</div>;
     }
     return (
       <><JpegRung
