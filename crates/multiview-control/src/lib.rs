@@ -52,6 +52,7 @@ pub mod config_watch;
 pub mod cors;
 pub mod devices;
 pub mod error;
+pub mod event_automation;
 pub mod is07;
 pub mod jwt;
 /// Management-plane rate limiting (SEC-14): the keyed token-bucket + the
