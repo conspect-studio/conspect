@@ -210,11 +210,8 @@ pub(crate) async fn put_audio_routing(
         }
         tracing::warn!("accepted audio committed; store projection failed");
     }
-    let (_, version) = crate::boot_model::accepted_audio(&state).map_err(|error| {
-        ControlError::CommitIndeterminate(format!(
-            "accepted audio cannot be read after commit: {error}"
-        ))
-    })?;
+    // The committed candidate is already validated. Never let a fallible
+    // read of the projection or envelope suppress publication to the live bus.
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -228,6 +225,13 @@ pub(crate) async fn put_audio_routing(
         Some(capability) if capability.apply(&routing) => ApplyMode::Live,
         _ => ApplyMode::Restart,
     };
+    // A read failure after this point is explicitly indeterminate, not a
+    // successful live response for an event that never reached the bus.
+    let (_, version) = crate::boot_model::accepted_audio(&state).map_err(|error| {
+        ControlError::CommitIndeterminate(format!(
+            "committed audio was published, but its version cannot be reread; GET before retrying: {error}"
+        ))
+    })?;
     Ok(with_apply(
         mode,
         state_response(StatusCode::OK, Some(routing), version),

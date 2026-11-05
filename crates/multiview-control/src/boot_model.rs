@@ -185,20 +185,10 @@ pub async fn commit_desired_with_selection(
     layouts: Vec<crate::repository::Layout>,
     selected_layout_id: String,
 ) -> ControlResult<()> {
-    let Some(model) = &state.boot_model else {
+    if state.boot_model.is_none() {
         return Ok(());
-    };
-    let output_ids = load_desired(model.boot_path())
-        .map_err(ControlError::Repository)?
-        .as_ref()
-        .map_or_else(
-            || {
-                (0..config.outputs.len())
-                    .map(|index| format!("output-{index}"))
-                    .collect()
-            },
-            |prior| prior.output_ids.clone(),
-        );
+    }
+    let output_ids = output_ids_for_config(state, &config)?;
     commit_desired_document(state, config, layouts, selected_layout_id, output_ids).await
 }
 
@@ -642,11 +632,12 @@ pub fn accepted_audio(
     Ok(state.audio_routing.snapshot())
 }
 
-/// Map prospective outputs to accepted stable identities, matching unchanged
-/// bodies first so reorder and deletion cannot reassign existing identities.
+/// Preserve output API identities using authored output ids, never body equality.
+/// Legacy id-less slots retain their position only while their identity is
+/// unambiguous; a file edit that moves or replaces one must supply an id.
 ///
 /// # Errors
-/// A corrupt desired record fails closed.
+/// An ambiguous id-less edit fails before committing or changing live state.
 pub fn output_ids_for_config(
     state: &AppState,
     config: &MultiviewConfig,
@@ -663,52 +654,64 @@ pub fn output_ids_for_config(
             .map(|index| format!("output-{index}"))
             .collect());
     };
-    let mut used = vec![false; prior.output_ids.len()];
-    let mut result = vec![None; config.outputs.len()];
-    // Reserve every exact match before assigning any edited/new position.
-    for (output, identity) in config.outputs.iter().zip(result.iter_mut()) {
-        if let Some((candidate, _)) = prior
-            .config
-            .outputs
-            .iter()
-            .enumerate()
-            .find(|(candidate, old)| used.get(*candidate) == Some(&false) && *old == output)
+    // Equal id-less bodies have no distinguishing field in the watched file.
+    // Even a position-preserving equality match cannot tell them apart after
+    // an external reorder, so reject before any identity can be reassigned.
+    for (slot, output) in config.outputs.iter().enumerate() {
+        if output.explicit_id().is_none()
+            && config
+                .outputs
+                .iter()
+                .take(slot)
+                .any(|other| other == output)
         {
-            if let (Some(marker), Some(id)) =
-                (used.get_mut(candidate), prior.output_ids.get(candidate))
+            return Err(ControlError::Validation(format!(
+                "output slot {slot} duplicates an id-less output; add distinct stable output ids before a file edit"
+            )));
+        }
+    }
+    let mut result = Vec::with_capacity(config.outputs.len());
+    let mut used = std::collections::HashSet::new();
+    for (slot, output) in config.outputs.iter().enumerate() {
+        let identity = if let Some(authored) = output.explicit_id() {
+            if let Some(old_slot) = prior
+                .config
+                .outputs
+                .iter()
+                .position(|old| old.explicit_id() == Some(authored))
             {
-                *marker = true;
-                *identity = Some(id.clone());
+                prior.output_ids.get(old_slot).cloned().ok_or_else(|| {
+                    ControlError::Validation("accepted output identity map is inconsistent".into())
+                })?
+            } else {
+                // A file can annotate a previously id-less REST slot with its
+                // accepted identity before editing it; the identity is explicit.
+                authored.to_owned()
             }
-        }
-    }
-    let mut allocated = result
-        .iter()
-        .flatten()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    for (slot, identity) in result.iter_mut().enumerate() {
-        if identity.is_some() {
-            continue;
-        }
-        if let (Some(false), Some(id)) = (used.get(slot), prior.output_ids.get(slot)) {
-            *identity = Some(id.clone());
-            if let Some(marker) = used.get_mut(slot) {
-                *marker = true;
-            }
+        } else if (prior.config.outputs.len() == 1 && config.outputs.len() == 1)
+            || (prior.config.outputs.get(slot) == Some(output)
+                && prior
+                    .config
+                    .outputs
+                    .get(slot)
+                    .is_some_and(|old| old.explicit_id().is_none()))
+        {
+            prior.output_ids.get(slot).cloned().ok_or_else(|| {
+                ControlError::Validation("accepted output identity map is inconsistent".into())
+            })?
         } else {
-            let mut suffix = 0;
-            loop {
-                let id = format!("output-{suffix}");
-                suffix += 1;
-                if !prior.output_ids.contains(&id) && allocated.insert(id.clone()) {
-                    *identity = Some(id);
-                    break;
-                }
-            }
+            return Err(ControlError::Validation(format!(
+                "output slot {slot} has no authored id; its identity is ambiguous after a file edit. Add a stable output id before changing or reordering it"
+            )));
+        };
+        if !used.insert(identity.clone()) {
+            return Err(ControlError::Validation(format!(
+                "duplicate accepted output identity {identity:?}"
+            )));
         }
+        result.push(identity);
     }
-    Ok(result.into_iter().flatten().collect())
+    Ok(result)
 }
 
 /// Read all saved layout definitions, including their identities. SQLite is a

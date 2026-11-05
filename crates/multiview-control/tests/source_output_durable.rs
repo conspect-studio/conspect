@@ -6,15 +6,16 @@ mod support;
 use axum::http::StatusCode;
 use multiview_config::{MultiviewConfig, StartMode};
 use multiview_control::{
-    boot_model::{load_desired, BootModel},
-    command_bus, AppState, ControlError, ControlResult, EngineStateSnapshot, InMemoryRepository,
-    ResourceInput, ResourceRepository, VersionedResource,
+    AppState, ControlError, ControlResult, EngineStateSnapshot, InMemoryRepository, ResourceInput,
+    ResourceRepository, VersionedResource,
+    boot_model::{BootModel, load_desired},
+    command_bus,
 };
 use multiview_engine::EnginePublisher;
 use multiview_events::Event;
 use serde_json::json;
 use std::sync::Arc;
-use support::{body_json, etag, get, put_json, send, ADMIN_TOKEN};
+use support::{ADMIN_TOKEN, body_json, etag, get, put_json, send};
 
 const BOOT: &str = r##"schema_version = 1
 [canvas]
@@ -163,4 +164,86 @@ async fn accepted_sources_and_outputs_survive_failed_projection_with_stable_etag
     assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
     let listed = body_json(send(&router, get("/api/v1/outputs", ADMIN_TOKEN)).await).await;
     assert_eq!(listed[0]["name"], "Accepted output");
+}
+
+#[tokio::test]
+async fn authored_output_ids_preserve_rest_identity_and_ambiguous_file_edits_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    std::fs::write(&path, BOOT).unwrap();
+    let config = MultiviewConfig::load_from_toml(BOOT).unwrap();
+    let seeded = multiview_control::seed_resources(&config).unwrap();
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+    let (sender, _receiver) = command_bus(64);
+    let state = AppState::new(
+        publisher,
+        sender,
+        Arc::new(InMemoryRepository::new()),
+        Arc::new(support::seeded_keys()),
+    )
+    .with_seeded_resources(seeded)
+    .with_base_document(serde_json::to_value(&config).unwrap())
+    .with_boot_model(Arc::new(BootModel::new(
+        path.clone(),
+        config.clone(),
+        config,
+        StartMode::Boot,
+        false,
+        None,
+    )));
+    let layouts = multiview_control::boot_model::layout_library(&state).unwrap();
+    let initial: MultiviewConfig = serde_json::from_value(
+        multiview_control::boot_model::current_desired_config(&state).unwrap(),
+    )
+    .unwrap();
+    multiview_control::boot_model::commit_desired(&state, initial.clone(), layouts)
+        .await
+        .unwrap();
+    let mut edited = initial.clone();
+    let mut value = serde_json::to_value(&edited).unwrap();
+    value["outputs"][0]["path"] = json!("/tmp/edited.m3u8");
+    edited = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        multiview_control::boot_model::output_ids_for_config(&state, &edited).unwrap(),
+        ["output-0"]
+    );
+    // One id-less slot is unambiguous; an inserted id-less duplicate is not.
+    let mut ambiguous = serde_json::to_value(&initial).unwrap();
+    let duplicate = ambiguous["outputs"][0].clone();
+    ambiguous["outputs"].as_array_mut().unwrap().push(duplicate);
+    let ambiguous: MultiviewConfig = serde_json::from_value(ambiguous).unwrap();
+    let err = multiview_control::boot_model::output_ids_for_config(&state, &ambiguous).unwrap_err();
+    assert!(err.to_string().contains("slot 1"));
+    assert!(err.to_string().contains("duplicates an id-less output"));
+    assert_eq!(
+        load_desired(&path).unwrap().unwrap().output_ids,
+        ["output-0"]
+    );
+
+    value["outputs"][0]["id"] = json!("operator-output");
+    let authored: MultiviewConfig = serde_json::from_value(value).unwrap();
+    // The authored id supplies identity even when every other field changes.
+    let ids = multiview_control::boot_model::output_ids_for_config(&state, &authored).unwrap();
+    assert_eq!(ids, ["operator-output"]);
+    multiview_control::boot_model::commit_desired_document(
+        &state,
+        authored.clone(),
+        multiview_control::boot_model::layout_library(&state).unwrap(),
+        load_desired(&path).unwrap().unwrap().selected_layout_id,
+        ids,
+    )
+    .await
+    .unwrap();
+    let mut reordered = serde_json::to_value(&authored).unwrap();
+    let mut second = reordered["outputs"][0].clone();
+    second["id"] = json!("new-output");
+    reordered["outputs"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, second);
+    let reorder: MultiviewConfig = serde_json::from_value(reordered).unwrap();
+    assert_eq!(
+        multiview_control::boot_model::output_ids_for_config(&state, &reorder).unwrap(),
+        ["new-output", "operator-output"]
+    );
 }
