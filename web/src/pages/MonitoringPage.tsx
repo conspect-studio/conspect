@@ -122,35 +122,28 @@ export function MonitoringPage(): JSX.Element {
   // One WHEP focus is admitted server-wide. Release the automatic program
   // focus before a user-requested input focus negotiates its session.
   const [focusedInput, setFocusedInput] = useState<string | undefined>();
-  const desiredInput = useRef<string | undefined>(undefined);
   const [activeInput, setActiveInput] = useState<string | undefined>();
-  const [inputReleasing, setInputReleasing] = useState(false);
-  const [programReleasing, setProgramReleasing] = useState(false);
+  const [programLease, setProgramLease] = useState<'negotiating' | 'active' | 'released'>('released');
+  const [inputLease, setInputLease] = useState<'negotiating' | 'active' | 'released'>('released');
+  const desiredInput = useRef<string | undefined>(undefined);
   const hlsPath = playbackPaths.get(hlsOutput);
-  const programWhep = hlsPath === undefined && whepAvailable(capabilities.data, 'program');
   const inputWhep = whepAvailable(capabilities.data, 'input');
-  const paused = focusedInput !== undefined || activeInput !== undefined || programReleasing || inputReleasing;
+  const paused = focusedInput !== undefined || activeInput !== undefined;
+  // The mounted player (not the capability advertisement) owns the lease.
+  // Its release callback fires only after any in-flight POST and DELETE settle.
+  const readyInput = focusedInput !== undefined && activeInput === focusedInput
+    ? focusedInput
+    : focusedInput !== undefined && activeInput === undefined && programLease === 'released' && inputLease === 'released'
+      ? focusedInput : undefined;
   const changeFocus = (id: string, open: boolean): void => {
     const next = open ? id : undefined;
     desiredInput.current = next;
     setFocusedInput(next);
-    if (activeInput !== undefined && next !== activeInput) {
-      if (inputWhep) {
-        setInputReleasing(true);
-      } else {
-        setActiveInput(next);
-      }
-      return;
+    if (!inputWhep) {
+      setActiveInput(next);
+    } else if (activeInput !== undefined && next !== activeInput && inputLease === 'released') {
+      setActiveInput(undefined);
     }
-    if (inputReleasing || programReleasing) return;
-    if (next !== undefined && activeInput === undefined) {
-      if (programWhep) {
-        setProgramReleasing(true);
-      } else {
-        setActiveInput(next);
-      }
-    }
-    if (next === undefined && !inputWhep) setActiveInput(undefined);
   };
 
   // The served WebRTC (WHEP) outputs — previewable via their OUTPUT scope tap.
@@ -185,10 +178,8 @@ export function MonitoringPage(): JSX.Element {
             capabilities={capabilities.data}
             audio
             className="aspect-video w-full bg-black object-contain"
-            onSessionReleased={(): void => {
-              setProgramReleasing(false);
-              setActiveInput(desiredInput.current);
-            }}
+            onLeaseState={setProgramLease}
+            onSessionReleased={(): void => { setProgramLease('released'); setActiveInput(desiredInput.current); }}
           />}
           <CardContent className="space-y-2 py-3">
             <p className="text-sm text-muted-foreground"><Trans>This is the current engine program. Saved and unsaved layouts do not have separate live outputs.</Trans></p>
@@ -226,9 +217,10 @@ export function MonitoringPage(): JSX.Element {
                 tile={tiles.get(id)}
                 capabilities={capabilities.data}
                 open={focusedInput === id}
-                focusReady={activeInput === id && !inputReleasing}
+                focusReady={readyInput === id}
+                onLeaseState={setInputLease}
                 onSessionReleased={(): void => {
-                  setInputReleasing(false);
+                  setInputLease('released');
                   setActiveInput(desiredInput.current);
                 }}
                 onOpenChange={(open): void => { changeFocus(id, open); }}
@@ -272,6 +264,7 @@ function InputThumbnail(props: {
   readonly open: boolean;
   readonly focusReady: boolean;
   readonly onSessionReleased: () => void;
+  readonly onLeaseState: (state: 'negotiating' | 'active' | 'released') => void;
   readonly onOpenChange: (open: boolean) => void;
 }): JSX.Element {
   const { t } = useLingui();
@@ -321,6 +314,7 @@ function InputThumbnail(props: {
               label={t`Live preview of input ${props.id}`}
               capabilities={props.capabilities}
               onSessionReleased={props.onSessionReleased}
+              onLeaseState={props.onLeaseState}
               className="aspect-video w-full bg-black object-contain"
             />
           ) : null}

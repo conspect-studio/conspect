@@ -498,7 +498,7 @@ msgstr "About the encode-once output model"
 msgid "About the tile lifecycle"
 msgstr "About the tile lifecycle"
 
-#: src/pages/MonitoringPage.tsx:212
+#: src/pages/MonitoringPage.tsx:203
 #: src/pages/SourcesPage.tsx:857
 msgid "About tile lifecycle states"
 msgstr "About tile lifecycle states"
@@ -3495,7 +3495,7 @@ msgstr "HLS link unavailable: output IDs resolve to colliding mounts; the runtim
 msgid "HLS output — delayed by the output buffer, not a low-latency preview."
 msgstr "HLS output — delayed by the output buffer, not a low-latency preview."
 
-#: src/pages/MonitoringPage.tsx:199
+#: src/pages/MonitoringPage.tsx:190
 msgid "HLS video (buffered)"
 msgstr "HLS video (buffered)"
 
@@ -3661,7 +3661,7 @@ msgstr "Input elementary streams"
 msgid "Input id"
 msgstr "Input id"
 
-#: src/pages/MonitoringPage.tsx:209
+#: src/pages/MonitoringPage.tsx:200
 msgid "Inputs — still thumbnails (~1 fps)"
 msgstr "Inputs — still thumbnails (~1 fps)"
 
@@ -4021,16 +4021,28 @@ msgstr "Live ephemeral cast sessions."
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
+#: src/preview/PreviewSurface.tsx:154
+msgid "Live input preview is unavailable. The preview session is busy or failed."
+msgstr "Live input preview is unavailable. The preview session is busy or failed."
+
+#: src/preview/PreviewSurface.tsx:146
+msgid "Live input video is unavailable on this server."
+msgstr "Live input video is unavailable on this server."
+
+#: src/preview/PreviewSurface.tsx:167
+msgid "Live preview is busy. Another viewer has the session."
+msgstr "Live preview is busy. Another viewer has the session."
+
 #. placeholder {0}: props.id
-#: src/pages/MonitoringPage.tsx:321
+#: src/pages/MonitoringPage.tsx:314
 msgid "Live preview of input {0}"
 msgstr "Live preview of input {0}"
 
-#: src/pages/MonitoringPage.tsx:184
+#: src/pages/MonitoringPage.tsx:177
 msgid "Live program output"
 msgstr "Live program output"
 
-#: src/pages/MonitoringPage.tsx:164
+#: src/pages/MonitoringPage.tsx:157
 msgid "Live program output and per-input previews, with each tile's lifecycle state from the engine stream."
 msgstr "Live program output and per-input previews, with each tile's lifecycle state from the engine stream."
 
@@ -4288,11 +4300,11 @@ msgstr "Maintenance"
 msgid "Major"
 msgstr "Major"
 
-#: src/pages/MonitoringPage.tsx:202
+#: src/pages/MonitoringPage.tsx:193
 msgid "Manage layouts"
 msgstr "Manage layouts"
 
-#: src/pages/MonitoringPage.tsx:202
+#: src/pages/MonitoringPage.tsx:193
 msgid "Manage outputs"
 msgstr "Manage outputs"
 
@@ -4300,7 +4312,7 @@ msgstr "Manage outputs"
 msgid "Manage overlay layers and subtitles."
 msgstr "Manage overlay layers and subtitles."
 
-#: src/pages/MonitoringPage.tsx:202
+#: src/pages/MonitoringPage.tsx:193
 msgid "Manage sources"
 msgstr "Manage sources"
 
@@ -4486,7 +4498,7 @@ msgid "Momentary (400 ms)"
 msgstr "Momentary (400 ms)"
 
 #: src/app/navigation.tsx:58
-#: src/pages/MonitoringPage.tsx:162
+#: src/pages/MonitoringPage.tsx:155
 msgid "Monitoring"
 msgstr "Monitoring"
 
@@ -4602,7 +4614,7 @@ msgstr "Mutable resources carry an <0>ETag</0>. Send it back as <1>If-Match</1> 
 msgid "Mute"
 msgstr "Mute"
 
-#: src/preview/WhepPlayer.tsx:314
+#: src/preview/WhepPlayer.tsx:327
 msgid "Mute {label}"
 msgstr "Mute {label}"
 
@@ -4816,7 +4828,7 @@ msgstr "No GPUs are reported on this host."
 msgid "No host-memory sample."
 msgstr "No host-memory sample."
 
-#: src/pages/MonitoringPage.tsx:218
+#: src/pages/MonitoringPage.tsx:209
 msgid "No inputs are available to preview."
 msgstr "No inputs are available to preview."
 
@@ -5170,7 +5182,7 @@ msgid "Open navigation"
 msgstr "Open navigation"
 
 #. placeholder {0}: props.id
-#: src/pages/MonitoringPage.tsx:293
+#: src/pages/MonitoringPage.tsx:286
 msgid "Open preview of input {0}"
 msgstr "Open preview of input {0}"
 
@@ -5441,7 +5453,7 @@ msgstr "Play player"
 msgid "Playback"
 msgstr "Playback"
 
-#: src/pages/MonitoringPage.tsx:196
+#: src/pages/MonitoringPage.tsx:187
 msgid "Playback transport"
 msgstr "Playback transport"
 
@@ -5477,17 +5489,17 @@ msgid "Preview"
 msgstr "Preview"
 
 #. placeholder {0}: props.id
-#: src/pages/MonitoringPage.tsx:313
+#: src/pages/MonitoringPage.tsx:306
 msgid "Preview — input {0}"
 msgstr "Preview — input {0}"
 
 #. placeholder {0}: props.id
-#: src/pages/MonitoringPage.tsx:285
+#: src/pages/MonitoringPage.tsx:278
 msgid "Preview of input {0}"
 msgstr "Preview of input {0}"
 
 #. placeholder {0}: output.name
-#: src/pages/MonitoringPage.tsx:251
+#: src/pages/MonitoringPage.tsx:243
 msgid "Preview of WebRTC output {0}"
 msgstr "Preview of WebRTC output {0}"
 
@@ -5541,7 +5553,7 @@ msgstr "Profiles"
 msgid "PROG"
 msgstr "PROG"
 
-#: src/pages/MonitoringPage.tsx:175
+#: src/pages/MonitoringPage.tsx:168
 msgid "Program"
 msgstr "Program"
 
@@ -5549,7 +5561,7 @@ msgstr "Program"
 msgid "Program bus only"
 msgstr "Program bus only"
 
-#: src/pages/MonitoringPage.tsx:180
+#: src/pages/MonitoringPage.tsx:173
 msgid "Program HLS output"
 msgstr "Program HLS output"
 
@@ -5580,7 +5592,7 @@ msgstr "Program output frame rate trend"
 msgid "Program output never depends on this device: if it fails, bound sources ride the tile ladder and outputs ride their failover policy — the multiview keeps running."
 msgstr "Program output never depends on this device: if it fails, bound sources ride the tile ladder and outputs ride their failover policy — the multiview keeps running."
 
-#: src/pages/MonitoringPage.tsx:180
+#: src/pages/MonitoringPage.tsx:173
 msgid "Program preview paused while input focus is open"
 msgstr "Program preview paused while input focus is open"
 
@@ -6504,7 +6516,7 @@ msgstr "Staying off"
 msgid "Stereo"
 msgstr "Stereo"
 
-#: src/pages/MonitoringPage.tsx:198
+#: src/pages/MonitoringPage.tsx:189
 msgid "Still preview (~1 fps)"
 msgstr "Still preview (~1 fps)"
 
@@ -7296,7 +7308,7 @@ msgstr "This is one of the most common picture-quality bugs in any video chain. 
 msgid "This is one-way: the grid's tracks and areas become fixed rectangles you move and resize individually. Nothing is saved until you save the layout."
 msgstr "This is one-way: the grid's tracks and areas become fixed rectangles you move and resize individually. Nothing is saved until you save the layout."
 
-#: src/pages/MonitoringPage.tsx:194
+#: src/pages/MonitoringPage.tsx:185
 msgid "This is the current engine program. Saved and unsaved layouts do not have separate live outputs."
 msgstr "This is the current engine program. Saved and unsaved layouts do not have separate live outputs."
 
@@ -7553,7 +7565,7 @@ msgstr "Unknown error"
 msgid "unlimited"
 msgstr "unlimited"
 
-#: src/preview/WhepPlayer.tsx:314
+#: src/preview/WhepPlayer.tsx:327
 msgid "Unmute {label}"
 msgstr "Unmute {label}"
 
@@ -7782,11 +7794,11 @@ msgstr "WebRTC and TURN (ICE servers)"
 msgid "WebRTC carries sub-second video and audio straight to and from a browser with no plugin. Multiview speaks the two open HTTP signalling profiles built on it: <0>WHIP</0> (WebRTC-HTTP Ingestion Protocol) for a browser or encoder to publish a feed into a <1>webrtc</1> source, and <2>WHEP</2> (WebRTC-HTTP Egress Protocol) for a browser to play a <3>webrtc</3> output or a live preview. Both negotiate once over HTTPS — the client POSTs an SDP offer and gets the answer back — then media flows directly over the negotiated peer connection."
 msgstr "WebRTC carries sub-second video and audio straight to and from a browser with no plugin. Multiview speaks the two open HTTP signalling profiles built on it: <0>WHIP</0> (WebRTC-HTTP Ingestion Protocol) for a browser or encoder to publish a feed into a <1>webrtc</1> source, and <2>WHEP</2> (WebRTC-HTTP Egress Protocol) for a browser to play a <3>webrtc</3> output or a live preview. Both negotiate once over HTTPS — the client POSTs an SDP offer and gets the answer back — then media flows directly over the negotiated peer connection."
 
-#: src/pages/MonitoringPage.tsx:244
+#: src/pages/MonitoringPage.tsx:236
 msgid "WebRTC outputs"
 msgstr "WebRTC outputs"
 
-#: src/pages/MonitoringPage.tsx:198
+#: src/pages/MonitoringPage.tsx:189
 msgid "WebRTC preview (low latency)"
 msgstr "WebRTC preview (low latency)"
 
@@ -7829,7 +7841,7 @@ msgstr "What is never sent"
 msgid "What is sent when you opt in"
 msgstr "What is sent when you opt in"
 
-#: src/pages/MonitoringPage.tsx:245
+#: src/pages/MonitoringPage.tsx:237
 #: src/pages/OutputsPage.tsx:324
 msgid "What is WHEP?"
 msgstr "What is WHEP?"

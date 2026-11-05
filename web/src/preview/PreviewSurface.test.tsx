@@ -118,7 +118,7 @@ describe('<PreviewSurface>', () => {
     expect(queryByTestId('whep-player')).toBeNull();
   });
 
-  it('renders the JPEG rung with NO badge when the scope advertises no whep', () => {
+  it('does not pretend JPEG is a live input when the scope advertises no whep', () => {
     const { getByTestId, queryByTestId } = renderWithProviders(
       <PreviewSurface
         scope="input"
@@ -134,7 +134,8 @@ describe('<PreviewSurface>', () => {
         })}
       />,
     );
-    expect(getByTestId('jpeg-rung')).toBeInTheDocument();
+    expect(queryByTestId('jpeg-rung')).toBeNull();
+    expect(getByTestId('input-preview-unavailable')).toBeInTheDocument();
     expect(queryByTestId('fallback-badge')).toBeNull();
   });
 
@@ -172,7 +173,8 @@ describe('<PreviewSurface>', () => {
     });
     expect(getByTestId('jpeg-rung')).toBeInTheDocument();
 
-    // The retry affordance re-arms a fresh WHEP attempt.
+    // Wait for the rejected POST and player cleanup before retrying.
+    await waitFor(() => expect(getByRole('button', { name: /retry live preview/i })).toBeInTheDocument());
     act(() => {
       fireEvent.click(getByRole('button', { name: /retry live preview/i }));
     });

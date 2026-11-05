@@ -113,6 +113,7 @@ export function PreviewSurface({
   rtcConfig,
   fetchImpl,
   onSessionReleased,
+  onLeaseState,
 }: {
   readonly scope: PreviewScope;
   /** The WHEP endpoint for this scope (e.g. `/api/v1/preview/program/whep`). */
@@ -128,34 +129,42 @@ export function PreviewSurface({
   readonly rtcConfig?: RTCConfiguration | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
   readonly onSessionReleased?: (() => void) | undefined;
+  readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
 }): JSX.Element {
   // A monotonically-increasing attempt id: bumping it remounts <WhepPlayer> for
   // a fresh negotiation (the "retry live preview" affordance). `degraded` flips
   // to JPEG-with-badge on a fatal error and clears on a retry.
   const [attempt, setAttempt] = useState(0);
   const [degraded, setDegraded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [released, setReleased] = useState(true);
 
   const canWhep = whepAvailable(capabilities, scope);
 
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
   if (!canWhep) {
+    if (scope === 'input') return <div role="status" data-testid="input-preview-unavailable"><Trans>Live input video is unavailable on this server.</Trans></div>;
     return <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />;
   }
 
   // WHEP was attempted and failed: degrade to JPEG with the honest badge + a
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
+    if (scope === 'input') {
+      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable"><Trans>Live input preview is unavailable. The preview session is busy or failed.</Trans>{released ? <Button type="button" onClick={(): void => { setBusy(false); setDegraded(false); setAttempt((n) => n + 1); }}>Retry live preview</Button> : null}</div>;
+    }
     return (
-      <JpegRung
+      <><JpegRung
         jpegPath={jpegPath}
         label={label}
         degraded
         className={className}
-        onRetry={(): void => {
+        {...(released ? { onRetry: (): void => {
+          setBusy(false);
           setDegraded(false);
           setAttempt((n) => n + 1);
-        }}
-      />
+        } } : {})}
+      />{busy ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null}</>
     );
   }
 
@@ -170,6 +179,11 @@ export function PreviewSurface({
       {...(rtcConfig !== undefined ? { rtcConfig } : {})}
       {...(fetchImpl !== undefined ? { fetchImpl } : {})}
       onSessionReleased={onSessionReleased}
+      onLeaseState={(state): void => {
+        setReleased(state === 'released');
+        onLeaseState?.(state);
+      }}
+      onBusy={(): void => { setBusy(true); }}
       onFatal={(): void => {
         setDegraded(true);
       }}

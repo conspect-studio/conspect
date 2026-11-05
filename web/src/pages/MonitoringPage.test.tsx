@@ -11,13 +11,15 @@ import { MonitoringPage } from './MonitoringPage';
 const release = vi.hoisted(() => new Map<string, () => void>());
 const sessions = vi.hoisted(() => new Array<string>());
 vi.mock('../preview/PreviewSurface', () => ({
-  PreviewSurface: ({ whepEndpoint, onSessionReleased }: { whepEndpoint: string; onSessionReleased?: () => void }): null => {
+  PreviewSurface: ({ whepEndpoint, onSessionReleased, onLeaseState }: { whepEndpoint: string; onSessionReleased?: () => void; onLeaseState?: (state: 'negotiating' | 'active' | 'released') => void }): null => {
     const callback = useRef(onSessionReleased);
+    const state = useRef(onLeaseState);
     callback.current = onSessionReleased;
+    state.current = onLeaseState;
     useEffect(() => {
       sessions.push(whepEndpoint);
-      // Save the actual unmount callback; tests can complete the asynchronous DELETE.
-      release.set(whepEndpoint, () => { callback.current?.(); });
+      state.current?.('negotiating');
+      release.set(whepEndpoint, () => { state.current?.('released'); callback.current?.(); });
     }, [whepEndpoint]);
     return null;
   },
