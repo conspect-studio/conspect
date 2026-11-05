@@ -1,4 +1,14 @@
 //! Identical local-only release-bake comparison harness; NOT full-canvas oracle.
+#![allow(
+    clippy::similar_names,
+    clippy::as_conversions,
+    clippy::unnecessary_cast,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::print_stdout
+)] // Local-only benchmark harness uses bounded fixture indices and intentional output.
 use multiview_compositor::overlay::subpass::{
     apply_overlays_to_nv12, OverlayColor, OverlayDrawList, OverlayPrimitive, OverlayRect,
 };

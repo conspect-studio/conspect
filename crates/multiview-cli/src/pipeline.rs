@@ -17168,6 +17168,29 @@ mod live_overlay_bake_tests {
     }
 
     #[test]
+    fn over_budget_overlay_tick_keeps_baker_and_audio_clock_alive() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let clocks = (0..80)
+            .map(|i| analog_clock_at(&format!("clock_{i}"), 100, 100, 12))
+            .collect();
+        crate::live_overlays::publish_set(&slot, clocks);
+        let first = baker.bake(&item(7)).expect("over-budget frame must bake");
+        let mut bus = multiview_audio::ProgramBus::new(
+            crate::audio::canonical_format(),
+            Rational::new(25, 1),
+        );
+        let audio_first = super::drive_audio_for_item(&mut bus, 7);
+        crate::live_overlays::publish_set(&slot, Vec::new());
+        let next = baker.bake(&item(8)).expect("next ordinary frame must bake");
+        let audio_next = super::drive_audio_for_item(&mut bus, 8);
+        assert_eq!(first.width(), next.width());
+        assert_eq!(audio_first.frame_count(), 8 * 1_920);
+        assert_eq!(audio_next.frame_count(), 1_920);
+        assert!(region_diff(&first, &next, FACE_A) > 0);
+    }
+
+    #[test]
     fn stream_baker_rederives_the_analog_clock_from_the_live_slot() {
         // Generation 0: an empty boot set ⇒ no analog face anywhere.
         let slot = crate::live_overlays::overlay_apply_slot(Vec::new());

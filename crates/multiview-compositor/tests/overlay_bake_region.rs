@@ -72,6 +72,68 @@ fn vivid_input(w: u32, h: u32) -> Nv12Image {
 }
 
 #[test]
+fn large_overlay_lists_and_overlap_never_reject_valid_frames() {
+    let input = vivid_input(1920, 1080);
+    let mut list = OverlayDrawList::new();
+    for n in 0..1025 {
+        list.push(OverlayPrimitive::FilledRect {
+            rect: OverlayRect::new(0, 0, 96, 96),
+            corner_radius: 0,
+            color: OverlayColor::new(0.2, 0.6, 0.4, 0.001),
+        });
+        if n == 1024 {
+            let out = apply_overlays_to_nv12(&input, &list, CanvasColor::default()).unwrap();
+            let reference =
+                apply_overlays_to_nv12_reference(&input, &list, CanvasColor::default()).unwrap();
+            assert_eq!(out.y_plane(), reference.y_plane());
+            assert_eq!(out.uv_plane(), reference.uv_plane());
+        }
+    }
+}
+
+#[test]
+fn overlapping_1080_regions_exceeding_legacy_budget_keep_every_overlay() {
+    let input = vivid_input(1920, 1080);
+    let mut list = OverlayDrawList::new();
+    for i in 0..20 {
+        list.push(OverlayPrimitive::FilledRect {
+            rect: OverlayRect::new(i * 3, 10, 480, 300),
+            corner_radius: 0,
+            color: OverlayColor::new(0.1, 0.8, 0.2, 0.2),
+        });
+    }
+    let out = apply_overlays_to_nv12(&input, &list, CanvasColor::default()).unwrap();
+    let reference =
+        apply_overlays_to_nv12_reference(&input, &list, CanvasColor::default()).unwrap();
+    assert_eq!(out.y_plane(), reference.y_plane());
+    assert_eq!(out.uv_plane(), reference.uv_plane());
+}
+
+#[test]
+fn four_k_overlay_and_color_tag_mismatch_do_not_hit_fixed_1080_budget() {
+    let input = vivid_input(3840, 2160);
+    let mut list = OverlayDrawList::new();
+    list.push(OverlayPrimitive::FilledRect {
+        rect: OverlayRect::new(10, 10, 32, 24),
+        corner_radius: 0,
+        color: OverlayColor::opaque(0.2, 0.6, 0.4),
+    });
+    assert!(apply_overlays_to_nv12(&input, &list, CanvasColor::default()).is_ok());
+    let mismatch = Nv12Image::new(
+        3840,
+        2160,
+        input.y_plane().to_vec(),
+        input.uv_plane().to_vec(),
+        ColorInfo {
+            range: ColorRange::Full,
+            ..bt709_limited()
+        },
+    )
+    .unwrap();
+    assert!(apply_overlays_to_nv12(&mismatch, &list, CanvasColor::default()).is_ok());
+}
+
+#[test]
 fn sparse_bake_covers_news_style_badges_meters_glyphs_and_clipped_captions() {
     let input = vivid_input(1920, 1080);
     let mut list = OverlayDrawList::new();
@@ -251,7 +313,7 @@ fn merged_footprints_keep_both_corner_holes_exact_for_all_sdr_tags() {
 }
 
 #[test]
-fn dense_chain_and_disjoint_lists_have_an_explicit_cpu_bound() {
+fn dense_chain_and_disjoint_lists_fall_back_without_losing_ink() {
     let input = vivid_input(128, 64);
     for disjoint in [false, true] {
         let mut list = OverlayDrawList::new();
@@ -264,10 +326,15 @@ fn dense_chain_and_disjoint_lists_have_an_explicit_cpu_bound() {
                 color: OverlayColor::opaque(0.1, 0.8, 0.2),
             });
         }
-        let err = apply_overlays_to_nv12(&input, &list, CanvasColor::default()).unwrap_err();
-        assert!(
-            err.to_string().contains("primitive count"),
-            "unexpected budget error: {err}"
+        let out = apply_overlays_to_nv12(&input, &list, CanvasColor::default()).unwrap();
+        let reference =
+            apply_overlays_to_nv12_reference(&input, &list, CanvasColor::default()).unwrap();
+        assert_eq!(out.y_plane(), reference.y_plane());
+        assert_eq!(out.uv_plane(), reference.uv_plane());
+        assert_ne!(
+            out.y_plane(),
+            input.y_plane(),
+            "fallback must not discard overlays"
         );
     }
     let mut list = OverlayDrawList::new();

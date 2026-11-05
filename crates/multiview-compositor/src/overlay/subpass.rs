@@ -1180,6 +1180,24 @@ pub fn apply_overlays_to_nv12_reference(
     Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag())
 }
 
+fn overlay_reference_fallback(
+    image: &Nv12Image,
+    list: &OverlayDrawList,
+    canvas: CanvasColor,
+    reason: &'static str,
+    actual: u64,
+    limit: u64,
+) -> Result<Nv12Image> {
+    tracing::warn!(
+        reason,
+        actual,
+        limit,
+        primitives = list.len(),
+        "overlay optimization bypassed; using full-canvas reference"
+    );
+    apply_overlays_to_nv12_reference(image, list, canvas)
+}
+
 /// Burn `list` into `image`, returning a new NV12 program frame — the CPU
 /// overlay bake the CLI/software path uses.
 ///
@@ -1200,26 +1218,30 @@ pub fn apply_overlays_to_nv12_reference(
 /// Propagates the colour-conversion errors (unresolved/unsupported colour) and
 /// the [`Nv12Image::new`] geometry check, exactly as
 /// [`apply_overlays_to_nv12_reference`] does.
+#[allow(clippy::too_many_lines)] // Region traversal and color writes stay together for raster-order chroma.
 pub fn apply_overlays_to_nv12(
     image: &Nv12Image,
     list: &OverlayDrawList,
     canvas: CanvasColor,
 ) -> Result<Nv12Image> {
     const MAX_PRIMITIVES: usize = 1024;
-    const MAX_REGION_PIXELS: u64 = 2_073_600;
     const COALESCE_LIMIT: usize = 64;
     let width = image.width();
     let height = image.height();
+    let canvas_pixels = u64::from(width) * u64::from(height);
     let color = image.color();
+    // These are optimization admission limits, never validity checks. A complex
+    // but valid draw list must not terminate the output consumer and all HLS
+    // renditions. The reference path preserves every primitive in order.
     if list.len() > MAX_PRIMITIVES {
-        return Err(crate::error::Error::OverlayBudgetExceeded(
+        return overlay_reference_fallback(
+            image,
+            list,
+            canvas,
             "primitive count",
-        ));
-    }
-    if u64::from(width) * u64::from(height) > MAX_REGION_PIXELS && color != canvas.output_tag() {
-        return Err(crate::error::Error::OverlayBudgetExceeded(
-            "full-canvas color conversion pixels",
-        ));
+            u64::try_from(list.len()).unwrap_or(u64::MAX),
+            u64::try_from(MAX_PRIMITIVES).unwrap_or(u64::MAX),
+        );
     }
 
     // Passing untouched pixels through verbatim is colour-correct only when the
@@ -1227,7 +1249,14 @@ pub fn apply_overlays_to_nv12(
     // input is the composited canvas. If that ever differs, the whole frame
     // needs conversion, so fall back to the full-canvas reference.
     if color != canvas.output_tag() {
-        return apply_overlays_to_nv12_reference(image, list, canvas);
+        return overlay_reference_fallback(
+            image,
+            list,
+            canvas,
+            "canvas color mismatch",
+            canvas_pixels,
+            canvas_pixels,
+        );
     }
 
     // Start from the input planes verbatim (exact passthrough); only the dirty
@@ -1261,10 +1290,15 @@ pub fn apply_overlays_to_nv12(
         .iter()
         .map(|r| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0))
         .sum();
-    if processed_pixels > MAX_REGION_PIXELS || primitive_pixels > MAX_REGION_PIXELS * 4 {
-        return Err(crate::error::Error::OverlayBudgetExceeded(
-            "processed pixels",
-        ));
+    if processed_pixels > canvas_pixels || primitive_pixels > canvas_pixels.saturating_mul(4) {
+        return overlay_reference_fallback(
+            image,
+            list,
+            canvas,
+            "region work",
+            processed_pixels.max(primitive_pixels / 4),
+            canvas_pixels,
+        );
     }
     if rects.is_empty() {
         // Nothing lands on the canvas: the bake is a no-op (planes unchanged).
