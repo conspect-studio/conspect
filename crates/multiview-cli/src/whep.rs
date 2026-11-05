@@ -970,6 +970,28 @@ mod tests {
 
     use super::pump_turn_relays;
 
+    #[test]
+    fn live_preview_without_candidates_is_unavailable_and_refuses_session() {
+        use multiview_control::{WhepProvider, WhepReject, WhepScope};
+        use std::sync::{Arc, Mutex};
+        let provider = super::CliWhepProvider {
+            egress: Arc::new(WhepEgress::new()),
+            state: Arc::new(Mutex::new(super::DriverState::default())),
+            program: Arc::new(multiview_framestore::SwapCell::new(None)),
+            stores: Arc::new(multiview_framestore::SwapCell::new(Arc::new(
+                std::collections::HashMap::new(),
+            ))),
+            program_audio: None,
+            available: true,
+        };
+        assert!(!provider.webrtc_available());
+        assert!(matches!(
+            provider.negotiate(&WhepScope::Program, VIDEO_OFFER),
+            Err(WhepReject::CapacityExceeded { .. })
+        ));
+        assert_eq!(provider.active_sessions(), 0);
+    }
+
     /// A WHEP offer carrying a recvonly H.264 video m-line (str0m needs real ICE
     /// credentials + a DTLS fingerprint + `setup:actpass` to answer).
     const VIDEO_OFFER: &str = "v=0\r\n\
