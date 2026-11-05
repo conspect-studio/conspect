@@ -530,18 +530,15 @@ fn render_timer(
     } else {
         [0.95, 0.95, 0.95, 1.0]
     };
-    let size_px = (f32_of(count_h) / 2.5).max(8.0);
-    let run = engine
-        .rasterize_run(&text, FontFamily::Mono, size_px, rgba)
-        .map_err(cc)?;
-    let count_cy = round_to_i32(f32_of(count_top) + f32_of(count_h) / 2.0);
-    push_run_centred_at(
+    draw_fixed_mono_readout(
         &mut list,
-        &run,
-        i32_of(width) / 2,
-        count_cy,
-        OverlayColor::opaque(rgba[0], rgba[1], rgba[2]),
-    );
+        &mut engine,
+        &text,
+        width,
+        (count_top, count_h),
+        rgba,
+        Some(spec.overrun_prefix.unwrap_or("+")),
+    )?;
 
     // The overrun a11y badge (bottom band) — reads the state without colour.
     if show_badge {
@@ -632,11 +629,8 @@ fn draw_digital_readout(
     spec: ClockRender<'_>,
     now: WallTime,
 ) -> Result<(), SynthError> {
-    use multiview_compositor::overlay::subpass::OverlayColor;
-    use multiview_compositor::overlay::text::FontFamily;
     use multiview_overlay::clock::{ClockFace, ClockModel, RefSource, RefStatus, TimeRef};
 
-    let cc = |e: multiview_compositor::Error| SynthError::Compositor(e.to_string());
     // The time reference is the host system clock (free-running). The value only
     // feeds the optional a11y badge in the metadata strip (display only).
     let time_ref = TimeRef::new(RefSource::System, RefStatus::Freerun);
@@ -647,15 +641,72 @@ fn draw_digital_readout(
     };
     let model = ClockModel::new(face, spec.offset, time_ref);
     let text = model.render_digital(now).ok_or(SynthError::ClockTime)?;
-    // Size the readout to a fraction of the region height.
-    let size_px = (f32_of(region_h) / 2.5).max(8.0);
-    let color = OverlayColor::opaque(0.95, 0.95, 0.95);
-    let run = engine
-        .rasterize_run(&text, FontFamily::Mono, size_px, [0.95, 0.95, 0.95, 1.0])
+    draw_fixed_mono_readout(
+        list,
+        engine,
+        &text,
+        width,
+        (top, region_h),
+        [0.95, 0.95, 0.95, 1.0],
+        None,
+    )?;
+    Ok(())
+}
+
+/// Place the complete monospaced readout on a fixed logical advance, not on
+/// the changing ink rectangle. The run's advance includes uninked whitespace;
+/// reserve the configured overrun sign in the same slot even before target.
+/// The width check uses the actual formatted string and its font metrics, so
+/// long hour/day fields and narrow tiles fit without a fixed-width assumption.
+#[cfg(feature = "overlay")]
+fn draw_fixed_mono_readout(
+    list: &mut multiview_compositor::overlay::subpass::OverlayDrawList,
+    engine: &mut multiview_compositor::overlay::text::TextEngine,
+    text: &str,
+    width: u32,
+    region: (u32, u32),
+    rgba: [f32; 4],
+    overrun_prefix: Option<&str>,
+) -> Result<(), SynthError> {
+    use multiview_compositor::overlay::subpass::OverlayColor;
+    use multiview_compositor::overlay::text::FontFamily;
+
+    let (top, region_h) = region;
+    let cc = |e: multiview_compositor::Error| SynthError::Compositor(e.to_string());
+    let reserved = match overrun_prefix {
+        Some(prefix) if !prefix.is_empty() && !text.starts_with(prefix) => {
+            format!("{}{}", " ".repeat(prefix.chars().count()), text)
+        }
+        _ => text.to_owned(),
+    };
+    let available = width.saturating_sub(4).max(1);
+    let mut size_px = (f32_of(region_h) / 2.5).max(1.0);
+    let mut run = engine
+        .rasterize_run(&reserved, FontFamily::Mono, size_px, rgba)
         .map_err(cc)?;
-    let cx = round_to_i32(f32_of(width) / 2.0);
-    let cy = round_to_i32(f32_of(top) + f32_of(region_h) / 2.0);
-    push_run_centred_at(list, &run, cx, cy, color);
+    // The first rasterization is the normal path. Only a narrow or unusually
+    // long readout needs a second pass at a smaller font size.
+    let ink_width = run_bbox(&run).map_or(0, |(_, _, right, _)| right.max(0));
+    let occupied = run
+        .advance_width()
+        .max(u32_to_f32(ink_width.unsigned_abs()));
+    if occupied > f32_of(available) {
+        size_px = (size_px * f32_of(available) / occupied * 0.95).max(1.0);
+        run = engine
+            .rasterize_run(&reserved, FontFamily::Mono, size_px, rgba)
+            .map_err(cc)?;
+    }
+    let left = round_to_i32((f32_of(width) - run.advance_width()) / 2.0);
+    // cosmic-text places every run against the same size-dependent baseline.
+    // Do not recalculate its y-offset from digit-specific ink bounds.
+    let baseline = round_to_i32(f32_of(top) + (f32_of(region_h) - size_px) / 2.0);
+    push_run_offset(
+        list,
+        &run,
+        left,
+        baseline,
+        OverlayColor::opaque(rgba[0], rgba[1], rgba[2]),
+    );
     Ok(())
 }
 
@@ -1560,6 +1611,132 @@ segment_ms = 1000
             after.y_plane(),
             "the overrun frame (prefix + OVER badge) differs from the pre-target frame"
         );
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn timer_digits_keep_fixed_slots_and_fit_tile() {
+        use multiview_compositor::overlay::subpass::OverlayDrawList;
+        use multiview_compositor::overlay::text::TextEngine;
+
+        let cad = Rational { num: 25, den: 1 };
+        let target = 14 * 3600 + 30 * 60;
+        let values = [12 * 3600 + 18 * 60 + 30, 11 * 3600 + 11 * 60 + 11, 0];
+        for (width, height) in [(320, 120), (100, 120), (64, 34), (140, 42)] {
+            let mut starts = Vec::new();
+            for seconds in values {
+                let kind = timer_kind(TimerFormat::HhMmSs, TimerOnTarget::Hold);
+                let rendered = render_at(
+                    &kind,
+                    width,
+                    height,
+                    canvas(),
+                    WallTime::from_unix_seconds(target - seconds),
+                    0,
+                    cad,
+                )
+                .expect("render timer at each duration and tile size");
+                assert_eq!(rendered.width(), width);
+                // Inspect the readout glyph positions, not the moving ink edges.
+                let mut list = OverlayDrawList::new();
+                let mut engine = TextEngine::new().expect("font");
+                let formatted = format!(
+                    "{:02}:{:02}:{:02}",
+                    seconds / 3600,
+                    (seconds / 60) % 60,
+                    seconds % 60
+                );
+                draw_fixed_mono_readout(
+                    &mut list,
+                    &mut engine,
+                    &formatted,
+                    width,
+                    (0, height),
+                    [0.95; 4],
+                    Some("+"),
+                )
+                .expect("layout timer");
+                let glyphs: Vec<_> = list
+                    .primitives
+                    .iter()
+                    .filter_map(|p| match p {
+                        multiview_compositor::overlay::subpass::OverlayPrimitive::Glyph {
+                            dest_x,
+                            dest_y,
+                            width: glyph_w,
+                            height: glyph_h,
+                            ..
+                        } => Some((*dest_x, *dest_y, *glyph_w, *glyph_h)),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    glyphs.iter().all(|(x, y, w, h)| *x >= 0
+                        && *y >= 0
+                        && x.saturating_add(i32_of(*w)) <= i32_of(width)
+                        && y.saturating_add(i32_of(*h)) <= i32_of(height)),
+                    "readout clipped at {width}x{height}: {glyphs:?}"
+                );
+                starts.push(glyphs.iter().map(|g| g.0).min().expect("ink"));
+            }
+            assert!(
+                starts.iter().all(|x| *x >= 0),
+                "left edge must fit: {starts:?}"
+            );
+            assert!(
+                starts.windows(2).all(|pair| (pair[0] - pair[1]).abs() <= 2),
+                "digit slots shift: {starts:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn long_timer_formats_and_clock_fit_narrow_cells() {
+        use multiview_compositor::overlay::subpass::{OverlayDrawList, OverlayPrimitive};
+        use multiview_compositor::overlay::text::TextEngine;
+
+        for (width, height) in [(64, 34), (100, 120), (280, 36)] {
+            for text in [
+                "123:12:18:30",
+                "123456:18:30",
+                "123d 12:18:30",
+                "+123456:18:30",
+                "12:18:30 PM",
+            ] {
+                let mut list = OverlayDrawList::new();
+                let mut engine = TextEngine::new().expect("font");
+                draw_fixed_mono_readout(
+                    &mut list,
+                    &mut engine,
+                    text,
+                    width,
+                    (0, height),
+                    [0.95; 4],
+                    None,
+                )
+                .expect("long readout");
+                assert!(!list.is_empty(), "{text} did not draw");
+                for primitive in list.primitives {
+                    if let OverlayPrimitive::Glyph {
+                        dest_x,
+                        dest_y,
+                        width: w,
+                        height: h,
+                        ..
+                    } = primitive
+                    {
+                        assert!(
+                            dest_x >= 0
+                                && dest_y >= 0
+                                && dest_x.saturating_add(i32_of(w)) <= i32_of(width)
+                                && dest_y.saturating_add(i32_of(h)) <= i32_of(height),
+                            "{text} clipped in {width}x{height}: ({dest_x},{dest_y},{w},{h})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(feature = "overlay")]

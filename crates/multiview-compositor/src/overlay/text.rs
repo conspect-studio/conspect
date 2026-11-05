@@ -112,9 +112,12 @@ pub struct RasterizedGlyph {
 
 /// The result of [`TextEngine::rasterize_run`]: the run's premultiplied glyph
 /// bitmaps for the CPU reference blit.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RasterizedRun {
     glyphs: Vec<RasterizedGlyph>,
+    /// The shaped run's logical advance, including uninked spaces. Unlike the
+    /// glyph ink bounds, this stays fixed as monospaced digits change.
+    advance_width: f32,
 }
 
 impl RasterizedRun {
@@ -122,6 +125,12 @@ impl RasterizedRun {
     #[must_use]
     pub fn glyphs(&self) -> &[RasterizedGlyph] {
         &self.glyphs
+    }
+
+    /// The shaped logical width, including whitespace and terminal side bearings.
+    #[must_use]
+    pub fn advance_width(&self) -> f32 {
+        self.advance_width
     }
 }
 
@@ -201,7 +210,7 @@ impl TextEngine {
         size_px: f32,
         color: [f32; 4],
     ) -> Result<PreparedRun> {
-        let shaped = self.shape(text, family, size_px);
+        let (shaped, _) = self.shape(text, family, size_px);
         let mut glyphs = Vec::with_capacity(shaped.len());
         for placed in shaped {
             let Some(resident) = self.ensure_resident(&placed)? else {
@@ -240,7 +249,7 @@ impl TextEngine {
         color: [f32; 4],
     ) -> Result<RasterizedRun> {
         let rgb8 = straight_rgb8(color);
-        let shaped = self.shape(text, family, size_px);
+        let (shaped, advance_width) = self.shape(text, family, size_px);
         let mut glyphs = Vec::with_capacity(shaped.len());
         for placed in shaped {
             let Some(resident) = self.ensure_resident(&placed)? else {
@@ -255,11 +264,14 @@ impl TextEngine {
                 premultiplied_rgba,
             });
         }
-        Ok(RasterizedRun { glyphs })
+        Ok(RasterizedRun {
+            glyphs,
+            advance_width,
+        })
     }
 
     /// Shape one run into placed glyphs (cache key + integer pen position).
-    fn shape(&mut self, text: &str, family: FontFamily, size_px: f32) -> Vec<PlacedGlyph> {
+    fn shape(&mut self, text: &str, family: FontFamily, size_px: f32) -> (Vec<PlacedGlyph>, f32) {
         // Line height is irrelevant for single-run placement; use the size.
         let metrics = Metrics::new(size_px, size_px);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
@@ -272,9 +284,11 @@ impl TextEngine {
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         let mut placed = Vec::new();
+        let mut advance_width = 0.0_f32;
         for run in buffer.layout_runs() {
             let baseline = run.line_y;
             for glyph in run.glyphs {
+                advance_width = advance_width.max(glyph.x + glyph.w);
                 // Physical (pixel-snapped) placement at the run baseline; scale 1
                 // because size_px is already device pixels (invariant #6).
                 let physical = glyph.physical((0.0, baseline), 1.0);
@@ -285,7 +299,7 @@ impl TextEngine {
                 });
             }
         }
-        placed
+        (placed, advance_width)
     }
 
     /// Ensure the shaped glyph is rasterized and resident in the atlas, and
