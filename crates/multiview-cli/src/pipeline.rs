@@ -13966,6 +13966,14 @@ impl TileScaler {
         frame: &Video,
         tag: multiview_core::color::ColorInfo,
     ) -> Result<Nv12Image, String> {
+        // Packing already handles padded strides. Avoid Scaler's identity deep
+        // copy, but retain the cached scaler for subsequent nonidentity frames.
+        if frame.format() == Pixel::NV12
+            && frame.width() == self.tile_w
+            && frame.height() == self.tile_h
+        {
+            return video_to_nv12(frame, tag);
+        }
         let src = ScaleSpec::new(frame.format(), frame.width(), frame.height());
         let dst = ScaleSpec::new(Pixel::NV12, self.tile_w, self.tile_h);
         let rebuild = match &self.scaler {
@@ -13981,6 +13989,167 @@ impl TileScaler {
             .ok_or_else(|| "tile scaler unexpectedly absent".to_owned())?;
         let resized = sws.run(frame).map_err(|e| e.to_string())?;
         video_to_nv12(&resized, tag)
+    }
+}
+
+#[cfg(test)]
+mod tile_scaler_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use multiview_core::color::{ColorInfo, ColorRange};
+
+    fn tag() -> ColorInfo {
+        ColorInfo {
+            range: ColorRange::Full,
+            ..ColorInfo::default().resolve_defaults(1920, 1080)
+        }
+    }
+
+    // Fill active samples independently of padding, with deterministic distinct
+    // chroma bytes. P010 stores ten-bit samples in the high bits of each word.
+    fn fixture(format: Pixel, w: u32, h: u32, mut seed: u32) -> Video {
+        let mut frame = Video::new(format, w, h);
+        // The caller's full-range tag must win over source-frame metadata.
+        frame.set_color_range(ffmpeg::color::Range::MPEG);
+        let bytes = if format == Pixel::P010LE { 2 } else { 1 };
+        for plane in 0..2 {
+            let stride = frame.stride(plane);
+            let rows = usize::try_from(h).unwrap() / (plane + 1);
+            frame.data_mut(plane).fill(0xa5);
+            for row in 0..rows {
+                for x in 0..usize::try_from(w).unwrap() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let value = seed.to_be_bytes()[0];
+                    let offset = row * stride + x * bytes;
+                    if bytes == 2 {
+                        let sample = (u16::from(value) << 8).to_le_bytes();
+                        frame.data_mut(plane)[offset..offset + 2].copy_from_slice(&sample);
+                    } else {
+                        frame.data_mut(plane)[offset] = value;
+                    }
+                }
+            }
+        }
+        frame
+    }
+
+    fn legacy(frame: &Video, w: u32, h: u32) -> Nv12Image {
+        let mut scaler = Scaler::new(
+            ScaleSpec::new(frame.format(), frame.width(), frame.height()),
+            ScaleSpec::new(Pixel::NV12, w, h),
+        )
+        .unwrap();
+        video_to_nv12(&scaler.run(frame).unwrap(), tag()).unwrap()
+    }
+
+    fn same(actual: &Nv12Image, expected: &Nv12Image) {
+        assert_eq!(actual.width(), expected.width());
+        assert_eq!(actual.height(), expected.height());
+        assert_eq!(actual.y_plane(), expected.y_plane());
+        assert_eq!(actual.uv_plane(), expected.uv_plane());
+        assert_eq!(actual.color(), expected.color());
+        assert_eq!(actual.color(), tag());
+    }
+
+    fn active(frame: &Video, plane: usize) -> Vec<u8> {
+        frame
+            .data(plane)
+            .chunks(frame.stride(plane))
+            .take(usize::try_from(frame.height()).unwrap() / (plane + 1))
+            .flat_map(|row| {
+                row[..usize::try_from(frame.width()).unwrap()]
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tile_scaler_exact_nv12_does_not_create_scaler() {
+        let frame = fixture(Pixel::NV12, 18, 10, 7);
+        let mut scaler = TileScaler::new(18, 10);
+        let output = scaler.convert(&frame, tag()).unwrap();
+        same(&output, &legacy(&frame, 18, 10));
+        assert!(
+            scaler.scaler.is_none(),
+            "identity packing must bypass Scaler"
+        );
+    }
+
+    #[test]
+    fn tile_scaler_padded_distinct_chroma_preserves_active_bytes_and_tag() {
+        let frame = fixture(Pixel::NV12, 18, 10, 19);
+        assert!(frame.stride(0) > 18);
+        assert!(frame.stride(1) > 18);
+        let y_before = frame.data(0).to_vec();
+        let uv_before = frame.data(1).to_vec();
+        let output = TileScaler::new(18, 10).convert(&frame, tag()).unwrap();
+        assert_eq!(output.y_plane(), active(&frame, 0));
+        assert_eq!(output.uv_plane(), active(&frame, 1));
+        assert!(output.uv_plane().chunks_exact(2).any(|p| p[0] != p[1]));
+        same(&output, &legacy(&frame, 18, 10));
+        assert_eq!(frame.data(0), y_before);
+        assert_eq!(frame.data(1), uv_before);
+    }
+
+    #[test]
+    fn tile_scaler_seeded_exact_frames_match_legacy() {
+        for (w, h) in [(2, 2), (18, 10), (64, 48), (640, 540)] {
+            let mut scaler = TileScaler::new(w, h);
+            for seed in [1, 42, 987_654] {
+                let frame = fixture(Pixel::NV12, w, h, seed);
+                let output = scaler.convert(&frame, tag()).unwrap();
+                same(&output, &legacy(&frame, w, h));
+                assert_eq!(output.y_plane(), active(&frame, 0));
+                assert_eq!(output.uv_plane(), active(&frame, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn tile_scaler_exact_resize_exact_preserves_cached_conversion() {
+        let mut scaler = TileScaler::new(18, 10);
+        for (w, h, seed) in [(18, 10, 1), (36, 20, 2), (18, 10, 3), (54, 30, 4)] {
+            let frame = fixture(Pixel::NV12, w, h, seed);
+            let cached = scaler
+                .scaler
+                .as_ref()
+                .map(|s| (s.source(), s.destination()));
+            let output = scaler.convert(&frame, tag()).unwrap();
+            same(&output, &legacy(&frame, 18, 10));
+            if w == 18 {
+                assert_eq!(
+                    scaler
+                        .scaler
+                        .as_ref()
+                        .map(|s| (s.source(), s.destination())),
+                    cached,
+                    "exact packing must not replace the cached resize scaler"
+                );
+            } else {
+                assert_eq!(
+                    scaler.scaler.as_ref().unwrap().source(),
+                    ScaleSpec::new(Pixel::NV12, w, h)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tile_scaler_p010_exact_and_resize_keep_conversion() {
+        for (w, h) in [(18, 10), (36, 20)] {
+            let frame = fixture(Pixel::P010LE, w, h, 123);
+            let mut scaler = TileScaler::new(18, 10);
+            same(
+                &scaler.convert(&frame, tag()).unwrap(),
+                &legacy(&frame, 18, 10),
+            );
+            assert_eq!(
+                scaler.scaler.as_ref().unwrap().source(),
+                ScaleSpec::new(Pixel::P010LE, w, h)
+            );
+        }
     }
 }
 
