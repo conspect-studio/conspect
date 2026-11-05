@@ -23,6 +23,14 @@ See [ADR-0183](../decisions/ADR-0183-source-event-automation.md). Source-owned e
 
 These modules alone do not satisfy the feature. Test evidence is local and scoped, not full CI or deployment evidence.
 
+## Latest local milestone (not deployed)
+
+Authorized read API06d7374f and operator Events panel003cb8b2 are committed. Six source API +4 preview authorization tests pass. Eleven UI tests, full web lint and production web build pass; generated OpenAPI/TS and Lingui catalogs are updated. Independent UI review fixed valid uncertain/overrun handling; no browser receipt-clock countdown.
+
+Active runtime worker has produced one passing injected-cue -> selected-frame projection -> real StreamBaker NV12 pixel-change/clear regression. Native library check passes, but production main provider wiring is still being completed by a separate worker. This is not live server evidence. HLS generation-fence/completeness repairs have20native tests passed; integration caller compilation remains active.
+
+Full requested automation remains unfinished: no armed production executor, atomic bars+tone takeover/return, external hooks or persisted rule UI is deployed. These remain mandatory scope, not optional follow-ups.
+
 ## Required integration work
 
 1. Complete immutable timestamp mapping without feeding cues into the video normalizer. Preserve source epoch, discontinuity and mapping validity.
