@@ -95,12 +95,12 @@ impl PreviewVideoEncoder {
     /// Integer-only scaling (the workspace bans silent `as` conversions): scale
     /// each dimension by `PREVIEW_LONGEST_EDGE / longest` using `u64` math, then
     /// floor to an even value (NV12 chroma) with a floor of 2.
-    fn target_dims(image: &Nv12Image) -> (u32, u32) {
+    fn target_dims(&self, image: &Nv12Image) -> (u32, u32) {
         let (w, h) = (image.width().max(2), image.height().max(2));
-        Self::bounded_dims(w, h)
+        Self::bounded_dims(w, h, self.codec == PreviewCodec::H264)
     }
 
-    fn bounded_dims(w: u32, h: u32) -> (u32, u32) {
+    fn bounded_dims(w: u32, h: u32, h264: bool) -> (u32, u32) {
         let longest = w.max(h).max(2);
         let mut cap = longest.min(PREVIEW_LONGEST_EDGE) & !1;
         loop {
@@ -110,7 +110,7 @@ impl PreviewVideoEncoder {
             };
             let (width, height) = (scale(w), scale(h));
             // H.264 level 3.1 MaxFS=3600 macroblocks, including padded edges.
-            if width.div_ceil(16) * height.div_ceil(16) <= 3600 || cap <= 2 {
+            if !h264 || width.div_ceil(16) * height.div_ceil(16) <= 3600 || cap <= 2 {
                 return (width, height);
             }
             cap -= 2;
@@ -149,7 +149,7 @@ impl PreviewVideoEncoder {
     fn open(&self, image: &Nv12Image) -> Option<VideoEncoder> {
         use ffmpeg_next::format::Pixel;
         use multiview_core::time::Rational;
-        let (w, h) = Self::target_dims(image);
+        let (w, h) = self.target_dims(image);
         // The preview cadence as an exact rational (invariant #3: never float fps).
         let fps = Rational::new(i64::from(PREVIEW_FPS), 1);
         let (encoder_name, options) = match self.codec {
@@ -978,6 +978,11 @@ mod tests {
 
     #[test]
     fn preview_shapes_fit_negotiated_level_31() {
+        assert_eq!(
+            super::PreviewVideoEncoder::bounded_dims(1280, 1280, false),
+            (1280, 1280),
+            "VP8 keeps its original edge-only cap"
+        );
         for (width, height) in [
             (1920, 1080),
             (1080, 1920),
@@ -986,18 +991,18 @@ mod tests {
             (3, 5),
             (1, 1),
         ] {
-            let (w, h) = super::PreviewVideoEncoder::bounded_dims(width, height);
+            let (w, h) = super::PreviewVideoEncoder::bounded_dims(width, height, true);
             assert!(w >= 2 && h >= 2 && w % 2 == 0 && h % 2 == 0);
             let macroblocks = w.div_ceil(16) * h.div_ceil(16);
             assert!(macroblocks <= 3600);
             assert!(macroblocks * super::PREVIEW_FPS <= 108_000);
         }
         assert_eq!(
-            super::PreviewVideoEncoder::bounded_dims(1920, 1080),
+            super::PreviewVideoEncoder::bounded_dims(1920, 1080, true),
             (1280, 720)
         );
         assert_eq!(
-            super::PreviewVideoEncoder::bounded_dims(1080, 1920),
+            super::PreviewVideoEncoder::bounded_dims(1080, 1920, true),
             (720, 1280)
         );
     }
