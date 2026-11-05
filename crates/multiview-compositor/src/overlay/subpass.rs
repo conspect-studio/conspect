@@ -1180,6 +1180,23 @@ pub fn apply_overlays_to_nv12_reference(
     Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag())
 }
 
+// Each reason has its own lock-free counter. Emit the first fallback and one
+// update per 1024 occurrences; a persistent mismatch must not flood the log.
+static PRIMITIVE_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COLOR_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REGION_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cumulative full-canvas fallbacks by reason: primitive count, canvas color,
+/// then region work. These are lock-free counters for diagnostic sampling.
+#[must_use]
+pub fn overlay_fallback_counts() -> [u64; 3] {
+    [
+        PRIMITIVE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+        COLOR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+        REGION_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
 fn overlay_reference_fallback(
     image: &Nv12Image,
     list: &OverlayDrawList,
@@ -1188,13 +1205,22 @@ fn overlay_reference_fallback(
     actual: u64,
     limit: u64,
 ) -> Result<Nv12Image> {
-    tracing::warn!(
-        reason,
-        actual,
-        limit,
-        primitives = list.len(),
-        "overlay optimization bypassed; using full-canvas reference"
-    );
+    let counter = match reason {
+        "primitive count" => &PRIMITIVE_FALLBACKS,
+        "canvas color mismatch" => &COLOR_FALLBACKS,
+        _ => &REGION_FALLBACKS,
+    };
+    let occurrence = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if occurrence == 1 || occurrence % 1024 == 0 {
+        tracing::warn!(
+            reason,
+            actual,
+            limit,
+            occurrences = occurrence,
+            primitives = list.len(),
+            "overlay optimization bypassed; using full-canvas reference"
+        );
+    }
     apply_overlays_to_nv12_reference(image, list, canvas)
 }
 
@@ -1224,7 +1250,16 @@ pub fn apply_overlays_to_nv12(
     list: &OverlayDrawList,
     canvas: CanvasColor,
 ) -> Result<Nv12Image> {
-    const MAX_PRIMITIVES: usize = 1024;
+    apply_overlays_with_limit(image, list, canvas, 1024)
+}
+
+#[allow(clippy::too_many_lines)] // Shared production and small-budget test path.
+fn apply_overlays_with_limit(
+    image: &Nv12Image,
+    list: &OverlayDrawList,
+    canvas: CanvasColor,
+    max_primitives: usize,
+) -> Result<Nv12Image> {
     const COALESCE_LIMIT: usize = 64;
     let width = image.width();
     let height = image.height();
@@ -1233,14 +1268,14 @@ pub fn apply_overlays_to_nv12(
     // These are optimization admission limits, never validity checks. A complex
     // but valid draw list must not terminate the output consumer and all HLS
     // renditions. The reference path preserves every primitive in order.
-    if list.len() > MAX_PRIMITIVES {
+    if list.len() > max_primitives {
         return overlay_reference_fallback(
             image,
             list,
             canvas,
             "primitive count",
             u64::try_from(list.len()).unwrap_or(u64::MAX),
-            u64::try_from(MAX_PRIMITIVES).unwrap_or(u64::MAX),
+            u64::try_from(max_primitives).unwrap_or(u64::MAX),
         );
     }
 
@@ -1629,9 +1664,29 @@ fn write_nv12_pixel(
 #[cfg(test)]
 mod dirty_rects_tests {
     use super::{
-        overlay_dirty_rects, DirtyRect, OverlayColor, OverlayDrawList, OverlayPrimitive,
-        OverlayRect,
+        apply_overlays_to_nv12_reference, apply_overlays_with_limit, overlay_dirty_rects,
+        DirtyRect, OverlayColor, OverlayDrawList, OverlayPrimitive, OverlayRect,
     };
+    use crate::pipeline::{CanvasColor, Nv12Image};
+
+    #[test]
+    fn tiny_complexity_limit_preserves_all_source_over_pixels() {
+        let canvas = CanvasColor::default();
+        let image =
+            Nv12Image::solid(48, 32, 80, 120, 140, canvas.output_tag()).expect("small canvas");
+        let mut list = OverlayDrawList::new();
+        for n in 0..5 {
+            list.push(OverlayPrimitive::FilledRect {
+                rect: OverlayRect::new(n * 2, 4, 15, 15),
+                corner_radius: 0,
+                color: OverlayColor::new(0.3, 0.7, 0.2, 0.25),
+            });
+        }
+        let actual = apply_overlays_with_limit(&image, &list, canvas, 4).expect("fallback");
+        let reference = apply_overlays_to_nv12_reference(&image, &list, canvas).expect("oracle");
+        assert_eq!(actual.y_plane(), reference.y_plane());
+        assert_eq!(actual.uv_plane(), reference.uv_plane());
+    }
 
     fn green() -> OverlayColor {
         OverlayColor::opaque(0.0, 1.0, 0.0)
