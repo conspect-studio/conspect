@@ -21,6 +21,9 @@ import type { JSX } from 'react';
 import { useLingui } from '@lingui/react/macro';
 import { Volume2, VolumeX } from 'lucide-react';
 
+import { safeStats, safeStates, failureStage } from './diagnostics';
+import type { FailureStage, PreviewDiagnostics } from './diagnostics';
+
 import { Button } from '../components/ui/button';
 import { defaultPcFactory } from './pcFactory';
 import type { PeerConnectionFactory } from './pcFactory';
@@ -62,26 +65,6 @@ function awaitIceGathering(pc: RTCPeerConnection): Promise<void> {
   });
 }
 
-/** Read a numeric `bytesReceived` off a stats entry, or 0 when absent. */
-function bytesReceivedOf(stat: RTCStats): number {
-  // `RTCStats` is the base type; `bytesReceived` lives on the inbound-rtp
-  // refinement. Read it structurally without a narrowing assertion.
-  const record: Record<string, unknown> = { ...stat };
-  const bytes = record.bytesReceived;
-  return typeof bytes === 'number' ? bytes : 0;
-}
-
-/** Sum the `bytesReceived` over every inbound-rtp report in a stats snapshot. */
-function inboundBytes(report: RTCStatsReport): number {
-  let total = 0;
-  report.forEach((stat: RTCStats) => {
-    if (stat.type === 'inbound-rtp') {
-      total += bytesReceivedOf(stat);
-    }
-  });
-  return total;
-}
-
 /**
  * The WHEP player. Renders a muted, inline `<video>` and drives the full
  * negotiate/connect/teardown lifecycle. Calls `onStatus` on each transition and
@@ -115,7 +98,7 @@ export function WhepPlayer({
   /** Lifecycle callback — connecting → playing, or → failed. */
   readonly onStatus?: ((status: WhepPlayerStatus) => void) | undefined;
   /** Called once when the session fails (fatal): the surface degrades to JPEG. */
-  readonly onFatal?: (() => void) | undefined;
+  readonly onFatal?: ((diagnostics: PreviewDiagnostics) => void) | undefined;
   /** Overridable fetch (tests inject a mock; default is global fetch). */
   readonly fetchImpl?: typeof fetch | undefined;
   /** Fires after the teardown request completes, for single-focus handoff. */
@@ -152,7 +135,21 @@ export function WhepPlayer({
     const aborted = (): boolean => abort.signal.aborted;
     let sessionUrl: string | undefined;
     let statsTimer: number | undefined;
-    const effectiveFetch = fetchImpl ?? fetch;
+    const startedAt = Date.now();
+    let connectedAt: number | undefined;
+    let signalingMs: number | null = null;
+    let httpStatus: number | null = null;
+    let media = safeStats();
+    let failed = false;
+    let connectTimer: number | undefined;
+    const effectiveFetch: typeof fetch = async (input, init) => {
+      const response = await (fetchImpl ?? fetch)(input, init);
+      if (init?.method === 'POST') {
+        httpStatus = response.status;
+        signalingMs = Date.now() - startedAt;
+      }
+      return response;
+    };
     const pc = pcFactory(rtcConfig ?? {});
     onLeaseState?.('negotiating');
     let releaseStarted: Promise<void> | undefined;
@@ -178,13 +175,32 @@ export function WhepPlayer({
       onStatusRef.current?.(next);
     };
 
-    const fail = (): void => {
-      if (aborted()) {
+    const fail = (stage: FailureStage = 'signaling'): void => {
+      if (aborted() || failed) {
         return;
       }
+      failed = true;
+      window.clearTimeout(connectTimer);
+      window.clearInterval(statsTimer);
       setStatusOnce('failed');
-      onFatalRef.current?.();
+      onFatalRef.current?.({ stage, httpStatus, elapsedMs: Date.now() - startedAt,
+        signalingMs, connectedMs: connectedAt === undefined ? null : Date.now() - connectedAt,
+        ...safeStates(pc), media });
     };
+
+    const onIceChange = (): void => {
+      if (pc.iceConnectionState === 'failed') fail('ice-failed');
+    };
+    pc.addEventListener('iceconnectionstatechange', onIceChange);
+    // Capture transport evidence even before connected (notably DTLS failure).
+    const diagnosticTimer = window.setInterval(() => {
+      if (aborted() || failed || connectedAt !== undefined) return;
+      void pc.getStats().then((report) => {
+        if (aborted() || failed) return;
+        media = safeStats(report);
+        if (media.dtls === 'failed') fail('dtls-failed');
+      }).catch(() => undefined);
+    }, STATS_POLL_MS);
 
     // recvonly video + audio so the offer always carries both m-lines.
     pc.addTransceiver('video', { direction: 'recvonly' });
@@ -200,7 +216,10 @@ export function WhepPlayer({
     };
 
     pc.onconnectionstatechange = (): void => {
+      if (aborted() || failed) return;
       if (pc.connectionState === 'connected') {
+        window.clearTimeout(connectTimer);
+        connectedAt ??= Date.now();
         setStatusOnce('playing');
         const video = videoRef.current;
         if (video !== null) {
@@ -209,32 +228,34 @@ export function WhepPlayer({
           video.muted = true;
           video.playsInline = true;
           // play() returns a Promise in modern browsers, `undefined` in some
-          // impls, and THROWS in jsdom (not implemented). A failed autoplay is
-          // non-fatal — the surface still shows pixels once the user interacts.
+          // impls. Report rejection without copying browser error text.
           try {
             const played: unknown = video.play();
             if (played instanceof Promise) {
-              played.catch(() => undefined);
+              played.catch(() => { fail('media-play-error'); });
             }
           } catch {
-            // jsdom / unsupported: ignore.
+            fail('media-play-error');
           }
         }
         startStallWatchdog();
       } else if (pc.connectionState === 'failed') {
-        fail();
+        fail(pc.iceConnectionState === 'failed' ? 'ice-failed' : media.dtls === 'failed' ? 'dtls-failed' : 'peer-failed');
       }
     };
 
     // The getStats watchdog: catch the silent-blackness failure mode where the
     // connection reports `connected` but no media flows.
     let lastBytes = 0;
+    let lastFrames = 0;
+    let lastDecodeAt = Date.now();
     let lastProgressAt = Date.now();
     const startStallWatchdog = (): void => {
       if (statsTimer !== undefined) {
         return;
       }
       lastProgressAt = Date.now();
+      lastDecodeAt = Date.now();
       statsTimer = window.setInterval(() => {
         void pc
           .getStats()
@@ -242,13 +263,19 @@ export function WhepPlayer({
             if (aborted()) {
               return;
             }
-            const bytes = inboundBytes(report);
-            if (bytes > lastBytes) {
+            media = safeStats(report);
+            const bytes = media.bytesReceived;
+            if (media.framesDecoded !== null && media.framesDecoded > lastFrames) {
+              lastFrames = media.framesDecoded;
+              lastDecodeAt = Date.now();
+            }
+            if (bytes !== null && bytes > lastBytes) {
               lastBytes = bytes;
               lastProgressAt = Date.now();
             } else if (Date.now() - lastProgressAt > STALL_TIMEOUT_MS) {
-              fail();
+              fail(failureStage(media));
             }
+            if (media.framesDecoded === 0 && Date.now() - lastDecodeAt > STALL_TIMEOUT_MS) fail(failureStage(media));
           })
           .catch(() => {
             // A failed getStats is not, on its own, a stall signal.
@@ -272,6 +299,9 @@ export function WhepPlayer({
       sessionUrl = answer.sessionUrl;
       if (aborted()) return;
       onLeaseState?.('active');
+      connectTimer = window.setTimeout(() => {
+        fail(media.dtls === 'failed' ? 'dtls-failed' : 'ice-timeout');
+      }, 15000);
       await pc.setRemoteDescription({ type: 'answer', sdp: answer.answerSdp });
     };
 
@@ -279,7 +309,7 @@ export function WhepPlayer({
       if (error instanceof WhepSignalingError && error.status === 503 && !aborted()) {
         onBusyRef.current?.();
       }
-      fail();
+      fail(httpStatus === 503 ? 'http-capacity' : httpStatus !== null && (httpStatus < 200 || httpStatus >= 300) ? 'http-error' : 'signaling');
     });
 
     // Tear down promptly on a tab close / navigation, not only on unmount.
@@ -290,6 +320,9 @@ export function WhepPlayer({
 
     return (): void => {
       abort.abort();
+      window.clearInterval(diagnosticTimer);
+      pc.removeEventListener('iceconnectionstatechange', onIceChange);
+      window.clearTimeout(connectTimer);
       window.removeEventListener('pagehide', onPageHide);
       if (statsTimer !== undefined) {
         window.clearInterval(statsTimer);

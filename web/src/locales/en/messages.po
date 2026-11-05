@@ -1787,6 +1787,10 @@ msgstr "Connecting"
 msgid "Connecting…"
 msgstr "Connecting…"
 
+#: src/preview/PreviewDiagnostics.tsx:13
+msgid "Connection timed out. The network cause is unknown."
+msgstr "Connection timed out. The network cause is unknown."
+
 #: src/pages/OutputsPage.tsx:437
 msgid "Connector"
 msgstr "Connector"
@@ -1831,6 +1835,10 @@ msgstr "Copied"
 #: src/resources/FormControls.tsx:376
 msgid "Copy {label}"
 msgstr "Copy {label}"
+
+#: src/preview/PreviewDiagnostics.tsx:33
+msgid "Copy diagnostics"
+msgstr "Copy diagnostics"
 
 #: src/resources/FormControls.tsx:347
 msgid "Copy failed"
@@ -1883,6 +1891,10 @@ msgstr "Could not change the mode"
 #: src/pages/SupportPage.tsx:411
 msgid "Could not compose the bundle"
 msgstr "Could not compose the bundle"
+
+#: src/preview/PreviewDiagnostics.tsx:34
+msgid "Could not copy diagnostics. Select the safe technical details and copy them manually."
+msgstr "Could not copy diagnostics. Select the safe technical details and copy them manually."
 
 #: src/resources/CrudPage.tsx:271
 msgid "Could not create"
@@ -2472,6 +2484,10 @@ msgstr "Devices never carry the program: Multiview's program output never depend
 msgid "Devices that need authentication take a secret reference (e.g. <0>op://Site/foyer-decoder/credentials</0>), never a plaintext password: the configuration only ever stores and exports the reference. If a device rejects its credentials it parks in AUTH_FAILED with no blind retries; updating the secret reference re-probes automatically."
 msgstr "Devices that need authentication take a secret reference (e.g. <0>op://Site/foyer-decoder/credentials</0>), never a plaintext password: the configuration only ever stores and exports the reference. If a device rejects its credentials it parks in AUTH_FAILED with no blind retries; updating the secret reference re-probes automatically."
 
+#: src/preview/PreviewDiagnostics.tsx:34
+msgid "Diagnostics copied."
+msgstr "Diagnostics copied."
+
 #: src/pages/DataPage.tsx:340
 msgid "Diagnostics snapshot"
 msgstr "Diagnostics snapshot"
@@ -2674,6 +2690,10 @@ msgstr "DST-correct, preferred over a fixed offset (e.g. Australia/Sydney, UTC).
 #: src/pages/SourcesPage.tsx:521
 msgid "DST-correct, preferred over a fixed offset. Leave blank to use a fixed offset instead."
 msgstr "DST-correct, preferred over a fixed offset. Leave blank to use a fixed offset instead."
+
+#: src/preview/PreviewDiagnostics.tsx:16
+msgid "DTLS transport failed."
+msgstr "DTLS transport failed."
 
 #: src/pages/SourcesPage.tsx:305
 msgid "Dual (analogue face + digital readout)"
@@ -3096,7 +3116,7 @@ msgstr "Face"
 msgid "Failures use RFC 9457 problem documents (<0>application/problem+json</0>) with a machine-readable type and a human-readable detail."
 msgstr "Failures use RFC 9457 problem documents (<0>application/problem+json</0>) with a machine-readable type and a human-readable detail."
 
-#: src/preview/PreviewSurface.tsx:76
+#: src/preview/PreviewSurface.tsx:78
 msgid "Fallback — still preview (~1 fps)"
 msgstr "Fallback — still preview (~1 fps)"
 
@@ -3564,6 +3584,10 @@ msgstr "HTTP(S) management endpoint. Wrap IPv6 literals in brackets."
 msgid "ICE (Interactive Connectivity Establishment)"
 msgstr "ICE (Interactive Connectivity Establishment)"
 
+#: src/preview/PreviewDiagnostics.tsx:14
+msgid "ICE connection failed. The network cause is unknown."
+msgstr "ICE connection failed. The network cause is unknown."
+
 #: src/pages/docs/ApiPage.tsx:80
 msgid "Idempotency"
 msgstr "Idempotency"
@@ -3627,6 +3651,10 @@ msgstr "In this UI, set your token under Settings, then API access. For a contai
 #: src/pages/docs/concepts/TransportsPage.tsx:314
 msgid "In-facility broadcast distribution"
 msgstr "In-facility broadcast distribution"
+
+#: src/preview/PreviewDiagnostics.tsx:19
+msgid "Inbound video stopped progressing."
+msgstr "Inbound video stopped progressing."
 
 #: src/pages/SupportPage.tsx:456
 msgid "Include"
@@ -4021,19 +4049,19 @@ msgstr "Live ephemeral cast sessions."
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
-#: src/preview/PreviewSurface.tsx:154
+#: src/preview/PreviewSurface.tsx:157
 msgid "Live input preview failed."
 msgstr "Live input preview failed."
 
-#: src/preview/PreviewSurface.tsx:154
+#: src/preview/PreviewSurface.tsx:157
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr "Live input preview is busy. Another viewer has the session."
 
-#: src/preview/PreviewSurface.tsx:146
+#: src/preview/PreviewSurface.tsx:149
 msgid "Live input video is unavailable on this server."
 msgstr "Live input video is unavailable on this server."
 
-#: src/preview/PreviewSurface.tsx:167
+#: src/preview/PreviewSurface.tsx:170
 msgid "Live preview is busy. Another viewer has the session."
 msgstr "Live preview is busy. Another viewer has the session."
 
@@ -4618,7 +4646,7 @@ msgstr "Mutable resources carry an <0>ETag</0>. Send it back as <1>If-Match</1> 
 msgid "Mute"
 msgstr "Mute"
 
-#: src/preview/WhepPlayer.tsx:327
+#: src/preview/WhepPlayer.tsx:360
 msgid "Mute {label}"
 msgstr "Mute {label}"
 
@@ -4831,6 +4859,10 @@ msgstr "No GPUs are reported on this host."
 #: src/pages/SystemPage.tsx:309
 msgid "No host-memory sample."
 msgstr "No host-memory sample."
+
+#: src/preview/PreviewDiagnostics.tsx:17
+msgid "No inbound video RTP bytes were reported."
+msgstr "No inbound video RTP bytes were reported."
 
 #: src/pages/MonitoringPage.tsx:209
 msgid "No inputs are available to preview."
@@ -5392,6 +5424,10 @@ msgstr "Paused"
 msgid "Peer"
 msgstr "Peer"
 
+#: src/preview/PreviewDiagnostics.tsx:15
+msgid "Peer connection failed. The cause is unknown."
+msgstr "Peer connection failed. The cause is unknown."
+
 #: src/pages/MeshPage.tsx:177
 msgid "Peers discovered"
 msgstr "Peers discovered"
@@ -5500,6 +5536,14 @@ msgstr "Preview"
 #: src/pages/MonitoringPage.tsx:306
 msgid "Preview — input {0}"
 msgstr "Preview — input {0}"
+
+#: src/preview/PreviewDiagnostics.tsx:24
+msgid "Preview diagnostics"
+msgstr "Preview diagnostics"
+
+#: src/preview/PreviewDiagnostics.tsx:12
+msgid "Preview negotiation failed."
+msgstr "Preview negotiation failed."
 
 #. placeholder {0}: props.id
 #: src/pages/MonitoringPage.tsx:278
@@ -5970,7 +6014,7 @@ msgstr "Restart pending:"
 msgid "Results stream in below as they are found. {0}"
 msgstr "Results stream in below as they are found. {0}"
 
-#: src/preview/PreviewSurface.tsx:87
+#: src/preview/PreviewSurface.tsx:89
 msgid "Retry live preview"
 msgstr "Retry live preview"
 
@@ -6081,6 +6125,10 @@ msgstr "Runnable"
 #: src/pages/docs/ContainerPage.tsx:23
 msgid "Running in containers"
 msgstr "Running in containers"
+
+#: src/preview/PreviewDiagnostics.tsx:27
+msgid "Safe technical details"
+msgstr "Safe technical details"
 
 #: src/pages/DataPage.tsx:132
 msgid "Salted digests and a signed lease request — never raw serials, MAC addresses, or media. The exhaustive list:"
@@ -6528,7 +6576,7 @@ msgstr "Stereo"
 msgid "Still preview (~1 fps)"
 msgstr "Still preview (~1 fps)"
 
-#: src/preview/PreviewSurface.tsx:93
+#: src/preview/PreviewSurface.tsx:95
 msgid "Still preview (~1 fps) — live video is unavailable for this preview."
 msgstr "Still preview (~1 fps) — live video is unavailable for this preview."
 
@@ -6857,6 +6905,10 @@ msgstr "The amount of data a stream uses per second, usually in megabits per sec
 #: src/pages/docs/ApiPage.tsx:133
 msgid "The API authenticates each request with a bearer token in the <0>Authorization</0> header. A coarse role (admin, operator, or viewer) gates what actions a token may take, and a per-object check confines a token to the resources it owns."
 msgstr "The API authenticates each request with a bearer token in the <0>Authorization</0> header. A coarse role (admin, operator, or viewer) gates what actions a token may take, and a per-object check confines a token to the resources it owns."
+
+#: src/preview/PreviewDiagnostics.tsx:21
+msgid "The browser could not play the preview media."
+msgstr "The browser could not play the preview media."
 
 #: src/pages/docs/FeaturesPage.tsx:18
 msgid "The building blocks of a Multiview deployment, and what each one does."
@@ -7569,11 +7621,15 @@ msgstr "unhealthy"
 msgid "Unknown error"
 msgstr "Unknown error"
 
+#: src/preview/PreviewDiagnostics.tsx:26
+msgid "Unknown values mean the browser did not provide evidence. Network blocking is not established."
+msgstr "Unknown values mean the browser did not provide evidence. Network blocking is not established."
+
 #: src/pages/LicencePage.tsx:148
 msgid "unlimited"
 msgstr "unlimited"
 
-#: src/preview/WhepPlayer.tsx:327
+#: src/preview/WhepPlayer.tsx:360
 msgid "Unmute {label}"
 msgstr "Unmute {label}"
 
@@ -7659,6 +7715,14 @@ msgstr "Very low (<1 s)"
 msgid "Very low (~1 frame)"
 msgstr "Very low (~1 frame)"
 
+#: src/preview/PreviewDiagnostics.tsx:20
+msgid "Video progress could not be determined from browser statistics."
+msgstr "Video progress could not be determined from browser statistics."
+
+#: src/preview/PreviewDiagnostics.tsx:18
+msgid "Video RTP arrived, but no decoded frames were reported."
+msgstr "Video RTP arrived, but no decoded frames were reported."
+
 #: src/pages/docs/concepts/GlossaryPage.tsx:101
 msgid "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
 msgstr "Video using a brightness curve (PQ or HLG) and usually the BT.2020 gamut that represents far brighter highlights and deeper shadows than standard dynamic range (SDR). HDR tiles must be tone-mapped onto an SDR canvas or they look dim and grey."
@@ -7729,7 +7793,7 @@ msgid "VT transport for the configured media-player channels. Load an asset, cue
 msgstr "VT transport for the configured media-player channels. Load an asset, cue, play, pause, stop, and — for a vamp/loop fill — arm, take, or cancel a clean exit at the next vamp boundary. Each command is accepted asynchronously; the player's live state and playhead arrive on the realtime stream."
 
 #: src/pages/MonitoringPage.tsx:80
-#: src/preview/PreviewSurface.tsx:41
+#: src/preview/PreviewSurface.tsx:43
 msgid "Waiting for a frame…"
 msgstr "Waiting for a frame…"
 
@@ -7908,6 +7972,14 @@ msgstr "When this machine has no internet path to the licence server, exchange a
 #: src/pages/docs/concepts/GlossaryPage.tsx:359
 msgid "WHEP (WebRTC-HTTP Egress Protocol)"
 msgstr "WHEP (WebRTC-HTTP Egress Protocol)"
+
+#: src/preview/PreviewDiagnostics.tsx:10
+msgid "WHEP capacity response. The server could not accept this preview."
+msgstr "WHEP capacity response. The server could not accept this preview."
+
+#: src/preview/PreviewDiagnostics.tsx:11
+msgid "WHEP HTTP request failed."
+msgstr "WHEP HTTP request failed."
 
 #: src/pages/OutputsPage.tsx:315
 msgid "WHEP play endpoint"

@@ -18,6 +18,8 @@ import { Button } from '../components/ui/button';
 import { whepAvailable } from './capabilities';
 import type { PreviewCapabilities, PreviewScope } from './capabilities';
 import { useJpegPreview } from './useJpegPreview';
+import { PreviewDiagnostics } from './PreviewDiagnostics';
+import type { PreviewDiagnostics as Diagnostics } from './diagnostics';
 import { WhepPlayer } from './WhepPlayer';
 import type { PeerConnectionFactory } from './pcFactory';
 
@@ -136,6 +138,7 @@ export function PreviewSurface({
   // to JPEG-with-badge on a fatal error and clears on a retry.
   const [attempt, setAttempt] = useState(0);
   const [degraded, setDegraded] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<Diagnostics>();
   const [busy, setBusy] = useState(false);
   const [released, setReleased] = useState(true);
 
@@ -151,7 +154,7 @@ export function PreviewSurface({
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
     if (scope === 'input') {
-      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={(): void => { setBusy(false); setDegraded(false); setAttempt((n) => n + 1); }}>Retry live preview</Button> : null}</div>;
+      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={(): void => { setBusy(false); setDegraded(false); setAttempt((n) => n + 1); }}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>;
     }
     return (
       <><JpegRung
@@ -164,7 +167,7 @@ export function PreviewSurface({
           setDegraded(false);
           setAttempt((n) => n + 1);
         } } : {})}
-      />{busy ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null}</>
+      />{busy ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</>
     );
   }
 
@@ -184,7 +187,8 @@ export function PreviewSurface({
         onLeaseState?.(state);
       }}
       onBusy={(): void => { setBusy(true); }}
-      onFatal={(): void => {
+      onFatal={(details): void => {
+        setDiagnostics(details);
         setDegraded(true);
       }}
     />
