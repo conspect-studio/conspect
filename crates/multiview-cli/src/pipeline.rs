@@ -1614,6 +1614,10 @@ pub struct Pipeline {
     /// Frame-boundary tile geometry and bindings for the off-clock bake consumer.
     #[cfg(feature = "overlay")]
     tile_spec_apply: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    /// Source-kind audio applicability, refreshed at frame-boundary live edits.
+    /// Missing PCM from a decoded source is unknown, not proof of no audio.
+    #[cfg(feature = "overlay")]
+    audio_free_sources: AudioFreeSources,
     /// Operator-declared content-fault probes, resolved from `config.probes`
     /// (M10). Each probe `watches` a cell; this resolves that cell to its bound
     /// **source** so the per-tick [`FaultDetector`] can build that source's fault
@@ -2242,6 +2246,15 @@ impl Pipeline {
         // serial build path (#48), indexed by id for the loop's cheap lookup.
         #[cfg(feature = "overlay")]
         let mut prefetched_captions = prefetch_caption_plans(config);
+        #[cfg(feature = "overlay")]
+        let audio_free_sources = Arc::new(multiview_framestore::SwapCell::from_pointee(
+            config
+                .sources
+                .iter()
+                .filter(|source| is_intentionally_audio_free(&source.kind))
+                .map(|source| source.id.clone())
+                .collect(),
+        ));
 
         // MP-2 (ADR-0030 §3): the SourceRegistry owns each source's shared TileStore
         // and its decode sizing. In this single-program build it keys by source id —
@@ -2619,6 +2632,8 @@ impl Pipeline {
             tile_labels,
             #[cfg(feature = "overlay")]
             tile_spec_apply,
+            #[cfg(feature = "overlay")]
+            audio_free_sources,
             #[cfg(feature = "overlay")]
             declared_probes: config.probes.clone(),
             #[cfg(feature = "overlay")]
@@ -3764,6 +3779,7 @@ impl Pipeline {
             self.meter_db_timelines.clone(),
             self.audio_stores.clone(),
             self.cadence,
+            Arc::clone(&self.audio_free_sources),
             source_probes,
         );
         // The last fault verdict, reused on cadence-hold REPEAT frames (#143): a
@@ -4079,6 +4095,13 @@ impl Pipeline {
         &self,
     ) -> Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>> {
         Arc::clone(&self.tile_spec_apply)
+    }
+
+    /// Share source-kind applicability with the frame-boundary command drain.
+    #[cfg(feature = "overlay")]
+    #[must_use]
+    pub fn audio_free_sources_slot(&self) -> AudioFreeSources {
+        Arc::clone(&self.audio_free_sources)
     }
 
     /// Extract the **`Send`** bake context the off-hot-path consumer thread owns
@@ -5956,6 +5979,18 @@ const SILENCE_FLOOR_DB: f64 = -50.0;
 /// first decoded frame) cannot reset an otherwise-sustained freeze. Black and
 /// silence are unaffected.
 #[cfg(feature = "overlay")]
+pub(crate) type AudioFreeSources =
+    Arc<multiview_framestore::SwapCell<Arc<std::collections::HashSet<String>>>>;
+
+#[cfg(feature = "overlay")]
+fn is_intentionally_audio_free(kind: &SourceKind) -> bool {
+    matches!(
+        kind,
+        SourceKind::Clock { .. } | SourceKind::Timer { .. } | SourceKind::Solid { .. }
+    )
+}
+
+#[cfg(feature = "overlay")]
 struct FaultDetector {
     /// The per-source last-good stores, shared with the engine drive loop.
     stores: HashMapStores,
@@ -5964,6 +5999,7 @@ struct FaultDetector {
     /// Source PCM before program routing, gain or mute.
     audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
     cadence: Rational,
+    audio_free_sources: AudioFreeSources,
     /// Per-source dwell/hysteresis state machines for each fault class.
     machines: std::collections::HashMap<String, SourceFaultMachines>,
     /// The stateless black probe (default broadcast threshold).
@@ -6037,6 +6073,16 @@ struct SourceFaultMachines {
 
 #[cfg(feature = "overlay")]
 impl SourceFaultMachines {
+    fn reset_silence(&mut self) {
+        // Applicability changed, not a measured non-silent interval. Clear
+        // even a latched alarm without advancing evidence or clear dwell.
+        self.silence.reset();
+        self.silence_evidence_pts = MediaTime::ZERO;
+        self.last_silence_pts = None;
+        self.last_silence_index = None;
+        self.previous_silence_known = false;
+    }
+
     fn observe_silence(&mut self, measured: Option<bool>, pts: MediaTime, index: u64) {
         if let Some(condition) = measured {
             // The detector does not sample runtime repeat frames or skipped ticks.
@@ -6073,6 +6119,7 @@ impl FaultDetector {
         meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
         audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
         cadence: Rational,
+        audio_free_sources: AudioFreeSources,
         source_probes: std::collections::HashMap<String, SourceProbeOverride>,
     ) -> Self {
         use multiview_engine::{
@@ -6147,6 +6194,7 @@ impl FaultDetector {
             meter_db_timelines,
             audio_stores,
             cadence,
+            audio_free_sources,
             machines: std::collections::HashMap::new(),
             black: BlackProbe::new(BlackConfig::default()),
             freeze: FreezeProbe::new(freeze_cfg),
@@ -6241,6 +6289,7 @@ impl FaultDetector {
         // Snapshot the source ids this tick (sorted for deterministic logging).
         let mut ids: Vec<String> = source_states.keys().cloned().collect();
         ids.sort_unstable();
+        let audio_free = self.audio_free_sources.load();
         for id in ids {
             // Sample this tile's last-good frame (lock-free; never blocks).
             let frame = self
@@ -6263,8 +6312,14 @@ impl FaultDetector {
                 self.previous.remove(&id);
                 self.freeze_window.remove(&id);
             }
-            // Instantaneous silence from the per-input meter timeline.
-            let silence_now = self.silence_now(&id, index, pts);
+            // An intentional audio-free kind has no silence probe. A source
+            // edited to that kind must explicitly clear its old active fault.
+            let intentionally_audio_free = audio_free.contains(&id);
+            let silence_now = if intentionally_audio_free {
+                None
+            } else {
+                self.silence_now(&id, index, pts)
+            };
 
             // Debounce the freeze condition over a short window so a single noisy
             // GOP-boundary / warm-up frame cannot reset the 2 s freeze dwell.
@@ -6274,7 +6329,11 @@ impl FaultDetector {
             let machines = self.machines_for(&id);
             machines.black.observe(black_now, pts);
             machines.freeze.observe(freeze_debounced, pts);
-            machines.observe_silence(silence_now, pts, index);
+            if intentionally_audio_free {
+                machines.reset_silence();
+            } else {
+                machines.observe_silence(silence_now, pts, index);
+            }
 
             // Precedence: black > freeze > silence (a black picture is the most
             // specific/severe content fault; a still or silent tile is lesser).
@@ -6361,8 +6420,8 @@ impl FaultDetector {
     /// The source's build-time meter reading is at/below its silence floor. The
     /// floor is operator-declared `level_dbfs` when this source has a silence probe
     /// (M10), otherwise the shared default [`SILENCE_FLOOR_DB`]. A source with no
-    /// meter timeline rides the meter floor (which is below either silence floor),
-    /// so an audio-free tile reads silent.
+    /// meter timeline is an unknown condition: lack of an audio store never
+    /// proves that a decoded source intentionally has no audio.
     fn silence_now(&self, id: &str, index: u64, pts: MediaTime) -> Option<bool> {
         let floor = self
             .declared_silence_floor
@@ -6396,17 +6455,9 @@ impl FaultDetector {
                 multiview_audio::store::PcmMeasurement::Unknown => None,
             };
         }
-        let db = match self.meter_db_timelines.get(id) {
-            Some(timeline) => {
-                let i = usize::try_from(index).unwrap_or(usize::MAX);
-                timeline
-                    .get(i)
-                    .copied()
-                    .or_else(|| timeline.last().copied())
-                    .unwrap_or(multiview_audio::Ballistics::FLOOR_DB)
-            }
-            None => multiview_audio::Ballistics::FLOOR_DB,
-        };
+        let timeline = self.meter_db_timelines.get(id)?;
+        let i = usize::try_from(index).ok()?;
+        let db = timeline.get(i).copied()?;
         Some(db <= floor)
     }
 }
@@ -14461,6 +14512,9 @@ mod fault_detector_tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             source_probes_for(id, &[probe]),
         );
         let states = live_states(id);
@@ -14506,6 +14560,9 @@ mod fault_detector_tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -14564,6 +14621,9 @@ mod fault_detector_tests {
             std::collections::HashMap::new(),
             audio_stores,
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         (det, video, audio)
@@ -14782,6 +14842,132 @@ mod fault_detector_tests {
     }
 
     #[test]
+    fn synthetic_audio_applicability_and_live_edits_preserve_measured_silence() {
+        let kind = |json: &str| serde_json::from_str::<SourceKind>(json).unwrap();
+        for json in [
+            r#"{"kind":"clock"}"#,
+            r#"{"kind":"timer","target":"time_of_day","at":"12:00:00"}"#,
+            r##"{"kind":"solid","color":"#abcdef"}"##,
+        ] {
+            assert!(is_intentionally_audio_free(&kind(json)), "{json}");
+        }
+        for json in [
+            r#"{"kind":"bars"}"#,
+            r#"{"kind":"hls","url":"https://example.test/a.m3u8"}"#,
+            r#"{"kind":"rtsp","url":"rtsp://example.test/a"}"#,
+            r#"{"kind":"file","path":"/missing"}"#,
+        ] {
+            assert!(!is_intentionally_audio_free(&kind(json)), "{json}");
+        }
+
+        let id = "edited";
+        let (stores, video) = store_for(id);
+        let applicability: AudioFreeSources =
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::from([id.to_owned()]),
+            ));
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            48_000,
+        ));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let mut detector = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            Arc::clone(&applicability),
+            std::collections::HashMap::new(),
+        );
+        for tick in 0..20 {
+            assert_ne!(
+                live_audio_tick(&mut detector, &video, &audio, id, tick, Some(0.0)),
+                TileFault::Silent
+            );
+        }
+        // Clock -> decoded source: prior synthetic silence adds no dwell.
+        applicability.store(Arc::new(std::collections::HashSet::new()));
+        assert_eq!(
+            live_audio_tick(&mut detector, &video, &audio, id, 20, None),
+            TileFault::None
+        );
+        for tick in 21..37 {
+            let fault = live_audio_tick(&mut detector, &video, &audio, id, tick, Some(0.0));
+            if tick == 36 {
+                assert_eq!(fault, TileFault::Silent);
+            }
+        }
+        // Decoded source -> clock: explicit reset clears without fabricated PCM.
+        applicability.store(Arc::new(std::collections::HashSet::from([id.to_owned()])));
+        assert_eq!(
+            live_audio_tick(&mut detector, &video, &audio, id, 37, None),
+            TileFault::None
+        );
+        // Clock -> decoded source: the first known sample cannot inherit dwell.
+        applicability.store(Arc::new(std::collections::HashSet::new()));
+        assert_eq!(
+            live_audio_tick(&mut detector, &video, &audio, id, 38, Some(0.0)),
+            TileFault::None
+        );
+    }
+
+    #[test]
+    fn bars_silent_tone_is_measured_but_missing_hls_audio_is_unknown() {
+        let id = "bars";
+        let (stores, video) = store_for(id);
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            48_000,
+        ));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let mut det = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashMap::new(),
+        );
+        for tick in 0..20 {
+            let fault = live_audio_tick(&mut det, &video, &audio, id, tick, Some(0.0));
+            if tick == 19 {
+                assert_eq!(fault, TileFault::Silent);
+            }
+        }
+        for tick in 20..33 {
+            let fault = live_audio_tick(&mut det, &video, &audio, id, tick, Some(0.2));
+            if tick == 32 {
+                assert_eq!(fault, TileFault::None);
+            }
+        }
+        let (stores, video) = store_for("hls");
+        let mut no_store = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashMap::new(),
+        );
+        for tick in 0..20 {
+            video.publish(moving(u8::try_from(tick).unwrap()), pts_of(tick));
+            assert_eq!(no_store.silence_now("hls", tick, pts_of(tick)), None);
+            assert_ne!(
+                no_store
+                    .sample(pts_of(tick), tick, &live_states("hls"))
+                    .get("hls"),
+                Some(&TileFault::Silent)
+            );
+        }
+    }
+
+    #[test]
     fn audible_live_source_without_file_meter_must_not_raise_no_audio() {
         let id = "live-hls";
         let (stores, video) = store_for(id);
@@ -14794,6 +14980,9 @@ mod fault_detector_tests {
             std::collections::HashMap::new(),
             audio_stores,
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -14873,6 +15062,9 @@ mod fault_detector_tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -14900,6 +15092,9 @@ mod fault_detector_tests {
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -14931,6 +15126,9 @@ mod fault_detector_tests {
             timelines,
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -14961,6 +15159,9 @@ mod fault_detector_tests {
             timelines,
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -14996,6 +15197,9 @@ mod fault_detector_tests {
             timelines,
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -15029,6 +15233,9 @@ mod fault_detector_tests {
             timelines,
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -15058,6 +15265,9 @@ mod fault_detector_tests {
             timelines,
             std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);

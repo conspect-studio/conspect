@@ -1215,6 +1215,7 @@ pub fn command_drain_with_seams(
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     overlays: crate::live_overlays::OverlayApplySlot,
     tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    audio_free: crate::pipeline::AudioFreeSources,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<
         String,
@@ -1226,6 +1227,7 @@ pub fn command_drain_with_seams(
         .with_audio_route(audio_route)
         .with_live_overlays(overlays)
         .with_tile_spec_apply(tiles)
+        .with_audio_free_sources(audio_free)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
     move |drive: &mut CompositorDrive<Nv12Image>| {
@@ -1337,6 +1339,8 @@ pub struct CommandDrain {
     #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
     tile_spec_apply:
         Option<Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>>,
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    audio_free_sources: Option<crate::pipeline::AudioFreeSources>,
     /// The media-player transport seam (ADR-0057 / ADR-0097): the per-player
     /// bounded [`TransportMailbox`](crate::player::TransportMailbox) the running
     /// player ingest thread drains between frames, keyed by player id. A
@@ -1379,6 +1383,8 @@ impl CommandDrain {
             live_overlays: None,
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             tile_spec_apply: None,
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+            audio_free_sources: None,
             player_mailboxes: std::collections::HashMap::new(),
             cell_ids_set: false,
             #[cfg(test)]
@@ -1429,6 +1435,13 @@ impl CommandDrain {
         tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
     ) -> Self {
         self.tile_spec_apply = Some(tiles);
+        self
+    }
+
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    #[must_use]
+    fn with_audio_free_sources(mut self, sources: crate::pipeline::AudioFreeSources) -> Self {
+        self.audio_free_sources = Some(sources);
         self
     }
 
@@ -2063,6 +2076,21 @@ impl CommandDrain {
             Some(slot) => *slot = source.clone(),
             None => self.config.sources.push(source.clone()),
         }
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+        if let Some(slot) = &self.audio_free_sources {
+            let mut audio_free = (*slot.load()).clone();
+            if matches!(
+                source.kind,
+                multiview_config::SourceKind::Clock { .. }
+                    | multiview_config::SourceKind::Timer { .. }
+                    | multiview_config::SourceKind::Solid { .. }
+            ) {
+                audio_free.insert(id);
+            } else {
+                audio_free.remove(&id);
+            }
+            slot.store(Arc::new(audio_free));
+        }
     }
 
     /// Apply a `RemoveSource` (ADR-W018 live remove) at the frame boundary:
@@ -2106,6 +2134,12 @@ impl CommandDrain {
             tracing::info!(source = %id, "remove_source: no registered store under that id");
         }
         self.config.sources.retain(|s| s.id != id);
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+        if let Some(slot) = &self.audio_free_sources {
+            let mut audio_free = (*slot.load()).clone();
+            audio_free.remove(id);
+            slot.store(Arc::new(audio_free));
+        }
     }
 
     /// Apply an `UpsertOverlay` (ADR-W022) at the frame boundary: upsert the

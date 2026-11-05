@@ -679,6 +679,7 @@ async fn run_pipeline_until_ctrl_c(
             pipeline.audio_route_slot(),
             pipeline.overlay_apply_slot(),
             pipeline.tile_spec_apply_slot(),
+            pipeline.audio_free_sources_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
         ));
