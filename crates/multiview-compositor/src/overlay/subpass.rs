@@ -1184,8 +1184,9 @@ pub fn apply_overlays_to_nv12_reference(
 /// overlay bake the CLI/software path uses.
 ///
 /// **Region-limited (ADR-0023).** Only the overlay primitives' even-aligned
-/// footprints (one dirty rect each — *not* a single union box, so gaps between
-/// spread-out overlays stay untouched) are colour round-tripped; every pixel no
+/// footprints (nearby overlapping rects coalesce, but *not* into a single union
+/// box, so gaps between spread-out overlays stay untouched) are colour
+/// round-tripped; every pixel no
 /// overlay rect covers is passed through the NV12 planes byte-identically, so the
 /// per-frame cost tracks the overlay footprint, not the canvas. Inside the rects
 /// the output is **byte-identical** to [`apply_overlays_to_nv12_reference`] (same
@@ -1221,10 +1222,10 @@ pub fn apply_overlays_to_nv12(
     let mut y_plane = image.y_plane().to_vec();
     let mut uv_plane = image.uv_plane().to_vec();
 
-    // One even-aligned rect per primitive footprint — NOT a single union box, so
-    // the gaps between spread-out overlays (labels/meters/clock across the frame)
-    // stay exact passthrough and only the real footprints are processed.
-    let rects = overlay_dirty_rects(list, width, height);
+    // Coalesce intersecting, even-aligned primitive footprints only when their
+    // bounding rectangle adds little area. Distant labels and meters retain
+    // exact passthrough between regions; dense overlap is decoded fewer times.
+    let rects = coalesce_dirty_rects(overlay_dirty_rects(list, width, height));
     if rects.is_empty() {
         // Nothing lands on the canvas: the bake is a no-op (planes unchanged).
         return Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag());
@@ -1238,7 +1239,8 @@ pub fn apply_overlays_to_nv12(
     // inside the rects). The rest of the buffer stays transparent and is never
     // read. The rects are even-aligned (whole NV12 2×2 chroma blocks) and walked
     // in raster order, so `write_nv12_pixel`'s last-writer-wins chroma matches the
-    // reference exactly; overlapping rects re-process the same value (idempotent).
+    // reference exactly; any residual overlapping rects re-process the source
+    // value (idempotent).
     let w = usize::try_from(width).unwrap_or(0);
     for rect in &rects {
         let mut buffer = LinearCanvasBuffer::region(*rect);
@@ -1303,6 +1305,44 @@ fn overlay_dirty_rects(list: &OverlayDrawList, width: u32, height: u32) -> Vec<D
         .iter()
         .filter_map(|primitive| primitive_dirty_rect(primitive, width, height))
         .collect()
+}
+
+/// Merge only intersecting footprints whose bounding union adds no more than
+/// a quarter of their combined area. This avoids repeated conversion of dense
+/// overlapping meter segments without turning sparse labels into a full-frame
+/// rectangle. All endpoints remain even, and draw order stays unchanged.
+fn coalesce_dirty_rects(mut rects: Vec<DirtyRect>) -> Vec<DirtyRect> {
+    let area = |r: DirtyRect| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0);
+    let mut index = 0;
+    'restart: while index < rects.len() {
+        let mut other = index + 1;
+        while other < rects.len() {
+            let Some(&a) = rects.get(index) else { break };
+            let Some(&b) = rects.get(other) else { break };
+            if !a.intersects(b) {
+                other += 1;
+                continue;
+            }
+            let union = DirtyRect {
+                x0: a.x0.min(b.x0),
+                y0: a.y0.min(b.y0),
+                x1: a.x1.max(b.x1),
+                y1: a.y1.max(b.y1),
+            };
+            if area(union) <= (area(a) + area(b)) * 5 / 4 {
+                if let Some(slot) = rects.get_mut(index) {
+                    *slot = union;
+                }
+                rects.swap_remove(other);
+                // A larger footprint may now intersect an earlier candidate.
+                index = 0;
+                continue 'restart;
+            }
+            other += 1;
+        }
+        index += 1;
+    }
+    rects
 }
 
 /// The even-aligned, canvas-clamped dirty rect of one primitive, or `None` if it
