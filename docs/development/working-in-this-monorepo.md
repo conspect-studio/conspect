@@ -125,8 +125,10 @@ the task, not just after an ENOSPC failure.
 - A paused task must state its worktree owner, reason for retention, retained size and cleanup
   condition in the PR or handoff. A pushed branch is not, by itself, permission to delete a lane.
 - Before removal, resolve and verify the exact absolute path. Check owner/session and process
-  activity, worktree locks, nested worktrees, `git status --short --untracked-files=all`, and
-  `git status --short --ignored` (which also exposes ignored data). Do not read secret contents.
+  activity, worktree locks and nested worktrees. Run
+  `git status --short --ignored --untracked-files=all` inside the lane to list ignored and untracked
+  paths together. A collapsed `!! <dir>/` line remains unclassified, never disposable; inventory
+  its contents before any deletion. Do not read secret contents.
 - Preserve uncommitted, untracked and non-rebuildable ignored data, open-PR work and unique commits.
   Preserve detached commits with a durable branch ref before removing their checkout. A clean Git
   status, old mtime, dead PID or merged branch alone does **not** prove a directory disposable.
