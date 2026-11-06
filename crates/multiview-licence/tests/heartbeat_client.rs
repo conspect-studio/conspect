@@ -60,6 +60,32 @@ fn test_identity() -> DeviceIdentity {
     }
 }
 
+// Signing, verification and status reads share the fabricated keyset's epoch.
+fn fixture_store() -> Arc<LeaseStore> {
+    let now_ms = fake::FabricatedKeyset::new().now_ms();
+    Arc::new(LeaseStore::with_clock(Arc::new(move || {
+        chrono::DateTime::from_timestamp_millis(now_ms).unwrap()
+    })))
+}
+
+fn fixture_client(
+    server: Arc<FakeLicenceServer>,
+    store: Arc<LeaseStore>,
+    pinned: multiview_licence::heartbeat::PinnedRoot,
+    config: HeartbeatConfig,
+    identity: DeviceIdentity,
+) -> HeartbeatClient<FakeLicenceServer> {
+    let now_ms = server.kit().now_ms();
+    HeartbeatClient::with_clock(
+        server,
+        store,
+        pinned,
+        config,
+        identity,
+        Arc::new(move || now_ms),
+    )
+}
+
 fn client(
     server: Arc<FakeLicenceServer>,
     store: Arc<LeaseStore>,
@@ -68,20 +94,22 @@ fn client(
     // v0.9.0 enforces device-PoP: every client carries a bound device signer (the
     // fake verifies the proof). The shared `pop_test_signer` matches the key the
     // fake checks against.
-    HeartbeatClient::with_device_signer(
+    let now_ms = server.kit().now_ms();
+    HeartbeatClient::with_clock(
         server,
         store,
         pinned,
         test_config(),
         test_identity(),
-        std::sync::Arc::new(fake::pop_test_signer()),
+        Arc::new(move || now_ms),
     )
+    .with_signer(std::sync::Arc::new(fake::pop_test_signer()))
 }
 
 #[tokio::test]
 async fn a_successful_heartbeat_installs_the_verified_lease_active() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
 
     // No lease installed yet → no status.
@@ -105,7 +133,7 @@ async fn a_successful_heartbeat_installs_the_verified_lease_active() {
 #[tokio::test]
 async fn a_tampered_lease_from_the_server_is_rejected_and_nothing_is_installed() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     // Point the client at the WRONG pinned root: the server's (fabricated) keyset
     // cannot be attested by a foreign root, so key-trust fails and no lease is
     // installed — the client refuses to trust an un-attested chain.
@@ -114,7 +142,7 @@ async fn a_tampered_lease_from_the_server_is_rejected_and_nothing_is_installed()
     let wrong_root = foreign_root();
     let _ = foreign;
     let pinned = wrong_root;
-    let client = HeartbeatClient::new(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -136,7 +164,7 @@ async fn a_tampered_lease_from_the_server_is_rejected_and_nothing_is_installed()
 #[tokio::test]
 async fn withholding_the_lease_keeps_last_good_never_tightens() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
 
     // First heartbeat installs Active.
@@ -176,7 +204,7 @@ async fn withholding_the_lease_keeps_last_good_never_tightens() {
 #[tokio::test]
 async fn an_unreachable_server_keeps_last_good() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
     tokio::time::timeout(Duration::from_secs(5), client.run_once())
         .await
@@ -260,12 +288,12 @@ async fn run_once_with_no_binding_performs_no_mutation_and_installs_nothing() {
     // no-ops the cycle and keeps last-good. A lease arrives via an install surface
     // (control-upload / file-drop / mesh relay), and the next cycle renews it.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     // No binding configured → activate would have fired here in the old design.
     let mut identity = test_identity();
     identity.binding_id = None;
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::new(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -309,11 +337,11 @@ async fn an_installed_lease_then_renews_on_the_next_cycle() {
     // surface shares), the next heartbeat cycle RENEWS it (the binding is read from
     // the store) — proving the renew path is intact and drives install_binding.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let mut identity = test_identity();
     identity.binding_id = None; // unconfigured: relies on the store for the binding
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::new(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -390,7 +418,7 @@ async fn aborting_the_heartbeat_task_leaves_the_store_untouched() {
     // the heartbeat task holds no lock the store/engine takes (invariant #10) and
     // can never tighten or remove a lease by dying (invariant #1).
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
     tokio::time::timeout(Duration::from_secs(5), client.run_once())
         .await
@@ -402,7 +430,7 @@ async fn aborting_the_heartbeat_task_leaves_the_store_untouched() {
     let store2 = Arc::clone(&store);
     let server2 = Arc::clone(&server);
     let handle = tokio::spawn(async move {
-        let client = HeartbeatClient::new(
+        let client = fixture_client(
             server2,
             store2,
             FakeLicenceServer::new().pinned_root(),
@@ -432,7 +460,7 @@ async fn an_in_flight_stalled_heartbeat_cannot_block_a_store_reader() {
     // a concurrent task and assert that read completes promptly under a tight
     // timeout while the heartbeat is still stalled (invariant #10).
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
     tokio::time::timeout(Duration::from_secs(5), client.run_once())
         .await
@@ -500,7 +528,7 @@ async fn the_installed_lease_expiry_is_the_signed_not_after() {
     // (year ~2026, distinct from the real wall clock), so an installer that minted
     // a fresh now()+35d term would land far from the signed instant.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
     tokio::time::timeout(Duration::from_secs(5), client.run_once())
         .await
@@ -525,7 +553,7 @@ async fn replaying_an_older_signed_lease_does_not_re_extend_entitlement() {
     // installer rejects an expired signed lease (or keeps the newer last-good), so
     // the live expiry never moves backward to the replay's past window.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
     tokio::time::timeout(Duration::from_secs(5), client.run_once())
         .await
@@ -572,13 +600,13 @@ async fn a_lease_for_another_devices_binding_is_rejected_not_installed() {
     // configured identity.binding_id), install() rejects a body whose
     // instance_binding_id != the local binding — cross-instance replay defence.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     // This device's established binding is the fabricated one; the server will
     // hand a (correctly-signed) lease whose body binds a DIFFERENT instance.
     let mut identity = test_identity();
     identity.binding_id = Some(server.kit().binding_id().to_owned()); // local = ib_fab_0001
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::new(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -609,11 +637,11 @@ async fn a_rejected_lease_does_not_poison_the_learned_binding_id() {
     // rejected (here: expired) lease must NOT mutate the learned binding id, so the
     // next renewal still addresses the legitimate binding, not the attacker's.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let mut identity = test_identity();
     identity.binding_id = Some(server.kit().binding_id().to_owned());
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::new(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -661,7 +689,7 @@ async fn a_signed_lease_with_an_absolute_past_not_after_is_rejected_lease_expire
     // signed-expiry rejection fires (not InstallError::Stale via a fixed epoch).
     use multiview_licence::heartbeat::HeartbeatError;
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
 
     server.set_replay_absolute_past(true);
@@ -689,7 +717,7 @@ async fn a_signed_lease_with_an_absolute_past_not_after_is_rejected_lease_expire
 async fn a_stale_foreign_lease_against_a_store_anchored_binding_does_not_poison_identity() {
     use multiview_licence::heartbeat::HeartbeatError;
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
 
     // The device has NO configured/learned heartbeat binding, but its local store
     // ALREADY HOLDS a newer lease for THIS device (a prior install). Seed that by
@@ -699,7 +727,7 @@ async fn a_stale_foreign_lease_against_a_store_anchored_binding_does_not_poison_
     let seed_client = {
         let mut id = test_identity();
         id.binding_id = Some(server.kit().binding_id().to_owned());
-        HeartbeatClient::new(
+        fixture_client(
             Arc::clone(&server),
             Arc::clone(&store),
             server.pinned_root(),
@@ -723,7 +751,7 @@ async fn a_stale_foreign_lease_against_a_store_anchored_binding_does_not_poison_
     // for a FOREIGN binding. It is crypto-valid, so verify passes; the binding
     // anchored from the store rejects the foreign body BEFORE the stale check. The
     // device identity must remain the seeded one.
-    let attack_client = HeartbeatClient::new(
+    let attack_client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         server.pinned_root(),
@@ -776,7 +804,7 @@ async fn a_signer_that_expires_during_the_call_is_rejected_at_acceptance() {
     use multiview_licence::heartbeat::HeartbeatError;
     use std::sync::atomic::{AtomicUsize, Ordering as O};
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
 
     // The fabricated signer is valid in [VALID_FROM, VALID_UNTIL]. We drive a
     // clock that reports an instant INSIDE the window on the FIRST read (so any
@@ -844,7 +872,7 @@ fn foreign_root() -> multiview_licence::heartbeat::PinnedRoot {
 async fn a_signer_revoked_during_the_call_is_rejected_at_acceptance() {
     use multiview_licence::heartbeat::HeartbeatError;
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
 
     // The first fetch_keys returns a clean keyset (signer unrevoked). The issuer
@@ -886,7 +914,7 @@ async fn a_signer_revoked_during_the_call_is_rejected_at_acceptance() {
 async fn a_lease_installed_via_the_upload_surface_anchors_identity_against_a_foreign_renew() {
     use multiview_licence::heartbeat::HeartbeatError;
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
 
     // Simulate the offline-upload / file-drop surface: install a LeaseBinding for
     // THIS device's binding DIRECTLY into the store (NOT via the heartbeat path),
@@ -905,7 +933,7 @@ async fn a_lease_installed_via_the_upload_surface_anchors_identity_against_a_for
     // store's binding (renew-only). The server returns a FOREIGN-binding lease. The
     // device is NOT fresh (it holds an upload-installed lease), so the foreign lease
     // must be rejected.
-    let attack = HeartbeatClient::new(
+    let attack = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         server.pinned_root(),
@@ -932,7 +960,7 @@ async fn a_lease_installed_via_the_upload_surface_anchors_identity_against_a_for
 #[tokio::test]
 async fn retries_of_the_same_logical_operation_send_a_stable_idempotency_key() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = client(Arc::clone(&server), Arc::clone(&store));
 
     // The first heartbeat attempt fails AFTER the server records its Idempotency-
@@ -1000,7 +1028,7 @@ async fn the_idempotency_nonce_is_distinct_across_a_restart() {
 
     // Lifetime A: one successful heartbeat.
     let server_a = shared_fake();
-    let store_a = Arc::new(LeaseStore::new());
+    let store_a = fixture_store();
     let client_a = HeartbeatClient::with_clock_and_nonce(
         Arc::clone(&server_a),
         store_a,
@@ -1024,7 +1052,7 @@ async fn the_idempotency_nonce_is_distinct_across_a_restart() {
     // Lifetime B: a fresh client + fresh server, reconstructed from the SAME
     // durable nonce store (the restart).
     let server_b = shared_fake();
-    let store_b = Arc::new(LeaseStore::new());
+    let store_b = fixture_store();
     let client_b = HeartbeatClient::with_clock_and_nonce(
         Arc::clone(&server_b),
         store_b,
@@ -1110,7 +1138,7 @@ async fn a_failing_durable_nonce_store_keeps_last_good_and_sends_no_mutation() {
     // heartbeat mutation is sent (so the server can never receive a colliding key),
     // and nothing is installed (last-good kept; output stays on air).
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     // Default identity carries a configured binding → the renew path.
     let client = HeartbeatClient::with_clock_and_nonce(
         Arc::clone(&server),
@@ -1151,7 +1179,7 @@ async fn a_nonce_commit_failure_blocks_the_mutation_fail_closed() {
     // never durably persisted, so sending the mutation would risk a cross-restart
     // collision. The mint must fail closed: no mutation, nothing installed.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = HeartbeatClient::with_clock_and_nonce(
         Arc::clone(&server),
         Arc::clone(&store),
