@@ -31,6 +31,49 @@ fn parse_stored_source(body: &serde_json::Value) -> Option<multiview_config::Sou
     serde_json::from_value(body.clone()).ok()
 }
 
+/// Compare media configuration without cloning arbitrary source documents.
+/// Only EPG and IPTV presentation metadata may bypass the engine command path.
+fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
+    let (Some(previous), Some(next)) = (previous.as_object(), next.as_object()) else {
+        return false;
+    };
+    let media_field = |key: &str| key != "epg" && key != "playlist_metadata";
+    previous
+        .iter()
+        .filter(|(key, _)| media_field(key))
+        .eq(next.iter().filter(|(key, _)| media_field(key)))
+}
+
+#[cfg(test)]
+mod guide_change_tests {
+    use super::guide_only_change;
+    use serde_json::json;
+
+    #[test]
+    fn guide_changes_do_not_change_media_identity() {
+        let source = json!({"id":"news", "kind":"hls", "url":"https://example.com/live"});
+        let mut next = source.clone();
+        next["epg"] =
+            json!({"mode":"manual", "url":"https://example.com/guide", "channel_id":"42"});
+        next["playlist_metadata"] = json!({"name":"News"});
+        assert!(guide_only_change(&source, &next));
+        assert!(guide_only_change(&next, &source));
+        next["url"] = json!("https://example.com/other");
+        assert!(!guide_only_change(&source, &next));
+    }
+
+    #[test]
+    fn other_source_changes_still_require_canonical_apply() {
+        let source = json!({"id":"news", "kind":"hls"});
+        for key in ["captions", "auth", "display_name", "wallclock"] {
+            let mut next = source.clone();
+            next[key] = json!("changed");
+            assert!(!guide_only_change(&source, &next));
+        }
+        assert!(!guide_only_change(&json!(null), &json!(null)));
+    }
+}
+
 /// Apply a stored source mutation to the **running** engine where the engine
 /// can take it live (ADR-W018, invariant #11), returning the apply semantics
 /// the response must declare.
@@ -391,11 +434,19 @@ pub(crate) async fn update_source(
         &id,
         Some(versioned.resource.body.clone()),
     );
-    let mode = live_apply_upsert(
-        &state,
-        parse_stored_source(&versioned.resource.body),
-        previous.as_ref(),
-    );
+    let next = parse_stored_source(&versioned.resource.body);
+    let mode = if guide_only_change(&current.resource.body, &versioned.resource.body) {
+        // Guide/presentation edits must not restart a decoder. Preserve the
+        // adopted media identity, but carry its new metadata into resume state.
+        if let (Some(model), Some(next)) = (state.boot_model.as_ref(), next.as_ref()) {
+            if model.adopted_sources().iter().any(|source| source.id == id) {
+                model.adopt_source(next.clone());
+            }
+        }
+        ApplyMode::Live
+    } else {
+        live_apply_upsert(&state, next, previous.as_ref())
+    };
     Ok(with_apply(
         mode,
         source_response(StatusCode::OK, &versioned),
