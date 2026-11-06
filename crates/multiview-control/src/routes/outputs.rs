@@ -8,18 +8,18 @@
 //! write. The stored `body` is the opaque config-as-code document; engine-side
 //! validation against `multiview-config` happens before it is applied. Errors
 //! are RFC 9457 problem documents.
-use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
 use crate::concurrency::IfMatch;
 use crate::error::ControlResult;
-use crate::resource_store::{OUTPUT_KIND, Resource, ResourceInput, VersionedResource};
+use crate::resource_store::{Resource, ResourceInput, VersionedResource, OUTPUT_KIND};
 use crate::state::AppState;
-use crate::typed_resources::{TypedCollection, validated_body, with_apply_restart};
+use crate::typed_resources::{validated_body, with_apply_restart, TypedCollection};
 
 /// Read accepted intent rather than a lagging, fallible SQLite projection.
 fn accepted_outputs(state: &AppState) -> ControlResult<Vec<VersionedResource>> {

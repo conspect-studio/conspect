@@ -2211,8 +2211,10 @@ impl Pipeline {
         // decoded frames are scaled to tile the canvas (the reference compositor
         // places tiles 1:1 at the cell origin).
         let mut stores: HashMapStores = std::collections::HashMap::new();
-        let source_events = Arc::new(crate::source_event_runtime::Runtime::new()
-            .map_err(|e| PipelineError::Engine(format!("source events: {e}")))?);
+        let source_events = Arc::new(
+            crate::source_event_runtime::Runtime::new()
+                .map_err(|e| PipelineError::Engine(format!("source events: {e}")))?,
+        );
         let mut ingest_plans: Vec<IngestPlan> = Vec::with_capacity(config.sources.len());
         // Per-source audio stores + decode plans (AUD-2). Built for every
         // libav-openable (file/URL) source so program audio — when this run opts
@@ -3880,9 +3882,17 @@ impl Pipeline {
                     tick_index: frame.tick.index,
                 });
             }
-            let selected_event_times = frame.source_times.iter()
-                .filter(|(id, _)| frame.source_states.get(*id).is_some_and(|state| state.is_live()))
-                .map(|(id, time)| (id.clone(), *time)).collect();
+            let selected_event_times = frame
+                .source_times
+                .iter()
+                .filter(|(id, _)| {
+                    frame
+                        .source_states
+                        .get(*id)
+                        .is_some_and(|state| state.is_live())
+                })
+                .map(|(id, time)| (id.clone(), *time))
+                .collect();
             let events = source_event_reader.sample(&selected_event_times);
             #[cfg(not(feature = "overlay"))]
             let _ = events;
@@ -4415,7 +4425,13 @@ impl StreamBaker {
         }
         let list = self
             .baker
-            .draw_list_with_events(pts, &dynamics, &captions, &item.caption_bitmaps, &item.events)
+            .draw_list_with_events(
+                pts,
+                &dynamics,
+                &captions,
+                &item.caption_bitmaps,
+                &item.events,
+            )
             .map_err(|e| PipelineError::Engine(format!("overlay draw: {e}")))?;
         let overlaid = apply_overlays_to_nv12(&item.canvas, &list, self.canvas_color)
             .map_err(|e| PipelineError::Engine(format!("overlay blend: {e}")))?;
@@ -6972,7 +6988,9 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     fn source_without_audio(&self, id: &str) {
         // A timed-out decoded producer must not publish after HLS -> synthetic.
         let lifecycle = begin_live_lifecycle(id);
-        if let Some(lease) = self.source_events.activate(id, lifecycle) { lease.retire(); }
+        if let Some(lease) = self.source_events.activate(id, lifecycle) {
+            lease.retire();
+        }
         #[cfg(feature = "overlay")]
         self.clear_captions_for_lifecycle(id, lifecycle);
         #[cfg(not(feature = "overlay"))]
@@ -6986,7 +7004,9 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
 
     fn source_removed(&self, id: &str) {
         let lifecycle = begin_live_lifecycle(id);
-        if let Some(lease) = self.source_events.activate(id, lifecycle) { lease.retire(); }
+        if let Some(lease) = self.source_events.activate(id, lifecycle) {
+            lease.retire();
+        }
         #[cfg(feature = "overlay")]
         self.clear_captions_for_lifecycle(id, lifecycle);
         #[cfg(not(feature = "overlay"))]
@@ -10269,7 +10289,7 @@ fn ingest_plan_for(
     let youtube_url_slot = youtube_url_slot_for(&location);
 
     Ok(IngestPlan {
-            source_events: None,
+        source_events: None,
         id: source.id.clone(),
         location,
         // Not a media-player channel (those are built from `config.media_players`).
@@ -12319,13 +12339,21 @@ fn open_and_stream(
                 // registry lookup or a competing source-service registration.
                 let (observer, bridge) = if plan.source_events.is_some() {
                     let (observer, bridge) = crate::source_event_hls_bridge::channel(
-                        plan.id.clone(), plan.lifecycle, 128,
+                        plan.id.clone(),
+                        plan.lifecycle,
+                        128,
                     );
                     (Some(observer), Some(bridge))
-                } else { (None, None) };
+                } else {
+                    (None, None)
+                };
                 let start_result = if observer.is_some() {
                     crate::hls_fetch::HlsFetcher::start_with_observer(
-                        &plan.id, &open_url, stop, plan.lifecycle, observer,
+                        &plan.id,
+                        &open_url,
+                        stop,
+                        plan.lifecycle,
+                        observer,
                     )
                 } else {
                     crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop, plan.lifecycle)
@@ -12461,12 +12489,29 @@ fn open_and_stream(
     // subtitle). See the fn doc for the footgun + the routed-keep.
     // Detect metadata explicitly before unrouted packets are discarded. ID3 is
     // recognized but remains unavailable until its native adapter is wired.
-    let metadata_streams: std::collections::HashMap<usize, (crate::source_event_packet::MetadataKind, ffmpeg::Rational)> = input.streams()
+    let metadata_streams: std::collections::HashMap<
+        usize,
+        (crate::source_event_packet::MetadataKind, ffmpeg::Rational),
+    > = input
+        .streams()
         .filter_map(|stream| match stream.parameters().id() {
-            ffmpeg::codec::Id::SCTE_35 => Some((stream.index(), (crate::source_event_packet::MetadataKind::Scte35, stream.time_base()))),
-            ffmpeg::codec::Id::TIMED_ID3 => Some((stream.index(), (crate::source_event_packet::MetadataKind::Id3, stream.time_base()))),
+            ffmpeg::codec::Id::SCTE_35 => Some((
+                stream.index(),
+                (
+                    crate::source_event_packet::MetadataKind::Scte35,
+                    stream.time_base(),
+                ),
+            )),
+            ffmpeg::codec::Id::TIMED_ID3 => Some((
+                stream.index(),
+                (
+                    crate::source_event_packet::MetadataKind::Id3,
+                    stream.time_base(),
+                ),
+            )),
             _ => None,
-        }).collect();
+        })
+        .collect();
     discard_unrouted_subtitle_streams(plan, &mut input);
 
     // The wall-clock pacer: maps the first frame's PTS to "now" and releases
@@ -12508,13 +12553,15 @@ fn open_and_stream(
     let mut packet_gate = crate::source_event_packet::PacketGate::default();
     let mut video_fence = 0_u64;
     let mut source_events = (!metadata_streams.is_empty() || hls_event_bridge.is_some())
-        .then_some(plan.source_events.as_ref()).flatten().and_then(|lease|
-            crate::source_event_runtime::NativeEvents::new(plan.id.clone(), lease));
+        .then_some(plan.source_events.as_ref())
+        .flatten()
+        .and_then(|lease| crate::source_event_runtime::NativeEvents::new(plan.id.clone(), lease));
     if let (Some(events), Some(bridge)) = (source_events.as_mut(), hls_event_bridge.take()) {
         let _ = events.attach_hls(bridge);
     }
     // Metadata has a separate fixed budget: never consume video read-ahead slots.
-    let (metadata_tx, metadata_rx) = std::sync::mpsc::sync_channel::<crate::source_event_packet::MetadataPacket>(32);
+    let (metadata_tx, metadata_rx) =
+        std::sync::mpsc::sync_channel::<crate::source_event_packet::MetadataPacket>(32);
     let metadata_overflow = Arc::new(AtomicBool::new(false));
     let demux_overflow = Arc::clone(&metadata_overflow);
     let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
@@ -12530,11 +12577,17 @@ fn open_and_stream(
                 if let Some(&(kind, tb)) = metadata_streams.get(&packet.stream()) {
                     if let Some(bytes) = packet.data() {
                         if bytes.len() <= 4096 {
-                            if metadata_tx.try_send(crate::source_event_packet::MetadataPacket {
-                                kind, bytes: bytes.to_vec(), pts: packet.pts(),
-                                time_base_num: tb.numerator(), time_base_den: tb.denominator(),
-                                video_fence,
-                            }).is_err() {
+                            if metadata_tx
+                                .try_send(crate::source_event_packet::MetadataPacket {
+                                    kind,
+                                    bytes: bytes.to_vec(),
+                                    pts: packet.pts(),
+                                    time_base_num: tb.numerator(),
+                                    time_base_den: tb.denominator(),
+                                    video_fence,
+                                })
+                                .is_err()
+                            {
                                 demux_overflow.store(true, Ordering::Release);
                             }
                         } else {
@@ -12543,7 +12596,7 @@ fn open_and_stream(
                     }
                 }
                 None
-            },
+            }
             Err(ffmpeg::Error::Eof) => Some(ReadItem::Eof),
             Err(other) => Some(ReadItem::Error(other.to_string())),
         }
@@ -12598,8 +12651,12 @@ fn open_and_stream(
                     metadata_overflow.store(true, Ordering::Release);
                 }
             }
-            let gated = packet_gate.decoded(decoded.raw_pts, generation,
-                i32::try_from(time_base.num).unwrap_or(0), i32::try_from(time_base.den).unwrap_or(0));
+            let gated = packet_gate.decoded(
+                decoded.raw_pts,
+                generation,
+                i32::try_from(time_base.num).unwrap_or(0),
+                i32::try_from(time_base.den).unwrap_or(0),
+            );
             let event_clock = source_events.as_mut().and_then(|events| {
                 let clock = events.mapping(mapping);
                 if metadata_overflow.swap(false, Ordering::AcqRel) {
@@ -12614,7 +12671,9 @@ fn open_and_stream(
                         crate::source_event_packet::MetadataKind::Scte35 if packet.trusted => {
                             events.ingest(&packet.packet.bytes, mapping);
                         }
-                        crate::source_event_packet::MetadataKind::Scte35 => events.observe_scte_untimed(&packet.packet.bytes),
+                        crate::source_event_packet::MetadataKind::Scte35 => {
+                            events.observe_scte_untimed(&packet.packet.bytes)
+                        }
                     }
                 }
                 events.ingest_hls();
@@ -17201,33 +17260,64 @@ mod live_overlay_bake_tests {
 
     #[test]
     fn selected_source_event_reaches_stream_baker_pixels() {
-        use multiview_core::source_event::{EventBoundary, EventOrigin, SourceEventKey, SourceEventObservation};
+        use multiview_core::source_event::{
+            EventBoundary, EventOrigin, SourceEventKey, SourceEventObservation,
+        };
         use multiview_framestore::tile::SourceFrameTime;
         let runtime = crate::source_event_runtime::Runtime::new().expect("runtime");
         let lease = runtime.activate("cnn", 11).expect("lease");
         let connection = lease.connect().expect("connection");
         let (context, producer) = connection.register(3).expect("registration");
         let _ = producer.try_observe(SourceEventObservation {
-            key: SourceEventKey { source_id: "cnn".into(), epoch: context.service_epoch,
-                origin: EventOrigin::Scte35, event_id: "injected-cue".into() },
-            revision: 1, boundary: EventBoundary::Start { pts_ns: Some(1_000_000_000), duration_ns: Some(10_000_000_000) },
-            asset_id: None, correlation_id: None,
+            key: SourceEventKey {
+                source_id: "cnn".into(),
+                epoch: context.service_epoch,
+                origin: EventOrigin::Scte35,
+                event_id: "injected-cue".into(),
+            },
+            revision: 1,
+            boundary: EventBoundary::Start {
+                pts_ns: Some(1_000_000_000),
+                duration_ns: Some(10_000_000_000),
+            },
+            asset_id: None,
+            correlation_id: None,
         });
         let reader = runtime.reader();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while reader.registry().snapshot("cnn").is_none_or(|read| read.events.is_empty()) {
-            assert!(std::time::Instant::now() < deadline, "event worker deadline");
+        while reader
+            .registry()
+            .snapshot("cnn")
+            .is_none_or(|read| read.events.is_empty())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event worker deadline"
+            );
             std::thread::yield_now();
         }
-        let selected = SourceFrameTime { pts: multiview_core::time::MediaTime::from_nanos(2_000_000_000),
-            generation: 11, event_clock: Some(context.clock) };
+        let selected = SourceFrameTime {
+            pts: multiview_core::time::MediaTime::from_nanos(2_000_000_000),
+            generation: 11,
+            event_clock: Some(context.clock),
+        };
         let events = reader.sample(&HashMap::from([("cnn".into(), selected)]));
-        assert_eq!(events["cnn"].timer.as_ref().expect("timer").nanoseconds, "9000000000");
+        assert_eq!(
+            events["cnn"].timer.as_ref().expect("timer").nanoseconds,
+            "9000000000"
+        );
         let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
         let mut context = bake_context(&slot);
-        let tile = crate::overlays::TileSpec::new("cnn", "CNN", multiview_overlay::geometry::PixelRect {
-            x: 0.0, y: 0.0, width: 320.0, height: 180.0,
-        });
+        let tile = crate::overlays::TileSpec::new(
+            "cnn",
+            "CNN",
+            multiview_overlay::geometry::PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 180.0,
+            },
+        );
         context.tile_specs = vec![tile.clone()];
         let mut baker = StreamBaker::new(context).expect("baker");
         let mut frame = item(50);
@@ -17235,8 +17325,14 @@ mod live_overlay_bake_tests {
         let plain = baker.bake(&frame).expect("plain");
         frame.events = events;
         let event = baker.bake(&frame).expect("event");
-        assert!(region_diff(&plain, &event, (0, 30, 320, 120)) > 0, "event must reach actual bake pixels");
-        let wrong = SourceFrameTime { generation: 12, ..selected };
+        assert!(
+            region_diff(&plain, &event, (0, 30, 320, 120)) > 0,
+            "event must reach actual bake pixels"
+        );
+        let wrong = SourceFrameTime {
+            generation: 12,
+            ..selected
+        };
         frame.events = reader.sample(&HashMap::from([("cnn".into(), wrong)]));
         assert!(frame.events.is_empty());
         let cleared = baker.bake(&frame).expect("cleared");

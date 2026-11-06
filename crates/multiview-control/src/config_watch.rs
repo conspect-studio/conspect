@@ -34,16 +34,16 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use multiview_config::{ConfigDiff, MultiviewConfig, OverlayChange, SourceChange};
 use multiview_events::{Event, HealthWarning, WarningCode, WarningSeverity};
 
 use crate::{
-    AppState, AuditAction, Command, LayoutInput, OperationId, ResourceInput, ResourceRepository,
-    resolve_layout_document,
+    resolve_layout_document, AppState, AuditAction, Command, LayoutInput, OperationId,
+    ResourceInput, ResourceRepository,
 };
 
 /// The audit-log actor every file-applied change is recorded under.

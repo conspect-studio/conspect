@@ -29,10 +29,10 @@
 //! only a restart can honour it (no program bus running, a changed
 //! `sample_rate_hz`, or a mixed input with no audio store on this run). Either
 //! way the stored document is persisted to `active.toml`.
-use axum::Json;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Serialize;
 
 use crate::audio_routing::{AUDIO_ROUTING_ID, AUDIO_ROUTING_KIND};
@@ -41,7 +41,7 @@ use crate::auth::{Action, Principal};
 use crate::concurrency::{IfMatch, Version};
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
-use crate::typed_resources::{ApplyMode, with_apply};
+use crate::typed_resources::{with_apply, ApplyMode};
 use multiview_config::{AudioRouting, PROGRAM_TRACK};
 
 /// The wire envelope both verbs return: whether a document is configured, the

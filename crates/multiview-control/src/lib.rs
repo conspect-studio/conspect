@@ -91,10 +91,10 @@ pub mod watch_status;
 pub mod whep_output;
 pub mod whip;
 
+pub mod source_events;
 #[cfg(feature = "embed-web")]
 pub mod spa;
-pub mod source_events;
-pub use source_events::{SourceEventProvider, SourceEventsDto, SharedSourceEvents};
+pub use source_events::{SharedSourceEvents, SourceEventProvider, SourceEventsDto};
 
 #[cfg(feature = "openapi")]
 pub mod openapi;

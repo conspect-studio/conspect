@@ -7,7 +7,7 @@
 //! `202 Accepted` + an operation id; their outcome arrives later on the realtime
 //! stream (ADR-W008). Errors are RFC 9457 problem documents.
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,7 +19,7 @@ use crate::command::{Command, OperationId};
 use crate::concurrency::{IdempotencyKey, IfMatch, Reservation, Version};
 use crate::error::{ControlError, ControlResult};
 use crate::problem::Problem;
-use crate::repository::{LAYOUT_KIND, Layout, LayoutInput, VersionedLayout};
+use crate::repository::{Layout, LayoutInput, VersionedLayout, LAYOUT_KIND};
 use crate::state::AppState;
 
 pub mod account;
@@ -32,7 +32,6 @@ pub mod devices;
 pub mod discovery;
 pub mod health;
 pub mod inputs;
-pub mod source_events;
 pub mod licence;
 pub mod logs;
 pub mod media_players;
@@ -43,6 +42,7 @@ pub mod preview;
 pub mod probes;
 pub mod routing;
 pub mod salvos;
+pub mod source_events;
 pub mod sources;
 pub mod support;
 pub mod sync_groups;
@@ -848,11 +848,19 @@ pub(crate) async fn cmd_apply_layout(
     // Resolve once, then persist before the reserved slot publishes its command.
     // Release the idempotency reservation on every pre-submit refusal.
     let prepared: ControlResult<_> = async {
+        // An unknown stored-layout id is a 422 problem before any 202 (ADR-W019).
         let versioned = if let Some(desired) = authoritative_layouts(&state)? {
-            authoritative_layout(&desired, &req.layout)?
+            authoritative_layout(&desired, &req.layout)
         } else {
-            state.repository.get_layout(&req.layout)?
-        };
+            state.repository.get_layout(&req.layout)
+        }
+        .map_err(|e| match e {
+            ControlError::NotFound { .. } => ControlError::Validation(format!(
+                "layout {:?} does not exist in the layouts library",
+                req.layout
+            )),
+            other => other,
+        })?;
         let resolved = crate::command::resolve_layout_document(
             &req.layout,
             &versioned.layout.body,

@@ -24,8 +24,8 @@
 //! grow, or block. The render thread never sees any of it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use multiview_config::{MultiviewConfig, StartMode};
@@ -1162,7 +1162,7 @@ fn write_atomic_with_sync(
 
 #[cfg(test)]
 mod atomic_commit_tests {
-    use super::{AtomicWriteError, write_atomic_with_sync};
+    use super::{write_atomic_with_sync, AtomicWriteError};
     use std::io;
 
     #[test]

@@ -77,14 +77,13 @@ pub mod cli;
 /// the Web/API uses; an invalid file changes nothing (warn + health event).
 pub mod config_watch;
 pub mod control;
+pub mod hls_event_observer;
 /// The Conspect entitlement-plane wiring for the cli (CONSPECT-2b/10, ADR-0050):
 /// the shared lease store, the published [`licence::WatermarkSignal`] the engine
 /// bake samples lock-free (S3), and the sampled [`multiview_licence::EnforcementLevel`]
 /// the startup gate (S1) consults. Always compiled — the entitlement *state model*
 /// renders consistently regardless of features (ADR-0050 §7).
 pub mod licence;
-pub mod hls_event_observer;
-pub mod source_event_hls_bridge;
 pub mod live_overlays;
 pub mod live_sources;
 /// Off-hot-path **program-bus loudness telemetry** (AUD-8): a read-only EBU R128
@@ -124,6 +123,7 @@ pub mod outputs;
 pub mod placement;
 pub mod preview;
 pub mod run;
+pub mod source_event_hls_bridge;
 pub mod source_event_ingest;
 pub mod source_event_packet;
 pub mod source_event_runtime;

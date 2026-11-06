@@ -111,9 +111,12 @@ impl HlsEventObserver {
                         self.mark_degraded();
                         return;
                     }
-                    let label = decoded_label.as_deref().filter(|label| {
-                        !label.is_empty() && label.bytes().all(|b| (0x20..=0x7e).contains(&b))
-                    }).unwrap_or(raw_caid);
+                    let label = decoded_label
+                        .as_deref()
+                        .filter(|label| {
+                            !label.is_empty() && label.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                        })
+                        .unwrap_or(raw_caid);
                     assets.insert(raw_caid.clone(), label.to_owned());
                 }
                 CueMetadata::DateRange { attributes } => {

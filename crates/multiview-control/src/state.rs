@@ -1232,7 +1232,10 @@ impl AppState {
 
     /// Attach the read-only source-event adapter without changing preview behavior.
     #[must_use]
-    pub fn with_source_events(mut self, provider: crate::source_events::SharedSourceEvents) -> Self {
+    pub fn with_source_events(
+        mut self,
+        provider: crate::source_events::SharedSourceEvents,
+    ) -> Self {
         self.source_events = Some(provider);
         self
     }

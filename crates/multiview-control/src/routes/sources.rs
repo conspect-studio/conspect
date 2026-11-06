@@ -10,19 +10,19 @@
 //! document is rejected with `422 /problems/validation` naming the field path,
 //! and every accepted mutation declares its apply semantics via
 //! `X-Multiview-Apply`. Errors are RFC 9457 problem documents.
-use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
 use crate::command::{Command, OperationId};
 use crate::concurrency::IfMatch;
 use crate::error::ControlResult;
-use crate::resource_store::{Resource, ResourceInput, SOURCE_KIND, VersionedResource};
+use crate::resource_store::{Resource, ResourceInput, VersionedResource, SOURCE_KIND};
 use crate::state::AppState;
-use crate::typed_resources::{ApplyMode, TypedCollection, validated_body, with_apply};
+use crate::typed_resources::{validated_body, with_apply, ApplyMode, TypedCollection};
 
 /// Parse a stored (already ADR-W015-validated) source body back into the
 /// canonical config type, or `None` for a legacy/foreign document that does
@@ -37,6 +37,10 @@ fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> 
     let (Some(previous), Some(next)) = (previous.as_object(), next.as_object()) else {
         return false;
     };
+    if previous == next {
+        // An unchanged body is not a guide edit; it keeps the canonical path.
+        return false;
+    }
     let media_field = |key: &str| key != "epg" && key != "playlist_metadata";
     previous
         .iter()
@@ -71,6 +75,7 @@ mod guide_change_tests {
             assert!(!guide_only_change(&source, &next));
         }
         assert!(!guide_only_change(&json!(null), &json!(null)));
+        assert!(!guide_only_change(&source, &source));
     }
 }
 

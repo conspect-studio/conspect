@@ -17,9 +17,9 @@ use std::sync::Arc;
 use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::MultiviewConfig;
 use multiview_control::{
-    AppState, Command, CommandReceiver, CommandSender, EngineStateSnapshot, InMemoryRepository,
-    InMemoryWarningStore, ResolvedLayout, SharedPreview, WarningRepository, provision_admin_keys,
-    run_warning_ingest,
+    provision_admin_keys, run_warning_ingest, AppState, Command, CommandReceiver, CommandSender,
+    EngineStateSnapshot, InMemoryRepository, InMemoryWarningStore, ResolvedLayout, SharedPreview,
+    WarningRepository,
 };
 use multiview_engine::{
     CompositorDrive, EnginePublisher, RouteApplier, RouteIntent, RouteResolution,
@@ -2600,7 +2600,7 @@ mod tests {
     use super::*;
     use multiview_compositor::blend::LinearRgba;
     use multiview_compositor::pipeline::CanvasColor;
-    use multiview_control::{Command, OperationId, command_bus};
+    use multiview_control::{command_bus, Command, OperationId};
     use multiview_engine::EnginePublisher;
     use multiview_events::{Event, OutputRunState};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2944,13 +2944,11 @@ input_id = "in_b"
             .expect("fresh audio");
         let block = bus.tick_to(3);
         assert_eq!(block.frame_count(), 5_760);
-        assert!(
-            block
-                .interleaved()
-                .iter()
-                .skip(480 * 2)
-                .all(|sample| (*sample - 0.75).abs() < 0.001)
-        );
+        assert!(block
+            .interleaved()
+            .iter()
+            .skip(480 * 2)
+            .all(|sample| (*sample - 0.75).abs() < 0.001));
     }
 
     /// ADR-W019: an `ApplyLayout` carrying a stored, route-solved document swaps

@@ -25,24 +25,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{header, Request, StatusCode};
+use axum::Router;
 use multiview_config::{ConfigDiff, MultiviewConfig, StartMode};
 use multiview_control::boot_model::{
-    BootModel, finish_running_persist, load_desired, load_resume_config, persist_loaded,
-    persist_running_now, spawn_running_persist, write_active_serialized, write_atomic,
+    finish_running_persist, load_desired, load_resume_config, persist_loaded, persist_running_now,
+    spawn_running_persist, write_active_serialized, write_atomic, BootModel,
 };
 use multiview_control::config_watch::{
-    ManualPoll, WatchOptions, apply_document_diff, spawn as spawn_watch,
+    apply_document_diff, spawn as spawn_watch, ManualPoll, WatchOptions,
 };
 use multiview_control::{
-    AppState, Command, CommandReceiver, EngineStateSnapshot, InMemoryRepository,
-    InMemoryWarningStore, WarningFilter, WarningRepository, command_bus, run_warning_ingest,
+    command_bus, run_warning_ingest, AppState, Command, CommandReceiver, EngineStateSnapshot,
+    InMemoryRepository, InMemoryWarningStore, WarningFilter, WarningRepository,
 };
 use multiview_engine::EnginePublisher;
 use multiview_events::Event;
-use support::{ADMIN_TOKEN, OPERATOR_TOKEN, VIEWER_TOKEN, body_json, get, put_json, send};
+use support::{body_json, get, put_json, send, ADMIN_TOKEN, OPERATOR_TOKEN, VIEWER_TOKEN};
 
 /// The fast poll the watcher-interplay tests run at (real default is 1 s).
 const TEST_POLL: Duration = Duration::from_millis(80);
@@ -274,22 +274,19 @@ async fn output_track_cross_reference_fails_before_etag_or_desired_commit() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let after = send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await;
     assert_eq!(support::etag(&after).as_deref(), Some(etag.as_str()));
-    assert!(
-        load_desired(&r.boot_path)
-            .expect("desired lookup")
-            .is_none()
-    );
+    assert!(load_desired(&r.boot_path)
+        .expect("desired lookup")
+        .is_none());
 }
 
 /// Output identities chosen by the API remain stable through a file-watch edit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_preserves_arbitrary_output_identity_and_revert_preserves_it() {
     let r = rig(BOOT_DOC);
-    let mut body = body_json(
-        send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await,
-    )
-    .await["body"]
-        .clone();
+    let mut body =
+        body_json(send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await).await
+            ["body"]
+            .clone();
     body["path"] = serde_json::json!("/tmp/custom-config-model.m3u8");
     let created = send(
         &r.router,

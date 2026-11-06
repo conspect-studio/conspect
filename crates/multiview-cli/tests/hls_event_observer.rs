@@ -12,7 +12,9 @@ impl HlsEvidenceSink for Sink {
     fn mark_degraded(&mut self) {
         self.0.lock().unwrap().1 = true;
     }
-    fn retire(&mut self) { self.0.lock().unwrap().0.clear(); }
+    fn retire(&mut self) {
+        self.0.lock().unwrap().0.clear();
+    }
 }
 fn snapshot(assets: &[&str]) -> multiview_input::hls::PlaylistCueMetadata {
     let mut text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n".to_string();
@@ -103,15 +105,27 @@ fn decoded_asset_label_and_raw_correlation_survive_absence_and_recurrence() {
     observer.observe(&snapshot(&[]));
     observer.observe(&snapshot(&["0x41442D31"]));
     let data = sink.0.lock().unwrap();
-    let printable: Vec<_> = data.0.iter().filter(|o| o.correlation_id.as_deref() == Some("0x41442D31")).collect();
+    let printable: Vec<_> = data
+        .0
+        .iter()
+        .filter(|o| o.correlation_id.as_deref() == Some("0x41442D31"))
+        .collect();
     assert_eq!(printable.len(), 3);
-    assert!(printable.iter().all(|o| o.asset_id.as_deref() == Some("AD-1")));
+    assert!(printable
+        .iter()
+        .all(|o| o.asset_id.as_deref() == Some("AD-1")));
     assert_eq!(printable[0].key, printable[1].key);
     assert_eq!(printable[1].boundary, EventBoundary::MarkerAbsent);
     assert_ne!(printable[0].key, printable[2].key);
-    let opaque: Vec<_> = data.0.iter().filter(|o| o.correlation_id.as_deref() == Some("0x001B")).collect();
+    let opaque: Vec<_> = data
+        .0
+        .iter()
+        .filter(|o| o.correlation_id.as_deref() == Some("0x001B"))
+        .collect();
     assert_eq!(opaque.len(), 2);
-    assert!(opaque.iter().all(|o| o.asset_id.as_deref() == Some("0x001B")));
+    assert!(opaque
+        .iter()
+        .all(|o| o.asset_id.as_deref() == Some("0x001B")));
 }
 
 #[test]

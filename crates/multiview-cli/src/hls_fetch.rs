@@ -546,9 +546,14 @@ impl HlsFetcher {
         let observation_active = Arc::new(Mutex::new(observer));
         if has_observer {
             let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
-            let entry = map.get_mut(source_id).filter(|e| e.generation == generation)
+            let entry = map
+                .get_mut(source_id)
+                .filter(|e| e.generation == generation)
                 .ok_or("source replaced before observer attachment")?;
-            let old = entry.observation_active.replace(Arc::downgrade(&observation_active)).and_then(|w| w.upgrade());
+            let old = entry
+                .observation_active
+                .replace(Arc::downgrade(&observation_active))
+                .and_then(|w| w.upgrade());
             drop(map);
             retire_observer(old);
         }
@@ -928,7 +933,9 @@ fn observe_playlist(
 ) {
     let mut owner = gate.lock().unwrap_or_else(PoisonError::into_inner);
     if !stop.load(Ordering::Acquire) {
-        if let Some(observer) = owner.as_mut() { observer.observe(metadata); }
+        if let Some(observer) = owner.as_mut() {
+            observer.observe(metadata);
+        }
     }
 }
 
@@ -955,7 +962,13 @@ fn coordinate(
             match fetch_playlist(origin.agent, origin.playlist.as_str(), &stats.throttle) {
                 Ok((p, _)) => playlist = Some(p),
                 Err(e) => {
-                    if let Some(observer) = observation_active.lock().unwrap_or_else(PoisonError::into_inner).as_mut() { observer.mark_degraded(); }
+                    if let Some(observer) = observation_active
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .as_mut()
+                    {
+                        observer.mark_degraded();
+                    }
                     tracing::warn!(source = %id, error = %e, "hls fetch: playlist reload failed");
                     next_reload = Instant::now() + Duration::from_secs(1);
                 }
@@ -968,7 +981,13 @@ fn coordinate(
             target = p.target_duration;
             shared.lock().target_duration = target;
             let Some(lost) = sched.absorb(p) else {
-                if let Some(observer) = observation_active.lock().unwrap_or_else(PoisonError::into_inner).as_mut() { observer.mark_degraded(); }
+                if let Some(observer) = observation_active
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_mut()
+                {
+                    observer.mark_degraded();
+                }
                 shared.fail("media sequence ran backwards".to_owned());
                 return;
             };
@@ -1239,19 +1258,39 @@ mod tests {
         struct Sink(Arc<Mutex<Vec<SourceEventObservation>>>);
         impl HlsEvidenceSink for Sink {
             fn try_observe(&mut self, o: SourceEventObservation) -> bool {
-                self.0.lock().unwrap().push(o); true
+                self.0.lock().unwrap().push(o);
+                true
             }
             fn mark_degraded(&mut self) {}
-            fn retire(&mut self) { self.0.lock().unwrap().clear(); }
+            fn retire(&mut self) {
+                self.0.lock().unwrap().clear();
+            }
         }
         let id = "observer-generation-test";
         let generation = begin_generation(id);
         let observations = Arc::new(Mutex::new(Vec::new()));
-        let active = Arc::new(Mutex::new(Some(HlsEventObserver::new(id.into(), 1, Sink(observations.clone()), 8, 256))));
-        urls().lock().unwrap().get_mut(id).unwrap().observation_active = Some(Arc::downgrade(&active));
-        let playlist = parse_media_playlist("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-ASSET:CAID=original\n#EXTINF:6,\na.ts\n").unwrap();
+        let active = Arc::new(Mutex::new(Some(HlsEventObserver::new(
+            id.into(),
+            1,
+            Sink(observations.clone()),
+            8,
+            256,
+        ))));
+        urls()
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .observation_active = Some(Arc::downgrade(&active));
+        let playlist = parse_media_playlist(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-ASSET:CAID=original\n#EXTINF:6,\na.ts\n",
+        )
+        .unwrap();
         observe_playlist(&active, &AtomicBool::new(false), &playlist.cue_metadata);
-        assert_eq!(observations.lock().unwrap()[0].asset_id.as_deref(), Some("original"));
+        assert_eq!(
+            observations.lock().unwrap()[0].asset_id.as_deref(),
+            Some("original")
+        );
         assert!(begin_generation(id) > generation);
         observe_playlist(&active, &AtomicBool::new(false), &Default::default());
         assert_eq!(observations.lock().unwrap().len(), 0);
@@ -1302,18 +1341,38 @@ mod tests {
                 self.evidence.lock().unwrap().clear();
             }
         }
-        let id = if drop_fetcher { "observer-drop-barrier-test" } else { "observer-barrier-test" };
+        let id = if drop_fetcher {
+            "observer-drop-barrier-test"
+        } else {
+            "observer-barrier-test"
+        };
         let generation = begin_generation(id);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let evidence = Arc::new(Mutex::new(Vec::new()));
-        let gate = Arc::new(Mutex::new(Some(HlsEventObserver::new(id.into(), 1, BlockingSink {
-            entered: entered_tx, release: release_rx, evidence: evidence.clone(),
-        }, 8, 256))));
-        urls().lock().unwrap().get_mut(id).unwrap().observation_active = Some(Arc::downgrade(&gate));
+        let gate = Arc::new(Mutex::new(Some(HlsEventObserver::new(
+            id.into(),
+            1,
+            BlockingSink {
+                entered: entered_tx,
+                release: release_rx,
+                evidence: evidence.clone(),
+            },
+            8,
+            256,
+        ))));
+        urls()
+            .lock()
+            .unwrap()
+            .get_mut(id)
+            .unwrap()
+            .observation_active = Some(Arc::downgrade(&gate));
         let worker_gate = gate.clone();
         let worker = std::thread::spawn(move || {
-            let metadata = multiview_input::hls::MediaPlaylist::parse_cue_metadata("#EXTM3U\n#EXT-X-ASSET:CAID=A\na.ts\n#EXT-X-ASSET:CAID=B\nb.ts\n").unwrap();
+            let metadata = multiview_input::hls::MediaPlaylist::parse_cue_metadata(
+                "#EXTM3U\n#EXT-X-ASSET:CAID=A\na.ts\n#EXT-X-ASSET:CAID=B\nb.ts\n",
+            )
+            .unwrap();
             observe_playlist(&worker_gate, &AtomicBool::new(false), &metadata);
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1323,11 +1382,19 @@ mod tests {
             if drop_fetcher {
                 let fetcher = HlsFetcher {
                     shared: Arc::new(Shared {
-                        window: Mutex::new(Window { target_duration: 6.0, segments: VecDeque::new(), next_local: 0, failed: None }),
-                        ready: Condvar::new(), stop: AtomicBool::new(false),
+                        window: Mutex::new(Window {
+                            target_duration: 6.0,
+                            segments: VecDeque::new(),
+                            next_local: 0,
+                            failed: None,
+                        }),
+                        ready: Condvar::new(),
+                        stop: AtomicBool::new(false),
                     }),
-                    source_id: id.into(), local_url: "http://[::1]:1/live.m3u8".into(),
-                    generation, observation_gate: drop_gate,
+                    source_id: id.into(),
+                    local_url: "http://[::1]:1/live.m3u8".into(),
+                    generation,
+                    observation_gate: drop_gate,
                 };
                 drop(fetcher);
             } else {
@@ -1341,7 +1408,8 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
         release_tx.send(()).unwrap();
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        worker.join().unwrap(); retirement.join().unwrap();
+        worker.join().unwrap();
+        retirement.join().unwrap();
         observe_playlist(&gate, &AtomicBool::new(false), &Default::default());
         assert!(evidence.lock().unwrap().is_empty());
         assert!(gate.lock().unwrap().is_none());

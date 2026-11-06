@@ -15,9 +15,9 @@
 //! Every successful commit/rollback is recorded in the change audit log.
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditAction;
@@ -25,7 +25,7 @@ use crate::auth::{Action, Principal};
 use crate::concurrency::{IdempotencyKey, Reservation};
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
-use crate::versioning::{CONFIG_REVISION_KIND, ConfigRevision, DocumentDiff, RevisionId};
+use crate::versioning::{ConfigRevision, DocumentDiff, RevisionId, CONFIG_REVISION_KIND};
 
 /// The body of a `PUT /config/{target}` commit.
 #[derive(Debug, Clone, Deserialize)]

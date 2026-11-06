@@ -6,16 +6,15 @@ mod support;
 use axum::http::StatusCode;
 use multiview_config::{MultiviewConfig, StartMode};
 use multiview_control::{
-    AppState, ControlError, ControlResult, EngineStateSnapshot, InMemoryRepository, ResourceInput,
-    ResourceRepository, VersionedResource,
-    boot_model::{BootModel, load_desired},
-    command_bus,
+    boot_model::{load_desired, BootModel},
+    command_bus, AppState, ControlError, ControlResult, EngineStateSnapshot, InMemoryRepository,
+    ResourceInput, ResourceRepository, VersionedResource,
 };
 use multiview_engine::EnginePublisher;
 use multiview_events::Event;
 use serde_json::json;
 use std::sync::Arc;
-use support::{ADMIN_TOKEN, body_json, etag, get, put_json, send};
+use support::{body_json, etag, get, put_json, send, ADMIN_TOKEN};
 
 const BOOT: &str = r##"schema_version = 1
 [canvas]
