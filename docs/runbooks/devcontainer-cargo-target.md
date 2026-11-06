@@ -4,8 +4,7 @@
 Cargo therefore uses each checkout's own local `target/`: the root checkout
 (`/workspaces/multiview`) builds into `/workspaces/multiview/target`, and **every
 git-worktree lane** under `.claude/worktrees/**` builds into **its own**
-`<lane>/target`. This is the isolation [`AGENTS.md`](../../AGENTS.md) rules 10 and
-11 require, and it is what stops the host load-storms below.
+`<lane>/target`. This is the isolation [`AGENTS.md`](../../AGENTS.md) build-isolation and disk-hygiene instructions require, and it is what stops the host load-storms below.
 
 ## Symptom (what this prevents)
 
@@ -33,10 +32,10 @@ into the **one** root dir `/workspaces/multiview/target`. Concurrent builds then
 1. **contend on cargo's target `flock`** and hammer one directory's inodes →
    the D-state I/O storm above; and
 2. **link siblings' stale artifacts**, which can **fake a green** build/test run —
-   the exact hazard [`AGENTS.md`](../../AGENTS.md) rule 11 warns about.
+   the exact hazard described in [build-cache honesty](../development/working-in-this-monorepo.md#build-cache-honesty).
 
-This directly contradicted rule 10 ("Do **not** override `CARGO_TARGET_DIR` — use
-each worktree's local `target/`; it is isolated and deleted with the worktree").
+This directly contradicted the [`AGENTS.md`](../../AGENTS.md) instruction not to override
+`CARGO_TARGET_DIR`: each worktree must use its own isolated local `target/`.
 
 ## The fix
 
@@ -92,8 +91,10 @@ the cache other co-tenant lanes are using and forces mass rebuilds.
 Per-worktree isolation prevents cache contention, but abandoned `target/` directories still fill
 shared storage. Follow [workspace disk hygiene](../development/working-in-this-monorepo.md#workspace-disk-hygiene)
 for capacity checks, concurrency limits, ownership checks and post-merge cleanup. Check both bytes
-and inodes before a large build. Do not start another large build when free space is below 20% or
-50 GiB, or cannot cover estimated concurrent peak growth plus 50 GiB. Restore headroom first.
+and inodes before a large build. Record estimated concurrent peak additional bytes and inodes.
+Require free bytes of at least `max(20% of filesystem capacity, estimated peak additional bytes + 50 GiB)`
+and free inodes of at least estimated peak additional inodes plus 20% of total inodes where applicable.
+Restore headroom before another large build if either requirement fails.
 Never infer that a cache or worktree is disposable from age alone, and never clean the root cache
 or another agent's active lane to make space. This is an agent procedure, not an automated disk quota.
 
@@ -118,8 +119,9 @@ concurrent lane builds no longer contend on one directory.
 
 ## See also
 
-- [`AGENTS.md`](../../AGENTS.md) rules 10 (no `CARGO_TARGET_DIR` override) and 11
-  (shared build caches fake a green run).
+- [`AGENTS.md`](../../AGENTS.md) — build isolation and bounded workspace disk use.
+- [Build-cache honesty](../development/working-in-this-monorepo.md#build-cache-honesty) —
+  shared caches can fake a green run.
 - [`.devcontainer/devcontainer.json`](../../.devcontainer/devcontainer.json) —
   `containerEnv` (env vars) and the `multiview-target` named volume mount.
 - [`docs/operations/devcontainer.md`](../operations/devcontainer.md) — full

@@ -99,11 +99,14 @@ recall/record is the [`memory`](../memory/SKILL.md) skill.
   go green — stop and ask the operator instead.
 
 ### ⑦ CLEAN
-- `git worktree remove` the lane (+ `git worktree prune`), delete its branch, then
-  `git fetch origin && git pull --ff-only origin main` in the root so the **next wave
-  bases on current HEAD**. Never force-remove a `locked` worktree of a *live* session;
-  if a `locked` worktree's owning pid is dead, salvage its WIP to a `salvage/*` branch
-  first (see Salvage below).
+- Apply [workspace disk hygiene](../../../docs/development/working-in-this-monorepo.md#workspace-disk-hygiene):
+  check capacity before each build wave; inventory ignored/untracked data, owner/activity, locks,
+  nested worktrees and unique commits before removal. Preserve all non-rebuildable data first.
+  Stop your jobs, leave the lane, remove disposable artifacts and then the checkout without
+  `--force`. Retain branches until merge or durable handoff is verified. Age/dead PID is not
+  removal authority. Sync the root only after merge with explicit local-data preservation and
+  collision refusal; never reset/clean/stash it or rely on `pull --ff-only` alone. Base the next
+  wave on fetched `origin/main`. Report reclaimed bytes and retained lanes/owners/cleanup conditions.
 
 ### ⑧ RECORD
 - Flip the board checkbox + set the Part-3 Status; add the red→green commit SHAs + PR
@@ -142,13 +145,13 @@ owner** — do not split the territory.
 
 ## Salvage (orphaned `locked` lane with a dead owning pid)
 
-```bash
-# work is preserved as a readable, recoverable branch before the worktree is removed
-git -C <lane> add -A && git -C <lane> commit -m "wip(salvage): <what> — recovered by Conductor"
-git branch salvage/<descriptive-name> $(git -C <lane> rev-parse HEAD)
-git worktree unlock <lane> && git worktree remove --force <lane>
-```
-Then queue the salvage branch for rebase + completion in the owning territory's lane.
+Confirm the owner and absence of active sessions/writers first; a dead PID alone proves nothing.
+Inventory tracked, untracked and ignored paths without reading secrets. Preserve commits with a
+`salvage/*` ref, and preserve non-committed data through an owner-approved secure handoff.
+Never `git add -A` unknown content or assume a commit preserves ignored files. Stage only reviewed,
+secret-free source paths if a salvage commit is appropriate. Do not unlock or remove the checkout
+until the owner authorizes it and the complete disk-hygiene preservation checklist passes.
+Do not force-remove it. Queue the salvage branch for rebase and completion in its owning territory.
 
 ## Non-negotiables (never relax under self-pacing)
 

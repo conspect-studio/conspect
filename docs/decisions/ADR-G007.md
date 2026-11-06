@@ -61,9 +61,11 @@ The Conductor runs a repeating loop:
 > cherry-picks; rebuild from a clean isolated `target/` — no shared-cache fake-green) →
 > **⑤ REVIEW** (dispatch each diff to a fresh, **different-vendor** reviewer; ≥1
 > substantive risk required; high-risk diffs get a 3-reviewer panel) → **⑥ MERGE**
-> (green deterministic CI + passing review → merge, ADR-G005) → **⑦ CLEAN** (remove the
-> lane's worktree, prune its branch, `fetch && pull --ff-only` so the next wave bases on
-> current HEAD) → **⑧ RECORD** (flip board checkboxes, `qdrant-store` decisions/gotchas,
+> (green deterministic CI + passing review → merge, ADR-G005) → **⑦ CLEAN** (apply
+> [workspace disk hygiene](../development/working-in-this-monorepo.md#workspace-disk-hygiene):
+> preserve local data and unique commits, remove only verified disposable lane artifacts and
+> finished worktrees, safely sync the root without overwriting local work; base new lanes on
+> fetched `origin/main`) → **⑧ RECORD** (flip board checkboxes, `qdrant-store` decisions/gotchas,
 > write/refresh runbooks) → **⑨** reschedule the next iteration.
 
 Concrete shape:

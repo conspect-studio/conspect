@@ -104,10 +104,13 @@ the task, not just after an ENOSPC failure.
   a reviewed omnibus PR. Only sync the root after merge, without overwriting existing changes.
 - Check `df -h .` and `df -i .`, then inspect `git worktree list --porcelain` and the size of your
   own worktree, `target/`, dependency caches and scratch outputs with `du -sh <exact-path>`.
-- Reserve headroom for the expected peak of **all** concurrent lanes, not only final artifact size.
-  If free space is below 20% or 50 GiB, or below that estimated peak plus 50 GiB, do not start
-  another large build, dependency install or fan-out. Reclaim verified disposable task artifacts,
-  reduce concurrency, or arrange more capacity first. Recheck during long runs and between waves.
+- Estimate and record peak additional bytes and inodes for **all** concurrent lanes in the PR or
+  task handoff, not only final artifact size. Require free bytes to be at least
+  `max(20% of filesystem capacity, estimated peak additional bytes + 50 GiB)`, and free inodes
+  to cover estimated peak additional inodes plus 20% of total inodes (where inode limits apply).
+  Otherwise do not start another large build, dependency install or fan-out. Reclaim verified
+  disposable task artifacts, reduce concurrency, or arrange capacity first. Recheck during long
+  runs and between waves.
 - Keep Cargo's per-worktree `target/` isolation. Never override `CARGO_TARGET_DIR`, share a sibling's
   cache, or move build output to `/tmp` or another filesystem to evade the capacity check. See
   [`devcontainer-cargo-target.md`](../runbooks/devcontainer-cargo-target.md) for the I/O-storm history.
@@ -133,17 +136,29 @@ the task, not just after an ENOSPC failure.
 
 ### After merge or explicit abandonment
 
+Explicit abandonment requires a recorded owner decision and durable refs for every unmerged commit;
+a handoff alone is not abandonment. Before a root sync, inspect root tracked, untracked and ignored
+paths without reading secrets. Refuse the update if any local work lacks an explicit preservation
+plan. Use a safe sync that preserves all local paths and commits; abort on collision. Never reset,
+clean, stash or force the root to make a sync pass. `pull --ff-only` alone is not a preservation plan.
+
 1. Verify the merged commit on `origin/main`, or record a deliberate handoff for any unmerged work.
 2. Stop your own processes and leave the worktree before removal. Recheck the path and protections
    above immediately before deletion; do not rely on an old inventory.
-3. Remove verified rebuildable outputs with a narrowly scoped tool (for example `cargo clean`
-   from your inactive lane). Never clean the shared root cache. Remove only your disposable
-   dependency installs, logs and scratch files; never follow symlinks or cross mount boundaries.
-4. Remove your finished checkout with `git worktree remove <verified-absolute-path>` from outside
-   it. Do not use `--force` to bypass dirty/untracked data or a worktree lock. If ignored generated
-   output prevents removal, verify and remove that output first. Retain branches until merge or
-   durable handoff is verified; do not force-delete unique commits.
-5. Check `git worktree list --porcelain`, `df -h .` and `df -i .` again. Report reclaimed space and
+3. Inventory **all ignored paths** before removal, including nested directories; do not infer
+   safety from a clean tracked status. Positively classify each as rebuildable or preserve it
+   through an owner-approved secure handoff. Refuse removal while any path is unclassified.
+   Plain `git worktree remove` deletes ignored data without warning, even without `--force`.
+4. Remove only verified disposable outputs; never follow symlinks or cross mount boundaries.
+   Before a Cargo clean, use `env -u CARGO_TARGET_DIR cargo metadata --no-deps --format-version 1`
+   in the inactive lane and verify `target_directory` resolves exactly to `<lane>/target`, not a
+   root/shared/mounted cache. Only then use `env -u CARGO_TARGET_DIR cargo clean` there. Remove
+   only your disposable dependency installs, logs and scratch files. Never clean the root cache.
+5. Refuse removal if nested worktrees remain. Remove your finished checkout with
+   `git worktree remove <verified-absolute-path>` from outside it, only after the inventory and
+   preservation above. Do not use `--force` to bypass dirty/untracked data or a lock. Retain
+   branches until merge or durable handoff is verified; do not force-delete unique commits.
+6. Check `git worktree list --porcelain`, `df -h .` and `df -i .` again. Report reclaimed space and
    any retained lane, its owner and cleanup condition. Cleanup is part of completion, not optional
    follow-up. If safe cleanup cannot restore headroom, report the capacity blocker instead of
    starting more disk-heavy work.
