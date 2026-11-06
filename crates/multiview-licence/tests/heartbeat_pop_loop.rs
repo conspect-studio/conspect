@@ -49,26 +49,35 @@ fn test_identity() -> multiview_licence::heartbeat::DeviceIdentity {
     }
 }
 
+fn fixture_store() -> Arc<LeaseStore> {
+    let now_ms = fake::FabricatedKeyset::new().now_ms();
+    Arc::new(LeaseStore::with_clock(Arc::new(move || {
+        chrono::DateTime::from_timestamp_millis(now_ms).unwrap()
+    })))
+}
+
 /// A client wired with a known device signer so the fake can verify the proof.
 fn pop_client(
     server: Arc<FakeLicenceServer>,
     store: Arc<LeaseStore>,
 ) -> HeartbeatClient<FakeLicenceServer> {
     let pinned = server.pinned_root();
-    HeartbeatClient::with_device_signer(
+    let now_ms = server.kit().now_ms();
+    HeartbeatClient::with_clock(
         server,
         store,
         pinned,
         test_config(),
         test_identity(),
-        Arc::new(pop_test_signer()),
+        Arc::new(move || now_ms),
     )
+    .with_signer(Arc::new(pop_test_signer()))
 }
 
 #[tokio::test]
 async fn cold_start_fetches_a_challenge_then_heartbeats_with_a_valid_pop() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = pop_client(Arc::clone(&server), Arc::clone(&store));
 
     let outcome = tokio::time::timeout(Duration::from_secs(5), client.run_once())
@@ -103,7 +112,7 @@ async fn cold_start_fetches_a_challenge_then_heartbeats_with_a_valid_pop() {
 #[tokio::test]
 async fn steady_state_uses_next_nonce_and_skips_the_challenge_round_trip() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = pop_client(Arc::clone(&server), Arc::clone(&store));
 
     // Cycle 1: cold start (1 challenge fetch).
@@ -137,7 +146,7 @@ async fn steady_state_uses_next_nonce_and_skips_the_challenge_round_trip() {
 #[tokio::test]
 async fn an_unreachable_challenge_keeps_last_good_no_mutation() {
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = pop_client(Arc::clone(&server), Arc::clone(&store));
 
     // Seed a healthy lease first (so there is a last-good to keep).
@@ -183,7 +192,7 @@ async fn a_server_rejected_nonce_pop_invalid_keeps_last_good_and_recovers() {
     // burned and must never be replayed; only an AMBIGUOUS (no-response) failure
     // replays the pinned unit.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = pop_client(Arc::clone(&server), Arc::clone(&store));
 
     // Seed a healthy lease.
@@ -241,7 +250,7 @@ async fn a_malformed_2xx_body_keeps_last_good_and_recovers_with_a_fresh_challeng
     // fetch a FRESH /challenge and sign a FRESH proof (RECOVERY). Only an AMBIGUOUS
     // (no-response/5xx) failure replays the pinned unit verbatim.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = pop_client(Arc::clone(&server), Arc::clone(&store));
 
     // Seed a healthy lease.
@@ -303,7 +312,7 @@ async fn no_binding_makes_no_challenge_and_no_pop() {
     // The renew-only client makes NO server call when there is no binding to renew
     // — so it must NOT fetch a challenge or build a PoP (a benign no-op).
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let pinned = server.pinned_root();
     let mut identity = test_identity();
     identity.binding_id = None; // no configured binding, empty store → NoBinding
@@ -336,7 +345,7 @@ async fn an_already_expired_fresh_challenge_is_not_signed_or_sent() {
     // was expiry-checked, a fresh one was not). Fail closed — no heartbeat mutation
     // this cycle, keep last-good (never off air).
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = pop_client(Arc::clone(&server), Arc::clone(&store));
 
     // Seed a healthy lease so there is a last-good to keep.
@@ -387,7 +396,7 @@ async fn a_lost_response_retry_replays_the_same_idempotency_key_and_body_and_non
     // MUST replay the SAME {idempotency-key, body, nonce} as the attempt that may have
     // landed on the server.
     let server = shared_fake();
-    let store = Arc::new(LeaseStore::new());
+    let store = fixture_store();
     let client = pop_client(Arc::clone(&server), Arc::clone(&store));
 
     // The first heartbeat records its key+body, then returns a transport error (a
