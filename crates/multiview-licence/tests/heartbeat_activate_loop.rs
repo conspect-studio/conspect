@@ -56,14 +56,18 @@ fn enrolling_client(
     store: Arc<LeaseStore>,
 ) -> HeartbeatClient<FakeLicenceServer> {
     let pinned = server.pinned_root();
-    HeartbeatClient::with_device_signer(
+    // The signed fake leases and client verification must use the same clock.
+    // Keep expiry checks and the 35-day term intact, independent of the host date.
+    let now_ms = server.kit().now_ms();
+    HeartbeatClient::with_clock(
         server,
         store,
         pinned,
         activate_config(),
         fresh_identity(),
-        Arc::new(pop_test_signer()),
+        Arc::new(move || now_ms),
     )
+    .with_signer(Arc::new(pop_test_signer()))
 }
 
 #[tokio::test]
@@ -105,7 +109,10 @@ async fn a_fresh_device_with_activate_enabled_enrols_and_installs_a_lease() {
 
     // A lease was installed and the device is now licensed-active.
     assert_eq!(
-        store.status().unwrap().enforcement,
+        store
+            .status_at(chrono::DateTime::from_timestamp_millis(server.kit().now_ms()).unwrap())
+            .unwrap()
+            .enforcement,
         EnforcementLevel::Active
     );
 }
