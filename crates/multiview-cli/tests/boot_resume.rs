@@ -14,6 +14,8 @@ use std::path::PathBuf;
 
 use multiview_cli::boot::resolve_start_config;
 use multiview_config::MultiviewConfig;
+use multiview_control::boot_model::DesiredState;
+use multiview_control::repository::Layout;
 
 /// A boot document with the given `[control]` extras spliced in.
 fn boot_doc(control_extra: &str) -> String {
@@ -82,6 +84,54 @@ fn in_a_color(config: &MultiviewConfig) -> Option<String> {
         })
 }
 
+/// A single accepted envelope wins over stale observational active.toml.
+#[test]
+fn accepted_desired_envelope_restores_config_and_selected_definition() {
+    let boot = boot_doc("");
+    let active = boot.replace("#101418", "#222222");
+    let (_dir, boot_path, boot_config) = stage(&boot, Some(&active));
+    let mut accepted = boot_config.clone();
+    accepted.sources[0] = serde_json::from_value(serde_json::json!({
+        "id": "in_a", "kind": "solid", "color": "#333333"
+    }))
+    .expect("source parses");
+    let body = serde_json::json!({
+        "canvas": accepted.canvas, "layout": accepted.layout, "cells": accepted.cells,
+    });
+    let desired = DesiredState {
+        version: 1,
+        config: accepted,
+        selected_layout_id: "custom".into(),
+        layouts: vec![Layout {
+            id: "custom".into(),
+            name: "custom".into(),
+            body: body.clone(),
+        }],
+        selected_body: body,
+        output_ids: vec!["output-0".into()],
+        layout_versions: Default::default(),
+        resource_versions: Default::default(),
+        resource_names: Default::default(),
+    };
+    desired.validate().expect("valid envelope");
+    std::fs::write(
+        boot_path
+            .parent()
+            .expect("parent")
+            .join(".multiview/desired.json"),
+        serde_json::to_vec(&desired).expect("serialize"),
+    )
+    .expect("write desired");
+    let resumed =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
+    assert!(resumed.resumed);
+    assert_eq!(in_a_color(&resumed.running).as_deref(), Some("#333333"));
+    assert_eq!(
+        resumed.desired.expect("desired library").selected_layout_id,
+        "custom"
+    );
+}
+
 /// `start = "resume"` with a valid `active.toml` starts Running from it, while
 /// Loaded stays the boot snapshot.
 #[test]
@@ -90,7 +140,8 @@ fn resume_starts_from_a_valid_active_toml() {
     let active = boot.replace("#101418", "#f0f0f0");
     let (_dir, boot_path, boot_config) = stage(&boot, Some(&active));
 
-    let start = resolve_start_config(boot_config, boot.clone(), &boot_path);
+    let start =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
     assert!(start.resumed, "a valid active.toml must be resumed");
     assert!(start.resume_fallback.is_none());
     assert_eq!(
@@ -112,7 +163,8 @@ fn resume_falls_back_to_boot_on_a_corrupt_active() {
     let boot = boot_doc("start = \"resume\"");
     let (_dir, boot_path, boot_config) = stage(&boot, Some("this is [not the schema"));
 
-    let start = resolve_start_config(boot_config, boot.clone(), &boot_path);
+    let start =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
     assert!(!start.resumed, "a corrupt active.toml must not resume");
     let reason = start
         .resume_fallback
@@ -134,7 +186,8 @@ fn resume_falls_back_to_boot_when_active_is_missing() {
     let boot = boot_doc("start = \"resume\"");
     let (_dir, boot_path, boot_config) = stage(&boot, None);
 
-    let start = resolve_start_config(boot_config, boot.clone(), &boot_path);
+    let start =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
     assert!(!start.resumed);
     assert!(start.resume_fallback.is_some());
     assert_eq!(in_a_color(&start.running).as_deref(), Some("#101418"));
@@ -156,7 +209,8 @@ fn resume_splices_storeless_sections_from_the_boot_file() {
     let active = boot_doc("start = \"resume\"").replace("#101418", "#f0f0f0");
     let (_dir, boot_path, boot_config) = stage(&boot, Some(&active));
 
-    let start = resolve_start_config(boot_config, boot.clone(), &boot_path);
+    let start =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
     assert!(start.resumed, "the valid active.toml must still resume");
     assert_eq!(
         start
@@ -276,7 +330,8 @@ segment_ms = 1000
 "##;
     let (_dir, boot_path, boot_config) = stage(&boot, Some(active));
 
-    let start = resolve_start_config(boot_config, boot.clone(), &boot_path);
+    let start =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
     assert!(
         !start.resumed,
         "a splice that does not validate must not resume"
@@ -325,7 +380,8 @@ fn resume_keeps_runtime_salvo_and_tally_edits_from_active() {
     );
     let (_dir, boot_path, boot_config) = stage(&boot, Some(&active));
 
-    let start = resolve_start_config(boot_config, boot.clone(), &boot_path);
+    let start =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
     assert!(start.resumed, "the valid active.toml must resume");
     let salvo = start
         .running
@@ -350,7 +406,8 @@ fn the_default_boot_policy_ignores_an_existing_active() {
     let active = boot.replace("#101418", "#f0f0f0");
     let (_dir, boot_path, boot_config) = stage(&boot, Some(&active));
 
-    let start = resolve_start_config(boot_config, boot.clone(), &boot_path);
+    let start =
+        resolve_start_config(boot_config, boot.clone(), &boot_path).expect("resolve startup");
     assert!(!start.resumed, "start = boot must never resume");
     assert!(
         start.resume_fallback.is_none(),
@@ -378,7 +435,7 @@ fn to_boot_model_canonicalizes_a_symlinked_config() {
     std::os::unix::fs::symlink(&real, &link).expect("create symlink");
 
     let config = MultiviewConfig::load_from_toml(&boot).expect("parse");
-    let start = resolve_start_config(config, boot, &link);
+    let start = resolve_start_config(config, boot, &link).expect("resolve startup");
     let model = start.to_boot_model(&link);
 
     let canonical_real = std::fs::canonicalize(&real).expect("canonicalize real");

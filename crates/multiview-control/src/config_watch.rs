@@ -34,16 +34,16 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use multiview_config::{ConfigDiff, MultiviewConfig, OverlayChange, SourceChange};
 use multiview_events::{Event, HealthWarning, WarningCode, WarningSeverity};
 
 use crate::{
-    resolve_layout_document, AppState, AuditAction, Command, LayoutInput, OperationId,
-    ResourceInput, ResourceRepository,
+    AppState, AuditAction, Command, LayoutInput, OperationId, ResourceInput, ResourceRepository,
+    resolve_layout_document,
 };
 
 /// The audit-log actor every file-applied change is recorded under.
@@ -880,6 +880,15 @@ async fn watch_loop(
                 // sections the engine actually applied LIVE, so a shed left it at
                 // the adopted state — there is no global gate to unstick.
                 let _mutation = state.lock_config_mutation().await;
+                if let Err(error) = commit_watched_desired(&state, &baseline).await {
+                    reject(
+                        &state,
+                        &path,
+                        &format!("restoring desired state: {error}"),
+                        &mut invalid_active,
+                    );
+                    continue;
+                }
                 resync_all_stores(&state, ACTOR, &baseline);
                 clear_apply_incomplete(&state, &path, &mut incomplete_active);
                 state.running_changed.notify_one();
@@ -977,6 +986,15 @@ async fn watch_loop(
                 // adoption already kept it at the adopted state through the
                 // shed).
                 let _mutation = state.lock_config_mutation().await;
+                if let Err(error) = commit_watched_desired(&state, &baseline).await {
+                    reject(
+                        &state,
+                        &path,
+                        &format!("restoring desired state: {error}"),
+                        &mut invalid_active,
+                    );
+                    continue;
+                }
                 resync_all_stores(&state, ACTOR, &baseline);
                 clear_apply_incomplete(&state, &path, &mut incomplete_active);
                 state.running_changed.notify_one();
@@ -1001,6 +1019,7 @@ async fn watch_loop(
                 &mut invalid_active,
                 &mut incomplete_active,
             )
+            .await
         };
         match apply_result {
             ApplyResult::Settled => {
@@ -1075,7 +1094,7 @@ enum ApplyResult {
 /// diff, apply through the one machinery, advance the baseline — unless a
 /// command was shed, in which case NOTHING advances and the apply is retried
 /// on a later poll (review M1).
-fn apply_change(
+async fn apply_change(
     path: &Path,
     text: &str,
     baseline: &mut MultiviewConfig,
@@ -1098,6 +1117,15 @@ fn apply_change(
         // the stores may have followed the abandoned content — re-converge
         // them to the file before clearing the interim warning.
         if *incomplete_active {
+            if let Err(error) = commit_watched_desired(state, &next).await {
+                reject(
+                    state,
+                    path,
+                    &format!("restoring desired state: {error}"),
+                    invalid_active,
+                );
+                return ApplyResult::Retry;
+            }
             resync_all_stores(state, ACTOR, &next);
             clear_apply_incomplete(state, path, incomplete_active);
         }
@@ -1116,6 +1144,18 @@ fn apply_change(
         state.running_changed.notify_one();
         tracing::debug!(path = %path.display(), "config file rewritten with identical content");
         return ApplyResult::Settled;
+    }
+    // The file is external intent. Publish its whole validated envelope before
+    // any control store or command changes, so an I/O refusal leaves state intact.
+    // A shed command does not undo accepted intent; the poll retries its live apply.
+    if let Err(error) = commit_watched_desired(state, &next).await {
+        reject(
+            state,
+            path,
+            &format!("committing desired state: {error}"),
+            invalid_active,
+        );
+        return ApplyResult::Retry;
     }
     let outcome = apply_document_diff(state, ACTOR, &diff, &next);
     // The document is valid either way — the invalid latch clears even when
@@ -1141,23 +1181,10 @@ fn apply_change(
             ),
         );
         publish_apply_incomplete(state, path, outcome.shed, incomplete_active);
-        // MAJOR-B round 4: a command was SHED — the engine did NOT adopt this
-        // document, so the adopted snapshot is left UNCHANGED (it still reflects
-        // the last fully-adopted document). The idempotent retry on a later poll
-        // adopts it when it lands. active.toml therefore never captures the
-        // mid-retry store state.
         return ApplyResult::Retry;
     }
     *baseline = next;
     clear_apply_incomplete(state, path, incomplete_active);
-    // MAJOR-B round 5: the apply landed completely. The adopted snapshot was
-    // ALREADY advanced PER-SECTION inside `apply_document_diff` for exactly the
-    // sections the engine applied LIVE (synthetic sources via UpsertSource,
-    // layout via ApplyLayout) — restart-only sections (a non-synthetic source,
-    // a Class-2 canvas/layout, outputs/probes/devices/sync_groups/audio) applied
-    // NOTHING to the snapshot, so they never leak into `active.toml`. No
-    // wholesale adoption here (that was the round-4 over-adoption). Re-fire so
-    // the debounced persister captures the per-section-updated snapshot.
     state.running_changed.notify_one();
     state
         .config_watch
@@ -1166,17 +1193,32 @@ fn apply_change(
         state
             .config_watch
             .add_restart_pending(outcome.restart.iter().cloned());
-        // Warn with the LATCHED union (every section pending since start), so
-        // the single coalesced warning entry stays complete.
         let pending = state.config_watch.snapshot().restart_pending;
         publish_requires_restart(state, &pending);
     }
-    tracing::info!(
-        path = %path.display(),
-        summary = %outcome.summary,
-        "applied an external config-file change (ADR-W020)"
-    );
+    tracing::info!(path = %path.display(), summary = %outcome.summary, "applied an external config-file change (ADR-W020)");
     ApplyResult::Settled
+}
+
+/// Commit file intent before changing live state. The selected identity and
+/// output map come from the authoritative envelope, never the stale store.
+async fn commit_watched_desired(
+    state: &AppState,
+    next: &MultiviewConfig,
+) -> crate::ControlResult<()> {
+    let Some(model) = state.boot_model.as_ref() else {
+        return Ok(());
+    };
+    let layouts = crate::boot_model::layout_library(state)?;
+    let output_ids = crate::boot_model::output_ids_for_config(state, next)?;
+    let selected = crate::boot_model::load_desired(model.boot_path())
+        .map_err(crate::ControlError::Repository)?
+        .map(|desired| desired.selected_layout_id)
+        .or_else(|| model.selected_layout_id())
+        .or_else(|| state.working_layout_id.clone())
+        .ok_or_else(|| crate::ControlError::Validation("no selected working layout".into()))?;
+    crate::boot_model::commit_desired_document(state, next.clone(), layouts, selected, output_ids)
+        .await
 }
 
 /// What one document apply did: the human summary, the restart-only sections,
@@ -1310,7 +1352,7 @@ pub fn apply_document_diff(
         }
         restart.insert((*section).to_owned());
         match *section {
-            "outputs" => resync_store(state, actor, &state.outputs, &desired_outputs(next)),
+            "outputs" => resync_outputs(state, actor, next),
             "probes" => resync_store(state, actor, &state.probes, &desired_probes(next)),
             "devices" => {
                 resync_store(state, actor, &state.devices, &desired_devices(next));
@@ -1716,10 +1758,16 @@ fn reseed_working_layout(state: &AppState, actor: &str, id: &str, body: &serde_j
         name: id.to_owned(),
         body: body.clone(),
     };
-    let updated = state
-        .repository
-        .update_layout(id, input.clone())
-        .or_else(|_| state.repository.create_layout(id, input));
+    // An operator's saved definition is not the working canvas. A file watch
+    // must not overwrite an existing library ID merely because its old seed
+    // happened to share the same name.
+    let updated = match state.repository.get_layout(id) {
+        Ok(_) => return,
+        Err(crate::error::ControlError::NotFound { .. }) => {
+            state.repository.create_layout(id, input)
+        }
+        Err(error) => Err(error),
+    };
     match updated {
         Ok(_) => {
             state.audit(
@@ -1920,26 +1968,41 @@ fn desired_sources(config: &MultiviewConfig) -> Vec<(String, ResourceInput)> {
         .collect()
 }
 
-/// The outputs store's desired contents: stable index-derived `output-{n}`
-/// ids in config order, named by the `kind` tag (mirrors `seed_resources`).
-fn desired_outputs(config: &MultiviewConfig) -> Vec<(String, ResourceInput)> {
-    config
-        .outputs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, output)| {
-            let body = to_body(output)?;
-            let kind = body
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("output")
-                .to_owned();
-            Some((
-                format!("output-{index}"),
-                ResourceInput { name: kind, body },
-            ))
-        })
-        .collect()
+/// Match output bodies to the accepted identity map. File edits may add or
+/// reorder outputs, and API-created IDs need not have an `output-{n}` shape.
+fn desired_outputs(
+    state: &AppState,
+    config: &MultiviewConfig,
+) -> Option<Vec<(String, ResourceInput)>> {
+    let ids = match crate::boot_model::output_ids_for_config(state, config) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, "cannot resolve accepted output identities for store resync");
+            return None;
+        }
+    };
+    Some(
+        config
+            .outputs
+            .iter()
+            .zip(ids)
+            .filter_map(|(output, id)| {
+                let body = to_body(output)?;
+                let name = body
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("output")
+                    .to_owned();
+                Some((id, ResourceInput { name, body }))
+            })
+            .collect(),
+    )
+}
+
+fn resync_outputs(state: &AppState, actor: &str, config: &MultiviewConfig) {
+    if let Some(desired) = desired_outputs(state, config) {
+        resync_store(state, actor, &state.outputs, &desired);
+    }
 }
 
 /// The overlays store's desired contents (id-named, mirrors `seed_resources`).
@@ -2151,9 +2214,20 @@ fn apply_incomplete_warning(path: &Path, shed: u32, since: i64, active: bool) ->
 /// passes the requesting principal to roll the stores back to the pre-revert
 /// Running document so a shed revert applies nothing durable and its retry's
 /// diff is non-empty again. Idempotent.
+/// Restore exact pre-apply output identities after a shed revert. The accepted
+/// document may already have Loaded's output map, while runtime must retain
+/// the pre-revert store until the operator retries.
+pub(crate) fn restore_output_store(
+    state: &AppState,
+    actor: &str,
+    before: &[(String, ResourceInput)],
+) {
+    resync_store(state, actor, &state.outputs, before);
+}
+
 pub(crate) fn resync_all_stores(state: &AppState, actor: &str, config: &MultiviewConfig) {
     resync_store(state, actor, &state.sources, &desired_sources(config));
-    resync_store(state, actor, &state.outputs, &desired_outputs(config));
+    resync_outputs(state, actor, config);
     resync_store(state, actor, &state.overlays, &desired_overlays(config));
     resync_store(state, actor, &state.probes, &desired_probes(config));
     resync_store(state, actor, &state.devices, &desired_devices(config));

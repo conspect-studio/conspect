@@ -15,9 +15,9 @@
 //! Every successful commit/rollback is recorded in the change audit log.
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditAction;
@@ -25,7 +25,7 @@ use crate::auth::{Action, Principal};
 use crate::concurrency::{IdempotencyKey, Reservation};
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
-use crate::versioning::{ConfigRevision, DocumentDiff, RevisionId, CONFIG_REVISION_KIND};
+use crate::versioning::{CONFIG_REVISION_KIND, ConfigRevision, DocumentDiff, RevisionId};
 
 /// The body of a `PUT /config/{target}` commit.
 #[derive(Debug, Clone, Deserialize)]
@@ -727,6 +727,10 @@ pub struct RevertToStartBody {
         ),
     )
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "revert commits intent and reports shed engine commands atomically"
+)]
 pub(crate) async fn revert_to_start(
     State(state): State<AppState>,
     principal: Principal,
@@ -779,6 +783,58 @@ pub(crate) async fn revert_to_start(
         }
     };
     let diff = multiview_config::ConfigDiff::between(&running, model.loaded());
+    let before_outputs = match state.outputs.list() {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|entry| {
+                let resource = entry.resource;
+                (
+                    resource.id,
+                    crate::ResourceInput {
+                        name: resource.name,
+                        body: resource.body,
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            state.idempotency.release(idem.0.as_deref(), &op);
+            return Err(error);
+        }
+    };
+    // Revert changes accepted intent too, even when the live document already
+    // equals Loaded. Commit the full desired envelope before touching stores or
+    // the command bus; a failed commit must leave the reservation retryable.
+    let desired_commit = (|| {
+        let layouts = crate::boot_model::layout_library(&state)?;
+        let output_ids = crate::boot_model::output_ids_for_config(&state, model.loaded())?;
+        let selected = crate::boot_model::load_desired(model.boot_path())
+            .map_err(ControlError::Repository)?
+            .map(|desired| desired.selected_layout_id)
+            .or_else(|| model.selected_layout_id())
+            .or_else(|| state.working_layout_id.clone())
+            .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
+        Ok::<_, ControlError>((layouts, output_ids, selected))
+    })();
+    let (layouts, output_ids, selected) = match desired_commit {
+        Ok(parts) => parts,
+        Err(error) => {
+            state.idempotency.release(idem.0.as_deref(), &op);
+            return Err(error);
+        }
+    };
+    if let Err(error) = crate::boot_model::commit_desired_document(
+        &state,
+        model.loaded().clone(),
+        layouts,
+        selected,
+        output_ids,
+    )
+    .await
+    {
+        state.idempotency.release(idem.0.as_deref(), &op);
+        return Err(error);
+    }
     if diff.is_empty() {
         // Running already equals Loaded. A previously shed revert's warning
         // clears too: any interim edits that re-converged the stores rode the
@@ -810,6 +866,7 @@ pub(crate) async fn revert_to_start(
     // lets a later completed revert clear exactly this instance.
     if outcome.shed > 0 {
         crate::config_watch::resync_all_stores(&state, &principal.key_id, &running);
+        crate::config_watch::restore_output_store(&state, &principal.key_id, &before_outputs);
         model.note_revert_incomplete();
         state
             .engine

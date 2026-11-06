@@ -17,9 +17,9 @@ use std::sync::Arc;
 use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::MultiviewConfig;
 use multiview_control::{
-    provision_admin_keys, run_warning_ingest, AppState, Command, CommandReceiver, CommandSender,
-    EngineStateSnapshot, InMemoryRepository, InMemoryWarningStore, ResolvedLayout, SharedPreview,
-    WarningRepository,
+    AppState, Command, CommandReceiver, CommandSender, EngineStateSnapshot, InMemoryRepository,
+    InMemoryWarningStore, ResolvedLayout, SharedPreview, WarningRepository, provision_admin_keys,
+    run_warning_ingest,
 };
 use multiview_engine::{
     CompositorDrive, EnginePublisher, RouteApplier, RouteIntent, RouteResolution,
@@ -235,6 +235,31 @@ where
     // in-memory store holding the config's working layout; move that layout into
     // the persistent store (if any) and serve from it.
     state.repository = persist_layouts(&state.repository, boot_model.as_deref()).await;
+    if let Some(model) = boot_model.as_ref() {
+        if let Some(desired) = multiview_control::boot_model::load_desired(model.boot_path())
+            .map_err(std::io::Error::other)?
+        {
+            let mapped = multiview_control::resource_store::InMemoryOutputStore::new();
+            for (id, output) in desired.output_ids.iter().zip(desired.config.outputs.iter()) {
+                let body = serde_json::to_value(output).map_err(std::io::Error::other)?;
+                let name = body
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("output")
+                    .to_owned();
+                multiview_control::resource_store::ResourceRepository::create(
+                    &mapped,
+                    id,
+                    multiview_control::resource_store::ResourceInput { name, body },
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            state = state.with_outputs_store(Arc::new(mapped));
+        }
+        model
+            .restore_desired_layout_id()
+            .map_err(std::io::Error::other)?;
+    }
     if let Some(whep) = whep {
         state = state.with_whep(whep);
     }
@@ -2411,6 +2436,28 @@ fn salvo_event(salvo: String, phase: SalvoPhase, head: Option<String>) -> SalvoE
     }
 }
 
+/// Restore the complete saved library from its authoritative envelope.
+fn restore_desired_layouts(
+    model: &multiview_control::boot_model::BootModel,
+) -> Option<Arc<dyn multiview_control::repository::Repository>> {
+    let desired = multiview_control::boot_model::load_desired(model.boot_path()).ok()??;
+    let restored = multiview_control::InMemoryRepository::new();
+    for layout in desired.layouts {
+        let id = layout.id;
+        let input = multiview_control::repository::LayoutInput {
+            name: layout.name,
+            body: layout.body,
+        };
+        if let Err(error) =
+            multiview_control::repository::Repository::create_layout(&restored, &id, input)
+        {
+            tracing::error!(%error, layout = %id, "cannot restore accepted layout");
+            return None;
+        }
+    }
+    Some(Arc::new(restored))
+}
+
 /// The stored-layout repository for this run.
 ///
 /// With the `sqlite` feature and a config-file run (a boot model), layouts are
@@ -2436,26 +2483,96 @@ async fn persist_layouts(
             let url = format!("sqlite://{}?mode=rwc", path.display());
             match multiview_control::sqlite::SqliteRepository::connect(&url).await {
                 Ok(repo) => {
-                    // Refresh the config's working layout from the boot file
-                    // (it mirrors the loaded config), keep every operator layout.
-                    if let Ok(working) = seeded.list_layouts() {
-                        for layout in working {
-                            let id = layout.layout.id.clone();
-                            let input = multiview_control::repository::LayoutInput {
-                                name: layout.layout.name.clone(),
-                                body: layout.layout.body.clone(),
+                    // The desired envelope is authoritative; seed ONLY absent
+                    // ids in an older SQLite library. Never overwrite an
+                    // operator-authored saved definition at boot.
+                    let desired = multiview_control::boot_model::load_desired(model.boot_path())
+                        .map_err(std::io::Error::other);
+                    let desired = match desired {
+                        Ok(desired) => desired,
+                        Err(error) => {
+                            tracing::error!(%error, "cannot restore accepted layouts");
+                            return Arc::clone(seeded);
+                        }
+                    };
+                    let from_desired = desired.is_some();
+                    let desired_ids = desired.as_ref().map(|record| {
+                        record
+                            .layouts
+                            .iter()
+                            .map(|layout| layout.id.clone())
+                            .collect::<std::collections::HashSet<_>>()
+                    });
+                    let library = desired.map_or_else(
+                        || {
+                            seeded
+                                .list_layouts()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|v| v.layout)
+                                .collect()
+                        },
+                        |record| record.layouts,
+                    );
+                    for layout in library {
+                        let id = layout.id.clone();
+                        let input = multiview_control::repository::LayoutInput {
+                            name: layout.name,
+                            body: layout.body,
+                        };
+                        let result =
+                            match multiview_control::repository::Repository::get_layout(&repo, &id)
+                            {
+                                Ok(existing)
+                                    if existing.layout.name == input.name
+                                        && existing.layout.body == input.body =>
+                                {
+                                    Ok(())
+                                }
+                                Ok(_) if from_desired => {
+                                    multiview_control::repository::Repository::update_layout(
+                                        &repo, &id, input,
+                                    )
+                                    .map(|_| ())
+                                }
+                                Ok(_) => Ok(()), // Legacy SQLite definition wins over boot seeding.
+                                Err(multiview_control::ControlError::NotFound { .. }) => {
+                                    multiview_control::repository::Repository::create_layout(
+                                        &repo, &id, input,
+                                    )
+                                    .map(|_| ())
+                                }
+                                Err(error) => Err(error),
                             };
-                            let _ = multiview_control::repository::Repository::delete_layout(
-                                &repo, &id,
-                            );
-                            if let Err(e) = multiview_control::repository::Repository::create_layout(
-                                &repo, &id, input,
-                            ) {
-                                tracing::warn!(error = %e, layout = %id, "cannot persist the working layout");
+                        if let Err(error) = result {
+                            tracing::error!(%error, layout = %id, "cannot restore accepted layout");
+                        }
+                    }
+                    if let Some(ids) = desired_ids {
+                        match multiview_control::repository::Repository::list_layouts(&repo) {
+                            Ok(entries) => {
+                                for entry in entries {
+                                    if !ids.contains(&entry.layout.id) {
+                                        if let Err(error) =
+                                            multiview_control::repository::Repository::delete_layout(
+                                                &repo,
+                                                &entry.layout.id,
+                                            )
+                                        {
+                                            tracing::error!(%error, layout = %entry.layout.id, "cannot remove stale derived layout");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "cannot inspect derived layout projection")
                             }
                         }
                     }
                     tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
+                    if from_desired {
+                        return restore_desired_layouts(model).unwrap_or_else(|| Arc::new(repo));
+                    }
                     return Arc::new(repo);
                 }
                 Err(e) => {
@@ -2464,8 +2581,11 @@ async fn persist_layouts(
             }
         }
     }
-    #[cfg(not(feature = "sqlite"))]
-    let _ = boot_model;
+    if let Some(model) = boot_model {
+        if let Some(restored) = restore_desired_layouts(model) {
+            return restored;
+        }
+    }
     Arc::clone(seeded)
 }
 
@@ -2474,7 +2594,7 @@ mod tests {
     use super::*;
     use multiview_compositor::blend::LinearRgba;
     use multiview_compositor::pipeline::CanvasColor;
-    use multiview_control::{command_bus, Command, OperationId};
+    use multiview_control::{Command, OperationId, command_bus};
     use multiview_engine::EnginePublisher;
     use multiview_events::{Event, OutputRunState};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2818,11 +2938,13 @@ input_id = "in_b"
             .expect("fresh audio");
         let block = bus.tick_to(3);
         assert_eq!(block.frame_count(), 5_760);
-        assert!(block
-            .interleaved()
-            .iter()
-            .skip(480 * 2)
-            .all(|sample| (*sample - 0.75).abs() < 0.001));
+        assert!(
+            block
+                .interleaved()
+                .iter()
+                .skip(480 * 2)
+                .all(|sample| (*sample - 0.75).abs() < 0.001)
+        );
     }
 
     /// ADR-W019: an `ApplyLayout` carrying a stored, route-solved document swaps
