@@ -715,7 +715,11 @@ mod tests {
         wait_evidence(&reader);
         let read = reader.registry.snapshot("s").expect("snapshot");
         assert_eq!(read.events.len(), 1);
-        for o in read.events.iter().flat_map(|e| e.observations()) {
+        for o in read
+            .events
+            .iter()
+            .flat_map(multiview_core::source_event::SourceEvent::observations)
+        {
             assert_eq!(
                 o.key.origin,
                 multiview_core::source_event::EventOrigin::TimedId3
@@ -726,7 +730,7 @@ mod tests {
             );
         }
         native.mapping(None);
-        assert!(native.id3.is_empty());
+        assert_eq!(native.id3, [] as [multiview_input::id3::Id3Tag; 0]);
         runtime.shutdown().expect("join");
     }
     #[test]
@@ -766,7 +770,11 @@ mod tests {
         wait_evidence(&reader);
         let read = reader.registry.snapshot("s").expect("snapshot");
         assert_eq!(read.events.len(), 1);
-        for o in read.events.iter().flat_map(|e| e.observations()) {
+        for o in read
+            .events
+            .iter()
+            .flat_map(multiview_core::source_event::SourceEvent::observations)
+        {
             assert_eq!(
                 o.key.origin,
                 multiview_core::source_event::EventOrigin::Scte35
@@ -800,7 +808,10 @@ mod tests {
         assert_eq!(api["events"][0]["lifecycle"], "observed");
         assert!(api["events"][0]["timer"].is_null());
         native.mapping(None);
-        assert!(native.untimed_scte.is_empty());
+        assert_eq!(
+            native.untimed_scte,
+            [] as [std::vec::Vec<multiview_input::scte::NormalizedCueEvent>; 0]
+        );
         runtime.shutdown().expect("join");
     }
     #[test]
@@ -822,7 +833,10 @@ mod tests {
         let mut invalid = bytes;
         *invalid.last_mut().expect("CRC") ^= 1;
         other.observe_scte_untimed(&invalid);
-        assert!(other.untimed_scte.is_empty());
+        assert_eq!(
+            other.untimed_scte,
+            [] as [std::vec::Vec<multiview_input::scte::NormalizedCueEvent>; 0]
+        );
         assert!(other.loss.get());
         runtime.shutdown().expect("join");
     }
@@ -1088,7 +1102,7 @@ mod tests {
             .project(90_000, Rational::new(1, 90_000), WrapBits::Mpeg33)
             .expect("project")
             .as_nanos();
-        assert!(read.events.iter().flat_map(|e|e.observations()).any(|o| matches!(o.boundary, multiview_core::source_event::EventBoundary::Start { pts_ns: Some(p), .. } if p == expected)));
+        assert!(read.events.iter().flat_map(multiview_core::source_event::SourceEvent::observations).any(|o| matches!(o.boundary, multiview_core::source_event::EventBoundary::Start { pts_ns: Some(p), .. } if p == expected)));
         runtime.shutdown().expect("join");
     }
     #[test]

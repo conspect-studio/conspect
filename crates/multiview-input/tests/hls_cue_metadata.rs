@@ -47,12 +47,10 @@ fn binds_observations_without_claiming_ad_boundaries() {
         parsed.observations[2].metadata
     );
     // A sliding window without the marker supplies no manufactured end.
-    assert!(
-        MediaPlaylist::parse_cue_metadata("#EXTM3U\n#EXTINF:6,\nc.ts\n")
-            .unwrap()
-            .observations
-            .is_empty()
-    );
+    let observations = MediaPlaylist::parse_cue_metadata("#EXTM3U\n#EXTINF:6,\nc.ts\n")
+        .unwrap()
+        .observations;
+    assert_eq!(observations.len(), 0, "{observations:?}");
 }
 
 #[test]
@@ -68,7 +66,7 @@ fn dangling_markers_and_nonprintable_assets_remain_observational() {
 fn malformed_and_oversized_metadata_is_rejected_not_partially_trusted() {
     let text = format!("#EXTM3U\n#EXT-X-ASSET:CAID=\"unterminated\n#EXT-X-ASSET:CAID=a,CAID=b\n#EXT-X-DATERANGE:ID=\"bad\",SCTE35-OUT=0xFG\n#EXT-X-ASSET:CAID={}\n", "a".repeat(20_000));
     let parsed = MediaPlaylist::parse_cue_metadata(&text).unwrap();
-    assert!(parsed.observations.is_empty());
+    assert_eq!(parsed.observations.len(), 0, "{:?}", parsed.observations);
     assert_eq!(parsed.rejected, 4);
 }
 

@@ -17,7 +17,7 @@ impl HlsEvidenceSink for Sink {
     }
 }
 fn snapshot(assets: &[&str]) -> multiview_input::hls::PlaylistCueMetadata {
-    let mut text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n".to_string();
+    let mut text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n".to_owned();
     for asset in assets {
         text.push_str(&format!("#EXT-X-ASSET:CAID={asset}\n#EXTINF:6,\nlive.ts\n"));
     }
@@ -139,5 +139,8 @@ fn daterange_is_retained_without_fake_timing() {
     assert_eq!(metadata.observations.len(), 1);
     observer.observe(&metadata);
     assert_eq!(observer.pending_date_ranges(), metadata.observations);
-    assert!(sink.0.lock().unwrap().0.is_empty());
+    assert_eq!(
+        sink.0.lock().unwrap().0,
+        [] as [multiview_core::source_event::SourceEventObservation; 0]
+    );
 }

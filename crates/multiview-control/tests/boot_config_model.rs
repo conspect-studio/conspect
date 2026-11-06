@@ -457,7 +457,7 @@ async fn layout_envelope_remains_authoritative_when_projection_drifts() {
 }
 
 /// A deleted layout does not reappear from a stale projection. A recreated
-/// identity cannot accept a pre-delete ETag, including across a new router.
+/// identity cannot accept a pre-delete `ETag`, including across a new router.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn layout_delete_recreate_preserves_version_tombstone() {
     let r = rig(BOOT_DOC);

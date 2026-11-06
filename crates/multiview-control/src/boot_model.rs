@@ -1160,35 +1160,6 @@ fn write_atomic_with_sync(
     Ok(())
 }
 
-#[cfg(test)]
-mod atomic_commit_tests {
-    use super::{write_atomic_with_sync, AtomicWriteError};
-    use std::io;
-
-    #[test]
-    fn parent_sync_failure_is_indeterminate_and_new_bytes_are_visible() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("desired.json");
-        std::fs::write(&path, "old").expect("old state");
-        let failure = write_atomic_with_sync(&path, "new", |_| {
-            Err(io::Error::other("injected directory sync fault"))
-        })
-        .expect_err("sync must fail");
-        assert!(matches!(failure, AtomicWriteError::AfterRename(_)));
-        assert_eq!(std::fs::read_to_string(path).expect("visible state"), "new");
-    }
-
-    #[test]
-    fn failed_prepare_preserves_old_bytes() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("missing").join("desired.json");
-        let failure =
-            write_atomic_with_sync(&path, "new", |_| Ok(())).expect_err("temp create must fail");
-        assert!(matches!(failure, AtomicWriteError::BeforeRename(_)));
-        assert!(!path.exists());
-    }
-}
-
 /// The owner-only (0600) floor for a state-file write, tightened further to a
 /// stricter mode the destination already carries (MAJOR-A): a first create
 /// lands at 0600; an existing `chmod 0400` is preserved. Non-Unix targets are
@@ -1483,4 +1454,33 @@ pub fn spawn_running_persist(state: AppState, debounce: Duration) -> tokio::task
             }
         }
     })
+}
+
+#[cfg(test)]
+mod atomic_commit_tests {
+    use super::{write_atomic_with_sync, AtomicWriteError};
+    use std::io;
+
+    #[test]
+    fn parent_sync_failure_is_indeterminate_and_new_bytes_are_visible() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("desired.json");
+        std::fs::write(&path, "old").expect("old state");
+        let failure = write_atomic_with_sync(&path, "new", |_| {
+            Err(io::Error::other("injected directory sync fault"))
+        })
+        .expect_err("sync must fail");
+        assert!(matches!(failure, AtomicWriteError::AfterRename(_)));
+        assert_eq!(std::fs::read_to_string(path).expect("visible state"), "new");
+    }
+
+    #[test]
+    fn failed_prepare_preserves_old_bytes() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("missing").join("desired.json");
+        let failure =
+            write_atomic_with_sync(&path, "new", |_| Ok(())).expect_err("temp create must fail");
+        assert!(matches!(failure, AtomicWriteError::BeforeRename(_)));
+        assert!(!path.exists());
+    }
 }

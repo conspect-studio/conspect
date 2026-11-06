@@ -173,3 +173,12 @@ harness = false
 
 [lints]
 workspace = true
+
+# The coalesced bake-overlap tests and the matched bake benchmark need `overlay`.
+[[test]]
+name = "overlay_bake_overlap"
+required-features = ["overlay"]
+
+[[example]]
+name = "matched_bake"
+required-features = ["overlay"]
