@@ -122,6 +122,9 @@ pub async fn bind_and_serve<F>(
     // (backs `GET /config/boot-model` + the revert/promote actions); `None`
     // for store-only/`--ticks` runs (those routes report `modeled: false`).
     boot_model: Option<Arc<multiview_control::boot_model::BootModel>>,
+    // Read-only source event snapshots from the running pipeline. `None` keeps
+    // the default unavailable provider for run paths without an event runtime.
+    source_events: Option<crate::source_event_runtime::RuntimeReader>,
     shutdown: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
 where
@@ -231,6 +234,9 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    if let Some(reader) = source_events {
+        state = state.with_source_events(Arc::new(reader));
+    }
     // Stored layouts persist across restarts (#176): seeding installs a fresh
     // in-memory store holding the config's working layout; move that layout into
     // the persistent store (if any) and serve from it.
@@ -3579,6 +3585,8 @@ input_id = "in_b"
             multiview_control::LiveSourceCapability::synthetic_only(),
             // boot_model: none for this store-only bind test (ADR-W024).
             None,
+            // No source event runtime on this store-only run path.
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3657,6 +3665,7 @@ input_id = "in_b"
             multiview_control::LiveSourceCapability::synthetic_only(),
             // A config-file run: the watch handle MUST be installed before serving.
             Some(boot_model),
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },

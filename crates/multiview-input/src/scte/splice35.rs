@@ -123,6 +123,39 @@ pub enum SpliceCommand {
     Other(u8),
 }
 
+/// Opaque segmentation UPID. Bytes are preserved, never interpreted as UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentationUpid {
+    /// SCTE-35 UPID type byte.
+    pub upid_type: u8,
+    /// At most 255 bytes, bounded by the descriptor length.
+    pub value: Vec<u8>,
+}
+
+/// Decoded segmentation descriptor (tag 0x02, identifier CUEI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentationDescriptor {
+    /// Segmentation event identity, including cancellation messages.
+    pub event_id: u32,
+    /// Cancels a previously signalled segmentation event.
+    pub cancel: bool,
+    /// Absent on cancellation; unknown types are preserved.
+    pub segmentation_type_id: Option<u8>,
+    /// Exact 40-bit duration in 90 kHz ticks (not a wrapped PTS).
+    pub duration_90k: Option<u64>,
+    /// Absent on cancellation.
+    pub upid: Option<SegmentationUpid>,
+}
+
+/// Rich projection retaining segmentation identity alongside the legacy cue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedCueEvent {
+    /// Normalized break direction, timestamp, duration and event identity.
+    pub cue: CueEvent,
+    /// Descriptor evidence when the cue originates in a segmentation descriptor.
+    pub segmentation: Option<SegmentationDescriptor>,
+}
+
 /// A parsed SCTE-35 `splice_info_section`.
 ///
 /// The exact section bytes the parser validated are retained so the section can
@@ -137,6 +170,8 @@ pub struct SpliceInfoSection {
     pub command_type: u8,
     /// The decoded command.
     pub command: SpliceCommand,
+    /// All CUEI segmentation descriptors, in wire order; section-size bounded.
+    pub segmentation_descriptors: Vec<SegmentationDescriptor>,
     /// The exact validated section bytes (header + body + trailing CRC), retained
     /// so the section can be re-serialised with a rewritten `pts_adjustment` and a
     /// fresh CRC without re-encoding every other field byte-by-byte.
@@ -199,10 +234,12 @@ impl SpliceInfoSection {
         //   protocol_version(8), encrypted_packet(1), encryption_algorithm(6),
         //   pts_adjustment(33), cw_index(8), tier(12),
         //   splice_command_length(12), splice_command_type(8), ...
-        let after_length = full.get(3..).ok_or(ScteError::TooShort {
-            need: 4,
-            got: full.len(),
-        })?;
+        let after_length =
+            full.get(3..full.len().saturating_sub(CRC_LEN))
+                .ok_or(ScteError::TooShort {
+                    need: 4,
+                    got: full.len(),
+                })?;
         let mut reader = BitReader::new(after_length);
         let _protocol_version = reader.read(8)?;
         let encrypted = reader.flag()?;
@@ -221,25 +258,24 @@ impl SpliceInfoSection {
                 pts_adjustment,
                 command_type,
                 command: SpliceCommand::Other(command_type),
+                segmentation_descriptors: Vec::new(),
                 raw: Box::from(full),
                 encrypted: true,
             });
         }
 
-        let command = match command_type {
-            CMD_SPLICE_NULL => SpliceCommand::Null,
-            CMD_SPLICE_INSERT => SpliceCommand::Insert(parse_splice_insert(&mut reader)?),
-            CMD_TIME_SIGNAL => SpliceCommand::TimeSignal(parse_time_signal(&mut reader)?),
-            other => SpliceCommand::Other(other),
-        };
-        // `splice_command_length` is informational here; the bit reader already
-        // walked the exact command fields. (0xFFF means "unknown length".)
-        let _ = splice_command_length;
+        let command_start = reader.bit_pos / 8;
+        let remaining = after_length
+            .get(command_start..)
+            .ok_or(ScteError::Syntax("missing command"))?;
+        let (command, segmentation_descriptors) =
+            parse_command_and_descriptors(remaining, command_type, splice_command_length)?;
 
         Ok(Self {
             pts_adjustment,
             command_type,
             command,
+            segmentation_descriptors,
             raw: Box::from(full),
             encrypted: false,
         })
@@ -280,6 +316,54 @@ impl SpliceInfoSection {
             }),
             SpliceCommand::Null | SpliceCommand::Other(_) => None,
         }
+    }
+
+    /// Exact validated evidence, bounded by the 12-bit section length (4098 bytes).
+    #[must_use]
+    pub fn raw_section(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Project every segmentation descriptor of a time signal, in wire order.
+    /// Break Start (0x22) and Break End (0x23) map to splice out/in; all other
+    /// types and cancellations retain neutral timing semantics. Commands without
+    /// segmentation use the unchanged legacy projection. No wall-clock inference.
+    #[must_use]
+    pub fn normalized_cue_events(&self) -> Vec<NormalizedCueEvent> {
+        if let SpliceCommand::TimeSignal(ts) = self.command {
+            if !self.segmentation_descriptors.is_empty() {
+                return self
+                    .segmentation_descriptors
+                    .iter()
+                    .map(|descriptor| {
+                        let kind = match descriptor.segmentation_type_id {
+                            Some(0x22) => CueKind::SpliceOut,
+                            Some(0x23) => CueKind::SpliceIn,
+                            _ => CueKind::TimeSignal,
+                        };
+                        NormalizedCueEvent {
+                            cue: CueEvent {
+                                kind,
+                                event_id: descriptor.event_id,
+                                pts_time_90k: ts
+                                    .pts_time_90k
+                                    .map(|t| (t + self.pts_adjustment) & MASK_33),
+                                break_duration_90k: descriptor.duration_90k,
+                                cancel: descriptor.cancel,
+                            },
+                            segmentation: Some(descriptor.clone()),
+                        }
+                    })
+                    .collect();
+            }
+        }
+        self.cue_event()
+            .into_iter()
+            .map(|cue| NormalizedCueEvent {
+                cue,
+                segmentation: None,
+            })
+            .collect()
     }
 
     /// Re-emit this `splice_info_section`'s bytes with the 33-bit `pts_adjustment`
@@ -433,11 +517,13 @@ fn parse_splice_insert(reader: &mut BitReader<'_>) -> Result<SpliceInsert, ScteE
     // Component splice mode (program_splice == false) carries a component count
     // and per-component splice_time; Multiview ingests program-level splices, so we
     // do not descend into components — the cue still carries its id/flags.
-    if !program_splice && !immediate {
+    if !program_splice {
         let component_count = usize_from_u64(reader.read(8)?)?;
         for _ in 0..component_count {
             reader.skip(8)?; // component_tag
-            let _ = parse_splice_time(reader)?;
+            if !immediate {
+                let _ = parse_splice_time(reader)?;
+            }
         }
     }
 
@@ -448,7 +534,9 @@ fn parse_splice_insert(reader: &mut BitReader<'_>) -> Result<SpliceInsert, ScteE
         reader.skip(6)?; // reserved
         break_duration_90k = Some(reader.read(33)?);
     }
-    // unique_program_id(16), avail_num(8), avails_expected(8) follow; not needed.
+    // Consume unique_program_id(16), avail_num(8), avails_expected(8), so the
+    // descriptor boundary is exact even for an unknown-length command.
+    reader.skip(32)?;
 
     Ok(SpliceInsert {
         splice_event_id,
@@ -479,6 +567,144 @@ fn parse_splice_time(reader: &mut BitReader<'_>) -> Result<Option<u64>, ScteErro
         reader.skip(7)?; // reserved
         Ok(None)
     }
+}
+
+/// Decode the command within its declared boundary, then the descriptor loop.
+fn parse_command_and_descriptors(
+    remaining: &[u8],
+    command_type: u8,
+    splice_command_length: usize,
+) -> Result<(SpliceCommand, Vec<SegmentationDescriptor>), ScteError> {
+    let unknown_length = splice_command_length == 0xFFF;
+    let command_bytes = if unknown_length {
+        remaining
+    } else {
+        remaining
+            .get(..splice_command_length)
+            .ok_or(ScteError::Overrun {
+                declared: splice_command_length,
+                available: remaining.len(),
+            })?
+    };
+    let mut command_reader = BitReader::new(command_bytes);
+    let command = match command_type {
+        CMD_SPLICE_NULL => SpliceCommand::Null,
+        CMD_SPLICE_INSERT => SpliceCommand::Insert(parse_splice_insert(&mut command_reader)?),
+        CMD_TIME_SIGNAL => SpliceCommand::TimeSignal(parse_time_signal(&mut command_reader)?),
+        other => SpliceCommand::Other(other),
+    };
+    let consumed = command_reader.bit_pos / 8;
+    if !unknown_length
+        && !matches!(command, SpliceCommand::Other(_))
+        && consumed != splice_command_length
+    {
+        return Err(ScteError::Syntax("splice command length mismatch"));
+    }
+    // Unknown command plus unknown length has no safely discoverable loop boundary.
+    let segmentation_descriptors = if unknown_length && matches!(command, SpliceCommand::Other(_)) {
+        Vec::new()
+    } else {
+        let end = if unknown_length {
+            consumed
+        } else {
+            splice_command_length
+        };
+        let tail = remaining
+            .get(end..)
+            .ok_or(ScteError::Syntax("command overrun"))?;
+        // Historical callers emitted unknown-length commands without the empty
+        // descriptor loop. Preserve that exact legacy case, not truncated loops.
+        if unknown_length && tail.is_empty() {
+            Vec::new()
+        } else {
+            parse_descriptor_loop(tail)?
+        }
+    };
+    Ok((command, segmentation_descriptors))
+}
+
+/// Decode only within the declared loop; trailing bytes are alignment stuffing.
+fn parse_descriptor_loop(bytes: &[u8]) -> Result<Vec<SegmentationDescriptor>, ScteError> {
+    let mut reader = BitReader::new(bytes);
+    let length = usize_from_u64(reader.read(16)?)?;
+    let end = 2 + length;
+    let mut descriptors = bytes.get(2..end).ok_or(ScteError::Overrun {
+        declared: end,
+        available: bytes.len(),
+    })?;
+    let mut result = Vec::new();
+    while !descriptors.is_empty() {
+        let mut header = BitReader::new(descriptors);
+        let tag = header.read(8)?;
+        let length = usize_from_u64(header.read(8)?)?;
+        let end = 2 + length;
+        let body = descriptors.get(2..end).ok_or(ScteError::Overrun {
+            declared: end,
+            available: descriptors.len(),
+        })?;
+        if tag == 2 {
+            result.push(parse_segmentation(body)?);
+        }
+        descriptors = descriptors
+            .get(end..)
+            .ok_or(ScteError::Syntax("descriptor overrun"))?;
+    }
+    Ok(result)
+}
+
+fn parse_segmentation(bytes: &[u8]) -> Result<SegmentationDescriptor, ScteError> {
+    let mut reader = BitReader::new(bytes);
+    if reader.read(32)? != 0x4355_4549 {
+        return Err(ScteError::Syntax("segmentation identifier is not CUEI"));
+    }
+    let event_id = u32::try_from(reader.read(32)?)
+        .map_err(|_| ScteError::Syntax("segmentation event id out of range"))?;
+    let cancel = reader.flag()?;
+    reader.skip(7)?;
+    let mut descriptor = SegmentationDescriptor {
+        event_id,
+        cancel,
+        segmentation_type_id: None,
+        duration_90k: None,
+        upid: None,
+    };
+    if !cancel {
+        let program = reader.flag()?;
+        let duration = reader.flag()?;
+        // delivery_not_restricted flag + either reserved bits or restrictions.
+        reader.skip(6)?;
+        if !program {
+            let count = reader.read(8)?;
+            for _ in 0..count {
+                reader.skip(8)?; // component_tag
+                reader.skip(40)?; // reserved(7) + pts_offset(33)
+            }
+        }
+        if duration {
+            descriptor.duration_90k = Some(reader.read(40)?);
+        }
+        let upid_type = read_byte(&mut reader)?;
+        let length = usize::from(read_byte(&mut reader)?);
+        let mut value = Vec::with_capacity(length);
+        for _ in 0..length {
+            value.push(read_byte(&mut reader)?);
+        }
+        descriptor.upid = Some(SegmentationUpid { upid_type, value });
+        let kind = read_byte(&mut reader)?;
+        descriptor.segmentation_type_id = Some(kind);
+        reader.skip(16)?; // segment_num + segments_expected
+        if matches!(kind, 0x34 | 0x36 | 0x38 | 0x3a) {
+            reader.skip(16)?; // sub_segment_num + sub_segments_expected
+        }
+    }
+    if reader.bit_pos != bytes.len() * 8 {
+        return Err(ScteError::Syntax("segmentation descriptor length mismatch"));
+    }
+    Ok(descriptor)
+}
+
+fn read_byte(reader: &mut BitReader<'_>) -> Result<u8, ScteError> {
+    u8::try_from(reader.read(8)?).map_err(|_| ScteError::Syntax("byte out of range"))
 }
 
 /// Validate the SCTE-35 section CRC-32/MPEG-2 (same algorithm as PSI).

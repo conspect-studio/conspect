@@ -649,6 +649,99 @@ impl OverlayBaker {
         Ok(list)
     }
 
+    /// Bake source-linked event chips from the projections captured with this frame.
+    /// No registry or clock is sampled for events, and no event state is retained:
+    /// an empty map clears all event chips on the next bake. Existing tile chrome,
+    /// captions and bitmap subtitles take precedence when a cell is too small.
+    ///
+    /// # Errors
+    /// Returns a compositor error if text shaping or rasterization fails.
+    pub fn draw_list_with_events(
+        &mut self,
+        pts: MediaTime,
+        dynamics: &HashMap<String, TileDynamics>,
+        captions: &HashMap<String, Vec<String>>,
+        bitmaps: &HashMap<String, multiview_ffmpeg::caption::CueBitmap>,
+        events: &HashMap<String, multiview_core::event_overlay::EventOverlay>,
+    ) -> Result<OverlayDrawList, CompositorError> {
+        let mut list = self.draw_list(pts, dynamics, captions, bitmaps)?;
+        for index in 0..self.tiles.len() {
+            let Some(tile) = self.tiles.get(index) else {
+                continue;
+            };
+            let Some(event) = events.get(&tile.source_id) else {
+                continue;
+            };
+            // Reject accidentally cross-wired source projections rather than
+            // attributing one source's evidence to another source's picture.
+            if event.key.source_id != tile.source_id {
+                continue;
+            }
+            let geom = TileGeometry::resolve(tile.rect);
+            // Three chrome bands at minimum height leave no breathing room.
+            if geom.width < MIN_TILE_PX || geom.height <= MIN_TILE_PX {
+                continue;
+            }
+            let top = geom.chip_height().saturating_add(geom.pad());
+            let bottom_inset = geom.chip_height().saturating_add(geom.pad());
+            let mut bottom = geom.height.saturating_sub(bottom_inset);
+            if let Some(lines) = captions.get(&tile.source_id) {
+                let size = f32_dim((geom.height / 16).clamp(12, 36));
+                let height =
+                    u32_from_usize(lines.len()).saturating_mul(round_dim(size * 1.2).max(1));
+                bottom = bottom.saturating_sub(height);
+            }
+            if let Some(bitmap) = bitmaps.get(&tile.source_id) {
+                let (_, height) = fit_preserving_aspect(
+                    bitmap.rect.width,
+                    bitmap.rect.height,
+                    geom.width
+                        .saturating_sub(geom.pad().saturating_mul(2))
+                        .max(1),
+                    geom.height
+                        .saturating_sub(bottom_inset.saturating_add(geom.pad()))
+                        .max(1),
+                );
+                bottom = bottom.min(
+                    geom.height
+                        .saturating_sub(bottom_inset)
+                        .saturating_sub(height),
+                );
+            }
+            if top
+                .saturating_add(geom.chip_height())
+                .saturating_add(geom.pad())
+                > bottom
+            {
+                continue;
+            }
+            let text = event_badge_text(event);
+            let width = geom
+                .flag_width(self.text_ink_width(&text, FontFamily::Sans, geom.chip_text_px())?)
+                .min(geom.meter_left());
+            let chip = OverlayRect::new(
+                geom.x,
+                geom.y.saturating_add(i32_dim(top)),
+                width,
+                geom.chip_height(),
+            );
+            push_filled_rect(&mut list, chip, CHROME_BG);
+            self.push_text_clipped(
+                &mut list,
+                &text,
+                TextRun {
+                    family: FontFamily::Sans,
+                    size_px: geom.chip_text_px(),
+                    x: chip.x.saturating_add(geom.pad_i32()),
+                    y: chip.y.saturating_add(geom.pad_i32() / 2),
+                    color: AMBER,
+                },
+                chip,
+            )?;
+        }
+        Ok(list)
+    }
+
     /// Burn `cue_lines` into the cell `rect`, bottom-centre of THAT tile (never
     /// canvas-wide). The caption size scales with the cell so a small tile gets a
     /// proportionally smaller caption; the lines stack upward from a bottom inset.
@@ -1113,6 +1206,40 @@ impl OverlayBaker {
     }
 }
 
+/// Format exact decimal nanoseconds without float conversion or wall-clock time.
+fn event_badge_text(event: &multiview_core::event_overlay::EventOverlay) -> String {
+    use multiview_core::event_overlay::{OverlayLabel, OverlayTimerKind};
+    let label = match event.label {
+        OverlayLabel::Upcoming => "Event upcoming",
+        OverlayLabel::Active => "Event active",
+        OverlayLabel::Ended => "Event ended",
+        OverlayLabel::Uncertain => "Event timing uncertain",
+        OverlayLabel::Overrun => "End unconfirmed",
+        OverlayLabel::Observed => "Marker observed",
+    };
+    let Some(timer) = &event.timer else {
+        return label.to_owned();
+    };
+    // Wire data is decimal u64, not floating-point seconds. Malformed input
+    // remains explicitly unknown instead of looking like a zero countdown.
+    let ns = (!timer.nanoseconds.is_empty()
+        && timer.nanoseconds.len() <= 20
+        && timer.nanoseconds.bytes().all(|byte| byte.is_ascii_digit()))
+    .then(|| timer.nanoseconds.parse::<u64>().ok())
+    .flatten();
+    let Some(ns) = ns else {
+        return format!("{label} --:--");
+    };
+    let seconds = ns / 1_000_000_000;
+    let meaning = match timer.kind {
+        OverlayTimerKind::UntilStart => "in",
+        OverlayTimerKind::Remaining => "remaining",
+        OverlayTimerKind::Elapsed => "elapsed",
+        OverlayTimerKind::Overrun => "overrun",
+    };
+    format!("{label} {meaning} {:02}:{:02}", seconds / 60, seconds % 60)
+}
+
 /// Intersect a glyph's pixel coverage with its clip rectangle. Crop the source
 /// rows too: a smaller destination with the old coverage would distort glyphs.
 fn clip_glyph(
@@ -1549,6 +1676,203 @@ mod tests {
     use crate::wallclock::{WallClock, WallClockSource};
 
     use super::*;
+
+    fn event_fixture() -> multiview_core::event_overlay::EventOverlay {
+        use multiview_core::event_overlay::{
+            EventOverlay, OverlayEventKey, OverlayLabel, OverlayTimer, OverlayTimerKind,
+        };
+        use multiview_core::source_event::{EventLifecycle, EventOrigin};
+        EventOverlay {
+            key: OverlayEventKey {
+                source_id: "in_a".into(),
+                epoch: "1".into(),
+                origin: EventOrigin::Scte35,
+                event_id: "cue".into(),
+            },
+            lifecycle: EventLifecycle::Active,
+            label: OverlayLabel::Active,
+            timer: Some(OverlayTimer {
+                kind: OverlayTimerKind::Remaining,
+                nanoseconds: "61000000001".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn event_badge_exact_timer_and_evidence_labels() {
+        use multiview_core::event_overlay::{OverlayLabel, OverlayTimerKind};
+        let mut event = event_fixture();
+        assert_eq!(event_badge_text(&event), "Event active remaining 01:01");
+        event.timer.as_mut().unwrap().nanoseconds = u64::MAX.to_string();
+        assert_eq!(
+            event_badge_text(&event),
+            "Event active remaining 307445734:33"
+        );
+        event.timer.as_mut().unwrap().nanoseconds = "1e9".into();
+        assert_eq!(event_badge_text(&event), "Event active --:--");
+        event.label = OverlayLabel::Overrun;
+        event.timer.as_mut().unwrap().nanoseconds = "59999999999".into();
+        event.timer.as_mut().unwrap().kind = OverlayTimerKind::Overrun;
+        assert_eq!(event_badge_text(&event), "End unconfirmed overrun 00:59");
+        event.label = OverlayLabel::Observed;
+        event.timer = None;
+        assert_eq!(event_badge_text(&event), "Marker observed");
+        event.key.origin = multiview_core::source_event::EventOrigin::TimedId3;
+        assert_eq!(event_badge_text(&event), "Marker observed");
+    }
+
+    #[test]
+    fn event_badge_renders_glyphs_and_clears_without_retention() {
+        let mut baker = OverlayBaker::new(quad_tiles(), epoch_clock()).unwrap();
+        let mut events = HashMap::from([("in_a".into(), event_fixture())]);
+        let baseline = baker
+            .draw_list(
+                MediaTime::ZERO,
+                &HashMap::new(),
+                &no_captions(),
+                &no_bitmaps(),
+            )
+            .unwrap();
+        let rendered = baker
+            .draw_list_with_events(
+                MediaTime::ZERO,
+                &HashMap::new(),
+                &no_captions(),
+                &no_bitmaps(),
+                &events,
+            )
+            .unwrap();
+        let added = &rendered.primitives[baseline.primitives.len()..];
+        assert!(added.iter().any(|p| matches!(p, OverlayPrimitive::Glyph { coverage, .. } if coverage.iter().any(|c| *c != 0))));
+        assert!(added.len() > 2);
+        assert!(
+            matches!(added.first(), Some(OverlayPrimitive::FilledRect { rect, .. }) if rect.x == 0 && rect.y == 48 && rect.width <= 614 && rect.height == 40)
+        );
+        for primitive in added {
+            if let OverlayPrimitive::Glyph {
+                dest_x,
+                dest_y,
+                width,
+                height,
+                ..
+            } = primitive
+            {
+                assert!(*dest_x >= 0 && *dest_y >= 48);
+                assert!(i64::from(*dest_x) + i64::from(*width) <= 640);
+                assert!(i64::from(*dest_y) + i64::from(*height) <= 88);
+            }
+        }
+        events.clear();
+        let cleared = baker
+            .draw_list_with_events(
+                MediaTime::ZERO,
+                &HashMap::new(),
+                &no_captions(),
+                &no_bitmaps(),
+                &events,
+            )
+            .unwrap();
+        assert_eq!(cleared.primitives, baseline.primitives);
+    }
+
+    #[test]
+    fn event_badge_yields_to_captions_and_rejects_wrong_source() {
+        let mut baker = OverlayBaker::new(quad_tiles(), epoch_clock()).unwrap();
+        let mut events = HashMap::from([("in_a".into(), event_fixture())]);
+        let caps = HashMap::from([("in_a".into(), vec!["Subtitle".into(); 20])]);
+        let baseline = baker
+            .draw_list(MediaTime::ZERO, &HashMap::new(), &caps, &no_bitmaps())
+            .unwrap();
+        let rendered = baker
+            .draw_list_with_events(
+                MediaTime::ZERO,
+                &HashMap::new(),
+                &caps,
+                &no_bitmaps(),
+                &events,
+            )
+            .unwrap();
+        assert_eq!(rendered.primitives, baseline.primitives);
+        events.get_mut("in_a").unwrap().key.source_id = "in_b".into();
+        let caps = HashMap::new();
+        let baseline = baker
+            .draw_list(MediaTime::ZERO, &HashMap::new(), &caps, &no_bitmaps())
+            .unwrap();
+        let rendered = baker
+            .draw_list_with_events(
+                MediaTime::ZERO,
+                &HashMap::new(),
+                &caps,
+                &no_bitmaps(),
+                &events,
+            )
+            .unwrap();
+        assert_eq!(rendered.primitives, baseline.primitives);
+    }
+
+    #[test]
+    fn event_badge_long_readout_stays_in_unequal_and_tiny_cells() {
+        for (width, height) in [(83.0, 180.0), (420.0, 150.0), (48.0, 48.0), (9.0, 4.0)] {
+            let tile = TileSpec::new(
+                "in_a",
+                "A",
+                PixelRect {
+                    x: 700.0,
+                    y: 100.0,
+                    width,
+                    height,
+                },
+            );
+            let geom = TileGeometry::resolve(tile.rect);
+            let mut baker = OverlayBaker::new(vec![tile], epoch_clock()).unwrap();
+            let mut event = event_fixture();
+            event.timer.as_mut().unwrap().nanoseconds = u64::MAX.to_string();
+            let events = HashMap::from([("in_a".into(), event)]);
+            let baseline = baker
+                .draw_list(
+                    MediaTime::ZERO,
+                    &HashMap::new(),
+                    &no_captions(),
+                    &no_bitmaps(),
+                )
+                .unwrap();
+            let rendered = baker
+                .draw_list_with_events(
+                    MediaTime::ZERO,
+                    &HashMap::new(),
+                    &no_captions(),
+                    &no_bitmaps(),
+                    &events,
+                )
+                .unwrap();
+            let added = &rendered.primitives[baseline.primitives.len()..];
+            if geom.width < MIN_TILE_PX || geom.height <= 48 {
+                assert!(added.is_empty());
+            } else {
+                assert!(added.len() > 1);
+            }
+            for primitive in added {
+                if let OverlayPrimitive::Glyph {
+                    dest_x,
+                    dest_y,
+                    width,
+                    height,
+                    ..
+                } = primitive
+                {
+                    assert!(*dest_x >= geom.x && *dest_y >= geom.y);
+                    assert!(
+                        i64::from(*dest_x) + i64::from(*width)
+                            <= i64::from(geom.x) + i64::from(geom.meter_left())
+                    );
+                    assert!(
+                        i64::from(*dest_y) + i64::from(*height)
+                            <= i64::from(geom.y) + i64::from(geom.height)
+                    );
+                }
+            }
+        }
+    }
 
     /// A test wall-clock whose instant the test controls (atomic so a single
     /// shared instance can be advanced between bakes — the anti-drift proof

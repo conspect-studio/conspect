@@ -1,0 +1,254 @@
+//! Read-only source-event bridge. The binary supplies the runtime adapter.
+use serde::Serialize;
+use std::sync::Arc;
+
+/// Maximum event rows in one response.
+pub const MAX_SOURCE_EVENTS: usize = 256;
+/// Maximum bytes in any public identity token. Oversized identities are omitted,
+/// never truncated into a different identity.
+pub const MAX_SOURCE_EVENT_ID_BYTES: usize = 256;
+
+/// A bounded snapshot provider, independent of CLI implementation details.
+///
+/// Implementations must project events against the exact latched source-frame
+/// clock and its epoch, never the latest ingest anchor. Missing/stale frame timing
+/// must report uncertainty, not a fabricated countdown. Reads must be bounded and
+/// must never block the engine. Return `None` only for an unknown source; known
+/// sources without events return an empty snapshot. Publish only public identity
+/// tokens and semantic fields, never raw cue bytes, URLs, credentials or secrets.
+pub trait SourceEventProvider: Send + Sync {
+    /// Read the observational snapshot for this exact source identity.
+    fn source_events(&self, id: &str) -> Option<SourceEventsDto>;
+}
+/// Shared optional runtime adapter handle.
+pub type SharedSourceEvents = Arc<dyn SourceEventProvider>;
+
+/// Availability of the latched presentation clock, not ingest health.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum SourceEventAvailability {
+    /// Exact latched source-frame clock is usable.
+    Available,
+    /// Previously usable presentation clock is stale.
+    Stale,
+    /// No presentation clock exists yet.
+    Unavailable,
+}
+
+/// Structured observational row. No raw transport payload is exposed.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SourceEventDto {
+    /// Public occurrence identity, not an asset identity.
+    pub event_id: String,
+    /// Exact unsigned decimal timeline epoch.
+    pub epoch: String,
+    /// Evidence origin; vendor markers never imply a splice boundary.
+    pub origin: SourceEventOrigin,
+    /// Public vendor namespace when applicable.
+    pub vendor: Option<String>,
+    /// Observational lifecycle, not an automation command.
+    pub lifecycle: SourceEventLifecycle,
+    /// Server-projected source-media timer; clients must not tick it from receipt time.
+    pub timer: Option<SourceEventTimer>,
+    /// Bounded public asset identity, independent of this occurrence.
+    #[cfg_attr(feature = "openapi", schema(max_length = 256))]
+    pub asset_id: Option<String>,
+    /// Bounded public association token; never proof that origins corroborate.
+    #[cfg_attr(feature = "openapi", schema(max_length = 256))]
+    pub correlation_id: Option<String>,
+    /// Optional semantic display label consistent with lifecycle and timer.
+    pub label: Option<SourceEventLabel>,
+}
+
+/// Exact timer value projected by the server against the selected source frame.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SourceEventTimer {
+    /// Interpretation of the nonnegative duration.
+    pub kind: SourceEventTimerKind,
+    /// Canonical unsigned decimal nanoseconds, never a floating-point JSON number.
+    #[cfg_attr(
+        feature = "openapi",
+        schema(max_length = 20, pattern = "^(0|[1-9][0-9]{0,19})$")
+    )]
+    pub nanoseconds: String,
+}
+
+/// Meaning of a server-projected timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum SourceEventTimerKind {
+    /// Time until the announced start.
+    UntilStart,
+    /// Time until an expected or confirmed end.
+    Remaining,
+    /// Time since an explicit start when no end is known.
+    Elapsed,
+    /// Time past the expected end; the end remains unconfirmed.
+    Overrun,
+}
+
+/// Semantic badge label, independent of evidence origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum SourceEventLabel {
+    /// Announced start is approaching.
+    Upcoming,
+    /// Explicit start has been presented.
+    Active,
+    /// Explicit end has been presented.
+    Ended,
+    /// Timing is uncertain.
+    Uncertain,
+    /// Expected end has passed without confirmation.
+    Overrun,
+    /// Presence-only metadata, not necessarily vendor evidence.
+    Observed,
+}
+
+/// Independent evidence origin.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum SourceEventOrigin {
+    /// SCTE-35 signalling.
+    Scte35,
+    /// Timed ID3.
+    TimedId3,
+    /// Manifest signalling.
+    Manifest,
+    /// Unverified vendor presence evidence.
+    VendorMarker,
+    /// Authenticated external evidence.
+    External,
+}
+/// Source-relative observational lifecycle.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum SourceEventLifecycle {
+    /// Future start.
+    Announced,
+    /// Presented start.
+    Active,
+    /// Presented explicit end.
+    Ended,
+    /// Cancelled occurrence.
+    Cancelled,
+    /// Invalidated epoch.
+    Superseded,
+    /// Insufficient timing.
+    Uncertain,
+    /// Presence only.
+    Observed,
+}
+
+fn canonical_decimal(value: &str) -> bool {
+    value.len() <= 20 && value.parse::<u64>().is_ok_and(|n| n.to_string() == value)
+}
+
+fn valid_event(event: &SourceEventDto, availability: SourceEventAvailability) -> bool {
+    if event.event_id.is_empty()
+        || event.event_id.len() > MAX_SOURCE_EVENT_ID_BYTES
+        || !canonical_decimal(&event.epoch)
+        || [&event.vendor, &event.asset_id, &event.correlation_id]
+            .into_iter()
+            .flatten()
+            .any(|value| value.len() > MAX_SOURCE_EVENT_ID_BYTES)
+    {
+        return false;
+    }
+    if matches!(event.origin, SourceEventOrigin::VendorMarker)
+        && (event.vendor.as_ref().is_none_or(String::is_empty)
+            || !matches!(
+                event.lifecycle,
+                SourceEventLifecycle::Observed
+                    | SourceEventLifecycle::Uncertain
+                    | SourceEventLifecycle::Cancelled
+                    | SourceEventLifecycle::Superseded
+            ))
+    {
+        return false;
+    }
+    let timer_kind = event.timer.as_ref().map(|timer| timer.kind);
+    if let Some(timer) = &event.timer {
+        if !matches!(availability, SourceEventAvailability::Available)
+            || matches!(event.origin, SourceEventOrigin::VendorMarker)
+            || !canonical_decimal(&timer.nanoseconds)
+            || !matches!(
+                (event.lifecycle, timer.kind),
+                (
+                    SourceEventLifecycle::Announced,
+                    SourceEventTimerKind::UntilStart
+                ) | (
+                    SourceEventLifecycle::Active,
+                    SourceEventTimerKind::Remaining | SourceEventTimerKind::Elapsed
+                ) | (
+                    SourceEventLifecycle::Uncertain,
+                    SourceEventTimerKind::Overrun
+                )
+            )
+        {
+            return false;
+        }
+    }
+    event.label.is_none_or(|label| {
+        matches!(
+            (event.lifecycle, label),
+            (SourceEventLifecycle::Announced, SourceEventLabel::Upcoming)
+                | (SourceEventLifecycle::Active, SourceEventLabel::Active)
+                | (SourceEventLifecycle::Ended, SourceEventLabel::Ended)
+                | (SourceEventLifecycle::Uncertain, SourceEventLabel::Uncertain)
+                | (SourceEventLifecycle::Observed, SourceEventLabel::Observed)
+        ) || (matches!(event.lifecycle, SourceEventLifecycle::Uncertain)
+            && label == SourceEventLabel::Overrun
+            && timer_kind == Some(SourceEventTimerKind::Overrun))
+    })
+}
+
+/// Bounded source snapshot with exact browser-safe epoch identities.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SourceEventsDto {
+    /// Exact source identity requested by the caller.
+    source_id: String,
+    /// Exact unsigned decimal epoch, including values above 2^53.
+    epoch: String,
+    /// Presentation clock availability.
+    availability: SourceEventAvailability,
+    /// True if upstream evidence or this response lost information.
+    degraded: bool,
+    /// Bounded structured event history; an empty list is valid.
+    #[cfg_attr(feature = "openapi", schema(max_items = 256))]
+    events: Vec<SourceEventDto>,
+}
+impl SourceEventsDto {
+    /// Construct a snapshot, dropping oversized/invalid rows and excess history.
+    /// The route verifies the exact source identity before exposing the result.
+    #[must_use]
+    pub fn new(
+        source_id: impl Into<String>,
+        epoch: u64,
+        availability: SourceEventAvailability,
+        degraded: bool,
+        mut events: Vec<SourceEventDto>,
+    ) -> Self {
+        let original_len = events.len();
+        events.retain(|event| valid_event(event, availability));
+        events.truncate(MAX_SOURCE_EVENTS);
+        Self {
+            source_id: source_id.into(),
+            epoch: epoch.to_string(),
+            availability,
+            degraded: degraded || events.len() != original_len,
+            events,
+        }
+    }
+    pub(crate) fn matches_source(&self, id: &str) -> bool {
+        self.source_id == id && self.source_id.len() <= MAX_SOURCE_EVENT_ID_BYTES
+    }
+}

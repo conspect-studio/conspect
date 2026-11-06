@@ -83,6 +83,8 @@ pub mod control;
 /// the startup gate (S1) consults. Always compiled — the entitlement *state model*
 /// renders consistently regardless of features (ADR-0050 §7).
 pub mod licence;
+pub mod hls_event_observer;
+pub mod source_event_hls_bridge;
 pub mod live_overlays;
 pub mod live_sources;
 /// Off-hot-path **program-bus loudness telemetry** (AUD-8): a read-only EBU R128
@@ -122,6 +124,10 @@ pub mod outputs;
 pub mod placement;
 pub mod preview;
 pub mod run;
+pub mod source_event_ingest;
+pub mod source_event_packet;
+pub mod source_event_runtime;
+pub mod source_event_service;
 /// Map the HAL probe + compiled features + resolved compositor adapter onto the
 /// [`multiview_control::system::SystemCapabilities`] DTO for
 /// `GET /api/v1/system/capabilities` (ADR-W030). A static startup snapshot

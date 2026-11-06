@@ -720,6 +720,8 @@ pub struct AppState {
     /// ([`NoPreview`](crate::preview::NoPreview)) yields no frames; the binary
     /// swaps in an engine-backed provider. Isolation-safe (invariant #10).
     pub preview: crate::preview::SharedPreview,
+    /// Optional read-only source-event adapter; absent until wired by the binary.
+    pub source_events: Option<crate::source_events::SharedSourceEvents>,
     /// The WHEP focus transport seam (sub-second WebRTC focus per scope). The
     /// default ([`NoWhep`](crate::preview::NoWhep)) refuses every focus with an
     /// honest `503 fallback`; the binary swaps in a transport-backed provider
@@ -984,6 +986,7 @@ impl AppState {
             corr: Arc::new(crate::realtime::CorrRegistry::new(256)),
             ack_clock: Arc::new(system_ack_clock),
             preview: crate::preview::no_preview(),
+            source_events: None,
             whep: crate::preview::no_whep(),
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
@@ -1224,6 +1227,13 @@ impl AppState {
         diagnostics_snapshots: Arc<DiagnosticsSnapshotStore>,
     ) -> Self {
         self.diagnostics_snapshots = diagnostics_snapshots;
+        self
+    }
+
+    /// Attach the read-only source-event adapter without changing preview behavior.
+    #[must_use]
+    pub fn with_source_events(mut self, provider: crate::source_events::SharedSourceEvents) -> Self {
+        self.source_events = Some(provider);
         self
     }
 

@@ -155,6 +155,7 @@ async fn control_listener_serves_hls_outputs_with_cors() {
         multiview_control::LiveApplyCaps::default(),
         multiview_control::LiveSourceCapability::synthetic_only(),
         None, // boot_model (ADR-W024)
+        None, // source_events
         async move {
             let _ = shutdown_rx.await;
         },

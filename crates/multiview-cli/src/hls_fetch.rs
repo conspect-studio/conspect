@@ -81,6 +81,8 @@ pub(crate) struct OriginPlaylist {
     pub target_duration: f64,
     /// The listed segments, in order.
     pub segments: Vec<OriginSegment>,
+    /// Bounded original manifest evidence; never inferred splice boundaries.
+    pub cue_metadata: multiview_input::hls::PlaylistCueMetadata,
 }
 
 /// Why a playlist cannot be fetched this way (the caller lets libav open the
@@ -106,6 +108,7 @@ pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsuppo
     let mut target_duration = 0.0_f64;
     let mut seq = 0_u64;
     let mut duration: Option<f64> = None;
+    let mut pending_segment = false;
     let mut discontinuity = false;
     let mut segments = Vec::new();
     for line in lines {
@@ -114,6 +117,10 @@ pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsuppo
         } else if let Some(v) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             seq = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("#EXTINF:") {
+            if pending_segment {
+                return Err(Unsupported::Feature("incomplete media snapshot"));
+            }
+            pending_segment = true;
             duration = v.split(',').next().and_then(|d| d.trim().parse().ok());
         } else if line == "#EXT-X-DISCONTINUITY" {
             discontinuity = true;
@@ -121,6 +128,9 @@ pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsuppo
             return Err(Unsupported::Vod);
         } else if line.starts_with("#EXT-X-STREAM-INF") {
             return Err(Unsupported::Master);
+        } else if line.starts_with("#EXT-X-SKIP:") {
+            // Delta updates cannot prove membership absence without reconstruction.
+            return Err(Unsupported::Feature("EXT-X-SKIP"));
         } else if line.starts_with("#EXT-X-MAP") {
             return Err(Unsupported::Feature("EXT-X-MAP"));
         } else if line.starts_with("#EXT-X-BYTERANGE") {
@@ -130,6 +140,7 @@ pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsuppo
                 return Err(Unsupported::Feature("EXT-X-KEY"));
             }
         } else if !line.starts_with('#') {
+            pending_segment = false;
             segments.push(OriginSegment {
                 seq,
                 duration: duration.take().unwrap_or(target_duration),
@@ -139,12 +150,21 @@ pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsuppo
             seq = seq.saturating_add(1);
         }
     }
+    if segments.is_empty() || pending_segment {
+        return Err(Unsupported::Feature("incomplete media snapshot"));
+    }
     if target_duration <= 0.0 {
         target_duration = segments.iter().map(|s| s.duration).fold(0.0, f64::max);
     }
     Ok(OriginPlaylist {
         target_duration: target_duration.max(1.0),
         segments,
+        cue_metadata: multiview_input::hls::MediaPlaylist::parse_cue_metadata(text).unwrap_or_else(
+            |_| multiview_input::hls::PlaylistCueMetadata {
+                rejected: 1,
+                ..Default::default()
+            },
+        ),
     })
 }
 
@@ -328,10 +348,22 @@ pub fn stats(id: &str) -> Arc<FetchStats> {
     Arc::clone(map.entry(id.to_owned()).or_default())
 }
 
+// Control-plane/coordinator only: never acquired by the output path.
+type ObservationGate = Mutex<Option<crate::hls_event_observer::HlsEventObserver>>;
+
+fn retire_observer(gate: Option<Arc<ObservationGate>>) {
+    if let Some(gate) = gate {
+        if let Some(mut observer) = gate.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            observer.retire();
+        }
+    }
+}
+
 #[derive(Default)]
 struct FetchRegistration {
     generation: u64,
     url: Option<String>,
+    observation_active: Option<std::sync::Weak<ObservationGate>>,
 }
 
 fn urls() -> &'static Mutex<HashMap<String, FetchRegistration>> {
@@ -340,13 +372,21 @@ fn urls() -> &'static Mutex<HashMap<String, FetchRegistration>> {
 }
 
 /// Invalidate the old fetcher before the replacement audio or video starts.
-/// Publication and invalidation use the same lock: a late A cannot race B.
+/// URL publication uses the registry lock. Observation invalidation completes
+/// before this returns: it waits for the old off-clock batch, then retires its
+/// sink outside URL/window locks. It is not an output-path operation.
 pub(crate) fn begin_generation(id: &str) -> u64 {
     let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
     let entry = map.entry(id.to_owned()).or_default();
+    let old = entry.observation_active.take().and_then(|w| w.upgrade());
     entry.generation = entry.generation.saturating_add(1);
     entry.url = None;
-    entry.generation
+    let generation = entry.generation;
+    drop(map);
+    // Completion fence: wait for an in-flight batch, then invalidate its sink.
+    // Never invoke a sink callback while holding the URL/window locks.
+    retire_observer(old);
+    generation
 }
 
 /// Install the local fetch only while its lifecycle still owns this id.
@@ -458,6 +498,7 @@ pub(crate) struct HlsFetcher {
     source_id: String,
     local_url: String,
     generation: u64,
+    observation_gate: Arc<ObservationGate>,
 }
 
 impl Drop for HlsFetcher {
@@ -471,6 +512,10 @@ impl Drop for HlsFetcher {
                 entry.url = None;
             }
         }
+        drop(map);
+        // Owned by the ingest supervisor, never the output clock. Complete the
+        // in-flight evidence batch and retire its sink before teardown returns.
+        retire_observer(Some(Arc::clone(&self.observation_gate)));
     }
 }
 
@@ -485,6 +530,28 @@ impl HlsFetcher {
         stop: &AtomicBool,
         generation: u64,
     ) -> Result<Self, String> {
+        Self::start_with_observer(source_id, playlist_url, stop, generation, None)
+    }
+
+    /// Inject a bounded observer owned solely by this fetch coordinator.
+    /// The caller must replace service registration before beginning a new fetch generation.
+    pub(crate) fn start_with_observer(
+        source_id: &str,
+        playlist_url: &str,
+        stop: &AtomicBool,
+        generation: u64,
+        observer: Option<crate::hls_event_observer::HlsEventObserver>,
+    ) -> Result<Self, String> {
+        let has_observer = observer.is_some();
+        let observation_active = Arc::new(Mutex::new(observer));
+        if has_observer {
+            let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
+            let entry = map.get_mut(source_id).filter(|e| e.generation == generation)
+                .ok_or("source replaced before observer attachment")?;
+            let old = entry.observation_active.replace(Arc::downgrade(&observation_active)).and_then(|w| w.upgrade());
+            drop(map);
+            retire_observer(old);
+        }
         let st = stats(source_id);
         if st.bypass_next.swap(false, Ordering::AcqRel) {
             return Err("bypassed after the fetcher gave up on this origin".to_owned());
@@ -513,6 +580,7 @@ impl HlsFetcher {
         spawn_server(source_id, listener, Arc::clone(&shared))?;
         let coord_shared = Arc::clone(&shared);
         let id = source_id.to_owned();
+        let observation_gate = Arc::clone(&observation_active);
         std::thread::Builder::new()
             .name(format!("multiview-hls-{source_id}"))
             .spawn(move || {
@@ -522,7 +590,7 @@ impl HlsFetcher {
                     playlist: &base,
                     segments: &segment_base,
                 };
-                coordinate(&origin, first, &coord_shared, &st);
+                coordinate(&origin, first, &coord_shared, &st, &observation_active);
             })
             .map_err(|e| format!("spawn hls coordinator: {e}"))?;
         let fetcher = Self {
@@ -530,6 +598,7 @@ impl HlsFetcher {
             source_id: source_id.to_owned(),
             local_url,
             generation,
+            observation_gate,
         };
         // Wait for the first segment (stop-responsive).
         let deadline = Instant::now() + FIRST_SEGMENT_DEADLINE;
@@ -852,13 +921,25 @@ impl Schedule {
 /// The coordinator: reload the playlist, keep [`IN_FLIGHT`] segments
 /// downloading, publish completed segments in order, skip ones that fail, and
 /// give up after [`DEAD_ORIGIN`] without a published segment.
+fn observe_playlist(
+    gate: &ObservationGate,
+    stop: &AtomicBool,
+    metadata: &multiview_input::hls::PlaylistCueMetadata,
+) {
+    let mut owner = gate.lock().unwrap_or_else(PoisonError::into_inner);
+    if !stop.load(Ordering::Acquire) {
+        if let Some(observer) = owner.as_mut() { observer.observe(metadata); }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-// reason: one sequential poll loop (reload, dispatch, collect, publish, liveness).
+// One sequential poll loop: reload, dispatch, collect, publish and liveness.
 fn coordinate(
     origin: &Origin<'_>,
     first: OriginPlaylist,
     shared: &Arc<Shared>,
     stats: &Arc<FetchStats>,
+    observation_active: &ObservationGate,
 ) {
     let id = origin.id;
     let mut playlist = Some(first);
@@ -874,18 +955,25 @@ fn coordinate(
             match fetch_playlist(origin.agent, origin.playlist.as_str(), &stats.throttle) {
                 Ok((p, _)) => playlist = Some(p),
                 Err(e) => {
+                    if let Some(observer) = observation_active.lock().unwrap_or_else(PoisonError::into_inner).as_mut() { observer.mark_degraded(); }
                     tracing::warn!(source = %id, error = %e, "hls fetch: playlist reload failed");
                     next_reload = Instant::now() + Duration::from_secs(1);
                 }
             }
         }
         if let Some(p) = playlist.take() {
+            // Preserve metadata before scheduling consumes the original playlist.
+            // A rejected backwards snapshot must not clear marker presence.
+            let metadata = p.cue_metadata.clone();
             target = p.target_duration;
             shared.lock().target_duration = target;
             let Some(lost) = sched.absorb(p) else {
+                if let Some(observer) = observation_active.lock().unwrap_or_else(PoisonError::into_inner).as_mut() { observer.mark_degraded(); }
                 shared.fail("media sequence ran backwards".to_owned());
                 return;
             };
+            // Outside both URL and window locks, with source service epoch fencing.
+            observe_playlist(observation_active, &shared.stop, &metadata);
             if lost > 0 {
                 stats.segments_skipped.fetch_add(lost, Ordering::Relaxed);
                 tracing::warn!(source = %id, lost, "hls fetch: segments expired before fetch");
@@ -1136,6 +1224,130 @@ mod tests {
     }
 
     #[test]
+    fn retains_original_cue_metadata_without_inventing_boundaries() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:41\n#EXT-X-ASSET:CAID=0x44495343\n#EXTINF:6,\na.ts\n";
+        let p = parse_media_playlist(text).expect("live playlist");
+        assert_eq!(p.cue_metadata.observations.len(), 1);
+        assert_eq!(p.segments[0].seq, 41);
+        assert_eq!(p.segments[0].uri, "a.ts");
+    }
+
+    #[test]
+    fn original_metadata_observation_is_fetch_generation_fenced() {
+        use crate::hls_event_observer::{HlsEventObserver, HlsEvidenceSink};
+        use multiview_core::source_event::SourceEventObservation;
+        struct Sink(Arc<Mutex<Vec<SourceEventObservation>>>);
+        impl HlsEvidenceSink for Sink {
+            fn try_observe(&mut self, o: SourceEventObservation) -> bool {
+                self.0.lock().unwrap().push(o); true
+            }
+            fn mark_degraded(&mut self) {}
+            fn retire(&mut self) { self.0.lock().unwrap().clear(); }
+        }
+        let id = "observer-generation-test";
+        let generation = begin_generation(id);
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let active = Arc::new(Mutex::new(Some(HlsEventObserver::new(id.into(), 1, Sink(observations.clone()), 8, 256))));
+        urls().lock().unwrap().get_mut(id).unwrap().observation_active = Some(Arc::downgrade(&active));
+        let playlist = parse_media_playlist("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-ASSET:CAID=original\n#EXTINF:6,\na.ts\n").unwrap();
+        observe_playlist(&active, &AtomicBool::new(false), &playlist.cue_metadata);
+        assert_eq!(observations.lock().unwrap()[0].asset_id.as_deref(), Some("original"));
+        assert!(begin_generation(id) > generation);
+        observe_playlist(&active, &AtomicBool::new(false), &Default::default());
+        assert_eq!(observations.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn incomplete_snapshots_are_not_absence_evidence() {
+        for text in [
+            "#EXTM3U\n",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n",
+            "#EXTM3U\n#EXTINF:6,\na.ts\n#EXTINF:6,\n",
+            "#EXTM3U\n#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n#EXTINF:6,\na.ts\n",
+        ] {
+            assert!(parse_media_playlist(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn retirement_waits_for_batch_and_blocks_late_callbacks() {
+        assert_retirement_fence(false);
+    }
+
+    #[test]
+    fn drop_waits_for_batch_and_blocks_late_callbacks() {
+        assert_retirement_fence(true);
+    }
+
+    fn assert_retirement_fence(drop_fetcher: bool) {
+        use crate::hls_event_observer::{HlsEventObserver, HlsEvidenceSink};
+        use multiview_core::source_event::SourceEventObservation;
+        struct BlockingSink {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            evidence: Arc<Mutex<Vec<SourceEventObservation>>>,
+        }
+        impl HlsEvidenceSink for BlockingSink {
+            fn try_observe(&mut self, o: SourceEventObservation) -> bool {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                self.evidence.lock().unwrap().push(o);
+                true
+            }
+            fn mark_degraded(&mut self) {}
+            fn retire(&mut self) {
+                // Acquiring the URL lock here proves callbacks run outside it.
+                // The test's bounded completion wait detects a lock-order deadlock.
+                drop(urls().lock().unwrap());
+                self.evidence.lock().unwrap().clear();
+            }
+        }
+        let id = if drop_fetcher { "observer-drop-barrier-test" } else { "observer-barrier-test" };
+        let generation = begin_generation(id);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let evidence = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Mutex::new(Some(HlsEventObserver::new(id.into(), 1, BlockingSink {
+            entered: entered_tx, release: release_rx, evidence: evidence.clone(),
+        }, 8, 256))));
+        urls().lock().unwrap().get_mut(id).unwrap().observation_active = Some(Arc::downgrade(&gate));
+        let worker_gate = gate.clone();
+        let worker = std::thread::spawn(move || {
+            let metadata = multiview_input::hls::MediaPlaylist::parse_cue_metadata("#EXTM3U\n#EXT-X-ASSET:CAID=A\na.ts\n#EXT-X-ASSET:CAID=B\nb.ts\n").unwrap();
+            observe_playlist(&worker_gate, &AtomicBool::new(false), &metadata);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let drop_gate = gate.clone();
+        let retirement = std::thread::spawn(move || {
+            if drop_fetcher {
+                let fetcher = HlsFetcher {
+                    shared: Arc::new(Shared {
+                        window: Mutex::new(Window { target_duration: 6.0, segments: VecDeque::new(), next_local: 0, failed: None }),
+                        ready: Condvar::new(), stop: AtomicBool::new(false),
+                    }),
+                    source_id: id.into(), local_url: "http://[::1]:1/live.m3u8".into(),
+                    generation, observation_gate: drop_gate,
+                };
+                drop(fetcher);
+            } else {
+                begin_generation(id);
+            }
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap(); retirement.join().unwrap();
+        observe_playlist(&gate, &AtomicBool::new(false), &Default::default());
+        assert!(evidence.lock().unwrap().is_empty());
+        assert!(gate.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn rejects_what_it_cannot_serve() {
         assert_eq!(parse_media_playlist("nope"), Err(Unsupported::NotAPlaylist));
         assert_eq!(
@@ -1175,6 +1387,7 @@ mod tests {
     fn listing(seqs: std::ops::Range<u64>) -> OriginPlaylist {
         OriginPlaylist {
             target_duration: 6.0,
+            cue_metadata: Default::default(),
             segments: seqs
                 .map(|seq| OriginSegment {
                     seq,
@@ -1410,6 +1623,7 @@ mod tests {
             source_id: id.to_owned(),
             local_url: "http://[::1]:1/live.m3u8".to_owned(),
             generation: a,
+            observation_gate: Arc::new(Mutex::new(None)),
         };
         publish_url(id, a, &old.local_url).expect("A publish");
         assert_eq!(shared_url(id, a).as_deref(), Some(old.local_url.as_str()));

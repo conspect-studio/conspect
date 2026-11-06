@@ -270,6 +270,7 @@ impl SubtitleRouter {
                     multiview_framestore::tile::SourceFrameTime {
                         pts: now,
                         generation: store.generation(),
+                        event_clock: None,
                     },
                 )
             })
@@ -1851,6 +1852,7 @@ input_id = "cam_b"
             SourceFrameTime {
                 pts: MediaTime::from_nanos(1_500_000_000),
                 generation: 1,
+                event_clock: None,
             },
         ))));
         let plan = CaptionPlan {
@@ -1923,6 +1925,7 @@ input_id = "cam_b"
             SourceFrameTime {
                 pts: MediaTime::from_nanos(50_000_000_000),
                 generation: 1,
+                event_clock: None,
             },
         ))));
         let mut pending = PendingCues::default();
@@ -1938,6 +1941,7 @@ input_id = "cam_b"
         cursor.store(Some(Arc::new(SourceFrameTime {
             pts: MediaTime::from_nanos(1_000_000_000),
             generation: 2,
+            event_clock: None,
         })));
         let fresh = CaptionCue::try_text(
             MediaTime::ZERO,
@@ -1978,6 +1982,7 @@ input_id = "cam_b"
             SourceFrameTime {
                 pts: MediaTime::from_nanos(1_500_000_000),
                 generation: 1,
+                event_clock: None,
             },
         ))));
         let plan = CaptionPlan {
@@ -2026,6 +2031,7 @@ input_id = "cam_b"
         cursor.store(Some(Arc::new(SourceFrameTime {
             pts: MediaTime::from_nanos(13_500_000_000),
             generation: 1,
+            event_clock: None,
         })));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while store
@@ -2054,6 +2060,7 @@ input_id = "cam_b"
                 SourceFrameTime {
                     pts: MediaTime::from_nanos(pts),
                     generation,
+                    event_clock: None,
                 },
             )])
         };

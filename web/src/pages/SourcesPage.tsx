@@ -48,6 +48,7 @@ import type {
 } from '../resources/forms';
 import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
 import { SourcePreviewButton } from '../preview/SourcePreviewButton';
+import { SourceEventsButton } from '../events/SourceEventsButton';
 import {
   AdvancedSection,
   ApplySemanticsCallout,
@@ -867,6 +868,11 @@ export function SourcesPage(): JSX.Element {
       id: 'preview',
       header: t`Preview`,
       cell: (ctx): JSX.Element => <SourcePreviewButton id={ctx.row.original.id} name={ctx.row.original.name} />,
+    },
+    {
+      id: 'events',
+      header: t`Events`,
+      cell: (ctx): JSX.Element => <SourceEventsButton id={ctx.row.original.id} name={ctx.row.original.name} />,
     },
     {
       id: 'actions',
