@@ -1088,6 +1088,7 @@ mod tests {
                     len: u64::try_from(body.len()).unwrap(),
                     etag: None,
                     last_modified: None,
+                    content_type: None,
                 })
             })
         }

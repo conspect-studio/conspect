@@ -115,13 +115,8 @@ pub fn install(
     use std::sync::Arc;
     let dir =
         service::catalogue_dir(boot_path.unwrap_or_else(|| std::path::Path::new("multiview.toml")));
-    let fetcher: Arc<dyn sync::Fetcher> = match net::HttpFetcher::new() {
-        Ok(f) => Arc::new(f),
-        Err(e) => {
-            tracing::warn!(error = %e, "iptv-org catalogue HTTP client unavailable; sync disabled");
-            Arc::new(NoFetcher)
-        }
-    };
+    let fetcher: Arc<dyn sync::Fetcher> =
+        Arc::new(net::UpstreamFetcher::new(Arc::clone(&state.dial_policy)));
     let catalogue = Catalogue::new(dir, cfg, fetcher);
     let guard = guard::DialGuard::new(Arc::clone(&state.dial_policy));
     let collector: Arc<dyn netdiag::NetworkCollector> = Arc::new(netdiag::collect::Collector::new(
@@ -203,21 +198,6 @@ fn spawn_probe_linked_loop(state: AppState, every: std::time::Duration) {
             tracing::debug!(admitted = n, "iptv-org linked-source probe round");
         }
     });
-}
-
-/// A fetcher that always fails (HTTP client could not be built).
-#[cfg(feature = "catalogue")]
-struct NoFetcher;
-
-#[cfg(feature = "catalogue")]
-impl sync::Fetcher for NoFetcher {
-    fn fetch<'a>(
-        &'a self,
-        _: &'a str,
-        _: Option<&'a str>,
-    ) -> sync::BoxFuture<'a, Result<sync::FetchOutcome, String>> {
-        Box::pin(async { Err("HTTP client unavailable".to_owned()) })
-    }
 }
 
 /// Jittered periodic sync: first run shortly after boot when nothing is persisted

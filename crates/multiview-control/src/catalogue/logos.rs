@@ -1,5 +1,5 @@
 //! Bounded server-side logo cache: the browser never loads third-party images.
-//! Logos are fetched through the same screened dial guard as probes (redirects off),
+//! Logos are fetched through the shared screened `iptv::fetch` transport,
 //! image content types only, ≤ 512 KiB each, and kept in an LRU-ish in-memory map
 //! bounded by entry count and total bytes. Control plane only.
 
@@ -32,23 +32,33 @@ fn cache() -> &'static Mutex<Cache> {
     C.get_or_init(|| Mutex::new(Cache::default()))
 }
 
-fn client(state: &AppState) -> Result<reqwest::Client, String> {
-    let guard = super::guard::DialGuard::new(state.dial_policy.clone());
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .dns_resolver(guard.resolver())
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())
-}
-
 /// Fetch (or serve from cache) the logo for `key` at `url`.
 ///
 /// # Errors
 ///
 /// A message when the URL is refused by the guard, not an image, or too large.
 pub async fn fetch(state: &AppState, key: &str, url: &str) -> Result<(Vec<u8>, String), String> {
+    fetch_with(
+        &*crate::iptv::fetch::default_fetcher(),
+        &state.dial_policy,
+        key,
+        url,
+    )
+    .await
+}
+
+/// [`fetch`] over an explicit transport (the shared SSRF-screened fetcher seam).
+///
+/// # Errors
+///
+/// As [`fetch`].
+pub async fn fetch_with(
+    fetcher: &dyn crate::iptv::fetch::Fetcher,
+    policy: &std::sync::Arc<multiview_config::device::net_guard::DialPolicy>,
+    key: &str,
+    url: &str,
+) -> Result<(Vec<u8>, String), String> {
+    use std::io::Read as _;
     if let Some(hit) = cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -58,39 +68,36 @@ pub async fn fetch(state: &AppState, key: &str, url: &str) -> Result<(Vec<u8>, S
     {
         return Ok(hit);
     }
-    let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
-    super::guard::DialGuard::new(state.dial_policy.clone()).screen_url(&parsed)?;
-    let mut resp = client(state)?
-        .get(parsed)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if resp.status().as_u16() != 200 {
-        return Err(format!("upstream answered HTTP {}", resp.status().as_u16()));
-    }
-    let ctype = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .unwrap_or_default();
+    let request = crate::iptv::fetch::FetchRequest {
+        url: url.to_owned(),
+        max_bytes: MAX_LOGO_BYTES as u64,
+        timeout: Duration::from_secs(10),
+        etag: None,
+        last_modified: None,
+    };
+    let crate::iptv::fetch::FetchOutcome::Body {
+        mut file,
+        content_type,
+        ..
+    } = fetcher
+        .fetch(request, std::sync::Arc::clone(policy))
+        .await?
+    else {
+        return Err("upstream answered HTTP 304".to_owned());
+    };
+    let ctype = content_type.unwrap_or_default();
     if !ALLOWED.contains(&ctype.as_str()) {
         return Err(format!(
             "content type {ctype:?} is not an allowed image type"
         ));
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        if body.len() + chunk.len() > MAX_LOGO_BYTES {
-            return Err("logo exceeds the 512 KiB cap".to_owned());
-        }
-        body.extend_from_slice(&chunk);
+    file.by_ref()
+        .take(MAX_LOGO_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| e.to_string())?;
+    if body.len() > MAX_LOGO_BYTES {
+        return Err("logo exceeds the 512 KiB cap".to_owned());
     }
     let mut g = cache()
         .lock()
@@ -107,4 +114,69 @@ pub async fn fetch(state: &AppState, key: &str, url: &str) -> Result<(Vec<u8>, S
     g.order.push_back(key.to_owned());
     g.map.insert(key.to_owned(), (body.clone(), ctype.clone()));
     Ok((body, ctype))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iptv::fetch::{FetchFuture, FetchOutcome, FetchRequest, Fetcher};
+    use multiview_config::device::net_guard::DialPolicy;
+    use std::io::{Seek, Write};
+    use std::sync::Arc;
+
+    struct Stub(Vec<u8>, Option<&'static str>);
+
+    impl Fetcher for Stub {
+        fn fetch(&self, request: FetchRequest, _: Arc<DialPolicy>) -> FetchFuture<'_> {
+            assert_eq!(request.max_bytes, 512 * 1024);
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&self.0).unwrap();
+            file.rewind().unwrap();
+            let out = FetchOutcome::Body {
+                file,
+                len: self.0.len() as u64,
+                etag: None,
+                last_modified: None,
+                content_type: self.1.map(str::to_owned),
+            };
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    #[tokio::test]
+    async fn image_types_only_and_cached() {
+        let policy = Arc::new(DialPolicy::allow_lan());
+        let ok = fetch_with(
+            &Stub(b"PNG".to_vec(), Some("image/png")),
+            &policy,
+            "k-ok",
+            "https://h/a.png",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok, (b"PNG".to_vec(), "image/png".to_owned()));
+        let html = fetch_with(
+            &Stub(b"<html>".to_vec(), Some("text/html")),
+            &policy,
+            "k-html",
+            "https://h/a",
+        )
+        .await
+        .unwrap_err();
+        assert!(html.contains("not an allowed image type"), "{html}");
+        let none = fetch_with(&Stub(b"x".to_vec(), None), &policy, "k-none", "https://h/a")
+            .await
+            .unwrap_err();
+        assert!(none.contains("not an allowed"), "{none}");
+        // Second call is served from the cache without touching the transport.
+        let hit = fetch_with(
+            &Stub(b"other".to_vec(), Some("image/png")),
+            &policy,
+            "k-ok",
+            "https://h/a.png",
+        )
+        .await
+        .unwrap();
+        assert_eq!(hit.0, b"PNG".to_vec());
+    }
 }

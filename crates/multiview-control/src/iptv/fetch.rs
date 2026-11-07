@@ -51,6 +51,8 @@ pub enum FetchOutcome {
         etag: Option<String>,
         /// Response `Last-Modified`, if any.
         last_modified: Option<String>,
+        /// Response media type (parameters dropped, lower-cased), if any.
+        content_type: Option<String>,
     },
     /// `304 Not Modified` for a conditional request.
     NotModified,
@@ -273,6 +275,13 @@ mod net {
         };
         let etag = header("etag");
         let last_modified = header("last-modified");
+        let content_type = header("content-type").map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
         let mut file = tempfile::tempfile().map_err(|e| format!("spool: {e}"))?;
         let mut len: u64 = 0;
         while let Some(chunk) = response
@@ -293,6 +302,7 @@ mod net {
             len,
             etag,
             last_modified,
+            content_type,
         })
     }
 }
