@@ -2546,6 +2546,399 @@
         ]
       }
     },
+    "/api/v1/inputs/{id}/events/automation": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`GET /api/v1/inputs/{id}/events/automation` — rule, live status and log.",
+        "operationId": "get_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Automation rule, live status and bounded action log.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`PUT /api/v1/inputs/{id}/events/automation` — replace (or remove) the rule,\npersisted through the canonical durable source path. Never arms: a new or\nedited rule keeps the CURRENT armed state (disarmed if new).",
+        "operationId": "put_automation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomationPut"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source, target or cell outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid rule",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/automation/arm": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/automation/arm` — arm the stored rule.",
+        "operationId": "post_automation_arm",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Armed; rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source, target or cell outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No rule configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/automation/disarm": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/automation/disarm` — disarm. A break in\nprogress is restored by the executor on its next tick.",
+        "operationId": "post_automation_disarm",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Disarmed; rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No rule configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/automation/restore": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/automation/restore` — restore now.",
+        "operationId": "post_automation_restore",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restore dispatched; rule and live status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Nothing to restore, or an operator change already took over",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Executor unavailable or command bus busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/inputs/{id}/events/test": {
       "post": {
         "tags": [
@@ -9371,6 +9764,152 @@
           }
         }
       },
+      "AutomationLogEntry": {
+        "type": "object",
+        "description": "One action-log row.",
+        "required": [
+          "at_unix_ms",
+          "action",
+          "detail"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "Short machine action (`take`, `restore`, `watchdog`, ...)."
+          },
+          "at_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix milliseconds."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Human-readable detail."
+          }
+        }
+      },
+      "AutomationPut": {
+        "type": "object",
+        "description": "Request body for `PUT .../events/automation`: the rule, or `null` to remove it.",
+        "properties": {
+          "rule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventAutomationRuleDoc",
+                "description": "Replacement rule; `null` deletes it. `armed` here is ignored unless the\nrule is already armed — arm with `POST .../arm` (explicit confirmation)."
+              }
+            ]
+          }
+        }
+      },
+      "AutomationStatus": {
+        "type": "object",
+        "description": "Public status of one source's automation.",
+        "required": [
+          "phase",
+          "armed",
+          "test",
+          "replaced"
+        ],
+        "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "Whether the rule is armed."
+          },
+          "audio_replaced": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Whether the source's program-bus audio was re-pointed."
+          },
+          "event_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Break occurrence being handled."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last refusal/failure, if any."
+          },
+          "phase": {
+            "$ref": "#/components/schemas/Phase",
+            "description": "Current phase."
+          },
+          "replaced": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplacedCell"
+            },
+            "description": "Cells currently replaced."
+          },
+          "since_unix_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix milliseconds the replacement was taken."
+          },
+          "test": {
+            "type": "boolean",
+            "description": "Whether that occurrence is operator test evidence."
+          }
+        }
+      },
+      "AutomationView": {
+        "type": "object",
+        "description": "Automation rule + live status for one source (ADR-0183).",
+        "required": [
+          "status",
+          "log",
+          "bars_sources",
+          "executor_running"
+        ],
+        "properties": {
+          "bars_sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ids of configured `bars` sources (used by the `bars`/`bars_tone` targets)."
+          },
+          "executor_running": {
+            "type": "boolean",
+            "description": "Whether the executor is running in this process."
+          },
+          "log": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AutomationLogEntry"
+            },
+            "description": "Bounded action log, newest first."
+          },
+          "rule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventAutomationRuleDoc",
+                "description": "The configured rule (absent when none is configured)."
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/AutomationStatus",
+            "description": "Live executor status."
+          }
+        }
+      },
       "BackendCapability": {
         "type": "object",
         "description": "The availability + probed capability of one `(kind, stage)` backend.\n\n`available` is the honest single signal: the backend is compiled **and** a\nusable device is present. The compiled-but-device-absent distinction\n(`compiled_in`) needs HAL-side feature introspection and is deferred to the\nSA-1+ deep probe (task #180).",
@@ -9543,6 +10082,42 @@
               "null"
             ],
             "description": "The `[control] start` cold-start policy (`boot` | `resume`)."
+          }
+        }
+      },
+      "BreakActionKindDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::schema::BreakActionKind`.",
+        "enum": [
+          "swap_cell",
+          "route_program"
+        ]
+      },
+      "BreakStartActionDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::schema::BreakStartAction`.",
+        "required": [
+          "action",
+          "target"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/BreakActionKindDoc",
+            "description": "`swap_cell` (cells only) or `route_program` (cells + program audio)."
+          },
+          "cells": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Cells to replace; absent = every cell showing the source."
+          },
+          "target": {
+            "type": "string",
+            "description": "A source id, or `bars` / `bars_tone`."
           }
         }
       },
@@ -10861,6 +11436,46 @@
           "block-new-instance",
           "unlicensed-build"
         ]
+      },
+      "EventAutomationRuleDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::schema::EventAutomationRule` (ADR-0183).",
+        "required": [
+          "on_break_start"
+        ],
+        "properties": {
+          "armed": {
+            "type": "boolean",
+            "description": "Whether the rule acts (default `false`). Use the arm/disarm routes."
+          },
+          "max_duration_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Watchdog seconds (1..=86400, default 600).",
+            "minimum": 0
+          },
+          "on_break_start": {
+            "$ref": "#/components/schemas/BreakStartActionDoc",
+            "description": "What to take at break start."
+          },
+          "restore_on_end": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Restore the pre-break routing at the confirmed end (default `true`)."
+          },
+          "webhook_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `http://` hook POSTed on break start/end."
+          }
+        }
       },
       "FiredBody": {
         "type": "object",
@@ -12724,6 +13339,17 @@
           "Critical"
         ]
       },
+      "Phase": {
+        "type": "string",
+        "description": "Live automation phase of one source.",
+        "enum": [
+          "disarmed",
+          "idle",
+          "in_break",
+          "restoring",
+          "manual_override"
+        ]
+      },
       "PinVendorDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of `multiview_config::placement::PinVendor`.",
@@ -13169,6 +13795,29 @@
           }
         },
         "additionalProperties": false
+      },
+      "ReplacedCell": {
+        "type": "object",
+        "description": "One replaced cell.",
+        "required": [
+          "cell",
+          "original",
+          "replacement"
+        ],
+        "properties": {
+          "cell": {
+            "type": "string",
+            "description": "Cell id."
+          },
+          "original": {
+            "type": "string",
+            "description": "Source the cell showed before the break (restored at the end)."
+          },
+          "replacement": {
+            "type": "string",
+            "description": "Source taken into the cell."
+          }
+        }
       },
       "ReplyRequest": {
         "type": "object",

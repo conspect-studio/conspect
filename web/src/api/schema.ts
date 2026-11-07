@@ -829,6 +829,82 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/inputs/{id}/events/automation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/inputs/{id}/events/automation` — rule, live status and log. */
+        get: operations["get_automation"];
+        /**
+         * `PUT /api/v1/inputs/{id}/events/automation` — replace (or remove) the rule,
+         *     persisted through the canonical durable source path. Never arms: a new or
+         *     edited rule keeps the CURRENT armed state (disarmed if new).
+         */
+        put: operations["put_automation"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/inputs/{id}/events/automation/arm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/inputs/{id}/events/automation/arm` — arm the stored rule. */
+        post: operations["post_automation_arm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/inputs/{id}/events/automation/disarm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/inputs/{id}/events/automation/disarm` — disarm. A break in
+         *     progress is restored by the executor on its next tick.
+         */
+        post: operations["post_automation_disarm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/inputs/{id}/events/automation/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/inputs/{id}/events/automation/restore` — restore now. */
+        post: operations["post_automation_restore"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/inputs/{id}/events/test": {
         parameters: {
             query?: never;
@@ -2676,6 +2752,56 @@ export interface components {
             /** @description The resource collection the object belongs to (e.g. `layout`). */
             object_kind: string;
         };
+        /** @description One action-log row. */
+        AutomationLogEntry: {
+            /** @description Short machine action (`take`, `restore`, `watchdog`, ...). */
+            action: string;
+            /**
+             * Format: int64
+             * @description Unix milliseconds.
+             */
+            at_unix_ms: number;
+            /** @description Human-readable detail. */
+            detail: string;
+        };
+        /** @description Request body for `PUT .../events/automation`: the rule, or `null` to remove it. */
+        AutomationPut: {
+            rule?: null | components["schemas"]["EventAutomationRuleDoc"];
+        };
+        /** @description Public status of one source's automation. */
+        AutomationStatus: {
+            /** @description Whether the rule is armed. */
+            armed: boolean;
+            /** @description Whether the source's program-bus audio was re-pointed. */
+            audio_replaced?: string | null;
+            /** @description Break occurrence being handled. */
+            event_id?: string | null;
+            /** @description Last refusal/failure, if any. */
+            last_error?: string | null;
+            /** @description Current phase. */
+            phase: components["schemas"]["Phase"];
+            /** @description Cells currently replaced. */
+            replaced: components["schemas"]["ReplacedCell"][];
+            /**
+             * Format: int64
+             * @description Unix milliseconds the replacement was taken.
+             */
+            since_unix_ms?: number | null;
+            /** @description Whether that occurrence is operator test evidence. */
+            test: boolean;
+        };
+        /** @description Automation rule + live status for one source (ADR-0183). */
+        AutomationView: {
+            /** @description Ids of configured `bars` sources (used by the `bars`/`bars_tone` targets). */
+            bars_sources: string[];
+            /** @description Whether the executor is running in this process. */
+            executor_running: boolean;
+            /** @description Bounded action log, newest first. */
+            log: components["schemas"]["AutomationLogEntry"][];
+            rule?: null | components["schemas"]["EventAutomationRuleDoc"];
+            /** @description Live executor status. */
+            status: components["schemas"]["AutomationStatus"];
+        };
         /**
          * @description The availability + probed capability of one `(kind, stage)` backend.
          *
@@ -2771,6 +2897,20 @@ export interface components {
             resumed: boolean;
             /** @description The `[control] start` cold-start policy (`boot` | `resume`). */
             start?: string | null;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::schema::BreakActionKind`.
+         * @enum {string}
+         */
+        BreakActionKindDoc: "swap_cell" | "route_program";
+        /** @description `OpenAPI` mirror of `multiview_config::schema::BreakStartAction`. */
+        BreakStartActionDoc: {
+            /** @description `swap_cell` (cells only) or `route_program` (cells + program audio). */
+            action: components["schemas"]["BreakActionKindDoc"];
+            /** @description Cells to replace; absent = every cell showing the source. */
+            cells?: string[] | null;
+            /** @description A source id, or `bars` / `bars_tone`. */
+            target: string;
         };
         /**
          * @description The build-profile compliance surface: effective licence, redistributability,
@@ -3479,6 +3619,22 @@ export interface components {
          * @enum {string}
          */
         EnforcementLevelDoc: "active" | "warning" | "config-locked" | "watermark" | "block-new-instance" | "unlicensed-build";
+        /** @description `OpenAPI` mirror of `multiview_config::schema::EventAutomationRule` (ADR-0183). */
+        EventAutomationRuleDoc: {
+            /** @description Whether the rule acts (default `false`). Use the arm/disarm routes. */
+            armed?: boolean;
+            /**
+             * Format: int32
+             * @description Watchdog seconds (1..=86400, default 600).
+             */
+            max_duration_s?: number | null;
+            /** @description What to take at break start. */
+            on_break_start: components["schemas"]["BreakStartActionDoc"];
+            /** @description Restore the pre-break routing at the confirmed end (default `true`). */
+            restore_on_end?: boolean | null;
+            /** @description Optional `http://` hook POSTed on break start/end. */
+            webhook_url?: string | null;
+        };
         /** @description The `202` body of a successful salvo fire. */
         FiredBody: {
             /** @description The queued action id (also the pending-action + audit correlation id). */
@@ -4297,6 +4453,11 @@ export interface components {
          */
         PerceivedSeverityDoc: "Cleared" | "Indeterminate" | "Warning" | "Minor" | "Major" | "Critical";
         /**
+         * @description Live automation phase of one source.
+         * @enum {string}
+         */
+        Phase: "disarmed" | "idle" | "in_break" | "restoring" | "manual_override";
+        /**
          * @description `OpenAPI` mirror of `multiview_config::placement::PinVendor`.
          * @enum {string}
          */
@@ -4528,6 +4689,15 @@ export interface components {
         RelaySetRequest: {
             /** @description Whether this machine should relay neighbours' heartbeats (brief §9.2). */
             enabled: boolean;
+        };
+        /** @description One replaced cell. */
+        ReplacedCell: {
+            /** @description Cell id. */
+            cell: string;
+            /** @description Source the cell showed before the break (restored at the end). */
+            original: string;
+            /** @description Source taken into the cell. */
+            replacement: string;
         };
         /** @description The `POST /api/v1/support/tickets/{id}/reply` request body. */
         ReplyRequest: {
@@ -7868,6 +8038,305 @@ export interface operations {
                 };
             };
             /** @description Source event provider unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_automation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact source identity */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Automation rule, live status and bounded action log. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutomationView"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source outside principal scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_automation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact source identity */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AutomationPut"];
+            };
+        };
+        responses: {
+            /** @description The stored rule and live status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutomationView"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source, target or cell outside principal scope, or insufficient role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid rule */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    post_automation_arm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact source identity */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Armed; rule and live status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutomationView"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source, target or cell outside principal scope, or insufficient role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No rule configured */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    post_automation_disarm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact source identity */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Disarmed; rule and live status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutomationView"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source outside principal scope, or insufficient role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No rule configured */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    post_automation_restore: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact source identity */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Restore dispatched; rule and live status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutomationView"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source outside principal scope, or insufficient role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Nothing to restore, or an operator change already took over */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Executor unavailable or command bus busy */
             503: {
                 headers: {
                     [name: string]: unknown;

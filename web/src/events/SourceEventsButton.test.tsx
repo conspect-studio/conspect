@@ -16,7 +16,11 @@ const row = (changes: Partial<SourceEvent> = {}): SourceEvent => ({
 const snapshot = (events = [row()]): SourceEvents => ({
   source_id: 'source-a', epoch: '9007199254740993', availability: 'available', degraded: false, events,
 });
-const server = setupServer();
+const automationEndpoint = '*/api/v1/inputs/:id/events/automation';
+const server = setupServer(http.get(automationEndpoint, () => HttpResponse.json({
+  rule: null, log: [], bars_sources: [], executor_running: true,
+  status: { phase: 'disarmed', armed: false, test: false, replaced: [] },
+})));
 beforeAll(() => { server.listen({ onUnhandledRequest: 'error' }); });
 afterEach(() => { server.resetHandlers(); vi.useRealTimers(); });
 afterAll(() => { server.close(); });

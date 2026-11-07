@@ -4,6 +4,7 @@ import { Trans, useLingui } from '@lingui/react/macro';
 import { Button } from '../components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '../components/ui/dialog';
 import { OperationApiError } from '../api/operations';
+import { AutomationPanel } from './AutomationPanel';
 import { nanosecondsToSeconds, useInjectTestEvent, useSourceEvents } from './sourceEvents';
 import type { SourceEvent } from './sourceEvents';
 import type { SourceView } from '../resources/types';
@@ -58,7 +59,7 @@ function TestInjectionControls({ id }: { readonly id: string }): JSX.Element {
   const notFound = inject.error instanceof OperationApiError && inject.error.status === 404;
   return <div className="space-y-2 rounded border border-dashed p-3">
     <p className="text-xs font-semibold uppercase text-muted-foreground"><Trans>Test aid (admin only) — not live evidence</Trans></p>
-    <p className="text-xs text-muted-foreground"><Trans>Inject a clearly-labelled synthetic break so you can see the overlay/automation work without waiting for a live ad break.</Trans></p>
+    <p className="text-xs text-muted-foreground"><Trans>Inject a clearly-labelled synthetic break so you can see the overlay/automation work without waiting for a live ad break. If automation is armed, a test start takes the replacement and a test end restores it.</Trans></p>
     <div className="flex gap-2">
       <Button
         type="button"
@@ -107,6 +108,7 @@ function SourceEventsPanel({ id, eventObservation }: { readonly id: string; read
     {snapshot.events.length === 0
       ? <p><Trans>No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile.</Trans></p>
       : <ul className="max-h-96 space-y-2 overflow-auto">{snapshot.events.map((event, index) => <EventRow key={`${event.epoch}:${event.event_id}:${String(index)}`} event={event} timingAvailable={snapshot.availability === 'available'} />)}</ul>}
+    <AutomationPanel id={id} />
     <TestInjectionControls id={id} />
   </div>;
 }
@@ -130,7 +132,7 @@ export function SourceEventsButton({ id, name, eventObservation }: {
       <DialogContent>
         <DialogHeader>
           <DialogTitle><Trans>Source events</Trans> — {name}</DialogTitle>
-          <DialogDescription><Trans>Read-only server snapshot, refreshed every second while open. Automation (if configured) acts separately and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time.</Trans></DialogDescription>
+          <DialogDescription><Trans>Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time.</Trans></DialogDescription>
         </DialogHeader>
         {open ? <SourceEventsPanel key={id} id={id} eventObservation={eventObservation ?? 'observing'} /> : null}
       </DialogContent>

@@ -34,6 +34,10 @@ msgstr "(desired: {0})"
 msgid "(opens in a new tab)"
 msgstr "(opens in a new tab)"
 
+#: src/events/AutomationPanel.tsx:28
+msgid "(program audio → {audio})"
+msgstr "(program audio → {audio})"
+
 #. placeholder {0}: names.length
 #. placeholder {1}: editableCells(model).length
 #. placeholder {2}: sourceLabels.size
@@ -78,7 +82,7 @@ msgstr "{option} (custom — preserved)"
 msgid "{seconds} s ago"
 msgstr "{seconds} s ago"
 
-#: src/events/SourceEventsButton.tsx:40
+#: src/events/SourceEventsButton.tsx:41
 msgid "{seconds} seconds"
 msgstr "{seconds} seconds"
 
@@ -553,6 +557,10 @@ msgstr "Acknowledged"
 msgid "Action"
 msgstr "Action"
 
+#: src/events/AutomationPanel.tsx:147
+msgid "Action log"
+msgstr "Action log"
+
 #: src/pages/AlarmsPage.tsx:221
 #: src/pages/AudioPage.tsx:443
 #: src/pages/CastPage.tsx:320
@@ -571,7 +579,7 @@ msgstr "Actions"
 msgid "Actions that take time return <0>202 Accepted</0> with an operation id; the final result arrives on the realtime stream, not in the HTTP response body."
 msgstr "Actions that take time return <0>202 Accepted</0> with an operation id; the final result arrives on the realtime stream, not in the HTTP response body."
 
-#: src/events/SourceEventsButton.tsx:14
+#: src/events/SourceEventsButton.tsx:15
 msgid "Active"
 msgstr "Active"
 
@@ -595,6 +603,10 @@ msgstr "Active only"
 #: src/pages/SystemActionsPage.tsx:235
 msgid "Actor"
 msgstr "Actor"
+
+#: src/events/AutomationPanel.tsx:121
+msgid "Ad-break automation"
+msgstr "Ad-break automation"
 
 #: src/layout/components/SourcePalette.tsx:103
 msgid "Add"
@@ -650,7 +662,7 @@ msgstr "Addresses are presented IPv6-first; IPv4 results are explicitly labelled
 msgid "admin.xxxxxxxx-xxxx-…"
 msgstr "admin.xxxxxxxx-xxxx-…"
 
-#: src/events/SourceEventsButton.tsx:83
+#: src/events/SourceEventsButton.tsx:84
 msgid "Administer role required to inject test events."
 msgstr "Administer role required to inject test events."
 
@@ -758,6 +770,10 @@ msgstr "Alarms matching the current filter."
 #: src/layout/components/CellPropertiesPanel.tsx:204
 msgid "Align"
 msgstr "Align"
+
+#: src/events/AutomationPanel.tsx:84
+msgid "All cells showing this source"
+msgstr "All cells showing this source"
 
 #: src/pages/LayoutsPage.tsx:248
 msgid "All configured layouts."
@@ -963,9 +979,14 @@ msgstr "Areas"
 msgid "Areas & cells"
 msgstr "Areas & cells"
 
+#: src/events/AutomationPanel.tsx:128
 #: src/pages/SalvosPage.tsx:257
 msgid "Arm"
 msgstr "Arm"
+
+#: src/events/AutomationPanel.tsx:132
+msgid "Arm automation? Confirmed ad breaks on this source will switch program output automatically."
+msgstr "Arm automation? Confirmed ad breaks on this source will switch program output automatically."
 
 #: src/pages/MediaPlayersPage.tsx:411
 msgid "Arm exit"
@@ -979,6 +1000,10 @@ msgstr "Arm salvo"
 msgid "Arm vamp exit"
 msgstr "Arm vamp exit"
 
+#: src/events/AutomationPanel.tsx:35
+msgid "Armed — idle, waiting for a break."
+msgstr "Armed — idle, waiting for a break."
+
 #: src/pages/docs/concepts/TransportsPage.tsx:164
 msgid "As an input, HLS arrives in bursts (whole segments at a time), so Multiview paces it back to real time internally before it is sampled onto the wall. As an output it is the easiest way to let many people open the multiview in a browser or player."
 msgstr "As an input, HLS arrives in bursts (whole segments at a time), so Multiview paces it back to real time internally before it is sampled onto the wall. As an output it is the easiest way to let many people open the multiview in a browser or player."
@@ -991,7 +1016,7 @@ msgstr "Ask in the community discussions"
 msgid "Assemble a redacted local diagnostics bundle for your own troubleshooting — logs and engine state, never media or raw identifiers. Built from the local buffer, independent of telemetry consent."
 msgstr "Assemble a redacted local diagnostics bundle for your own troubleshooting — logs and engine state, never media or raw identifiers. Built from the local buffer, independent of telemetry consent."
 
-#: src/events/SourceEventsButton.tsx:37
+#: src/events/SourceEventsButton.tsx:38
 msgid "Asset"
 msgstr "Asset"
 
@@ -1056,7 +1081,7 @@ msgstr "AUTH_FAILED"
 msgid "Authentication"
 msgstr "Authentication"
 
-#: src/events/SourceEventsButton.tsx:95
+#: src/events/SourceEventsButton.tsx:96
 msgid "Authentication required to read source events."
 msgstr "Authentication required to read source events."
 
@@ -1081,6 +1106,14 @@ msgstr "Automatic (default)"
 #: src/pages/OutputsPage.tsx:426
 msgid "Automatic (EDID preferred mode)"
 msgstr "Automatic (EDID preferred mode)"
+
+#: src/events/AutomationPanel.tsx:20
+msgid "Automation executor is not running on this server (source events are unavailable)."
+msgstr "Automation executor is not running on this server (source events are unavailable)."
+
+#: src/events/AutomationPanel.tsx:114
+msgid "Automation status could not be read."
+msgstr "Automation status could not be read."
 
 #: src/docs/registry.ts:528
 #: src/pages/docs/concepts/CodecsPage.tsx:79
@@ -1127,6 +1160,14 @@ msgstr "Background fill as a hex color (e.g. #101014)."
 #: src/layout/components/CellsForm.tsx:361
 msgid "Backward"
 msgstr "Backward"
+
+#: src/events/AutomationPanel.tsx:80
+msgid "Bars"
+msgstr "Bars"
+
+#: src/events/AutomationPanel.tsx:81
+msgid "Bars + tone"
+msgstr "Bars + tone"
 
 #: src/pages/docs/ApiPage.tsx:60
 msgid "Base path"
@@ -1296,6 +1337,7 @@ msgstr "Bus"
 msgid "Camera 1"
 msgstr "Camera 1"
 
+#: src/events/AutomationPanel.tsx:135
 #: src/layout/components/GridLayoutEditor.tsx:882
 #: src/layout/components/LayoutEditor.tsx:426
 #: src/pages/CastPage.tsx:459
@@ -1330,7 +1372,7 @@ msgstr "Cancel salvo"
 msgid "Cancel vamp exit"
 msgstr "Cancel vamp exit"
 
-#: src/events/SourceEventsButton.tsx:14
+#: src/events/SourceEventsButton.tsx:15
 msgid "Cancelled"
 msgstr "Cancelled"
 
@@ -1479,6 +1521,10 @@ msgstr "Cells"
 #: src/layout/components/LayoutEditor.tsx:318
 msgid "Cells (accessible)"
 msgstr "Cells (accessible)"
+
+#: src/events/AutomationPanel.tsx:83
+msgid "Cells (optional, comma-separated)"
+msgstr "Cells (optional, comma-separated)"
 
 #: src/pages/OverlaysPage.tsx:74
 msgid "Centre x (px)"
@@ -1799,6 +1845,10 @@ msgstr "Configured overlay layers."
 msgid "Configured sync groups."
 msgstr "Configured sync groups."
 
+#: src/events/AutomationPanel.tsx:134
+msgid "Confirm"
+msgstr "Confirm"
+
 #: src/components/ConnectionStatus.tsx:29
 msgid "Connected"
 msgstr "Connected"
@@ -1884,7 +1934,7 @@ msgstr "Corner radius (px)"
 msgid "Corner radius must be a whole number of pixels (0 or more)."
 msgstr "Corner radius must be a whole number of pixels (0 or more)."
 
-#: src/events/SourceEventsButton.tsx:38
+#: src/events/SourceEventsButton.tsx:39
 msgid "Correlation"
 msgstr "Correlation"
 
@@ -2388,7 +2438,7 @@ msgstr "Degradation"
 msgid "Degraded"
 msgstr "Degraded"
 
-#: src/events/SourceEventsButton.tsx:106
+#: src/events/SourceEventsButton.tsx:107
 msgid "Degraded event evidence: information may be incomplete."
 msgstr "Degraded event evidence: information may be incomplete."
 
@@ -2547,6 +2597,18 @@ msgstr "Digital (HH:MM:SS readout)"
 #: src/pages/SourcesPage.tsx:556
 msgid "Direction"
 msgstr "Direction"
+
+#: src/events/AutomationPanel.tsx:128
+msgid "Disarm"
+msgstr "Disarm"
+
+#: src/events/AutomationPanel.tsx:133
+msgid "Disarm automation? A replacement on air now will be restored."
+msgstr "Disarm automation? A replacement on air now will be restored."
+
+#: src/events/AutomationPanel.tsx:36
+msgid "Disarmed — no automatic action will be taken."
+msgstr "Disarmed — no automatic action will be taken."
 
 #: src/pages/SourcesPage.tsx:650
 msgid "Discard the source wall-clock"
@@ -2931,7 +2993,7 @@ msgstr "Edit sync group"
 msgid "Effective licence"
 msgstr "Effective licence"
 
-#: src/events/SourceEventsButton.tsx:23
+#: src/events/SourceEventsButton.tsx:24
 msgid "Elapsed"
 msgstr "Elapsed"
 
@@ -2968,7 +3030,7 @@ msgstr "Encoder utilisation: ours over device total"
 msgid "End of file"
 msgstr "End of file"
 
-#: src/events/SourceEventsButton.tsx:14
+#: src/events/SourceEventsButton.tsx:15
 msgid "Ended"
 msgstr "Ended"
 
@@ -3054,7 +3116,7 @@ msgstr "Enter an exact rational rate like 60000/1001, or a whole number like 50 
 msgid "Entitlement"
 msgstr "Entitlement"
 
-#: src/events/SourceEventsButton.tsx:36
+#: src/events/SourceEventsButton.tsx:37
 msgid "Epoch"
 msgstr "Epoch"
 
@@ -3062,13 +3124,13 @@ msgstr "Epoch"
 msgid "Errors"
 msgstr "Errors"
 
-#: src/events/SourceEventsButton.tsx:128
+#: src/events/SourceEventsButton.tsx:130
 #: src/pages/DeviceDetailPage.tsx:453
 #: src/pages/SourcesPage.tsx:874
 msgid "Events"
 msgstr "Events"
 
-#: src/events/SourceEventsButton.tsx:128
+#: src/events/SourceEventsButton.tsx:130
 msgid "Events: {name}"
 msgstr "Events: {name}"
 
@@ -3120,7 +3182,7 @@ msgstr "Example sync group"
 msgid "exit armed"
 msgstr "exit armed"
 
-#: src/events/SourceEventsButton.tsx:22
+#: src/events/SourceEventsButton.tsx:23
 msgid "Expected return in"
 msgstr "Expected return in"
 
@@ -3165,11 +3227,7 @@ msgstr "Exposed ports and roadmap"
 msgid "External edits to the boot configuration file hot-reload the parts that can apply live; an invalid file changes nothing and is reported here and on the health banner. Sections that cannot hot-apply stay listed until a restart."
 msgstr "External edits to the boot configuration file hot-reload the parts that can apply live; an invalid file changes nothing and is reported here and on the health banner. Sections that cannot hot-apply stay listed until a restart."
 
-#: src/events/SourceEventsButton.tsx:18
-#~ msgid "External evidence"
-#~ msgstr "External evidence"
-
-#: src/events/SourceEventsButton.tsx:19
+#: src/events/SourceEventsButton.tsx:20
 msgid "External evidence (test injection or authenticated hook)"
 msgstr "External evidence (test injection or authenticated hook)"
 
@@ -3706,6 +3764,10 @@ msgstr "Images"
 msgid "In a multiview chain there are two transports in the path: the one each source arrives on, and the one the composed wall goes out on. Both choices matter, and they are independent — a wall of low-latency RTSP cameras served out over plain HLS is still tens of seconds behind for its viewers."
 msgstr "In a multiview chain there are two transports in the path: the one each source arrives on, and the one the composed wall goes out on. Both choices matter, and they are independent — a wall of low-latency RTSP cameras served out over plain HLS is still tens of seconds behind for its viewers."
 
+#: src/events/AutomationPanel.tsx:27
+msgid "In break: replaced {swaps} since {since}"
+msgstr "In break: replaced {swaps} since {since}"
+
 #: src/pages/LoudnessMeter.tsx:50
 msgid "In spec"
 msgstr "In spec"
@@ -3738,15 +3800,15 @@ msgstr "Index"
 msgid "Index→cell rules"
 msgstr "Index→cell rules"
 
-#: src/events/SourceEventsButton.tsx:61
-msgid "Inject a clearly-labelled synthetic break so you can see the overlay/automation work without waiting for a live ad break."
-msgstr "Inject a clearly-labelled synthetic break so you can see the overlay/automation work without waiting for a live ad break."
+#: src/events/SourceEventsButton.tsx:62
+msgid "Inject a clearly-labelled synthetic break so you can see the overlay/automation work without waiting for a live ad break. If automation is armed, a test start takes the replacement and a test end restores it."
+msgstr "Inject a clearly-labelled synthetic break so you can see the overlay/automation work without waiting for a live ad break. If automation is armed, a test start takes the replacement and a test end restores it."
 
-#: src/events/SourceEventsButton.tsx:79
+#: src/events/SourceEventsButton.tsx:80
 msgid "Inject test break end"
 msgstr "Inject test break end"
 
-#: src/events/SourceEventsButton.tsx:70
+#: src/events/SourceEventsButton.tsx:71
 msgid "Inject test break start (30s)"
 msgstr "Inject test break start (30s)"
 
@@ -4215,6 +4277,10 @@ msgstr "Loading audio routing…"
 msgid "Loading audit log…"
 msgstr "Loading audit log…"
 
+#: src/events/AutomationPanel.tsx:116
+msgid "Loading automation…"
+msgstr "Loading automation…"
+
 #: src/layout/components/LayoutEditor.tsx:343
 msgid "Loading canvas…"
 msgstr "Loading canvas…"
@@ -4299,7 +4365,7 @@ msgstr "Loading profiles…"
 msgid "Loading salvos…"
 msgstr "Loading salvos…"
 
-#: src/events/SourceEventsButton.tsx:101
+#: src/events/SourceEventsButton.tsx:102
 msgid "Loading source events…"
 msgstr "Loading source events…"
 
@@ -4457,13 +4523,17 @@ msgstr "Managed facility LAN"
 msgid "Management address"
 msgstr "Management address"
 
-#: src/events/SourceEventsButton.tsx:18
+#: src/events/SourceEventsButton.tsx:19
 msgid "Manifest signalling"
 msgstr "Manifest signalling"
 
 #: src/pages/TallyPage.tsx:200
 msgid "Manual override"
 msgstr "Manual override"
+
+#: src/events/AutomationPanel.tsx:33
+msgid "Manual override: an operator changed a replaced cell; automation will not restore this break."
+msgstr "Manual override: an operator changed a replaced cell; automation will not restore this break."
 
 #: src/pages/SourcesPage.tsx:747
 msgid "Matrix"
@@ -4898,6 +4968,14 @@ msgstr "No alarms match the current filter."
 msgid "No audit entries match."
 msgstr "No audit entries match."
 
+#: src/events/AutomationPanel.tsx:149
+msgid "No automation actions yet."
+msgstr "No automation actions yet."
+
+#: src/events/AutomationPanel.tsx:97
+msgid "No Bars source is configured yet — this rule will refuse to act until you add one."
+msgstr "No Bars source is configured yet — this rule will refuse to act until you add one."
+
 #: src/pages/CastPage.tsx:245
 msgid "No Cast receivers discovered. You can still start a session by entering a receiver address directly."
 msgstr "No Cast receivers discovered. You can still start a session by entering a receiver address directly."
@@ -5026,7 +5104,7 @@ msgstr "No probes configured."
 msgid "No recovery; loss = glitch"
 msgstr "No recovery; loss = glitch"
 
-#: src/events/SourceEventsButton.tsx:41
+#: src/events/SourceEventsButton.tsx:42
 msgid "No reliable timing readout."
 msgstr "No reliable timing readout."
 
@@ -5067,11 +5145,7 @@ msgstr "NO SIGNAL"
 msgid "No source"
 msgstr "No source"
 
-#: src/events/SourceEventsButton.tsx:55
-#~ msgid "No source events in the current server snapshot."
-#~ msgstr "No source events in the current server snapshot."
-
-#: src/events/SourceEventsButton.tsx:108
+#: src/events/SourceEventsButton.tsx:109
 msgid "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 msgstr "No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile."
 
@@ -5128,6 +5202,10 @@ msgstr "none (located by enrolled identity)"
 msgid "None (no captions decoded)"
 msgstr "None (no captions decoded)"
 
+#: src/events/AutomationPanel.tsx:142
+msgid "none configured"
+msgstr "none configured"
+
 #: src/pages/docs/concepts/TransportsPage.tsx:326
 msgid "None needed"
 msgstr "None needed"
@@ -5169,7 +5247,7 @@ msgstr "Not probed yet."
 msgid "Not static"
 msgstr "Not static"
 
-#: src/events/SourceEventsButton.tsx:49
+#: src/events/SourceEventsButton.tsx:50
 msgid "Not supported for this source kind: only HLS (and YouTube, an HLS wrapper) sources carry cue surfaces this tracker understands."
 msgstr "Not supported for this source kind: only HLS (and YouTube, an HLS wrapper) sources carry cue surfaces this tracker understands."
 
@@ -5236,15 +5314,15 @@ msgstr "NVIDIA"
 msgid "Object"
 msgstr "Object"
 
-#: src/events/SourceEventsButton.tsx:48
+#: src/events/SourceEventsButton.tsx:49
 msgid "Observation disabled for this source (events.observe = false in its configuration)."
 msgstr "Observation disabled for this source (events.observe = false in its configuration)."
 
-#: src/events/SourceEventsButton.tsx:15
+#: src/events/SourceEventsButton.tsx:16
 msgid "Observed"
 msgstr "Observed"
 
-#: src/events/SourceEventsButton.tsx:47
+#: src/events/SourceEventsButton.tsx:48
 msgid "Observing: HLS cue/DATERANGE, SCTE-35 and timed ID3 are watched for this source."
 msgstr "Observing: HLS cue/DATERANGE, SCTE-35 and timed ID3 are watched for this source."
 
@@ -5278,6 +5356,10 @@ msgstr "Offset trim (ms)"
 #: src/pages/MeshPage.tsx:144
 msgid "On"
 msgstr "On"
+
+#: src/events/AutomationPanel.tsx:71
+msgid "On break start"
+msgstr "On break start"
 
 #: src/layout/components/CellPropertiesPanel.tsx:166
 msgid "On signal loss"
@@ -5518,7 +5600,7 @@ msgstr "Part target (ms)"
 msgid "Pass through the host render node and add the container user to the group that owns it. The render group id varies by host — look it up with <0>getent group render</0>."
 msgstr "Pass through the host render node and add the container user to the group that owns it. The render group id varies by host — look it up with <0>getent group render</0>."
 
-#: src/events/SourceEventsButton.tsx:23
+#: src/events/SourceEventsButton.tsx:24
 msgid "Past expected return (end unconfirmed)"
 msgstr "Past expected return (end unconfirmed)"
 
@@ -5644,7 +5726,7 @@ msgstr "Pre-encode canvas approximation"
 msgid "Present only in the untrusted discovery inventory — not a device yet. Adoption is always an explicit operator action."
 msgstr "Present only in the untrusted discovery inventory — not a device yet. Adoption is always an explicit operator action."
 
-#: src/events/SourceEventsButton.tsx:105
+#: src/events/SourceEventsButton.tsx:106
 msgid "Presentation timing is unavailable or stale. Timing is uncertain."
 msgstr "Presentation timing is unavailable or stale. Timing is uncertain."
 
@@ -5778,7 +5860,7 @@ msgstr "Program-mix changes (on the program mix, gain, mute) apply to the runnin
 msgid "Promote this ephemeral session to a permanent managed Cast device."
 msgstr "Promote this ephemeral session to a permanent managed Cast device."
 
-#: src/events/SourceEventsButton.tsx:35
+#: src/events/SourceEventsButton.tsx:36
 msgid "Provenance"
 msgstr "Provenance"
 
@@ -5862,13 +5944,9 @@ msgstr "Reachable. DEGRADED means the device itself reports a fault — a stalle
 msgid "Read the in-app documentation"
 msgstr "Read the in-app documentation"
 
-#: src/events/SourceEventsButton.tsx:133
-msgid "Read-only server snapshot, refreshed every second while open. Automation (if configured) acts separately and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time."
-msgstr "Read-only server snapshot, refreshed every second while open. Automation (if configured) acts separately and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time."
-
-#: src/events/SourceEventsButton.tsx:70
-#~ msgid "Read-only server snapshot, refreshed every second while open. No automation is armed. Timing uses the source presentation clock, not browser receipt time."
-#~ msgstr "Read-only server snapshot, refreshed every second while open. No automation is armed. Timing uses the source presentation clock, not browser receipt time."
+#: src/events/SourceEventsButton.tsx:135
+msgid "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time."
+msgstr "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time."
 
 #: src/docs/registry.ts:208
 #: src/pages/docs/ApiPage.tsx:96
@@ -6023,6 +6101,10 @@ msgstr "Remove route {row}"
 msgid "Remove row"
 msgstr "Remove row"
 
+#: src/events/AutomationPanel.tsx:100
+msgid "Remove rule"
+msgstr "Remove rule"
+
 #: src/pages/DeviceDetailPage.tsx:865
 msgid "removed from the registry"
 msgstr "removed from the registry"
@@ -6071,6 +6153,14 @@ msgstr "Replace cells"
 #: src/layout/components/LayoutEditor.tsx:410
 msgid "Replace the current cells?"
 msgstr "Replace the current cells?"
+
+#: src/events/AutomationPanel.tsx:77
+msgid "Replacement"
+msgstr "Replacement"
+
+#: src/events/AutomationPanel.tsx:95
+msgid "Replacement is another source id, or \"bars\" / \"bars_tone\". Bars uses your first configured Bars source; \"bars_tone\" also routes its 1 kHz line-up tone onto this source's program audio. Add a Bars source on the Sources page first if you have none."
+msgstr "Replacement is another source id, or \"bars\" / \"bars_tone\". Bars uses your first configured Bars source; \"bars_tone\" also routes its 1 kHz line-up tone onto this source's program audio. Add a Bars source on the Sources page first if you have none."
 
 #: src/pages/SupportPage.tsx:254
 msgid "Reply"
@@ -6142,6 +6232,18 @@ msgstr "REST conventions"
 #: src/pages/SettingsPage.tsx:112
 msgid "Restart pending:"
 msgstr "Restart pending:"
+
+#: src/events/AutomationPanel.tsx:92
+msgid "Restore at break end"
+msgstr "Restore at break end"
+
+#: src/events/AutomationPanel.tsx:138
+msgid "Restore now"
+msgstr "Restore now"
+
+#: src/events/AutomationPanel.tsx:27
+msgid "Restoring…"
+msgstr "Restoring…"
 
 #. placeholder {0}: accepted.note
 #: src/pages/DevicesPage.tsx:300
@@ -6247,6 +6349,10 @@ msgstr "RTSP transport"
 msgid "RTSP, NDI, SRT, RTMP, HLS, MPEG-TS, and files: how each carries video and which to use where."
 msgstr "RTSP, NDI, SRT, RTMP, HLS, MPEG-TS, and files: how each carries video and which to use where."
 
+#: src/events/AutomationPanel.tsx:142
+msgid "Rule"
+msgstr "Rule"
+
 #: src/pages/docs/ContainerPage.tsx:25
 msgid "Run Multiview with Docker — single container or the compose stack — with optional GPU access, persistent volumes, and healthchecks."
 msgstr "Run Multiview with Docker — single container or the compose stack — with optional GPU access, persistent volumes, and healthchecks."
@@ -6330,6 +6436,10 @@ msgstr "Save audio routing"
 msgid "Save layout"
 msgstr "Save layout"
 
+#: src/events/AutomationPanel.tsx:99
+msgid "Save rule"
+msgstr "Save rule"
+
 #: src/layout/components/GridLayoutEditor.tsx:288
 #: src/layout/components/LayoutEditor.tsx:208
 msgid "Save stores this layout for later use. Save & apply stores it, then asks the running engine to use it now. Saved layouts are not separate live renderers."
@@ -6381,7 +6491,7 @@ msgstr "Scan the canvas out to a local HDMI/DisplayPort screen by KMS <0>connect
 msgid "Scope"
 msgstr "Scope"
 
-#: src/events/SourceEventsButton.tsx:18
+#: src/events/SourceEventsButton.tsx:19
 msgid "SCTE-35 signalling"
 msgstr "SCTE-35 signalling"
 
@@ -6585,15 +6695,15 @@ msgstr "Source bound"
 msgid "Source connections are supervised. A stalled read times out rather than hanging forever; the supervisor then reconnects with exponential backoff (so a dead camera is not hammered) and keeps trying indefinitely — sources recover without operator action whenever the far end comes back. Mid-stream surprises that normally break players, like a camera changing resolution or a stream resetting its timestamps, are absorbed inside the tile: the decoder re-initializes behind the frame store while the compositor keeps drawing the last good frame."
 msgstr "Source connections are supervised. A stalled read times out rather than hanging forever; the supervisor then reconnects with exponential backoff (so a dead camera is not hammered) and keeps trying indefinitely — sources recover without operator action whenever the far end comes back. Mid-stream surprises that normally break players, like a camera changing resolution or a stream resetting its timestamps, are absorbed inside the tile: the decoder re-initializes behind the frame store while the compositor keeps drawing the last good frame."
 
-#: src/events/SourceEventsButton.tsx:98
+#: src/events/SourceEventsButton.tsx:99
 msgid "Source event service is unavailable."
 msgstr "Source event service is unavailable."
 
-#: src/events/SourceEventsButton.tsx:132
+#: src/events/SourceEventsButton.tsx:134
 msgid "Source events"
 msgstr "Source events"
 
-#: src/events/SourceEventsButton.tsx:99
+#: src/events/SourceEventsButton.tsx:100
 msgid "Source events could not be read."
 msgstr "Source events could not be read."
 
@@ -6845,7 +6955,7 @@ msgstr "Subtitle track (id / language)"
 msgid "Successive frames differing by less than this per-mille of full-scale luma count as frozen."
 msgstr "Successive frames differing by less than this per-mille of full-scale luma count as frozen."
 
-#: src/events/SourceEventsButton.tsx:15
+#: src/events/SourceEventsButton.tsx:16
 msgid "Superseded"
 msgstr "Superseded"
 
@@ -6861,6 +6971,14 @@ msgstr "Supports casting a stream to media renderers on the network (ad-hoc, bes
 #: src/pages/docs/DevicesHelpPage.tsx:105
 msgid "Supports ZowieBox-class encoder/decoder appliances: probing, encoder/decoder mode convergence, stream enumeration for source binding, decode-slot binding for outputs, reboot, and temperature. Sync is bounded-skew only (see the sync guide)."
 msgstr "Supports ZowieBox-class encoder/decoder appliances: probing, encoder/decoder mode convergence, stream enumeration for source binding, decode-slot binding for outputs, reboot, and temperature. Sync is bounded-skew only (see the sync guide)."
+
+#: src/events/AutomationPanel.tsx:75
+msgid "Swap cell(s) and program audio"
+msgstr "Swap cell(s) and program audio"
+
+#: src/events/AutomationPanel.tsx:74
+msgid "Swap the cell(s) showing this source"
+msgstr "Swap the cell(s) showing this source"
 
 #: src/pages/SettingsPage.tsx:175
 msgid "Switch the interface language and text direction."
@@ -7016,19 +7134,20 @@ msgstr "Teletext page"
 msgid "Temperature"
 msgstr "Temperature"
 
-#: src/events/SourceEventsButton.tsx:32
+#: src/events/AutomationPanel.tsx:29
+#: src/events/SourceEventsButton.tsx:33
 msgid "Test"
 msgstr "Test"
 
-#: src/events/SourceEventsButton.tsx:60
+#: src/events/SourceEventsButton.tsx:61
 msgid "Test aid (admin only) — not live evidence"
 msgstr "Test aid (admin only) — not live evidence"
 
-#: src/events/SourceEventsButton.tsx:86
+#: src/events/SourceEventsButton.tsx:87
 msgid "Test event injection failed."
 msgstr "Test event injection failed."
 
-#: src/events/SourceEventsButton.tsx:84
+#: src/events/SourceEventsButton.tsx:85
 msgid "Test injection is unavailable (no active generation for this source, or the queue is full)."
 msgstr "Test injection is unavailable (no active generation for this source, or the queue is full)."
 
@@ -7606,7 +7725,7 @@ msgstr "This requires licence-server connectivity (not yet wired in this build).
 msgid "This screen is part of an upcoming milestone."
 msgstr "This screen is part of an upcoming milestone."
 
-#: src/events/SourceEventsButton.tsx:85
+#: src/events/SourceEventsButton.tsx:86
 msgid "This source has never been active; connect it before injecting a test event."
 msgstr "This source has never been active; connect it before injecting a test event."
 
@@ -7614,7 +7733,7 @@ msgstr "This source has never been active; connect it before injecting a test ev
 msgid "This source is not part of the running engine, so it has no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart."
 msgstr "This source is not part of the running engine, so it has no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart."
 
-#: src/events/SourceEventsButton.tsx:97
+#: src/events/SourceEventsButton.tsx:98
 msgid "This source was not found."
 msgstr "This source was not found."
 
@@ -7667,7 +7786,7 @@ msgstr "Time"
 msgid "Time of day (recurring)"
 msgstr "Time of day (recurring)"
 
-#: src/events/SourceEventsButton.tsx:18
+#: src/events/SourceEventsButton.tsx:19
 msgid "Timed ID3"
 msgstr "Timed ID3"
 
@@ -7783,7 +7902,7 @@ msgstr "UMD (Under-Monitor Display)"
 msgid "Unacknowledged"
 msgstr "Unacknowledged"
 
-#: src/events/SourceEventsButton.tsx:15
+#: src/events/SourceEventsButton.tsx:16
 msgid "Uncertain"
 msgstr "Uncertain"
 
@@ -7827,7 +7946,7 @@ msgstr "Unreachable"
 msgid "UNREACHABLE"
 msgstr "UNREACHABLE"
 
-#: src/events/SourceEventsButton.tsx:22
+#: src/events/SourceEventsButton.tsx:23
 msgid "Until start"
 msgstr "Until start"
 
@@ -7839,7 +7958,7 @@ msgstr "unverified"
 msgid "unverified — supply the URL yourself"
 msgstr "unverified — supply the URL yourself"
 
-#: src/events/SourceEventsButton.tsx:14
+#: src/events/SourceEventsButton.tsx:15
 msgid "Upcoming"
 msgstr "Upcoming"
 
@@ -7892,7 +8011,7 @@ msgstr "Vamping"
 msgid "Vendor decoders (ZowieBox-class)"
 msgstr "Vendor decoders (ZowieBox-class)"
 
-#: src/events/SourceEventsButton.tsx:19
+#: src/events/SourceEventsButton.tsx:20
 msgid "Vendor marker (unverified presence only)"
 msgstr "Vendor marker (unverified presence only)"
 
@@ -8042,9 +8161,17 @@ msgstr "Watch / live / channel URL"
 msgid "Watch program"
 msgstr "Watch program"
 
+#: src/events/AutomationPanel.tsx:85
+msgid "Watchdog: restore after (seconds)"
+msgstr "Watchdog: restore after (seconds)"
+
 #: src/pages/SettingsPage.tsx:85
 msgid "Watching"
 msgstr "Watching"
+
+#: src/events/AutomationPanel.tsx:87
+msgid "Webhook URL (optional, http://)"
+msgstr "Webhook URL (optional, http://)"
 
 #: src/pages/docs/concepts/TransportsPage.tsx:317
 msgid "WebRTC (WHIP / WHEP)"
@@ -8255,9 +8382,13 @@ msgstr "Yes"
 msgid "You can also run the binary directly against a config file with <0>multiview run path/to/multiview.toml</0>. See the sections below for the container, compose, config, and API details."
 msgstr "You can also run the binary directly against a config file with <0>multiview run path/to/multiview.toml</0>. See the sections below for the container, compose, config, and API details."
 
-#: src/events/SourceEventsButton.tsx:96
+#: src/events/SourceEventsButton.tsx:97
 msgid "You do not have permission to read this source's events."
 msgstr "You do not have permission to read this source's events."
+
+#: src/events/AutomationPanel.tsx:113
+msgid "You do not have permission to view this source's automation."
+msgstr "You do not have permission to view this source's automation."
 
 #: src/components/account/chrome.tsx:110
 msgid "You have remote actions awaiting review."
