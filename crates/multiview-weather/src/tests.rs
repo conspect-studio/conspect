@@ -49,6 +49,121 @@ fn invalid_numeric_time_dtd_and_malformed_xml_are_rejected() {
 }
 
 #[test]
+fn observation_local_utc_instants_must_match() {
+    let bad = OBS.replace("2026-01-01T11:00:00+11:00", "2026-01-01T11:00:00+10:00");
+    assert!(matches!(
+        parse_observations(bad.as_bytes()),
+        Err(ParseError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn observation_categorical_and_qualified_values_are_preserved() {
+    let xml = OBS.replace(
+        "<element type=\"air_temperature\" units=\"Celsius\">22.6</element>",
+        "<element type=\"air_temperature\" units=\"Celsius\">22.6</element><element type=\"weather\">Fine</element><element type=\"sea_height\" units=\"m\">&lt;0.5</element><element type=\"unknown_field\">opaque</element><element type=\"rainfall\" units=\"mm\"></element>",
+    );
+    let p = parse_observations(xml.as_bytes()).unwrap();
+    let values = &p.stations[0].periods[0].elements;
+    assert_eq!(values[1].value.as_deref(), Some("Fine"));
+    assert_eq!(values[2].value.as_deref(), Some("<0.5"));
+    assert_eq!(values[3].value.as_deref(), Some("opaque"));
+    assert_eq!(values[4].value, None);
+}
+
+#[test]
+fn forecast_local_utc_instants_must_match() {
+    let bad = FORECAST.replace("2026-01-01T10:00:00+11:00", "2026-01-01T10:00:00+10:00");
+    assert!(matches!(
+        parse_forecast(bad.as_bytes()),
+        Err(ParseError::InvalidValue { .. })
+    ));
+    let parsed = parse_forecast(FORECAST.as_bytes()).unwrap();
+    assert_eq!(
+        parsed.areas[0].periods[0].temperature(),
+        Some(("Celsius", 25.0))
+    );
+}
+
+#[test]
+fn documented_regional_product_ids_are_accepted_and_wrong_kind_rejected() {
+    for id in [
+        "IDV10753", "IDQ11295", "IDS10044", "IDW14199", "IDT16710", "IDD10207",
+    ] {
+        let xml = FORECAST.replace("IDN11060", id);
+        assert_eq!(parse_forecast(xml.as_bytes()).unwrap().product_id, id);
+    }
+    for id in [
+        "IDV60920", "IDQ60920", "IDS60920", "IDW60920", "IDT60920", "IDD60920",
+    ] {
+        let xml = OBS.replace("IDN60920", id);
+        assert_eq!(
+            parse_observations(xml.as_bytes())
+                .unwrap()
+                .provenance
+                .product_id,
+            id
+        );
+    }
+    assert!(parse_observations(FORECAST.as_bytes()).is_err());
+}
+
+#[test]
+fn known_numeric_observations_reject_non_numeric_but_allow_zero() {
+    let zero = OBS.replace(">22.6</element>", ">0</element>");
+    let parsed = parse_observations(zero.as_bytes()).unwrap();
+    assert_eq!(
+        parsed.stations[0].periods[0].elements[0].value.as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        parsed.stations[0].periods[0].temperature(),
+        Some(("Celsius", 0.0))
+    );
+    let missing = OBS.replace(
+        "<element type=\"air_temperature\" units=\"Celsius\">22.6</element>",
+        "<element type=\"air_temperature\" units=\"Celsius\"></element>",
+    );
+    assert_eq!(
+        parse_observations(missing.as_bytes()).unwrap().stations[0].periods[0].temperature(),
+        None
+    );
+    let invalid = OBS.replace(">22.6</element>", ">wat</element>");
+    assert!(matches!(
+        parse_observations(invalid.as_bytes()),
+        Err(ParseError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn spoofed_root_element_is_rejected() {
+    let bad = FORECAST.replacen("<product", "<spoofed", 1);
+    let bad = bad.replacen("</product>", "</spoofed>", 1);
+    assert!(matches!(
+        parse_forecast(bad.as_bytes()),
+        Err(ParseError::Product("unexpected root element"))
+    ));
+}
+
+#[test]
+fn duplicate_measurement_elements_are_all_preserved_first_wins() {
+    let xml = OBS.replace(
+        "<element type=\"air_temperature\" units=\"Celsius\">22.6</element>",
+        "<element type=\"air_temperature\" units=\"Celsius\">22.6</element><element type=\"air_temperature\" units=\"Celsius\">99.9</element>",
+    );
+    let p = parse_observations(xml.as_bytes()).unwrap();
+    let elements = &p.stations[0].periods[0].elements;
+    assert_eq!(elements.len(), 2);
+    assert_eq!(elements[0].value.as_deref(), Some("22.6"));
+    assert_eq!(elements[1].value.as_deref(), Some("99.9"));
+    // measurement() documents first-match-wins when a kind is duplicated.
+    assert_eq!(
+        p.stations[0].periods[0].temperature(),
+        Some(("Celsius", 22.6))
+    );
+}
+
+#[test]
 fn parser_enforces_each_resource_limit() {
     for limits in [
         crate::Limits {
