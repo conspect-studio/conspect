@@ -10,7 +10,13 @@
 //!
 //! Verified transport limits (ADR-R005 rationale):
 //! - **MPEG-TS / SRT / RTSP** carry *N* simultaneous tracks (PIDs / subsessions).
-//! - **HLS / DASH** are **select-one**: one rendition is delivered at a time.
+//! - **HLS / DASH** support **select-one** as a format, but that is not a
+//!   runtime availability signal. The HLS packager publishes `master.m3u8`
+//!   only when video bitrate metadata permits a truthful `BANDWIDTH` tag and
+//!   all referenced media manifests exist. A client must verify the published
+//!   master before it offers audio selection; the legacy `index.m3u8` remains
+//!   playable when the master is absent. Do not infer an active audio menu from
+//!   this static capability matrix.
 //! - **RTMP** is capability-gated: the conservative default carries only the
 //!   mixed program bus; Enhanced-RTMP-v2 multitrack is negotiated per endpoint
 //!   (not assumed here).

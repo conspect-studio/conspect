@@ -72,11 +72,12 @@ pub fn spawn_unified_webrtc(
     // The concrete host candidate (the unspecified bind addr is not a valid str0m
     // candidate) for the preview egress; `None` ⇒ a socket-free egress (host comes
     // from advertised addresses on each session anyway).
-    let host = builder
+    let hosts = builder
         .host_candidates()
         .iter()
-        .find(|a| !a.ip().is_unspecified())
-        .copied();
+        .filter(|a| !a.ip().is_unspecified())
+        .copied()
+        .collect();
 
     // 1. WHIP ingest lane (only when there are `webrtc` sources).
     let want_ingest = crate::webrtc_ingest::has_webrtc_sources(config);
@@ -104,10 +105,7 @@ pub fn spawn_unified_webrtc(
 
     // 3. The native preview egress (always wired when the socket bound — preview is
     //    the always-available WebRTC surface).
-    let egress = Arc::new(match host {
-        Some(addr) => WhepEgress::with_host_candidate(addr),
-        None => WhepEgress::new(),
-    });
+    let egress = Arc::new(WhepEgress::with_host_candidates(hosts));
     let preview_provider = crate::whep::CliWhepProvider::for_unified(
         Arc::clone(&egress),
         program_slot,

@@ -24,7 +24,70 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use multiview_audio::store::AudioStore;
+use multiview_audio::store::{AudioStore, PcmMeasurement};
+
+#[test]
+fn measured_pcm_requires_full_coverage_and_preserves_cursor() {
+    let store = AudioStore::timeline(stereo(), 16);
+    store.seek_to(123);
+    assert_eq!(store.measure_pcm(0, 4), PcmMeasurement::Unknown);
+    let quiet = AudioBlock::silence(stereo(), 4);
+    store.publish_at(0, &quiet).unwrap();
+    assert_eq!(
+        store.measure_pcm(0, 4),
+        PcmMeasurement::Measured {
+            rms_dbfs: f64::NEG_INFINITY,
+            peak_dbfs: f64::NEG_INFINITY
+        }
+    );
+    assert_eq!(store.measure_pcm(2, 4), PcmMeasurement::Unknown);
+    let loud = AudioBlock::from_interleaved(stereo(), vec![0.5; 4 * 2]).unwrap();
+    store.publish_at(6, &loud).unwrap();
+    assert_eq!(
+        store.measure_pcm(0, 10),
+        PcmMeasurement::Unknown,
+        "zero-filled hole is not covered PCM"
+    );
+    assert!(
+        matches!(store.measure_pcm(6, 4), PcmMeasurement::Measured { rms_dbfs, peak_dbfs } if rms_dbfs > -10.0 && peak_dbfs > -10.0)
+    );
+    store.publish_at(4, &quiet).unwrap();
+    assert!(matches!(
+        store.measure_pcm(0, 10),
+        PcmMeasurement::Measured { .. }
+    ));
+    assert_eq!(
+        store.measure_pcm(0, 17),
+        PcmMeasurement::Unknown,
+        "measurement has a hard capacity bound"
+    );
+    assert_eq!(
+        store.read_cursor(),
+        123,
+        "observation must not consume source PCM"
+    );
+}
+
+#[test]
+fn measured_pcm_reports_sparse_peak_independently_of_rms() {
+    let store = AudioStore::timeline(stereo(), 1920);
+    let mut samples = vec![0.0; 1920 * 2];
+    samples[0] = 0.01;
+    store
+        .publish_at(0, &AudioBlock::from_interleaved(stereo(), samples).unwrap())
+        .unwrap();
+    let PcmMeasurement::Measured {
+        rms_dbfs,
+        peak_dbfs,
+    } = store.measure_pcm(0, 1920)
+    else {
+        panic!("published PCM must be fully covered");
+    };
+    assert!((peak_dbfs + 40.0).abs() < 0.01);
+    assert!(rms_dbfs < -70.0);
+    assert_eq!(store.measure_pcm(0, 1921), PcmMeasurement::Unknown);
+}
+
 use multiview_audio::{AudioBlock, AudioFormat, ChannelLayout};
 
 const FS: u32 = 48_000;

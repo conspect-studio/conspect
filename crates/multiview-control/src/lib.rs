@@ -52,8 +52,10 @@ pub mod config_watch;
 pub mod cors;
 pub mod devices;
 pub mod error;
+pub mod event_automation;
 pub mod is07;
 pub mod jwt;
+pub mod layout_projection;
 /// Management-plane rate limiting (SEC-14): the keyed token-bucket + the
 /// request-concurrency + rate middleware backing the control-plane `DoS` floor.
 pub(crate) mod limits;
@@ -90,8 +92,10 @@ pub mod watch_status;
 pub mod whep_output;
 pub mod whip;
 
+pub mod source_events;
 #[cfg(feature = "embed-web")]
 pub mod spa;
+pub use source_events::{SharedSourceEvents, SourceEventProvider, SourceEventsDto};
 
 #[cfg(feature = "openapi")]
 pub mod openapi;
@@ -138,7 +142,7 @@ pub use is07::{
     Is07EventType, Is07Message, Is07Payload, Is07Subscription, Is07Timing,
 };
 pub use jwt::{JwtError, JwtValidator, SignatureAlgorithm};
-pub use live_apply::{LiveApplyCaps, OverlayLiveCapability};
+pub use live_apply::{AudioRoutingLiveCapability, LiveApplyCaps, OverlayLiveCapability};
 pub use nmos::is04::{Device, MediaFormat, Node, Receiver, Registration, ResourceCore, Sender};
 pub use nmos::is05::{
     parse_sdp_transport, Activation, ActivationMode, ConnectionRequest, ConnectionState,

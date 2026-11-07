@@ -69,7 +69,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg git \
       build-essential clang llvm pkg-config nasm yasm make \
-      libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev \
+      libopus-dev libsrt-openssl-dev libgnutls28-dev libdrm-dev libva-dev zlib1g-dev \
  && if [ "${FF_HWACCEL}" = "vaapi" ] && [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       apt-get install -y --no-install-recommends libvpl-dev; \
     fi \

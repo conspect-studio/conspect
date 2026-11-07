@@ -2952,6 +2952,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "ffmpeg-next",
+ "flate2",
  "getrandom 0.4.3",
  "multiview-audio",
  "multiview-compositor",
@@ -2984,6 +2985,8 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "ureq",
+ "url",
  "wgpu",
 ]
 
@@ -3336,6 +3339,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "multiview-weather"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "quick-xml",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4013,6 +4025,17 @@ name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "encoding_rs",
+ "memchr",
+ "serde",
+]
 
 [[package]]
 name = "quinn"

@@ -523,6 +523,7 @@ fn conflation_policy_is_per_event_type_on_devices() {
     // same per-event predicate.
     assert!(Event::AudioMeter(AudioMeter {
         track: 0,
+        input_id: None,
         peak_db: vec![-6.0],
         rms_db: vec![-12.0],
         clip: false,

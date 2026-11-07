@@ -35,6 +35,12 @@ export interface AudioRoutingWithEtag {
   readonly state: AudioRoutingState;
   /** The document `ETag` for the next conditional PUT, when carried. */
   readonly etag: string | undefined;
+  /**
+   * How a PUT took effect (`X-Multiview-Apply`): `live` when the running
+   * program bus applied it, `restart` when it needs a restart. `undefined` on
+   * GET or when the server sent no header.
+   */
+  readonly apply?: 'live' | 'restart';
 }
 
 /** Connection options shared by both calls. */
@@ -149,7 +155,14 @@ async function readState(response: Response): Promise<AudioRoutingWithEtag> {
     throw new ApiError('The server returned an unexpected audio-routing document.');
   }
   const etag = response.headers.get('ETag');
-  return { state: body, etag: etag ?? undefined };
+  const applyHeader = response.headers.get('X-Multiview-Apply');
+  const apply =
+    applyHeader === 'live' || applyHeader === 'restart' ? applyHeader : undefined;
+  return {
+    state: body,
+    etag: etag ?? undefined,
+    ...(apply !== undefined ? { apply } : {}),
+  };
 }
 
 /** Fetch the singleton document (404-free) with its `ETag`. */

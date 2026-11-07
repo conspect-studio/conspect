@@ -177,14 +177,12 @@ segment_ms = 1000
 }
 
 /// A native caption cue store carrying one text cue over `[start, end)` seconds.
-fn caption_store(start_s: f64, end_s: f64, line: &str) -> Arc<CueStore> {
-    let store = Arc::new(CueStore::new());
+fn publish_cue(store: &CueStore, start_s: f64, end_s: f64, line: &str) {
     let start = MediaTime::from_nanos((start_s * 1e9) as i64);
     let end = MediaTime::from_nanos((end_s * 1e9) as i64);
     let cue =
         CaptionCue::try_text(start, end, vec![line.to_owned()], None).expect("valid text cue");
     store.publish(start, end, cue);
-    store
 }
 
 /// Build a pipeline for `name`, returning it plus its `program.ts` path.
@@ -228,7 +226,8 @@ async fn run_renders_the_subtitle_layers_active_cue() {
 
     // Run A: a caption store attached to the displayed source, active the whole run.
     let (mut with_caps, prog_with) = build_pipeline(dir.path(), "with_caps");
-    with_caps.attach_caption_store("in_a", caption_store(0.0, 2.0, "MULTIVIEW ROUTE TEST"));
+    let store = with_caps.attach_caption_store("in_a", Arc::new(CueStore::new()));
+    publish_cue(&store, 0.0, 2.0, "MULTIVIEW ROUTE TEST");
     let report = with_caps
         .run_for(TICKS)
         .await
@@ -285,7 +284,8 @@ async fn a_subtitle_repoint_takes_effect_in_the_running_pipeline() {
     // The displayed source carries a wide cue (active the whole run). A SPARE
     // source carries NO active cue. Re-pointing the displayed layer to the spare
     // therefore clears the band.
-    pipeline.attach_caption_store("in_a", caption_store(0.0, 8.0, "BEFORE REPOINT"));
+    let store = pipeline.attach_caption_store("in_a", Arc::new(CueStore::new()));
+    publish_cue(&store, 0.0, 8.0, "BEFORE REPOINT");
     pipeline.attach_caption_store("spare", Arc::new(CueStore::new()));
 
     // A clone of the pipeline's shared re-point slot — readable concurrently with

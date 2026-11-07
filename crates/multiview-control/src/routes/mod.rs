@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
 use crate::command::{Command, OperationId};
-use crate::concurrency::{IdempotencyKey, IfMatch, Reservation};
+use crate::concurrency::{IdempotencyKey, IfMatch, Reservation, Version};
 use crate::error::{ControlError, ControlResult};
 use crate::problem::Problem;
 use crate::repository::{Layout, LayoutInput, VersionedLayout, LAYOUT_KIND};
@@ -42,6 +42,7 @@ pub mod preview;
 pub mod probes;
 pub mod routing;
 pub mod salvos;
+pub mod source_events;
 pub mod sources;
 pub mod support;
 pub mod sync_groups;
@@ -126,6 +127,39 @@ fn layout_response(status: StatusCode, versioned: &VersionedLayout) -> Response 
     response
 }
 
+/// Read the accepted layout library, not its replaceable SQLite projection.
+/// Review R3-03: the in-memory accepted snapshot, not a fresh
+/// `desired.json` read-parse-validate on every layout list/GET.
+fn authoritative_layouts(
+    state: &AppState,
+) -> ControlResult<Option<std::sync::Arc<crate::boot_model::DesiredState>>> {
+    let Some(model) = &state.boot_model else {
+        return Ok(None);
+    };
+    model.accepted().map_err(ControlError::Repository)
+}
+
+/// Return a layout with the envelope-owned version. Older envelopes without
+/// explicit counters use version one until their next accepted mutation.
+fn authoritative_layout(
+    desired: &crate::boot_model::DesiredState,
+    id: &str,
+) -> ControlResult<VersionedLayout> {
+    let layout = desired
+        .layouts
+        .iter()
+        .find(|layout| layout.id == id)
+        .cloned()
+        .ok_or_else(|| ControlError::NotFound {
+            kind: LAYOUT_KIND,
+            id: id.to_owned(),
+        })?;
+    Ok(VersionedLayout {
+        version: Version::new(desired.layout_versions.get(id).copied().unwrap_or(1)),
+        layout,
+    })
+}
+
 /// `GET /api/v1/layouts` — list all layouts (role: read).
 #[cfg_attr(
     feature = "openapi",
@@ -150,13 +184,18 @@ async fn list_layouts(
     // rows outside the allowlist — exactly as `list_devices` does. A layout
     // carries no embedded device_ref, so the row filter alone is complete; it is
     // a no-op for an unscoped principal.
-    let layouts = state
-        .repository
-        .list_layouts()?
-        .into_iter()
-        .map(|v| v.layout)
-        .filter(|layout| crate::auth::authorize_object(&principal, &layout.id).is_ok())
-        .collect();
+    let mut layouts = if let Some(desired) = authoritative_layouts(&state)? {
+        desired.layouts.clone()
+    } else {
+        state
+            .repository
+            .list_layouts()?
+            .into_iter()
+            .map(|v| v.layout)
+            .collect()
+    };
+    layouts.retain(|layout| crate::auth::authorize_object(&principal, &layout.id).is_ok());
+    layouts.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Json(layouts))
 }
 
@@ -183,7 +222,11 @@ async fn get_layout(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.repository.get_layout(&id)?;
+    let versioned = if let Some(desired) = authoritative_layouts(&state)? {
+        authoritative_layout(&desired, &id)?
+    } else {
+        state.repository.get_layout(&id)?
+    };
     Ok(layout_response(StatusCode::OK, &versioned))
 }
 
@@ -211,7 +254,36 @@ async fn create_layout(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.repository.create_layout(&id, input)?;
+    let _mutation = state.lock_config_mutation().await;
+    if state.boot_model.is_none() {
+        let versioned = state.repository.create_layout(&id, input)?;
+        state.audit(
+            &principal.key_id,
+            AuditAction::Create,
+            LAYOUT_KIND,
+            &id,
+            Some(versioned.layout.body.clone()),
+        );
+        return Ok(layout_response(StatusCode::CREATED, &versioned));
+    }
+    let mut layouts = crate::boot_model::layout_library(&state)?;
+    if layouts.iter().any(|layout| layout.id == id) {
+        return Err(ControlError::Validation(format!(
+            "layout {id:?} already exists"
+        )));
+    }
+    layouts.push(Layout {
+        id: id.clone(),
+        name: input.name,
+        body: input.body,
+    });
+    let config: multiview_config::MultiviewConfig =
+        serde_json::from_value(crate::boot_model::current_desired_config(&state)?)
+            .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
+    crate::boot_model::commit_desired(&state, config, layouts).await?;
+    let desired = authoritative_layouts(&state)?
+        .ok_or_else(|| ControlError::Repository("desired envelope was not published".into()))?;
+    let versioned = authoritative_layout(&desired, &id)?;
     // Audit only after the mutation succeeded (who/what/when).
     state.audit(
         &principal.key_id,
@@ -252,9 +324,35 @@ async fn update_layout(
     crate::auth::authorize_object(&principal, &id)?;
     // Enforce the optimistic-concurrency precondition against the live version
     // before mutating.
-    let current = state.repository.get_layout(&id)?;
+    let _mutation = state.lock_config_mutation().await;
+    let desired = authoritative_layouts(&state)?;
+    let current = if let Some(desired) = &desired {
+        authoritative_layout(desired, &id)?
+    } else {
+        state.repository.get_layout(&id)?
+    };
     if_match.require(LAYOUT_KIND, &id, current.version)?;
-    let versioned = state.repository.update_layout(&id, input)?;
+    let versioned = if state.boot_model.is_some() {
+        let mut layouts = crate::boot_model::layout_library(&state)?;
+        let layout = layouts
+            .iter_mut()
+            .find(|layout| layout.id == id)
+            .ok_or_else(|| ControlError::NotFound {
+                kind: LAYOUT_KIND,
+                id: id.clone(),
+            })?;
+        layout.name = input.name;
+        layout.body = input.body;
+        let config: multiview_config::MultiviewConfig =
+            serde_json::from_value(crate::boot_model::current_desired_config(&state)?)
+                .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
+        crate::boot_model::commit_desired(&state, config, layouts).await?;
+        let desired = authoritative_layouts(&state)?
+            .ok_or_else(|| ControlError::Repository("desired envelope was not published".into()))?;
+        authoritative_layout(&desired, &id)?
+    } else {
+        state.repository.update_layout(&id, input)?
+    };
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -290,9 +388,39 @@ async fn delete_layout(
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let current = state.repository.get_layout(&id)?;
+    let _mutation = state.lock_config_mutation().await;
+    let desired = authoritative_layouts(&state)?;
+    let current = if let Some(desired) = &desired {
+        authoritative_layout(desired, &id)?
+    } else {
+        state.repository.get_layout(&id)?
+    };
     if_match.require(LAYOUT_KIND, &id, current.version)?;
-    state.repository.delete_layout(&id)?;
+    if state.boot_model.is_some() {
+        let mut layouts = crate::boot_model::layout_library(&state)?;
+        let config: multiview_config::MultiviewConfig =
+            serde_json::from_value(crate::boot_model::current_desired_config(&state)?)
+                .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
+        let selected = crate::boot_model::selected_layout_id(&state, &config, &layouts)?;
+        layouts.retain(|layout| layout.id != id);
+        if selected == id {
+            let replacement = layouts.first().ok_or_else(|| {
+                ControlError::Validation("cannot delete the last selected layout".into())
+            })?;
+            crate::boot_model::commit_desired_with_selection(
+                &state,
+                config,
+                layouts.clone(),
+                replacement.id.clone(),
+            )
+            .await?;
+        } else {
+            crate::boot_model::commit_desired_with_selection(&state, config, layouts, selected)
+                .await?;
+        }
+    } else {
+        state.repository.delete_layout(&id)?;
+    }
     state.audit(
         &principal.key_id,
         AuditAction::Delete,
@@ -590,6 +718,32 @@ async fn cmd_swap(
     Ok(response)
 }
 
+/// Fold one stored-layout key into the desired config document.
+///
+/// A stored layout's `canvas` carries only the geometry it authored (size and
+/// rate). Fields it omits, such as `pixel_format`, `background` and `color`,
+/// keep their running values instead of failing the whole apply.
+fn merge_selected_layout_key(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    if key == "canvas" {
+        if let (Some(current), Some(stored)) = (
+            object
+                .get_mut(key)
+                .and_then(serde_json::Value::as_object_mut),
+            value.as_object(),
+        ) {
+            for (field, field_value) in stored {
+                current.insert(field.clone(), field_value.clone());
+            }
+            return;
+        }
+    }
+    object.insert(key.into(), value.clone());
+}
+
 /// `POST /api/v1/commands/apply-layout` — apply a **stored** layout to the
 /// running multiview, live, at the next frame boundary (role: write;
 /// per-object authz; 202) — ADR-W019, invariant #11 Class-1.
@@ -625,6 +779,10 @@ async fn cmd_swap(
         ),
     )
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "reservation, validation and enqueue form an ordered control-plane transaction"
+)]
 pub(crate) async fn cmd_apply_layout(
     State(state): State<AppState>,
     principal: Principal,
@@ -643,55 +801,109 @@ pub(crate) async fn cmd_apply_layout(
     // `ApplyLayout` lands (a shed leaves the snapshot at the prior adopted
     // layout, so a shed apply-layout never leaks into `active.toml`).
     let _mutation = state.lock_config_mutation().await;
-    let adopted_body: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
-    // Resolution runs INSIDE the fresh-reservation arm (pinned semantics,
-    // ADR-W019): a replayed Idempotency-Key answers from the reservation
-    // without re-resolving, and a refused resolve releases the key.
-    let mut body = submit_accepted_body(&state, &idem, |op| {
-        // Resolve + solve the STORED layout at request time: repository read +
-        // pure solve, both fine here and forbidden on the render thread.
-        // Every failure is a 422 problem BEFORE any 202 — a 202 is a promise.
-        let versioned = state
-            .repository
-            .get_layout(&req.layout)
-            .map_err(|e| match e {
-                ControlError::NotFound { .. } => ControlError::Validation(format!(
-                    "layout {:?} does not exist in the layouts library",
-                    req.layout
-                )),
-                other => other,
-            })?;
-        // The ONE resolve machinery (parse + solve + Class-1 pinned-canvas
-        // gate), shared with the config-file watcher (ADR-W019/W020). A `None`
-        // running canvas fails closed there.
+    // Reserve the idempotency key and a bounded engine slot before the disk
+    // commit. A full bus cannot create an unacknowledged accepted selection.
+    let op = match state.idempotency.reserve(idem.0.as_deref()) {
+        Reservation::Replay(op) => {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(AcceptedBody {
+                    operation_id: op.to_string(),
+                    kind: "replay".into(),
+                    applied_live: None,
+                    carried_only: None,
+                }),
+            )
+                .into_response());
+        }
+        Reservation::Fresh(op) => op,
+    };
+    let Ok(permit) = state.commands.try_reserve() else {
+        state.idempotency.release(idem.0.as_deref(), &op);
+        return Err(ControlError::EngineBusy);
+    };
+    // Resolve once, then persist before the reserved slot publishes its command.
+    // Release the idempotency reservation on every pre-submit refusal.
+    let prepared: ControlResult<_> = async {
+        // An unknown stored-layout id is a 422 problem before any 202 (ADR-W019).
+        let versioned = if let Some(desired) = authoritative_layouts(&state)? {
+            authoritative_layout(&desired, &req.layout)
+        } else {
+            state.repository.get_layout(&req.layout)
+        }
+        .map_err(|e| match e {
+            ControlError::NotFound { .. } => ControlError::Validation(format!(
+                "layout {:?} does not exist in the layouts library",
+                req.layout
+            )),
+            other => other,
+        })?;
         let resolved = crate::command::resolve_layout_document(
             &req.layout,
             &versioned.layout.body,
             state.running_canvas.as_ref(),
         )?;
-        // Capture the authored body so a LANDED apply can adopt its
-        // canvas/layout/cells into the snapshot (the resolved form is the
-        // engine's solved layout, not the authored config sections).
-        if let Ok(mut slot) = adopted_body.lock() {
-            *slot = Some(versioned.layout.body.clone());
+        if state.boot_model.is_some() {
+            let stored = &versioned;
+            let mut document = crate::boot_model::current_desired_config(&state)?;
+            let object = document
+                .as_object_mut()
+                .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?;
+            for key in ["canvas", "layout", "cells"] {
+                let value = stored.layout.body.get(key).ok_or_else(|| {
+                    ControlError::Validation(format!("selected layout has no {key}"))
+                })?;
+                merge_selected_layout_key(object, key, value);
+            }
+            let config: multiview_config::MultiviewConfig =
+                serde_path_to_error::deserialize(document).map_err(|e| {
+                    ControlError::Validation(format!(
+                        "selected config at `{}`: {}",
+                        e.path(),
+                        e.inner()
+                    ))
+                })?;
+            crate::boot_model::commit_desired_with_selection(
+                &state,
+                config,
+                crate::boot_model::layout_library(&state)?,
+                req.layout.clone(),
+            )
+            .await?;
         }
-        Ok(Command::ApplyLayout {
-            op,
-            layout: req.layout,
-            document: Some(Box::new(resolved)),
-        })
-    })?;
+        Ok((versioned, resolved))
+    }
+    .await;
+    let (versioned, resolved) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state.idempotency.release(idem.0.as_deref(), &op);
+            return Err(error);
+        }
+    };
+    let command = Command::ApplyLayout {
+        op: op.clone(),
+        layout: req.layout,
+        document: Some(Box::new(resolved)),
+    };
+    let corr_key = crate::realtime::CorrKey::for_command(&command);
+    permit.send(command);
+    if let Some(key) = corr_key {
+        state.corr.record(key, op.clone());
+    }
+    let mut body = AcceptedBody {
+        operation_id: op.to_string(),
+        kind: "apply_layout".into(),
+        applied_live: None,
+        carried_only: None,
+    };
     // A FRESH landed apply (not a replay) → adopt the layout into the snapshot
     // (MAJOR-B round 5). A shed never reaches here (`submit_accepted_body`
     // returns `Err(EngineBusy)`), so a shed apply-layout leaves the snapshot at
     // the prior adopted layout.
-    if body.kind != "replay" {
-        if let Some(model) = state.boot_model.as_ref() {
-            let captured = adopted_body.lock().ok().and_then(|mut s| s.take());
-            if let Some(layout_body) = captured {
-                adopt_layout_from_body(model, &layout_body);
-            }
-        }
+    if let Some(model) = state.boot_model.as_ref() {
+        model.select_layout(layout.clone());
+        adopt_layout_from_body(model, &versioned.layout.body);
     }
     // State honestly which per-cell property classes land on screen at the
     // frame boundary vs are carried-but-not-yet-rendered (ADR-W019). A replay
@@ -808,6 +1020,7 @@ fn resource_router() -> Router<AppState> {
         // Read-only input elementary-stream inventory (RT-3): every stream an
         // input offers, projected from the off-engine cached snapshot (inv #10).
         .route("/inputs/{id}/streams", get(inputs::get_input_streams))
+        .route("/inputs/{id}/events", get(source_events::get_source_events))
         // Outputs resource CRUD (managed sinks/servers), mirroring layouts.
         .route("/outputs", get(outputs::list_outputs))
         .route(

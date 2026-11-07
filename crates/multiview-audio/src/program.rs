@@ -99,6 +99,8 @@ impl SwitchTier {
 pub struct ProgramBus {
     mixer: Mixer,
     clock: SampleClock,
+    /// The output cadence the bus is paced by.
+    cadence: Rational,
     /// Per routed source: its mixer route point + the store the output clock
     /// pulls from. Shared (`Arc`) with the source's decode thread, which
     /// publishes into the same store.
@@ -119,6 +121,7 @@ impl ProgramBus {
         Self {
             mixer: Mixer::new(format),
             clock: SampleClock::new(format.sample_rate(), fps),
+            cadence: fps,
             routes: Vec::new(),
             fading_out: Vec::new(),
             format,
@@ -144,6 +147,17 @@ impl ProgramBus {
         self.mixer.route_to_program(point, program_gain);
         self.routes.push((point, store));
         point
+    }
+
+    /// Take a route off the bus (a live source removal): its mixer strip is
+    /// reclaimed (slot reused — invariant #9) and its store is never read
+    /// again. Returns `false` for an unknown/stale point. No I/O, cannot block.
+    pub fn remove_source(&mut self, point: RoutePoint) -> bool {
+        if !self.routes.iter().any(|(p, _)| *p == point) {
+            return false;
+        }
+        self.routes.retain(|(p, _)| *p != point);
+        self.mixer.remove_input(point)
     }
 
     /// Re-point an **existing** route point onto a different `Arc<AudioStore>`
@@ -270,6 +284,67 @@ impl ProgramBus {
         Ok(SwitchTier::ClickFree)
     }
 
+    /// Move a route's steady program gain to `gain` (linear) over `ramp_frames`
+    /// with a per-sample envelope — the click-free live re-gain (include/exclude,
+    /// `gain_db`, `mute` are all gain changes: every input rides the bus, an
+    /// unrouted one at zero gain).
+    ///
+    /// The ramp starts from the route's **current effective** gain (including any
+    /// in-flight ramp's position), so a re-gain issued mid-fade is continuous. The
+    /// mixer's envelope is bounded to `[0, 1]`, so the strip's base is set to the
+    /// larger endpoint and the envelope runs between the two ratios; on
+    /// completion the steady gain settles at exactly `gain`. `ramp_frames == 0`
+    /// (or an unchanged gain) is an immediate set. Does no I/O and cannot block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::UnknownInput`](crate::error::AudioError::UnknownInput)
+    /// if `point` is not a live route on this bus.
+    pub fn set_program_gain_ramped(
+        &mut self,
+        point: RoutePoint,
+        gain: f64,
+        ramp_frames: usize,
+    ) -> crate::error::Result<()> {
+        if !self.routes.iter().any(|(p, _)| *p == point) {
+            return Err(crate::error::AudioError::UnknownInput(point.index()));
+        }
+        let target = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
+        let base = self.mixer.program_gain(point).unwrap_or(0.0);
+        let current = match self.mixer.gain_ramp(point) {
+            Some(ramp) => base * f64::from(ramp.envelope_at(ramp.frames_done)),
+            None => base,
+        };
+        let hi = current.max(target);
+        if ramp_frames == 0 || hi <= 0.0 || (current - target).abs() < 1e-9 {
+            self.mixer.clear_gain_ramp(point);
+            self.mixer.route_to_program(point, target);
+            return Ok(());
+        }
+        self.mixer.route_to_program(point, hi);
+        self.mixer.set_gain_ramp(
+            point,
+            GainRamp {
+                from: current / hi,
+                to: target / hi,
+                frames_total: ramp_frames,
+                frames_done: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// The steady program gain of a route (the endpoint any in-flight ramp
+    /// settles at is applied on completion), or `None` for an unknown route.
+    #[must_use]
+    pub fn program_gain(&self, point: RoutePoint) -> Option<f64> {
+        let base = self.mixer.program_gain(point)?;
+        Some(match self.mixer.gain_ramp(point) {
+            Some(ramp) => base * f64::from(ramp.envelope_at(ramp.frames_total)),
+            None => base,
+        })
+    }
+
     /// The program-bus format.
     #[must_use]
     pub const fn format(&self) -> AudioFormat {
@@ -297,6 +372,22 @@ impl ProgramBus {
         self.mixer.live_input_count()
     }
 
+    /// The discrete (pre-mix, unaltered) block each routed source contributed to
+    /// the **last** mix, as `(source id, block)`, in route order. Read-only; the
+    /// per-input meter tap (AUD-8 / SW-14) reads this after each tick. Empty
+    /// before the first mix.
+    #[must_use]
+    pub fn input_tracks(&self) -> Vec<(&str, &AudioBlock)> {
+        self.routes
+            .iter()
+            .filter_map(|(point, _)| {
+                let id = self.mixer.input_id(*point)?;
+                let block = self.mixer.discrete_track(*point)?;
+                Some((id, block))
+            })
+            .collect()
+    }
+
     /// Mix one output tick of program audio.
     ///
     /// Advances the [`SampleClock`] by one tick to
@@ -307,8 +398,39 @@ impl ProgramBus {
     /// [`tick_to`](Self::tick_to) instead, so audio cannot drift from video
     /// (invariant #3).
     pub fn tick(&mut self) -> AudioBlock {
+        let start = self.clock_frame();
         let frames = self.clock.next_tick();
-        self.mix(frames)
+        self.mix(start, frames)
+    }
+
+    /// The output-timeline frame of output tick `tick` (`total_at(tick)`): where
+    /// the bus reads timeline stores for that tick.
+    #[must_use]
+    pub fn position_at(&self, tick: u64) -> i64 {
+        i64::try_from(self.clock.total_at(tick)).unwrap_or(i64::MAX)
+    }
+
+    /// The output cadence this bus is paced by.
+    #[must_use]
+    pub const fn cadence(&self) -> Rational {
+        self.cadence
+    }
+
+    /// The ids of the routed sources whose store is a timeline store (locked to
+    /// vision).
+    #[must_use]
+    pub fn timeline_source_ids(&self) -> Vec<String> {
+        self.routes
+            .iter()
+            .filter(|(_, store)| store.is_timeline())
+            .filter_map(|(point, _)| self.mixer.input_id(*point).map(str::to_owned))
+            .collect()
+    }
+
+    /// The bus's absolute sample position: the output-timeline frame the next
+    /// mixed sample belongs to (`total_at(ticks)`).
+    fn clock_frame(&self) -> i64 {
+        i64::try_from(self.clock.total_at(self.clock.tick_count())).unwrap_or(i64::MAX)
     }
 
     /// Mix program audio up to the absolute output **tick index** `target_tick`.
@@ -327,8 +449,9 @@ impl ProgramBus {
     /// `StreamItem`; combined with [`repoint`](Self::repoint)'s live-edge seek it
     /// keeps an audio breakaway lip-synced across overload gaps.
     pub fn tick_to(&mut self, target_tick: u64) -> AudioBlock {
+        let start = self.clock_frame();
         let frames = self.clock.advance_to(target_tick);
-        self.mix(frames)
+        self.mix(start, frames)
     }
 
     /// Pull `frames` from each routed source's store and mix the program bus,
@@ -336,7 +459,12 @@ impl ProgramBus {
     /// never absent (the audio continuity guarantee). Does no I/O and cannot
     /// block (the stores are wait-free reads), so it is safe on the output-clock
     /// hot loop (invariant #1) and never back-pressures any input (invariant #10).
-    fn mix(&mut self, frames: usize) -> AudioBlock {
+    ///
+    /// A [`timeline`](AudioStore::is_timeline) store (audio placed at output-time
+    /// frames, locked to vision) is read at `start` — the bus clock's own
+    /// absolute frame — so it can never drift from, or re-sync away from, the
+    /// output timeline.
+    fn mix(&mut self, start: i64, frames: usize) -> AudioBlock {
         // Pull-and-submit + mix with the PRE-advance envelope position (so this
         // tick's block uses the ramp values for its own frames), then advance the
         // ramps and retire any completed cross-fade. Disjoint field borrows:
@@ -353,6 +481,9 @@ impl ProgramBus {
                 // format (= the bus format), so `submit` cannot fail on a format
                 // mismatch; a (impossible) error degrades to dropping that input
                 // this tick rather than panicking on the hot loop.
+                if store.is_timeline() || store.is_line_up_tone() {
+                    store.seek_to(start);
+                }
                 let block = store.read(frames);
                 let _ = mixer.submit(*point, block);
             }

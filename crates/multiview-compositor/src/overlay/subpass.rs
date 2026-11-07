@@ -524,7 +524,13 @@ impl OverlayDrawList {
 pub struct LinearCanvasBuffer {
     width: u32,
     height: u32,
-    /// Row-major premultiplied-linear RGBA, `width * height` pixels.
+    /// Global origin of a compact dirty-region accumulator. The public canvas
+    /// constructors use zero; overlay bake uses one bounded allocation per rect.
+    origin_x: u32,
+    origin_y: u32,
+    stride: u32,
+    region_height: u32,
+    /// Row-major premultiplied-linear RGBA, `stride * region_height` pixels.
     pixels: Vec<[f32; 4]>,
 }
 
@@ -539,8 +545,23 @@ impl LinearCanvasBuffer {
         Self {
             width,
             height,
+            origin_x: 0,
+            origin_y: 0,
+            stride: width,
+            region_height: height,
             pixels: vec![[0.0; 4]; count],
         }
+    }
+
+    /// Compact accumulator for one clipped dirty rectangle. Coordinates passed
+    /// to blend routines remain global, so their rasterization stays identical.
+    fn region(rect: DirtyRect) -> Self {
+        let mut buffer = Self::transparent(rect.x1 - rect.x0, rect.y1 - rect.y0);
+        buffer.origin_x = rect.x0;
+        buffer.origin_y = rect.y0;
+        buffer.width = rect.x1;
+        buffer.height = rect.y1;
+        buffer
     }
 
     /// A canvas filled with one premultiplied-linear background color.
@@ -594,12 +615,14 @@ impl LinearCanvasBuffer {
 
     /// Linear index of `(x, y)` within bounds.
     fn index(&self, x: u32, y: u32) -> Option<usize> {
-        if x >= self.width || y >= self.height {
+        let local_x = x.checked_sub(self.origin_x)?;
+        let local_y = y.checked_sub(self.origin_y)?;
+        if local_x >= self.stride || local_y >= self.region_height {
             return None;
         }
-        let w = usize::try_from(self.width).ok()?;
-        let xi = usize::try_from(x).ok()?;
-        let yi = usize::try_from(y).ok()?;
+        let w = usize::try_from(self.stride).ok()?;
+        let xi = usize::try_from(local_x).ok()?;
+        let yi = usize::try_from(local_y).ok()?;
         yi.checked_mul(w)?.checked_add(xi)
     }
 
@@ -1157,12 +1180,57 @@ pub fn apply_overlays_to_nv12_reference(
     Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag())
 }
 
+// Each reason has its own lock-free counter. Emit the first fallback and one
+// update per 1024 occurrences; a persistent mismatch must not flood the log.
+static PRIMITIVE_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COLOR_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REGION_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cumulative full-canvas fallbacks by reason: primitive count, canvas color,
+/// then region work. These are lock-free counters for diagnostic sampling.
+#[must_use]
+pub fn overlay_fallback_counts() -> [u64; 3] {
+    [
+        PRIMITIVE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+        COLOR_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+        REGION_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
+fn overlay_reference_fallback(
+    image: &Nv12Image,
+    list: &OverlayDrawList,
+    canvas: CanvasColor,
+    reason: &'static str,
+    actual: u64,
+    limit: u64,
+) -> Result<Nv12Image> {
+    let counter = match reason {
+        "primitive count" => &PRIMITIVE_FALLBACKS,
+        "canvas color mismatch" => &COLOR_FALLBACKS,
+        _ => &REGION_FALLBACKS,
+    };
+    let occurrence = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if occurrence == 1 || occurrence % 1024 == 0 {
+        tracing::warn!(
+            reason,
+            actual,
+            limit,
+            occurrences = occurrence,
+            primitives = list.len(),
+            "overlay optimization bypassed; using full-canvas reference"
+        );
+    }
+    apply_overlays_to_nv12_reference(image, list, canvas)
+}
+
 /// Burn `list` into `image`, returning a new NV12 program frame — the CPU
 /// overlay bake the CLI/software path uses.
 ///
 /// **Region-limited (ADR-0023).** Only the overlay primitives' even-aligned
-/// footprints (one dirty rect each — *not* a single union box, so gaps between
-/// spread-out overlays stay untouched) are colour round-tripped; every pixel no
+/// footprints (nearby overlapping rects coalesce, but *not* into a single union
+/// box, so gaps between spread-out overlays stay untouched) are colour
+/// round-tripped; every pixel no
 /// overlay rect covers is passed through the NV12 planes byte-identically, so the
 /// per-frame cost tracks the overlay footprint, not the canvas. Inside the rects
 /// the output is **byte-identical** to [`apply_overlays_to_nv12_reference`] (same
@@ -1176,21 +1244,54 @@ pub fn apply_overlays_to_nv12_reference(
 /// Propagates the colour-conversion errors (unresolved/unsupported colour) and
 /// the [`Nv12Image::new`] geometry check, exactly as
 /// [`apply_overlays_to_nv12_reference`] does.
+#[allow(clippy::too_many_lines)] // Region traversal and color writes stay together for raster-order chroma.
 pub fn apply_overlays_to_nv12(
     image: &Nv12Image,
     list: &OverlayDrawList,
     canvas: CanvasColor,
 ) -> Result<Nv12Image> {
+    apply_overlays_with_limit(image, list, canvas, 1024)
+}
+
+#[allow(clippy::too_many_lines)] // Shared production and small-budget test path.
+fn apply_overlays_with_limit(
+    image: &Nv12Image,
+    list: &OverlayDrawList,
+    canvas: CanvasColor,
+    max_primitives: usize,
+) -> Result<Nv12Image> {
+    const COALESCE_LIMIT: usize = 64;
     let width = image.width();
     let height = image.height();
+    let canvas_pixels = u64::from(width) * u64::from(height);
     let color = image.color();
+    // These are optimization admission limits, never validity checks. A complex
+    // but valid draw list must not terminate the output consumer and all HLS
+    // renditions. The reference path preserves every primitive in order.
+    if list.len() > max_primitives {
+        return overlay_reference_fallback(
+            image,
+            list,
+            canvas,
+            "primitive count",
+            u64::try_from(list.len()).unwrap_or(u64::MAX),
+            u64::try_from(max_primitives).unwrap_or(u64::MAX),
+        );
+    }
 
     // Passing untouched pixels through verbatim is colour-correct only when the
     // input already sits in the canvas colour space — which it does: the bake
     // input is the composited canvas. If that ever differs, the whole frame
     // needs conversion, so fall back to the full-canvas reference.
     if color != canvas.output_tag() {
-        return apply_overlays_to_nv12_reference(image, list, canvas);
+        return overlay_reference_fallback(
+            image,
+            list,
+            canvas,
+            "canvas color mismatch",
+            canvas_pixels,
+            canvas_pixels,
+        );
     }
 
     // Start from the input planes verbatim (exact passthrough); only the dirty
@@ -1198,10 +1299,42 @@ pub fn apply_overlays_to_nv12(
     let mut y_plane = image.y_plane().to_vec();
     let mut uv_plane = image.uv_plane().to_vec();
 
-    // One even-aligned rect per primitive footprint — NOT a single union box, so
-    // the gaps between spread-out overlays (labels/meters/clock across the frame)
-    // stay exact passthrough and only the real footprints are processed.
-    let rects = overlay_dirty_rects(list, width, height);
+    // Coalesce intersecting, even-aligned primitive footprints only when their
+    // bounding rectangle adds little area. Distant labels and meters retain
+    // exact passthrough between regions; dense overlap is decoded fewer times.
+    // Limit worst-case list work and scratch to a fixed, explicit per-frame
+    // budget. Excess cannot silently discard text, captions, or style.
+    let footprints: Vec<_> = list
+        .primitives
+        .iter()
+        .map(|p| primitive_dirty_rect(p, width, height))
+        .collect();
+    let original: Vec<_> = footprints.iter().flatten().copied().collect();
+    // Above 64 footprints, the original-region path has predictable bounded
+    // primitive intersection scans and no restart-scan coalescing.
+    let rects = if original.len() <= COALESCE_LIMIT {
+        coalesce_dirty_rects(original.clone())
+    } else {
+        original.clone()
+    };
+    let processed_pixels: u64 = rects
+        .iter()
+        .map(|r| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0))
+        .sum();
+    let primitive_pixels: u64 = original
+        .iter()
+        .map(|r| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0))
+        .sum();
+    if processed_pixels > canvas_pixels || primitive_pixels > canvas_pixels.saturating_mul(4) {
+        return overlay_reference_fallback(
+            image,
+            list,
+            canvas,
+            "region work",
+            processed_pixels.max(primitive_pixels / 4),
+            canvas_pixels,
+        );
+    }
     if rects.is_empty() {
         // Nothing lands on the canvas: the bake is a no-op (planes unchanged).
         return Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag());
@@ -1215,9 +1348,11 @@ pub fn apply_overlays_to_nv12(
     // inside the rects). The rest of the buffer stays transparent and is never
     // read. The rects are even-aligned (whole NV12 2×2 chroma blocks) and walked
     // in raster order, so `write_nv12_pixel`'s last-writer-wins chroma matches the
-    // reference exactly; overlapping rects re-process the same value (idempotent).
-    let mut buffer = LinearCanvasBuffer::transparent(width, height);
+    // reference exactly; any residual overlapping rects re-process the source
+    // value (idempotent).
+    let w = usize::try_from(width).unwrap_or(0);
     for rect in &rects {
+        let mut buffer = LinearCanvasBuffer::region(*rect);
         for y in rect.y0..rect.y1 {
             for x in rect.x0..rect.x1 {
                 let Some((y8, cb8, cr8)) = image.sample(x, y) else {
@@ -1231,19 +1366,43 @@ pub fn apply_overlays_to_nv12(
                 }
             }
         }
-    }
+        // Preserve primitive order for source-over, but never re-rasterize
+        // unrelated glyphs/meters once for every other dirty rectangle.
+        for (primitive, footprint) in list.primitives.iter().zip(&footprints) {
+            if footprint.is_some_and(|footprint| footprint.intersects(*rect)) {
+                blend_primitive(&mut buffer, primitive);
+            }
+        }
 
-    blend_overlays(&mut buffer, list);
-
-    let w = usize::try_from(width).unwrap_or(0);
-    for rect in &rects {
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                let premul = buffer.pixel(x, y).unwrap_or(PremulRgba::TRANSPARENT);
-                let straight = premul.unpremultiplied();
-                let out =
-                    canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
-                write_nv12_pixel(&mut y_plane, &mut uv_plane, w, x, y, out);
+        // A merged bounding rectangle may contain holes. Decode can cover the
+        // bounding rectangle, but only original chroma-aligned footprints may
+        // write output; each skipped block retains its input Y and UV bytes.
+        let members: Vec<_> = if original.len() > COALESCE_LIMIT {
+            // The fallback has no merged bounding boxes: this region itself
+            // is an original footprint, with no holes or membership scan.
+            vec![*rect]
+        } else {
+            original
+                .iter()
+                .copied()
+                .filter(|r| r.intersects(*rect))
+                .collect()
+        };
+        for y in (rect.y0..rect.y1).step_by(2) {
+            for x in (rect.x0..rect.x1).step_by(2) {
+                if !members
+                    .iter()
+                    .any(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
+                {
+                    continue;
+                }
+                for (px, py) in [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)] {
+                    let premul = buffer.pixel(px, py).unwrap_or(PremulRgba::TRANSPARENT);
+                    let straight = premul.unpremultiplied();
+                    let out =
+                        canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
+                    write_nv12_pixel(&mut y_plane, &mut uv_plane, w, px, py, out);
+                }
             }
         }
     }
@@ -1260,15 +1419,60 @@ struct DirtyRect {
     y1: u32,
 }
 
+impl DirtyRect {
+    fn intersects(self, other: Self) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
+}
+
 /// One even-aligned, canvas-clamped dirty rect **per primitive footprint** (not
 /// a single union box — so gaps between spread-out overlays stay exact
 /// passthrough and only the real footprints are colour-processed). Empty when
 /// nothing lands on the canvas.
+#[cfg(test)]
 fn overlay_dirty_rects(list: &OverlayDrawList, width: u32, height: u32) -> Vec<DirtyRect> {
     list.primitives
         .iter()
         .filter_map(|primitive| primitive_dirty_rect(primitive, width, height))
         .collect()
+}
+
+/// Merge only intersecting footprints whose bounding union adds no more than
+/// a quarter of their combined area. This avoids repeated conversion of dense
+/// overlapping meter segments without turning sparse labels into a full-frame
+/// rectangle. All endpoints remain even, and draw order stays unchanged.
+fn coalesce_dirty_rects(mut rects: Vec<DirtyRect>) -> Vec<DirtyRect> {
+    let area = |r: DirtyRect| u64::from(r.x1 - r.x0) * u64::from(r.y1 - r.y0);
+    let mut index = 0;
+    'restart: while index < rects.len() {
+        let mut other = index + 1;
+        while other < rects.len() {
+            let Some(&a) = rects.get(index) else { break };
+            let Some(&b) = rects.get(other) else { break };
+            if !a.intersects(b) {
+                other += 1;
+                continue;
+            }
+            let union = DirtyRect {
+                x0: a.x0.min(b.x0),
+                y0: a.y0.min(b.y0),
+                x1: a.x1.max(b.x1),
+                y1: a.y1.max(b.y1),
+            };
+            if area(union) <= (area(a) + area(b)) * 5 / 4 {
+                if let Some(slot) = rects.get_mut(index) {
+                    *slot = union;
+                }
+                rects.swap_remove(other);
+                // A larger footprint may now intersect an earlier candidate.
+                index = 0;
+                continue 'restart;
+            }
+            other += 1;
+        }
+        index += 1;
+    }
+    rects
 }
 
 /// The even-aligned, canvas-clamped dirty rect of one primitive, or `None` if it
@@ -1460,9 +1664,29 @@ fn write_nv12_pixel(
 #[cfg(test)]
 mod dirty_rects_tests {
     use super::{
-        overlay_dirty_rects, DirtyRect, OverlayColor, OverlayDrawList, OverlayPrimitive,
-        OverlayRect,
+        apply_overlays_to_nv12_reference, apply_overlays_with_limit, overlay_dirty_rects,
+        DirtyRect, OverlayColor, OverlayDrawList, OverlayPrimitive, OverlayRect,
     };
+    use crate::pipeline::{CanvasColor, Nv12Image};
+
+    #[test]
+    fn tiny_complexity_limit_preserves_all_source_over_pixels() {
+        let canvas = CanvasColor::default();
+        let image =
+            Nv12Image::solid(48, 32, 80, 120, 140, canvas.output_tag()).expect("small canvas");
+        let mut list = OverlayDrawList::new();
+        for n in 0..5 {
+            list.push(OverlayPrimitive::FilledRect {
+                rect: OverlayRect::new(n * 2, 4, 15, 15),
+                corner_radius: 0,
+                color: OverlayColor::new(0.3, 0.7, 0.2, 0.25),
+            });
+        }
+        let actual = apply_overlays_with_limit(&image, &list, canvas, 4).expect("fallback");
+        let reference = apply_overlays_to_nv12_reference(&image, &list, canvas).expect("oracle");
+        assert_eq!(actual.y_plane(), reference.y_plane());
+        assert_eq!(actual.uv_plane(), reference.uv_plane());
+    }
 
     fn green() -> OverlayColor {
         OverlayColor::opaque(0.0, 1.0, 0.0)

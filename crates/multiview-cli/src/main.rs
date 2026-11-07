@@ -197,7 +197,8 @@ async fn run_run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // persisted `active.toml` (with the boot file's restart-only sections
     // spliced in), falling back to boot with a surfaced reason. Loaded stays
     // the boot snapshot in both modes (the revert-to-start target).
-    let start = multiview_cli::boot::resolve_start_config(boot, boot_text, &args.config);
+    let start = multiview_cli::boot::resolve_start_config(boot, boot_text, &args.config)
+        .map_err(anyhow::Error::msg)?;
 
     // A configured `[timing].ptp_phc` in a build without the `ptp` feature is
     // a capability this binary cannot provide: fail the run at startup with a
@@ -311,11 +312,16 @@ async fn run_pipeline(
     })
 }
 
-/// The per-run-path inputs the control plane is wired from: the live preview
-/// taps (the program slot the run loop fills + the per-source store map), the
-/// producer stop registry the live-source hub shares with the run's startup
-/// supervisors, and what this run path can take live (ADR-W022 — the binary
-/// is the only place that knows both the compiled features and the path).
+/// Preserve the existing fail-soft boot snapshot persistence policy.
+fn persist_loaded_best_effort(boot_model: &multiview_control::boot_model::BootModel) {
+    if let Err(reason) = multiview_control::boot_model::persist_loaded(boot_model) {
+        tracing::warn!(reason = %reason, "could not persist the Loaded snapshot (fail-soft; the in-memory snapshot is authoritative)");
+    }
+}
+
+/// The per-run-path inputs the control plane is wired from: live preview taps,
+/// shared producer stop registry, and supported live-apply capabilities.
+/// Only the binary knows both compiled features and the selected run path.
 struct ControlPlaneWiring {
     /// The shared program-frame slot the run loop fills for previews.
     program_slot: multiview_cli::preview::ProgramSlot,
@@ -341,6 +347,8 @@ struct ControlPlaneWiring {
     /// discovery. `None` ⇒ an empty, relay-declined default. Control-plane only
     /// (invariant #10).
     mesh: Option<Arc<multiview_mesh::MeshState>>,
+    /// Read-only source event snapshots from the running ingest pipeline.
+    source_events: Option<multiview_cli::source_event_runtime::RuntimeReader>,
     /// The shared WHIP publisher rendezvous (ADR-T014): the pipeline's registry,
     /// so the control plane's `WhipProvider` rendezvous a `POST`ed publisher to
     /// the matching webrtc source's `drive_webrtc` loop. Only under
@@ -406,6 +414,7 @@ async fn serve_control_plane(
         live_apply,
         licence,
         mesh,
+        source_events,
         #[cfg(feature = "webrtc-native")]
         webrtc_registry,
         #[cfg(feature = "webrtc-native")]
@@ -485,6 +494,7 @@ async fn serve_control_plane(
         live_apply,
         live_capability,
         Some(Arc::clone(&boot_model)),
+        source_events,
         async move {
             let _ = shutdown_rx.await;
         },
@@ -495,12 +505,7 @@ async fn serve_control_plane(
     // Persist the Loaded snapshot to `loaded.toml` (forensics + the on-disk
     // revert-target record). Fail-soft: the in-memory snapshot is
     // authoritative; a write failure is warned, never fatal.
-    if let Err(reason) = multiview_control::boot_model::persist_loaded(&boot_model) {
-        tracing::warn!(
-            reason = %reason,
-            "could not persist the Loaded snapshot (fail-soft; the in-memory snapshot is authoritative)"
-        );
-    }
+    persist_loaded_best_effort(&boot_model);
     // The debounced Running persister (ADR-W024 §3): waits on the ONE
     // `running_changed` choke-point signal `AppState::audit` fires, then writes
     // `active.toml` atomically. Control-plane file I/O only (inv #10).
@@ -626,6 +631,14 @@ async fn run_pipeline_until_ctrl_c(
         );
         #[cfg(not(feature = "overlay"))]
         let live_apply = multiview_control::LiveApplyCaps::default();
+        // Audio routing applies to the RUNNING program bus (no restart): the
+        // hook loads the run's audio control handle (published at drive start;
+        // empty when this run carries no program audio → honest `restart`) and
+        // hands it the new gain table, which the bake consumer ramps in at its
+        // next tick. Wait-free: a SwapCell load + store (inv #1/#10).
+        let live_apply = live_apply.with_audio_routing(
+            multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
+        );
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
             start,
@@ -645,6 +658,7 @@ async fn run_pipeline_until_ctrl_c(
                     plane.pinned.clone(),
                 )),
                 mesh: Some(Arc::clone(&plane.mesh)),
+                source_events: Some(pipeline.source_event_reader()),
                 #[cfg(feature = "webrtc-native")]
                 webrtc_registry: pipeline.webrtc_registry(),
                 #[cfg(feature = "webrtc-native")]
@@ -668,15 +682,19 @@ async fn run_pipeline_until_ctrl_c(
             config.clone(),
             Arc::clone(&publisher),
             pipeline.subtitle_route_slot(),
+            pipeline.audio_route_slot(),
             pipeline.overlay_apply_slot(),
+            pipeline.tile_spec_apply_slot(),
+            pipeline.audio_free_sources_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
         ));
         #[cfg(not(feature = "overlay"))]
-        let drain: ControlDrain = Box::new(control::command_drain_with_live_sources_and_players(
+        let drain: ControlDrain = Box::new(control::command_drain_with_audio_and_players(
             command_rx,
             config.clone(),
             Arc::clone(&publisher),
+            pipeline.audio_route_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
         ));
@@ -1028,6 +1046,7 @@ async fn run_software_until_ctrl_c(
                     plane.pinned.clone(),
                 )),
                 mesh: Some(Arc::clone(&plane.mesh)),
+                source_events: None,
                 // The software run path has no ingest pipeline, so no webrtc
                 // source drive loop reads this registry — an empty one keeps
                 // the WhipProvider present (publishes ride NO_SIGNAL on a

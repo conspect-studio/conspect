@@ -64,6 +64,944 @@ pub(crate) fn new_store() -> Arc<AudioStore> {
     Arc::new(AudioStore::new(canonical_format(), STORE_CAPACITY_FRAMES))
 }
 
+/// Build a finite-file store. It preserves retained PCM instead of re-syncing
+/// to the append edge; the decode pacer bounds producer lead off the output clock.
+#[must_use]
+pub(crate) fn new_file_store() -> Arc<AudioStore> {
+    Arc::new(AudioStore::finite_file(
+        canonical_format(),
+        STORE_CAPACITY_FRAMES,
+    ))
+}
+
+/// Scheduling-independent bars source tone, pulled at the consumer sample index.
+#[must_use]
+pub(crate) fn new_tone_store() -> Arc<AudioStore> {
+    Arc::new(AudioStore::line_up_tone(canonical_format()))
+}
+
+/// A store for a **live network** source's decoded audio, locked to its video:
+/// a [`timeline`](AudioStore::timeline) store whose frames are output-timeline
+/// positions. The decode places each block where the source's video stamper
+/// put the same PTS ([`crate::pipeline::live_anchor_slot`]), and the bus reads
+/// it at its own sample clock.
+pub(crate) fn new_live_store() -> Arc<AudioStore> {
+    Arc::new(AudioStore::timeline(
+        canonical_format(),
+        multiview_audio::store::TIMELINE_CAPACITY,
+    ))
+}
+
+/// The source's latest video anchor, as the audio crate's [`PtsAnchor`]
+/// (`None` before video anchors, or when its anchor frame carried no raw PTS).
+fn video_anchor(
+    slot: &crate::pipeline::LiveAnchorSlot,
+    floor: u64,
+) -> Option<multiview_audio::store::PtsAnchor> {
+    let a = slot.load()?;
+    if a.generation <= floor {
+        return None;
+    }
+    Some(multiview_audio::store::PtsAnchor {
+        generation: a.generation,
+        out0_ns: a.out0.as_nanos(),
+        raw_pts0_ns: a.raw_pts0_ns?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_video_anchor(
+    slot: &crate::pipeline::LiveAnchorSlot,
+) -> Option<multiview_audio::store::PtsAnchor> {
+    video_anchor(slot, 0)
+}
+
+/// Maximum unresolved operator re-points retained while the bake consumer is slow.
+pub(crate) const MAX_AUDIO_REPOINT_BACKLOG: usize = 256;
+
+#[derive(Clone)]
+struct AudioRepoint {
+    point: multiview_audio::RoutePoint,
+    store: Arc<AudioStore>,
+    ramp_frames: usize,
+}
+
+/// The program-bus gain ramp a live routing change rides: 40 ms at 48 kHz —
+/// long enough to be click-free, short enough to land within ~2 output ticks.
+pub(crate) const LIVE_GAIN_RAMP_FRAMES: usize = 1_920;
+
+/// One requested program-bus gain table: `(channel id, linear gain)` pairs.
+type GainTable = Arc<Vec<(String, f64)>>;
+
+/// A live change to the program bus's MEMBERSHIP (a source added, edited or
+/// removed while the program runs), applied by the bake consumer.
+#[derive(Clone)]
+enum MemberChange {
+    /// `id` now feeds `store`: a new id joins the bus (at the routed gain, zero
+    /// when unrouted); an id already on the bus cross-fades onto the new store.
+    Join { id: String, store: Arc<AudioStore> },
+    /// `id` leaves the bus: faded out click-free, then its strip is reclaimed.
+    Leave { id: String },
+}
+
+/// The cross-fade a live membership change rides (10 ms at 48 kHz).
+const MEMBER_RAMP_FRAMES: usize = 480;
+
+/// A copy-on-write map published through a `SwapCell` (wait-free readers).
+type SharedMap<V> = Arc<multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, V>>>>;
+
+#[derive(Default)]
+struct MemberMailbox {
+    changes: std::collections::BTreeMap<String, MemberChange>,
+    closed: bool,
+}
+
+/// Bounded latest-intent mailbox between the off-clock hub and bake consumer.
+/// No lock or client is shared with the output clock.
+///
+/// The bus membership is LIVE: a source added at runtime registers its store
+/// with [`Self::set_source_audio`] (from the live-source hub worker), the bake
+/// consumer adds it to the running bus at its next tick, and routing it then
+/// applies live. The channel table uses keyed off-clock access; only the bake
+/// consumer ever touches the bus (inv #1/#10).
+#[derive(Clone)]
+pub struct AudioControlHandle {
+    pending: Arc<multiview_framestore::SwapCell<Arc<Vec<AudioRepoint>>>>,
+    /// The latest requested program-bus gain table (`(channel id, linear gain)`).
+    /// Latest-wins: a routing PUT replaces the whole table, so an unapplied older
+    /// table is superseded, never queued (bounded at one table — inv #10).
+    pending_gains: Arc<multiview_framestore::SwapCell<Option<GainTable>>>,
+    /// Keyed latest intent: one slot per admitted source, irrespective of churn.
+    /// Both producer and bake consumer run OFF the output clock; each consumer
+    /// tick removes at most 16 entries without scanning/cloning the backlog.
+    pending_members: Arc<(std::sync::Mutex<MemberMailbox>, std::sync::Condvar)>,
+    /// The per-source audio stores (what a breakaway can re-point onto).
+    sources: SharedMap<Arc<AudioStore>>,
+    /// The bus route point of every source on the running bus. Written only by
+    /// the bake consumer (after it changed the bus); read by the control side.
+    channels:
+        Arc<std::sync::RwLock<std::collections::HashMap<String, multiview_audio::RoutePoint>>>,
+    /// Every source id that exists on this run, with or without audio: what a
+    /// routing document may name and still apply live (an audio-free source
+    /// mixes as silence — a restart would not change that).
+    known: SharedMap<()>,
+    /// The latest routing document, so a source joining later rides its gain.
+    routing: Arc<multiview_framestore::SwapCell<Option<Arc<multiview_config::AudioRouting>>>>,
+    sample_rate: u32,
+    /// Output tracks are pinned to source ids at startup until the discrete
+    /// encoder's route table accepts live updates.
+    declared_tracks: std::collections::HashMap<String, usize>,
+    /// Shared stable-index source list read by the bake consumer each tick.
+    live_track_inputs: Option<Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>>,
+    /// Test-only interleaving point inside [`Self::request_routing`], after the
+    /// channel snapshot and before the gain table is published.
+    #[cfg(test)]
+    routing_gap_hook: RoutingGapHook,
+}
+
+#[cfg(test)]
+type RoutingGapHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// The consumer owns this guard from thread spawn through normal or panic exit.
+pub struct AudioConsumerGuard(AudioControlHandle);
+
+impl Drop for AudioConsumerGuard {
+    fn drop(&mut self) {
+        self.0.close_consumer();
+    }
+}
+
+impl Default for AudioControlHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn shared_map<V>(map: std::collections::HashMap<String, V>) -> SharedMap<V> {
+    Arc::new(multiview_framestore::SwapCell::from_pointee(map))
+}
+
+fn map_insert<V: Clone>(cell: &SharedMap<V>, id: &str, value: V) {
+    cell.rcu(|current| {
+        let mut next = current.as_ref().clone();
+        next.insert(id.to_owned(), value.clone());
+        next
+    });
+}
+
+fn map_remove<V: Clone>(cell: &SharedMap<V>, id: &str) {
+    if cell.load().contains_key(id) {
+        cell.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.remove(id);
+            next
+        });
+    }
+}
+
+impl AudioControlHandle {
+    /// Create an empty mailbox; route resolution is installed at run startup.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::from_sources(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// Create the run's source and destination registry, keyed by configured ids.
+    #[must_use]
+    pub fn from_sources(
+        sources: std::collections::HashMap<String, Arc<AudioStore>>,
+        channels: std::collections::HashMap<String, multiview_audio::RoutePoint>,
+    ) -> Self {
+        let known = sources
+            .keys()
+            .chain(channels.keys())
+            .map(|id| (id.clone(), ()))
+            .collect();
+        Self {
+            pending: Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new())),
+            pending_gains: Arc::new(multiview_framestore::SwapCell::empty()),
+            pending_members: Arc::new((
+                std::sync::Mutex::new(MemberMailbox::default()),
+                std::sync::Condvar::new(),
+            )),
+            sources: shared_map(sources),
+            channels: Arc::new(std::sync::RwLock::new(channels)),
+            known: shared_map(known),
+            routing: Arc::new(multiview_framestore::SwapCell::empty()),
+            sample_rate: AudioFormat::CANONICAL_RATE,
+            declared_tracks: std::collections::HashMap::new(),
+            live_track_inputs: None,
+            #[cfg(test)]
+            routing_gap_hook: Arc::default(),
+        }
+    }
+
+    /// Record the running program bus's sample rate (what a routing document's
+    /// `sample_rate_hz` must equal to apply live).
+    #[must_use]
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    /// Record the routing the bus was built with (a later-joining source rides
+    /// its gain) and every startup source id, audio-bearing or not.
+    #[must_use]
+    pub fn with_startup(
+        self,
+        routing: Option<&multiview_config::AudioRouting>,
+        source_ids: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.routing.store(routing.cloned().map(Arc::new));
+        let ids: Vec<String> = source_ids.into_iter().collect();
+        self.known.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            for id in &ids {
+                next.insert(id.clone(), ());
+            }
+            next
+        });
+        self
+    }
+
+    /// Keep the membership mailbox open for the lifetime of the bake consumer.
+    #[must_use]
+    pub fn consumer_guard(&self) -> AudioConsumerGuard {
+        AudioConsumerGuard(self.clone())
+    }
+
+    /// Close admission when the sole bus consumer exits, including on panic.
+    /// Wakes every producer blocked on a full mailbox; pending intent remains
+    /// available for inspection, but no longer promises delivery to a dead bus.
+    pub fn close_consumer(&self) {
+        let (pending, drained) = &*self.pending_members;
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.closed = true;
+        drained.notify_all();
+    }
+
+    fn push_member(&self, change: MemberChange) -> bool {
+        let id = match &change {
+            MemberChange::Join { id, .. } | MemberChange::Leave { id } => id.clone(),
+        };
+        // Both sides are off-clock. At capacity, wait for the bake consumer to
+        // drain rather than shed a terminal leave or grow memory unbounded.
+        // A consumed stale intent reads current authoritative state when applied;
+        // newer producer updates enqueue their own latest intent.
+        let (pending, drained) = &*self.pending_members;
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !pending.closed
+            && pending.changes.len() >= multiview_config::MAX_ADMITTED_SOURCES
+            && !pending.changes.contains_key(&id)
+        {
+            pending = drained
+                .wait(pending)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if pending.closed {
+            return false;
+        }
+        pending.changes.insert(id, change);
+        true
+    }
+
+    /// A source now exists on the run (added or edited live). With `Some(store)`
+    /// its decoded audio joins the RUNNING program bus at its next tick — at the
+    /// current routing's gain, zero when the routing does not mix it — or, on an
+    /// edit, cross-fades onto the new store. With `None` the source carries no
+    /// audio (it may still be routed: it mixes as silence). Bounded, with
+    /// backpressure only on the off-clock hub worker at saturation; never the
+    /// output clock.
+    #[must_use]
+    pub fn set_source_audio(&self, id: &str, store: Option<Arc<AudioStore>>) -> bool {
+        map_insert(&self.known, id, ());
+        if let Some(store) = store {
+            map_insert(&self.sources, id, Arc::clone(&store));
+            self.push_member(MemberChange::Join {
+                id: id.to_owned(),
+                store,
+            })
+        } else {
+            map_remove(&self.sources, id);
+            self.push_member(MemberChange::Leave { id: id.to_owned() })
+        }
+    }
+
+    /// Observe the actual store the live hub handed to the bus, for in-module
+    /// lifecycle regression tests only. Never exposed in production.
+    #[cfg(test)]
+    pub(crate) fn test_source_store(&self, id: &str) -> Option<Arc<AudioStore>> {
+        self.sources.load().get(id).cloned()
+    }
+
+    #[cfg(test)]
+    fn set_routing_gap_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .routing_gap_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_routing_gap_hook(&self) {
+        let hook = self
+            .routing_gap_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_source_point(&self, id: &str) -> Option<multiview_audio::RoutePoint> {
+        self.channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .copied()
+    }
+
+    /// A source was removed from the run: its bus point goes away (faded out,
+    /// then reclaimed) and routing it needs it back first. Bounded; hub worker.
+    #[must_use]
+    pub fn remove_source(&self, id: &str) -> bool {
+        map_remove(&self.known, id);
+        map_remove(&self.sources, id);
+        self.push_member(MemberChange::Leave { id: id.to_owned() })
+    }
+
+    /// Capture the output's startup-pinned track-to-source wiring.
+    #[must_use]
+    pub fn with_declared_tracks(
+        mut self,
+        routing: Option<&multiview_config::AudioRouting>,
+        live_track_inputs: Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>,
+    ) -> Self {
+        self.declared_tracks = routing
+            .map(|r| {
+                r.routes
+                    .iter()
+                    .filter_map(|route| route.target_track.as_deref())
+                    .enumerate()
+                    .map(|(index, name)| (name.to_owned(), index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.live_track_inputs = Some(live_track_inputs);
+        self
+    }
+
+    /// Apply an `[audio]` routing document to the RUNNING program bus, if it can
+    /// be applied live. Returns `true` when the new gain table was published for
+    /// the bake consumer (it lands at its next tick, ramped click-free), `false`
+    /// when only a restart can honour it: a different `sample_rate_hz` than the
+    /// running bus, or a route that mixes an input that does not exist on this
+    /// run. Off-clock control path; never touches the bus or output clock (inv #1/#10).
+    #[must_use]
+    pub fn request_routing(&self, routing: &multiview_config::AudioRouting) -> bool {
+        if routing.sample_rate_hz != self.sample_rate {
+            return false;
+        }
+        let known = self.known.load();
+        let requested: Vec<(&str, &str)> = routing
+            .routes
+            .iter()
+            .filter_map(|route| {
+                route
+                    .target_track
+                    .as_deref()
+                    .map(|name| (name, route.input_id.as_str()))
+            })
+            .collect();
+        if requested.len() != self.declared_tracks.len()
+            || requested.iter().enumerate().any(|(index, (name, source))| {
+                self.declared_tracks.get(*name) != Some(&index) || !known.contains_key(*source)
+            })
+        {
+            // An added/removed/reordered output track needs output-only
+            // reconfiguration; a source absent from the live registry cannot be routed.
+            return false;
+        }
+        if routing
+            .routes
+            .iter()
+            .any(|r| r.contributes_to_program() && !known.contains_key(&r.input_id))
+        {
+            return false;
+        }
+        // Review H3 publication protocol: publish the routing document BEFORE
+        // taking the channel snapshot. A live join inserts its channel under the
+        // `channels` write lock and only then re-reads the routing. The lock
+        // totally orders the two: either this snapshot is taken after the
+        // join's insert (the gain table covers the new channel), or the join's
+        // write lock is acquired after this read lock is released — which is
+        // after the store below — so its re-read sees this routing. A joining
+        // source can therefore never keep a superseded gain.
+        self.routing.store(Some(Arc::new(routing.clone())));
+        let channels = self
+            .channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let gains =
+            crate::pipeline::program_bus_gains(channels.keys().map(String::as_str), Some(routing));
+        drop(channels);
+        #[cfg(test)]
+        self.run_routing_gap_hook();
+        if let Some(live) = &self.live_track_inputs {
+            live.store(Arc::new(
+                requested
+                    .iter()
+                    .map(|(_, source)| (*source).to_owned())
+                    .collect(),
+            ));
+        }
+        self.pending_gains.store(Some(Arc::new(gains)));
+        true
+    }
+
+    /// The gain a source joining the bus now rides: the latest routing's, or
+    /// zero when no routing mixes it (never put unrouted audio on air).
+    fn joining_gain(&self, id: &str) -> f64 {
+        self.routing
+            .load()
+            .filter(|routing| !routing.routes.is_empty())
+            .and_then(|routing| {
+                crate::pipeline::program_bus_gains(std::iter::once(id), Some(&routing))
+                    .first()
+                    .map(|(_, gain)| *gain)
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Resolve a command against the run's actual channels and per-source stores.
+    /// A missing target/source stays held, never silently binds a wrong source.
+    #[must_use]
+    pub fn request_route(&self, target: &str, source_id: &str, ramp_frames: usize) -> bool {
+        let channels = self
+            .channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sources = self.sources.load();
+        let (Some(&point), Some(store)) = (channels.get(target), sources.get(source_id)) else {
+            return false;
+        };
+        self.request_repoint(point, Arc::clone(store), ramp_frames);
+        true
+    }
+
+    /// Publish a resolved re-point; a wedged consumer cannot block the producer.
+    pub fn request_repoint(
+        &self,
+        point: multiview_audio::RoutePoint,
+        store: Arc<AudioStore>,
+        ramp_frames: usize,
+    ) {
+        let current = self.pending.load();
+        let mut next = current.as_ref().clone();
+        if next.len() >= MAX_AUDIO_REPOINT_BACKLOG {
+            next.remove(0);
+        }
+        next.push(AudioRepoint {
+            point,
+            store,
+            ramp_frames,
+        });
+        self.pending.store(Arc::new(next));
+    }
+
+    /// Apply one membership change to the bus (bake consumer only).
+    fn apply_member(&self, bus: &mut multiview_audio::program::ProgramBus, change: &MemberChange) {
+        let existing = self
+            .channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(match change {
+                MemberChange::Join { id, .. } | MemberChange::Leave { id } => id.as_str(),
+            })
+            .copied();
+        match (change, existing) {
+            (MemberChange::Join { id, store }, Some(point)) => {
+                if let Err(error) =
+                    bus.repoint_crossfade(point, Arc::clone(store), MEMBER_RAMP_FRAMES)
+                {
+                    tracing::warn!(%error, source = %id, "audio re-join held: unknown program channel");
+                }
+            }
+            (MemberChange::Join { id, store }, None) => {
+                let gain = self.joining_gain(id);
+                let point = bus.add_source(id.clone(), Arc::clone(store), gain);
+                self.channels
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id.clone(), point);
+                // A routing PUT stores its document BEFORE it reads `channels`,
+                // so re-reading AFTER the insert closes the window where it
+                // missed this channel and `gain` was read from the old document.
+                let latest = self.joining_gain(id);
+                if (latest - gain).abs() > f64::EPSILON {
+                    let _ = bus.set_program_gain_ramped(point, latest, LIVE_GAIN_RAMP_FRAMES);
+                }
+                tracing::info!(source = %id, gain = latest, "live source joined the running program bus");
+            }
+            (MemberChange::Leave { id }, Some(point)) => {
+                // Cross-fade the strip onto silence (click-free; the outgoing
+                // strip retires itself), then reclaim the now-silent channel.
+                let silence = Arc::new(AudioStore::new(canonical_format(), 1));
+                let _ = bus.repoint_crossfade(point, silence, MEMBER_RAMP_FRAMES);
+                bus.remove_source(point);
+                self.channels
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(id);
+                tracing::info!(source = %id, "source left the running program bus");
+            }
+            (MemberChange::Leave { .. }, None) => {}
+        }
+    }
+
+    /// Apply before the next audio tick, on the sole bus-owning bake consumer.
+    pub fn apply_pending(&self, bus: &mut multiview_audio::program::ProgramBus) -> usize {
+        let members: Vec<MemberChange> = {
+            let (pending, drained) = &*self.pending_members;
+            let mut pending = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let members: Vec<MemberChange> = (0..16)
+                .filter_map(|_| pending.changes.pop_first().map(|(_, change)| change))
+                .collect();
+            if !members.is_empty() {
+                drained.notify_all();
+            }
+            members
+        };
+        for change in &members {
+            let id = match change {
+                MemberChange::Join { id, .. } | MemberChange::Leave { id } => id,
+            };
+            let current = self.sources.load();
+            let latest = match current.get(id) {
+                Some(store) => MemberChange::Join {
+                    id: id.clone(),
+                    store: Arc::clone(store),
+                },
+                None => MemberChange::Leave { id: id.clone() },
+            };
+            self.apply_member(bus, &latest);
+        }
+        let pending = self.pending.swap(Arc::new(Vec::new()));
+        let mut applied = 0;
+        for request in pending.iter() {
+            if let Err(error) = bus.repoint_crossfade(
+                request.point,
+                Arc::clone(&request.store),
+                request.ramp_frames,
+            ) {
+                tracing::warn!(%error, "audio route held: unknown program channel");
+            } else {
+                applied += 1;
+            }
+        }
+        if let Some(gains) = self.pending_gains.swap(None) {
+            let channels = self
+                .channels
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (id, gain) in gains.iter() {
+                let Some(&point) = channels.get(id) else {
+                    continue;
+                };
+                if let Err(error) = bus.set_program_gain_ramped(point, *gain, LIVE_GAIN_RAMP_FRAMES)
+                {
+                    tracing::warn!(%error, channel = %id, "audio gain held: unknown program channel");
+                } else {
+                    applied += 1;
+                }
+            }
+        }
+        applied
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.load().len()
+    }
+}
+
+/// The control plane's audio-routing live-apply capability for a run whose
+/// program bus publishes its [`AudioControlHandle`] into `slot` at drive start.
+///
+/// The hook loads the handle (empty ⇒ this run carries no program audio ⇒
+/// honest `restart`) and hands it the new gain table, which the bake consumer
+/// ramps in at its next tick via [`AudioControlHandle::apply_pending`].
+/// Wait-free: a `SwapCell` load + store, never the bus (inv #1/#10).
+#[must_use]
+pub fn routing_live_capability(
+    slot: Arc<multiview_framestore::SwapCell<Option<Arc<AudioControlHandle>>>>,
+) -> multiview_control::AudioRoutingLiveCapability {
+    multiview_control::AudioRoutingLiveCapability::new(move |routing| {
+        slot.load()
+            .is_some_and(|handle| handle.request_routing(routing))
+    })
+}
+
+#[cfg(test)]
+mod route_seam_tests {
+    use super::*;
+    use multiview_audio::program::ProgramBus;
+
+    #[test]
+    fn changed_discrete_track_source_does_not_claim_live_apply() {
+        let routing = |source: &str| {
+            let doc = format!("schema_version = 1\n[canvas]\nwidth = 640\nheight = 360\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"grid\"\ncolumns = [\"1fr\"]\nrows = [\"1fr\"]\nareas = [\"a\"]\n[[sources]]\nid = \"{source}\"\nkind = \"bars\"\n[[cells]]\nid = \"cell\"\narea = \"a\"\n[cells.source]\ninput_id = \"{source}\"\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"{source}\"\nchannels = {{ kind = \"stereo\" }}\ntarget_track = \"clean\"\n");
+            multiview_config::MultiviewConfig::load_from_toml(&doc)
+                .expect("route fixture")
+                .audio
+                .expect("audio routing")
+        };
+        let live = Arc::new(multiview_framestore::SwapCell::from_pointee(vec![
+            "old".to_owned()
+        ]));
+        let mut sources = std::collections::HashMap::new();
+        sources.insert("old".to_owned(), new_store());
+        let handle = AudioControlHandle::from_sources(sources, std::collections::HashMap::new())
+            .with_startup(Some(&routing("old")), ["old".to_owned(), "new".to_owned()])
+            .with_declared_tracks(Some(&routing("old")), Arc::clone(&live));
+        // A known source without a decoded store is still a valid silent track.
+        assert!(handle.request_routing(&routing("new")));
+        assert_eq!(live.load().as_slice(), &["new".to_owned()]);
+        assert!(!handle.request_routing(&routing("missing")));
+        assert_eq!(live.load().as_slice(), &["new".to_owned()]);
+        assert!(handle.remove_source("new"));
+        assert!(!handle.request_routing(&routing("new")));
+        assert_eq!(live.load().as_slice(), &["new".to_owned()]);
+        assert!(handle.set_source_audio("new", Some(new_store())));
+        assert!(handle.request_routing(&routing("new")));
+    }
+
+    #[test]
+    fn route_audio_reaches_crossfade_at_sample_boundary_without_losing_ticks() {
+        let old = new_store();
+        let incoming = new_store();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(30_000, 1001));
+        let point = bus.add_source("program", Arc::clone(&old), 1.0);
+        let handle = AudioControlHandle::new();
+        let before = bus.tick_to(10);
+        handle.request_repoint(point, Arc::clone(&incoming), 480);
+        assert_eq!(handle.apply_pending(&mut bus), 1);
+        let after = bus.tick_to(13);
+        assert_eq!(
+            before.frame_count() + after.frame_count(),
+            usize::try_from(
+                multiview_audio::cadence::SampleClock::new(48_000, Rational::new(30_000, 1001))
+                    .total_at(13)
+            )
+            .expect("small test sample budget")
+        );
+        assert_eq!(handle.apply_pending(&mut bus), 0);
+    }
+
+    /// Review H3: a source joining the live bus between a routing PUT's channel
+    /// snapshot and its gain publication must not keep the superseded gain.
+    /// The join is driven deterministically from inside that window.
+    #[test]
+    fn a_join_racing_a_routing_exclusion_is_not_left_audible() {
+        let routing = |late_included: bool| {
+            let doc = format!("schema_version = 1\n[canvas]\nwidth = 640\nheight = 360\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"grid\"\ncolumns = [\"1fr\"]\nrows = [\"1fr\"]\nareas = [\"a\"]\n[[sources]]\nid = \"main\"\nkind = \"bars\"\n[[sources]]\nid = \"late\"\nkind = \"bars\"\n[[cells]]\nid = \"cell\"\narea = \"a\"\n[cells.source]\ninput_id = \"main\"\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"main\"\nchannels = {{ kind = \"stereo\" }}\n[[audio.routes]]\ninput_id = \"late\"\nchannels = {{ kind = \"stereo\" }}\ninclude_in_program_bus = {late_included}\n");
+            multiview_config::MultiviewConfig::load_from_toml(&doc)
+                .expect("route fixture")
+                .audio
+                .expect("audio routing")
+        };
+        let handle = AudioControlHandle::new()
+            .with_startup(Some(&routing(true)), ["main".to_owned(), "late".to_owned()]);
+        let bus = Arc::new(std::sync::Mutex::new(ProgramBus::new(
+            canonical_format(),
+            Rational::new(25, 1),
+        )));
+        assert!(handle.set_source_audio("main", Some(new_store())));
+        handle.apply_pending(&mut bus.lock().unwrap());
+        // `late` is admitted now; the bake consumer joins it INSIDE the window.
+        assert!(handle.set_source_audio("late", Some(new_store())));
+        let (racer, racing_bus) = (handle.clone(), Arc::clone(&bus));
+        handle.set_routing_gap_hook(move || {
+            racer.apply_pending(&mut racing_bus.lock().unwrap());
+        });
+        assert!(handle.request_routing(&routing(false)));
+        let mut bus = bus.lock().unwrap();
+        handle.apply_pending(&mut bus);
+        let point = handle.test_source_point("late").expect("late joined");
+        assert_eq!(
+            bus.program_gain(point),
+            Some(0.0),
+            "the excluded joining source stayed audible at the superseded gain"
+        );
+    }
+
+    #[test]
+    fn membership_overflow_reconciles_latest_join_and_leave() {
+        let handle = AudioControlHandle::new();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(25, 1));
+        let stale = new_store();
+        assert!(handle.set_source_audio("stale", Some(Arc::clone(&stale))));
+        handle.apply_pending(&mut bus);
+        assert!(handle.test_source_point("stale").is_some());
+        assert!(handle.remove_source("stale"));
+        let first = new_store();
+        assert!(handle.set_source_audio("first", Some(first)));
+        for n in 0..300 {
+            let id = format!("item-{n:03}");
+            assert!(handle.set_source_audio(&id, Some(new_store())));
+            if n % 3 == 0 {
+                assert!(handle.remove_source(&id));
+            }
+        }
+        assert!(handle.set_source_audio("first", None));
+        let final_store = new_store();
+        assert!(handle.set_source_audio("final", Some(Arc::clone(&final_store))));
+        assert!(handle.pending_members.0.lock().unwrap().changes.len() <= 303);
+        for _ in 0..40 {
+            handle.apply_pending(&mut bus);
+        }
+        assert!(
+            handle.test_source_point("stale").is_none(),
+            "evicted Leave is recovered"
+        );
+        assert!(handle.test_source_point("first").is_none());
+        assert!(handle.test_source_point("final").is_some());
+        for n in 0..300 {
+            let id = format!("item-{n:03}");
+            assert_eq!(handle.test_source_point(&id).is_some(), n % 3 != 0, "{id}");
+        }
+        assert!(handle.pending_members.0.lock().unwrap().changes.is_empty());
+    }
+
+    #[test]
+    fn large_backlog_consumes_at_most_sixteen_intents_per_tick_and_latest_churn() {
+        let handle = AudioControlHandle::new();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(25, 1));
+        for n in 0..700 {
+            assert!(handle.set_source_audio(&format!("source-{n:04}"), Some(new_store())));
+        }
+        for _ in 0..500 {
+            assert!(handle.set_source_audio("source-0001", Some(new_store())));
+            assert!(handle.remove_source("source-0002"));
+        }
+        let latest = new_store();
+        assert!(handle.set_source_audio("source-0001", Some(Arc::clone(&latest))));
+        let before = handle.pending_members.0.lock().unwrap().changes.len();
+        assert_eq!(before, 700, "churn has exactly one latest intent per id");
+        handle.apply_pending(&mut bus);
+        assert_eq!(
+            handle.pending_members.0.lock().unwrap().changes.len(),
+            before - 16
+        );
+        assert!(handle.test_source_point("source-0001").is_some());
+        assert!(handle.test_source_point("source-0002").is_none());
+        for _ in 0..44 {
+            handle.apply_pending(&mut bus);
+        }
+        assert!(handle.pending_members.0.lock().unwrap().changes.is_empty());
+        for n in 0..700 {
+            assert_eq!(
+                handle
+                    .test_source_point(&format!("source-{n:04}"))
+                    .is_some(),
+                n != 2
+            );
+        }
+        assert!(Arc::ptr_eq(
+            &handle.test_source_store("source-0001").unwrap(),
+            &latest
+        ));
+    }
+
+    #[test]
+    fn distinct_terminal_intent_at_capacity_waits_for_offclock_consumer() {
+        let handle = AudioControlHandle::new();
+        // Distinct IDs can churn faster than the bus. The source ceiling must
+        // hold even if a prior 1024 IDs were all removed before reconciliation.
+        for n in 0..multiview_config::MAX_ADMITTED_SOURCES {
+            assert!(handle.push_member(MemberChange::Leave {
+                id: format!("removed-{n:04}"),
+            }));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = handle.clone();
+        let join = std::thread::spawn(move || {
+            assert!(producer.push_member(MemberChange::Leave {
+                id: "final-terminal".to_owned(),
+            }));
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert_eq!(
+            handle.pending_members.0.lock().unwrap().changes.len(),
+            multiview_config::MAX_ADMITTED_SOURCES
+        );
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(25, 1));
+        handle.apply_pending(&mut bus);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+        assert!(handle
+            .pending_members
+            .0
+            .lock()
+            .unwrap()
+            .changes
+            .contains_key("final-terminal"));
+    }
+
+    #[test]
+    fn full_mailbox_wakes_blocked_producer_when_consumer_exits() {
+        let handle = AudioControlHandle::new();
+        let guard = handle.consumer_guard();
+        for n in 0..multiview_config::MAX_ADMITTED_SOURCES {
+            assert!(handle.push_member(MemberChange::Leave {
+                id: format!("removed-{n:04}"),
+            }));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let producer = handle.clone();
+        let join = std::thread::spawn(move || {
+            tx.send(producer.remove_source("terminal-after-close"))
+                .unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard); // Error, normal exit, and unwind all drop the consumer guard.
+        assert!(!rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        join.join().unwrap();
+        assert_eq!(
+            handle.pending_members.0.lock().unwrap().changes.len(),
+            multiview_config::MAX_ADMITTED_SOURCES,
+            "do not evict a terminal intent to claim false admission"
+        );
+        assert!(!handle.set_source_audio("late", Some(new_store())));
+    }
+
+    #[test]
+    fn hub_shutdown_finishes_after_full_mailbox_consumer_exit() {
+        struct RemoveOnHub(AudioControlHandle);
+        impl crate::live_sources::IngestSpawner for RemoveOnHub {
+            fn spawn(
+                &self,
+                _: crate::live_sources::SourceSpawn,
+                _: &crate::live_sources::StopRegistry,
+            ) -> Option<crate::live_sources::SpawnedProducer> {
+                None
+            }
+            fn source_removed(&self, id: &str) {
+                assert!(!self.0.remove_source(id));
+            }
+        }
+        let handle = AudioControlHandle::new();
+        let guard = handle.consumer_guard();
+        for n in 0..multiview_config::MAX_ADMITTED_SOURCES {
+            assert!(handle.push_member(MemberChange::Leave {
+                id: format!("removed-{n:04}"),
+            }));
+        }
+        let registry = crate::live_sources::stop_registry();
+        let preview = crate::live_sources::shared_stores(std::collections::HashMap::new());
+        let hub = crate::live_sources::LiveSourceHub::start_with_ingest(
+            registry,
+            preview,
+            Some(Arc::new(RemoveOnHub(handle.clone()))),
+        );
+        assert_eq!(
+            hub.handle().request_teardown("hub-terminal"),
+            crate::live_sources::HubSubmit::Accepted
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            hub.shutdown();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+        assert!(!handle
+            .pending_members
+            .0
+            .lock()
+            .unwrap()
+            .changes
+            .contains_key("hub-terminal"));
+    }
+
+    #[test]
+    fn audio_control_backlog_is_bounded_when_consumer_is_wedged() {
+        let handle = AudioControlHandle::new();
+        let store = new_store();
+        let mut bus = ProgramBus::new(canonical_format(), Rational::new(25, 1));
+        let point = bus.add_source("source", Arc::clone(&store), 1.0);
+        for _ in 0..1024 {
+            handle.request_repoint(point, Arc::clone(&store), 480);
+        }
+        assert!(handle.pending_len() <= MAX_AUDIO_REPOINT_BACKLOG);
+        // Simulate a permanently wedged consumer: publishing 1024 commands
+        // above did not await it, and the independent output tick clock still
+        // advances its exact rational sample budget without applying commands.
+        let mut emitted = 0;
+        for tick in 1..=120 {
+            emitted += bus.tick_to(tick).frame_count();
+        }
+        assert_eq!(
+            u64::try_from(emitted).expect("small test sample budget"),
+            multiview_audio::cadence::SampleClock::new(48_000, Rational::new(25, 1)).total_at(120)
+        );
+    }
+}
+
 /// Everything one source needs to decode its audio on its own thread: where the
 /// audio lives (a libav-openable path or URL) and whether it is a live
 /// (never-ending) source.
@@ -81,6 +1019,62 @@ pub(crate) struct AudioIngestPlan {
     /// audio is reopened on EOF/error (a transient HLS/RTSP audio drop
     /// reconnects); a finite file plays its audio once and then rides silence.
     pub(crate) live: bool,
+    /// Exact source lifecycle shared with the video producer and fetcher.
+    pub(crate) lifecycle: u64,
+    /// Startup audio is not gated by a live-edit replacement marker.
+    pub(crate) anchor_floor: u64,
+}
+
+/// How long [`await_shared_url`] waits for the video's fetcher.
+#[derive(Debug, Clone, Copy)]
+struct SharedUrlWait {
+    /// Video has not anchored yet: it may still be fetching its first segment,
+    /// so outlast the fetcher's own first-segment deadline (40 s).
+    first_connect: Duration,
+    /// Video is already running without a fetcher entry (or is reconnecting).
+    reconnect: Duration,
+    poll: Duration,
+}
+
+impl SharedUrlWait {
+    const DEFAULT: Self = Self {
+        first_connect: Duration::from_secs(45),
+        reconnect: Duration::from_secs(10),
+        poll: Duration::from_millis(100),
+    };
+}
+
+/// Wait for the video's fetched copy of this source, so audio does not race
+/// the fetcher to the origin: the URL is registered only after the first
+/// segment is in memory, which takes seconds on a slow origin. Returns `None`
+/// (open the origin) once video has anchored without a fetcher (it fell back
+/// to libav), on `stop`, or at the deadline. Runs on the audio ingest thread,
+/// never the output clock.
+fn await_shared_url(
+    lookup: impl Fn() -> Option<String>,
+    video_generation: impl Fn() -> Option<u64>,
+    stop: &AtomicBool,
+    wait: SharedUrlWait,
+) -> Option<String> {
+    let baseline = video_generation();
+    let limit = if baseline.is_none() {
+        wait.first_connect
+    } else {
+        wait.reconnect
+    };
+    let started = Instant::now();
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Some(url) = lookup() {
+            return Some(url);
+        }
+        if video_generation() != baseline || started.elapsed() >= limit {
+            return lookup();
+        }
+        std::thread::sleep(wait.poll);
+    }
 }
 
 /// Drive a source's audio decode under the supervised-reconnect bracket: open +
@@ -98,20 +1092,118 @@ pub(crate) struct AudioIngestPlan {
 /// (invariant #10); a wedged libav network call is bounded by the supervisor's
 /// detach-on-grace teardown, exactly as for video.
 pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop: &AtomicBool) {
+    // Name this source on every line the audio thread emits: our own (the span)
+    // and libav's synchronous lines (the thread-local resource context the log
+    // bridge resolves), exactly as the video `ingest_loop` does (ADR-0060). The
+    // `rail = "audio"` field keeps the audio connection distinguishable.
+    let _span = tracing::info_span!(
+        "source",
+        resource_kind = "source",
+        resource_id = %plan.id,
+        rail = "audio",
+    )
+    .entered();
+    let _resource =
+        multiview_ffmpeg::ResourceGuard::enter(multiview_ffmpeg::ResourceContext::source(&plan.id));
     let mut attempt: u32 = 0;
     let mut jitter = JitterRng::seeded(&plan.id);
-    let location = std::path::Path::new(&plan.location);
     loop {
-        if stop.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire)
+            || (plan.lifecycle != 0 && crate::pipeline::live_lifecycle(&plan.id) != plan.lifecycle)
+        {
             return;
         }
         let started = Instant::now();
+        // An HLS master is opened as a pinned variant media playlist, exactly as
+        // the video ingest does: libav opening a master also opens its WebVTT /
+        // alternate renditions, and one bad `.vtt` makes the whole open fail
+        // ("Invalid data found"), leaving the source silent. Re-resolved on every
+        // connection (variant URIs can be session-bound). Best-effort: `None`
+        // keeps the original URL.
+        let is_hls = plan
+            .location
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|b| b.to_ascii_lowercase().ends_with(".m3u8"));
+        // Prefer the video's fetched copy (one fetch per source: audio and video
+        // read the same segments). Fall back to opening the origin when video is
+        // not on the fetcher.
+        let shared =
+            if plan.live && is_hls && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none() {
+                // Review R3-02: a non-allocating, lifecycle-checked lookup. A
+                // worker whose lifecycle has already been retired (a race with
+                // `remove_live_lifecycle` between the loop-top check above and
+                // this lookup) must never recreate the slot that removal just
+                // dropped — `None` here means "already gone", not "not yet
+                // created", so it is read as no video anchor, never allocated.
+                let slot =
+                    crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle);
+                await_shared_url(
+                    || crate::hls_fetch::shared_url(&plan.id, plan.lifecycle),
+                    || {
+                        slot.as_ref()
+                            .and_then(|slot| slot.load())
+                            .filter(|a| a.raw_pts0_ns.is_some() && a.generation > plan.anchor_floor)
+                            .map(|a| a.generation)
+                    },
+                    stop,
+                    SharedUrlWait::DEFAULT,
+                )
+            } else {
+                None
+            };
+        let shared_fetch = shared.is_some();
+        let pinned = if shared.is_some() {
+            shared
+        } else if plan.live && is_hls {
+            crate::pipeline::resolve_hls_audio_url(&plan.location)
+        } else {
+            None
+        };
+        tracing::info!(
+            source = %plan.id,
+            location = %pinned.as_deref().unwrap_or(&plan.location),
+            shared_fetch,
+            "live audio: opening"
+        );
+        let location = std::path::Path::new(pinned.as_deref().unwrap_or(&plan.location));
         // One connection's worth of decode. `audio_decode_loop` opens the decoder
         // on THIS thread (libav contexts are not `Send`), publishes every decoded
         // block, and returns on stop / EOF / open-or-decode error — logging the
         // fault itself. A no-audio source returns immediately (open finds no audio
         // stream); its tile then simply rides silence.
-        audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
+        if plan.live && store.is_timeline() {
+            // Locked to vision: place by the video's PTS → output mapping.
+            // Review R3-02: the same non-allocating, lifecycle-checked lookup
+            // as above. `None` here means THIS worker's lifecycle has already
+            // been retired (raced with `remove_live_lifecycle` between the
+            // loop-top check and here) — skip the decode connection entirely
+            // rather than recreate the dropped slot; the loop-top check on the
+            // next iteration returns.
+            if let Some(slot) =
+                crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle)
+            {
+                multiview_audio::store::audio_decode_loop_anchored(
+                    location,
+                    ChannelLayout::Stereo,
+                    store,
+                    stop,
+                    &|| {
+                        if plan.lifecycle == 0
+                            || crate::pipeline::live_lifecycle(&plan.id) == plan.lifecycle
+                        {
+                            video_anchor(&slot, plan.anchor_floor)
+                        } else {
+                            None
+                        }
+                    },
+                    Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
+                    &plan.id,
+                );
+            }
+        } else {
+            audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
+        }
         let ran_for = started.elapsed();
         if !plan.live || stop.load(Ordering::Acquire) {
             // A finite source has played its audio out (the store silence-fills
@@ -123,9 +1215,10 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // and reconnect — the same policy the video ingest uses.
         attempt = next_reconnect_attempt(attempt, ran_for);
         let nap = reconnect_backoff(attempt, jitter.next_unit());
-        tracing::debug!(
+        tracing::info!(
             source = %plan.id,
             attempt,
+            ?ran_for,
             ?nap,
             "reconnecting live source audio after backoff"
         );
@@ -1173,5 +2266,76 @@ mod player_audio_tests {
             "peak retained buffer {cap_frames} frames ballooned past the window {window_len} \
              (+1 block slack) — the pre-vamp_in prefix was buffered (CRITICAL-3)"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_url_wait_tests {
+    #![allow(clippy::unwrap_used)]
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::{await_shared_url, SharedUrlWait};
+
+    const FAST: SharedUrlWait = SharedUrlWait {
+        first_connect: Duration::from_millis(200),
+        reconnect: Duration::from_millis(50),
+        poll: Duration::from_millis(1),
+    };
+
+    /// The race seen live: audio asks before the fetcher has its first segment.
+    #[test]
+    fn audio_waits_for_a_fetcher_that_is_still_starting() {
+        let calls = Cell::new(0);
+        let stop = AtomicBool::new(false);
+        let url = await_shared_url(
+            || {
+                calls.set(calls.get() + 1);
+                (calls.get() > 5).then(|| "http://[::1]:1/live.m3u8".to_owned())
+            },
+            || None,
+            &stop,
+            FAST,
+        );
+        assert_eq!(url.as_deref(), Some("http://[::1]:1/live.m3u8"));
+    }
+
+    /// Video anchored with no fetcher entry: it fell back to libav, so audio
+    /// opens the origin now instead of serving out the whole wait.
+    #[test]
+    fn audio_stops_waiting_once_video_runs_without_a_fetcher() {
+        let calls = Cell::new(0u32);
+        let stop = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let url = await_shared_url(
+            || None,
+            || {
+                calls.set(calls.get() + 1);
+                (calls.get() > 3).then_some(1)
+            },
+            &stop,
+            SharedUrlWait {
+                first_connect: Duration::from_secs(30),
+                ..FAST
+            },
+        );
+        assert_eq!(url, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_wait_is_bounded_and_stops_on_request() {
+        let stop = AtomicBool::new(false);
+        assert_eq!(await_shared_url(|| None, || None, &stop, FAST), None);
+        assert_eq!(await_shared_url(|| None, || Some(4), &stop, FAST), None);
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let wait = SharedUrlWait {
+            first_connect: Duration::from_secs(30),
+            ..FAST
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(await_shared_url(|| None, || None, &stop, wait), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

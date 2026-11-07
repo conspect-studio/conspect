@@ -18,8 +18,8 @@ use multiview_core::tally::TallyState;
 use multiview_events::{Event, TallyEvent, TallyTarget};
 use serde_json::json;
 use support::{
-    body_json, delete_json, get, harness, harness_with_capacity, put_json, send, ADMIN_TOKEN,
-    OPERATOR_TOKEN, VIEWER_TOKEN,
+    body_json, delete_if_match, delete_json, get, harness, harness_with_capacity, put_json, send,
+    ADMIN_TOKEN, OPERATOR_TOKEN, TALLY_SCOPED_ADMIN_TOKEN, TALLY_SCOPED_TOKEN, VIEWER_TOKEN,
 };
 
 #[tokio::test]
@@ -302,4 +302,267 @@ async fn admin_may_set_an_override_too() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+// --- Per-object authorization (BOLA, ADR-W005/ADR-W025) ------------------
+//
+// `TALLY_SCOPED_TOKEN` is scoped to the object allowlist `["tile:2",
+// "main-profile", "in-cell"]` (see `support::seeded_keys`): it owns the tally
+// target `tile:2` (the `target_key` form `list_tally`/the override routes
+// check against), the profile id `main-profile`, and the cell `in-cell` an
+// `index_cells` rule may reference.
+
+#[tokio::test]
+async fn set_override_is_refused_for_an_out_of_scope_target() {
+    let h = harness();
+    let body = json!({ "target": { "kind": "tile", "index": 9 }, "color": "Red" });
+    let resp = send(
+        &h.router,
+        put_json("/api/v1/tally/override", TALLY_SCOPED_TOKEN, None, &body),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a scoped key must not force the lamp on a target outside its allowlist"
+    );
+}
+
+#[tokio::test]
+async fn set_override_is_allowed_for_an_in_scope_target() {
+    let mut h = harness();
+    let body = json!({ "target": { "kind": "tile", "index": 2 }, "color": "Red" });
+    let resp = send(
+        &h.router,
+        put_json("/api/v1/tally/override", TALLY_SCOPED_TOKEN, None, &body),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a scoped key must be allowed to force the lamp on its OWN allowlisted target"
+    );
+    assert_eq!(h.commands.try_drain().len(), 1);
+}
+
+#[tokio::test]
+async fn clear_override_is_refused_for_an_out_of_scope_target() {
+    let h = harness();
+    let body = json!({ "target": { "kind": "tile", "index": 9 } });
+    let resp = send(
+        &h.router,
+        delete_json("/api/v1/tally/override", TALLY_SCOPED_TOKEN, &body),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a scoped key must not clear an override on a target outside its allowlist"
+    );
+}
+
+#[tokio::test]
+async fn clear_override_is_allowed_for_an_in_scope_target() {
+    let h = harness();
+    let body = json!({ "target": { "kind": "tile", "index": 2 } });
+    let resp = send(
+        &h.router,
+        delete_json("/api/v1/tally/override", TALLY_SCOPED_TOKEN, &body),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn list_tally_filters_rows_to_the_scoped_allowlist() {
+    let h = harness();
+    let mut sub = h.engine.subscribe();
+    for index in [2_u32, 9] {
+        h.engine.publish_event(Event::TallyState(TallyEvent {
+            target: TallyTarget::Tile { index },
+            state: TallyState::program(),
+        }));
+        let step = multiview_control::tally_ingest_step(&mut sub, h.tally.as_ref()).await;
+        assert_eq!(step, multiview_control::TallyIngestStep::Applied);
+    }
+
+    let resp = send(&h.router, get("/api/v1/tally", TALLY_SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = body_json(resp).await;
+    let entries = arr.as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "a scoped key must see ONLY its allowlisted tally target (BOLA)"
+    );
+    assert_eq!(entries[0]["target"]["index"], 2);
+
+    let resp = send(&h.router, get("/api/v1/tally", ADMIN_TOKEN)).await;
+    assert_eq!(body_json(resp).await.as_array().unwrap().len(), 2);
+}
+
+fn scoped_profile_body(id: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "bit_colors": [{ "bit": 0, "color": "Red" }],
+        "index_cells": [{ "index": 0, "cell": "in-cell" }],
+    })
+}
+
+#[tokio::test]
+async fn profile_get_put_delete_are_refused_for_an_out_of_scope_id() {
+    let h = harness();
+    // Seed the out-of-scope profile as admin first.
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/tally/profiles/other-profile",
+            ADMIN_TOKEN,
+            None,
+            &scoped_profile_body("other-profile"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = send(
+        &h.router,
+        get("/api/v1/tally/profiles/other-profile", TALLY_SCOPED_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/tally/profiles/other-profile",
+            TALLY_SCOPED_TOKEN,
+            Some("W/\"1\""),
+            &scoped_profile_body("other-profile"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Use the ADMIN-rolled scoped key here so the 403 proves the OBJECT-authz
+    // check, not merely the Administer role gate a plain Operator would also
+    // fail on.
+    let resp = send(
+        &h.router,
+        delete_if_match(
+            "/api/v1/tally/profiles/other-profile",
+            TALLY_SCOPED_ADMIN_TOKEN,
+            Some("W/\"1\""),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "an admin scoped off this profile id must still be refused (BOLA, not just role)"
+    );
+}
+
+#[tokio::test]
+async fn profile_get_put_delete_are_allowed_for_an_in_scope_id() {
+    let h = harness();
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/tally/profiles/main-profile",
+            TALLY_SCOPED_TOKEN,
+            None,
+            &scoped_profile_body("main-profile"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a scoped key must be allowed to create its OWN allowlisted profile id"
+    );
+
+    let resp = send(
+        &h.router,
+        get("/api/v1/tally/profiles/main-profile", TALLY_SCOPED_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = send(
+        &h.router,
+        delete_if_match(
+            "/api/v1/tally/profiles/main-profile",
+            TALLY_SCOPED_ADMIN_TOKEN,
+            Some("W/\"1\""),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "an admin scoped to the SAME allowlist must be allowed to delete its own profile"
+    );
+}
+
+#[tokio::test]
+async fn profile_put_is_refused_when_an_index_cells_rule_references_an_out_of_scope_cell() {
+    let h = harness();
+    let body = json!({
+        "id": "main-profile",
+        "bit_colors": [],
+        "index_cells": [{ "index": 0, "cell": "other-cell" }],
+    });
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/tally/profiles/main-profile",
+            TALLY_SCOPED_TOKEN,
+            None,
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a profile binding an index to a cell outside the allowlist must be refused, \
+         even though the profile id itself is in scope"
+    );
+}
+
+#[tokio::test]
+async fn list_profiles_filters_rows_to_the_scoped_allowlist() {
+    let h = harness();
+    for id in ["main-profile", "other-profile"] {
+        let resp = send(
+            &h.router,
+            put_json(
+                &format!("/api/v1/tally/profiles/{id}"),
+                ADMIN_TOKEN,
+                None,
+                &scoped_profile_body(id),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = send(&h.router, get("/api/v1/tally/profiles", TALLY_SCOPED_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let arr = body_json(resp).await;
+    let ids: Vec<String> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["main-profile".to_owned()],
+        "a scoped key must see ONLY its allowlisted profile rows (BOLA)"
+    );
+
+    let resp = send(&h.router, get("/api/v1/tally/profiles", ADMIN_TOKEN)).await;
+    assert_eq!(body_json(resp).await.as_array().unwrap().len(), 2);
 }

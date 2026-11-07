@@ -109,8 +109,13 @@ pub struct TilesSnapshot {
 /// A high-rate audio meter sample (numeric only — never audio).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioMeter {
-    /// The track index this sample is for.
+    /// The track index this sample is for: `0` is the program bus; `1..` are the
+    /// per-input tracks (stable per run, in first-seen order).
     pub track: u32,
+    /// The source/input id this per-input sample is for; absent on the program
+    /// bus (`track == 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_id: Option<String>,
     /// Per-channel peak level (dBFS).
     pub peak_db: Vec<f32>,
     /// Per-channel RMS level (dBFS).

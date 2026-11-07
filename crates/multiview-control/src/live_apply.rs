@@ -25,6 +25,9 @@ pub struct LiveApplyCaps {
     /// this run path: every overlay mutation is `restart` and no overlay
     /// command is enqueued.
     pub overlays: Option<OverlayLiveCapability>,
+    /// The audio-routing live-apply capability. [`None`] ⇒ no running program
+    /// bus on this run path: a routing PUT is stored and declares `restart`.
+    pub audio_routing: Option<AudioRoutingLiveCapability>,
 }
 
 impl LiveApplyCaps {
@@ -34,12 +37,23 @@ impl LiveApplyCaps {
         self.overlays = Some(capability);
         self
     }
+
+    /// Declare the audio-routing live-apply capability (builder-style).
+    #[must_use]
+    pub fn with_audio_routing(mut self, capability: AudioRoutingLiveCapability) -> Self {
+        self.audio_routing = Some(capability);
+        self
+    }
 }
 
 impl fmt::Debug for LiveApplyCaps {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveApplyCaps")
             .field("overlays", &self.overlays.as_ref().map(|_| "live"))
+            .field(
+                "audio_routing",
+                &self.audio_routing.as_ref().map(|_| "live"),
+            )
             .finish()
     }
 }
@@ -82,6 +96,46 @@ impl OverlayLiveCapability {
 impl fmt::Debug for OverlayLiveCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OverlayLiveCapability(<predicate>)")
+    }
+}
+
+/// The audio-routing live-apply capability: a binary-injected **apply** hook
+/// over a validated `[audio]` document.
+///
+/// The hook hands the document to the running program bus's bounded,
+/// consumer-polled control mailbox (never the bus itself — the bake consumer
+/// applies it at its next tick, ramped) and returns whether the running engine
+/// can honour it live. `false` (no program bus running, a changed sample rate,
+/// a mixed input with no audio store) ⇒ the stored document waits for a
+/// restart and the response says `restart`. The hook must be wait-free: it is
+/// called from an HTTP handler and must never block or await the engine
+/// (invariant #10).
+#[derive(Clone)]
+pub struct AudioRoutingLiveCapability {
+    apply: Arc<dyn Fn(&multiview_config::AudioRouting) -> bool + Send + Sync>,
+}
+
+impl AudioRoutingLiveCapability {
+    /// Wrap the binary's apply hook.
+    #[must_use]
+    pub fn new(
+        apply: impl Fn(&multiview_config::AudioRouting) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            apply: Arc::new(apply),
+        }
+    }
+
+    /// Hand `routing` to the running engine; `true` iff it applies live.
+    #[must_use]
+    pub fn apply(&self, routing: &multiview_config::AudioRouting) -> bool {
+        (self.apply)(routing)
+    }
+}
+
+impl fmt::Debug for AudioRoutingLiveCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AudioRoutingLiveCapability(<hook>)")
     }
 }
 

@@ -111,13 +111,14 @@ describe('<PreviewSurface>', () => {
       />,
     );
     expect(getByTestId('jpeg-rung')).toBeInTheDocument();
-    // No degradation: JPEG is the deployment's primary, not a fallback.
+    // A primary still preview is labeled too; it is not live video.
+    expect(getByTestId('still-preview-label')).toHaveTextContent('Still preview (~1 fps)');
     expect(queryByTestId('fallback-badge')).toBeNull();
     // The WHEP player was never mounted.
     expect(queryByTestId('whep-player')).toBeNull();
   });
 
-  it('renders the JPEG rung with NO badge when the scope advertises no whep', () => {
+  it('renders the JPEG rung with NO badge for an input scope that advertises no whep (honest primary)', () => {
     const { getByTestId, queryByTestId } = renderWithProviders(
       <PreviewSurface
         scope="input"
@@ -134,6 +135,8 @@ describe('<PreviewSurface>', () => {
       />,
     );
     expect(getByTestId('jpeg-rung')).toBeInTheDocument();
+    expect(getByTestId('still-preview-label')).toHaveTextContent('Still preview (~1 fps)');
+    expect(queryByTestId('input-preview-unavailable')).toBeNull();
     expect(queryByTestId('fallback-badge')).toBeNull();
   });
 
@@ -171,7 +174,8 @@ describe('<PreviewSurface>', () => {
     });
     expect(getByTestId('jpeg-rung')).toBeInTheDocument();
 
-    // The retry affordance re-arms a fresh WHEP attempt.
+    // Wait for the rejected POST and player cleanup before retrying.
+    await waitFor(() => expect(getByRole('button', { name: /retry live preview/i })).toBeInTheDocument());
     act(() => {
       fireEvent.click(getByRole('button', { name: /retry live preview/i }));
     });

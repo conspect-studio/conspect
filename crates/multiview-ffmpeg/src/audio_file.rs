@@ -34,13 +34,19 @@ use ffmpeg::util::frame::Audio;
 use ffmpeg::ChannelLayout;
 use ffmpeg_next as ffmpeg;
 
-use multiview_core::time::{MediaTime, Rational};
+use multiview_core::time::MediaTime;
 
 use crate::convert::MediaKind;
 use crate::decode_stream::StreamAudioDecoder;
-use crate::demux::Demuxer;
+use crate::demux::{DemuxOptions, Demuxer};
 use crate::error::{FfmpegError, Result};
 use crate::resample::{ResampleSpec, Resampler};
+
+/// How long one live read may block before the input counts as dead. Longer
+/// than video's socket timeout because this also bounds a whole `av_read_frame`,
+/// which on HLS spans the playlist wait plus a segment fetch (seen at 27 s on a
+/// slow origin).
+pub const LIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One decoded + resampled audio block as pure interleaved `f32`.
 ///
@@ -93,6 +99,42 @@ pub struct AudioFileDecoder {
     finished: bool,
     /// Pending input packets have all been sent; only draining remains.
     eof_sent: bool,
+    /// Live inputs only: follow the audio onto a new stream when it moves, and
+    /// report a connection that has lost its audio ([`FfmpegError::AudioStarved`]).
+    live: bool,
+    /// Consecutive packets read since the last packet of the selected stream.
+    since_ours: u32,
+    /// Packets per other audio stream within the current `since_ours` run.
+    other_audio: Vec<(usize, u32)>,
+    /// Media time (ns) elapsed on non-audio streams since the last audio
+    /// packet, with the latest PTS per stream it was measured from.
+    quiet_ns: i64,
+    quiet_last: Vec<(usize, i64)>,
+    /// Every non-audio packet cannot reset the selected-audio starvation clock.
+    last_audio_packet: std::time::Instant,
+}
+
+/// A live audio stream that delivers no packet for this many reads while
+/// another audio stream delivers [`SWITCH_AFTER`] has moved (an ad splice or
+/// origin switch onto new PIDs).
+const SWITCH_AFTER: u32 = 100;
+
+/// Stream time (other streams' packet PTS) with no audio on any stream before a
+/// live input counts as having lost its audio. Measured in media time, not
+/// wall time or packet count, so a slow origin or a low frame rate cannot
+/// trigger it.
+const STARVED_AFTER_NS: i64 = 30_000_000_000;
+
+/// Bound selected-audio starvation even when continuing video has no usable
+/// timestamps. The per-read I/O timeout alone resets on every video packet.
+const STARVED_AFTER_WALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The largest PTS step between two packets of one stream that still counts
+/// as elapsed time (well over a frame at any rate; far under a splice).
+const MAX_PTS_STEP_NS: i64 = 1_000_000_000;
+
+fn audio_starved(media_ns: i64, elapsed: std::time::Duration) -> bool {
+    media_ns >= STARVED_AFTER_NS || elapsed >= STARVED_AFTER_WALL
 }
 
 impl AudioFileDecoder {
@@ -106,18 +148,64 @@ impl AudioFileDecoder {
     /// * [`FfmpegError::FrameMismatch`] — `target_channels` is zero, or the
     ///   stream parameters could not be resolved.
     pub fn open(path: &Path, target_rate: u32, target_channels: u16) -> Result<Self> {
+        Self::from_demuxer(Demuxer::open(path)?, target_rate, target_channels)
+    }
+
+    /// [`open`](Self::open) for a live network source: a stalled open or read
+    /// aborts with [`FfmpegError::ReadTimeout`] within [`LIVE_READ_TIMEOUT`]
+    /// instead of hanging the caller, and an `.m3u8` input also gets the video
+    /// ingest's HLS options (`seg_max_retry`, `strict`, `protocol_whitelist`).
+    ///
+    /// # Errors
+    /// As [`open`](Self::open), plus [`FfmpegError::ReadTimeout`].
+    pub fn open_live(path: &Path, target_rate: u32, target_channels: u16) -> Result<Self> {
+        let is_hls = path
+            .to_string_lossy()
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|base| base.to_ascii_lowercase().ends_with(".m3u8"));
+        let mut options = DemuxOptions::new().with_rw_timeout(LIVE_READ_TIMEOUT);
+        if is_hls {
+            options = options.with_options(&[
+                ("strict", "normal"),
+                ("seg_max_retry", "8"),
+                ("protocol_whitelist", "file,http,https,tcp,tls,crypto,data"),
+            ]);
+        }
+        let mut decoder = Self::from_demuxer(
+            Demuxer::open_with_interrupt(path, options)?,
+            target_rate,
+            target_channels,
+        )?;
+        decoder.live = true;
+        Ok(decoder)
+    }
+
+    /// Select `demuxer`'s best audio stream and build the decoder.
+    fn from_demuxer(demuxer: Demuxer, target_rate: u32, target_channels: u16) -> Result<Self> {
         if target_rate == 0 || target_channels == 0 {
             return Err(FfmpegError::FrameMismatch(
                 "target rate and channel count must be non-zero",
             ));
         }
-        let demuxer = Demuxer::open(path)?;
         let stream_index = demuxer
             .best_stream(MediaKind::Audio)
             .ok_or(FfmpegError::StreamNotFound("audio"))?;
 
-        // Find the matching stream's parameters + time-base to build the decoder.
-        let (parameters, time_base) = Self::stream_params(path, stream_index)?;
+        // Read the chosen stream's parameters + time-base from the ALREADY-OPEN
+        // demuxer. Re-opening the URL just for them (the old path) fails on
+        // session-bound live playlists (an ad-insertion origin such as AWS
+        // MediaTailor serves a variant URL once per session), leaving the source
+        // silent; it also doubled every network open.
+        let parameters = demuxer
+            .stream_parameters(stream_index)
+            .ok_or(FfmpegError::StreamNotFound("audio"))?;
+        let time_base = demuxer
+            .streams()
+            .into_iter()
+            .find(|s| s.index == stream_index)
+            .map(|s| s.time_base)
+            .ok_or(FfmpegError::StreamNotFound("audio"))?;
         let decoder = StreamAudioDecoder::new(parameters, time_base)?;
 
         let target_layout = ChannelLayout::default(i32::from(target_channels));
@@ -133,26 +221,122 @@ impl AudioFileDecoder {
             source_spec: None,
             finished: false,
             eof_sent: false,
+            live: false,
+            since_ours: 0,
+            other_audio: Vec::new(),
+            quiet_ns: 0,
+            quiet_last: Vec::new(),
+            last_audio_packet: std::time::Instant::now(),
         })
     }
 
-    /// Re-open the container briefly to read the chosen stream's codec
-    /// parameters and time-base (the [`Demuxer`] does not expose the raw
-    /// `Parameters` needed to construct a decoder).
-    fn stream_params(
-        path: &Path,
-        stream_index: usize,
-    ) -> Result<(ffmpeg::codec::Parameters, Rational)> {
-        let input = ffmpeg::format::input(&path).map_err(|source| FfmpegError::OpenInput {
-            path: path.display().to_string(),
-            source,
-        })?;
-        let stream = input
+    /// Read the next packet of the selected audio stream (live: following a
+    /// move to another audio stream), or `None` at end-of-stream.
+    fn next_audio_packet(&mut self) -> Result<Option<crate::demux::ReadPacket>> {
+        if !self.live {
+            return self.demuxer.read_packet_for(self.stream_index);
+        }
+        loop {
+            let Some(pkt) = self.demuxer.read_packet()? else {
+                return Ok(None);
+            };
+            if pkt.stream_index == self.stream_index {
+                self.since_ours = 0;
+                self.other_audio.clear();
+                self.quiet_ns = 0;
+                self.quiet_last.clear();
+                self.last_audio_packet = std::time::Instant::now();
+                return Ok(Some(pkt));
+            }
+            self.since_ours = self.since_ours.saturating_add(1);
+            let stream = self
+                .demuxer
+                .streams()
+                .into_iter()
+                .find(|st| st.index == pkt.stream_index);
+            let is_audio = stream
+                .as_ref()
+                .is_some_and(|st| st.kind == MediaKind::Audio);
+            if is_audio {
+                self.quiet_ns = 0;
+                self.quiet_last.clear();
+                let count = if let Some((_, n)) = self
+                    .other_audio
+                    .iter_mut()
+                    .find(|(i, _)| *i == pkt.stream_index)
+                {
+                    *n = n.saturating_add(1);
+                    *n
+                } else {
+                    self.other_audio.push((pkt.stream_index, 1));
+                    1
+                };
+                if count >= SWITCH_AFTER && self.switch_to(pkt.stream_index) {
+                    self.last_audio_packet = std::time::Instant::now();
+                    return Ok(Some(pkt));
+                }
+            } else if let (Some(st), Some(pts)) = (stream, pkt.pts()) {
+                let ns = multiview_core::time::rescale(
+                    pts,
+                    st.time_base,
+                    multiview_core::time::Rational::new(1, 1_000_000_000),
+                );
+                // Count only small forward steps: a PTS jump (a splice, a
+                // wrap, the next segment's offset) is not elapsed media time.
+                match self
+                    .quiet_last
+                    .iter_mut()
+                    .find(|(i, _)| *i == pkt.stream_index)
+                {
+                    Some((_, last)) => {
+                        let step = ns.saturating_sub(*last);
+                        if (0..=MAX_PTS_STEP_NS).contains(&step) {
+                            self.quiet_ns = self.quiet_ns.saturating_add(step);
+                        }
+                        *last = ns;
+                    }
+                    None => self.quiet_last.push((pkt.stream_index, ns)),
+                }
+            }
+            if audio_starved(self.quiet_ns, self.last_audio_packet.elapsed()) {
+                return Err(FfmpegError::AudioStarved {
+                    path: self.demuxer.source().to_owned(),
+                    packets: self.since_ours,
+                });
+            }
+        }
+    }
+
+    /// Move decoding onto audio stream `index`; `false` if it cannot be
+    /// decoded (the caller keeps looking).
+    fn switch_to(&mut self, index: usize) -> bool {
+        let Some(parameters) = self.demuxer.stream_parameters(index) else {
+            return false;
+        };
+        let Some(time_base) = self
+            .demuxer
             .streams()
-            .nth(stream_index)
-            .ok_or(FfmpegError::StreamNotFound("audio"))?;
-        let time_base = crate::convert::from_ff_rational(stream.time_base());
-        Ok((stream.parameters(), time_base))
+            .into_iter()
+            .find(|st| st.index == index)
+            .map(|st| st.time_base)
+        else {
+            return false;
+        };
+        let Ok(decoder) = StreamAudioDecoder::new(parameters, time_base) else {
+            return false;
+        };
+        tracing::info!(
+            from = self.stream_index,
+            to = index,
+            "live audio: audio moved to another stream; following it"
+        );
+        self.decoder = decoder;
+        self.stream_index = index;
+        self.resampler = None;
+        self.source_spec = None;
+        self.since_ours = 0;
+        self.other_audio.clear();
+        true
     }
 
     /// The target sample rate in Hz.
@@ -198,7 +382,7 @@ impl AudioFileDecoder {
 
             // Need more input: feed the next packet for our stream, or signal
             // EOF when the demuxer is exhausted.
-            if let Some(pkt) = self.demuxer.read_packet_for(self.stream_index)? {
+            if let Some(pkt) = self.next_audio_packet()? {
                 self.decoder.send_packet(&pkt.packet)?;
             } else {
                 self.decoder.send_eof()?;
@@ -309,6 +493,23 @@ pub(crate) fn interleave_fltp(frame: &Audio, channels: u16) -> Result<Vec<f32>> 
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod starvation_tests {
+    use super::*;
+
+    #[test]
+    fn continuing_video_without_timestamps_cannot_extend_selected_audio_deadline() {
+        assert!(!audio_starved(
+            0,
+            STARVED_AFTER_WALL
+                .checked_sub(std::time::Duration::from_nanos(1))
+                .unwrap()
+        ));
+        assert!(audio_starved(0, STARVED_AFTER_WALL));
+        assert!(audio_starved(STARVED_AFTER_NS, std::time::Duration::ZERO));
+    }
 }
 
 // `AudioFileDecoder` owns libav contexts that must not be shared across threads

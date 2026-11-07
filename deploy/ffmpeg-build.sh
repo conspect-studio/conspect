@@ -256,6 +256,10 @@ CONFIGURE_ARGS=(
   --enable-filter=scale,format,aformat,aresample,anull,null,fps,setpts,asetpts
   --enable-swscale --enable-swresample --enable-avfilter
   --enable-libopus --enable-libsrt --enable-gnutls
+  # zlib: HTTP gzip Content-Encoding — some HLS origins gzip their playlists;
+  # without it libav fails the fetch ("need zlib with gzip support"). zlib is
+  # zlib-licensed (permissive), so the build stays LGPL-clean.
+  --enable-zlib
 )
 
 # Hardware acceleration — both branches are LGPL-clean.

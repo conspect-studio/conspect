@@ -31,6 +31,7 @@ import type { LayoutModel } from '../model';
 import type { SourceView } from '../../resources/types';
 import { AreaMatrixEditor } from './AreaMatrixEditor';
 import { CellPropertiesPanel } from './CellPropertiesPanel';
+import { FrameRateField } from './FrameRateField';
 import { GridValidationMessage } from './validationMessages';
 import type { LayoutSavePayload } from './LayoutEditor';
 import { HelpLink } from '../../components/HelpLink';
@@ -245,7 +246,7 @@ export function GridLayoutEditor({
           />
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <Button
             type="button"
             variant="outline"
@@ -283,6 +284,13 @@ export function GridLayoutEditor({
           ) : null}
         </div>
       </div>
+      <p className="-mt-4 text-sm text-muted-foreground">
+        <Trans>
+          Save stores this layout for later use. Save &amp; apply stores it,
+          then asks the running engine to use it now. Saved layouts are not
+          separate live renderers.
+        </Trans>
+      </p>
 
       <p className="text-sm text-muted-foreground">
         <Trans>
@@ -339,21 +347,14 @@ export function GridLayoutEditor({
               }}
             />
           </div>
-          <div className="flex flex-col gap-1">
-            <Label htmlFor="grid-canvas-fps" className="text-xs">
-              <Trans>Frame rate (rational)</Trans>
-            </Label>
-            <Input
-              id="grid-canvas-fps"
-              className="w-32"
-              value={model.canvas.fps}
-              placeholder="30/1"
-              aria-invalid={errors.some((issue) => issue.path === 'canvas.fps')}
-              onChange={(event): void => {
-                editor.setCanvas({ ...model.canvas, fps: event.target.value });
-              }}
-            />
-          </div>
+          <FrameRateField
+            id="grid-canvas-fps"
+            value={model.canvas.fps}
+            invalid={errors.some((issue) => issue.path === 'canvas.fps')}
+            onChange={(fps): void => {
+              editor.setCanvas({ ...model.canvas, fps });
+            }}
+          />
         </fieldset>
 
         <fieldset className="flex flex-wrap items-end gap-3">
@@ -697,6 +698,20 @@ export function GridLayoutEditor({
                               ))}
                             </SelectContent>
                           </Select>
+                          {selectedCell.sourceId !== undefined &&
+                          !sources.some((source) => source.id === selectedCell.sourceId) ? (
+                            <p role="alert" className="text-xs text-destructive">
+                              <Trans>Missing source:</Trans>{' '}
+                              <code>{selectedCell.sourceId}</code>
+                            </p>
+                          ) : selectedCell.sourceId !== undefined ? (
+                            <p className="text-xs text-muted-foreground">
+                              <Trans>Bound source:</Trans>{' '}
+                              <span lang="" dir="auto">
+                                {sources.find((source) => source.id === selectedCell.sourceId)?.name}
+                              </span>
+                            </p>
+                          ) : null}
                         </div>
 
                         <div className="flex flex-col gap-1">

@@ -530,18 +530,15 @@ fn render_timer(
     } else {
         [0.95, 0.95, 0.95, 1.0]
     };
-    let size_px = (f32_of(count_h) / 2.5).max(8.0);
-    let run = engine
-        .rasterize_run(&text, FontFamily::Mono, size_px, rgba)
-        .map_err(cc)?;
-    let count_cy = round_to_i32(f32_of(count_top) + f32_of(count_h) / 2.0);
-    push_run_centred_at(
+    draw_fixed_mono_readout(
         &mut list,
-        &run,
-        i32_of(width) / 2,
-        count_cy,
-        OverlayColor::opaque(rgba[0], rgba[1], rgba[2]),
-    );
+        &mut engine,
+        &text,
+        width,
+        (count_top, count_h),
+        rgba,
+        Some(spec.overrun_prefix.unwrap_or("+")),
+    )?;
 
     // The overrun a11y badge (bottom band) — reads the state without colour.
     if show_badge {
@@ -632,11 +629,8 @@ fn draw_digital_readout(
     spec: ClockRender<'_>,
     now: WallTime,
 ) -> Result<(), SynthError> {
-    use multiview_compositor::overlay::subpass::OverlayColor;
-    use multiview_compositor::overlay::text::FontFamily;
     use multiview_overlay::clock::{ClockFace, ClockModel, RefSource, RefStatus, TimeRef};
 
-    let cc = |e: multiview_compositor::Error| SynthError::Compositor(e.to_string());
     // The time reference is the host system clock (free-running). The value only
     // feeds the optional a11y badge in the metadata strip (display only).
     let time_ref = TimeRef::new(RefSource::System, RefStatus::Freerun);
@@ -647,15 +641,72 @@ fn draw_digital_readout(
     };
     let model = ClockModel::new(face, spec.offset, time_ref);
     let text = model.render_digital(now).ok_or(SynthError::ClockTime)?;
-    // Size the readout to a fraction of the region height.
-    let size_px = (f32_of(region_h) / 2.5).max(8.0);
-    let color = OverlayColor::opaque(0.95, 0.95, 0.95);
-    let run = engine
-        .rasterize_run(&text, FontFamily::Mono, size_px, [0.95, 0.95, 0.95, 1.0])
+    draw_fixed_mono_readout(
+        list,
+        engine,
+        &text,
+        width,
+        (top, region_h),
+        [0.95, 0.95, 0.95, 1.0],
+        None,
+    )?;
+    Ok(())
+}
+
+/// Place the complete monospaced readout on a fixed logical advance, not on
+/// the changing ink rectangle. The run's advance includes uninked whitespace;
+/// reserve the configured overrun sign in the same slot even before target.
+/// The width check uses the actual formatted string and its font metrics, so
+/// long hour/day fields and narrow tiles fit without a fixed-width assumption.
+#[cfg(feature = "overlay")]
+fn draw_fixed_mono_readout(
+    list: &mut multiview_compositor::overlay::subpass::OverlayDrawList,
+    engine: &mut multiview_compositor::overlay::text::TextEngine,
+    text: &str,
+    width: u32,
+    region: (u32, u32),
+    rgba: [f32; 4],
+    overrun_prefix: Option<&str>,
+) -> Result<(), SynthError> {
+    use multiview_compositor::overlay::subpass::OverlayColor;
+    use multiview_compositor::overlay::text::FontFamily;
+
+    let (top, region_h) = region;
+    let cc = |e: multiview_compositor::Error| SynthError::Compositor(e.to_string());
+    let reserved = match overrun_prefix {
+        Some(prefix) if !prefix.is_empty() && !text.starts_with(prefix) => {
+            format!("{}{}", " ".repeat(prefix.chars().count()), text)
+        }
+        _ => text.to_owned(),
+    };
+    let available = width.saturating_sub(4).max(1);
+    let mut size_px = (f32_of(region_h) / 2.5).max(1.0);
+    let mut run = engine
+        .rasterize_run(&reserved, FontFamily::Mono, size_px, rgba)
         .map_err(cc)?;
-    let cx = round_to_i32(f32_of(width) / 2.0);
-    let cy = round_to_i32(f32_of(top) + f32_of(region_h) / 2.0);
-    push_run_centred_at(list, &run, cx, cy, color);
+    // The first rasterization is the normal path. Only a narrow or unusually
+    // long readout needs a second pass at a smaller font size.
+    let ink_width = run_bbox(&run).map_or(0, |(_, _, right, _)| right.max(0));
+    let occupied = run
+        .advance_width()
+        .max(u32_to_f32(ink_width.unsigned_abs()));
+    if occupied > f32_of(available) {
+        size_px = (size_px * f32_of(available) / occupied * 0.95).max(1.0);
+        run = engine
+            .rasterize_run(&reserved, FontFamily::Mono, size_px, rgba)
+            .map_err(cc)?;
+    }
+    let left = round_to_i32((f32_of(width) - run.advance_width()) / 2.0);
+    // cosmic-text places every run against the same size-dependent baseline.
+    // Do not recalculate its y-offset from digit-specific ink bounds.
+    let baseline = round_to_i32(f32_of(top) + (f32_of(region_h) - size_px) / 2.0);
+    push_run_offset(
+        list,
+        &run,
+        left,
+        baseline,
+        OverlayColor::opaque(rgba[0], rgba[1], rgba[2]),
+    );
     Ok(())
 }
 
@@ -919,6 +970,25 @@ pub fn generator_loop(
     cadence: Rational,
     stop: &AtomicBool,
 ) {
+    generator_loop_fenced(kind, store, width, height, canvas, cadence, stop, None);
+}
+
+/// Live generator with a producer lifecycle token; stale detached writers
+/// cannot publish into a replacement's reused tile store.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+// reason: this is the original generator's positional call plus one lifecycle
+// option; the thread owns its kind, and keeping the wrapper preserves existing
+// startup producers and their public API.
+pub(crate) fn generator_loop_fenced(
+    kind: SyntheticKind,
+    store: &TileStore<Nv12Image>,
+    width: u32,
+    height: u32,
+    canvas: CanvasColor,
+    cadence: Rational,
+    stop: &AtomicBool,
+    lifecycle: Option<(&str, u64)>,
+) {
     let interval = tick_interval(cadence);
     let start = Instant::now();
     // (render-key, frame) so a clock re-renders once a second and statics once.
@@ -948,7 +1018,19 @@ pub fn generator_loop(
         };
         let elapsed = Instant::now().saturating_duration_since(start);
         let at = MediaTime::from_nanos(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX));
-        store.publish_arc(frame, at);
+        #[cfg(feature = "ffmpeg")]
+        if let Some((id, epoch)) = lifecycle {
+            if !crate::pipeline::publish_live_synth_frame_for(id, epoch, store, frame, at) {
+                return;
+            }
+        } else {
+            store.publish_arc(frame, at);
+        }
+        #[cfg(not(feature = "ffmpeg"))]
+        {
+            let _ = lifecycle;
+            store.publish_arc(frame, at);
+        }
         sleep_until(interval, stop);
     }
 }
@@ -1529,6 +1611,389 @@ segment_ms = 1000
             after.y_plane(),
             "the overrun frame (prefix + OVER badge) differs from the pre-target frame"
         );
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn timer_digits_keep_fixed_slots_and_fit_tile() {
+        use multiview_compositor::overlay::subpass::OverlayDrawList;
+        use multiview_compositor::overlay::text::TextEngine;
+
+        let cad = Rational { num: 25, den: 1 };
+        let target = 14 * 3600 + 30 * 60;
+        let values = [12 * 3600 + 18 * 60 + 30, 11 * 3600 + 11 * 60 + 11, 0];
+        for (width, height) in [(320, 120), (100, 120), (64, 34), (140, 42)] {
+            let mut starts = Vec::new();
+            for seconds in values {
+                let kind = timer_kind(TimerFormat::HhMmSs, TimerOnTarget::Hold);
+                let rendered = render_at(
+                    &kind,
+                    width,
+                    height,
+                    canvas(),
+                    WallTime::from_unix_seconds(target - seconds),
+                    0,
+                    cad,
+                )
+                .expect("render timer at each duration and tile size");
+                assert_eq!(rendered.width(), width);
+                // Inspect the readout glyph positions, not the moving ink edges.
+                let mut list = OverlayDrawList::new();
+                let mut engine = TextEngine::new().expect("font");
+                let formatted = format!(
+                    "{:02}:{:02}:{:02}",
+                    seconds / 3600,
+                    (seconds / 60) % 60,
+                    seconds % 60
+                );
+                draw_fixed_mono_readout(
+                    &mut list,
+                    &mut engine,
+                    &formatted,
+                    width,
+                    (0, height),
+                    [0.95; 4],
+                    Some("+"),
+                )
+                .expect("layout timer");
+                let glyphs: Vec<_> = list
+                    .primitives
+                    .iter()
+                    .filter_map(|p| match p {
+                        multiview_compositor::overlay::subpass::OverlayPrimitive::Glyph {
+                            dest_x,
+                            dest_y,
+                            width: glyph_w,
+                            height: glyph_h,
+                            ..
+                        } => Some((*dest_x, *dest_y, *glyph_w, *glyph_h)),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    glyphs.iter().all(|(x, y, w, h)| *x >= 0
+                        && *y >= 0
+                        && x.saturating_add(i32_of(*w)) <= i32_of(width)
+                        && y.saturating_add(i32_of(*h)) <= i32_of(height)),
+                    "readout clipped at {width}x{height}: {glyphs:?}"
+                );
+                starts.push(glyphs.iter().map(|g| g.0).min().expect("ink"));
+            }
+            assert!(
+                starts.iter().all(|x| *x >= 0),
+                "left edge must fit: {starts:?}"
+            );
+            assert!(
+                starts.windows(2).all(|pair| (pair[0] - pair[1]).abs() <= 2),
+                "digit slots shift: {starts:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn every_timer_digit_and_colon_uses_a_stable_slot_with_reserved_sign() {
+        use multiview_compositor::overlay::subpass::{OverlayDrawList, OverlayPrimitive};
+        use multiview_compositor::overlay::text::TextEngine;
+        for (width, height) in [(320, 120), (100, 120), (64, 34), (140, 42)] {
+            let positions = |value: &str| {
+                let mut engine = TextEngine::new().expect("font");
+                let mut list = OverlayDrawList::new();
+                draw_fixed_mono_readout(
+                    &mut list,
+                    &mut engine,
+                    value,
+                    width,
+                    (0, height),
+                    [0.95; 4],
+                    Some("+"),
+                )
+                .expect("timer readout");
+                list.primitives
+                    .iter()
+                    .filter_map(|p| match p {
+                        OverlayPrimitive::Glyph {
+                            dest_x,
+                            dest_y,
+                            width: glyph_w,
+                            height: glyph_h,
+                            ..
+                        } => {
+                            assert!(*dest_x >= 0 && *dest_y >= 0);
+                            assert!(dest_x.saturating_add(i32_of(*glyph_w)) <= i32_of(width));
+                            assert!(dest_y.saturating_add(i32_of(*glyph_h)) <= i32_of(height));
+                            Some(*dest_x)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let base = positions("12:18:30");
+            for value in ["11:11:11", "00:00:00"] {
+                let next = positions(value);
+                assert_eq!(
+                    base.len(),
+                    8,
+                    "two digits per field and both colons at {width}"
+                );
+                assert_eq!(next.len(), base.len());
+                for (slot, (a, b)) in base.iter().zip(next.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 2,
+                        "slot {slot} moved for {value} at {width}: {base:?} vs {next:?}"
+                    );
+                }
+            }
+            let overrun = positions("+12:18:30");
+            assert_eq!(overrun.len(), base.len() + 1, "one visible sign");
+            for (slot, (before, after)) in base.iter().zip(overrun[1..].iter()).enumerate() {
+                assert!(
+                    (before - after).abs() <= 2,
+                    "sign changed slot {slot} at {width}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn full_timer_readout_is_visible_in_rendered_pixels_and_png() {
+        let (width, height) = (320, 120);
+        let kind = timer_kind(TimerFormat::HhMmSs, TimerOnTarget::Hold);
+        let seconds = 12 * 3600 + 18 * 60 + 30;
+        let target = 14 * 3600 + 30 * 60;
+        let image = render_at(
+            &kind,
+            width,
+            height,
+            canvas(),
+            WallTime::from_unix_seconds(target - seconds),
+            0,
+            Rational::new(25, 1),
+        )
+        .expect("full timer render");
+        let blank = Nv12Image::solid_rgb(width, height, 8, 8, 12, canvas()).expect("background");
+        // Count every non-background luma pixel across the full readout band;
+        // both edges and the centre must contain visible text, not a cropped substring.
+        let y = image.y_plane();
+        let bg = blank.y_plane();
+        let bands = [(35, 105), (105, 160), (160, 215), (215, 285)];
+        for (left, right) in bands {
+            let pixels = (30..90_u32)
+                .flat_map(|row| {
+                    (left..right).filter_map(move |col| usize::try_from(row * width + col).ok())
+                })
+                .filter(|&offset| y.get(offset) != bg.get(offset))
+                .count();
+            assert!(
+                pixels > 10,
+                "rendered timer readout has no ink in {left}..{right}"
+            );
+        }
+        // Encode the Y plane as an in-process grayscale PNG artifact (no
+        // external `ffmpeg`/`convert` binary): the "feature-gated clippy
+        // (multiview-cli, overlay)" CI leg intentionally runs on a bare
+        // runner with no FFmpeg CLI installed (.github/workflows/ci.yml), so
+        // a prior version of this test that shelled out to `ffmpeg` failed
+        // there with `NotFound`. The pixel-visibility assertions above
+        // already prove the readout renders; this just also proves the Y
+        // plane survives a real PNG round-trip with visible ink.
+        let dir = tempfile::tempdir().expect("image directory");
+        let path = dir.path().join("timer-full-readout.png");
+        write_grayscale_png(&path, width, height, y).expect("write PNG");
+        let metadata = std::fs::metadata(&path).expect("PNG artifact");
+        assert!(
+            metadata.len() > 1_000,
+            "full readout PNG must contain visible pixels"
+        );
+        let decoded = read_grayscale_png(&path).expect("read back PNG");
+        assert_eq!(decoded, y, "PNG round-trip must preserve the Y plane");
+    }
+
+    /// Write `pixels` (one `u8` luma sample per pixel, row-major) as a minimal
+    /// valid 8-bit grayscale PNG at `path`. Pure Rust (`flate2`'s zlib
+    /// deflate), no external encoder process — the "feature-gated clippy
+    /// (multiview-cli, overlay)" CI leg runs on a bare runner with no
+    /// `ffmpeg`/`convert` binary installed.
+    #[cfg(feature = "overlay")]
+    fn write_grayscale_png(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> std::io::Result<()> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let width_usize = usize::try_from(width).expect("width fits usize");
+        let height_usize = usize::try_from(height).expect("height fits usize");
+        assert_eq!(pixels.len(), width_usize * height_usize);
+
+        // Scanlines, each prefixed with filter-type byte 0 (None).
+        let mut raw = Vec::with_capacity(pixels.len() + height_usize);
+        for row in 0..height_usize {
+            raw.push(0u8);
+            let start = row * width_usize;
+            raw.extend_from_slice(&pixels[start..start + width_usize]);
+        }
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::fast());
+        zlib.write_all(&raw)?;
+        let idat = zlib.finish()?;
+
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]); // bit depth 8, grayscale, defaults
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])?;
+        write_png_chunk(&mut file, *b"IHDR", &ihdr)?;
+        write_png_chunk(&mut file, *b"IDAT", &idat)?;
+        write_png_chunk(&mut file, *b"IEND", &[])?;
+        Ok(())
+    }
+
+    /// Read back a grayscale PNG written by [`write_grayscale_png`] and
+    /// return its pixel bytes, row-major. Minimal reader matching the exact
+    /// writer above (no filter other than `None`, no interlace); proves the
+    /// written file is a genuine, decodable PNG rather than asserting on
+    /// byte length alone.
+    #[cfg(feature = "overlay")]
+    fn read_grayscale_png(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+
+        let bytes = std::fs::read(path)?;
+        assert_eq!(
+            &bytes[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        let mut pos = 8;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut idat = Vec::new();
+        while pos < bytes.len() {
+            let len = usize::try_from(u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()))
+                .expect("chunk length fits usize");
+            let kind = &bytes[pos + 4..pos + 8];
+            let data = &bytes[pos + 8..pos + 8 + len];
+            match kind {
+                b"IHDR" => {
+                    width = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                    height = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                }
+                b"IDAT" => idat.extend_from_slice(data),
+                b"IEND" => break,
+                _ => {}
+            }
+            pos += 8 + len + 4; // length + kind + data + crc
+        }
+        let mut decoder = ZlibDecoder::new(idat.as_slice());
+        let mut raw = Vec::new();
+        decoder.read_to_end(&mut raw)?;
+        let width_usize = usize::try_from(width).expect("width fits usize");
+        let height_usize = usize::try_from(height).expect("height fits usize");
+        let mut pixels = Vec::with_capacity(width_usize * height_usize);
+        let stride = width_usize + 1;
+        for row in 0..height_usize {
+            let start = row * stride;
+            pixels.extend_from_slice(&raw[start + 1..start + stride]);
+        }
+        Ok(pixels)
+    }
+
+    /// Append one length-prefixed, CRC32-checked PNG chunk to `out`.
+    #[cfg(feature = "overlay")]
+    fn write_png_chunk(
+        out: &mut impl std::io::Write,
+        kind: [u8; 4],
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let len = u32::try_from(data.len()).expect("PNG chunk length fits u32");
+        out.write_all(&len.to_be_bytes())?;
+        out.write_all(&kind)?;
+        out.write_all(data)?;
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(&kind);
+        crc_input.extend_from_slice(data);
+        out.write_all(&crc32(&crc_input).to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Standard IEEE CRC-32 (the PNG chunk checksum), computed without a
+    /// dependency: a fresh table built from the fixed polynomial every call is
+    /// cheap at the tiny chunk sizes this test writes.
+    #[cfg(feature = "overlay")]
+    fn crc32(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (n, slot) in table.iter_mut().enumerate() {
+            let mut c = u32::try_from(n).expect("table index fits u32");
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *slot = c;
+        }
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            let idx =
+                usize::try_from((crc ^ u32::from(byte)) & 0xFF).expect("byte index fits usize");
+            crc = table[idx] ^ (crc >> 8);
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn long_timer_formats_and_clock_fit_narrow_cells() {
+        use multiview_compositor::overlay::subpass::{OverlayDrawList, OverlayPrimitive};
+        use multiview_compositor::overlay::text::TextEngine;
+
+        for (width, height) in [(64, 34), (100, 120), (280, 36)] {
+            for text in [
+                "123:12:18:30",
+                "123456:18:30",
+                "123d 12:18:30",
+                "+123456:18:30",
+                "12:18:30 PM",
+            ] {
+                let mut list = OverlayDrawList::new();
+                let mut engine = TextEngine::new().expect("font");
+                draw_fixed_mono_readout(
+                    &mut list,
+                    &mut engine,
+                    text,
+                    width,
+                    (0, height),
+                    [0.95; 4],
+                    None,
+                )
+                .expect("long readout");
+                assert!(!list.is_empty(), "{text} did not draw");
+                for primitive in list.primitives {
+                    if let OverlayPrimitive::Glyph {
+                        dest_x,
+                        dest_y,
+                        width: w,
+                        height: h,
+                        ..
+                    } = primitive
+                    {
+                        assert!(
+                            dest_x >= 0
+                                && dest_y >= 0
+                                && dest_x.saturating_add(i32_of(w)) <= i32_of(width)
+                                && dest_y.saturating_add(i32_of(h)) <= i32_of(height),
+                            "{text} clipped in {width}x{height}: ({dest_x},{dest_y},{w},{h})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(feature = "overlay")]

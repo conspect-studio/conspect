@@ -93,6 +93,33 @@ fn encodes_frames_into_packets_with_carried_timestamps() {
     assert!(saw_pts, "encoded packets carry presentation timestamps");
 }
 
+#[cfg(feature = "gpl-codecs")]
+#[test]
+fn preview_h264_sps_matches_baseline_level_31() {
+    // This path requires an available encoder, not a GPU. The GPL feature only
+    // permits testing a system-provided libx264; it never enables it by default.
+    if ffmpeg::encoder::find_by_name("libx264").is_none() {
+        return;
+    }
+    let options = multiview_ffmpeg::preview_h264_options("libx264", Rational::new(25, 1));
+    let mut encoder = VideoEncoder::new_with_options(&target("libx264"), &options)
+        .expect("open baseline preview");
+    encoder.send_frame(&gray_yuv420p(0)).expect("encode");
+    let packet = encoder
+        .receive_packet()
+        .expect("receive")
+        .expect("zero latency packet");
+    let bytes = packet.data().expect("encoded data");
+    let sps = bytes
+        .windows(4)
+        .position(|window| window == [0, 0, 1, 0x67])
+        .map(|offset| &bytes[offset + 4..])
+        .expect("Annex B SPS");
+    assert_eq!(sps[0], 66, "baseline profile_idc");
+    assert_eq!(sps[1] & 0xc0, 0xc0, "constrained baseline flags");
+    assert_eq!(sps[2], 31, "level 3.1");
+}
+
 #[test]
 fn video_encoder_is_send() {
     fn assert_send<T: Send>() {}

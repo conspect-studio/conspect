@@ -122,6 +122,9 @@ pub async fn bind_and_serve<F>(
     // (backs `GET /config/boot-model` + the revert/promote actions); `None`
     // for store-only/`--ticks` runs (those routes report `modeled: false`).
     boot_model: Option<Arc<multiview_control::boot_model::BootModel>>,
+    // Read-only source event snapshots from the running pipeline. `None` keeps
+    // the default unavailable provider for run paths without an event runtime.
+    source_events: Option<crate::source_event_runtime::RuntimeReader>,
     shutdown: F,
 ) -> std::io::Result<(SocketAddr, JoinHandle<std::io::Result<()>>, AppState)>
 where
@@ -231,6 +234,26 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    if let Some(reader) = source_events {
+        state = state.with_source_events(Arc::new(reader));
+    }
+    // Stored layouts persist across restarts (#176): seeding installs a fresh
+    // in-memory store holding the config's working layout; move that layout into
+    // the persistent store (if any) and serve from it.
+    state.repository = persist_layouts(&state.repository, boot_model.as_deref()).await;
+    if let Some(model) = boot_model.as_ref() {
+        if let Some(desired) = multiview_control::boot_model::load_desired(model.boot_path())
+            .map_err(std::io::Error::other)?
+        {
+            // Names and ETags continue from accepted intent; reseeding would
+            // restart every counter at 1 and let a stale tag match again.
+            state = multiview_control::boot_model::restore_accepted_stores(state, &desired)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        model
+            .restore_desired_layout_id()
+            .map_err(std::io::Error::other)?;
+    }
     if let Some(whep) = whep {
         state = state.with_whep(whep);
     }
@@ -385,6 +408,8 @@ where
     // handle — promote there correctly skips suppression (nothing to suppress).
     if state.boot_model.is_some() {
         state.install_watch_handle(multiview_control::config_watch::ConfigWatchHandle::new());
+        // Boot is a repair point: a fault that outlived the last run heals here.
+        multiview_control::layout_projection::request(&state);
     }
     let mut app = multiview_control::router(state.clone());
     for mount in hls_mounts(config) {
@@ -745,10 +770,33 @@ pub fn cast_delivery(
             );
             continue;
         };
+        // A configured discrete track has a separate audio-only rendition.
+        // Cast LOAD must use the master to expose its player audio menu;
+        // the legacy media playlist stays reachable unchanged.
+        let selectable = config
+            .outputs
+            .iter()
+            .find(|output| output.id() == mount.output_id)
+            .and_then(multiview_config::Output::audio)
+            .is_some_and(|selection| {
+                let names: Vec<&str> = config
+                    .audio
+                    .as_ref()
+                    .map(|audio| {
+                        audio
+                            .routes
+                            .iter()
+                            .filter_map(|route| route.target_track.as_deref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                !selection.resolve(&names).1.is_empty()
+            });
+        let playback = if selectable { "master.m3u8" } else { &playlist };
         delivery.insert(
             &mount.output_id,
             CastMediaTarget {
-                url: base.join(&mount.route, &playlist),
+                url: base.join(&mount.route, playback),
                 format: HlsSegmentFormat::MpegTs,
             },
         );
@@ -895,6 +943,7 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
         .map(|(id, &state)| (id.as_str(), state))
         .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let offsets = crate::av_sync::offsets();
     let tiles: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(id, state)| {
@@ -904,7 +953,14 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
             // plane skips rather than panicking on the publish path.
             let state = serde_json::to_value(multiview_events::LifecycleState::from(state))
                 .unwrap_or(serde_json::Value::Null);
-            serde_json::json!({ "id": id, "state": state })
+            let mut tile = serde_json::json!({ "id": id, "state": state });
+            // On-air lip-sync error of a live source (video raw PTS − audio raw
+            // PTS at the same output instant, ms; + = audio late). Absent until
+            // measured.
+            if let (Some(o), Some(obj)) = (offsets.get(id), tile.as_object_mut()) {
+                obj.insert("av_offset_ms".to_owned(), serde_json::json!(o));
+            }
+            tile
         })
         .collect();
     obj.insert("tiles".to_owned(), serde_json::Value::Array(tiles));
@@ -1013,11 +1069,10 @@ fn resolve_and_apply(config: &MultiviewConfig, drive: &mut CompositorDrive<Nv12I
 ///   [`SubtitleLayer::repoint`](multiview_overlay::SubtitleLayer) the
 ///   [`RouteApplier`] drives in-engine). Without a seam (the software-engine path,
 ///   which renders no subtitles) the route is a logged held action, never a panic.
-/// * [`Command::RouteAudio`] desugars to [`RouteIntent::Audio`] but the run path
-///   wires **no per-source audio crosspoint** yet (program audio is silence —
-///   there is no per-source `AudioStore` to re-point onto, the run-side audio
-///   ingest is RT-5/RT-8b, unbuilt). It is therefore a **surfaced** held action
-///   (`tracing::warn!` naming the missing crosspoint), never a silent drop.
+/// * [`Command::RouteAudio`] resolves a configured channel and source's live
+///   audio store, then publishes to the bounded audio control slot. The consumer
+///   calls `ProgramBus::repoint_crossfade` before the next audio tick. Without
+///   program audio or a known store/target, it is a logged held action.
 /// * [`Command::ApplyLayout`] **with a route-resolved document** (ADR-W019)
 ///   swaps the STORED layout in at the frame boundary — geometry, bindings,
 ///   cell ids, and per-cell `on_loss` slates — in O(cells) with no I/O and no
@@ -1104,6 +1159,27 @@ pub fn command_drain_with_live_sources_and_players(
     }
 }
 
+/// Build the non-overlay full run with its live audio slot as well as source
+/// and player seams. The legacy form remains for software-only callers.
+#[cfg(feature = "ffmpeg")]
+#[allow(clippy::implicit_hasher)]
+pub fn command_drain_with_audio_and_players(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_audio_route(audio_route)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
 /// Build the per-tick control hook **with the live overlay seam** (ADR-W022)
 /// threaded in, so `UpsertOverlay`/`RemoveOverlay` apply to the running
 /// engine: the drain mirrors the document into the working overlay set and
@@ -1148,7 +1224,7 @@ pub fn command_drain_with_live_overlays(
 /// rendering) wires the plain [`command_drain`].
 // The player-mailbox map always originates from `Pipeline::player_mailboxes()`
 // (the default hasher); generalizing over the hasher buys no caller anything.
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
 pub fn command_drain_with_seams(
     commands: CommandReceiver,
@@ -1157,7 +1233,10 @@ pub fn command_drain_with_seams(
     subtitle_route: Arc<
         multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>,
     >,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     overlays: crate::live_overlays::OverlayApplySlot,
+    tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    audio_free: crate::pipeline::AudioFreeSources,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<
         String,
@@ -1166,7 +1245,10 @@ pub fn command_drain_with_seams(
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
         .with_subtitle_route(subtitle_route)
+        .with_audio_route(audio_route)
         .with_live_overlays(overlays)
+        .with_tile_spec_apply(tiles)
+        .with_audio_free_sources(audio_free)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
     move |drive: &mut CompositorDrive<Nv12Image>| {
@@ -1232,8 +1314,8 @@ fn map_transport_verb(
 ///   (RT-6);
 /// * **subtitle** → the run's live [`SubtitleRouteHandle`](crate::captions::SubtitleRouteHandle)
 ///   seam (RT-10b), when one is threaded in via [`command_drain_with_seams`];
-/// * **audio** → a surfaced held action (the run wires no per-source audio
-///   crosspoint yet — RT-5/RT-8b), never a silent drop.
+/// * **audio** → a bounded, wait-free audio mailbox drained by the bake consumer
+///   immediately before the next sample-aligned `ProgramBus` tick.
 ///
 /// Geometry-changing commands (`ApplyLayout`) still re-solve, exactly as before.
 pub struct CommandDrain {
@@ -1257,6 +1339,10 @@ pub struct CommandDrain {
     subtitle_route: Option<
         Arc<multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>>,
     >,
+    /// Non-blocking audio re-point seam, published at run startup.
+    #[cfg(feature = "ffmpeg")]
+    audio_route:
+        Option<Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>>,
     /// The live-source producer seam (ADR-W018), when wired
     /// ([`command_drain_with_live_sources`] / [`command_drain_with_seams`]): the
     /// bounded, non-blocking handle to the off-thread
@@ -1270,6 +1356,12 @@ pub struct CommandDrain {
     /// state from. `None` ⇒ `UpsertOverlay`/`RemoveOverlay` are surfaced held
     /// actions (never a silent drop).
     live_overlays: Option<crate::live_overlays::OverlayApplySlot>,
+    /// Published active tile placements for the off-clock overlay consumer.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    tile_spec_apply:
+        Option<Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>>,
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    audio_free_sources: Option<crate::pipeline::AudioFreeSources>,
     /// The media-player transport seam (ADR-0057 / ADR-0097): the per-player
     /// bounded [`TransportMailbox`](crate::player::TransportMailbox) the running
     /// player ingest thread drains between frames, keyed by player id. A
@@ -1306,8 +1398,14 @@ impl CommandDrain {
             resolution: RouteResolution::default(),
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             subtitle_route: None,
+            #[cfg(feature = "ffmpeg")]
+            audio_route: None,
             live_sources: None,
             live_overlays: None,
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+            tile_spec_apply: None,
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+            audio_free_sources: None,
             player_mailboxes: std::collections::HashMap::new(),
             cell_ids_set: false,
             #[cfg(test)]
@@ -1350,6 +1448,24 @@ impl CommandDrain {
         self
     }
 
+    /// Thread in the active tile placement slot for the off-clock baker.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    #[must_use]
+    fn with_tile_spec_apply(
+        mut self,
+        tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    ) -> Self {
+        self.tile_spec_apply = Some(tiles);
+        self
+    }
+
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    #[must_use]
+    fn with_audio_free_sources(mut self, sources: crate::pipeline::AudioFreeSources) -> Self {
+        self.audio_free_sources = Some(sources);
+        self
+    }
+
     /// Thread in the live run-side subtitle re-point seam (RT-10b) so a
     /// `RouteSubtitle` reaches the running pipeline's layer. See
     /// [`command_drain_with_seams`].
@@ -1362,6 +1478,19 @@ impl CommandDrain {
         >,
     ) -> Self {
         self.subtitle_route = Some(subtitle_route);
+        self
+    }
+
+    /// Thread the run-owned bus's resolved, non-blocking audio command slot in.
+    #[cfg(feature = "ffmpeg")]
+    #[must_use]
+    fn with_audio_route(
+        mut self,
+        audio_route: Arc<
+            multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>,
+        >,
+    ) -> Self {
+        self.audio_route = Some(audio_route);
         self
     }
 
@@ -1405,7 +1534,18 @@ impl CommandDrain {
 
         // Drain the bus, routing commands. Video re-points are enqueued (batched +
         // bounded); every other command is applied immediately as before.
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+        let mut tile_binding_changed = false;
         for command in self.commands.try_drain() {
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+            {
+                tile_binding_changed |= matches!(
+                    &command,
+                    Command::ApplyLayout { .. }
+                        | Command::UpsertSource { .. }
+                        | Command::RemoveSource { .. }
+                );
+            }
             self.route_command(command, drive);
         }
 
@@ -1431,7 +1571,38 @@ impl CommandDrain {
             }
             applied = applied.saturating_add(1);
         }
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+        if tile_binding_changed || applied != 0 {
+            self.publish_tile_specs(drive);
+        }
         applied
+    }
+
+    /// Publish only when the active placements differ from the baker's snapshot.
+    /// This happens on the frame boundary after layout or video-route changes;
+    /// steady-state ticks do not allocate or wait on the bake consumer.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    fn publish_tile_specs(&self, drive: &CompositorDrive<Nv12Image>) {
+        if let Some(slot) = &self.tile_spec_apply {
+            let labels = self
+                .config
+                .sources
+                .iter()
+                .map(|source| {
+                    (
+                        source.id.clone(),
+                        source
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| source.id.clone()),
+                    )
+                })
+                .collect();
+            let tiles = crate::pipeline::tile_specs_for_layout(drive.layout(), &labels);
+            if *slot.load().as_ref() != tiles {
+                slot.store(Arc::new(tiles));
+            }
+        }
     }
 
     /// Enqueue a VIDEO→cell route intent, bounded drop-oldest (safety rule §5).
@@ -1605,23 +1776,7 @@ impl CommandDrain {
                 ref target,
                 ref source,
                 ..
-            } => {
-                // RT-11: `RouteAudio` desugars to `RouteIntent::Audio` and the
-                // canonical apply is `RouteApplier::apply_audio` →
-                // `ProgramBus::repoint_crossfade`. BUT the run wires **no per-source
-                // audio crosspoint** yet: program audio is silence (there is no
-                // per-source `AudioStore` to re-point onto), and the program bus is
-                // owned off-thread by the bake consumer with no re-point seam. The
-                // run-side audio ingest (per-source decode → `AudioStore` → bus
-                // registration) is RT-5/RT-8b, not built. Surface the held route
-                // loudly — NEVER a silent drop — naming the missing crosspoint.
-                tracing::warn!(
-                    target = %target,
-                    source = ?source,
-                    "route_audio held: the run has no per-source audio crosspoint yet \
-                     (program audio is silence; per-source audio ingest is RT-5/RT-8b)"
-                );
-            }
+            } => self.route_audio(target, source),
             Command::RouteSubtitle {
                 ref layer,
                 ref source,
@@ -1942,6 +2097,21 @@ impl CommandDrain {
             Some(slot) => *slot = source.clone(),
             None => self.config.sources.push(source.clone()),
         }
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+        if let Some(slot) = &self.audio_free_sources {
+            let mut audio_free = (*slot.load()).clone();
+            if matches!(
+                source.kind,
+                multiview_config::SourceKind::Clock { .. }
+                    | multiview_config::SourceKind::Timer { .. }
+                    | multiview_config::SourceKind::Solid { .. }
+            ) {
+                audio_free.insert(id);
+            } else {
+                audio_free.remove(&id);
+            }
+            slot.store(Arc::new(audio_free));
+        }
     }
 
     /// Apply a `RemoveSource` (ADR-W018 live remove) at the frame boundary:
@@ -1985,6 +2155,12 @@ impl CommandDrain {
             tracing::info!(source = %id, "remove_source: no registered store under that id");
         }
         self.config.sources.retain(|s| s.id != id);
+        #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+        if let Some(slot) = &self.audio_free_sources {
+            let mut audio_free = (*slot.load()).clone();
+            audio_free.remove(id);
+            slot.store(Arc::new(audio_free));
+        }
     }
 
     /// Apply an `UpsertOverlay` (ADR-W022) at the frame boundary: upsert the
@@ -2167,16 +2343,31 @@ impl CommandDrain {
             }));
     }
 
-    /// Apply a `RouteSubtitle` by driving the run's live subtitle re-point seam
-    /// (RT-10b): re-point the layer rendered into `layer` to the cues of the source
-    /// `source` resolves to.
-    ///
-    /// The seam ([`SubtitleRouteHandle`](crate::captions::SubtitleRouteHandle)) is
-    /// the thread-safe bridge to the bake consumer's `SubtitleRouter`, which applies
-    /// the re-point at its next sample boundary via the engine
-    /// [`SubtitleLayer::repoint`](multiview_overlay::SubtitleLayer) (CLEAR-on-switch
-    /// at the seam). Publishing is wait-free + bounded drop-oldest, so it can never
-    /// pace or stall the output clock (invariants #1/#10). The run's `SubtitleRouter`
+    /// Publish a resolved audio re-point without borrowing the consumer-owned bus.
+    /// The one-store-per-source run supports Best (not arbitrary alternate tracks).
+    #[cfg(feature = "ffmpeg")]
+    fn route_audio(&self, target: &str, source: &multiview_config::routing::StreamRef) {
+        let Some(handle) = self.audio_route.as_ref().and_then(|slot| slot.load()) else {
+            tracing::warn!(target, "route_audio held: program audio is not running");
+            return;
+        };
+        if !matches!(
+            source.selector,
+            multiview_config::routing::StreamSelector::Best
+        ) || source.kind != multiview_core::stream::StreamKind::Audio
+            || !handle.request_route(target, &source.input_id, 480)
+        {
+            tracing::warn!(target, source = ?source, "route_audio held: unknown channel, source or track");
+        }
+    }
+
+    #[cfg(not(feature = "ffmpeg"))]
+    #[allow(clippy::unused_self)]
+    fn route_audio(&self, target: &str, _source: &multiview_config::routing::StreamRef) {
+        tracing::warn!(target, "route_audio held: this build has no program audio");
+    }
+
+    /// Apply a `RouteSubtitle` through the live re-point seam. The router
     /// keys layers + sources by source id, so the subtitle `StreamRef`'s `input_id`
     /// names the target source (selector resolution to a specific track within a
     /// source is the run-side caption-track work; identity-by-source is today's
@@ -2239,6 +2430,105 @@ fn salvo_event(salvo: String, phase: SalvoPhase, head: Option<String>) -> SalvoE
         Some(head) => event.with_head(head),
         None => event,
     }
+}
+
+/// Restore the complete saved library from its authoritative envelope.
+fn restore_desired_layouts(
+    model: &multiview_control::boot_model::BootModel,
+) -> Option<Arc<dyn multiview_control::repository::Repository>> {
+    let desired = multiview_control::boot_model::load_desired(model.boot_path()).ok()??;
+    let restored = multiview_control::InMemoryRepository::new();
+    for layout in desired.layouts {
+        let id = layout.id;
+        let input = multiview_control::repository::LayoutInput {
+            name: layout.name,
+            body: layout.body,
+        };
+        if let Err(error) =
+            multiview_control::repository::Repository::create_layout(&restored, &id, input)
+        {
+            tracing::error!(%error, layout = %id, "cannot restore accepted layout");
+            return None;
+        }
+    }
+    Some(Arc::new(restored))
+}
+
+/// The stored-layout repository for this run.
+///
+/// With the `sqlite` feature and a config-file run (a boot model), layouts are
+/// persisted to `<config-dir>/.multiview/layouts.db`. Before the first desired
+/// commit that database is the legacy library; afterwards it is a projection of
+/// the envelope. Otherwise — or if the database cannot be opened — layouts live
+/// in memory for the life of the process (logged, never fatal: the control
+/// plane must still come up).
+#[cfg_attr(
+    not(feature = "sqlite"),
+    allow(clippy::unused_async, reason = "awaits only the sqlite open")
+)]
+async fn persist_layouts(
+    seeded: &Arc<dyn multiview_control::repository::Repository>,
+    boot_model: Option<&multiview_control::boot_model::BootModel>,
+) -> Arc<dyn multiview_control::repository::Repository> {
+    #[cfg(feature = "sqlite")]
+    if let Some(model) = boot_model {
+        let dir = model.state_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, dir = %dir.display(), "cannot create the layout store dir; layouts are in-memory only");
+        } else {
+            let path = dir.join("layouts.db");
+            let url = format!("sqlite://{}?mode=rwc", path.display());
+            match multiview_control::sqlite::SqliteRepository::connect(&url).await {
+                Ok(repo) => {
+                    tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
+                    // Once an envelope exists the database is only its
+                    // projection: it stays the live repository, and the repair
+                    // task `bind_and_serve` starts reconciles it. A corrupt
+                    // envelope fails startup in the caller.
+                    if !matches!(
+                        multiview_control::boot_model::load_desired(model.boot_path()),
+                        Ok(None)
+                    ) {
+                        return Arc::new(repo);
+                    }
+                    // A legacy library: seed ONLY absent ids. Never overwrite an
+                    // operator-authored saved definition at boot.
+                    for entry in seeded.list_layouts().unwrap_or_default() {
+                        let id = entry.layout.id;
+                        let input = multiview_control::repository::LayoutInput {
+                            name: entry.layout.name,
+                            body: entry.layout.body,
+                        };
+                        let result =
+                            match multiview_control::repository::Repository::get_layout(&repo, &id)
+                            {
+                                Ok(_) => Ok(()),
+                                Err(multiview_control::ControlError::NotFound { .. }) => {
+                                    multiview_control::repository::Repository::create_layout(
+                                        &repo, &id, input,
+                                    )
+                                    .map(|_| ())
+                                }
+                                Err(error) => Err(error),
+                            };
+                        if let Err(error) = result {
+                            tracing::error!(%error, layout = %id, "cannot seed the working layout");
+                        }
+                    }
+                    return Arc::new(repo);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "cannot open the layout store; layouts are in-memory only");
+                }
+            }
+        }
+    }
+    if let Some(model) = boot_model {
+        if let Some(restored) = restore_desired_layouts(model) {
+            return restored;
+        }
+    }
+    Arc::clone(seeded)
 }
 
 #[cfg(test)]
@@ -2459,6 +2749,142 @@ input_id = "in_b"
     /// The matching canvas for `TWO_CELL_DOC` (64x64 @ 25/1).
     fn matching_canvas() -> serde_json::Value {
         serde_json::json!({ "width": 64, "height": 64, "fps": "25/1" })
+    }
+
+    /// A stored NewsOne-like layout replaces the boot tile chrome, not just the
+    /// video geometry; a later video route updates the same cell's label.
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+    #[test]
+    fn live_layout_publishes_unequal_tile_overlay_placements_and_routes() {
+        let config = test_config();
+        let boot = config.solve_layout().expect("boot layout");
+        let labels = std::collections::HashMap::from([
+            ("in_a".to_owned(), "CNN".to_owned()),
+            ("in_b".to_owned(), "BBC".to_owned()),
+        ]);
+        let tiles = Arc::new(multiview_framestore::SwapCell::new(Arc::new(
+            crate::pipeline::tile_specs_for_layout(&boot, &labels),
+        )));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_tile_spec_apply(Arc::clone(&tiles));
+        let mut drive = test_drive(&test_config());
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "hero", "rect": { "x": 0.0, "y": 0.0, "w": 0.75, "h": 1.0 },
+                  "source": { "input_id": "in_a" } },
+                { "id": "side", "rect": { "x": 0.75, "y": 0.25, "w": 0.25, "h": 0.5 },
+                  "source": { "input_id": "in_b" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("stored doc");
+        let solved = document.solve_named("NewsOne").expect("stored layout");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "NewsOne".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("apply layout");
+        drain.apply(&mut drive);
+        let active = tiles.load();
+        assert_eq!(active.len(), 2, "each source-bound tile receives chrome");
+        assert_eq!(
+            (
+                active[0].source_id.as_str(),
+                active[0].rect.x,
+                active[0].rect.width
+            ),
+            ("in_a", 0.0, 48.0)
+        );
+        assert_eq!(
+            (
+                active[1].source_id.as_str(),
+                active[1].rect.x,
+                active[1].rect.y,
+                active[1].rect.width,
+                active[1].rect.height
+            ),
+            ("in_b", 48.0, 16.0, 16.0, 32.0)
+        );
+        sender
+            .try_submit(Command::SwapSource {
+                op: OperationId::new(),
+                tile: "side".to_owned(),
+                source: "in_a".to_owned(),
+            })
+            .expect("route side");
+        drain.apply(&mut drive);
+        let rerouted = tiles.load();
+        assert_eq!(rerouted[1].source_id, "in_a");
+        assert_eq!(rerouted[1].rect, active[1].rect);
+    }
+
+    /// A real command drained on the clock publishes a resolved re-point to the
+    /// off-thread consumer, which applies the crossfade before its next audio tick.
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn route_audio_command_reaches_program_bus_crossfade_without_clock_wait() {
+        use multiview_config::routing::StreamRef;
+        use multiview_core::stream::StreamKind;
+        let old = crate::audio::new_store();
+        let incoming = crate::audio::new_store();
+        // Different steady signals show the crossfade replaces, not appends, the
+        // target channel; tick_to(3) also catches up a dropped video tick.
+        old.publish_samples(&vec![0.25; 48_000 * 2])
+            .expect("old audio");
+        incoming
+            .publish_samples(&vec![0.75; 48_000 * 2])
+            .expect("incoming audio");
+        let mut bus = multiview_audio::ProgramBus::new(
+            crate::audio::canonical_format(),
+            multiview_core::time::Rational::new(25, 1),
+        );
+        let point = bus.add_source("in_a", Arc::clone(&old), 1.0);
+        let mut channels = std::collections::HashMap::new();
+        channels.insert("in_a".to_owned(), point);
+        let mut stores = std::collections::HashMap::new();
+        stores.insert("in_a".to_owned(), old);
+        stores.insert("in_b".to_owned(), Arc::clone(&incoming));
+        let handle = Arc::new(crate::audio::AudioControlHandle::from_sources(
+            stores, channels,
+        ));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(Some(Arc::clone(
+            &handle,
+        ))));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, test_config(), publisher).with_audio_route(slot);
+        let mut drive = test_drive(&test_config());
+        sender
+            .try_submit(Command::RouteAudio {
+                op: OperationId::new(),
+                target: "in_a".to_owned(),
+                source: StreamRef::best("in_b", StreamKind::Audio),
+                gain_db: 0.0,
+                mute: false,
+            })
+            .expect("submit audio breakaway");
+        drain.apply(&mut drive);
+        assert_eq!(handle.apply_pending(&mut bus), 1);
+        // The live edge is intentionally seeked on re-point; fresh decoder audio
+        // arriving after that edge is sampled without replaying stale history.
+        incoming
+            .publish_samples(&vec![0.75; 5_760 * 2])
+            .expect("fresh audio");
+        let block = bus.tick_to(3);
+        assert_eq!(block.frame_count(), 5_760);
+        assert!(block
+            .interleaved()
+            .iter()
+            .skip(480 * 2)
+            .all(|sample| (*sample - 0.75).abs() < 0.001));
     }
 
     /// ADR-W019: an `ApplyLayout` carrying a stored, route-solved document swaps
@@ -3093,6 +3519,8 @@ input_id = "in_b"
             multiview_control::LiveSourceCapability::synthetic_only(),
             // boot_model: none for this store-only bind test (ADR-W024).
             None,
+            // No source event runtime on this store-only run path.
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3171,6 +3599,7 @@ input_id = "in_b"
             multiview_control::LiveSourceCapability::synthetic_only(),
             // A config-file run: the watch handle MUST be installed before serving.
             Some(boot_model),
+            None,
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3184,6 +3613,97 @@ input_id = "in_b"
              router serves a single request (no startup TOCTOU for promote)"
         );
 
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    /// Review H1/H2: the real boot path restores accepted names and versions.
+    /// Reseeding here would restart every `ETag` at 1, so a stale tag could match.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_and_serve_restores_accepted_names_and_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let boot_path = dir.path().join("multiview.toml");
+        let mut config = config_with_hls_outputs(&[("out-a", "/tmp/restore-accepted.m3u8")]);
+        std::fs::write(&boot_path, config.to_toml().expect("render boot")).expect("boot file");
+        config.overlays = vec![serde_json::from_value(serde_json::json!({
+            "id": "ov_clock", "kind": "clock", "target": "canvas"
+        }))
+        .expect("overlay")];
+        let body = serde_json::json!({
+            "canvas": config.canvas, "layout": config.layout, "cells": config.cells,
+        });
+        let desired = multiview_control::boot_model::DesiredState {
+            version: 1,
+            selected_layout_id: "working".to_owned(),
+            layouts: vec![multiview_control::Layout {
+                id: "working".to_owned(),
+                name: "working".to_owned(),
+                body: body.clone(),
+            }],
+            selected_body: body,
+            output_ids: (0..config.outputs.len())
+                .map(|index| format!("output-{index}"))
+                .collect(),
+            layout_versions: std::collections::BTreeMap::new(),
+            resource_versions: [(
+                "overlays".to_owned(),
+                [("ov_clock".to_owned(), 7_u64)].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            resource_names: [(
+                "overlays".to_owned(),
+                [("ov_clock".to_owned(), "Studio clock".to_owned())]
+                    .into_iter()
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+            config: config.clone(),
+        };
+        desired.validate().expect("valid envelope");
+        let state_dir = dir.path().join(".multiview");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(
+            state_dir.join("desired.json"),
+            serde_json::to_vec(&desired).expect("serialize"),
+        )
+        .expect("write desired");
+        let boot_model = Arc::new(multiview_control::boot_model::BootModel::new(
+            boot_path,
+            config.clone(),
+            config.clone(),
+            multiview_config::StartMode::Resume,
+            true,
+            None,
+        ));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+        let (commands, _rx) = multiview_control::command_bus(8);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_addr, handle, state) = bind_and_serve(
+            "[::1]:0",
+            &config,
+            publisher,
+            commands,
+            multiview_control::no_preview(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            multiview_control::LiveApplyCaps::default(),
+            multiview_control::LiveSourceCapability::synthetic_only(),
+            Some(boot_model),
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .expect("bind + serve should start");
+        let overlay = state.overlays.get("ov_clock").expect("restored overlay");
+        assert_eq!(overlay.version.get(), 7);
+        assert_eq!(overlay.resource.name, "Studio clock");
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
@@ -3226,6 +3746,30 @@ input_id = "in_a"
             );
         }
         MultiviewConfig::load_from_toml(&doc).expect("parse HLS-outputs config")
+    }
+
+    #[test]
+    fn cast_uses_master_for_selected_tracks_and_keeps_legacy_program_url() {
+        let base = config_with_hls_outputs(&[("program", "/srv/hls/index.m3u8")]);
+        let mut doc = base.to_toml().expect("serialize config");
+        doc.push_str("\n[control]\nlisten = \"[::]:8080\"\ncast_media_base = \"http://[2001:db8::1]:8080\"\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"in_a\"\nchannels = { kind = \"stereo\" }\ntarget_track = \"clean\"\n");
+        let legacy = MultiviewConfig::load_from_toml(&doc).expect("legacy config");
+        let url = cast_delivery(&legacy)
+            .expect("cast delivery")
+            .for_output("program")
+            .expect("output")
+            .url
+            .clone();
+        assert!(url.ends_with("/index.m3u8"), "{url}");
+        doc.push_str("\n[outputs.audio]\nmode = \"auto\"\n");
+        let selected = MultiviewConfig::load_from_toml(&doc).expect("selected config");
+        let url = cast_delivery(&selected)
+            .expect("cast delivery")
+            .for_output("program")
+            .expect("output")
+            .url
+            .clone();
+        assert!(url.ends_with("/master.m3u8"), "{url}");
     }
 
     /// Two outputs whose **distinct** ids sanitise to the SAME URL segment get

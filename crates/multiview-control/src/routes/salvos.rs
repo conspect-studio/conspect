@@ -83,9 +83,7 @@ pub(crate) async fn list_salvos(
     // rows outside the allowlist — exactly as `list_devices` does. A salvo
     // carries no embedded device_ref, so the row filter alone is complete; it is
     // a no-op for an unscoped principal.
-    let salvos = state
-        .salvos
-        .list()?
+    let salvos = crate::boot_model::accepted_salvos(&state)?
         .into_iter()
         .map(|v| v.salvo)
         .filter(|salvo| crate::auth::authorize_object(&principal, &salvo.id).is_ok())
@@ -101,7 +99,7 @@ pub(crate) async fn get_salvo(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.salvos.get(&id)?;
+    let versioned = crate::boot_model::accepted_salvo(&state, &id)?;
     Ok(salvo_response(StatusCode::OK, &versioned))
 }
 
@@ -143,11 +141,17 @@ pub(crate) async fn put_salvo(
         .validate()
         .map_err(|e| crate::error::ControlError::Validation(e.to_string()))?;
 
-    match state.salvos.get(&id) {
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
+    let durable = crate::boot_model::config_value(&salvo)?;
+    match crate::boot_model::accepted_salvo(&state, &id) {
         Ok(current) => {
             // Replace: enforce the optimistic-concurrency precondition first.
             if_match.require(SALVO_KIND, &id, current.version)?;
-            let versioned = state.salvos.update(&id, salvo)?;
+            crate::boot_model::commit_resource(&state, "salvos", &id, Some(durable), None).await?;
+            let versioned =
+                crate::boot_model::project_salvo(&state, &id, || state.salvos.update(&id, salvo))?;
             // ADR-W024 round 6: a salvo definition is runtime-mutable running
             // state composed into active.toml; audit (the ONE persist choke
             // point) so the debounced persister captures the edit. The store
@@ -162,7 +166,9 @@ pub(crate) async fn put_salvo(
             Ok(salvo_response(StatusCode::OK, &versioned))
         }
         Err(crate::error::ControlError::NotFound { .. }) => {
-            let versioned = state.salvos.create(salvo)?;
+            crate::boot_model::commit_resource(&state, "salvos", &id, Some(durable), None).await?;
+            let versioned =
+                crate::boot_model::project_salvo(&state, &id, || state.salvos.create(salvo))?;
             state.audit(
                 &principal.key_id,
                 AuditAction::Create,
@@ -185,9 +191,13 @@ pub(crate) async fn delete_salvo(
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let current = state.salvos.get(&id)?;
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
+    let current = crate::boot_model::accepted_salvo(&state, &id)?;
     if_match.require(SALVO_KIND, &id, current.version)?;
-    state.salvos.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "salvos", &id, None, None).await?;
+    crate::boot_model::project_salvo_delete(&state, &id)?;
     // ADR-W024 round 6: removing a runtime-mutable salvo definition changes the
     // composed running state — audit so the persister rewrites active.toml.
     state.audit(
@@ -226,7 +236,7 @@ fn submit_for_existing_salvo(
         crate::auth::authorize_output(principal, head)?;
     }
     // Fail fast on an unknown salvo before reserving an idempotency key.
-    let _ = state.salvos.get(id)?;
+    let _ = crate::boot_model::accepted_salvo(state, id)?;
     submit_accepted(state, idem, |op| build(op, head))
 }
 

@@ -11,6 +11,11 @@ pub type Result<T> = core::result::Result<T, AudioError>;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AudioError {
+    /// The input stopped delivering data within the read timeout. The connection
+    /// is dead: retrying the read cannot help, reconnect instead.
+    #[error("audio input stalled: {0}")]
+    Stalled(String),
+
     /// A PCM block's sample count is not a whole number of frames for its
     /// channel layout (interleaved samples must be a multiple of the channel
     /// count).

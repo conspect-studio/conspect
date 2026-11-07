@@ -1180,9 +1180,12 @@ segment_ms = 1000
 
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
+            source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
+            output_origin: crate::timing_status::anchor_slot(),
+            audio_route: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             // EMPTY island slot — admission named no device.
             island: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             load_source: Box::new(CountingLoadSource {
@@ -1270,9 +1273,12 @@ segment_ms = 1000
 
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
+            source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
+            output_origin: crate::timing_status::anchor_slot(),
+            audio_route: std::sync::Arc::new(multiview_framestore::SwapCell::empty()),
             island: std::sync::Arc::new(multiview_framestore::SwapCell::from_some(island(
                 FakeTwoGpu::GPU1_UUID,
                 1,
@@ -1538,6 +1544,7 @@ impl RunnableOutput {
 
 /// A built, ready-to-run pipeline.
 pub struct Pipeline {
+    source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved layout (canvas + normalized cells).
     layout: Arc<Layout>,
     /// The fixed output cadence (exact rational).
@@ -1560,6 +1567,11 @@ pub struct Pipeline {
     /// feature to render, so the stores are only built/sampled under it.
     #[cfg(feature = "overlay")]
     caption_stores: std::collections::HashMap<String, Arc<crate::captions::CueStore>>,
+    #[cfg(feature = "overlay")]
+    caption_generations:
+        Arc<multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, u64>>>>,
+    #[cfg(feature = "overlay")]
+    live_caption_stores: crate::captions::LiveCaptionStores,
     /// RT-10b: the live subtitle re-point handle, published when a `drive` begins
     /// (the hot-loop-owned [`SubtitleRouter`](crate::captions::SubtitleRouter) builds
     /// its [`SubtitleRouteHandle`](crate::captions::SubtitleRouteHandle) into this
@@ -1577,6 +1589,9 @@ pub struct Pipeline {
     /// ingest plans. Empty ⇒ no native caption readers.
     #[cfg(feature = "overlay")]
     caption_plans: Vec<crate::captions::CaptionPlan>,
+    /// Latest picture time per caption reader, published without a clock wait.
+    #[cfg(feature = "overlay")]
+    caption_display_times: crate::captions::DisplayCursors,
     /// An optional legacy `--subtitles` sidecar track, routed through the SAME
     /// per-tile burn-in path as native captions: its active cue is sampled per
     /// tick and burned into [`Self::sidecar_target`]'s tile. `None` ⇒ no sidecar.
@@ -1593,10 +1608,19 @@ pub struct Pipeline {
     /// than showing a fabricated constant.
     #[cfg(feature = "overlay")]
     meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
+    #[cfg(feature = "overlay")]
+    meter_channel_timelines: std::collections::HashMap<String, Vec<crate::overlays::MeterChannels>>,
     /// Per-source human label (`display_name`, or the id when unnamed), keyed by
     /// source id — the text drawn bottom-left of each tile.
     #[cfg(feature = "overlay")]
     tile_labels: std::collections::HashMap<String, String>,
+    /// Frame-boundary tile geometry and bindings for the off-clock bake consumer.
+    #[cfg(feature = "overlay")]
+    tile_spec_apply: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    /// Source-kind audio applicability, refreshed at frame-boundary live edits.
+    /// Missing PCM from a decoded source is unknown, not proof of no audio.
+    #[cfg(feature = "overlay")]
+    audio_free_sources: AudioFreeSources,
     /// Operator-declared content-fault probes, resolved from `config.probes`
     /// (M10). Each probe `watches` a cell; this resolves that cell to its bound
     /// **source** so the per-tick [`FaultDetector`] can build that source's fault
@@ -1693,18 +1717,26 @@ pub struct Pipeline {
     /// silence-fills past what was published). Empty when this run did not opt into
     /// program audio.
     audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+    /// The document's declared `[audio]` routes (ADR-R005 / ADR-0059 §4). When
+    /// it declares any, they decide program-bus membership (`include_in_program_bus`),
+    /// gain (`gain_db`) and `mute` at build; with none, every store rides at unity.
+    audio_routing: Option<multiview_config::AudioRouting>,
+    /// The run's declared discrete audio tracks (#152), in `[audio]` route
+    /// order: the source id each track is taken from. Track `i` is encoded as
+    /// [`StreamKind::AudioTrack`](multiview_ffmpeg::StreamKind::AudioTrack)`(i)`.
+    /// Empty when no route names a `target_track`.
+    discrete_track_inputs: Vec<String>,
+    /// Published at drive start; control reads without locking or waiting on bake.
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     /// Per-source **audio** ingest plans (AUD-2): how to open + decode each
     /// source's audio. The drive starts one audio decode thread per plan
     /// (alongside the video decode thread) writing into [`Self::audio_stores`].
     /// Built only for libav-openable (file/URL) sources; empty when this run did
     /// not opt into program audio.
     audio_ingest_plans: Vec<crate::audio::AudioIngestPlan>,
-    /// Per-source synthetic **tone** plans (AUD-5): the `bars` line-up tone
-    /// companion. The drive starts one tone publish thread per plan, writing the
-    /// 1 kHz reference sine into that source's [`Self::audio_stores`] entry (which
-    /// is routed onto the program bus exactly like a decoded source's audio).
-    /// Built only for `bars` synthetic sources; empty when this run did not opt
-    /// into program audio.
+    /// Legacy asynchronous tone-plan slot, empty in the scheduling-independent
+    /// bars path. Kept for the supervisor interface until that legacy thread path
+    /// is removed separately; bars now read a pure tone store on the consumer.
     tone_ingest_plans: Vec<crate::audio::ToneIngestPlan>,
     /// Media-player channel **audio loop** plans (ADR-T019): how to prime + loop
     /// each player's embedded audio onto the program bus on the same wrap instant
@@ -1861,6 +1893,7 @@ pub fn decoder_open_args<'p>(
 /// its media lives, the store to publish into, the tile size to scale to, the
 /// canvas color tag, and whether it is a live (never-ending) source.
 struct IngestPlan {
+    source_events: Option<crate::source_event_ingest::SourceLease>,
     /// The source id (for diagnostics / store keying).
     id: String,
     /// Where the media lives.
@@ -1882,6 +1915,20 @@ struct IngestPlan {
     tile_h: u32,
     /// The store to publish decoded frames into (shared with the drive loop).
     store: Arc<TileStore<Nv12Image>>,
+    /// The run's output-clock origin (time source + tick-0 seed), published
+    /// once the program seeds. When set, a live decode publishes each frame
+    /// stamped at the **output media instant it was released at**
+    /// (`time.now() - seed`), so a tile's frames sit on the same timeline the
+    /// output clock samples (`tick.pts`) whatever moment the source connected
+    /// or reconnected. Unset (no run yet, tests, bounded drives) falls back to
+    /// the source-relative stamp. Read lock-free (a `SwapCell` load).
+    output_origin: crate::timing_status::EpochAnchorSlot,
+    /// Where a live decode publishes its per-connection output anchor (see
+    /// [`LiveAnchor`]) for the audio rail; [`live_anchor_slot`] of the source id
+    /// for config sources.
+    live_anchor: LiveAnchorSlot,
+    /// Authoritative source lifecycle shared by video, audio and captions.
+    lifecycle: u64,
     /// Whether this is a live (continuous, never-EOF) source. Live sources are
     /// reopened on EOF/error (a transient HLS/RTSP drop reconnects); a finite
     /// file/VOD source plays once and then holds its last frame.
@@ -2164,6 +2211,10 @@ impl Pipeline {
         // decoded frames are scaled to tile the canvas (the reference compositor
         // places tiles 1:1 at the cell origin).
         let mut stores: HashMapStores = std::collections::HashMap::new();
+        let source_events = Arc::new(
+            crate::source_event_runtime::Runtime::new()
+                .map_err(|e| PipelineError::Engine(format!("source events: {e}")))?,
+        );
         let mut ingest_plans: Vec<IngestPlan> = Vec::with_capacity(config.sources.len());
         // Per-source audio stores + decode plans (AUD-2). Built for every
         // libav-openable (file/URL) source so program audio — when this run opts
@@ -2176,7 +2227,7 @@ impl Pipeline {
         > = std::collections::HashMap::new();
         let mut audio_ingest_plans: Vec<crate::audio::AudioIngestPlan> = Vec::new();
         // AUD-5: synthetic line-up tone plans (the `bars` source's 1 kHz companion).
-        let mut tone_ingest_plans: Vec<crate::audio::ToneIngestPlan> = Vec::new();
+        let tone_ingest_plans: Vec<crate::audio::ToneIngestPlan> = Vec::new();
         // #103: AES67 / ST 2110-30 audio RX plans. Each `SourceKind::Aes67` source
         // is AUDIO-ONLY — the source loop below SKIPS the entire video path for it
         // (no TileStore, no registry entry, no ingest plan) and queues one RX plan
@@ -2203,6 +2254,15 @@ impl Pipeline {
         // serial build path (#48), indexed by id for the loop's cheap lookup.
         #[cfg(feature = "overlay")]
         let mut prefetched_captions = prefetch_caption_plans(config);
+        #[cfg(feature = "overlay")]
+        let audio_free_sources = Arc::new(multiview_framestore::SwapCell::from_pointee(
+            config
+                .sources
+                .iter()
+                .filter(|source| is_intentionally_audio_free(&source.kind))
+                .map(|source| source.id.clone())
+                .collect(),
+        ));
 
         // MP-2 (ADR-0030 §3): the SourceRegistry owns each source's shared TileStore
         // and its decode sizing. In this single-program build it keys by source id —
@@ -2270,6 +2330,10 @@ impl Pipeline {
                 canvas_color,
                 cadence,
             )?;
+            // Reserve the authoritative epoch before either startup rail starts.
+            // Old detached publishers from a previous run retain their old token.
+            plan.lifecycle = begin_live_lifecycle(&source.id);
+            plan.source_events = source_events.activate(&source.id, plan.lifecycle);
 
             // Stamp this source's NDI license acceptance from `[system.ndi]`
             // (ADR-0008 §7.5), like `cuda_ordinal` below — the per-source drive
@@ -2297,6 +2361,11 @@ impl Pipeline {
                 &mut prefetched_captions,
             );
 
+            let lifecycle = plan.lifecycle;
+            let anchor_floor = plan
+                .live_anchor
+                .load()
+                .map_or(0, |anchor| anchor.generation);
             stores.insert(source.id.clone(), store);
             ingest_plans.push(plan);
 
@@ -2305,21 +2374,30 @@ impl Pipeline {
             // source yields `None` (no audio thread; it rides silence on the bus).
             // The store is built per audio-bearing source so the bus can route it;
             // it stays empty (silence-filling) until the decode thread fills it.
-            if let Some(audio_plan) = audio_ingest_plan_for(source) {
-                audio_stores.insert(source.id.clone(), crate::audio::new_store());
+            if let Some(mut audio_plan) = audio_ingest_plan_for(source) {
+                audio_plan.lifecycle = lifecycle;
+                audio_plan.anchor_floor = anchor_floor;
+                // A live network source arrives on its own clock: give it the
+                // cushioned store so fetch stalls are inaudible. A file plays
+                // from frame 0 against the output clock: the plain store.
+                let store = if audio_plan.live {
+                    crate::audio::new_live_store()
+                } else {
+                    crate::audio::new_file_store()
+                };
+                audio_stores.insert(source.id.clone(), store);
                 audio_ingest_plans.push(audio_plan);
             }
             // AUD-5: the `bars` synthetic source emits a 1 kHz line-up tone (its
             // colour-bars companion), so it contributes a real audio store on the
-            // bus rather than silence. Build the store the same way an audio-bearing
-            // source does (so the existing bus-routing below picks it up) and queue
-            // a tone publish plan; a tone thread fills the store at cadence. `solid`
-            // / `clock` synthetic sources carry no audio and stay silent.
-            if let Some(tone_plan) = tone_ingest_plan_for(source, cadence) {
+            // bus rather than silence. Its pure tone store is pulled by the bake
+            // consumer, without a producer thread. Other synthetic sources stay silent.
+            if let Some(_tone_plan) = tone_ingest_plan_for(source, cadence) {
                 audio_stores
                     .entry(source.id.clone())
-                    .or_insert_with(crate::audio::new_store);
-                tone_ingest_plans.push(tone_plan);
+                    .or_insert_with(crate::audio::new_tone_store);
+                // No asynchronous publisher: the bus consumer pulls the tone at
+                // its exact sample index, including any skipped output ticks.
             }
         }
 
@@ -2421,10 +2499,16 @@ impl Pipeline {
         let has_display = !built.display.is_empty();
         #[cfg(not(feature = "display-kms"))]
         let has_display = false;
-        let outputs = built.packet;
+        let mut outputs = built.packet;
         if outputs.is_empty() && !has_display {
             return Err(PipelineError::NoOutput("file/HLS"));
         }
+        // #151/#152: resolve each muxing output's audio selection (program bus
+        // and/or discrete tracks) against the declared tracks.
+        let discrete_tracks = declared_discrete_tracks(config.audio.as_ref());
+        let discrete_track_inputs: Vec<String> =
+            discrete_tracks.iter().map(|t| t.input_id.clone()).collect();
+        apply_output_audio_selections(&mut outputs, &config.outputs, &discrete_tracks);
 
         // Derive the PER-SOURCE per-tick audio-loudness timelines off the
         // build path: decode each file-backed source's OWN audio with
@@ -2434,7 +2518,7 @@ impl Pipeline {
         // rides its floor — no fabricated constant). This never touches the hot
         // path: it is computed once at build time.
         #[cfg(feature = "overlay")]
-        let meter_db_timelines = build_meter_timelines(config, cadence);
+        let (meter_db_timelines, meter_channel_timelines) = build_meter_timelines(config, cadence);
         #[cfg(feature = "overlay")]
         let tile_labels = config
             .sources
@@ -2444,6 +2528,10 @@ impl Pipeline {
                 (s.id.clone(), label)
             })
             .collect();
+        #[cfg(feature = "overlay")]
+        let tile_spec_apply = Arc::new(multiview_framestore::SwapCell::new(Arc::new(
+            tile_specs_for_layout(&layout, &tile_labels),
+        )));
         // Read the analog clock faces from the `[[overlays]]` clock entries.
         #[cfg(feature = "overlay")]
         let analog_clocks =
@@ -2476,7 +2564,14 @@ impl Pipeline {
             config.outputs.clone(),
         );
 
+        #[cfg(feature = "overlay")]
+        let caption_generations = ingest_plans
+            .iter()
+            .map(|plan| (plan.id.clone(), plan.lifecycle))
+            .collect();
+
         Ok(Self {
+            source_events,
             layout,
             cadence,
             program_spec,
@@ -2493,6 +2588,9 @@ impl Pipeline {
             #[cfg(feature = "webrtc-native")]
             egress_registry,
             audio_stores,
+            audio_routing: config.audio.clone(),
+            discrete_track_inputs,
+            audio_route: Arc::new(multiview_framestore::SwapCell::empty()),
             audio_ingest_plans,
             tone_ingest_plans,
             player_audio_ingest_plans,
@@ -2500,9 +2598,24 @@ impl Pipeline {
             aes67_rx_plans,
             inventories,
             #[cfg(feature = "overlay")]
+            caption_generations: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                caption_generations,
+            )),
+            #[cfg(feature = "overlay")]
+            live_caption_stores: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                caption_stores.clone(),
+            )),
+            #[cfg(feature = "overlay")]
             caption_stores,
             #[cfg(feature = "overlay")]
             subtitle_route: Arc::new(multiview_framestore::SwapCell::empty()),
+            #[cfg(feature = "overlay")]
+            caption_display_times: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                caption_plans
+                    .iter()
+                    .map(|p| (p.id.clone(), Arc::clone(&p.displayed_time)))
+                    .collect(),
+            )),
             #[cfg(feature = "overlay")]
             caption_plans,
             canvas_color,
@@ -2524,7 +2637,13 @@ impl Pipeline {
             #[cfg(feature = "overlay")]
             meter_db_timelines,
             #[cfg(feature = "overlay")]
+            meter_channel_timelines,
+            #[cfg(feature = "overlay")]
             tile_labels,
+            #[cfg(feature = "overlay")]
+            tile_spec_apply,
+            #[cfg(feature = "overlay")]
+            audio_free_sources,
             #[cfg(feature = "overlay")]
             declared_probes: config.probes.clone(),
             #[cfg(feature = "overlay")]
@@ -2596,7 +2715,20 @@ impl Pipeline {
         store: Arc<crate::captions::CueStore>,
     ) -> Arc<crate::captions::CueStore> {
         let id = source_id.into();
-        self.caption_stores.insert(id, Arc::clone(&store));
+        // A test or caller attaching a store after build must share the source
+        // lifecycle selected by its video plan, not the store's default token.
+        if let Some(plan) = self.ingest_plans.iter().find(|plan| plan.id == id) {
+            if store.generation() != plan.lifecycle {
+                store.begin_generation(plan.lifecycle);
+            }
+        }
+        self.caption_stores.insert(id.clone(), Arc::clone(&store));
+        let shared = Arc::clone(&store);
+        self.live_caption_stores.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert(id.clone(), Arc::clone(&shared));
+            next
+        });
         store
     }
 
@@ -2681,14 +2813,29 @@ impl Pipeline {
     #[must_use]
     pub fn live_ingest_spawner(&self) -> Arc<dyn crate::live_sources::IngestSpawner> {
         Arc::new(LiveIngestSpawner {
+            source_events: Arc::clone(&self.source_events),
             layout: Arc::clone(&self.layout),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
+            output_origin: Arc::clone(&self.epoch_anchor),
+            audio_route: Arc::clone(&self.audio_route),
+            #[cfg(feature = "overlay")]
+            caption_stores: Arc::clone(&self.live_caption_stores),
+            #[cfg(feature = "overlay")]
+            caption_generations: Arc::clone(&self.caption_generations),
+            #[cfg(feature = "overlay")]
+            caption_display_times: Arc::clone(&self.caption_display_times),
             #[cfg(feature = "gpu")]
             island: Arc::clone(&self.live_island),
             #[cfg(feature = "gpu")]
             load_source: crate::system_metrics::default_load_source(),
         })
+    }
+
+    /// Lock-free selected-frame event reader for the control plane.
+    #[must_use]
+    pub fn source_event_reader(&self) -> crate::source_event_runtime::RuntimeReader {
+        self.source_events.reader()
     }
 
     /// The shared WHIP publisher rendezvous registry (ADR-T014). The run wiring
@@ -2800,6 +2947,21 @@ impl Pipeline {
     /// sink fails. Input exhaustion is **not** an error: a source past its last
     /// frame holds its last-good frame, so the output keeps emitting on cadence.
     pub async fn run_for(&mut self, max_ticks: u64) -> Result<PipelineReport, PipelineError> {
+        let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
+        self.run_for_publishing(max_ticks, &publisher).await
+    }
+
+    /// Like [`Pipeline::run_for`], but the engine's outbound `publisher` is
+    /// supplied by the caller so a test (or tool) can subscribe to the realtime
+    /// events (e.g. `audio.meter`) the bake consumer pushes during the run.
+    ///
+    /// # Errors
+    /// See [`Pipeline::run_for`].
+    pub async fn run_for_publishing(
+        &mut self,
+        max_ticks: u64,
+        publisher: &EnginePublisher<EngineStateSnapshot, Event>,
+    ) -> Result<PipelineReport, PipelineError> {
         let time: Arc<dyn TimeSource> = Arc::new(MonotonicTimeSource::new());
         let stop = StopSignal::new();
         // Offline render: block-for-exact so every tick is encoded (exact N). The
@@ -2809,9 +2971,6 @@ impl Pipeline {
             runners: self.build_sink_runners(false),
             hot_tick_observer: None,
         };
-        // Offline render serves no UI: a throwaway publisher/preview + no-op
-        // control hook.
-        let publisher = EnginePublisher::<EngineStateSnapshot, Event>::new(EVENT_CAPACITY);
         let preview = crate::preview::program_slot();
         let out = self
             .drive_streaming(
@@ -2820,7 +2979,7 @@ impl Pipeline {
                 &stop,
                 Some(max_ticks),
                 plan,
-                &publisher,
+                publisher,
                 &preview,
                 |_: &mut CompositorDrive<Nv12Image>| {},
             )
@@ -2967,6 +3126,15 @@ impl Pipeline {
         self.subtitle_route.load()
     }
 
+    /// Shared audio re-point rendezvous; published on drive start only when the
+    /// run has program audio. The clock only loads/publishes a bounded RCU slot.
+    #[must_use]
+    pub fn audio_route_slot(
+        &self,
+    ) -> Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>> {
+        Arc::clone(&self.audio_route)
+    }
+
     /// RT-10b: the **shared** subtitle re-point slot (the `Arc` behind
     /// [`subtitle_route_handle`](Self::subtitle_route_handle)).
     ///
@@ -3017,8 +3185,8 @@ impl Pipeline {
         outputs
             .into_iter()
             .map(|output| -> SinkRunner {
-                Box::new(move |rx, params, time_base, audio| {
-                    run_one_output(output, rx, &params, time_base, audio.as_ref())
+                Box::new(move |rx, params, time_base, audio, tracks| {
+                    run_one_output(output, rx, &params, time_base, audio.as_ref(), &tracks)
                 })
             })
             .collect()
@@ -3062,7 +3230,7 @@ impl Pipeline {
                 // The fake sink consumes the coded-packet fan-out channel; it does
                 // not mux, so the seeded codec params + time-base (and the audio
                 // params + time-base) are unused.
-                Box::new(move |rx, _params, _time_base, _audio| {
+                Box::new(move |rx, _params, _time_base, _audio, _tracks| {
                     let outcome = r(rx);
                     Ok(SinkRunOutcome {
                         line: format!("test sink: {} packet(s)", outcome.frames),
@@ -3227,7 +3395,17 @@ impl Pipeline {
         // run reliably stops the clock AND the ingest (invariant #1). Taking the
         // plans by value means a second call simply ingests nothing (the stores
         // hold their last frames / slate) rather than double-spawning.
-        let plans = std::mem::take(&mut self.ingest_plans);
+        let mut plans = std::mem::take(&mut self.ingest_plans);
+        let startup_lifecycles: Vec<(String, u64)> = plans
+            .iter()
+            .filter(|plan| plan.player.is_none())
+            .map(|plan| (plan.id.clone(), plan.lifecycle))
+            .collect();
+        // Every decode stamps its frames on the run's output timeline once the
+        // program seeds (see `IngestPlan::output_origin`).
+        for plan in &mut plans {
+            plan.output_origin = Arc::clone(&self.epoch_anchor);
+        }
         // Native caption readers exist only under `overlay` (they feed the
         // per-tile burn-in renderer); without it there are none.
         #[cfg(feature = "overlay")]
@@ -3336,10 +3514,32 @@ impl Pipeline {
 
         // Build the SINGLE program encoder (invariant #7) the consumer owns: the
         // canvas is encoded once and the same packets fan to every mux-only sink.
-        let encoder = ProgramEncoder::new(&self.encode_cfg).map_err(|e| PipelineError::Output {
-            kind: "encode",
-            reason: e.to_string(),
-        })?;
+        let mut encoder =
+            ProgramEncoder::new(&self.encode_cfg).map_err(|e| PipelineError::Output {
+                kind: "encode",
+                reason: e.to_string(),
+            })?;
+        // #152: one encoder per declared discrete track, opened with the
+        // program audio's settings. Tracks need the program-audio bus (their
+        // pre-mix blocks come from it); without it they are reported, not faked.
+        let track_inputs: Vec<String> = if self.discrete_track_inputs.is_empty() {
+            Vec::new()
+        } else if self.encode_cfg.audio.is_none() {
+            tracing::warn!(
+                tracks = self.discrete_track_inputs.len(),
+                "discrete audio tracks declared but program audio is off; not muxing them"
+            );
+            Vec::new()
+        } else {
+            let count = u16::try_from(self.discrete_track_inputs.len()).unwrap_or(u16::MAX);
+            encoder
+                .open_audio_tracks(count)
+                .map_err(|e| PipelineError::Output {
+                    kind: "encode-audio",
+                    reason: e.to_string(),
+                })?;
+            self.discrete_track_inputs.clone()
+        };
 
         // The program-audio bus (AUD-4): built ONLY when this run opted into audio
         // (`encode_cfg.audio` is `Some`). It mixes one block per output tick at the
@@ -3355,19 +3555,35 @@ impl Pipeline {
         // the bake consumer (it is `Send`); it is ticked off the hot path, never on
         // the output-clock loop. `None` (audio off) means the consumer encodes no
         // audio at all, so the run is byte-identical to the video-only path.
+        let live_track_inputs =
+            Arc::new(multiview_framestore::SwapCell::from_pointee(track_inputs));
         let audio_bus = self.encode_cfg.audio.as_ref().map(|cfg| {
             let mut bus = program_audio_bus(cfg, self.cadence);
             // Route every per-source store onto the program bus at unity gain. The
             // route key is the source id; per-source gains / breakaways are a
             // control-plane concern (AUD-7) that re-points/re-gains these routes at
             // runtime. Sorted for a deterministic route order across runs.
-            let mut ids: Vec<&String> = self.audio_stores.keys().collect();
-            ids.sort_unstable();
-            for id in ids {
-                if let Some(store) = self.audio_stores.get(id) {
-                    let _ = bus.add_source(id.clone(), Arc::clone(store), 1.0);
+            // The `[audio]` routes decide membership/gain/mute (ADR-0059 §4);
+            // with none declared every store rides at unity.
+            let mut channels = std::collections::HashMap::new();
+            for (id, gain) in program_bus_gains(
+                self.audio_stores.keys().map(String::as_str),
+                self.audio_routing.as_ref(),
+            ) {
+                if let Some(store) = self.audio_stores.get(id.as_str()) {
+                    let point = bus.add_source(id.clone(), Arc::clone(store), gain);
+                    channels.insert(id, point);
                 }
             }
+            self.audio_route.store(Some(Arc::new(
+                crate::audio::AudioControlHandle::from_sources(self.audio_stores.clone(), channels)
+                    .with_sample_rate(cfg.sample_rate)
+                    .with_startup(self.audio_routing.as_ref(), self.stores.keys().cloned())
+                    .with_declared_tracks(
+                        self.audio_routing.as_ref(),
+                        Arc::clone(&live_track_inputs),
+                    ),
+            )));
             bus
         });
         // The program-bus loudness normaliser (AUD-6): pair one with the audio bus
@@ -3474,17 +3690,21 @@ impl Pipeline {
         // overlay baker from it, plus the single `ProgramEncoder`; the bake +
         // encode math moved off the hot loop, never onto it.
         let bake_ctx = self.bake_context();
+        #[cfg(feature = "overlay")]
+        let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
             policy,
             encoder,
             audio_bus,
+            self.audio_route.load(),
             audio_loudnorm,
             audio_loudness,
             loudness_publisher,
             display_audio,
             self.program_audio_preview.clone(),
+            live_track_inputs,
             #[cfg(feature = "aes67")]
             aes67_send_handles,
         );
@@ -3539,7 +3759,9 @@ impl Pipeline {
         // build-time per-source meter timeline (for silence). Sampling-only and
         // non-blocking. Only built under `overlay` (the badge renderer).
         #[cfg(feature = "overlay")]
-        let caption_stores = self.caption_stores.clone();
+        let caption_stores = Arc::clone(&self.live_caption_stores);
+        #[cfg(feature = "overlay")]
+        let caption_display_times = Arc::clone(&self.caption_display_times);
         // RT-10b: the per-layer subtitle crosspoint. One re-pointable
         // `SubtitleLayer` per source-bound caption store (identity routing by
         // default), sampled per output tick via `active_at(now)` so subtitle
@@ -3552,9 +3774,11 @@ impl Pipeline {
         #[cfg(feature = "overlay")]
         let mut subtitle_router = crate::captions::SubtitleRouter::from_stores(
             caption_stores
+                .load()
                 .iter()
                 .map(|(id, store)| (id.clone(), Arc::clone(store))),
-        );
+        )
+        .with_registry(Arc::clone(&caption_stores));
         #[cfg(feature = "overlay")]
         self.subtitle_route
             .store(Some(Arc::new(subtitle_router.handle())));
@@ -3570,9 +3794,18 @@ impl Pipeline {
         let mut fault_detector = FaultDetector::new(
             self.stores.clone(),
             self.meter_db_timelines.clone(),
+            self.audio_stores.clone(),
             self.cadence,
+            Arc::clone(&self.audio_free_sources),
             source_probes,
         );
+        // The last fault verdict, reused on cadence-hold REPEAT frames (#143): a
+        // repeat re-emits the unchanged last-good canvas, so re-running the
+        // black/freeze probes would only add per-tick cost on exactly the ticks
+        // where the loop is already behind — what kept catch-up from converging.
+        #[cfg(feature = "overlay")]
+        let mut last_faults: std::collections::HashMap<String, crate::overlays::TileFault> =
+            std::collections::HashMap::new();
         // RT-3 read-only stream-inventory discovery (off the hot loop, inv #10):
         // the per-input inventories were probed ONCE at build time. Emit one
         // `input.streams` event per input here — at run start, BEFORE the clock
@@ -3597,6 +3830,7 @@ impl Pipeline {
         // and hands it to the bake consumer over the bounded queue per `policy`:
         // blocking send offline (exact-N back-pressure on the renderer), wait-free
         // `try_send` + drop-and-count live (the engine never blocks — inv #1/#10).
+        let source_event_reader = self.source_events.reader();
         let state_of = move |frame: &CompositedFrame| -> EngineStateSnapshot {
             // RT-10b: sample the per-layer subtitle router (drains any pending
             // re-point at this sample boundary, then `active_at(pts)` per layer) —
@@ -3605,11 +3839,23 @@ impl Pipeline {
             // per-source path below (the text-layer primitive RT-10a built is
             // text-only).
             #[cfg(feature = "overlay")]
-            let captions = subtitle_router.sample(frame.pts());
+            for (id, cursor) in caption_display_times.load().iter() {
+                cursor.store(frame.source_times.get(id).copied().map(Arc::new));
+            }
             #[cfg(feature = "overlay")]
-            let caption_bitmaps = sample_caption_bitmaps(&caption_stores, frame.pts());
+            let captions = subtitle_router.sample_selected(&frame.source_times);
             #[cfg(feature = "overlay")]
-            let faults = fault_detector.sample(frame.pts(), frame.tick.index, &frame.source_states);
+            let caption_bitmaps =
+                sample_caption_bitmaps(&caption_stores.load(), &frame.source_times);
+            #[cfg(feature = "overlay")]
+            let faults = if frame.repeat {
+                last_faults.clone()
+            } else {
+                let faults =
+                    fault_detector.sample(frame.pts(), frame.tick.index, &frame.source_states);
+                last_faults.clone_from(&faults);
+                faults
+            };
             if let Some(obs) = hot_tick_observer.as_ref() {
                 obs.fetch_add(1, Ordering::Release);
             }
@@ -3636,11 +3882,29 @@ impl Pipeline {
                     tick_index: frame.tick.index,
                 });
             }
+            let selected_event_times = frame
+                .source_times
+                .iter()
+                .filter(|(id, _)| {
+                    frame
+                        .source_states
+                        .get(*id)
+                        .is_some_and(|state| state.is_live())
+                })
+                .map(|(id, time)| (id.clone(), *time))
+                .collect();
+            let events = source_event_reader.sample(&selected_event_times);
+            #[cfg(not(feature = "overlay"))]
+            let _ = events;
             let item = StreamItem {
+                #[cfg(feature = "overlay")]
+                events,
                 canvas: Arc::clone(&canvas),
                 tick_index: frame.tick.index,
                 #[cfg(feature = "overlay")]
                 source_states: frame.source_states.clone(),
+                #[cfg(feature = "overlay")]
+                tile_specs: tile_spec_apply.load(),
                 #[cfg(feature = "overlay")]
                 captions,
                 #[cfg(feature = "overlay")]
@@ -3750,6 +4014,11 @@ impl Pipeline {
         // ingest down deterministically (signal + join), then close the egress and
         // finalise. The hot queue is already closed by this point — see below.
         supervisor.shutdown();
+        // Invalidate every startup producer, including any libav worker detached
+        // after the bounded join. No old run may write into a later run's slot.
+        for (id, lifecycle) in startup_lifecycles {
+            end_live_lifecycle(&id, lifecycle);
+        }
         // The engine loop consumed the `state_of` closure (the ONLY owner of the
         // hot sender) when `run_for`/`run` returned above, so the hot queue is
         // already closed → the bake consumer's `recv()` has seen end-of-input,
@@ -3849,27 +4118,24 @@ impl Pipeline {
     /// pixel rectangle and the source's display label.
     #[cfg(feature = "overlay")]
     fn tile_specs(&self) -> Vec<crate::overlays::TileSpec> {
-        use multiview_overlay::geometry::PixelRect;
-        let (cw, ch) = (self.layout.canvas.width, self.layout.canvas.height);
-        let mut specs = Vec::new();
-        for cell in &self.layout.cells {
-            let Some(id) = cell.source.as_deref() else {
-                continue;
-            };
-            let label = self
-                .tile_labels
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| id.to_owned());
-            let rect = PixelRect {
-                x: norm_to_px_f32(cell.x, cw),
-                y: norm_to_px_f32(cell.y, ch),
-                width: norm_to_px_f32(cell.w, cw),
-                height: norm_to_px_f32(cell.h, ch),
-            };
-            specs.push(crate::overlays::TileSpec::new(id, label, rect));
-        }
-        specs
+        tile_specs_for_layout(&self.layout, &self.tile_labels)
+    }
+
+    /// The command drain publishes active cell placements after live layout and
+    /// video-route changes. The bake consumer samples the slot off the clock.
+    #[cfg(feature = "overlay")]
+    #[must_use]
+    pub fn tile_spec_apply_slot(
+        &self,
+    ) -> Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>> {
+        Arc::clone(&self.tile_spec_apply)
+    }
+
+    /// Share source-kind applicability with the frame-boundary command drain.
+    #[cfg(feature = "overlay")]
+    #[must_use]
+    pub fn audio_free_sources_slot(&self) -> AudioFreeSources {
+        Arc::clone(&self.audio_free_sources)
     }
 
     /// Extract the **`Send`** bake context the off-hot-path consumer thread owns
@@ -3883,7 +4149,9 @@ impl Pipeline {
     fn bake_context(&self) -> BakeContext {
         BakeContext {
             tile_specs: self.tile_specs(),
+            tile_spec_apply: Arc::clone(&self.tile_spec_apply),
             meter_db_timelines: self.meter_db_timelines.clone(),
+            meter_channel_timelines: self.meter_channel_timelines.clone(),
             subtitles: self.subtitles.clone(),
             sidecar_target: self.sidecar_target.clone(),
             analog_clocks: self.analog_clocks.clone(),
@@ -3914,9 +4182,13 @@ struct BakeContext {
     /// The per-tile overlay placements (cell rect + label per source-bound cell).
     #[cfg(feature = "overlay")]
     tile_specs: Vec<crate::overlays::TileSpec>,
+    #[cfg(feature = "overlay")]
+    tile_spec_apply: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
     /// Build-time per-source per-tick loudness timelines (dBFS) for the meters.
     #[cfg(feature = "overlay")]
     meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
+    #[cfg(feature = "overlay")]
+    meter_channel_timelines: std::collections::HashMap<String, Vec<crate::overlays::MeterChannels>>,
     /// The optional legacy `--subtitles` sidecar track (burned into its target).
     #[cfg(feature = "overlay")]
     subtitles: Option<multiview_overlay::subtitle::CueTrack>,
@@ -3994,6 +4266,12 @@ struct StreamBaker {
     /// state from (ADR-W022). `None` until the first bake, so a wired slot's
     /// seeded set drives the very first frame (one truth: the slot).
     overlay_generation: Option<u64>,
+    /// Last tile snapshot from the active drive, to avoid resetting meter state.
+    tile_snapshot: Arc<Vec<crate::overlays::TileSpec>>,
+    /// Last per-input audio peak observed by the consumer's live bus meter.
+    live_meter_db: std::collections::HashMap<String, crate::overlays::MeterChannels>,
+    /// Bounded per-input peak/RMS sampler shared with audio telemetry.
+    input_meters: crate::meter_telemetry::InputMeters,
 }
 
 #[cfg(not(feature = "overlay"))]
@@ -4023,8 +4301,12 @@ impl StreamBaker {
         if let Some(signal) = ctx.watermark_signal.clone() {
             baker = baker.with_watermark(signal, ctx.canvas_width, ctx.canvas_height);
         }
+        let tile_snapshot = ctx.tile_spec_apply.load();
         Ok(Self {
             baker,
+            tile_snapshot,
+            live_meter_db: std::collections::HashMap::new(),
+            input_meters: crate::meter_telemetry::InputMeters::new(),
             canvas_color: ctx.canvas_color,
             cadence: ctx.cadence,
             meter: ctx,
@@ -4055,6 +4337,27 @@ impl StreamBaker {
         self.overlay_generation = Some(set.generation());
     }
 
+    /// Sample the pre-mix audio of every routed source for its own tile meter.
+    /// The sample is shared with existing input telemetry; it never reads an
+    /// input or waits for a decoder on the protected output clock.
+    fn sample_input_meters(
+        &mut self,
+        bus: &multiview_audio::program::ProgramBus,
+        elapsed: Duration,
+    ) -> Vec<multiview_events::AudioMeter> {
+        let now_ns = i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX);
+        let samples = self.input_meters.push(&bus.input_tracks(), now_ns);
+        for sample in &samples {
+            if let Some(id) = sample.input_id.as_ref() {
+                self.live_meter_db.insert(
+                    id.clone(),
+                    crate::overlays::MeterChannels::from_db(&sample.peak_db),
+                );
+            }
+        }
+        samples
+    }
+
     /// Bake one streamed tick's overlays into its canvas, returning the overlaid
     /// `Arc<Nv12Image>` — the SAME math as the old post-loop `bake_overlays`, run
     /// once per received item off the hot loop.
@@ -4067,6 +4370,10 @@ impl StreamBaker {
         // ADR-W022: pick up a live overlay-set change before drawing, so this
         // frame is baked entirely from one set (frame-boundary apply).
         self.refresh_overlays(item.canvas.width(), item.canvas.height());
+        if !Arc::ptr_eq(&item.tile_specs, &self.tile_snapshot) {
+            self.baker.set_tiles(item.tile_specs.as_ref().clone());
+            self.tile_snapshot = Arc::clone(&item.tile_specs);
+        }
 
         let i = usize::try_from(item.tick_index).unwrap_or(usize::MAX);
         let pts = MediaTime::from_tick(i64::try_from(i).unwrap_or(i64::MAX), self.cadence);
@@ -4090,6 +4397,22 @@ impl StreamBaker {
                 spec.source_id.clone(),
                 crate::overlays::TileDynamics {
                     meter_db: self.meter.meter_db_for(&spec.source_id, i),
+                    channels: self
+                        .live_meter_db
+                        .get(&spec.source_id)
+                        .copied()
+                        .or_else(|| {
+                            self.meter
+                                .meter_channel_timelines
+                                .get(&spec.source_id)
+                                .and_then(|timeline| {
+                                    timeline
+                                        .get(i)
+                                        .copied()
+                                        .or_else(|| timeline.last().copied())
+                                })
+                        })
+                        .unwrap_or(crate::overlays::MeterChannels::EMPTY),
                     state,
                     fault,
                 },
@@ -4102,7 +4425,13 @@ impl StreamBaker {
         }
         let list = self
             .baker
-            .draw_list(pts, &dynamics, &captions, &item.caption_bitmaps)
+            .draw_list_with_events(
+                pts,
+                &dynamics,
+                &captions,
+                &item.caption_bitmaps,
+                &item.events,
+            )
             .map_err(|e| PipelineError::Engine(format!("overlay draw: {e}")))?;
         let overlaid = apply_overlays_to_nv12(&item.canvas, &list, self.canvas_color)
             .map_err(|e| PipelineError::Engine(format!("overlay blend: {e}")))?;
@@ -4131,6 +4460,8 @@ impl StreamBaker {
 /// loop this tick (captions/faults must be sampled now, before the small live
 /// cue window evicts them). The bake *render* runs on the consumer thread.
 struct StreamItem {
+    #[cfg(feature = "overlay")]
+    events: std::collections::HashMap<String, multiview_core::event_overlay::EventOverlay>,
     /// The composited canvas the protected output core emitted this tick.
     canvas: Arc<Nv12Image>,
     /// The engine's tick index for this frame (drives the per-frame media time
@@ -4145,6 +4476,9 @@ struct StreamItem {
     /// source absent here is treated as `NO_SIGNAL` by the baker.
     #[cfg(feature = "overlay")]
     source_states: std::collections::HashMap<String, multiview_core::traits::SourceState>,
+    /// Exact active placement snapshot from this frame's compositor boundary.
+    #[cfg(feature = "overlay")]
+    tile_specs: Arc<Vec<crate::overlays::TileSpec>>,
     /// Per-source active caption lines sampled from the cue stores at THIS tick's
     /// pts (`source_id -> on-screen lines`). Sampled on the hot loop because the
     /// bounded drop-oldest cue store only holds a small live window — sampling it
@@ -4188,6 +4522,7 @@ type SinkRunner = Box<
             StreamCodecParameters,
             Rational,
             Option<(StreamCodecParameters, Rational)>,
+            Vec<(StreamCodecParameters, Rational)>,
         ) -> Result<SinkRunOutcome, PipelineError>
         + Send,
 >;
@@ -4317,11 +4652,13 @@ impl StreamEgress {
         policy: SendPolicy,
         encoder: ProgramEncoder,
         audio_bus: Option<multiview_audio::program::ProgramBus>,
+        audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
         audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
         audio_loudness: Option<crate::loudness_telemetry::LoudnessTelemetry>,
         loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
         display_audio: DisplayAudioFeed,
         program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
+        track_inputs: Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>,
         #[cfg(feature = "aes67")] aes67_send_handles: Vec<
             multiview_output::aes67::Aes67SenderHandle,
         >,
@@ -4344,6 +4681,8 @@ impl StreamEgress {
             .audio_codec_params()
             .cloned()
             .zip(encoder.audio_time_base());
+        // The discrete audio tracks' (#152) params + time-bases, by track index.
+        let track_streams = encoder.audio_track_streams();
 
         // One bounded fan-out channel of coded packets + thread per sink. The sink
         // thread drives `PacketMuxSink::run` (or a test fake) over a
@@ -4357,7 +4696,8 @@ impl StreamEgress {
             let builder = std::thread::Builder::new().name(format!("multiview-sink-{i}"));
             let params = params.clone();
             let audio = audio.clone();
-            match builder.spawn(move || runner(rx, params, time_base, audio)) {
+            let tracks = track_streams.clone();
+            match builder.spawn(move || runner(rx, params, time_base, audio, tracks)) {
                 Ok(handle) => sinks.push(handle),
                 Err(e) => {
                     // A sink thread that cannot spawn is a real failure (we cannot
@@ -4372,20 +4712,26 @@ impl StreamEgress {
 
         let (hot_tx, hot_rx) = std::sync::mpsc::sync_channel::<StreamItem>(policy.queue_cap());
         let consumer_in_flight = Arc::clone(&in_flight);
+        // Keep a guard outside the spawn closure too: a failed thread spawn
+        // drops its captured guard and wakes any hub producer already waiting.
+        let consumer_guard = audio_route.as_ref().map(|route| route.consumer_guard());
         let builder = std::thread::Builder::new().name("multiview-bake-consumer".to_owned());
         let consumer = builder
             .spawn(move || {
+                let _consumer_guard = consumer_guard;
                 consumer_main(
                     ctx,
                     &hot_rx,
                     sink_txs,
                     encoder,
                     audio_bus,
+                    audio_route,
                     audio_loudnorm,
                     audio_loudness,
                     loudness_publisher,
                     display_audio,
                     program_audio_preview,
+                    &track_inputs,
                     #[cfg(feature = "aes67")]
                     aes67_send_handles,
                     &consumer_in_flight,
@@ -4647,7 +4993,7 @@ fn drive_audio_for_item(
 /// # Errors
 /// Returns [`PipelineError`] if building the baker, baking a frame, or the single
 /// encode fails.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 // reason: the consumer owns each pipeline tail input distinctly (encode, audio bus + loudnorm + loudness meter + publisher, display feed, in-flight counter); bundling them would only obscure the data flow.
 #[allow(clippy::needless_pass_by_value)] // reason: `loudness_publisher` is owned BY VALUE so it lives in the consumer thread's frame for the whole run (it cannot borrow from `drive_streaming`, which returns before this thread joins); the body only needs `&` access but the ownership is load-bearing.
 fn consumer_main(
@@ -4656,11 +5002,13 @@ fn consumer_main(
     sink_txs: Vec<SyncSender<EncodedPacket>>,
     mut encoder: ProgramEncoder,
     mut audio_bus: Option<multiview_audio::program::ProgramBus>,
+    audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
     mut audio_loudnorm: Option<multiview_audio::LoudnormProcessor>,
     mut audio_loudness: Option<crate::loudness_telemetry::LoudnessTelemetry>,
     loudness_publisher: Option<EnginePublisher<EngineStateSnapshot, Event>>,
     mut display_audio: DisplayAudioFeed,
     program_audio_preview: Option<crate::preview::ProgramAudioSlot>,
+    track_inputs: &multiview_framestore::SwapCell<Arc<Vec<String>>>,
     #[cfg(feature = "aes67")] aes67_send_handles: Vec<multiview_output::aes67::Aes67SenderHandle>,
     in_flight: &AtomicI64,
 ) -> Result<(), PipelineError> {
@@ -4669,6 +5017,26 @@ fn consumer_main(
     // loop (this is the bake-consumer thread). The epoch is the consumer start;
     // the conflator only ever sees a non-decreasing `now_ns`.
     let loudness_epoch = Instant::now();
+    // Program-bus peak/RMS meter (`audio.meter`, ~30 Hz conflated; AUD-8 / SW-14),
+    // built lazily from the first emitted block's channel count. Same thread and
+    // same non-blocking drop-oldest publisher as the loudness lane (inv #10).
+    let mut audio_meter: Option<crate::meter_telemetry::MeterTelemetry> = None;
+    // Without overlay support, keep the telemetry meter on this consumer.
+    #[cfg(not(feature = "overlay"))]
+    let mut input_meters = crate::meter_telemetry::InputMeters::new();
+    // On-air A/V offset for live (timeline) sources, measured per tick.
+    let mut av_ids: Vec<String> = audio_bus
+        .as_ref()
+        .map(multiview_audio::program::ProgramBus::timeline_source_ids)
+        .unwrap_or_default();
+    // Sources join and leave the running bus: re-read the metered ids when the
+    // strip count moves (a rare, operator-paced change), never per tick.
+    let mut av_strips = audio_bus
+        .as_ref()
+        .map_or(0, multiview_audio::program::ProgramBus::live_strip_count);
+    let mut av_meter = audio_bus
+        .as_ref()
+        .map(|bus| crate::av_sync::AvMeter::new(bus.cadence(), bus.format().sample_rate()));
     // Track which sinks are still live (their receiver has not hung up) so a sink
     // that ended early does not wedge or repeatedly error the consumer.
     let mut live: Vec<bool> = vec![true; sink_txs.len()];
@@ -4677,12 +5045,43 @@ fn consumer_main(
     while let Ok(item) = hot_rx.recv() {
         // One frame left the queue.
         in_flight.fetch_sub(1, Ordering::AcqRel);
+        // Freeze the declared track selection before this tick samples the bus.
+        // A concurrent routing PUT changes only the following tick's selection.
+        let selected_tracks = track_inputs.load();
+        // Consume input audio for this tick before the overlay draw so source
+        // bars represent the same output instant, never the preceding frame.
+        #[cfg(feature = "overlay")]
+        let early_audio_block = if let Some(bus) = audio_bus.as_mut() {
+            if let Some(handle) = audio_route.as_ref() {
+                handle.apply_pending(bus);
+            }
+            if bus.live_strip_count() != av_strips {
+                av_strips = bus.live_strip_count();
+                av_ids = bus.timeline_source_ids();
+            }
+            let tick_frame = bus.position_at(item.tick_index);
+            let input_block = drive_audio_for_item(bus, item.tick_index);
+            if let Some(meter) = av_meter.as_mut() {
+                meter.sample(&av_ids, item.tick_index, tick_frame);
+            }
+            let samples = baker.sample_input_meters(bus, loudness_epoch.elapsed());
+            if let Some(publisher) = loudness_publisher.as_ref() {
+                for sample in samples {
+                    publisher.publish_event(Event::AudioMeter(sample));
+                }
+            }
+            Some(input_block)
+        } else {
+            None
+        };
         let overlaid = baker.bake(&item)?;
         // Bridge once + encode once (invariant #7): the canvas is encoded a SINGLE
         // time here, never once per sink.
         let frame = nv12_to_decoded(&overlaid)?;
+        // Stamp video at the absolute output tick, the clock the program audio is
+        // driven by (`drive_audio_for_item`), so shed ticks cannot drift A/V.
         let packets = encoder
-            .encode_frame(frame)
+            .encode_frame_at(frame, item.tick_index)
             .map_err(|e| PipelineError::Output {
                 kind: "encode",
                 reason: e.to_string(),
@@ -4698,8 +5097,39 @@ fn consumer_main(
         // The pull does no I/O and cannot block (inv #1/#10); the encode runs here on
         // the bake consumer, never on the output-clock loop. `None` (audio off) skips
         // this entirely — the run is video-only as before.
-        if let Some(bus) = audio_bus.as_mut() {
+        if audio_bus.is_some() {
+            #[cfg(not(feature = "overlay"))]
+            let Some(bus) = audio_bus.as_mut() else {
+                continue;
+            };
+            // Apply resolved operator commands at this sample boundary before
+            // advancing the absolute tick clock. A stalled consumer merely sheds
+            // bounded pending commands; it never holds the output clock (#1/#10).
+            #[cfg(not(feature = "overlay"))]
+            if let Some(handle) = audio_route.as_ref() {
+                handle.apply_pending(bus);
+            }
+            #[cfg(not(feature = "overlay"))]
+            if bus.live_strip_count() != av_strips {
+                av_strips = bus.live_strip_count();
+                av_ids = bus.timeline_source_ids();
+            }
+            // The bus sample position of THIS tick (before the advance): the
+            // output frame whose audio the bus is about to read.
+            #[cfg(not(feature = "overlay"))]
+            let tick_frame = bus.position_at(item.tick_index);
+            #[cfg(not(feature = "overlay"))]
             let block = drive_audio_for_item(bus, item.tick_index);
+            #[cfg(feature = "overlay")]
+            let block = early_audio_block.ok_or_else(|| {
+                PipelineError::Engine(
+                    "audio bus advanced without a matching output block".to_owned(),
+                )
+            })?;
+            #[cfg(not(feature = "overlay"))]
+            if let Some(meter) = av_meter.as_mut() {
+                meter.sample(&av_ids, item.tick_index, tick_frame);
+            }
             // EBU R128 loudness normalisation of the PROGRAM bus (AUD-6), still off
             // the engine hot loop (this bake-consumer thread): a smoothed makeup
             // gain toward the target LUFS with a true-peak limiter clamping to the
@@ -4731,6 +5161,16 @@ fn consumer_main(
                 let now_ns = i64::try_from(now_ns).unwrap_or(i64::MAX);
                 if let Some(sample) = meter.push(&block, gain_f32, now_ns) {
                     publisher.publish_event(Event::AudioLoudness(sample));
+                }
+                let peak_rms = audio_meter.get_or_insert_with(|| {
+                    crate::meter_telemetry::MeterTelemetry::new(0, block.format().channel_count())
+                });
+                if let Some(sample) = peak_rms.push(&block, now_ns) {
+                    publisher.publish_event(Event::AudioMeter(sample));
+                }
+                #[cfg(not(feature = "overlay"))]
+                for sample in input_meters.push(&bus.input_tracks(), now_ns) {
+                    publisher.publish_event(Event::AudioMeter(sample));
                 }
             }
             // DEV-B4: the display heads hear the SAME post-loudnorm program
@@ -4774,6 +5214,22 @@ fn consumer_main(
                     reason: e.to_string(),
                 })?;
             fan_packets(&sink_txs, &mut live, audio_packets);
+            // #152: discrete tracks, same tick, same sample budget (inv #3).
+            if !selected_tracks.is_empty() {
+                #[cfg(feature = "overlay")]
+                let track_bus = audio_bus
+                    .as_mut()
+                    .ok_or_else(|| PipelineError::Engine("audio track bus missing".to_owned()))?;
+                #[cfg(not(feature = "overlay"))]
+                let track_bus = bus;
+                let packets = encode_discrete_tracks(
+                    &mut encoder,
+                    track_bus,
+                    &selected_tracks,
+                    block.frame_count(),
+                )?;
+                fan_packets(&sink_txs, &mut live, packets);
+            }
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
             // dedicated display bus by the same absolute tick index (RT-8b —
@@ -4795,6 +5251,38 @@ fn consumer_main(
     fan_packets(&sink_txs, &mut live, tail);
     drop(sink_txs);
     Ok(())
+}
+
+/// Encode one tick of every discrete track (#152) from its source's pre-mix
+/// block, with exactly the program block's `frames`, so each track's sample
+/// counter (its PTS) equals the program's — locked to vision. A source with no
+/// block this tick (or a block of another length) encodes silence; the track's
+/// clock never skips.
+fn encode_discrete_tracks(
+    encoder: &mut ProgramEncoder,
+    bus: &multiview_audio::program::ProgramBus,
+    track_inputs: &[String],
+    frames: usize,
+) -> Result<Vec<EncodedPacket>, PipelineError> {
+    let inputs = bus.input_tracks();
+    let mut out = Vec::new();
+    for (index, input_id) in track_inputs.iter().enumerate() {
+        let samples = inputs
+            .iter()
+            .find(|(id, _)| *id == input_id.as_str())
+            .map(|(_, b)| *b)
+            .filter(|b| b.frame_count() == frames)
+            .map(multiview_audio::format::AudioBlock::interleaved);
+        out.append(
+            &mut encoder
+                .encode_track_interleaved(index, samples, frames)
+                .map_err(|e| PipelineError::Output {
+                    kind: "encode-audio-track",
+                    reason: e.to_string(),
+                })?,
+        );
+    }
+    Ok(out)
 }
 
 /// Fan each coded packet to every still-live sink as an independently-owned copy
@@ -4880,7 +5368,12 @@ fn run_one_output(
     params: &StreamCodecParameters,
     time_base: Rational,
     audio: Option<&(StreamCodecParameters, Rational)>,
+    tracks: &[(StreamCodecParameters, Rational)],
 ) -> Result<SinkRunOutcome, PipelineError> {
+    let track_mux: Vec<multiview_output::MuxStream<'_>> = tracks
+        .iter()
+        .map(|(p, tb)| multiview_output::MuxStream::new(p, *tb))
+        .collect();
     // ADR-0060: run this sink's mux region inside an `output` resource scope so
     // our own logs (via the span) AND libav's synchronous mux/transport lines
     // (via the thread-local ResourceContext the bridge resolves) name this output
@@ -4899,10 +5392,11 @@ fn run_one_output(
             let mut source = StreamingPacketSource::new(rx);
             let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
             let outcome = sink
-                .run_av(
+                .run_av_tracks(
                     &mut source,
                     multiview_output::MuxStream::new(params, time_base),
                     audio_mux,
+                    &track_mux,
                 )
                 .map_err(|e| PipelineError::Output {
                     kind: "file",
@@ -4929,10 +5423,11 @@ fn run_one_output(
             let mut source = StreamingPacketSource::new(rx);
             let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
             let outcome = sink
-                .run_av(
+                .run_av_tracks(
                     &mut source,
                     multiview_output::MuxStream::new(params, time_base),
                     audio_mux,
+                    &track_mux,
                 )
                 .map_err(|e| PipelineError::Output {
                     kind: "hls",
@@ -4976,7 +5471,12 @@ fn run_one_output(
             label,
             url,
         } => Ok(run_push_output(
-            &sink, label, &url, rx, params, time_base, audio,
+            &sink,
+            label,
+            &url,
+            rx,
+            multiview_output::MuxStream::new(params, time_base),
+            (audio, &track_mux),
         )),
         #[cfg(feature = "webrtc-native")]
         RunnableOutput::WebRtc { id: _, sink, label } => {
@@ -5337,17 +5837,15 @@ fn run_push_output(
     label: &'static str,
     url: &str,
     rx: Receiver<EncodedPacket>,
-    params: &StreamCodecParameters,
-    time_base: Rational,
-    audio: Option<&(StreamCodecParameters, Rational)>,
+    video: multiview_output::MuxStream<'_>,
+    (audio, tracks): (
+        Option<&(StreamCodecParameters, Rational)>,
+        &[multiview_output::MuxStream<'_>],
+    ),
 ) -> SinkRunOutcome {
     let mut source = StreamingPacketSource::new(rx);
     let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
-    match sink.run_av(
-        &mut source,
-        multiview_output::MuxStream::new(params, time_base),
-        audio_mux,
-    ) {
+    match sink.run_av_tracks(&mut source, video, audio_mux, tracks) {
         Ok(outcome) => {
             let (packets, keyframes) = match &outcome {
                 PacketMuxOutcome::Single(s) => (s.packets, s.keyframes),
@@ -5387,12 +5885,15 @@ fn run_push_output(
 #[cfg(feature = "overlay")]
 fn sample_caption_bitmaps(
     stores: &std::collections::HashMap<String, Arc<crate::captions::CueStore>>,
-    pts: MediaTime,
+    times: &std::collections::HashMap<String, multiview_framestore::tile::SourceFrameTime>,
 ) -> std::collections::HashMap<String, multiview_ffmpeg::caption::CueBitmap> {
     let mut out = std::collections::HashMap::new();
     for (id, store) in stores {
+        let Some(selected) = times.get(id) else {
+            continue;
+        };
         if let Some(multiview_ffmpeg::caption::CaptionCue::Bitmap { bitmap, .. }) =
-            store.active_at(pts)
+            store.active_at_generation(selected.pts, selected.generation)
         {
             out.insert(id.clone(), bitmap);
         }
@@ -5520,11 +6021,27 @@ const SILENCE_FLOOR_DB: f64 = -50.0;
 /// first decoded frame) cannot reset an otherwise-sustained freeze. Black and
 /// silence are unaffected.
 #[cfg(feature = "overlay")]
+pub(crate) type AudioFreeSources =
+    Arc<multiview_framestore::SwapCell<Arc<std::collections::HashSet<String>>>>;
+
+#[cfg(feature = "overlay")]
+fn is_intentionally_audio_free(kind: &SourceKind) -> bool {
+    matches!(
+        kind,
+        SourceKind::Clock { .. } | SourceKind::Timer { .. } | SourceKind::Solid { .. }
+    )
+}
+
+#[cfg(feature = "overlay")]
 struct FaultDetector {
     /// The per-source last-good stores, shared with the engine drive loop.
     stores: HashMapStores,
     /// Build-time per-source per-tick loudness timelines (dBFS) for silence.
     meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
+    /// Source PCM before program routing, gain or mute.
+    audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+    cadence: Rational,
+    audio_free_sources: AudioFreeSources,
     /// Per-source dwell/hysteresis state machines for each fault class.
     machines: std::collections::HashMap<String, SourceFaultMachines>,
     /// The stateless black probe (default broadcast threshold).
@@ -5588,6 +6105,49 @@ struct SourceFaultMachines {
     black: multiview_engine::AlarmStateMachine,
     freeze: multiview_engine::AlarmStateMachine,
     silence: multiview_engine::AlarmStateMachine,
+    /// Silence alone uses an evidence clock; unknown PCM must not advance either
+    /// pending raise or pending clear dwell. Other fault machines keep raw PTS.
+    silence_evidence_pts: MediaTime,
+    last_silence_pts: Option<MediaTime>,
+    last_silence_index: Option<u64>,
+    previous_silence_known: bool,
+}
+
+#[cfg(feature = "overlay")]
+impl SourceFaultMachines {
+    fn reset_silence(&mut self) {
+        // Applicability changed, not a measured non-silent interval. Clear
+        // even a latched alarm without advancing evidence or clear dwell.
+        self.silence.reset();
+        self.silence_evidence_pts = MediaTime::ZERO;
+        self.last_silence_pts = None;
+        self.last_silence_index = None;
+        self.previous_silence_known = false;
+    }
+
+    fn observe_silence(&mut self, measured: Option<bool>, pts: MediaTime, index: u64) {
+        if let Some(condition) = measured {
+            // The detector does not sample runtime repeat frames or skipped ticks.
+            // Even two known samples cannot prove the intervening audio when
+            // their tick indexes are not adjacent.
+            if self.previous_silence_known
+                && self.last_silence_index.and_then(|last| last.checked_add(1)) == Some(index)
+            {
+                if let Some(last) = self.last_silence_pts {
+                    let delta = pts.saturating_sub(last);
+                    if delta.as_nanos() > 0 {
+                        self.silence_evidence_pts = self.silence_evidence_pts.saturating_add(delta);
+                    }
+                }
+            }
+            self.silence.observe(condition, self.silence_evidence_pts);
+        }
+        // The first covered sample after an unknown window has no proven
+        // intervening time; only consecutive covered samples accrue evidence.
+        self.previous_silence_known = measured.is_some();
+        self.last_silence_pts = Some(pts);
+        self.last_silence_index = Some(index);
+    }
 }
 
 #[cfg(feature = "overlay")]
@@ -5599,7 +6159,9 @@ impl FaultDetector {
     fn new(
         stores: HashMapStores,
         meter_db_timelines: std::collections::HashMap<String, Vec<f64>>,
-        _cadence: Rational,
+        audio_stores: std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>,
+        cadence: Rational,
+        audio_free_sources: AudioFreeSources,
         source_probes: std::collections::HashMap<String, SourceProbeOverride>,
     ) -> Self {
         use multiview_engine::{
@@ -5672,6 +6234,9 @@ impl FaultDetector {
         Self {
             stores,
             meter_db_timelines,
+            audio_stores,
+            cadence,
+            audio_free_sources,
             machines: std::collections::HashMap::new(),
             black: BlackProbe::new(BlackConfig::default()),
             freeze: FreezeProbe::new(freeze_cfg),
@@ -5737,6 +6302,10 @@ impl FaultDetector {
                     PerceivedSeverity::Minor,
                     hs,
                 ),
+                silence_evidence_pts: MediaTime::ZERO,
+                last_silence_pts: None,
+                last_silence_index: None,
+                previous_silence_known: false,
             }
         })
     }
@@ -5762,6 +6331,7 @@ impl FaultDetector {
         // Snapshot the source ids this tick (sorted for deterministic logging).
         let mut ids: Vec<String> = source_states.keys().cloned().collect();
         ids.sort_unstable();
+        let audio_free = self.audio_free_sources.load();
         for id in ids {
             // Sample this tile's last-good frame (lock-free; never blocks).
             let frame = self
@@ -5784,8 +6354,14 @@ impl FaultDetector {
                 self.previous.remove(&id);
                 self.freeze_window.remove(&id);
             }
-            // Instantaneous silence from the per-input meter timeline.
-            let silence_now = self.silence_now(&id, index);
+            // An intentional audio-free kind has no silence probe. A source
+            // edited to that kind must explicitly clear its old active fault.
+            let intentionally_audio_free = audio_free.contains(&id);
+            let silence_now = if intentionally_audio_free {
+                None
+            } else {
+                self.silence_now(&id, index, pts)
+            };
 
             // Debounce the freeze condition over a short window so a single noisy
             // GOP-boundary / warm-up frame cannot reset the 2 s freeze dwell.
@@ -5795,7 +6371,11 @@ impl FaultDetector {
             let machines = self.machines_for(&id);
             machines.black.observe(black_now, pts);
             machines.freeze.observe(freeze_debounced, pts);
-            machines.silence.observe(silence_now, pts);
+            if intentionally_audio_free {
+                machines.reset_silence();
+            } else {
+                machines.observe_silence(silence_now, pts, index);
+            }
 
             // Precedence: black > freeze > silence (a black picture is the most
             // specific/severe content fault; a still or silent tile is lesser).
@@ -5877,30 +6457,50 @@ impl FaultDetector {
         }
     }
 
-    /// The instantaneous silence condition for `id` at tick `index`: the source's
-    /// build-time meter reading is at/below its silence floor. The floor is the
-    /// operator-declared `level_dbfs` when this source has a declared silence probe
+    /// The instantaneous silence condition for `id` at tick `index`. Timeline
+    /// PCM with incomplete published coverage is unknown (`None`), not audible.
+    /// The source's build-time meter reading is at/below its silence floor. The
+    /// floor is operator-declared `level_dbfs` when this source has a silence probe
     /// (M10), otherwise the shared default [`SILENCE_FLOOR_DB`]. A source with no
-    /// meter timeline rides the meter floor (which is below either silence floor),
-    /// so an audio-free tile reads silent.
-    fn silence_now(&self, id: &str, index: u64) -> bool {
-        let db = match self.meter_db_timelines.get(id) {
-            Some(timeline) => {
-                let i = usize::try_from(index).unwrap_or(usize::MAX);
-                timeline
-                    .get(i)
-                    .copied()
-                    .or_else(|| timeline.last().copied())
-                    .unwrap_or(multiview_audio::Ballistics::FLOOR_DB)
-            }
-            None => multiview_audio::Ballistics::FLOOR_DB,
-        };
+    /// meter timeline is an unknown condition: lack of an audio store never
+    /// proves that a decoded source intentionally has no audio.
+    fn silence_now(&self, id: &str, index: u64, pts: MediaTime) -> Option<bool> {
         let floor = self
             .declared_silence_floor
             .get(id)
             .copied()
             .unwrap_or(SILENCE_FLOOR_DB);
-        db <= floor
+        if let Some(store) = self
+            .audio_stores
+            .get(id)
+            .filter(|store| store.is_timeline())
+        {
+            // Measure exactly this tick on the output sample clock, not a route cursor.
+            let rate = store.format().sample_rate();
+            let start = multiview_audio::store::output_ns_to_frame(pts.as_nanos(), rate);
+            // Each tick boundary comes from its integer index. Adding a truncated
+            // period to this tick's truncated PTS can omit its final PCM sample
+            // at fractional cadences (e.g. 30000/1001, tick 14).
+            let next = MediaTime::from_tick(
+                i64::try_from(index.saturating_add(1)).unwrap_or(i64::MAX),
+                self.cadence,
+            );
+            let end = multiview_audio::store::output_ns_to_frame(next.as_nanos(), rate);
+            let frames = usize::try_from(end.saturating_sub(start)).unwrap_or(0);
+            return match store.measure_pcm(start, frames) {
+                // Silence detection uses the covered span's sample peak, not RMS:
+                // a short audible burst must not read silent when the same PCM's
+                // tick-wide RMS falls below the operator's level floor.
+                multiview_audio::store::PcmMeasurement::Measured { peak_dbfs, .. } => {
+                    Some(peak_dbfs <= floor)
+                }
+                multiview_audio::store::PcmMeasurement::Unknown => None,
+            };
+        }
+        let timeline = self.meter_db_timelines.get(id)?;
+        let i = usize::try_from(index).ok()?;
+        let db = timeline.get(i).copied()?;
+        Some(db <= floor)
     }
 }
 
@@ -6292,6 +6892,7 @@ fn spawn_ingest_producer(
 /// spawns the same supervised [`ingest_loop`]. Runs on the hub worker thread
 /// only — heavy/blocking work never touches the output clock (inv #1).
 struct LiveIngestSpawner {
+    source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved startup layout: tile geometry for a bound cell, the canvas
     /// fallback for an unbound one — the same sizing rule the startup build
     /// applies (a freshly added source is typically unbound until the
@@ -6302,6 +6903,17 @@ struct LiveIngestSpawner {
     canvas_color: CanvasColor,
     /// The output cadence (generator pacing / plan metadata).
     cadence: Rational,
+    /// The run's output-clock origin slot (see [`IngestPlan::output_origin`]).
+    output_origin: crate::timing_status::EpochAnchorSlot,
+    /// The running program bus control handle.
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    #[cfg(feature = "overlay")]
+    caption_stores: crate::captions::LiveCaptionStores,
+    #[cfg(feature = "overlay")]
+    caption_generations:
+        Arc<multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, u64>>>>,
+    #[cfg(feature = "overlay")]
+    caption_display_times: crate::captions::DisplayCursors,
     /// The pinned island slot `drive_streaming` publishes (ADR-W018 §7).
     #[cfg(feature = "gpu")]
     island: LiveIslandSlot,
@@ -6311,19 +6923,161 @@ struct LiveIngestSpawner {
     load_source: Box<dyn multiview_hal::LoadSource + Send + Sync>,
 }
 
+#[cfg(feature = "overlay")]
+impl LiveIngestSpawner {
+    /// Apply the source lifecycle token that the video coordinator already
+    /// allocated. Never independently increment a caption epoch.
+    fn set_caption_generation(&self, id: &str, generation: u64) {
+        self.caption_generations.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert(id.to_owned(), generation);
+            next
+        });
+        if let Some(store) = self.caption_stores.load().get(id) {
+            store.begin_generation(generation);
+        }
+    }
+
+    /// Reuse the already-advanced video lifecycle for synthetic/remove clear.
+    fn clear_captions_for_lifecycle(&self, id: &str, generation: u64) {
+        self.set_caption_generation(id, generation);
+        self.caption_stores.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.remove(id);
+            next
+        });
+        self.caption_display_times.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.remove(id);
+            next
+        });
+    }
+}
+
 impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
+    #[allow(clippy::too_many_lines)]
+    // reason: the hub worker configures separate native caption forms and the
+    // video producer together; no part of this runs on the output clock.
     fn spawn(
         &self,
         spawn: crate::live_sources::SourceSpawn,
         registry: &crate::live_sources::StopRegistry,
     ) -> Option<crate::live_sources::SpawnedProducer> {
         let crate::live_sources::SourceSpawn { source, store } = spawn;
+        let audio = self.audio_route.load();
+        // The hub has stopped both old rails before this same-id edit. Do not
+        // let the replacement audio decode place B against A's video anchor
+        // while the new fetcher waits for its first segment.
+        let lifecycle = begin_live_lifecycle(&source.id);
+        // Capture the unusable replacement marker before video can publish B.
+        let anchor_floor = live_anchor_slot(&source.id)
+            .load()
+            .map_or(0, |anchor| anchor.generation);
+        let produced = self.spawn_video(&source, store, registry, lifecycle);
+        if let Some(handle) = audio {
+            let audio_store = produced.as_ref().and_then(|p| {
+                spawn_live_audio(&source, &p.stop, registry, lifecycle, anchor_floor)
+            });
+            if !handle.set_source_audio(&source.id, audio_store) {
+                tracing::warn!(source = %source.id, "audio membership rejected: consumer closed");
+            }
+        }
+        produced
+    }
+
+    fn source_without_audio(&self, id: &str) {
+        // A timed-out decoded producer must not publish after HLS -> synthetic.
+        let lifecycle = begin_live_lifecycle(id);
+        if let Some(lease) = self.source_events.activate(id, lifecycle) {
+            lease.retire();
+        }
+        #[cfg(feature = "overlay")]
+        self.clear_captions_for_lifecycle(id, lifecycle);
+        #[cfg(not(feature = "overlay"))]
+        let _ = lifecycle;
+        if let Some(handle) = self.audio_route.load() {
+            if !handle.set_source_audio(id, None) {
+                tracing::warn!(source = %id, "audio membership rejected: consumer closed");
+            }
+        }
+    }
+
+    fn source_removed(&self, id: &str) {
+        let lifecycle = remove_live_lifecycle(id);
+        if let Some(lease) = self.source_events.activate(id, lifecycle) {
+            lease.retire();
+        }
+        #[cfg(feature = "overlay")]
+        self.clear_captions_for_lifecycle(id, lifecycle);
+        #[cfg(not(feature = "overlay"))]
+        let _ = lifecycle;
+        if let Some(handle) = self.audio_route.load() {
+            if !handle.remove_source(id) {
+                tracing::warn!(source = %id, "audio removal rejected: consumer closed");
+            }
+        }
+    }
+}
+
+/// Spawn a runtime-added source's AUDIO decode exactly as the startup path does
+/// ([`audio_ingest_plan_for`] + [`crate::audio::audio_ingest_loop`] into a
+/// timeline store locked to vision through [`live_anchor_slot`]), returning the
+/// store the program bus should read. It shares the video producer's stop flag
+/// and registers it under `{id}/audio`, so a live edit/remove (which raises
+/// `{id}` and every `{id}/` companion and waits for their exit) and hub shutdown
+/// both stop it. `None` for a source with no audio path, or a failed spawn
+/// (logged; the source rides silence). Hub worker thread only, never the clock.
+fn spawn_live_audio(
+    source: &Source,
+    stop: &Arc<AtomicBool>,
+    registry: &crate::live_sources::StopRegistry,
+    lifecycle: u64,
+    anchor_floor: u64,
+) -> Option<Arc<multiview_audio::store::AudioStore>> {
+    if matches!(source.kind, SourceKind::Bars) {
+        return Some(crate::audio::new_tone_store());
+    }
+    let mut plan = audio_ingest_plan_for(source)?;
+    plan.lifecycle = lifecycle;
+    plan.anchor_floor = anchor_floor;
+    let store = if plan.live {
+        crate::audio::new_live_store()
+    } else {
+        crate::audio::new_file_store()
+    };
+    let id = plan.id.clone();
+    let exited = crate::live_sources::register_stop(registry, &format!("{id}/audio"), stop);
+    let exit_guard = crate::live_sources::ExitGuard::new(&exited);
+    let thread_stop = Arc::clone(stop);
+    let thread_store = Arc::clone(&store);
+    match std::thread::Builder::new()
+        .name(format!("multiview-audio-{id}"))
+        .spawn(move || {
+            let _exit = exit_guard;
+            crate::audio::audio_ingest_loop(&plan, &thread_store, &thread_stop);
+        }) {
+        Ok(_detached) => Some(store),
+        Err(e) => {
+            tracing::error!(error = %e, source = %id, "could not spawn live audio decode thread");
+            None
+        }
+    }
+}
+
+impl LiveIngestSpawner {
+    /// The video half of [`crate::live_sources::IngestSpawner::spawn`].
+    #[allow(clippy::too_many_lines)]
+    // reason: live caption setup shares source planning but runs only on the hub worker.
+    fn spawn_video(
+        &self,
+        source: &Source,
+        store: Arc<TileStore<Nv12Image>>,
+        registry: &crate::live_sources::StopRegistry,
+        lifecycle: u64,
+    ) -> Option<crate::live_sources::SpawnedProducer> {
+        let source = source.clone();
         let (tile_w, tile_h) = cell_pixel_size(&self.layout, &source.id)
             .unwrap_or((self.layout.canvas.width, self.layout.canvas.height));
-        #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
-        // reason: without `gpu` there is no placement consult, so the plan is
-        // never re-stamped after construction; the binding must still be `mut`
-        // for the gpu arm below.
         let mut plan = match ingest_plan_for(
             &source,
             tile_w,
@@ -6343,6 +7097,96 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
                 return None;
             }
         };
+        plan.output_origin = Arc::clone(&self.output_origin);
+        plan.lifecycle = lifecycle;
+        plan.source_events = self.source_events.activate(&source.id, lifecycle);
+        #[cfg(feature = "overlay")]
+        {
+            // The hub worker stopped old readers. Use the SAME lifecycle token
+            // already assigned to video and audio, never increment a caption-only
+            // clock. Caption work is off the output clock.
+            let id = source.id.clone();
+            let existing = self.caption_stores.load().get(&id).cloned();
+            self.set_caption_generation(&id, lifecycle);
+            let generation = lifecycle;
+            let caption_plan = caption_plan_for_generation(&source, existing.clone(), generation);
+            if caption_plan.is_none() {
+                if let Some(selector) = source.captions.as_ref() {
+                    if let Some(channel) =
+                        crate::captions::embedded_cc_channel(&source.kind, selector)
+                    {
+                        let store = existing
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(crate::captions::CueStore::new()));
+                        store.begin_generation(generation);
+                        plan.embedded_cc = Some(EmbeddedCcRoute {
+                            channel,
+                            store: Arc::clone(&store),
+                        });
+                        self.caption_stores.rcu(|current| {
+                            let mut next = current.as_ref().clone();
+                            next.insert(id.clone(), Arc::clone(&store));
+                            next
+                        });
+                    } else if crate::captions::incontainer_selector_active(&source.kind, selector) {
+                        if let Some((mut route, fresh)) =
+                            resolve_incontainer_sub_route(&source, selector, &plan.location)
+                        {
+                            let store = existing.clone().unwrap_or(fresh);
+                            store.begin_generation(generation);
+                            route.store = Arc::clone(&store);
+                            plan.incontainer_sub = Some(route);
+                            self.caption_stores.rcu(|current| {
+                                let mut next = current.as_ref().clone();
+                                next.insert(id.clone(), Arc::clone(&store));
+                                next
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(ref captions) = caption_plan {
+                let cue_store = Arc::clone(&captions.store);
+                self.caption_stores.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.insert(id.clone(), Arc::clone(&cue_store));
+                    next
+                });
+                let cursor = Arc::clone(&captions.displayed_time);
+                self.caption_display_times.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.insert(id.clone(), Arc::clone(&cursor));
+                    next
+                });
+                let stop = Arc::new(AtomicBool::new(false));
+                let exited =
+                    crate::live_sources::register_stop(registry, &format!("{id}/captions"), &stop);
+                let guard = crate::live_sources::ExitGuard::new(&exited);
+                let thread_stop = Arc::clone(&stop);
+                let builder = std::thread::Builder::new().name(format!("multiview-captions-{id}"));
+                if let Err(error) = builder.spawn(move || {
+                    let _exit = guard;
+                    if let Some(captions) = caption_plan {
+                        crate::captions::caption_loop(&captions, &thread_stop);
+                    }
+                }) {
+                    tracing::warn!(%id, %error, "caption reader spawn failed; video continues");
+                }
+            } else if plan.embedded_cc.is_none() && plan.incontainer_sub.is_none() {
+                // An edited source with captions off must not retain its former
+                // layer, even if the old selected picture is still held.
+                self.caption_stores.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.remove(&id);
+                    next
+                });
+                self.caption_display_times.rcu(|current| {
+                    let mut next = current.as_ref().clone();
+                    next.remove(&id);
+                    next
+                });
+            }
+        }
         // Hardware re-assessment on every change (ADR-W018 §7), under `gpu`.
         #[cfg(feature = "gpu")]
         {
@@ -6388,6 +7232,934 @@ impl LiveIngestSpawner {
             );
             DecodePlacement::SoftwareOnly
         }
+    }
+}
+
+#[cfg(all(test, feature = "ffmpeg"))]
+#[allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod live_edit_audio_regression_tests {
+    use super::*;
+    use crate::live_sources::{shared_stores, LiveSourceHub, SourceSpawn};
+    use multiview_audio::{AudioFormat, ChannelLayout, ProgramBus};
+    use multiview_framestore::{NoSignalPolicy, TileThresholds};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    fn clip(path: &std::path::Path, frequency: u32) {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=25:d=12",
+                "-f",
+                "lavfi",
+            ])
+            .arg("-i")
+            .arg(format!(
+                "sine=frequency={frequency}:sample_rate=48000:duration=12"
+            ))
+            .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-f", "mpegts"])
+            .arg(path)
+            .status()
+            .expect("generate local audio/video clip");
+        assert!(status.success(), "ffmpeg fixture generation failed");
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !condition() {
+            assert!(Instant::now() < deadline, "live edit did not make progress");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Review R3-04: `AudioControlHandle::set_source_audio` publishes its
+    /// membership map (what `test_source_store` reads) BEFORE it enqueues the
+    /// change `apply_pending` drains (`push_member`) — so a single
+    /// `apply_pending` call right after the map becomes visible can race an
+    /// as-yet-undrained enqueue and silently apply nothing this tick. Retry
+    /// `apply_pending` until the bus's delivered membership (`live_strip_count`)
+    /// actually reaches `want`, rather than asserting on one undetermined call.
+    fn apply_pending_until_delivered(
+        audio: &crate::audio::AudioControlHandle,
+        bus: &mut ProgramBus,
+        want: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            audio.apply_pending(bus);
+            if bus.live_strip_count() == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bus membership did not reach {want} strip(s); got {}",
+                bus.live_strip_count()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn source(path: &std::path::Path) -> Source {
+        serde_json::from_value(serde_json::json!({
+            "id": "edited", "kind": "file", "path": path.display().to_string()
+        }))
+        .expect("file source")
+    }
+
+    /// Serve generated MPEG-TS as two live HTTP HLS origins. The production
+    /// fetcher performs real playlist and segment requests, not a mocked URL.
+    fn hls_origin(a: Vec<u8>, b: Vec<u8>) -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("[::1]:0").expect("loopback HLS origin");
+        listener.set_nonblocking(true).expect("nonblocking origin");
+        let url = format!(
+            "http://[::1]:{}",
+            listener.local_addr().expect("address").port()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let thread_stop = Arc::clone(&stop);
+        let thread_hits = Arc::clone(&b_hits);
+        std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                std::thread::spawn({
+                    let a = a.clone();
+                    let b = b.clone();
+                    let hits = Arc::clone(&thread_hits);
+                    move || {
+                        conn.set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("origin read timeout");
+                        let mut request = [0_u8; 4096];
+                        let Ok(n) = conn.read(&mut request) else {
+                            return;
+                        };
+                        let head = String::from_utf8_lossy(&request[..n]);
+                        let path = head.split_whitespace().nth(1).unwrap_or_default();
+                        let body: &[u8] = match path {
+                            "/a.m3u8" => b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:12\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:12.0,\na.ts\n#EXTINF:12.0,\na.ts\n#EXTINF:12.0,\na.ts\n",
+                            "/b.m3u8" => b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:12\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:12.0,\nb.ts\n#EXTINF:12.0,\nb.ts\n#EXTINF:12.0,\nb.ts\n",
+                            "/a.ts" => &a,
+                            "/b.ts" => { hits.fetch_add(1, Ordering::AcqRel); &b },
+                            _ => b"not found",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = conn.write_all(response.as_bytes());
+                        let _ = conn.write_all(body);
+                    }
+                });
+            }
+        });
+        (url, stop, b_hits)
+    }
+
+    /// Same-id URL edits must plan the edited address for both decoders, and
+    /// the audio lookup must observe a re-anchored video connection, not cache A.
+    #[test]
+    fn same_id_network_url_edit_uses_latest_video_anchor_and_audio_location() {
+        let a: Source = serde_json::from_value(serde_json::json!({
+            "id": "anchor-edit", "kind": "hls", "url": "http://[::1]:1234/a.m3u8"
+        }))
+        .expect("A source");
+        let b: Source = serde_json::from_value(serde_json::json!({
+            "id": "anchor-edit", "kind": "hls", "url": "http://[::1]:1234/b.m3u8"
+        }))
+        .expect("B source");
+        let old = audio_ingest_plan_for(&a).expect("A audio plan");
+        let next = audio_ingest_plan_for(&b).expect("B audio plan");
+        assert_eq!(old.location, "http://[::1]:1234/a.m3u8");
+        assert_eq!(next.location, "http://[::1]:1234/b.m3u8");
+        assert!(
+            next.live,
+            "network replacement uses the live timeline store"
+        );
+        let tile = Arc::new(TileStore::new(
+            "anchor-edit",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let video = ingest_plan_for(
+            &b,
+            64,
+            64,
+            tile,
+            CanvasColor::default(),
+            Rational::new(25, 1),
+        )
+        .expect("B video plan");
+        assert!(
+            matches!(&video.location, SourceLocation::Url(url) if url == &next.location),
+            "replacement video and audio must use the same B URL"
+        );
+        let slot = video.live_anchor.clone();
+        publish_live_anchor(
+            &slot,
+            (MediaTime::from_nanos(1_000_000_000), MediaTime::ZERO),
+            Some(11),
+        );
+        let before = slot.load().expect("A anchor");
+        publish_live_anchor(
+            &slot,
+            (MediaTime::from_nanos(4_000_000_000), MediaTime::ZERO),
+            Some(22),
+        );
+        let after = slot.load().expect("B anchor");
+        assert!(after.generation > before.generation);
+        assert_eq!(after.raw_pts0_ns, Some(22));
+        assert_eq!(after.out0, MediaTime::from_nanos(4_000_000_000));
+        let observed = crate::audio::test_video_anchor(&slot).expect("audio reads B anchor");
+        assert_eq!(observed.generation, after.generation);
+        assert_eq!(observed.raw_pts0_ns, 22);
+        assert_eq!(observed.out0_ns, 4_000_000_000);
+        assert!(
+            Arc::ptr_eq(&slot, &live_anchor_slot("anchor-edit")),
+            "audio and replacement video share the anchor slot"
+        );
+    }
+
+    #[test]
+    fn paused_a_frame_cannot_overwrite_b_after_replace_or_remove() {
+        use multiview_framestore::{NoSignalPolicy, TileRead, TileThresholds};
+        let id = "paused-frame-epoch";
+        let store = Arc::new(multiview_framestore::TileStore::new(
+            id,
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let slot = live_anchor_slot(id);
+        let a = begin_live_lifecycle(id);
+        let image =
+            || Nv12Image::solid(2, 2, 16, 128, 128, CanvasColor::default().output_tag()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let store_a = Arc::clone(&store);
+            let slot_a = Arc::clone(&slot);
+            scope.spawn(move || {
+                ready_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                assert!(!publish_live_frame_for(
+                    id,
+                    a,
+                    &store_a,
+                    &slot_a,
+                    image(),
+                    MediaTime::from_nanos(100),
+                    MediaTime::from_nanos(11),
+                    Some((MediaTime::ZERO, Some(11))),
+                    None,
+                ));
+            });
+            ready_rx.recv().unwrap(); // A is paused immediately before publish.
+            let b = begin_live_lifecycle(id);
+            assert!(publish_live_frame_for(
+                id,
+                b,
+                &store,
+                &slot,
+                image(),
+                MediaTime::from_nanos(200),
+                MediaTime::from_nanos(22),
+                Some((MediaTime::ZERO, Some(22))),
+                None,
+            ));
+            resume_tx.send(()).unwrap();
+        });
+        assert_eq!(store.sequence(), 1, "A must not mutate B's reused store");
+        let (_, selected) = store.read_at_with_source_time(MediaTime::from_nanos(200));
+        assert_eq!(
+            selected,
+            Some(multiview_framestore::tile::SourceFrameTime {
+                event_clock: None,
+                pts: MediaTime::from_nanos(22),
+                generation: live_lifecycle(id)
+            }),
+            "B's selected picture keeps B's source PTS and lifecycle"
+        );
+        assert_eq!(slot.load().unwrap().raw_pts0_ns, Some(22));
+        assert!(matches!(
+            store.read_at(MediaTime::from_nanos(200)),
+            TileRead::Fresh { .. }
+        ));
+        let b = live_lifecycle(id);
+        begin_live_lifecycle(id); // B -> removed / synthetic replacement.
+        assert!(!publish_live_frame_for(
+            id,
+            b,
+            &store,
+            &slot,
+            image(),
+            MediaTime::from_nanos(300),
+            MediaTime::ZERO,
+            Some((MediaTime::ZERO, Some(33))),
+            None,
+        ));
+        assert_eq!(store.sequence(), 1);
+        assert!(crate::audio::test_video_anchor(&slot).is_none());
+        let synthetic = live_lifecycle(id);
+        assert!(!publish_live_synth_frame_for(
+            id,
+            b,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(400),
+        ));
+        assert!(publish_live_synth_frame_for(
+            id,
+            synthetic,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(500),
+        ));
+        assert_eq!(store.sequence(), 2, "only the new synthetic may publish");
+        let (_, selected) = store.read_at_with_source_time(MediaTime::from_nanos(500));
+        assert_eq!(selected.map(|frame| frame.generation), Some(synthetic));
+    }
+
+    #[test]
+    fn two_startup_runs_after_edit_use_fresh_video_audio_and_synthetic_epochs() {
+        use multiview_framestore::{NoSignalPolicy, TileThresholds};
+        let id = "repeated-startup-source";
+        let slot = live_anchor_slot(id);
+        let store = TileStore::new(id, TileThresholds::default(), NoSignalPolicy::HoldForever);
+        let image =
+            || Nv12Image::solid(2, 2, 16, 128, 128, CanvasColor::default().output_tag()).unwrap();
+        let first = begin_live_lifecycle(id);
+        assert!(publish_live_frame_for(
+            id,
+            first,
+            &store,
+            &slot,
+            image(),
+            MediaTime::ZERO,
+            MediaTime::ZERO,
+            Some((MediaTime::ZERO, Some(11))),
+            None,
+        ));
+        end_live_lifecycle(id, first);
+        let edited = begin_live_lifecycle(id);
+        end_live_lifecycle(id, edited);
+        let second = begin_live_lifecycle(id);
+        let audio_floor = slot.load().unwrap().generation;
+        assert!(second > edited && audio_floor > 0);
+        assert!(publish_live_frame_for(
+            id,
+            second,
+            &store,
+            &slot,
+            image(),
+            MediaTime::from_nanos(20),
+            MediaTime::from_nanos(20),
+            Some((MediaTime::from_nanos(20), Some(22))),
+            None,
+        ));
+        assert!(
+            slot.load().unwrap().generation > audio_floor,
+            "audio plan must wait for this run's frame"
+        );
+        assert_eq!(slot.load().unwrap().raw_pts0_ns, Some(22));
+        let (_, selected) = store.read_at_with_source_time(MediaTime::from_nanos(20));
+        assert_eq!(selected.map(|frame| frame.generation), Some(second));
+        assert!(!publish_live_frame_for(
+            id,
+            first,
+            &store,
+            &slot,
+            image(),
+            MediaTime::from_nanos(30),
+            MediaTime::from_nanos(30),
+            None,
+            None,
+        ));
+        end_live_lifecycle(id, second);
+        let synthetic = begin_live_lifecycle(id);
+        assert!(publish_live_synth_frame_for(
+            id,
+            synthetic,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(40)
+        ));
+        assert!(!publish_live_synth_frame_for(
+            id,
+            second,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(50)
+        ));
+        end_live_lifecycle(id, synthetic);
+        assert!(!publish_live_synth_frame_for(
+            id,
+            synthetic,
+            &store,
+            Arc::new(image()),
+            MediaTime::from_nanos(60)
+        ));
+    }
+
+    #[test]
+    fn detached_old_producer_cannot_republish_anchor_after_replacement() {
+        let id = "fenced-late-anchor";
+        let slot = live_anchor_slot(id);
+        let a = begin_live_lifecycle(id);
+        publish_live_anchor_for(
+            id,
+            a,
+            &slot,
+            (MediaTime::from_nanos(100), MediaTime::ZERO),
+            Some(11),
+        );
+        assert_eq!(slot.load().and_then(|anchor| anchor.raw_pts0_ns), Some(11));
+        let b = begin_live_lifecycle(id);
+        assert!(
+            crate::audio::test_video_anchor(&slot).is_none(),
+            "B cannot consume A anchor"
+        );
+        let stale = std::thread::spawn({
+            let slot = Arc::clone(&slot);
+            move || {
+                publish_live_anchor_for(
+                    id,
+                    a,
+                    &slot,
+                    (MediaTime::from_nanos(200), MediaTime::ZERO),
+                    Some(11),
+                );
+            }
+        });
+        stale.join().expect("late A writer");
+        assert!(
+            crate::audio::test_video_anchor(&slot).is_none(),
+            "late A stays fenced"
+        );
+        publish_live_anchor_for(
+            id,
+            b,
+            &slot,
+            (MediaTime::from_nanos(300), MediaTime::ZERO),
+            Some(22),
+        );
+        assert_eq!(
+            crate::audio::test_video_anchor(&slot)
+                .expect("B anchor")
+                .raw_pts0_ns,
+            22
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..1000 {
+                    publish_live_anchor_for(
+                        id,
+                        a,
+                        &slot,
+                        (MediaTime::from_nanos(400), MediaTime::ZERO),
+                        Some(11),
+                    );
+                }
+            });
+            for _ in 0..1000 {
+                publish_live_anchor_for(
+                    id,
+                    b,
+                    &slot,
+                    (MediaTime::from_nanos(500), MediaTime::ZERO),
+                    Some(22),
+                );
+            }
+        });
+        assert_eq!(slot.load().and_then(|anchor| anchor.raw_pts0_ns), Some(22));
+    }
+
+    /// A real loopback HLS edit replaces the production fetcher, audio worker,
+    /// video anchor, and running program bus without a process restart.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn same_id_http_hls_edit_replaces_shared_fetch_audio_and_program() {
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let a = dir.path().join("a.ts");
+        let b = dir.path().join("b.ts");
+        clip(&a, 440);
+        clip(&b, 880);
+        let (origin, origin_stop, b_hits) = hls_origin(
+            std::fs::read(a).expect("A TS"),
+            std::fs::read(b).expect("B TS"),
+        );
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "base"
+kind = "solid"
+color = "#101010"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "base"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            dir.path().join("out/index.m3u8").display()
+        );
+        let pipeline = Pipeline::build(&MultiviewConfig::load_from_toml(&doc).expect("config"))
+            .expect("pipeline");
+        let clock: Arc<dyn multiview_engine::clock::TimeSource> =
+            Arc::new(multiview_engine::clock::MonotonicTimeSource::new());
+        pipeline.epoch_anchor_slot().store(Some(Arc::new(
+            multiview_engine::epoch::EpochAnchor::new(clock, 0),
+        )));
+        let audio = Arc::new(crate::audio::AudioControlHandle::new().with_sample_rate(48_000));
+        pipeline.audio_route_slot().store(Some(Arc::clone(&audio)));
+        let registry = pipeline.stop_registry();
+        let hub = LiveSourceHub::start_with_ingest(
+            Arc::clone(&registry),
+            shared_stores(pipeline.preview_stores()),
+            Some(pipeline.live_ingest_spawner()),
+        );
+        let tile = Arc::new(TileStore::new(
+            "edited-http",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let submit = |name: &str| {
+            let source: Source = serde_json::from_value(serde_json::json!({
+                "id": "edited-http", "kind": "hls", "url": format!("{origin}/{name}.m3u8")
+            }))
+            .expect("HLS source");
+            assert_eq!(
+                hub.handle().request_spawn_source(SourceSpawn {
+                    source,
+                    store: Arc::clone(&tile),
+                }),
+                crate::live_sources::HubSubmit::Accepted
+            );
+        };
+        let mut bus = ProgramBus::new(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            Rational::new(25, 1),
+        );
+        submit("a");
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while crate::hls_fetch::shared_url("edited-http", live_lifecycle("edited-http")).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "A fetcher must publish a shared URL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let a_lifecycle = live_lifecycle("edited-http");
+        let old_url =
+            crate::hls_fetch::shared_url("edited-http", a_lifecycle).expect("A fetcher URL");
+        wait_until(|| audio.test_source_store("edited-http").is_some());
+        let old_store = audio
+            .test_source_store("edited-http")
+            .expect("A audio store");
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while live_anchor_slot("edited-http").load().is_none() {
+            assert!(Instant::now() < deadline, "A video must publish its anchor");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let old_anchor = live_anchor_slot("edited-http")
+            .load()
+            .expect("A video anchor");
+        let old_stop = registry
+            .lock()
+            .expect("registry")
+            .get("edited-http/audio")
+            .expect("A audio worker")
+            .stop
+            .clone();
+        apply_pending_until_delivered(&audio, &mut bus, 1);
+        bus.set_program_gain_ramped(
+            audio.test_source_point("edited-http").expect("route"),
+            1.0,
+            0,
+        )
+        .expect("A at unity");
+
+        submit("b");
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while live_lifecycle("edited-http") == a_lifecycle {
+            assert!(Instant::now() < deadline, "B lifecycle must start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let b_lifecycle = live_lifecycle("edited-http");
+        assert_eq!(
+            crate::hls_fetch::shared_url("edited-http", a_lifecycle),
+            None
+        );
+        assert_ne!(
+            crate::hls_fetch::shared_url("edited-http", b_lifecycle).as_deref(),
+            Some(old_url.as_str()),
+            "earliest B lookup must not select A before B publication"
+        );
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while crate::hls_fetch::shared_url("edited-http", b_lifecycle)
+            .as_ref()
+            .is_none_or(|url| url == &old_url)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "B fetcher must replace A shared URL"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            b_hits.load(Ordering::Acquire) > 0,
+            "B segments fetched over HTTP"
+        );
+        assert!(old_stop.load(Ordering::Acquire), "A audio worker stopped");
+        // Review R3-04: B's shared-URL publication is NOT proof B's audio
+        // registry entry exists — production spawns video (which the fetcher
+        // belongs to) before it registers/spawns audio, so the URL can become
+        // visible while the registry still lacks B's `edited-http/audio`
+        // entry (teardown already removed A's). Synchronize on B's registry
+        // identity SEPARATELY and explicitly, rather than reading it
+        // immediately on the strength of the URL condition alone.
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let new_stop = loop {
+            let candidate = registry
+                .lock()
+                .expect("registry")
+                .get("edited-http/audio")
+                .map(|producer| producer.stop.clone());
+            match candidate {
+                Some(stop) if !Arc::ptr_eq(&old_stop, &stop) => break stop,
+                _ => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "B audio worker must register in the stop registry"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        assert!(!new_stop.load(Ordering::Acquire), "B audio worker runs");
+        wait_until(|| {
+            audio
+                .test_source_store("edited-http")
+                .is_some_and(|s| !Arc::ptr_eq(&s, &old_store))
+        });
+        let new_store = audio
+            .test_source_store("edited-http")
+            .expect("B audio store");
+        assert!(
+            new_store.is_timeline(),
+            "B worker publishes on the video timeline"
+        );
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while !live_anchor_slot("edited-http")
+            .load()
+            .is_some_and(|anchor| {
+                anchor.generation > old_anchor.generation && anchor.raw_pts0_ns.is_some()
+            })
+        {
+            assert!(Instant::now() < deadline, "B video must replace A anchor");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let new_anchor = live_anchor_slot("edited-http").load().expect("B anchor");
+        assert!(
+            new_anchor.generation > old_anchor.generation,
+            "B replaces A anchor"
+        );
+        assert!(
+            new_anchor.raw_pts0_ns.is_some(),
+            "B video has a usable PTS anchor"
+        );
+        apply_pending_until_delivered(&audio, &mut bus, 2);
+        // A live HLS producer stays paced; the bus reads the B store after the
+        // source edit, rather than seeking a finite file back from EOF.
+        // The video anchor includes the two-second jitter hold. Drive the bus
+        // on that output timeline, not from tick zero (which must be silence).
+        let first_tick = u64::try_from(new_anchor.out0.as_nanos() / 40_000_000)
+            .expect("nonnegative video anchor")
+            + 1;
+        let _ = bus.tick_to(first_tick);
+        assert_eq!(bus.live_strip_count(), 1, "old A strip retires");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut crossings = 0;
+        let mut tick = first_tick;
+        while Instant::now() < deadline {
+            // Keep the real bus output clock close to wall time: the placer
+            // places blocks only after its consumer reaches this timeline.
+            tick += 1;
+            let samples: Vec<_> = bus
+                .tick_to(tick)
+                .interleaved()
+                .iter()
+                .step_by(2)
+                .copied()
+                .collect();
+            crossings = samples
+                .windows(2)
+                .filter(|p| p[0] < 0.0 && p[1] >= 0.0)
+                .count();
+            if (25..=45).contains(&crossings) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let final_anchor = live_anchor_slot("edited-http").load();
+        assert!(
+            (25..=45).contains(&crossings),
+            "program B tone: crossings={crossings}; bus tick {first_tick}..{tick}; B store \
+             cursor={} buffered={}; anchor gen={:?} out0_ns={:?} raw_pts0_ns={:?}; \
+             lifecycle now={} (B {b_lifecycle}); B segment hits={}",
+            new_store.read_cursor(),
+            new_store.buffered_frames(),
+            final_anchor.as_ref().map(|a| a.generation),
+            final_anchor.as_ref().map(|a| a.out0.as_nanos()),
+            final_anchor.as_ref().and_then(|a| a.raw_pts0_ns),
+            live_lifecycle("edited-http"),
+            b_hits.load(Ordering::Acquire),
+        );
+        hub.shutdown();
+        origin_stop.store(true, Ordering::Release);
+    }
+
+    /// The production hub and pipeline ingest spawner must replace BOTH workers
+    /// under the same id. The actual bus must read the replacement store, not
+    /// the startup map or the earlier live store.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn same_id_file_edit_replaces_audio_worker_and_running_program_store() {
+        const READ_SPAN_FRAMES: usize = 11_520;
+        let dir = tempfile::tempdir().expect("fixture directory");
+        let a = dir.path().join("a.ts");
+        let b = dir.path().join("b.ts");
+        clip(&a, 440);
+        clip(&b, 880);
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "base"
+kind = "solid"
+color = "#101010"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "base"
+[[outputs]]
+kind = "hls"
+path = "{}"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            dir.path().join("out/index.m3u8").display()
+        );
+        let config = MultiviewConfig::load_from_toml(&doc).expect("config");
+        let pipeline = Pipeline::build(&config).expect("pipeline");
+        let audio = Arc::new(crate::audio::AudioControlHandle::new().with_sample_rate(48_000));
+        pipeline.audio_route_slot().store(Some(Arc::clone(&audio)));
+        let registry = pipeline.stop_registry();
+        let hub = LiveSourceHub::start_with_ingest(
+            Arc::clone(&registry),
+            shared_stores(pipeline.preview_stores()),
+            Some(pipeline.live_ingest_spawner()),
+        );
+        let tile = Arc::new(TileStore::new(
+            "edited",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let submit = |path: &std::path::Path| {
+            assert_eq!(
+                hub.handle().request_spawn_source(SourceSpawn {
+                    source: source(path),
+                    store: Arc::clone(&tile),
+                }),
+                crate::live_sources::HubSubmit::Accepted
+            );
+        };
+        let mut bus = ProgramBus::new(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            Rational::new(25, 1),
+        );
+        submit(&a);
+        wait_until(|| audio.test_source_store("edited").is_some());
+        let old = audio.test_source_store("edited").expect("A store");
+        wait_until(|| old.buffered_frames() > 4_800);
+        apply_pending_until_delivered(&audio, &mut bus, 1);
+        bus.set_program_gain_ramped(audio.test_source_point("edited").expect("A route"), 1.0, 0)
+            .expect("route A at unity");
+        let first = registry
+            .lock()
+            .expect("registry")
+            .get("edited/audio")
+            .expect("A audio worker")
+            .stop
+            .clone();
+        assert!(!first.load(Ordering::Acquire), "A worker runs before edit");
+
+        submit(&b);
+        wait_until(|| {
+            audio
+                .test_source_store("edited")
+                .is_some_and(|s| !Arc::ptr_eq(&s, &old))
+        });
+        let new = audio.test_source_store("edited").expect("B store");
+        // Review R3-04: `buffered_frames() > 4_800` only proved SOME of the
+        // span had arrived — the paced decoder (2 s look-ahead) keeps
+        // publishing concurrently with the later unpaced 11_520-frame read
+        // below, so that read could land partway into not-yet-published
+        // (silence-filled) frames. Wait for `measure_pcm` to report the EXACT
+        // span the test reads as fully, stably covered before touching it —
+        // a `Measured` result (not `Unknown`) proves every frame in
+        // `[0, READ_SPAN_FRAMES)` was actually published, not inferred from a
+        // partial threshold.
+        wait_until(|| {
+            matches!(
+                new.measure_pcm(0, READ_SPAN_FRAMES),
+                multiview_audio::store::PcmMeasurement::Measured { .. }
+            )
+        });
+        let second = registry
+            .lock()
+            .expect("registry")
+            .get("edited/audio")
+            .expect("B audio worker")
+            .stop
+            .clone();
+        assert!(
+            first.load(Ordering::Acquire),
+            "same-id edit stops A audio worker"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "B has a fresh worker stop flag"
+        );
+        assert!(!second.load(Ordering::Acquire), "B worker runs after edit");
+        // B repoints the existing bus strip (crossfade briefly retains A
+        // until its 10 ms ramp ends).
+        apply_pending_until_delivered(&audio, &mut bus, 2);
+        assert!(Arc::ptr_eq(
+            &new,
+            &audio.test_source_store("edited").expect("bus source is B")
+        ));
+        // The finite FILE decoder may finish all 12 seconds before the bus first
+        // ticks. Park its cursor at the start of the span the `measure_pcm`
+        // wait above just proved is fully, stably published — never past EOF;
+        // the production bus still reads the actual B decode store after its
+        // ramp.
+        new.seek_to(0);
+        // A 440 Hz tone and B 880 Hz tone have different zero-crossing counts.
+        // The bus output (not a direct store read) must carry B after its ramp.
+        // Exactly `READ_SPAN_FRAMES` (6 ticks x 1_920 frames/tick at 25 fps):
+        // the `measure_pcm` wait above proved every one of these frames is
+        // real decoded PCM, not a still-filling live edge.
+        let mut samples = Vec::new();
+        for tick in 1..=6 {
+            samples.extend(bus.tick_to(tick).interleaved().iter().step_by(2).copied());
+        }
+        debug_assert_eq!(samples.len(), READ_SPAN_FRAMES, "one channel per frame");
+        assert_eq!(
+            bus.live_strip_count(),
+            1,
+            "A strip retires after the crossfade"
+        );
+        let tail = &samples[samples.len() - 4_800..];
+        let crossings = tail
+            .windows(2)
+            .filter(|pair| pair[0] < 0.0 && pair[1] >= 0.0)
+            .count();
+        assert!(
+            (70..=105).contains(&crossings),
+            "program must carry B's 880 Hz tone, crossings={crossings}"
+        );
+        hub.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod live_audio_spawn_tests {
+    use super::*;
+
+    /// The real spawn seam: a runtime-added network source gets a timeline
+    /// audio store and a decode thread registered under `{id}/audio`, so the
+    /// hub's `{id}` teardown stops it with the video.
+    #[test]
+    fn a_runtime_network_source_gets_a_locked_audio_store_and_a_stoppable_decode() {
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "live-audio-1", "kind": "hls", "url": "http://[::1]:9/none.m3u8"
+        }))
+        .expect("test source parses");
+        let registry = crate::live_sources::stop_registry();
+        let stop = Arc::new(AtomicBool::new(true));
+        let store =
+            spawn_live_audio(&source, &stop, &registry, 0, 0).expect("network source has audio");
+        assert!(store.is_timeline(), "live audio is locked to vision");
+        assert!(registry
+            .lock()
+            .is_ok_and(|map| map.contains_key("live-audio-1/audio")));
+    }
+
+    /// A runtime bars edit gets a synchronous tone, not a decode worker.
+    #[test]
+    fn a_runtime_synthetic_source_has_no_audio_decode() {
+        let source: Source =
+            serde_json::from_value(serde_json::json!({ "id": "live-audio-2", "kind": "bars" }))
+                .expect("test source parses");
+        let registry = crate::live_sources::stop_registry();
+        let stop = Arc::new(AtomicBool::new(true));
+        let store = spawn_live_audio(&source, &stop, &registry, 0, 0)
+            .expect("bars gets a scheduling-independent tone");
+        assert!(store.is_line_up_tone());
+        assert!(!store.is_timeline());
+        assert!(
+            registry.lock().is_ok_and(|map| map.is_empty()),
+            "no decoder thread registered"
+        );
+        let solid: Source = serde_json::from_value(serde_json::json!({
+            "id": "silent-solid", "kind": "solid", "color": "#101014"
+        }))
+        .expect("solid source parses");
+        assert!(
+            spawn_live_audio(&solid, &stop, &registry, 0, 0).is_none(),
+            "a non-bars synthetic source must not inherit the tone"
+        );
     }
 }
 
@@ -6542,6 +8314,40 @@ fn frac_to_px(frac: f32, extent: u32) -> u32 {
     lo
 }
 
+/// Resolve source-bound cells into canvas-space tile chrome, in cell order.
+#[cfg(feature = "overlay")]
+pub(crate) fn tile_specs_for_layout(
+    layout: &Layout,
+    labels: &std::collections::HashMap<String, String>,
+) -> Vec<crate::overlays::TileSpec> {
+    use multiview_overlay::geometry::PixelRect;
+    let (cw, ch) = (layout.canvas.width, layout.canvas.height);
+    layout
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            let id = cell.source.as_deref()?;
+            let label = labels.get(id).cloned().unwrap_or_else(|| id.to_owned());
+            // Match the compositor's normalized endpoint quantization, not an
+            // independent truncation of width/height that can spill a pixel.
+            let x = norm_to_px_f32(cell.x, cw);
+            let y = norm_to_px_f32(cell.y, ch);
+            let right = norm_to_px_f32(cell.x + cell.w, cw);
+            let bottom = norm_to_px_f32(cell.y + cell.h, ch);
+            Some(crate::overlays::TileSpec::new(
+                id,
+                label,
+                PixelRect {
+                    x,
+                    y,
+                    width: right - x,
+                    height: bottom - y,
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Convert a normalized fraction in `[0,1]` to a pixel coordinate `f32` against
 /// `extent`, `as`-cast-free, for placing the per-tile overlay surface. Reuses the
 /// exact integer [`frac_to_px`] then widens losslessly (overlay sizes are well
@@ -6582,19 +8388,37 @@ fn ticks_per_second(cadence: Rational) -> u32 {
 fn build_meter_timelines(
     config: &MultiviewConfig,
     cadence: Rational,
-) -> std::collections::HashMap<String, Vec<f64>> {
-    let mut timelines = std::collections::HashMap::new();
+) -> (
+    std::collections::HashMap<String, Vec<f64>>,
+    std::collections::HashMap<String, Vec<crate::overlays::MeterChannels>>,
+) {
+    let mut scalar = std::collections::HashMap::new();
+    let mut channels = std::collections::HashMap::new();
     for source in &config.sources {
-        // Only a file-backed source has decodable audio to pre-measure here.
-        // Synthetic (bars/solid/clock) carry no audio; live URLs never EOF and are
-        // not pre-decoded; NDI/unknown carry no file. None get a build-time meter.
         let path = match &source.kind {
             SourceKind::File { path } => PathBuf::from(path),
             _ => continue,
         };
         match meter_timeline_for_file(&path, cadence) {
             Ok(timeline) if !timeline.is_empty() => {
-                timelines.insert(source.id.clone(), timeline);
+                scalar.insert(
+                    source.id.clone(),
+                    timeline
+                        .iter()
+                        .map(|reading| {
+                            f64::from(
+                                reading
+                                    .db
+                                    .get(..reading.count)
+                                    .unwrap_or(&[])
+                                    .iter()
+                                    .copied()
+                                    .fold(-120.0_f32, f32::max),
+                            )
+                        })
+                        .collect(),
+                );
+                channels.insert(source.id.clone(), timeline);
             }
             Ok(_) => {}
             Err(reason) => {
@@ -6602,57 +8426,74 @@ fn build_meter_timelines(
             }
         }
     }
-    timelines
+    (scalar, channels)
 }
 
-/// Decode `path`'s audio and snapshot a sample-peak meter at each output-tick
-/// boundary, yielding one dBFS reading per tick.
+/// The file decoder normalizes into stereo PCM; L/R describe its output, not the
+/// original source channel count or layout. Sample peaks never downmix L/R.
 #[cfg(feature = "overlay")]
-fn meter_timeline_for_file(path: &Path, cadence: Rational) -> Result<Vec<f64>, String> {
+fn meter_timeline_for_file(
+    path: &Path,
+    cadence: Rational,
+) -> Result<Vec<crate::overlays::MeterChannels>, String> {
     use multiview_audio::decode::AudioFileDecoder;
     use multiview_audio::{Ballistics, ChannelLayout, MeterScale, PeakMode};
-
     let mut decoder =
         AudioFileDecoder::open(path, ChannelLayout::Stereo).map_err(|e| e.to_string())?;
     let format = decoder.format();
     let rate = format.sample_rate();
-    let channels = format.channel_count().max(1);
-    let mut meter = Ballistics::new(rate, MeterScale::SamplePeak(PeakMode::Sample));
-
-    // Samples per output tick = sample_rate * den / num (exact integer; never
-    // float fps). At least one sample per tick so a tick always advances.
+    let channels = format
+        .channel_count()
+        .min(crate::overlays::MAX_METER_CHANNELS);
+    let mut meters =
+        vec![Ballistics::new(rate, MeterScale::SamplePeak(PeakMode::Sample)); channels];
     let num = i128::from(cadence.num).max(1);
     let den = i128::from(cadence.den).max(1);
-    let samples_per_tick = (i128::from(rate).saturating_mul(den) / num).max(1);
-
+    let mut next_tick = 1_i128;
+    let mut frames = 0_i128;
     let mut timeline = Vec::new();
-    // Drive the meter sample-by-sample (downmix to mono by averaging the frame's
-    // channels — the meter wants a single program-loudness reading), emitting the
-    // reading each time we cross a tick boundary in input samples.
-    let mut samples_since_tick: i128 = 0;
     while let Some(block) = decoder.next_block().map_err(|e| e.to_string())? {
         for frame in block.interleaved().chunks_exact(channels) {
-            let sum: f32 = frame.iter().copied().sum();
-            let mono = f64::from(sum) / f64::from(u32_from_usize_audio(channels));
-            meter.push(mono);
-            samples_since_tick = samples_since_tick.saturating_add(1);
-            if samples_since_tick >= samples_per_tick {
-                timeline.push(meter.reading_db());
-                samples_since_tick = 0;
+            for (meter, &sample) in meters.iter_mut().zip(frame) {
+                meter.push(f64::from(sample));
+            }
+            frames = frames.saturating_add(1);
+            if frames.saturating_mul(num)
+                >= next_tick
+                    .saturating_mul(i128::from(rate))
+                    .saturating_mul(den)
+            {
+                timeline.push(crate::overlays::MeterChannels::from_db(
+                    &meters
+                        .iter()
+                        .map(|meter| {
+                            meter
+                                .reading_db()
+                                .to_string()
+                                .parse::<f32>()
+                                .unwrap_or(-120.0)
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+                next_tick = next_tick.saturating_add(1);
             }
         }
     }
-    // Flush a final partial tick so a short clip still contributes a reading.
-    if samples_since_tick > 0 {
-        timeline.push(meter.reading_db());
+    if timeline.is_empty() && frames > 0 {
+        timeline.push(crate::overlays::MeterChannels::from_db(
+            &meters
+                .iter()
+                .map(|meter| {
+                    meter
+                        .reading_db()
+                        .to_string()
+                        .parse::<f32>()
+                        .unwrap_or(-120.0)
+                })
+                .collect::<Vec<_>>(),
+        ));
     }
     Ok(timeline)
-}
-
-/// Saturating `usize` → `u32` for the audio-channel divisor (no `as`).
-#[cfg(feature = "overlay")]
-fn u32_from_usize_audio(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// The codec token a config output names, if it carries one.
@@ -8046,6 +9887,100 @@ fn maybe_prepend_program_ts(mut runnable: Vec<RunnableOutput>, live: bool) -> Ve
     runnable
 }
 
+/// One declared discrete audio track (#152): an `[audio]` route that names a
+/// `target_track`, in route order.
+struct DeclaredTrack {
+    name: String,
+    input_id: String,
+    language: Option<String>,
+    title: Option<String>,
+}
+
+/// The document's declared discrete tracks, in route order (track index = the
+/// position here). Bounded to `u16` indices.
+fn declared_discrete_tracks(
+    routing: Option<&multiview_config::AudioRouting>,
+) -> Vec<DeclaredTrack> {
+    routing
+        .map(|r| r.routes.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|route| {
+            route.target_track.as_ref().map(|name| DeclaredTrack {
+                name: name.clone(),
+                input_id: route.input_id.clone(),
+                language: route.language.clone(),
+                title: route.title.clone().or_else(|| Some(name.clone())),
+            })
+        })
+        .take(usize::from(u16::MAX))
+        .collect()
+}
+
+/// The [`multiview_output::AudioSelection`] for one configured output: absent
+/// `audio` block = program only (unchanged); `auto` = program + every declared
+/// track; `program` = program only; `tracks` = the listed ones (`prog` included
+/// only when listed). `auto` adds tracks only where the transport's capacity is
+/// unlimited (MPEG-TS family: HLS, SRT, RIST); a capped transport (legacy
+/// RTMP/FLV refuses a second audio stream at header time, NDI, WebRTC) keeps
+/// program only, so `auto` can never break an output.
+fn output_audio_selection(
+    output: &Output,
+    tracks: &[DeclaredTrack],
+) -> multiview_output::AudioSelection {
+    let Some(selection) = output.audio() else {
+        return multiview_output::AudioSelection::default();
+    };
+    let names: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
+    let (program, mut chosen) = selection.resolve(&names);
+    let capacity = output.audio_capability().discrete_capacity;
+    let auto_capped = selection.mode == multiview_config::OutputAudioMode::Auto
+        && capacity != multiview_config::TrackCapacity::Unlimited;
+    if auto_capped || capacity == multiview_config::TrackCapacity::AtMost(0) {
+        chosen.clear();
+    }
+    multiview_output::AudioSelection {
+        program,
+        tracks: tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| chosen.contains(&t.name.as_str()))
+            .filter_map(|(i, t)| {
+                Some(multiview_output::TrackSelection {
+                    index: u16::try_from(i).ok()?,
+                    language: t.language.clone(),
+                    title: t.title.clone(),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Apply each configured output's audio selection to its muxing runnable
+/// (matched by stable output id).
+fn apply_output_audio_selections(
+    runnable: &mut [RunnableOutput],
+    outputs: &[Output],
+    tracks: &[DeclaredTrack],
+) {
+    for r in runnable {
+        let (id, sink) = match r {
+            RunnableOutput::File { id, sink, .. }
+            | RunnableOutput::Hls { id, sink, .. }
+            | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
+            #[cfg(feature = "webrtc-native")]
+            RunnableOutput::WebRtc { .. } => continue,
+            #[cfg(feature = "ndi-bindings")]
+            RunnableOutput::Ndi { .. } => continue,
+            #[cfg(feature = "aes67")]
+            RunnableOutput::Aes67 { .. } => continue,
+        };
+        if let Some(output) = outputs.iter().find(|o| o.id() == id) {
+            sink.set_audio_selection(output_audio_selection(output, tracks));
+        }
+    }
+}
+
 /// Split an HLS output `path` into `(segment_dir, segment_prefix, playlist_path)`.
 ///
 /// A `path` ending in `.m3u8` names the playlist; segments are written beside it
@@ -8424,6 +10359,7 @@ fn ingest_plan_for(
     let youtube_url_slot = youtube_url_slot_for(&location);
 
     Ok(IngestPlan {
+        source_events: None,
         id: source.id.clone(),
         location,
         // Not a media-player channel (those are built from `config.media_players`).
@@ -8431,6 +10367,9 @@ fn ingest_plan_for(
         tile_w,
         tile_h,
         store,
+        output_origin: crate::timing_status::anchor_slot(),
+        live_anchor: live_anchor_slot(&source.id),
+        lifecycle: 0,
         live,
         #[cfg(feature = "overlay")]
         incontainer_sub: None,
@@ -8627,12 +10566,16 @@ fn build_media_player_boot(
 
         boot.stores.push((player.id.clone(), Arc::clone(&store)));
         boot.plans.push(IngestPlan {
+            source_events: None,
             id: player.id.clone(),
             location: SourceLocation::Path(path),
             player: Some(handle),
             tile_w,
             tile_h,
             store,
+            output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             // A media player is a finite asset played under transport control;
             // it is not a live (reconnect-forever) source — the player loop owns
             // its own loop/hold lifecycle.
@@ -8720,6 +10663,8 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         id: source.id.clone(),
         location,
         live,
+        lifecycle: 0,
+        anchor_floor: 0,
     })
 }
 
@@ -8742,6 +10687,24 @@ fn tone_ingest_plan_for(
         }),
         _ => None,
     }
+}
+
+/// Build an HLS caption plan for a specific source generation. The resolver
+/// returns a new generation-1 store; install the caller's token on the selected
+/// old or new store before any reader can observe it.
+#[cfg(feature = "overlay")]
+fn caption_plan_for_generation(
+    source: &Source,
+    existing: Option<Arc<crate::captions::CueStore>>,
+    generation: u64,
+) -> Option<crate::captions::CaptionPlan> {
+    let mut plan = crate::captions::caption_plan_for(source)?;
+    plan.generation = generation;
+    if let Some(store) = existing {
+        plan.store = store;
+    }
+    plan.store.begin_generation(generation);
+    Some(plan)
 }
 
 /// Resolve every source's HLS `WebVTT` caption plan concurrently (#48) and index
@@ -8775,7 +10738,9 @@ fn wire_source_captions(
 ) {
     // HLS WebVTT rendition path: take this source's plan, already resolved
     // concurrently off the build path (#48). A cheap map lookup — no network here.
-    if let Some(caption_plan) = prefetched.remove(&source.id) {
+    if let Some(mut caption_plan) = prefetched.remove(&source.id) {
+        caption_plan.generation = plan.lifecycle;
+        caption_plan.store.begin_generation(plan.lifecycle);
         caption_stores.insert(source.id.clone(), Arc::clone(&caption_plan.store));
         caption_plans.push(caption_plan);
     }
@@ -8794,6 +10759,7 @@ fn wire_source_captions(
     if !caption_stores.contains_key(&source.id) {
         if let Some(channel) = crate::captions::embedded_cc_channel(&source.kind, selector) {
             let store = Arc::new(crate::captions::CueStore::new());
+            store.begin_generation(plan.lifecycle);
             caption_stores.insert(source.id.clone(), Arc::clone(&store));
             plan.embedded_cc = Some(EmbeddedCcRoute { channel, store });
             tracing::info!(source = %source.id, "native embedded CEA-608 caption route wired");
@@ -8813,6 +10779,7 @@ fn wire_source_captions(
         if let Some((route, cue_store)) =
             resolve_incontainer_sub_route(source, selector, &plan.location)
         {
+            cue_store.begin_generation(plan.lifecycle);
             caption_stores.insert(source.id.clone(), cue_store);
             plan.incontainer_sub = Some(route);
         }
@@ -9170,8 +11137,45 @@ fn is_hls_location(location: &SourceLocation) -> bool {
 /// master cannot be fetched/parsed (best-effort: the open then falls back to the
 /// original URL, with the post-open discard + reconnect bracket as the remaining
 /// guards; this never fails the build, invariants #1/#10).
-fn resolve_hls_variant_url(master_url: &str, target_height: Option<u32>) -> Option<String> {
+pub(crate) fn resolve_hls_variant_url(
+    master_url: &str,
+    target_height: Option<u32>,
+) -> Option<String> {
     resolve_hls_variant_url_with(master_url, target_height, &crate::captions::LibavFetcher)
+}
+
+/// The HLS URL to open for a source's **audio** decode.
+///
+/// Always pins ONE media playlist when the URL is a master
+/// ([`MasterPlaylist::pick_audio_uri`](multiview_input::hls::MasterPlaylist::pick_audio_uri)):
+/// a separate `TYPE=AUDIO` rendition if the master declares one, else the best
+/// variant that carries audio (never a video-only rung). Opening the master
+/// instead made libav fetch EVERY variant's segments serially (cnn-na: four
+/// rungs, four 6 s segments per 6 s), which on a slow or ad-inserting origin
+/// outran real time and starved the audio (~40-60 % audible). A pinned media
+/// playlist also carries no `WebVTT` rendition (ADR-T011). Best-effort: `None`
+/// opens the original URL.
+pub(crate) fn resolve_hls_audio_url(master_url: &str) -> Option<String> {
+    resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher)
+}
+
+/// [`resolve_hls_audio_url`] with an injectable fetcher (offline tests).
+fn resolve_hls_audio_url_with(
+    master_url: &str,
+    fetcher: &dyn crate::captions::PlaylistFetcher,
+) -> Option<String> {
+    let playlist = match fetcher.fetch(master_url) {
+        Ok(playlist) => playlist,
+        Err(reason) => {
+            tracing::warn!(%master_url, %reason, "could not fetch HLS master for audio pin; opening URL as-is");
+            return None;
+        }
+    };
+    let master = multiview_input::hls::MasterPlaylist::parse(&playlist.body).ok()?;
+    let uri = master.pick_audio_uri()?;
+    let audio_url = crate::captions::resolve_rendition_uri(&playlist.url, uri);
+    tracing::info!(%master_url, %audio_url, "pinned HLS audio decode to one media playlist");
+    Some(audio_url)
 }
 
 /// [`resolve_hls_variant_url`] with an injectable [`PlaylistFetcher`](crate::captions::PlaylistFetcher)
@@ -9282,7 +11286,7 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
     // Synthetic sources (bars/solid/clock) render in-process — no decode, no
     // reconnect; the generator publishes into the store at cadence until `stop`.
     if let SourceLocation::Synthetic(kind) = &plan.location {
-        crate::synth::generator_loop(
+        crate::synth::generator_loop_fenced(
             kind.clone(),
             &plan.store,
             plan.tile_w,
@@ -9290,6 +11294,7 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
             plan.canvas_color,
             plan.cadence,
             stop,
+            Some((plan.id.as_str(), plan.lifecycle)),
         );
         return;
     }
@@ -9907,7 +11912,15 @@ fn publish_webrtc_video(
                 // Stamp publish with the source-relative instant; the OUTPUT clock
                 // paces emission, never this stamp (inputs are sampled, inv #1).
                 let _ = start;
-                plan.store.publish(image, pts);
+                plan.store.publish_arc_with_source_time(
+                    Arc::new(image),
+                    pts,
+                    Some(multiview_framestore::tile::SourceFrameTime {
+                        event_clock: None,
+                        pts,
+                        generation: plan.lifecycle,
+                    }),
+                );
             }
             Ok(None) => return, // decoder needs more input.
             Err(err) => {
@@ -10367,6 +12380,9 @@ fn open_and_stream(
     // Network sources open with an `rw_timeout` so a dead live source fails fast
     // instead of hanging this decode thread on open or a blocking read (#45).
     let opts = ingest_open_options(&plan.location);
+    // Kept alive for this connection: the loopback server libav reads from.
+    let mut hls_fetcher: Option<crate::hls_fetch::HlsFetcher> = None;
+    let mut hls_event_bridge = None;
     let mut input = match &plan.location {
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
@@ -10382,6 +12398,51 @@ fn open_and_stream(
             // the post-open discard + reconnect bracket as the remaining guards
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
             let open_url = main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h);
+            // A live HLS media playlist is fetched by our parallel-range segment
+            // fetcher and read by libav from loopback memory (see `hls_fetch`);
+            // anything it cannot serve (VOD, encrypted, fMP4) opens directly.
+            let open_url = if plan.live
+                && is_hls_location(&plan.location)
+                && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none()
+            {
+                // Unique receiver stays with this native connection, never a
+                // registry lookup or a competing source-service registration.
+                let (observer, bridge) = if plan.source_events.is_some() {
+                    let (observer, bridge) = crate::source_event_hls_bridge::channel(
+                        plan.id.clone(),
+                        plan.lifecycle,
+                        128,
+                    );
+                    (Some(observer), Some(bridge))
+                } else {
+                    (None, None)
+                };
+                let start_result = if observer.is_some() {
+                    crate::hls_fetch::HlsFetcher::start_with_observer(
+                        &plan.id,
+                        &open_url,
+                        stop,
+                        plan.lifecycle,
+                        observer,
+                    )
+                } else {
+                    crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop, plan.lifecycle)
+                };
+                match start_result {
+                    Ok(fetcher) => {
+                        let local = fetcher.local_url().to_owned();
+                        hls_event_bridge = bridge;
+                        hls_fetcher = Some(fetcher);
+                        local
+                    }
+                    Err(err) => {
+                        tracing::info!(source = %plan.id, error = %err, "hls fetch: not used, libav opens the origin");
+                        open_url
+                    }
+                }
+            } else {
+                open_url
+            };
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
@@ -10420,6 +12481,8 @@ fn open_and_stream(
         }
     };
 
+    // The fetcher lives for this connection (it stops when this returns).
+    let _hls_fetcher = hls_fetcher;
     let (stream_index, params, time_base, declared_fps) = best_video_stream_params(&input)?;
 
     // Prefer NVDEC hardware decode (`*_cuvid`) so 4K H.264/HEVC decode runs on
@@ -10494,11 +12557,42 @@ fn open_and_stream(
     // succeeded (no subtitle stream to discard), and a backstop on the fall-through
     // path (master unfetchable / a non-master playlist that still folds in a
     // subtitle). See the fn doc for the footgun + the routed-keep.
+    // Detect metadata explicitly before unrouted packets are discarded. ID3 is
+    // recognized but remains unavailable until its native adapter is wired.
+    let metadata_streams: std::collections::HashMap<
+        usize,
+        (crate::source_event_packet::MetadataKind, ffmpeg::Rational),
+    > = input
+        .streams()
+        .filter_map(|stream| match stream.parameters().id() {
+            ffmpeg::codec::Id::SCTE_35 => Some((
+                stream.index(),
+                (
+                    crate::source_event_packet::MetadataKind::Scte35,
+                    stream.time_base(),
+                ),
+            )),
+            ffmpeg::codec::Id::TIMED_ID3 => Some((
+                stream.index(),
+                (
+                    crate::source_event_packet::MetadataKind::Id3,
+                    stream.time_base(),
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
     discard_unrouted_subtitle_streams(plan, &mut input);
 
     // The wall-clock pacer: maps the first frame's PTS to "now" and releases
     // each subsequent frame when wall-clock catches up to its PTS (invariant #4).
     let mut pacer = PtsWallClock::new();
+    // Live frames go onto the output timeline with a jitter hold (see `LiveStamper`).
+    let mut stamper = LiveStamper::new();
+    // The raw-to-output mapping (`at - raw`) at the last anchor publish.
+    let mut last_raw_offset: Option<i64> = None;
+    // On-air A/V offset probe for this source (see `crate::av_sync`).
+    let av_probe = crate::av_sync::probe(&plan.id);
 
     // MEDIA-PLAYER CHANNEL (ADR-0057 / ADR-0097): when this source is a player,
     // run the transport-driven decode loop instead of the plain pump. It owns
@@ -10517,6 +12611,87 @@ fn open_and_stream(
             stop,
         );
     }
+
+    // Read the demuxer on its own thread, ahead of the PTS-paced decode below,
+    // so a slow segment fetch drains a queued backlog instead of stalling the
+    // tile (see `PacketReader`). Only the video and routed subtitle packets are
+    // queued.
+    #[cfg(feature = "overlay")]
+    let sub_index = plan.incontainer_sub.as_ref().map(|r| r.stream_index);
+    #[cfg(not(feature = "overlay"))]
+    let sub_index: Option<usize> = None;
+    let mut packet_gate = crate::source_event_packet::PacketGate::default();
+    let mut video_fence = 0_u64;
+    let mut source_events = (!metadata_streams.is_empty() || hls_event_bridge.is_some())
+        .then_some(plan.source_events.as_ref())
+        .flatten()
+        .and_then(|lease| crate::source_event_runtime::NativeEvents::new(plan.id.clone(), lease));
+    if let (Some(events), Some(bridge)) = (source_events.as_mut(), hls_event_bridge.take()) {
+        let _ = events.attach_hls(bridge);
+    }
+    // Metadata has a separate fixed budget: never consume video read-ahead slots.
+    let (metadata_tx, metadata_rx) =
+        std::sync::mpsc::sync_channel::<crate::source_event_packet::MetadataPacket>(32);
+    let metadata_overflow = Arc::new(AtomicBool::new(false));
+    let demux_overflow = Arc::clone(&metadata_overflow);
+    let reader = spawn_packet_reader(&plan.id, READ_AHEAD_PACKETS, move || {
+        let mut packet = ffmpeg::codec::packet::Packet::empty();
+        match packet.read(&mut input) {
+            Ok(()) if packet.stream() == stream_index || Some(packet.stream()) == sub_index => {
+                if packet.stream() == stream_index {
+                    video_fence = video_fence.saturating_add(1);
+                }
+                Some(ReadItem::Packet((video_fence, packet)))
+            }
+            Ok(()) => {
+                if let Some(&(kind, tb)) = metadata_streams.get(&packet.stream()) {
+                    if let Some(bytes) = packet.data() {
+                        if bytes.len() <= 4096 {
+                            if metadata_tx
+                                .try_send(crate::source_event_packet::MetadataPacket {
+                                    kind,
+                                    bytes: bytes.to_vec(),
+                                    pts: packet.pts(),
+                                    time_base_num: tb.numerator(),
+                                    time_base_den: tb.denominator(),
+                                    video_fence,
+                                })
+                                .is_err()
+                            {
+                                demux_overflow.store(true, Ordering::Release);
+                            }
+                        } else {
+                            demux_overflow.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                None
+            }
+            Err(ffmpeg::Error::Eof) => Some(ReadItem::Eof),
+            Err(other) => Some(ReadItem::Error(other.to_string())),
+        }
+    })?;
+    // A live source queues about a segment before pacing starts (see
+    // `LIVE_PREBUFFER`); a file/VOD starts at once.
+    let mut pending = if plan.live {
+        let tb_num = i128::from(time_base.num);
+        let tb_den = i128::from(time_base.den);
+        prebuffer(
+            &reader,
+            |(_, p): &(u64, ffmpeg::codec::packet::Packet)| {
+                if p.stream() != stream_index || tb_den <= 0 {
+                    return None;
+                }
+                let ts = p.pts().or_else(|| p.dts())?;
+                i64::try_from(i128::from(ts) * 1_000_000_000 * tb_num / tb_den).ok()
+            },
+            LIVE_PREBUFFER,
+            LIVE_PREBUFFER_DEADLINE,
+            stop,
+        )
+    } else {
+        std::collections::VecDeque::new()
+    };
 
     // Pump packets, publishing each decoded+scaled frame into the store.
     let mut drained = false;
@@ -10538,6 +12713,42 @@ fn open_and_stream(
             // with no usable PTS or a degenerate timebase falls back to the
             // decoder's own rescaled time so ingest never drops a frame.
             let pts = timeline_pts(&mut normalizer, decoded.raw_pts, decoded.meta.pts);
+            // Capture this decoded frame's immutable mapping before any pace wait.
+            let mapping = normalizer.mapping_snapshot();
+            let generation = normalizer.mapping_generation();
+            for packet in metadata_rx.try_iter().take(32) {
+                if packet_gate.push(packet).is_some() {
+                    metadata_overflow.store(true, Ordering::Release);
+                }
+            }
+            let gated = packet_gate.decoded(
+                decoded.raw_pts,
+                generation,
+                i32::try_from(time_base.num).unwrap_or(0),
+                i32::try_from(time_base.den).unwrap_or(0),
+            );
+            let event_clock = source_events.as_mut().and_then(|events| {
+                let clock = events.mapping(mapping);
+                if metadata_overflow.swap(false, Ordering::AcqRel) {
+                    events.mark_degraded();
+                }
+                for packet in gated {
+                    match packet.packet.kind {
+                        crate::source_event_packet::MetadataKind::Id3 => {
+                            // Presence-only metadata never acquires splice semantics.
+                            events.observe_id3(&packet.packet.bytes);
+                        }
+                        crate::source_event_packet::MetadataKind::Scte35 if packet.trusted => {
+                            events.ingest(&packet.packet.bytes, mapping);
+                        }
+                        crate::source_event_packet::MetadataKind::Scte35 => {
+                            events.observe_scte_untimed(&packet.packet.bytes);
+                        }
+                    }
+                }
+                events.ingest_hls();
+                clock
+            });
             // Pace to that PTS (invariant #4) so a file/VOD source is not slurped
             // into the ring faster than real time, then publish it stamped with
             // its SOURCE-RELATIVE media time — the timeline the output clock
@@ -10547,15 +12758,69 @@ fn open_and_stream(
             if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
-            plan.store.publish(image, pacer.publish_time(pts));
+            // Live sources stamp on the OUTPUT timeline (the instant this frame
+            // is released), so connect/reconnect timing never desynchronises the
+            // tile from the clock that samples it; a finite file/VOD keeps its
+            // source-relative stamp (it plays from its own start).
+            let at = if plan.live {
+                let at = stamper.stamp(&plan.output_origin, pts, pacer.publish_time(pts));
+                // Expose the A/V anchor on a (re-)anchor, and when the raw clock
+                // moved under a continuous video timeline (see `anchor_due`).
+                // Always rebased on THIS frame: (at, pts, its raw PTS).
+                let raw_ns = decoded.raw_pts.and_then(|raw| ticks_to_ns(raw, time_base));
+                let reanchored = stamper.take_reanchored().is_some();
+                let due = anchor_due(reanchored, last_raw_offset, raw_ns, at);
+                // Both publications belong to one producer epoch. Keep the
+                // producer-side lifecycle lock across the frame AND its anchor:
+                // teardown may detach a stalled A, but A cannot write into B's
+                // reused TileStore after B begins (nor expose A's anchor).
+                if publish_live_frame_for(
+                    &plan.id,
+                    plan.lifecycle,
+                    &plan.store,
+                    &plan.live_anchor,
+                    image,
+                    at,
+                    pts,
+                    due.then_some((pts, raw_ns)),
+                    event_clock,
+                ) {
+                    if due {
+                        if let Some(raw) = raw_ns {
+                            last_raw_offset = Some(at.as_nanos().saturating_sub(raw));
+                        }
+                    }
+                    crate::av_sync::record_video(&av_probe, at, raw_ns);
+                }
+                continue;
+            } else {
+                pacer.publish_time(pts)
+            };
+            plan.store.publish_arc_with_source_time(
+                Arc::new(image),
+                at,
+                Some(multiview_framestore::tile::SourceFrameTime {
+                    event_clock,
+                    pts,
+                    generation: plan.lifecycle,
+                }),
+            );
         }
         if drained {
             return Ok(());
         }
-        let mut packet = ffmpeg::codec::packet::Packet::empty();
-        match packet.read(&mut input) {
-            Ok(()) => {
+        // Wait in short slices so `stop` stays responsive while the origin is
+        // slow; a dead read still surfaces within `rw_timeout` as an error.
+        let Some(item) = pending
+            .pop_front()
+            .or_else(|| reader.next(Duration::from_millis(100)))
+        else {
+            continue;
+        };
+        match item {
+            ReadItem::Packet((fence, packet)) => {
                 if packet.stream() == stream_index {
+                    packet_gate.submitted(fence, packet.pts());
                     decoder.send_packet(&packet).map_err(|e| e.to_string())?;
                 } else {
                     // A non-video packet: route it to the in-container subtitle
@@ -10568,11 +12833,11 @@ fn open_and_stream(
                     pump_incontainer_sub(plan, incontainer_sub.as_mut(), &packet);
                 }
             }
-            Err(ffmpeg::Error::Eof) => {
+            ReadItem::Eof => {
                 decoder.send_eof().map_err(|e| e.to_string())?;
                 drained = true;
             }
-            Err(other) => return Err(other.to_string()),
+            ReadItem::Error(err) => return Err(err),
         }
     }
 }
@@ -10711,6 +12976,7 @@ fn stream_player(
     // bump), never a pixel-plane copy — no per-frame heap allocation on the hold
     // path (bounded-memory data plane, inv #5 / rule 22).
     let mut last_image: Option<Arc<Nv12Image>> = None;
+    let mut last_source_pts: Option<MediaTime> = None;
     // Whether the decoder has been fully drained (EOF reached with no loop, or a
     // fail-safe gave up): the loop falls through to `heartbeat_player_hold`, which
     // holds last-good forever — the tile rides the framestore state machine and
@@ -10847,7 +13113,16 @@ fn stream_player(
                     }
                     let image = Arc::new(image);
                     last_image = Some(Arc::clone(&image));
-                    plan.store.publish_arc(image, at);
+                    last_source_pts = Some(decoded.meta.pts);
+                    plan.store.publish_arc_with_source_time(
+                        image,
+                        at,
+                        last_source_pts.map(|pts| multiview_framestore::tile::SourceFrameTime {
+                            event_clock: None,
+                            pts,
+                            generation: plan.lifecycle,
+                        }),
+                    );
                     // Track the video's output media-time for the audio exit anchor
                     // (ADR-T019 §1): the audio arms its exit at the next vamp
                     // boundary at-or-after this same media-time.
@@ -10878,7 +13153,17 @@ fn stream_player(
                         if stop.load(Ordering::Acquire) {
                             return Ok(());
                         }
-                        plan.store.publish_arc(Arc::clone(image), at);
+                        plan.store.publish_arc_with_source_time(
+                            Arc::clone(image),
+                            at,
+                            last_source_pts.map(|pts| {
+                                multiview_framestore::tile::SourceFrameTime {
+                                    event_clock: None,
+                                    pts,
+                                    generation: plan.lifecycle,
+                                }
+                            }),
+                        );
                     }
                 }
                 PlayerAction::Ended => {
@@ -10935,7 +13220,14 @@ fn stream_player(
             // would have re-seeded packets). Hold the tile LIVE: a finite,
             // non-looping play-through keeps republishing its terminal frame at
             // cadence via the heartbeat below until `stop`.
-            heartbeat_player_hold(plan, &mut player, last_image.as_ref(), pacer, stop);
+            heartbeat_player_hold(
+                plan,
+                &mut player,
+                last_image.as_ref(),
+                last_source_pts,
+                pacer,
+                stop,
+            );
             return Ok(());
         }
 
@@ -11219,6 +13511,7 @@ fn heartbeat_player_hold(
     plan: &IngestPlan,
     player: &mut crate::player::MediaPlayer,
     last_image: Option<&Arc<Nv12Image>>,
+    last_source_pts: Option<MediaTime>,
     pacer: &mut PtsWallClock,
     stop: &AtomicBool,
 ) {
@@ -11243,7 +13536,15 @@ fn heartbeat_player_hold(
         }
         // Republish the held handle — an `Arc::clone` (refcount bump), never a
         // pixel-plane copy.
-        plan.store.publish_arc(Arc::clone(image), at);
+        plan.store.publish_arc_with_source_time(
+            Arc::clone(image),
+            at,
+            last_source_pts.map(|pts| multiview_framestore::tile::SourceFrameTime {
+                event_clock: None,
+                pts,
+                generation: plan.lifecycle,
+            }),
+        );
     }
 }
 
@@ -11336,7 +13637,9 @@ fn pump_incontainer_sub(
         return;
     }
     match decoder.decode(packet) {
-        Ok(cues) => crate::captions::publish_window_cues(&route.store, cues),
+        Ok(cues) => {
+            crate::captions::publish_window_cues_for_generation(&route.store, plan.lifecycle, cues);
+        }
         Err(err) => {
             tracing::debug!(source = %plan.id, error = %err, "in-container subtitle packet decode error");
         }
@@ -11385,7 +13688,9 @@ fn pump_embedded_cc(
         return;
     };
     match decoder.decode_bytes(bytes, frame.raw_pts) {
-        Ok(cues) => crate::captions::publish_window_cues(&route.store, cues),
+        Ok(cues) => {
+            crate::captions::publish_window_cues_for_generation(&route.store, plan.lifecycle, cues);
+        }
         Err(err) => {
             tracing::debug!(source = %plan.id, error = %err, "embedded-CC A53 decode error");
         }
@@ -11474,6 +13779,563 @@ impl PtsWallClock {
     }
 }
 
+/// Packets a source's read-ahead queue holds (video + routed subtitle packets
+/// only). At 30 fps that is ~34 s of media, at 60 fps ~17 s — more than the
+/// ~3 segments a live playlist exposes, so the live edge (not this queue) bounds
+/// how far ahead the reader runs. A few MB at news bitrates; bounded.
+const READ_AHEAD_PACKETS: usize = 1024;
+
+/// One result of a demuxer read, handed from the read-ahead thread to the
+/// decode/pace loop.
+enum ReadItem<P> {
+    /// A routed packet.
+    Packet(P),
+    /// Clean end of stream.
+    Eof,
+    /// A read error (the connection is over; the caller reconnects).
+    Error(String),
+}
+
+/// The consumer side of a live source's read-ahead thread.
+///
+/// The demuxer used to be read on the decode thread, which is paced to wall
+/// clock by PTS, so it could never get ahead of real time: a live HLS reader
+/// blocks inside libav while it fetches each segment, and a fetch longer than
+/// the 2 s jitter hold aged the tile into RECONNECTING although the origin was
+/// healthy (and fell behind the live edge, "skipping segments ahead"). The
+/// reader thread instead reads as fast as the origin delivers, into a bounded
+/// queue, so the paced decode drains a backlog across a slow fetch.
+///
+/// Dropping it cancels the reader: a blocked `send` fails at once, and a read
+/// blocked inside libav returns within `rw_timeout`. The thread is detached so
+/// a reconnect never waits on a stalled read (it only touches its own `Input`).
+struct PacketReader<P> {
+    rx: Receiver<ReadItem<P>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl<P> PacketReader<P> {
+    /// The next item, waiting at most `timeout`; `None` on timeout. A reader
+    /// thread that exited without a terminal item reads as an error.
+    fn next(&self, timeout: Duration) -> Option<ReadItem<P>> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(item) => Some(item),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Some(ReadItem::Error("live read-ahead thread exited".to_owned()))
+            }
+        }
+    }
+}
+
+impl<P> Drop for PacketReader<P> {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Spawn the read-ahead thread. `read` performs one blocking demuxer read and
+/// returns `None` for a packet that is not routed (skipped, not queued). The
+/// thread stops after a terminal item, on cancel, or once the consumer is gone.
+fn spawn_packet_reader<P, F>(
+    source_id: &str,
+    capacity: usize,
+    mut read: F,
+) -> Result<PacketReader<P>, String>
+where
+    P: Send + 'static,
+    F: FnMut() -> Option<ReadItem<P>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let id = source_id.to_owned();
+    std::thread::Builder::new()
+        .name(format!("multiview-read-{source_id}"))
+        .spawn(move || {
+            // Attribute libav's log lines on this thread to the source (ADR-0060).
+            let _resource = ingest_resource_scope(&id);
+            while !thread_cancel.load(Ordering::Acquire) {
+                let Some(item) = read() else { continue };
+                let terminal = !matches!(item, ReadItem::Packet(_));
+                if tx.send(item).is_err() || terminal {
+                    return;
+                }
+            }
+        })
+        .map_err(|e| format!("spawn live read-ahead thread: {e}"))?;
+    Ok(PacketReader { rx, cancel })
+}
+
+/// Media a live source queues before its first frame is paced. The pacer anchors
+/// on its first frame, so with an empty queue the next slow segment fetch makes
+/// every later frame late (measured on cnn-usa: up to 7 s behind in the first
+/// 25 s, until the backlog builds). About one HLS segment of prebuffer makes the
+/// cushion exist from the first frame. The tile shows NO SIGNAL meanwhile, as it
+/// does for any connect.
+const LIVE_PREBUFFER: Duration = Duration::from_secs(6);
+
+/// The longest a live connect waits for [`LIVE_PREBUFFER`] before starting with
+/// whatever has arrived.
+const LIVE_PREBUFFER_DEADLINE: Duration = Duration::from_secs(12);
+
+/// Pull from `reader` until the queued packets span `target` of media (by
+/// `media_ns`, `None` for packets without a timestamp or of another stream),
+/// a terminal item arrives, `deadline` passes, or `stop` is raised. Returns the
+/// items in order, for the caller to process before reading on.
+fn prebuffer<P>(
+    reader: &PacketReader<P>,
+    media_ns: impl Fn(&P) -> Option<i64>,
+    target: Duration,
+    deadline: Duration,
+    stop: &AtomicBool,
+) -> std::collections::VecDeque<ReadItem<P>> {
+    let mut queued = std::collections::VecDeque::new();
+    let end = Instant::now() + deadline;
+    let want = i64::try_from(target.as_nanos()).unwrap_or(i64::MAX);
+    let mut first: Option<i64> = None;
+    while !stop.load(Ordering::Acquire) {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let Some(item) = reader.next(left.min(Duration::from_millis(100))) else {
+            continue;
+        };
+        let span = match &item {
+            ReadItem::Packet(p) => media_ns(p).map(|t| t.saturating_sub(*first.get_or_insert(t))),
+            ReadItem::Eof | ReadItem::Error(_) => {
+                queued.push_back(item);
+                break;
+            }
+        };
+        queued.push_back(item);
+        if span.is_some_and(|s| s >= want) {
+            break;
+        }
+    }
+    queued
+}
+
+/// How far ahead of the output clock a live frame is placed (its jitter hold).
+///
+/// A live HLS/TS reader stalls at every segment boundary while it fetches the
+/// next segment; frames published "just in time" age past the tile's freshness
+/// threshold during that fetch (LIVE→STALE), then arrive in a burst. Placing
+/// each frame `LIVE_JITTER_HOLD` ahead, at its true media spacing, absorbs any
+/// gap shorter than this without a visible pause or catch-up.
+const LIVE_JITTER_HOLD: MediaTime = MediaTime::from_nanos(2_000_000_000);
+
+/// Stamps live frames onto the run's OUTPUT timeline (the scale `tick.pts`
+/// samples tiles on), preserving the source's media spacing.
+///
+/// On the first frame of a connection it anchors `stamp(pts0) = now + hold`;
+/// each later frame is `anchor + (pts - pts0)`. It re-anchors when the source
+/// timeline goes backwards or the stamp leaves `[now, now + 2*hold]` (a long
+/// stall, a PTS jump, or accumulated clock drift), so latency stays bounded.
+/// Without a run origin (before the program seeds, bounded/test drives) it
+/// returns the caller's source-relative `fallback`.
+struct LiveStamper {
+    anchor: Option<(MediaTime, MediaTime)>,
+    /// Set by a [`stamp`](Self::stamp) that (re-)anchored; cleared by
+    /// [`take_reanchored`](Self::take_reanchored).
+    reanchored: bool,
+}
+
+/// A live source's video anchor: the per-connection mapping from source media
+/// time to the run's OUTPUT timeline that [`LiveStamper`] stamps video with.
+///
+/// Published on every (re-)anchor so the audio rail can place its samples at
+/// the same output instant as the picture (audio locked to vision): a sample
+/// at source time `t` (same stream clock as `raw_pts0_ns`) belongs at
+/// `out0 + (t - raw_pts0_ns)`. `out0` already includes the jitter hold and any
+/// connect prebuffer (it is the release instant + hold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveAnchor {
+    /// Bumped on every (re-)anchor of this source (per process, starts at 1).
+    pub generation: u64,
+    /// Output-timeline instant (since the run's tick-0 seed) of the anchor frame.
+    pub out0: MediaTime,
+    /// The anchor frame's PTS on the video normalizer's timeline.
+    pub pts0: MediaTime,
+    /// The anchor frame's RAW container PTS in nanoseconds (the demuxer's stream
+    /// clock shared with the audio stream — for MPEG-TS, the 90 kHz PTS scaled),
+    /// `None` when the frame carried no PTS.
+    pub raw_pts0_ns: Option<i64>,
+}
+
+/// A lock-free cell holding a source's latest [`LiveAnchor`] (`None` before the
+/// first live frame on the output timeline). Written by the video ingest
+/// thread, read by anyone (audio) without blocking (invariants #1/#10).
+pub type LiveAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveAnchor>>>>;
+
+/// The process-wide [`LiveAnchorSlot`] for source `id` — the same `Arc` for
+/// every caller, so the audio rail can look up the slot the video rail writes.
+/// Takes a mutex only to find/create the entry (plan build, control plane);
+/// never on a per-frame path.
+pub fn live_anchor_slot(id: &str) -> LiveAnchorSlot {
+    let mut map = anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        map.entry(id.to_owned())
+            .or_insert_with(|| Arc::new(multiview_framestore::SwapCell::empty())),
+    )
+}
+
+/// A non-allocating, lifecycle-checked lookup for a LIVE AUDIO WORKER (review
+/// R3-02): unlike [`live_anchor_slot`], this never recreates a removed entry.
+///
+/// `lifecycle == 0` is the sole non-worker caller's convention (plan-build
+/// time, before any lifecycle is assigned): it always matches and allocates
+/// exactly as `live_anchor_slot` does. A worker's nonzero `lifecycle` is
+/// checked against the CURRENT token for `id` *and* the slot is looked up,
+/// both under the SAME `anchor_lifecycle()` lock [`remove_live_lifecycle`]
+/// takes (same lock order: tokens, then slots) — so a worker that already
+/// passed its own loop-top lifecycle check can never recreate a slot a
+/// concurrent `remove_live_lifecycle` has just dropped: either this call
+/// observes the removal (token mismatch/absent ⇒ `None`, no allocation) or it
+/// completes entirely before the removal starts (serialized by the lock).
+pub(crate) fn live_anchor_slot_for_lifecycle(id: &str, lifecycle: u64) -> Option<LiveAnchorSlot> {
+    if lifecycle == 0 {
+        return Some(live_anchor_slot(id));
+    }
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied() != Some(lifecycle) {
+        return None;
+    }
+    anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .cloned()
+}
+
+/// The process-wide anchor slots, keyed by live source id. A removed source's
+/// entry is dropped (review R2-04), so the map tracks live sources only.
+fn anchor_slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>> {
+    static SLOTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>>,
+    > = std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// A detached writer and a replacement synchronize publication under one lock.
+fn anchor_lifecycle() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static TOKENS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    TOKENS.get_or_init(Default::default)
+}
+
+pub(crate) fn live_lifecycle(id: &str) -> u64 {
+    anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .copied()
+        .unwrap_or(0)
+}
+
+pub(crate) fn begin_live_lifecycle(id: &str) -> u64 {
+    let mut tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    advance_live_lifecycle(id, &mut tokens)
+}
+
+#[allow(clippy::expect_used)] // 2^64 lifecycle replacements cannot safely reuse a token; fail closed before ABA.
+fn advance_live_lifecycle(id: &str, tokens: &mut std::collections::HashMap<String, u64>) -> u64 {
+    // Review R2-04: tokens come from one process-wide counter, so no id ever
+    // sees a token twice. A removed id can then drop its entry: a stale worker
+    // holds a token that no later lifecycle of any id can equal. Allocated
+    // under the lifecycle lock, so per-id tokens stay strictly increasing.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(next != u64::MAX, "source lifecycle epoch exhausted");
+    let token = tokens.entry(id.to_owned()).or_default();
+    *token = next;
+    let slot = live_anchor_slot(id);
+    let generation = slot
+        .load()
+        .map_or(0, |anchor| anchor.generation)
+        .saturating_add(1);
+    slot.store(Some(Arc::new(LiveAnchor {
+        generation,
+        out0: MediaTime::ZERO,
+        pts0: MediaTime::ZERO,
+        raw_pts0_ns: None,
+    })));
+    crate::hls_fetch::begin_generation_at(id, *token);
+    *token
+}
+
+/// End a removed source's lifecycle and release every per-id registry entry:
+/// the lifecycle token, the anchor slot and the fetch registration (review
+/// R2-04). Tokens are globally unique, so dropping the entry cannot unfence a
+/// stale worker: its token never matches an absent entry (read as `0`) or any
+/// later lifecycle. A detached worker keeps its own `Arc` of the old slot; a
+/// re-add gets a fresh slot that the old worker cannot reach.
+pub(crate) fn remove_live_lifecycle(id: &str) -> u64 {
+    let mut tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lifecycle = advance_live_lifecycle(id, &mut tokens);
+    crate::hls_fetch::forget_source(id, lifecycle);
+    tokens.remove(id);
+    anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(id);
+    lifecycle
+}
+
+/// Live entries retained by the lifecycle and anchor registries whose id
+/// starts with `prefix` (churn-bound tests).
+#[cfg(test)]
+pub(crate) fn retained_lifecycle_ids(prefix: &str) -> (usize, usize) {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .count();
+    let slots = anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .count();
+    (tokens, slots)
+}
+
+/// Invalidate an ending run only if its startup producer still owns this id.
+/// A later runtime replacement must keep its newer epoch.
+pub(crate) fn end_live_lifecycle(id: &str, lifecycle: u64) {
+    let mut tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied() == Some(lifecycle) {
+        advance_live_lifecycle(id, &mut tokens);
+    }
+}
+
+/// `ticks` of `time_base` in nanoseconds (exact integer math, `None` on a
+/// degenerate base or overflow).
+fn ticks_to_ns(ticks: i64, time_base: Rational) -> Option<i64> {
+    if time_base.den <= 0 {
+        return None;
+    }
+    let ns =
+        i128::from(ticks) * 1_000_000_000 * i128::from(time_base.num) / i128::from(time_base.den);
+    i64::try_from(ns).ok()
+}
+
+/// Whether the A/V anchor must be republished for a frame stamped `at` with raw
+/// PTS `raw_ns`: on a (re-)anchor, or when the frame's raw-to-output mapping
+/// (`at - raw`) moved by more than tick rounding since the last publish. The
+/// second case is a raw-PTS jump the video normalizer absorbed without a
+/// re-anchor (an ad splice, an origin restart, a 33-bit wrap): video stays
+/// continuous, but audio mapped through the old anchor lands seconds off.
+fn anchor_due(
+    reanchored: bool,
+    last_offset: Option<i64>,
+    raw_ns: Option<i64>,
+    at: MediaTime,
+) -> bool {
+    const TOLERANCE_NS: i64 = 1_000_000;
+    if reanchored {
+        return true;
+    }
+    match (last_offset, raw_ns) {
+        (Some(prev), Some(raw)) => (at.as_nanos().saturating_sub(raw) - prev).abs() > TOLERANCE_NS,
+        _ => false,
+    }
+}
+
+/// Publish only when this producer still owns the source lifecycle. The lock
+/// covers both the ownership check and store, excluding replacement races.
+#[cfg(test)]
+fn publish_live_anchor_for(
+    id: &str,
+    lifecycle: u64,
+    slot: &LiveAnchorSlot,
+    at: (MediaTime, MediaTime),
+    raw_pts0_ns: Option<i64>,
+) {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied().unwrap_or(0) == lifecycle {
+        publish_live_anchor(slot, at, raw_pts0_ns);
+    }
+}
+
+/// Fence a synthetic producer's image against the same lifecycle as decoded
+/// video. Called only from the generator thread (never from the output clock).
+pub(crate) fn publish_live_synth_frame_for(
+    id: &str,
+    lifecycle: u64,
+    store: &multiview_framestore::TileStore<Nv12Image>,
+    image: Arc<Nv12Image>,
+    at: MediaTime,
+) -> bool {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied().unwrap_or(0) != lifecycle {
+        return false;
+    }
+    store.publish_arc_with_source_time(
+        image,
+        at,
+        Some(multiview_framestore::tile::SourceFrameTime {
+            event_clock: None,
+            pts: at,
+            generation: lifecycle,
+        }),
+    );
+    true
+}
+
+/// Atomically fence the video image and its source-PTS metadata against the
+/// existing lifecycle token. This runs only in the producer, never output-clock.
+#[allow(clippy::too_many_arguments)]
+// reason: frame source time is distinct from its output stamp and anchor, and all
+// three are published inside one lifecycle fence without adding a heap wrapper.
+fn publish_live_frame_for(
+    id: &str,
+    lifecycle: u64,
+    store: &multiview_framestore::TileStore<Nv12Image>,
+    slot: &LiveAnchorSlot,
+    image: Nv12Image,
+    at: MediaTime,
+    source_pts: MediaTime,
+    anchor: Option<(MediaTime, Option<i64>)>,
+    event_clock: Option<multiview_framestore::tile::EventClockContext>,
+) -> bool {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied().unwrap_or(0) != lifecycle {
+        return false;
+    }
+    store.publish_arc_with_source_time(
+        Arc::new(image),
+        at,
+        Some(multiview_framestore::tile::SourceFrameTime {
+            event_clock,
+            pts: source_pts,
+            generation: lifecycle,
+        }),
+    );
+    if let Some((pts, raw)) = anchor {
+        publish_live_anchor(slot, (at, pts), raw);
+    }
+    true
+}
+
+/// Publish a fresh anchor into `slot`, bumping its generation.
+fn publish_live_anchor(
+    slot: &LiveAnchorSlot,
+    (out0, pts0): (MediaTime, MediaTime),
+    raw_pts0_ns: Option<i64>,
+) {
+    let generation = slot.load().map_or(0, |a| a.generation).saturating_add(1);
+    slot.store(Some(Arc::new(LiveAnchor {
+        generation,
+        out0,
+        pts0,
+        raw_pts0_ns,
+    })));
+}
+
+impl LiveStamper {
+    const fn new() -> Self {
+        Self {
+            anchor: None,
+            reanchored: false,
+        }
+    }
+
+    /// The current anchor if the last [`stamp`](Self::stamp) (re-)anchored,
+    /// once.
+    fn take_reanchored(&mut self) -> Option<(MediaTime, MediaTime)> {
+        if std::mem::take(&mut self.reanchored) {
+            self.anchor
+        } else {
+            None
+        }
+    }
+
+    fn stamp(
+        &mut self,
+        origin: &crate::timing_status::EpochAnchorSlot,
+        pts: MediaTime,
+        fallback: MediaTime,
+    ) -> MediaTime {
+        let Some(run) = origin.load() else {
+            return fallback;
+        };
+        let now = MediaTime::from_nanos(
+            run.time()
+                .now_nanos()
+                .saturating_sub(run.seed_nanos())
+                .max(0),
+        );
+        if let Some((out0, pts0)) = self.anchor {
+            if pts >= pts0 {
+                let at = out0.saturating_add(pts.saturating_sub(pts0));
+                let latest = now
+                    .saturating_add(LIVE_JITTER_HOLD)
+                    .saturating_add(LIVE_JITTER_HOLD);
+                if at >= now && at <= latest {
+                    return at;
+                }
+            }
+        }
+        let out0 = now.saturating_add(LIVE_JITTER_HOLD);
+        self.anchor = Some((out0, pts));
+        self.reanchored = true;
+        out0
+    }
+}
+
+/// The `(source id, linear program gain)` pairs the program bus is built from.
+///
+/// When the document's `[audio]` block declares routes they are authoritative
+/// (ADR-R005 §4.1 / ADR-0059 §4): a store is MIXED only if its route sets
+/// `include_in_program_bus` and is not `mute`d, at that route's `gain_db`
+/// (linear). Every other store still joins the bus at zero gain so its discrete
+/// track is metered (mute ≠ unroute; an operator routes by the meter). With no
+/// routes, every store rides at unity. Sorted by id.
+pub(crate) fn program_bus_gains<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    routing: Option<&multiview_config::AudioRouting>,
+) -> Vec<(String, f64)> {
+    let mut ids: Vec<&str> = ids.collect();
+    ids.sort_unstable();
+    let routes = routing.map(|r| r.routes.as_slice()).unwrap_or_default();
+    if routes.is_empty() {
+        return ids.into_iter().map(|id| (id.to_owned(), 1.0)).collect();
+    }
+    ids.into_iter()
+        .map(|id| {
+            // Every input is on the bus so it is METERED (an operator picks what
+            // to route by its meter), but only an included, unmuted route is
+            // MIXED: everything else rides at zero program gain.
+            let gain = routes
+                .iter()
+                .find(|r| r.input_id == id && r.include_in_program_bus && !r.mute)
+                .map_or(0.0, |r| {
+                    10f64.powf(f64::from(r.gain_db.clamp(-96.0, 24.0)) / 20.0)
+                });
+            (id.to_owned(), gain)
+        })
+        .collect()
+}
+
 /// Lazily-built scaler from a decoded NV12 frame's geometry to the tile size,
 /// emitting an [`Nv12Image`] tagged like the canvas.
 struct TileScaler {
@@ -11498,6 +14360,14 @@ impl TileScaler {
         frame: &Video,
         tag: multiview_core::color::ColorInfo,
     ) -> Result<Nv12Image, String> {
+        // Packing already handles padded strides. Avoid Scaler's identity deep
+        // copy, but retain the cached scaler for subsequent nonidentity frames.
+        if frame.format() == Pixel::NV12
+            && frame.width() == self.tile_w
+            && frame.height() == self.tile_h
+        {
+            return video_to_nv12(frame, tag);
+        }
         let src = ScaleSpec::new(frame.format(), frame.width(), frame.height());
         let dst = ScaleSpec::new(Pixel::NV12, self.tile_w, self.tile_h);
         let rebuild = match &self.scaler {
@@ -11513,6 +14383,167 @@ impl TileScaler {
             .ok_or_else(|| "tile scaler unexpectedly absent".to_owned())?;
         let resized = sws.run(frame).map_err(|e| e.to_string())?;
         video_to_nv12(&resized, tag)
+    }
+}
+
+#[cfg(test)]
+mod tile_scaler_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use multiview_core::color::{ColorInfo, ColorRange};
+
+    fn tag() -> ColorInfo {
+        ColorInfo {
+            range: ColorRange::Full,
+            ..ColorInfo::default().resolve_defaults(1920, 1080)
+        }
+    }
+
+    // Fill active samples independently of padding, with deterministic distinct
+    // chroma bytes. P010 stores ten-bit samples in the high bits of each word.
+    fn fixture(format: Pixel, w: u32, h: u32, mut seed: u32) -> Video {
+        let mut frame = Video::new(format, w, h);
+        // The caller's full-range tag must win over source-frame metadata.
+        frame.set_color_range(ffmpeg::color::Range::MPEG);
+        let bytes = if format == Pixel::P010LE { 2 } else { 1 };
+        for plane in 0..2 {
+            let stride = frame.stride(plane);
+            let rows = usize::try_from(h).unwrap() / (plane + 1);
+            frame.data_mut(plane).fill(0xa5);
+            for row in 0..rows {
+                for x in 0..usize::try_from(w).unwrap() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let value = seed.to_be_bytes()[0];
+                    let offset = row * stride + x * bytes;
+                    if bytes == 2 {
+                        let sample = (u16::from(value) << 8).to_le_bytes();
+                        frame.data_mut(plane)[offset..offset + 2].copy_from_slice(&sample);
+                    } else {
+                        frame.data_mut(plane)[offset] = value;
+                    }
+                }
+            }
+        }
+        frame
+    }
+
+    fn legacy(frame: &Video, w: u32, h: u32) -> Nv12Image {
+        let mut scaler = Scaler::new(
+            ScaleSpec::new(frame.format(), frame.width(), frame.height()),
+            ScaleSpec::new(Pixel::NV12, w, h),
+        )
+        .unwrap();
+        video_to_nv12(&scaler.run(frame).unwrap(), tag()).unwrap()
+    }
+
+    fn same(actual: &Nv12Image, expected: &Nv12Image) {
+        assert_eq!(actual.width(), expected.width());
+        assert_eq!(actual.height(), expected.height());
+        assert_eq!(actual.y_plane(), expected.y_plane());
+        assert_eq!(actual.uv_plane(), expected.uv_plane());
+        assert_eq!(actual.color(), expected.color());
+        assert_eq!(actual.color(), tag());
+    }
+
+    fn active(frame: &Video, plane: usize) -> Vec<u8> {
+        frame
+            .data(plane)
+            .chunks(frame.stride(plane))
+            .take(usize::try_from(frame.height()).unwrap() / (plane + 1))
+            .flat_map(|row| {
+                row[..usize::try_from(frame.width()).unwrap()]
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tile_scaler_exact_nv12_does_not_create_scaler() {
+        let frame = fixture(Pixel::NV12, 18, 10, 7);
+        let mut scaler = TileScaler::new(18, 10);
+        let output = scaler.convert(&frame, tag()).unwrap();
+        same(&output, &legacy(&frame, 18, 10));
+        assert!(
+            scaler.scaler.is_none(),
+            "identity packing must bypass Scaler"
+        );
+    }
+
+    #[test]
+    fn tile_scaler_padded_distinct_chroma_preserves_active_bytes_and_tag() {
+        let frame = fixture(Pixel::NV12, 18, 10, 19);
+        assert!(frame.stride(0) > 18);
+        assert!(frame.stride(1) > 18);
+        let y_before = frame.data(0).to_vec();
+        let uv_before = frame.data(1).to_vec();
+        let output = TileScaler::new(18, 10).convert(&frame, tag()).unwrap();
+        assert_eq!(output.y_plane(), active(&frame, 0));
+        assert_eq!(output.uv_plane(), active(&frame, 1));
+        assert!(output.uv_plane().chunks_exact(2).any(|p| p[0] != p[1]));
+        same(&output, &legacy(&frame, 18, 10));
+        assert_eq!(frame.data(0), y_before);
+        assert_eq!(frame.data(1), uv_before);
+    }
+
+    #[test]
+    fn tile_scaler_seeded_exact_frames_match_legacy() {
+        for (w, h) in [(2, 2), (18, 10), (64, 48), (640, 540)] {
+            let mut scaler = TileScaler::new(w, h);
+            for seed in [1, 42, 987_654] {
+                let frame = fixture(Pixel::NV12, w, h, seed);
+                let output = scaler.convert(&frame, tag()).unwrap();
+                same(&output, &legacy(&frame, w, h));
+                assert_eq!(output.y_plane(), active(&frame, 0));
+                assert_eq!(output.uv_plane(), active(&frame, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn tile_scaler_exact_resize_exact_preserves_cached_conversion() {
+        let mut scaler = TileScaler::new(18, 10);
+        for (w, h, seed) in [(18, 10, 1), (36, 20, 2), (18, 10, 3), (54, 30, 4)] {
+            let frame = fixture(Pixel::NV12, w, h, seed);
+            let cached = scaler
+                .scaler
+                .as_ref()
+                .map(|s| (s.source(), s.destination()));
+            let output = scaler.convert(&frame, tag()).unwrap();
+            same(&output, &legacy(&frame, 18, 10));
+            if w == 18 {
+                assert_eq!(
+                    scaler
+                        .scaler
+                        .as_ref()
+                        .map(|s| (s.source(), s.destination())),
+                    cached,
+                    "exact packing must not replace the cached resize scaler"
+                );
+            } else {
+                assert_eq!(
+                    scaler.scaler.as_ref().unwrap().source(),
+                    ScaleSpec::new(Pixel::NV12, w, h)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tile_scaler_p010_exact_and_resize_keep_conversion() {
+        for (w, h) in [(18, 10), (36, 20)] {
+            let frame = fixture(Pixel::P010LE, w, h, 123);
+            let mut scaler = TileScaler::new(18, 10);
+            same(
+                &scaler.convert(&frame, tag()).unwrap(),
+                &legacy(&frame, 18, 10),
+            );
+            assert_eq!(
+                scaler.scaler.as_ref().unwrap().source(),
+                ScaleSpec::new(Pixel::P010LE, w, h)
+            );
+        }
     }
 }
 
@@ -11655,6 +14686,7 @@ mod fault_detector_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::overlays::TileFault;
+    use multiview_audio::{AudioBlock, AudioFormat, ChannelLayout};
 
     /// A 25/1 fps cadence (40 ms per tick), so the dwell windows below convert to
     /// a small, deterministic number of ticks.
@@ -11821,7 +14853,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             source_probes_for(id, &[probe]),
         );
         let states = live_states(id);
@@ -11865,7 +14901,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -11880,6 +14920,482 @@ mod fault_detector_tests {
         }
     }
 
+    /// Publish exactly one measured tick; `None` leaves the PCM window uncovered.
+    fn live_audio_tick(
+        det: &mut FaultDetector,
+        video: &TileStore<Nv12Image>,
+        audio: &multiview_audio::store::AudioStore,
+        id: &str,
+        i: u64,
+        level: Option<f32>,
+    ) -> TileFault {
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        if let Some(level) = level {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(
+                    at,
+                    &AudioBlock::from_interleaved(format, vec![level; 3840]).unwrap(),
+                )
+                .unwrap();
+        }
+        video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+        det.sample(pts_of(i), i, &live_states(id))
+            .get(id)
+            .copied()
+            .unwrap_or(TileFault::None)
+    }
+
+    fn live_audio_detector() -> (
+        FaultDetector,
+        Arc<TileStore<Nv12Image>>,
+        Arc<multiview_audio::store::AudioStore>,
+    ) {
+        let id = "live-hls";
+        let (stores, video) = store_for(id);
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            48_000,
+        ));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let det = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashMap::new(),
+        );
+        (det, video, audio)
+    }
+
+    #[test]
+    fn fractional_tick_requires_its_final_sample_for_measured_silence() {
+        let (mut det, video, audio) = live_audio_detector();
+        det.cadence = Rational::new(30_000, 1_001);
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let index = 14;
+        let pts = MediaTime::from_tick(index, det.cadence);
+        let next = MediaTime::from_tick(index + 1, det.cadence);
+        let start = multiview_audio::store::output_ns_to_frame(pts.as_nanos(), 48_000);
+        let end = multiview_audio::store::output_ns_to_frame(next.as_nanos(), 48_000);
+        assert_eq!((start, end), (22_422, 24_024));
+        audio
+            .publish_at(start, &AudioBlock::silence(format, 1601))
+            .unwrap();
+        video.publish(moving(14), pts);
+        assert_eq!(det.silence_now("live-hls", 14, pts), None);
+        audio
+            .publish_at(end - 1, &AudioBlock::silence(format, 1))
+            .unwrap();
+        assert_eq!(det.silence_now("live-hls", 14, pts), Some(true));
+        audio
+            .publish_at(
+                end - 1,
+                &AudioBlock::from_interleaved(format, vec![0.01; 2]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(det.silence_now("live-hls", 14, pts), Some(false));
+    }
+
+    #[test]
+    fn sparse_near_floor_live_burst_is_audible() {
+        let (mut det, video, audio) = live_audio_detector();
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        for i in 0..20 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            let mut samples = vec![0.0; 1920 * 2];
+            for frame in samples.chunks_exact_mut(2).take(19) {
+                frame.fill(0.01); // -40 dBFS peak, approximately -60 dBFS RMS.
+            }
+            audio
+                .publish_at(at, &AudioBlock::from_interleaved(format, samples).unwrap())
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            assert_eq!(det.silence_now("live-hls", i, pts_of(i)), Some(false));
+            assert_ne!(
+                det.sample(pts_of(i), i, &live_states("live-hls"))
+                    .get("live-hls")
+                    .copied(),
+                Some(TileFault::Silent),
+                "a sparse audible burst must not raise a silence badge"
+            );
+        }
+    }
+
+    #[test]
+    fn active_live_silence_survives_unknown_pcm_beyond_clear_dwell() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..15 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        for i in 15..35 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, None),
+                TileFault::Silent,
+                "unpublished PCM must not clear an already active silence alarm"
+            );
+        }
+        for i in 35..44 {
+            let fault = live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.2));
+            if i < 43 {
+                assert_eq!(fault, TileFault::Silent);
+            } else {
+                assert_eq!(fault, TileFault::None, "covered audio clears normally");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_live_silence_does_not_count_unknown_pcm_toward_raise() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..5 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None
+            );
+        }
+        for i in 5..30 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, None),
+                TileFault::None
+            );
+        }
+        for i in 30..39 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None,
+                "unknown duration cannot satisfy pending raise dwell"
+            );
+        }
+        for i in 39..45 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 45, Some(0.0)),
+            TileFault::Silent,
+            "covered silence still raises after enough actual evidence"
+        );
+    }
+
+    #[test]
+    fn clearing_live_silence_does_not_count_unknown_pcm_toward_clear() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..15 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 15, Some(0.2)),
+            TileFault::Silent
+        );
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 16, Some(0.2)),
+            TileFault::Silent
+        );
+        for i in 17..40 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, None),
+                TileFault::Silent
+            );
+        }
+        for i in 40..46 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.2)),
+                TileFault::Silent,
+                "unknown duration cannot satisfy pending clear dwell"
+            );
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 46, Some(0.2)),
+            TileFault::Silent
+        );
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 47, Some(0.2)),
+            TileFault::None,
+            "covered audible PCM still clears after sufficient evidence"
+        );
+    }
+
+    #[test]
+    fn skipped_and_repeated_ticks_do_not_raise_silence_without_contiguous_evidence() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..5 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None
+            );
+        }
+        // Ticks 5 and 6 were repeats with no detector sample. Tick 7 alone
+        // cannot prove that either intervening audio interval was silent.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 7, Some(0.0)),
+            TileFault::None
+        );
+        // A skipped output-clock interval is likewise unknown, even if the
+        // resumed tick has fully covered PCM.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 100, Some(0.0)),
+            TileFault::None
+        );
+        for i in 101..109 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0)),
+                TileFault::None
+            );
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 109, Some(0.0)),
+            TileFault::Silent
+        );
+    }
+
+    #[test]
+    fn skipped_and_repeated_ticks_do_not_clear_silence_without_contiguous_evidence() {
+        let (mut det, video, audio) = live_audio_detector();
+        for i in 0..15 {
+            live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.0));
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 15, Some(0.2)),
+            TileFault::Silent
+        );
+        // Repeat ticks 16 and 17 have no audio observation.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 18, Some(0.2)),
+            TileFault::Silent
+        );
+        // A long skip is also unknown; its first covered sample must not clear.
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 100, Some(0.2)),
+            TileFault::Silent
+        );
+        for i in 101..108 {
+            assert_eq!(
+                live_audio_tick(&mut det, &video, &audio, "live-hls", i, Some(0.2)),
+                TileFault::Silent
+            );
+        }
+        assert_eq!(
+            live_audio_tick(&mut det, &video, &audio, "live-hls", 108, Some(0.2)),
+            TileFault::None
+        );
+    }
+
+    #[test]
+    fn synthetic_audio_applicability_and_live_edits_preserve_measured_silence() {
+        let kind = |json: &str| serde_json::from_str::<SourceKind>(json).unwrap();
+        for json in [
+            r#"{"kind":"clock"}"#,
+            r#"{"kind":"timer","target":"time_of_day","at":"12:00:00"}"#,
+            r##"{"kind":"solid","color":"#abcdef"}"##,
+        ] {
+            assert!(is_intentionally_audio_free(&kind(json)), "{json}");
+        }
+        for json in [
+            r#"{"kind":"bars"}"#,
+            r#"{"kind":"hls","url":"https://example.test/a.m3u8"}"#,
+            r#"{"kind":"rtsp","url":"rtsp://example.test/a"}"#,
+            r#"{"kind":"file","path":"/missing"}"#,
+        ] {
+            assert!(!is_intentionally_audio_free(&kind(json)), "{json}");
+        }
+
+        let id = "edited";
+        let (stores, video) = store_for(id);
+        let applicability: AudioFreeSources =
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::from([id.to_owned()]),
+            ));
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            48_000,
+        ));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let mut detector = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            Arc::clone(&applicability),
+            std::collections::HashMap::new(),
+        );
+        for tick in 0..20 {
+            assert_ne!(
+                live_audio_tick(&mut detector, &video, &audio, id, tick, Some(0.0)),
+                TileFault::Silent
+            );
+        }
+        // Clock -> decoded source: prior synthetic silence adds no dwell.
+        applicability.store(Arc::new(std::collections::HashSet::new()));
+        assert_eq!(
+            live_audio_tick(&mut detector, &video, &audio, id, 20, None),
+            TileFault::None
+        );
+        for tick in 21..37 {
+            let fault = live_audio_tick(&mut detector, &video, &audio, id, tick, Some(0.0));
+            if tick == 36 {
+                assert_eq!(fault, TileFault::Silent);
+            }
+        }
+        // Decoded source -> clock: explicit reset clears without fabricated PCM.
+        applicability.store(Arc::new(std::collections::HashSet::from([id.to_owned()])));
+        assert_eq!(
+            live_audio_tick(&mut detector, &video, &audio, id, 37, None),
+            TileFault::None
+        );
+        // Clock -> decoded source: the first known sample cannot inherit dwell.
+        applicability.store(Arc::new(std::collections::HashSet::new()));
+        assert_eq!(
+            live_audio_tick(&mut detector, &video, &audio, id, 38, Some(0.0)),
+            TileFault::None
+        );
+    }
+
+    #[test]
+    fn bars_silent_tone_is_measured_but_missing_hls_audio_is_unknown() {
+        let id = "bars";
+        let (stores, video) = store_for(id);
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(
+            AudioFormat::new(48_000, ChannelLayout::Stereo),
+            48_000,
+        ));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let mut det = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashMap::new(),
+        );
+        for tick in 0..20 {
+            let fault = live_audio_tick(&mut det, &video, &audio, id, tick, Some(0.0));
+            if tick == 19 {
+                assert_eq!(fault, TileFault::Silent);
+            }
+        }
+        for tick in 20..33 {
+            let fault = live_audio_tick(&mut det, &video, &audio, id, tick, Some(0.2));
+            if tick == 32 {
+                assert_eq!(fault, TileFault::None);
+            }
+        }
+        let (stores, video) = store_for("hls");
+        let mut no_store = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashMap::new(),
+        );
+        for tick in 0..20 {
+            video.publish(moving(u8::try_from(tick).unwrap()), pts_of(tick));
+            assert_eq!(no_store.silence_now("hls", tick, pts_of(tick)), None);
+            assert_ne!(
+                no_store
+                    .sample(pts_of(tick), tick, &live_states("hls"))
+                    .get("hls"),
+                Some(&TileFault::Silent)
+            );
+        }
+    }
+
+    #[test]
+    fn audible_live_source_without_file_meter_must_not_raise_no_audio() {
+        let id = "live-hls";
+        let (stores, video) = store_for(id);
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let audio = Arc::new(multiview_audio::store::AudioStore::timeline(format, 48_000));
+        let mut audio_stores = std::collections::HashMap::new();
+        audio_stores.insert(id.to_owned(), Arc::clone(&audio));
+        let mut det = FaultDetector::new(
+            stores,
+            std::collections::HashMap::new(),
+            audio_stores,
+            cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
+            std::collections::HashMap::new(),
+        );
+        let states = live_states(id);
+        let mut last = TileFault::None;
+        for i in 0..20 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(
+                    at,
+                    &AudioBlock::from_interleaved(format, vec![0.2; 3840]).unwrap(),
+                )
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_ne!(last, TileFault::Silent);
+        for i in 20..42 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(at, &AudioBlock::silence(format, 1920))
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_eq!(last, TileFault::Silent);
+        for i in 42..55 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(
+                    at,
+                    &AudioBlock::from_interleaved(format, vec![0.2; 3840]).unwrap(),
+                )
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_ne!(last, TileFault::Silent);
+        // Every tick overlaps published silence but only half is covered.
+        // Zero-fill in the uncovered half must not raise a false badge.
+        for i in 55..78 {
+            let at = multiview_audio::store::output_ns_to_frame(pts_of(i).as_nanos(), 48_000);
+            audio
+                .publish_at(at, &AudioBlock::silence(format, 960))
+                .unwrap();
+            video.publish(moving(u8::try_from(i).unwrap()), pts_of(i));
+            last = det
+                .sample(pts_of(i), i, &states)
+                .get(id)
+                .copied()
+                .unwrap_or(TileFault::None);
+        }
+        assert_ne!(
+            last,
+            TileFault::Silent,
+            "partial overlap is unknown, not measured silence"
+        );
+    }
+
     #[test]
     fn sustained_all_black_frames_raise_a_black_fault() {
         let id = "blk";
@@ -11887,7 +15403,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -11913,7 +15433,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -11943,7 +15467,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -11972,7 +15500,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -12006,7 +15538,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -12038,7 +15574,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -12066,7 +15606,11 @@ mod fault_detector_tests {
         let mut det = FaultDetector::new(
             stores,
             timelines,
+            std::collections::HashMap::new(),
             cadence(),
+            Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             std::collections::HashMap::new(),
         );
         let states = live_states(id);
@@ -12381,6 +15925,7 @@ mod reconnect_tests {
 /// exercised offline with a canned master (no network, no FFI).
 #[cfg(test)]
 mod variant_pin_tests {
+    use super::resolve_hls_audio_url_with;
     use super::resolve_hls_variant_url_with;
     use crate::captions::{FetchedPlaylist, PlaylistFetcher};
 
@@ -12425,6 +15970,42 @@ mod variant_pin_tests {
         "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,SUBTITLES=\"subs\"\n",
         "index_2.m3u8\n",
     );
+
+    /// cnn-na's shape (`MediaTailor`, four muxed A/V rungs, NO subtitles): the
+    /// audio decode must still pin ONE variant. Opening the master made libav
+    /// fetch all four rungs' segments per segment and starve the audio.
+    #[test]
+    fn audio_pins_one_variant_of_a_subtitle_free_abr_master() {
+        let fetcher = CannedFetcher(Ok(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=1020588\n",
+            "../m/0.m3u8\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=4715744\n",
+            "../m/3.m3u8\n",
+        )
+        .to_owned()));
+        assert_eq!(
+            resolve_hls_audio_url_with("https://cf.test/v1/master/x.m3u8", &fetcher).as_deref(),
+            Some("https://cf.test/v1/m/3.m3u8")
+        );
+    }
+
+    /// cnn-usa's shape: the audio pin never lands on a video-only rung.
+    #[test]
+    fn audio_pin_skips_a_video_only_variant() {
+        let fetcher = CannedFetcher(Ok(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS=\"hvc1.2.2.L120.90\"\n",
+            "tracks-v1/mono.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1390000,CODECS=\"hvc1.2.2.L120.90,mp4a.40.2\"\n",
+            "tracks-v1a1/mono.m3u8\n",
+        )
+        .to_owned()));
+        assert_eq!(
+            resolve_hls_audio_url_with("http://o.test/cnn/index.m3u8", &fetcher).as_deref(),
+            Some("http://o.test/cnn/tracks-v1a1/mono.m3u8")
+        );
+    }
 
     #[test]
     fn pins_the_main_demuxer_to_a_video_variant_url_for_the_tile_height() {
@@ -13452,9 +17033,189 @@ segment_ms = 1000
         supervisor.shutdown();
     }
 
-    /// M1: the caption reader registers under the derived `{id}/captions` key,
-    /// so a live edit/remove of the source also stops its caption reader (the
-    /// hub raises every `{id}`-rooted flag).
+    /// A same-id caption-off transition advances the lifecycle before new cues.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn caption_generation_survives_caption_off_and_rejects_old_frame() {
+        use multiview_core::time::MediaTime;
+        use multiview_framestore::tile::SourceFrameTime;
+        let config = rtsp_config();
+        let pipeline = super::Pipeline::build(&config).expect("pipeline");
+        let spawner = pipeline.live_ingest_spawner();
+        let store = Arc::new(crate::captions::CueStore::new());
+        let original = super::live_lifecycle("net1");
+        store.begin_generation(original);
+        let cue = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::ZERO,
+            MediaTime::from_nanos(10_000),
+            vec!["old".to_owned()],
+            None,
+        )
+        .expect("cue");
+        store.publish(cue.start(), cue.end(), cue);
+        pipeline.live_caption_stores.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.insert("net1".to_owned(), Arc::clone(&store));
+            next
+        });
+        let before = super::live_lifecycle("net1");
+        spawner.source_without_audio("net1"); // synthetic edit: shared lifecycle advances once
+        assert_eq!(
+            pipeline.caption_generations.load().get("net1"),
+            Some(&super::live_lifecycle("net1"))
+        );
+        assert_eq!(super::live_lifecycle("net1"), before.saturating_add(1));
+        assert!(pipeline.live_caption_stores.load().get("net1").is_none());
+        assert!(store
+            .active_at_generation(MediaTime::from_nanos(1), original)
+            .is_none());
+        // The same id reappears with captions. Its token must not reset,
+        // or a held old picture could render its new cue.
+        let token = pipeline
+            .caption_generations
+            .load()
+            .get("net1")
+            .copied()
+            .unwrap_or_default();
+        let old_picture = SourceFrameTime {
+            event_clock: None,
+            pts: MediaTime::from_nanos(1),
+            generation: original,
+        };
+        let fresh = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::ZERO,
+            MediaTime::from_nanos(10_000),
+            vec!["new".to_owned()],
+            None,
+        )
+        .expect("cue");
+        store.publish_for_generation(token, fresh.start(), fresh.end(), fresh);
+        assert!(store
+            .active_at_generation(old_picture.pts, old_picture.generation)
+            .is_none());
+        assert!(store.active_at_generation(old_picture.pts, token).is_some());
+    }
+
+    /// Real local HLS `WebVTT` survives captions-on → off → on with a fresh store.
+    #[cfg(feature = "overlay")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    // reason: one offline test creates a real master, transitions source identity,
+    // runs the isolated reader, and verifies the held old picture independently.
+    fn hls_caption_off_on_initializes_fresh_store_before_reader_spawn() {
+        use multiview_core::time::MediaTime;
+        use multiview_framestore::tile::SourceFrameTime;
+        let dir = tempfile::tempdir().expect("fixture directory");
+        multiview_ffmpeg::test_fixtures::generate_hls_with_valid_webvtt(dir.path())
+            .expect("local HLS master and WebVTT rendition");
+        let source = {
+            let doc = format!(
+                r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "net1"
+kind = "hls"
+url = "{}/master.m3u8"
+[sources.captions]
+mode = "auto"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "net1"
+"##,
+                dir.path().display()
+            );
+            MultiviewConfig::load_from_toml(&doc)
+                .expect("local HLS source config")
+                .sources
+                .remove(0)
+        };
+        let old = super::caption_plan_for_generation(&source, None, 1).expect("old caption plan");
+        let old_store = Arc::clone(&old.store);
+        let old_cue = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::from_nanos(1_000_000_000),
+            MediaTime::from_nanos(3_000_000_000),
+            vec!["old".to_owned()],
+            None,
+        )
+        .expect("valid old cue");
+        old_store.publish_for_generation(1, old_cue.start(), old_cue.end(), old_cue);
+        // Captions-off removes the registered store and advances the token.
+        old_store.begin_generation(2);
+        let fresh = super::caption_plan_for_generation(&source, None, 3)
+            .expect("caption plan after re-enable");
+        assert!(!Arc::ptr_eq(&old_store, &fresh.store));
+        assert_eq!(fresh.generation, 3);
+        assert_eq!(
+            fresh.store.generation(),
+            3,
+            "new plan must not retain generation 1"
+        );
+        let held_old = SourceFrameTime {
+            event_clock: None,
+            pts: MediaTime::from_nanos(1_500_000_000),
+            generation: 1,
+        };
+        let new_store = Arc::clone(&fresh.store);
+        let new_cursor = Arc::clone(&fresh.displayed_time);
+        new_cursor.store(Some(Arc::new(SourceFrameTime {
+            event_clock: None,
+            pts: held_old.pts,
+            generation: 3,
+        })));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let reader =
+            std::thread::spawn(move || crate::captions::caption_loop(&fresh, &reader_stop));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while new_store.active_at_generation(held_old.pts, 3).is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        reader.join().expect("isolated reader stopped");
+        let actual = new_store.active_at_generation(held_old.pts, 3);
+        assert!(
+            actual.is_some(),
+            "reader must publish the real local WebVTT cue"
+        );
+        assert!(
+            new_store.active_at_generation(held_old.pts, 1).is_none(),
+            "old held picture must not show the new cue"
+        );
+        assert!(
+            old_store.active_at_generation(held_old.pts, 1).is_none(),
+            "captions-off must clear the previous cue"
+        );
+        let detached = multiview_ffmpeg::caption::CaptionCue::try_text(
+            MediaTime::from_nanos(1_000_000_000),
+            MediaTime::from_nanos(3_000_000_000),
+            vec!["detached".to_owned()],
+            None,
+        )
+        .expect("valid detached cue");
+        old_store.publish_for_generation(1, detached.start(), detached.end(), detached);
+        assert!(
+            old_store.active_at_generation(held_old.pts, 1).is_none(),
+            "detached previous reader cannot revive old cues"
+        );
+    }
+
+    /// M1: the caption reader registers under `{id}/captions` so edits stop it.
     #[test]
     fn caption_reader_registers_a_prefixed_stop_flag() {
         let plan = crate::captions::CaptionPlan {
@@ -13462,6 +17223,8 @@ segment_ms = 1000
             rendition_url: "http://[::1]:1/never/subs.m3u8".to_owned(),
             store: Arc::new(crate::captions::CueStore::new()),
             live: true,
+            generation: 1,
+            displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
         };
         let registry = stop_registry();
         let supervisor = IngestSupervisor::start(
@@ -13612,7 +17375,9 @@ mod live_overlay_bake_tests {
     fn bake_context(slot: &crate::live_overlays::OverlayApplySlot) -> BakeContext {
         BakeContext {
             tile_specs: Vec::new(),
+            tile_spec_apply: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
             meter_db_timelines: HashMap::new(),
+            meter_channel_timelines: HashMap::new(),
             subtitles: None,
             sidecar_target: None,
             analog_clocks: Vec::new(),
@@ -13632,13 +17397,184 @@ mod live_overlay_bake_tests {
     fn item(tick_index: u64) -> StreamItem {
         let tag = CanvasColor::default().output_tag();
         StreamItem {
+            #[cfg(feature = "overlay")]
+            events: std::collections::HashMap::new(),
             canvas: Arc::new(Nv12Image::solid(320, 180, 16, 128, 128, tag).expect("solid")),
             tick_index,
             source_states: HashMap::new(),
+            tile_specs: Arc::new(Vec::new()),
             captions: HashMap::new(),
             caption_bitmaps: HashMap::new(),
             faults: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn selected_source_event_reaches_stream_baker_pixels() {
+        use multiview_core::source_event::{
+            EventBoundary, EventOrigin, SourceEventKey, SourceEventObservation,
+        };
+        use multiview_framestore::tile::SourceFrameTime;
+        let runtime = crate::source_event_runtime::Runtime::new().expect("runtime");
+        let lease = runtime.activate("cnn", 11).expect("lease");
+        let connection = lease.connect().expect("connection");
+        let (context, producer) = connection.register(3).expect("registration");
+        let _ = producer.try_observe(SourceEventObservation {
+            key: SourceEventKey {
+                source_id: "cnn".into(),
+                epoch: context.service_epoch,
+                origin: EventOrigin::Scte35,
+                event_id: "injected-cue".into(),
+            },
+            revision: 1,
+            boundary: EventBoundary::Start {
+                pts_ns: Some(1_000_000_000),
+                duration_ns: Some(10_000_000_000),
+            },
+            asset_id: None,
+            correlation_id: None,
+        });
+        let reader = runtime.reader();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while reader
+            .registry()
+            .snapshot("cnn")
+            .is_none_or(|read| read.events.is_empty())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event worker deadline"
+            );
+            std::thread::yield_now();
+        }
+        let selected = SourceFrameTime {
+            pts: multiview_core::time::MediaTime::from_nanos(2_000_000_000),
+            generation: 11,
+            event_clock: Some(context.clock),
+        };
+        let events = reader.sample(&HashMap::from([("cnn".into(), selected)]));
+        assert_eq!(
+            events["cnn"].timer.as_ref().expect("timer").nanoseconds,
+            "9000000000"
+        );
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut context = bake_context(&slot);
+        let tile = crate::overlays::TileSpec::new(
+            "cnn",
+            "CNN",
+            multiview_overlay::geometry::PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        context.tile_specs = vec![tile.clone()];
+        let mut baker = StreamBaker::new(context).expect("baker");
+        let mut frame = item(50);
+        frame.tile_specs = Arc::new(vec![tile]);
+        let plain = baker.bake(&frame).expect("plain");
+        frame.events = events;
+        let event = baker.bake(&frame).expect("event");
+        assert!(
+            region_diff(&plain, &event, (0, 30, 320, 120)) > 0,
+            "event must reach actual bake pixels"
+        );
+        let wrong = SourceFrameTime {
+            generation: 12,
+            ..selected
+        };
+        frame.events = reader.sample(&HashMap::from([("cnn".into(), wrong)]));
+        assert!(frame.events.is_empty());
+        let cleared = baker.bake(&frame).expect("cleared");
+        assert_eq!(region_diff(&plain, &cleared, (0, 30, 320, 120)), 0);
+    }
+
+    #[test]
+    fn source_audio_drives_its_own_live_tile_meter_without_program_gain() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let mut bus = multiview_audio::ProgramBus::new(
+            crate::audio::canonical_format(),
+            Rational::new(25, 1),
+        );
+        let cnn = crate::audio::new_store();
+        let bbc = crate::audio::new_store();
+        let mut unequal = Vec::with_capacity(2_000 * 2);
+        for _ in 0..2_000 {
+            unequal.extend_from_slice(&[0.5, 0.0]);
+        }
+        cnn.publish_samples(&unequal).expect("cnn samples");
+        bbc.publish_samples(&vec![0.0; 2_000 * 2])
+            .expect("bbc silence");
+        bus.add_source("cnn", cnn, 0.0);
+        bus.add_source("bbc", bbc, 0.0);
+        let block = super::drive_audio_for_item(&mut bus, 0);
+        assert_eq!(block.frame_count(), 1_920);
+        let samples = baker.sample_input_meters(&bus, std::time::Duration::from_millis(40));
+        assert_eq!(samples.len(), 2);
+        assert_eq!(baker.live_meter_db["cnn"].count, 2);
+        assert!(
+            baker.live_meter_db["cnn"].db[0] > -9.0,
+            "CNN left follows pre-gain audio"
+        );
+        assert!(
+            baker.live_meter_db["cnn"].db[1] < -50.0,
+            "CNN right stays silent"
+        );
+        assert!(
+            baker.live_meter_db["bbc"].db[0] < -50.0,
+            "BBC tile stays at floor"
+        );
+    }
+
+    #[test]
+    fn stream_baker_uses_each_frames_layout_snapshot_not_the_latest_slot() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut context = bake_context(&slot);
+        let fullscreen = crate::overlays::TileSpec::new(
+            "cnn",
+            "CNN",
+            multiview_overlay::geometry::PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 180.0,
+            },
+        );
+        context.tile_specs = vec![fullscreen.clone()];
+        context
+            .tile_spec_apply
+            .store(Arc::new(vec![fullscreen.clone()]));
+        let mut baker = StreamBaker::new(context).expect("baker");
+        let hero = crate::overlays::TileSpec::new(
+            "cnn",
+            "CNN",
+            multiview_overlay::geometry::PixelRect {
+                x: 0.0,
+                y: 0.0,
+                width: 240.0,
+                height: 180.0,
+            },
+        );
+        let side = crate::overlays::TileSpec::new(
+            "bbc",
+            "BBC",
+            multiview_overlay::geometry::PixelRect {
+                x: 240.0,
+                y: 45.0,
+                width: 80.0,
+                height: 90.0,
+            },
+        );
+        let mut old_frame = item(0);
+        old_frame.tile_specs = Arc::new(vec![fullscreen]);
+        let mut new_frame = item(1);
+        new_frame.tile_specs = Arc::new(vec![hero.clone(), side.clone()]);
+        baker.bake(&old_frame).expect("old frame");
+        assert_eq!(baker.baker.tiles().len(), 1);
+        baker.bake(&new_frame).expect("new frame");
+        assert_eq!(baker.baker.tiles(), &[hero, side]);
     }
 
     /// An analog wall-clock overlay document at the given placement.
@@ -13660,6 +17596,29 @@ mod live_overlay_bake_tests {
         let empty = crate::live_overlays::overlay_apply_slot(Vec::new());
         let mut bare = StreamBaker::new(bake_context(&empty)).expect("bare baker");
         bare.bake(&item(0)).expect("bare bake")
+    }
+
+    #[test]
+    fn over_budget_overlay_tick_keeps_baker_and_audio_clock_alive() {
+        let slot = crate::live_overlays::overlay_apply_slot(Vec::new());
+        let mut baker = StreamBaker::new(bake_context(&slot)).expect("baker");
+        let clocks = (0..80)
+            .map(|i| analog_clock_at(&format!("clock_{i}"), 100, 100, 12))
+            .collect();
+        crate::live_overlays::publish_set(&slot, clocks);
+        let first = baker.bake(&item(7)).expect("over-budget frame must bake");
+        let mut bus = multiview_audio::ProgramBus::new(
+            crate::audio::canonical_format(),
+            Rational::new(25, 1),
+        );
+        let audio_first = super::drive_audio_for_item(&mut bus, 7);
+        crate::live_overlays::publish_set(&slot, Vec::new());
+        let next = baker.bake(&item(8)).expect("next ordinary frame must bake");
+        let audio_next = super::drive_audio_for_item(&mut bus, 8);
+        assert_eq!(first.width(), next.width());
+        assert_eq!(audio_first.frame_count(), 8 * 1_920);
+        assert_eq!(audio_next.frame_count(), 1_920);
+        assert!(region_diff(&first, &next, FACE_A) > 0);
     }
 
     #[test]
@@ -14107,12 +18066,16 @@ mod media_player_loop_tests {
         ));
 
         let plan = super::IngestPlan {
+            source_events: None,
             id: "player-test".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
             player: Some(handle),
             tile_w,
             tile_h,
             store: Arc::clone(&store),
+            output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -14271,12 +18234,16 @@ mod media_player_loop_tests {
             NoSignalPolicy::HoldForever,
         ));
         let plan = super::IngestPlan {
+            source_events: None,
             id: "vt-bad".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
             player: Some(handle),
             tile_w: 160,
             tile_h: 120,
             store: Arc::clone(&store),
+            output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -14379,12 +18346,16 @@ mod media_player_loop_tests {
             NoSignalPolicy::HoldForever,
         ));
         let plan = super::IngestPlan {
+            source_events: None,
             id: "vt-bframe".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
             player: Some(handle),
             tile_w,
             tile_h,
             store: Arc::clone(&store),
+            output_origin: crate::timing_status::anchor_slot(),
+            live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
+            lifecycle: 0,
             live: false,
             #[cfg(feature = "overlay")]
             incontainer_sub: None,
@@ -15624,6 +19595,421 @@ a=mediaclk:direct=0\r\n"
         assert!(
             build_aes67_output(&aes67_output_value_with_ptime(0)).is_err(),
             "a zero packet time is a typed refusal, not a silent coercion to 1 frame"
+        );
+    }
+}
+
+#[cfg(test)]
+mod anchor_due_tests {
+    use multiview_core::time::MediaTime;
+
+    use super::anchor_due;
+
+    const MS: i64 = 1_000_000;
+
+    fn at(ms: i64) -> MediaTime {
+        MediaTime::from_nanos(ms * MS)
+    }
+
+    #[test]
+    fn steady_frames_do_not_republish() {
+        // Mapping at - raw = 2_000 ms, frame after frame.
+        let offset = Some(2_000 * MS);
+        for k in 0..1_000 {
+            let raw = Some(k * 33 * MS);
+            assert!(
+                !anchor_due(false, offset, raw, at(2_000 + k * 33)),
+                "frame {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raw_jump_the_normalizer_absorbed_republishes() {
+        // Video continues at 2_033 ms, but the raw clock jumped 12 s ahead.
+        assert!(anchor_due(
+            false,
+            Some(2_000 * MS),
+            Some(12_033 * MS),
+            at(2_033)
+        ));
+    }
+
+    #[test]
+    fn a_reanchor_always_republishes_and_no_raw_never_does() {
+        assert!(anchor_due(true, Some(0), None, at(0)));
+        assert!(!anchor_due(false, Some(0), None, at(5)));
+        assert!(!anchor_due(false, None, Some(0), at(5)));
+    }
+}
+
+#[cfg(test)]
+mod live_stamper_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use multiview_core::time::MediaTime;
+    use multiview_engine::{ManualTimeSource, TimeSource};
+
+    use super::{LiveStamper, LIVE_JITTER_HOLD};
+
+    const SECOND: i64 = 1_000_000_000;
+
+    fn run_at(seed_ns: i64) -> (Arc<ManualTimeSource>, crate::timing_status::EpochAnchorSlot) {
+        let time = Arc::new(ManualTimeSource::new());
+        time.set(seed_ns);
+        let source: Arc<dyn TimeSource> = time.clone();
+        let slot = crate::timing_status::anchor_slot();
+        slot.store(Some(Arc::new(multiview_engine::epoch::EpochAnchor::new(
+            source, seed_ns,
+        ))));
+        (time, slot)
+    }
+
+    fn ms(n: i64) -> MediaTime {
+        MediaTime::from_nanos(n * 1_000_000)
+    }
+
+    #[test]
+    fn every_re_anchor_is_published_with_a_new_generation() {
+        let (time, slot) = run_at(0);
+        let anchors = super::live_anchor_slot("anchor-test");
+        assert!(Arc::ptr_eq(
+            &anchors,
+            &super::live_anchor_slot("anchor-test")
+        ));
+        let mut s = LiveStamper::new();
+        let stamp = |pts: MediaTime, s: &mut LiveStamper| {
+            s.stamp(&slot, pts, MediaTime::ZERO);
+            if let Some(a) = s.take_reanchored() {
+                super::publish_live_anchor(&anchors, a, Some(pts.as_nanos() + 7));
+            }
+        };
+        stamp(ms(1_000), &mut s);
+        let first = anchors.load().expect("anchor published");
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.out0, LIVE_JITTER_HOLD);
+        assert_eq!(first.pts0, ms(1_000));
+        assert_eq!(first.raw_pts0_ns, Some(ms(1_000).as_nanos() + 7));
+        // Steady frames do not re-publish.
+        stamp(ms(1_033), &mut s);
+        assert_eq!(anchors.load().expect("anchor").generation, 1);
+        // A reconnect (PTS restarts lower) re-anchors and bumps the generation.
+        time.advance(Duration::from_secs(3));
+        stamp(ms(5), &mut s);
+        let re = anchors.load().expect("anchor");
+        assert_eq!(re.generation, 2);
+        assert_eq!(
+            re.out0,
+            MediaTime::from_nanos(3 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
+        assert_eq!(re.pts0, ms(5));
+    }
+
+    #[test]
+    fn ticks_convert_to_nanoseconds_exactly() {
+        let tb = multiview_core::time::Rational {
+            num: 1,
+            den: 90_000,
+        };
+        assert_eq!(super::ticks_to_ns(90_000, tb), Some(SECOND));
+        assert_eq!(super::ticks_to_ns(3_003, tb), Some(33_366_666));
+        assert_eq!(
+            super::ticks_to_ns(1, multiview_core::time::Rational { num: 1, den: 0 }),
+            None
+        );
+    }
+
+    #[test]
+    fn without_an_origin_the_source_relative_stamp_is_kept() {
+        let slot = crate::timing_status::anchor_slot();
+        let mut s = LiveStamper::new();
+        assert_eq!(s.stamp(&slot, ms(10), ms(7)), ms(7));
+    }
+
+    #[test]
+    fn a_late_connecting_source_lands_ahead_of_the_output_clock() {
+        // Output has run 600 s; a source connects now. Its first frame must be
+        // on the output timeline (not at 0, which would read 600 s stale).
+        let (time, slot) = run_at(5 * SECOND);
+        time.advance(Duration::from_secs(600));
+        let mut s = LiveStamper::new();
+        let at = s.stamp(&slot, ms(90_000), MediaTime::ZERO);
+        assert_eq!(
+            at,
+            MediaTime::from_nanos(600 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
+    }
+
+    #[test]
+    fn a_segment_fetch_stall_keeps_media_spacing_no_catch_up_burst() {
+        let (time, slot) = run_at(0);
+        let mut s = LiveStamper::new();
+        let first = s.stamp(&slot, ms(0), MediaTime::ZERO);
+        // The reader stalls 1.5 s fetching the next segment, then releases the
+        // late frames together: they keep their 33 ms media spacing.
+        time.advance(Duration::from_millis(1_500));
+        let a = s.stamp(&slot, ms(1_001), MediaTime::ZERO);
+        let b = s.stamp(&slot, ms(1_034), MediaTime::ZERO);
+        assert_eq!(a, first.saturating_add(ms(1_001)));
+        assert_eq!(b.saturating_sub(a), ms(33));
+    }
+
+    #[test]
+    fn backwards_pts_or_a_long_stall_re_anchors() {
+        let (time, slot) = run_at(0);
+        let mut s = LiveStamper::new();
+        s.stamp(&slot, ms(50_000), MediaTime::ZERO);
+        // Reconnect: the new connection's PTS restarts lower.
+        time.advance(Duration::from_secs(3));
+        let re = s.stamp(&slot, ms(100), MediaTime::ZERO);
+        assert_eq!(
+            re,
+            MediaTime::from_nanos(3 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
+        // A 10 s stall puts the next stamp behind the clock: re-anchor ahead.
+        time.advance(Duration::from_secs(10));
+        let after = s.stamp(&slot, ms(200), MediaTime::ZERO);
+        assert_eq!(
+            after,
+            MediaTime::from_nanos(13 * SECOND).saturating_add(LIVE_JITTER_HOLD)
+        );
+    }
+}
+
+#[cfg(test)]
+mod program_bus_gain_tests {
+    use super::program_bus_gains;
+
+    fn routing(json: serde_json::Value) -> multiview_config::AudioRouting {
+        serde_json::from_value(json).expect("valid routing")
+    }
+
+    #[test]
+    fn no_routes_means_every_source_at_unity() {
+        let got = program_bus_gains(["b", "a"].into_iter(), None);
+        assert_eq!(got, vec![("a".to_owned(), 1.0), ("b".to_owned(), 1.0)]);
+    }
+
+    #[test]
+    fn declared_routes_decide_membership_gain_and_mute() {
+        let r = routing(serde_json::json!({
+            "sample_rate_hz": 48000,
+            "routes": [
+                {"input_id": "cnn", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "gain_db": -6.0},
+                {"input_id": "bbc", "channels": {"kind": "stereo"}, "include_in_program_bus": false},
+                {"input_id": "abc", "channels": {"kind": "stereo"}, "include_in_program_bus": true, "mute": true}
+            ]
+        }));
+        let got = program_bus_gains(["abc", "bbc", "cnn", "unrouted"].into_iter(), Some(&r));
+        // Every input stays on the bus (metered); only cnn is mixed.
+        assert_eq!(got.len(), 4, "all inputs metered: {got:?}");
+        assert_eq!(got[0], ("abc".to_owned(), 0.0), "muted: metered, not mixed");
+        assert_eq!(
+            got[1],
+            ("bbc".to_owned(), 0.0),
+            "excluded: metered, not mixed"
+        );
+        assert_eq!(got[2].0, "cnn");
+        assert!((got[2].1 - 0.501_187).abs() < 1e-5, "-6 dB is about 0.501");
+        assert_eq!(
+            got[3],
+            ("unrouted".to_owned(), 0.0),
+            "no route: metered, not mixed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod packet_reader_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{prebuffer, spawn_packet_reader, ReadItem};
+
+    fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// The live stall: the decode side is paced to wall clock and is not
+    /// pulling, yet the reader must keep fetching so a backlog is queued for the
+    /// next slow segment fetch — up to the bound, and no further.
+    #[test]
+    fn reads_ahead_of_an_idle_consumer_up_to_the_bound() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        let reader = spawn_packet_reader("t", 8, move || {
+            Some(ReadItem::Packet(counter.fetch_add(1, Ordering::SeqCst)))
+        })
+        .expect("spawn");
+        assert!(
+            wait_until(Duration::from_secs(2), || reads.load(Ordering::SeqCst) >= 8),
+            "reader did not run ahead: {} reads",
+            reads.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        // 8 queued + at most one blocked in `send`.
+        assert!(reads.load(Ordering::SeqCst) <= 9, "queue must stay bounded");
+        for want in 0..8 {
+            match reader.next(Duration::from_secs(1)) {
+                Some(ReadItem::Packet(got)) => assert_eq!(got, want, "in order"),
+                _ => panic!("expected packet {want}"),
+            }
+        }
+    }
+
+    /// A live connect queues about a segment of media before pacing starts, so
+    /// the first slow fetch is covered by a backlog rather than making frames
+    /// late.
+    #[test]
+    fn prebuffer_collects_the_target_media_span_then_returns() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        // One packet per 100 ms of media; packet 3 carries no timestamp.
+        let reader = spawn_packet_reader("t", 64, move || {
+            let i = c.fetch_add(1, Ordering::SeqCst);
+            Some(ReadItem::Packet(i))
+        })
+        .expect("spawn");
+        let stop = AtomicBool::new(false);
+        let got = prebuffer(
+            &reader,
+            |i: &usize| (*i != 3).then(|| i64::try_from(*i).unwrap() * 100_000_000),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            &stop,
+        );
+        let ids: Vec<usize> = got
+            .iter()
+            .map(|it| match it {
+                ReadItem::Packet(i) => *i,
+                _ => panic!("only packets expected"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            (0..=10).collect::<Vec<_>>(),
+            "stops once 1 s is spanned"
+        );
+        // Nothing is lost: the next read continues after the prebuffer.
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Packet(11))
+        ));
+    }
+
+    #[test]
+    fn prebuffer_gives_up_at_the_deadline_or_a_terminal_item() {
+        let reader = spawn_packet_reader("t", 4, move || {
+            std::thread::sleep(Duration::from_millis(20));
+            None::<ReadItem<u8>>
+        })
+        .expect("spawn");
+        let stop = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let got = prebuffer(
+            &reader,
+            |_| Some(0),
+            Duration::from_secs(6),
+            Duration::from_millis(200),
+            &stop,
+        );
+        assert!(got.is_empty());
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "bounded by the deadline"
+        );
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        let eof = spawn_packet_reader("t", 4, move || {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                Some(ReadItem::Packet(1_u8))
+            } else {
+                Some(ReadItem::Eof)
+            }
+        })
+        .expect("spawn");
+        let got = prebuffer(
+            &eof,
+            |_| Some(0),
+            Duration::from_secs(6),
+            Duration::from_secs(5),
+            &stop,
+        );
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got.back(), Some(ReadItem::Eof)));
+    }
+
+    #[test]
+    fn unrouted_reads_are_skipped_and_eof_is_terminal() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        let reader = spawn_packet_reader("t", 4, move || match c.fetch_add(1, Ordering::SeqCst) {
+            0 | 2 => None,
+            1 => Some(ReadItem::Packet(7_u8)),
+            _ => Some(ReadItem::Eof),
+        })
+        .expect("spawn");
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Packet(7))
+        ));
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Eof)
+        ));
+        // The thread stopped after EOF: a further read is a disconnect error.
+        assert!(matches!(
+            reader.next(Duration::from_secs(1)),
+            Some(ReadItem::Error(_))
+        ));
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            4,
+            "no reads after the terminal item"
+        );
+    }
+
+    #[test]
+    fn a_slow_read_times_out_without_blocking_the_consumer() {
+        let reader = spawn_packet_reader("t", 4, move || {
+            std::thread::sleep(Duration::from_millis(300));
+            Some(ReadItem::Packet(1_u8))
+        })
+        .expect("spawn");
+        let t0 = Instant::now();
+        assert!(reader.next(Duration::from_millis(20)).is_none());
+        assert!(t0.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn dropping_the_reader_stops_the_thread() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Flag(Arc::clone(&done));
+        let reader = spawn_packet_reader("t", 2, move || {
+            let _keep = &flag;
+            Some(ReadItem::Packet(0_u8))
+        })
+        .expect("spawn");
+        drop(reader);
+        assert!(
+            wait_until(Duration::from_secs(2), || done.load(Ordering::SeqCst)),
+            "reader thread (and the Input it owns) must be released"
         );
     }
 }

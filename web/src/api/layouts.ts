@@ -95,6 +95,28 @@ export async function updateLayout(
 }
 
 /**
+ * Read a layout's current `ETag` via `GET /api/v1/layouts/{id}`. Returns
+ * `undefined` when the layout does not exist (404) — the caller then creates it.
+ * Used when a save targets an existing layout whose ETag this session never
+ * cached (e.g. after a page reload: the list response carries no ETags).
+ */
+export async function fetchLayoutEtag(
+  client: MultiviewApiClient,
+  id: string,
+): Promise<string | undefined> {
+  const { error, response } = await client.GET('/api/v1/layouts/{id}', {
+    params: { path: { id } },
+  });
+  if (response.status === 404) {
+    return undefined;
+  }
+  if (error !== undefined) {
+    throw new LayoutApiError(error.title, error.status);
+  }
+  return response.headers.get('ETag') ?? undefined;
+}
+
+/**
  * Delete a layout via `DELETE /api/v1/layouts/{id}`. Sends `If-Match` when an
  * ETag is provided. A 404 response is treated as idempotent success (the
  * resource is already gone).

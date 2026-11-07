@@ -918,7 +918,11 @@ fn audio_meter_schema() -> Value {
             "track": {
                 "type": "integer",
                 "format": "uint32",
-                "description": "Track index."
+                "description": "Track index: 0 is the program bus; 1.. are per-input tracks."
+            },
+            "input_id": {
+                "type": "string",
+                "description": "Source/input id of a per-input sample; absent on the program bus (track 0)."
             },
             "peak_db": {
                 "type": "array",

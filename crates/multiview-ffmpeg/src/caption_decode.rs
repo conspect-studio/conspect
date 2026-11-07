@@ -55,6 +55,10 @@ const NS_PER_SEC: Rational = Rational::new(1, 1_000_000_000);
 /// seconds is the conventional pop-on caption hold; the cue store further bounds
 /// it by the next cue.
 const DEFAULT_HOLD_NS: i64 = 4_000_000_000;
+/// Maximum decoded rects copied into Rust cues from one libav subtitle packet.
+const MAX_CUE_RECTS: usize = 16;
+/// Maximum owned caption payload materialized from one decoded packet.
+const MAX_CUE_PAYLOAD: usize = 256 * 1024;
 
 /// Which embedded closed-caption channel `cc_dec` should surface.
 ///
@@ -429,13 +433,28 @@ impl CaptionDecoder {
         let end = MediaTime::from_nanos(end_ns);
 
         let mut cues = Vec::new();
+        let mut bytes = 0_usize;
+        let mut dropped = 0_usize;
         for rect in subtitle.rects() {
-            // A degenerate rect (empty text after stripping, bad geometry) is
-            // dropped, not fatal: captions are intermittent and a malformed rect
-            // must never stall the caller (invariant #10).
+            if cues.len() == MAX_CUE_RECTS || bytes >= MAX_CUE_PAYLOAD {
+                dropped = dropped.saturating_add(1);
+                break;
+            }
+            // Inspect source sizes BEFORE text cloning or bitmap expansion.
+            if !rect_within_budget(&rect, MAX_CUE_PAYLOAD.saturating_sub(bytes)) {
+                dropped = dropped.saturating_add(1);
+                continue;
+            }
             if let Ok(Some(cue)) = self.cue_from_rect(&rect, start, end) {
+                bytes = bytes.saturating_add(cue_payload_len(&cue));
                 cues.push(cue);
             }
+        }
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "subtitle rects exceeded per-packet materialization budget"
+            );
         }
         cues
     }
@@ -451,6 +470,9 @@ impl CaptionDecoder {
         start: MediaTime,
         end: MediaTime,
     ) -> std::result::Result<Option<CaptionCue>, CueError> {
+        if !rect_within_budget(rect, MAX_CUE_PAYLOAD) {
+            return Ok(None);
+        }
         match rect {
             Rect::Ass(ass) => {
                 let (lines, region) = strip_ass_event(ass.get());
@@ -474,6 +496,34 @@ impl CaptionDecoder {
             Rect::Bitmap(bitmap) => bitmap_cue(bitmap, start, end).map(Some),
             Rect::None(_) => Ok(None),
         }
+    }
+}
+
+/// Ensure libav-owned data fits before copying it into a Rust cue.
+fn rect_within_budget(rect: &Rect<'_>, available: usize) -> bool {
+    match rect {
+        Rect::Ass(ass) => ass.get().len() <= available,
+        Rect::Text(text) => text.get().len() <= available,
+        Rect::Bitmap(bitmap) => usize::try_from(bitmap.width())
+            .ok()
+            .and_then(|w| {
+                usize::try_from(bitmap.height())
+                    .ok()
+                    .and_then(|h| w.checked_mul(h))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .is_some_and(|bytes| bytes <= available),
+        Rect::None(_) => true,
+    }
+}
+
+fn cue_payload_len(cue: &CaptionCue) -> usize {
+    match cue {
+        CaptionCue::Text { text, .. } => text
+            .lines
+            .iter()
+            .fold(0_usize, |sum, line| sum.saturating_add(line.len())),
+        CaptionCue::Bitmap { bitmap, .. } => bitmap.rgba.len(),
     }
 }
 
@@ -513,6 +563,37 @@ pub fn extract_a53_cc(frame: &Video) -> Option<Vec<u8>> {
     }
 }
 
+/// Validate all PAL8 offset math before touching libav-owned pixel pointers.
+/// Returns `(width, height, stride, rgba_len)` only for a bounded layout.
+fn bitmap_layout(width: u32, height: u32, stride: i32) -> Option<(usize, usize, usize, usize)> {
+    let w = usize::try_from(width).ok()?;
+    let h = usize::try_from(height).ok()?;
+    let pitch = usize::try_from(stride).ok()?;
+    if w == 0 || h == 0 || pitch < w {
+        return None;
+    }
+    let plane_len = pitch.checked_mul(h)?;
+    let rgba_len = w.checked_mul(h)?.checked_mul(4)?;
+    let cap = MAX_CUE_PAYLOAD.min(usize::try_from(isize::MAX).ok()?);
+    (plane_len <= cap && rgba_len <= cap).then_some((w, h, pitch, rgba_len))
+}
+
+/// Return a checked source-plane offset for one visible pixel.
+fn bitmap_offset(
+    row: usize,
+    col: usize,
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Option<usize> {
+    if row >= height || col >= width || stride < width {
+        return None;
+    }
+    let plane_len = stride.checked_mul(height)?;
+    let offset = row.checked_mul(stride)?.checked_add(col)?;
+    (offset < plane_len).then_some(offset)
+}
+
 /// Convert a decoded DVB-sub bitmap rect (PAL8: 8-bit palette indices plus an
 /// ARGB palette) into a premultiplied-RGBA [`CaptionCue::Bitmap`].
 ///
@@ -542,23 +623,31 @@ fn bitmap_cue(
     // `Rect`, so its backing `AVSubtitleRect` pointer is valid and immutable for
     // this call. We read `data[0]` (PAL8 indices), `data[1]` (the ARGB palette,
     // `nb_colors` u32 entries), and `linesize[0]` — all populated by the libav
-    // bitmap subtitle decoders. We bound every index read to `width`/`height`/
-    // `nb_colors`/`linesize` and copy out into an owned `Vec`, so no raw pointer
-    // escapes and no read goes past the libav-owned buffers.
+    // bitmap subtitle decoders. `AVSubtitleRect` exposes pointers without actual
+    // allocation lengths: validity of the plane for `stride * height` bytes and
+    // palette for `nb_colors * 4` bytes is a native decoder contract, not a fact
+    // this wrapper can independently verify. We reject narrow/invalid pitch,
+    // bound checked layout products and index only within those logical extents.
     let rgba = unsafe {
         let raw = bitmap.as_ptr();
         let indices = (*raw).data[0];
         let palette = (*raw).data[1];
         let stride = (*raw).linesize[0];
-        if indices.is_null() || palette.is_null() || stride <= 0 {
+        let Some((w, h, stride, rgba_len)) = bitmap_layout(width, height, stride) else {
+            return Err(CueError::InvalidBitmap {
+                width,
+                height,
+                len: 0,
+            });
+        };
+        if indices.is_null() || palette.is_null() {
             return Err(CueError::InvalidBitmap {
                 width,
                 height,
                 len: 0,
             });
         }
-        let stride = usize::try_from(stride).unwrap_or(0);
-        rgba_from_pal8(indices, palette, stride, width, height, nb_colors)
+        rgba_from_pal8(indices, palette, stride, w, h, rgba_len, nb_colors)
     };
 
     CaptionCue::try_bitmap(
@@ -579,31 +668,39 @@ fn bitmap_cue(
 ///
 /// # Safety
 /// `indices` must point to at least `stride * height` readable bytes and
-/// `palette` to at least `nb_colors * 4` readable bytes (libav guarantees this
-/// for a decoded bitmap rect). The caller bounds `width`/`height`/`stride`.
+/// `palette` to at least `nb_colors * 4` readable bytes. Those allocation sizes
+/// are not exposed by `AVSubtitleRect`; this relies on libav's decoded-rect
+/// ownership/validity contract, not independently checked buffer lengths.
+/// The caller checks `stride >= width` and caps both plane and RGBA products.
 // reason: r/g/b/a are the canonical RGBA channel names and w/h the pixel dims.
 #[allow(clippy::many_single_char_names)]
 unsafe fn rgba_from_pal8(
     indices: *const u8,
     palette: *const u8,
     stride: usize,
-    width: u32,
-    height: u32,
+    w: usize,
+    h: usize,
+    rgba_len: usize,
     nb_colors: usize,
 ) -> Vec<u8> {
-    let w = usize::try_from(width).unwrap_or(0);
-    let h = usize::try_from(height).unwrap_or(0);
-    let mut out = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
+    let mut out = vec![0u8; rgba_len];
     // The palette is `AV_PIX_FMT_RGB32` (ARGB packed in a native-endian u32); on
     // a little-endian host the bytes are B, G, R, A. Read each component and emit
     // straight RGBA, then premultiply by alpha for the linear-light compositor.
     for row in 0..h {
         for col in 0..w {
-            // SAFETY: row<h, col<w, stride>=w ⇒ in-bounds of the index plane.
-            let idx = usize::from(*indices.add(row.saturating_mul(stride).saturating_add(col)));
-            let (r, g, b, a) = if idx < nb_colors {
-                // SAFETY: idx<nb_colors ⇒ palette entry [idx*4, idx*4+4) is valid.
-                let base = idx.saturating_mul(4);
+            // SAFETY: validated plane dimensions and checked offset place this
+            // pixel within the libav-owned PAL8 plane.
+            let Some(offset) = bitmap_offset(row, col, stride, w, h) else {
+                continue;
+            };
+            let idx = usize::from(*indices.add(offset));
+            let (r, g, b, a) = if idx < nb_colors.min(256) {
+                // SAFETY: a PAL8 index is at most 255 and libav owns the palette
+                // entries up to nb_colors; checked multiplication cannot overflow.
+                let Some(base) = idx.checked_mul(4) else {
+                    continue;
+                };
                 let bch = *palette.add(base);
                 let gch = *palette.add(base.saturating_add(1));
                 let rch = *palette.add(base.saturating_add(2));
@@ -612,10 +709,15 @@ unsafe fn rgba_from_pal8(
             } else {
                 (0, 0, 0, 0)
             };
-            let oi = row.saturating_mul(w).saturating_add(col).saturating_mul(4);
+            let oi = row
+                .checked_mul(w)
+                .and_then(|n| n.checked_add(col))
+                .and_then(|n| n.checked_mul(4));
             // One disjoint 4-byte slice (avoids four simultaneous &mut borrows);
             // the slice pattern matches only a full RGBA quad, no indexing.
-            if let Some([o0, o1, o2, o3]) = out.get_mut(oi..oi.saturating_add(4)) {
+            if let Some([o0, o1, o2, o3]) =
+                oi.and_then(|offset| out.get_mut(offset..offset.checked_add(4)?))
+            {
                 *o0 = premultiply(r, a);
                 *o1 = premultiply(g, a);
                 *o2 = premultiply(b, a);
@@ -642,6 +744,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bitmap_layout_rejects_narrow_stride_and_overflow_before_pointer_reads() {
+        assert_eq!(bitmap_layout(4, 2, 3), None, "narrow pitch");
+        assert_eq!(bitmap_layout(4, 2, 0), None, "zero pitch");
+        assert_eq!(bitmap_layout(4, 2, -1), None, "negative pitch");
+        assert_eq!(bitmap_layout(u32::MAX, u32::MAX, i32::MAX), None);
+        assert_eq!(bitmap_layout(4, 2, i32::MAX), None, "huge padded plane");
+        assert_eq!(bitmap_layout(4, 2, 8), Some((4, 2, 8, 32)));
+        assert_eq!(bitmap_offset(1, 3, 8, 4, 16), Some(11));
+        assert_eq!(bitmap_offset(1, 4, 8, 4, 16), None);
+        assert_eq!(bitmap_offset(usize::MAX, 0, 8, 4, 16), None);
+    }
+
+    #[test]
+    fn caption_payload_budget_rejects_oversized_text_and_bitmap_dimensions() {
+        let text = CaptionCue::try_text(
+            MediaTime::ZERO,
+            MediaTime::from_nanos(1),
+            vec!["x".repeat(MAX_CUE_PAYLOAD + 1)],
+            None,
+        )
+        .unwrap();
+        assert!(cue_payload_len(&text) > MAX_CUE_PAYLOAD);
+        let valid = CaptionCue::try_text(
+            MediaTime::ZERO,
+            MediaTime::from_nanos(1),
+            vec!["valid caption".to_owned()],
+            None,
+        )
+        .unwrap();
+        assert!(cue_payload_len(&valid) < MAX_CUE_PAYLOAD);
+        assert!(usize::try_from(u32::MAX)
+            .ok()
+            .and_then(|w| usize::try_from(u32::MAX)
+                .ok()
+                .and_then(|h| w.checked_mul(h)))
+            .and_then(|n| n.checked_mul(4))
+            .is_none());
+    }
+
+    #[test]
     fn decoder_names_match_each_source() {
         assert_eq!(
             CaptionSource::Teletext { page: Some(801) }.decoder_name(),
@@ -665,9 +807,10 @@ mod tests {
         let opts = CaptionSource::Teletext { page: Some(801) }.decoder_options();
         assert_eq!(opts, vec![("txt_page", "801".to_owned())]);
         // Auto (no page) sets no option.
-        assert!(CaptionSource::Teletext { page: None }
-            .decoder_options()
-            .is_empty());
+        assert_eq!(
+            CaptionSource::Teletext { page: None }.decoder_options(),
+            Vec::<(&str, String)>::new()
+        );
     }
 
     #[test]

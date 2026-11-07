@@ -236,6 +236,7 @@ fn data_events_are_not_control_frames() {
 
     let meter = Event::AudioMeter(AudioMeter {
         track: 0,
+        input_id: None,
         peak_db: vec![-6.2, -7.1],
         rms_db: vec![-18.4, -19.0],
         clip: false,
@@ -247,6 +248,7 @@ fn data_events_are_not_control_frames() {
     let back: AudioMeter = serde_json::from_value(
         serde_json::to_value(&AudioMeter {
             track: 0,
+            input_id: None,
             peak_db: vec![-6.2, -7.1],
             rms_db: vec![-18.4, -19.0],
             clip: false,

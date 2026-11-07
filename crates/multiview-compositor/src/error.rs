@@ -43,6 +43,13 @@ pub enum Error {
     #[error("buffer geometry mismatch: {0}")]
     Geometry(String),
 
+    /// The overlay frame exceeds the documented CPU primitive or pixel budget.
+    /// The caller must retain the prior frame or report the failure; never drop
+    /// captions or text silently.
+    #[cfg(feature = "overlay")]
+    #[error("overlay CPU budget exceeded: {0}")]
+    OverlayBudgetExceeded(&'static str),
+
     /// No usable GPU adapter could be acquired (headless/GPU-free environment).
     ///
     /// This is the **graceful-degradation** signal: the wgpu backend returns it

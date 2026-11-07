@@ -162,7 +162,7 @@ pub use guarded::{
 };
 #[cfg(feature = "ffmpeg")]
 pub use sink::{
-    AudioEncodeConfig, EncodeConfig, EncodeStats, FileSink, MuxStream, PacketMuxOutcome,
-    PacketMuxSink, PacketSource, ProgramEncoder, PushProtocol, PushSink, SegmentResult,
-    SegmentSink, VideoFrameSource,
+    AudioEncodeConfig, AudioSelection, EncodeConfig, EncodeStats, FileSink, MuxStream,
+    PacketMuxOutcome, PacketMuxSink, PacketSource, ProgramEncoder, PushProtocol, PushSink,
+    SegmentResult, SegmentSink, TrackSelection, VideoFrameSource,
 };

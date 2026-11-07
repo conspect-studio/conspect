@@ -11,6 +11,8 @@
 // badged "Requires a display-kms build" (a default build fails the run with a
 // clear error rather than skipping the output).
 import type { JSX } from 'react';
+import { Link } from 'react-router-dom';
+import { hlsPlaybackCollisionIds, hlsPlaybackPaths } from '../preview/outputPlayback';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { CircleCheck, Hourglass, MonitorCog } from 'lucide-react';
 import type { ColumnDef } from '@tanstack/react-table';
@@ -643,6 +645,8 @@ function OutputAdvancedFields({
 export function OutputsPage(): JSX.Element {
   const { t } = useLingui();
   const outputs = useOutputs();
+  const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
+  const playbackCollisions = hlsPlaybackCollisionIds(outputs.data ?? []);
 
   const columns = (
     onEdit: (row: OutputView) => void,
@@ -689,6 +693,20 @@ export function OutputsPage(): JSX.Element {
             —
           </span>
         ),
+    },
+    {
+      id: 'playback',
+      header: t`Playback`,
+      cell: (ctx): JSX.Element => {
+        const path = playbackPaths.get(ctx.row.original.id);
+        return <div className="flex flex-col gap-1 text-sm">
+          <Link className="underline" to="/monitoring"><Trans>Watch program</Trans></Link>
+          {path !== undefined ? <a className="underline" href={path} target="_blank" rel="noreferrer"><Trans>Open HLS playlist</Trans></a> : null}
+          {playbackCollisions.has(ctx.row.original.id) ? <span className="text-xs text-muted-foreground"><Trans>HLS link unavailable: output IDs resolve to colliding mounts; the runtime mount depends on configuration order.</Trans></span> : null}
+          {path === undefined && !playbackCollisions.has(ctx.row.original.id) && (ctx.row.original.kind === 'hls' || ctx.row.original.kind === 'll-hls') ? <span className="text-xs text-muted-foreground"><Trans>Output playback unavailable: the configured playlist path is missing.</Trans></span> : null}
+          <span className="text-xs text-muted-foreground"><Trans>Requires an active output; saved settings do not confirm playback.</Trans></span>
+        </div>;
+      },
     },
     {
       id: 'actions',
