@@ -102,7 +102,38 @@ pub fn acquire(url: &str) -> Result<Arc<SrtIngestBridge>, String> {
     Ok(bridge)
 }
 
+/// How [`start_with`] spawns a named thread (injectable so a test can fail one).
+type Spawn<'a> = dyn Fn(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<()> + 'a;
+
+fn spawn_thread(name: &str, body: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(body)
+        .map(drop)
+}
+
+/// Raises the stop flag on drop unless disarmed: startup rollback.
+struct StopOnDrop(Option<Arc<AtomicBool>>);
+
+impl StopOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.store(true, Ordering::Release);
+        }
+    }
+}
+
 fn start(spec: ListenerSpec) -> Result<SrtIngestBridge, String> {
+    start_with(spec, &spawn_thread)
+}
+
+fn start_with(spec: ListenerSpec, spawn: &Spawn<'_>) -> Result<SrtIngestBridge, String> {
     let local = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
         .map_err(|e| format!("srt relay bind: {e}"))?;
     local
@@ -113,20 +144,26 @@ fn start(spec: ListenerSpec) -> Result<SrtIngestBridge, String> {
         .map_err(|e| format!("srt relay: {e}"))?
         .port();
     let stop = Arc::new(AtomicBool::new(false));
+    // Until the bridge owns `stop`, any early return raises it, so every
+    // thread already started exits and drops its socket (SRT-06).
+    let rollback = StopOnDrop(Some(Arc::clone(&stop)));
     let dropped = Arc::new(AtomicU64::new(0));
     let readers: Readers = Arc::new(Mutex::new(Vec::new()));
     let relay_stop = Arc::clone(&stop);
     let relay_readers = Arc::clone(&readers);
-    std::thread::Builder::new()
-        .name("multiview-srt-relay".to_owned())
-        .spawn(move || accept_readers(&local, &relay_readers, &relay_stop))
-        .map_err(|e| format!("srt relay thread: {e}"))?;
+    spawn(
+        "multiview-srt-relay",
+        Box::new(move || accept_readers(&local, &relay_readers, &relay_stop)),
+    )
+    .map_err(|e| format!("srt relay thread: {e}"))?;
     let srt_stop = Arc::clone(&stop);
     let srt_dropped = Arc::clone(&dropped);
-    std::thread::Builder::new()
-        .name("multiview-srt-listen".to_owned())
-        .spawn(move || listen(&spec, &readers, &srt_dropped, &srt_stop))
-        .map_err(|e| format!("srt listener thread: {e}"))?;
+    spawn(
+        "multiview-srt-listen",
+        Box::new(move || listen(&spec, &readers, &srt_dropped, &srt_stop)),
+    )
+    .map_err(|e| format!("srt listener thread: {e}"))?;
+    rollback.disarm();
     Ok(SrtIngestBridge {
         local_url: format!("tcp://[::1]:{port}"),
         stop,
@@ -277,9 +314,59 @@ fn feed_reader(mut stream: TcpStream, rx: &Receiver<Vec<u8>>) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::acquire;
+    use super::{acquire, start_with, Spawn};
+    use multiview_srt_sys::parse_listener_url;
     use std::process::{Command, Stdio};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    /// Every startup thread-spawn failure rolls back: each thread that DID start
+    /// exits, so a failed start leaks no relay, listener or fd (SRT-06).
+    #[test]
+    fn a_failed_thread_spawn_leaks_nothing_already_started() {
+        for fail_at in 1..=4_usize {
+            let started: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
+            let calls = Mutex::new(0_usize);
+            let spawn: &Spawn<'_> = &|name, body| {
+                let mut n = calls.lock().unwrap();
+                *n += 1;
+                if *n == fail_at {
+                    return Err(std::io::Error::other("injected spawn failure"));
+                }
+                let handle = std::thread::Builder::new()
+                    .name(name.to_owned())
+                    .spawn(body)?;
+                started.lock().unwrap().push(handle);
+                Ok(())
+            };
+            let spec = parse_listener_url("srt://[::1]:29873?mode=listener", false).unwrap();
+            let result = start_with(spec, spawn);
+            let spawned = *calls.lock().unwrap();
+            if fail_at > spawned {
+                // Every spawn already succeeded: nothing to inject here.
+                assert!(result.is_ok());
+                break;
+            }
+            assert!(
+                result.is_err(),
+                "spawn {fail_at} failed but start succeeded"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline
+                && started.lock().unwrap().iter().any(|h| !h.is_finished())
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            for handle in started.lock().unwrap().drain(..) {
+                assert!(
+                    handle.is_finished(),
+                    "spawn {fail_at} failed: a thread leaked"
+                );
+                handle.join().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn rails_share_one_bridge_and_a_bad_url_fails_closed_without_leaking() {
