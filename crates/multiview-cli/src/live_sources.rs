@@ -291,14 +291,63 @@ pub enum HubSubmit {
 #[derive(Clone)]
 pub struct LiveSourceHandle {
     tx: SyncSender<HubRequest>,
+    /// Test seam: a forced submission outcome ([`SubmitFault`]). `None` on
+    /// every production handle.
+    fault: Option<SubmitFault>,
+}
+
+/// A shared switch that forces a [`LiveSourceHandle`]'s submissions to be shed
+/// as [`HubSubmit::Full`] or [`HubSubmit::Gone`] without touching the real
+/// hub, so tests can drive the drain's shed-and-recover paths
+/// deterministically (review R4-01). Not used by any run path.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct SubmitFault(Arc<std::sync::atomic::AtomicU8>);
+
+impl SubmitFault {
+    /// Let submissions through to the real hub.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+    /// Shed every submission as [`HubSubmit::Full`].
+    pub fn full(&self) {
+        self.0.store(1, Ordering::Release);
+    }
+    /// Shed every submission as [`HubSubmit::Gone`].
+    pub fn gone(&self) {
+        self.0.store(2, Ordering::Release);
+    }
+    fn forced(&self) -> Option<HubSubmit> {
+        match self.0.load(Ordering::Acquire) {
+            1 => Some(HubSubmit::Full),
+            2 => Some(HubSubmit::Gone),
+            _ => None,
+        }
+    }
 }
 
 impl LiveSourceHandle {
+    /// Test seam: route this handle's submissions through `fault`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_fault(mut self, fault: SubmitFault) -> Self {
+        self.fault = Some(fault);
+        self
+    }
+
+    /// The forced outcome when the test seam sheds this submission.
+    fn forced(&self) -> Option<HubSubmit> {
+        self.fault.as_ref().and_then(SubmitFault::forced)
+    }
+
     /// Request a synthetic producer spawn (or replacement). Never blocks; a
     /// shed request is reported as [`HubSubmit::Full`]/[`HubSubmit::Gone`]
     /// (the tile rides the slate).
     #[must_use]
     pub fn request_spawn_synth(&self, spawn: SynthSpawn) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
         Self::submit_outcome(&self.tx.try_send(HubRequest::SpawnSynth(spawn)))
     }
 
@@ -307,6 +356,9 @@ impl LiveSourceHandle {
     /// [`HubSubmit::Full`]/[`HubSubmit::Gone`] (the tile rides the slate).
     #[must_use]
     pub fn request_spawn_source(&self, spawn: SourceSpawn) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
         let request = HubRequest::SpawnSource(Box::new(spawn));
         Self::submit_outcome(&self.tx.try_send(request))
     }
@@ -317,6 +369,9 @@ impl LiveSourceHandle {
     /// [`HubSubmit::Full`]/[`HubSubmit::Gone`].
     #[must_use]
     pub fn request_teardown(&self, id: &str) -> HubSubmit {
+        if let Some(forced) = self.forced() {
+            return forced;
+        }
         let request = HubRequest::Teardown { id: id.to_owned() };
         Self::submit_outcome(&self.tx.try_send(request))
     }
@@ -380,6 +435,7 @@ impl LiveSourceHub {
     pub fn handle(&self) -> LiveSourceHandle {
         LiveSourceHandle {
             tx: self.tx.clone(),
+            fault: None,
         }
     }
 

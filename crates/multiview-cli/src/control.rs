@@ -1547,6 +1547,16 @@ pub struct CommandDrain {
     /// spawn/teardown + the preview registry. `None` ⇒ `UpsertSource`/
     /// `RemoveSource` are surfaced held actions (never a silent drop).
     live_sources: Option<crate::live_sources::LiveSourceHandle>,
+    /// The APPLIED producer identity per source id (review R4-01): the source
+    /// document whose producer the hub actually accepted (or the startup path
+    /// spawned), never merely the requested mirror in `config`. Absent means
+    /// unknown. One entry per admitted source (bounded by the source cap);
+    /// cleared on remove.
+    applied_media: std::collections::HashMap<String, multiview_config::Source>,
+    /// Sources whose latest producer submission was shed (`Full`/`Gone`): the
+    /// mirror runs ahead of the producer, so no upsert may be judged
+    /// policy-only until a submission lands. Bounded like `applied_media`.
+    unapplied: std::collections::HashSet<String>,
     /// The live overlay working-set seam (ADR-W022), when wired
     /// ([`command_drain_with_live_overlays`] / [`command_drain_with_seams`]):
     /// the lock-free slot the bake consumer re-derives its overlay render
@@ -1599,6 +1609,12 @@ impl CommandDrain {
         config: MultiviewConfig,
         publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
     ) -> Self {
+        // The startup path spawned every declared source's producer.
+        let applied_media = config
+            .sources
+            .iter()
+            .map(|source| (source.id.clone(), source.clone()))
+            .collect();
         Self {
             commands,
             config,
@@ -1611,6 +1627,8 @@ impl CommandDrain {
             #[cfg(feature = "ffmpeg")]
             audio_route: None,
             live_sources: None,
+            applied_media,
+            unapplied: std::collections::HashSet::new(),
             live_overlays: None,
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             tile_spec_apply: None,
@@ -2377,6 +2395,14 @@ impl CommandDrain {
                 store: Arc::clone(&store),
             }),
         };
+        // Only an ACCEPTED submission changes which media the producer runs
+        // (review R4-01); a shed one leaves the mirror ahead of the producer.
+        if submitted == crate::live_sources::HubSubmit::Accepted {
+            self.applied_media.insert(id.clone(), source.clone());
+            self.unapplied.remove(&id);
+        } else {
+            self.unapplied.insert(id.clone());
+        }
         match submitted {
             crate::live_sources::HubSubmit::Accepted => {}
             crate::live_sources::HubSubmit::Full => {
@@ -2429,13 +2455,22 @@ impl CommandDrain {
     }
 
     /// An upsert that changes only presentation or standing policy
-    /// ([`multiview_config::Source::same_media`]) of a registered source, on a
-    /// run with no demand manager: there are no leases to re-read, so the
-    /// running producer is left alone and only the working-config mirror
-    /// follows (review R3-03). Returns `true` when it handled the upsert. A
-    /// byte-identical re-apply is NOT policy-only: it still respawns, the
-    /// documented retry for a shed spawn. A demand-managed run returns `false`:
-    /// its hub re-reads the pins and keeps the producer (`update_policy`).
+    /// ([`multiview_config::Source::same_media`]) of a running source, on a run
+    /// with no demand manager: there are no leases to re-read, so the running
+    /// producer is left alone and only the working-config mirror follows
+    /// (review R3-03). Returns `true` when it handled the upsert.
+    ///
+    /// The judgment is made against the APPLIED producer identity, never the
+    /// requested mirror (review R4-01), and the producer is respawned when:
+    /// * the source's latest submission was shed (`Full`/`Gone`) — its
+    ///   recovery upsert must reach the producer;
+    /// * the applied identity is unknown or differs in media;
+    /// * the upsert is an explicit **retry**: byte-identical to the requested
+    ///   config the drain already holds, i.e. nothing new was requested, so
+    ///   the only reason to send it is to re-apply (the documented retry).
+    ///
+    /// A demand-managed run returns `false`: its hub re-reads the pins and
+    /// keeps the producer (`update_policy`).
     fn policy_only_upsert(
         &mut self,
         source: &multiview_config::Source,
@@ -2445,16 +2480,21 @@ impl CommandDrain {
         if self.demand.is_some() {
             return false;
         }
-        if drive.store(&source.id).is_none() {
+        if drive.store(&source.id).is_none() || self.unapplied.contains(&source.id) {
             return false;
         }
-        let Some(slot) = self.config.sources.iter_mut().find(|s| s.id == source.id) else {
-            return false;
-        };
-        if *slot == *source || !slot.same_media(source) {
+        if !self
+            .applied_media
+            .get(&source.id)
+            .is_some_and(|applied| applied.same_media(source))
+        {
             return false;
         }
-        slot.clone_from(source);
+        match self.config.sources.iter_mut().find(|s| s.id == source.id) {
+            Some(slot) if *slot == *source => return false,
+            Some(slot) => slot.clone_from(source),
+            None => self.config.sources.push(source.clone()),
+        }
         tracing::debug!(
             source = %source.id,
             "upsert_source: policy/presentation-only edit; the producer keeps running"
@@ -2503,6 +2543,8 @@ impl CommandDrain {
             tracing::info!(source = %id, "remove_source: no registered store under that id");
         }
         self.config.sources.retain(|s| s.id != id);
+        self.applied_media.remove(id);
+        self.unapplied.remove(id);
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         if let Some(slot) = &self.audio_free_sources {
             let mut audio_free = (*slot.load()).clone();
