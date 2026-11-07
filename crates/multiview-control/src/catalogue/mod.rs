@@ -41,14 +41,32 @@ pub mod logos;
 pub mod logos {
     use crate::state::AppState;
 
-    /// Always fails: this build has no catalogue network I/O.
-    ///
-    /// # Errors
-    ///
-    /// Always.
+    /// A cached logo image (never produced in this build).
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Image {
+        /// The image bytes.
+        pub bytes: Vec<u8>,
+        /// Its content type.
+        pub content_type: String,
+        /// Strong `ETag`.
+        pub etag: String,
+    }
+
+    /// The answer for one logo request.
+    #[derive(Debug, Clone)]
+    pub enum Logo {
+        /// The image.
+        Image(std::sync::Arc<Image>),
+        /// Known missing.
+        Missing,
+        /// No fetch slot in time.
+        Busy,
+    }
+
+    /// Always missing: this build has no catalogue network I/O.
     #[allow(clippy::unused_async)]
-    pub async fn fetch(_: &AppState, _: &str, _: &str) -> Result<(Vec<u8>, String), String> {
-        Err("this build has no catalogue network I/O (feature `catalogue`)".to_owned())
+    pub async fn serve(_: &AppState, _: &std::path::Path, _: &str) -> Logo {
+        Logo::Missing
     }
 }
 

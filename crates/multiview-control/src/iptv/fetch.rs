@@ -188,6 +188,19 @@ mod net {
         }
     }
 
+    /// The error plus its `source()` chain, so callers can tell a DNS failure
+    /// ("dns error: …") from a timeout or a refused connection.
+    fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut out = e.to_string();
+        let mut cur = e.source();
+        while let Some(c) = cur {
+            out.push_str(": ");
+            out.push_str(&c.to_string());
+            cur = c.source();
+        }
+        out
+    }
+
     fn screen_literal(url: &url::Url, policy: &DialPolicy) -> Result<(), String> {
         let ip = match url.host() {
             Some(url::Host::Ipv4(v4)) => IpAddr::V4(v4),
@@ -237,7 +250,11 @@ mod net {
                 }
                 attempt.follow()
             }))
-            .user_agent(concat!("multiview-iptv/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                "Conspect-iptv/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/conspect-studio/conspect; catalogue and logo fetcher)"
+            ))
             .build()
             .map_err(|e| format!("http client: {e}"))?;
         let mut builder = client
@@ -252,7 +269,7 @@ mod net {
         let mut response = builder
             .send()
             .await
-            .map_err(|e| format!("{shown}: {}", e.without_url()))?;
+            .map_err(|e| format!("{shown}: {}", error_chain(&e.without_url())))?;
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(FetchOutcome::NotModified);
         }

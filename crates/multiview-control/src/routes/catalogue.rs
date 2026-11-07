@@ -312,7 +312,7 @@ pub(crate) async fn after_sync(
     crate::catalogue::link_runtime::recompute_and_publish(state, cat).await;
 }
 
-/// `GET /api/v1/catalogues/iptv-org/logos/{k}` — bounded server-side logo cache.
+/// `GET /api/v1/catalogues/iptv-org/logos/{k}` — persistent server-side logo cache.
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -322,33 +322,61 @@ pub(crate) async fn after_sync(
         tag = "catalogue",
         params(("k" = String, Path, description = "Logo key `l:<hex>` from an index row.")),
         responses(
-            (status = 200, description = "The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, fetched server-side.", content_type = "image/*"),
-            (status = 404, description = "Unknown logo key.", body = crate::problem::Problem),
-            (status = 502, description = "Upstream logo unavailable or not an image.", body = crate::problem::Problem),
+            (status = 200, description = "The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, cached on disk for 30 days. `Cache-Control: private, max-age=2592000, immutable` and a strong `ETag`.", content_type = "image/*"),
+            (status = 204, description = "No logo: unknown key, upstream missing/failing, oversized or not an image (`Cache-Control: private, max-age=86400`), or the upstream fetch queue was busy (`Cache-Control: no-store`; retry later). Never an error status."),
+            (status = 304, description = "`If-None-Match` matched the logo's `ETag`."),
+            (status = 409, description = "Catalogue not configured.", body = crate::problem::Problem),
         ),
     )
 )]
 pub(crate) async fn get_logo(
     State(state): State<AppState>,
     principal: Principal,
+    headers: axum::http::HeaderMap,
     Path(k): Path<String>,
 ) -> ControlResult<Response> {
+    use crate::catalogue::logos::{self, Logo};
     principal.role.require(Action::Read)?;
     let cat = enabled(&state)?;
-    let url = cat.logo_url(&k).ok_or_else(|| ControlError::NotFound {
-        kind: "logo",
-        id: k.clone(),
-    })?;
-    let (bytes, ctype) = crate::catalogue::logos::fetch(&state, &k, &url)
-        .await
-        .map_err(|e| ControlError::Conflict(format!("logo unavailable: {e}")))?;
-    let mut r = (StatusCode::OK, bytes).into_response();
-    if let Ok(v) = HeaderValue::from_str(&ctype) {
-        r.headers_mut().insert(header::CONTENT_TYPE, v);
+    let no_logo = |cache_control: &'static str| {
+        let mut r = StatusCode::NO_CONTENT.into_response();
+        r.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(cache_control),
+        );
+        r
+    };
+    let Some(url) = cat.logo_url(&k) else {
+        return Ok(no_logo("private, max-age=86400"));
+    };
+    let image = match logos::serve(&state, &cat.logo_dir(), &url).await {
+        Logo::Image(i) => i,
+        Logo::Missing => return Ok(no_logo("private, max-age=86400")),
+        Logo::Busy => return Ok(no_logo("no-store")),
+    };
+    let matches = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_start_matches("W/"))
+                .any(|t| t == "*" || t == image.etag)
+        });
+    let mut r = if matches {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let mut r = (StatusCode::OK, image.bytes.clone()).into_response();
+        if let Ok(v) = HeaderValue::from_str(&image.content_type) {
+            r.headers_mut().insert(header::CONTENT_TYPE, v);
+        }
+        r
+    };
+    if let Ok(v) = HeaderValue::from_str(&image.etag) {
+        r.headers_mut().insert(header::ETAG, v);
     }
     r.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=86400"),
+        HeaderValue::from_static("private, max-age=2592000, immutable"),
     );
     r.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
