@@ -1051,6 +1051,10 @@ fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String>
 /// config-as-code stores: sources, outputs, overlays, probes) and the
 /// read-only input stream inventory. Split from [`api_router`] so each stays
 /// a readable size.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat route table per resource family reads best as a single list"
+)]
 fn resource_router() -> Router<AppState> {
     Router::new()
         .route("/layouts", get(list_layouts))
