@@ -28,7 +28,7 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
 |---|---|
 | `crate::iptv::fetch` — SSRF-screened, bounded, conditional (`ETag`) `Fetcher` seam (`iptv-net` feature) | catalogue sync and every probe/network dial go through it (extended for per-hop reporting and request headers) |
 | `Source.playlist_metadata` (`tvg_id`, `name`, `logo`, `group`) | filled on add: `tvg_id = channel@feed`, `name`, `logo`, `group = first category` |
-| `Source.epg` (`mode`, `url`, `channel_id`) | filled on add when iptv-org `guides.json` has a guide for the channel/feed |
+| `Source.epg` (`mode`, `url`, `channel_id`) | **not** filled on add: `guides.json` gives `site`, `site_id`, `site_name` and `lang` but no feed URL (every `sources` array was empty on 2026-11-07). Index rows carry `guide {site, site_id, lang}` so the UI can show that a guide exists; the operator supplies the XMLTV URL |
 | `Source.events` + HLS cue observer (ADR-0183) | the probe reuses `multiview_input::hls` cue parsing (`PlaylistCueMetadata`) for broadcast-event detection |
 | M3U import dialog (`POST /api/v1/sources/import/m3u`) | unchanged; the browser is the rich alternative for iptv-org specifically |
 
@@ -50,6 +50,8 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
 5. **Headers on every rail.** HLS `user_agent`/`referrer` go through the shared loopback fetcher and
    the variant pin; no source bypasses them. The video rail, the audio rail and caption fetches send
    the same headers. Logs record that headers are set, never their values.
+   There is no per-origin policy: like libav, the headers go on every request of the source, including
+   redirect hops and segment hosts. They are not secrets.
 
 ---
 
@@ -239,7 +241,7 @@ bounds of §3 and every dial screened by `net_guard`.
 | **Server egress identity** | Public IPv4 and IPv6 as seen from the internet, egress country and CDN edge (Cloudflare `cdn-cgi/trace`: `ip`, `loc`, `colo`), queried per family. Cached 10 min. Fixed host; disable with `[network_diagnostics] egress_lookup = false`. |
 | **Host chain** | Every distinct host involved: master playlist, media playlist, segment host(s), key URI host, every redirect hop. Segment CDNs often differ from the playlist host. |
 | **DNS** (per host) | CNAME chain, A and AAAA records with TTL, the resolver used, `net_guard` class of each address (public / private / blocked). |
-| **Connection** (per host) | Address and family actually used, TCP connect time per address (v6 and v4 tried separately), TLS version, ALPN/HTTP version, certificate subject/SAN/issuer/expiry. |
+| **Connection** (per host) | Address and family actually used, TCP connect time per address (v6 and v4 tried separately), TLS version, ALPN/HTTP version, certificate subject/SAN/issuer/expiry (parsed with `x509-parser`, already in `Cargo.lock`). |
 | **HTTP** (per hop) | Status, redirect `Location` host, response time, `Server`, `Via`, `Age`, CDN identifiers (`cf-ray`, `x-cache`, `x-served-by`, `x-amz-cf-pop`, `x-akamai-*`, `x-cdn`), geo-related headers, and for 4xx a 512-byte text excerpt of the body (block pages often say "not available in your region"). Request headers sent (UA/Referer) are shown. |
 | **Assessment** | Plain-language hints, for example: "Channel country AU; this server egresses from US (DFW) → geo-block likely. Route this host via an AU egress." · "IPv6 path returns 403, IPv4 path returns 200 → prefer IPv4 for this host." · "Playlist OK, segment host `cdn.example` 403 → the CDN, not the origin, blocks." |
 | **Export** | Copy as text/JSON (credentials, userinfo and query strings redacted) and an equivalent `curl` command per hop (`--resolve`, `-4/-6`, headers) for reproducing from another host. |
