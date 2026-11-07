@@ -137,9 +137,9 @@ fn start(spec: ListenerSpec) -> Result<SrtIngestBridge, String> {
 fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) {
     let mut left = total;
     while !stop.load(Ordering::Acquire) && !left.is_zero() {
-        let step = left.min(POLL);
-        std::thread::sleep(step);
-        left = left.saturating_sub(step);
+        let slice = left.min(POLL);
+        std::thread::sleep(slice);
+        left = left.saturating_sub(slice);
     }
 }
 
