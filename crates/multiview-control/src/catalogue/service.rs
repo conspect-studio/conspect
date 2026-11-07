@@ -24,7 +24,9 @@ pub enum SyncState {
     Empty,
     /// A sync/import is running.
     Syncing,
-    /// A snapshot is loaded and the last attempt succeeded.
+    /// A snapshot is loaded and the last attempt succeeded (wire token `idle`,
+    /// the web contract's name for "nothing running").
+    #[serde(rename = "idle")]
     Ready,
     /// The last attempt failed (a previous snapshot, if any, is still served).
     Error,
@@ -39,6 +41,10 @@ pub struct StatusBody {
     pub state: SyncState,
     /// Time of the last successful sync/import (RFC 3339).
     pub last_sync_at: Option<String>,
+    /// Same instant as `last_sync_at` under the web contract's name.
+    pub synced_at: Option<String>,
+    /// The last attempt's error as a list (empty when it succeeded).
+    pub errors: Vec<String>,
     /// Time of the last attempt (RFC 3339).
     pub last_attempt_at: Option<String>,
     /// Last attempt's error, if it failed.
@@ -223,6 +229,8 @@ impl Catalogue {
             enabled: self.enabled,
             state,
             last_sync_at: g.manifest.as_ref().and_then(|m| m.synced_at.clone()),
+            synced_at: g.manifest.as_ref().and_then(|m| m.synced_at.clone()),
+            errors: g.last_error.clone().into_iter().collect(),
             last_attempt_at: g.last_attempt_at.clone(),
             last_error: g.last_error.clone(),
             origin: g.manifest.as_ref().and_then(|m| m.origin.clone()),
@@ -366,23 +374,45 @@ impl Serialize for IndexView<'_> {
     }
 }
 
-/// Serialize the index envelope `{etag, synced_at, count, rows}`. `added` marks
-/// rows `already_added` (per-caller); `None` produces the shared cacheable body.
+/// Serialize the index envelope
+/// `{schema, generated_at, categories[{id,name}], languages[{code,name}], streams[]}`.
+/// `added` marks rows `already_added` (per-caller); `None` produces the shared
+/// cacheable body.
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn index_body(snapshot: &Snapshot, added: Option<&HashSet<String>>) -> Option<Vec<u8>> {
     #[derive(Serialize)]
+    struct Cat<'a> {
+        id: &'a str,
+        name: &'a str,
+    }
+    #[derive(Serialize)]
+    struct Lang<'a> {
+        code: &'a str,
+        name: &'a str,
+    }
+    #[derive(Serialize)]
     struct Envelope<'a> {
-        etag: &'a str,
-        synced_at: &'a str,
-        count: usize,
-        rows: IndexView<'a>,
+        schema: u32,
+        generated_at: &'a str,
+        categories: Vec<Cat<'a>>,
+        languages: Vec<Lang<'a>>,
+        streams: IndexView<'a>,
     }
     serde_json::to_vec(&Envelope {
-        etag: &snapshot.etag,
-        synced_at: &snapshot.synced_at,
-        count: snapshot.rows.len(),
-        rows: IndexView {
+        schema: snapshot.schema,
+        generated_at: &snapshot.synced_at,
+        categories: snapshot
+            .categories
+            .iter()
+            .map(|(id, name)| Cat { id, name })
+            .collect(),
+        languages: snapshot
+            .languages
+            .iter()
+            .map(|(code, name)| Lang { code, name })
+            .collect(),
+        streams: IndexView {
             rows: &snapshot.rows,
             added,
         },

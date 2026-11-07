@@ -172,6 +172,7 @@ fn blank(url: &str) -> ProbeResult {
         probed_at: None,
         bytes: 0,
         cached: false,
+        network: None,
     }
 }
 

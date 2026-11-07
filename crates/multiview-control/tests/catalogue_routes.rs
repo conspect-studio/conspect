@@ -179,7 +179,7 @@ async fn import_then_index_places_status_have_the_design_shapes() {
         .await,
     )
     .await;
-    assert_eq!(st["state"], "ready");
+    assert_eq!(st["state"], "idle");
     assert_eq!(st["origin"], "import");
     assert_eq!(st["counts"]["streams"], 45);
     assert!(st["counts"]["index"].as_u64().unwrap() > 40);
@@ -199,10 +199,8 @@ async fn import_then_index_places_status_have_the_design_shapes() {
         .unwrap()
         .to_owned();
     let idx = body_json(resp).await;
-    assert_eq!(
-        idx["count"].as_u64().unwrap() as usize,
-        idx["rows"].as_array().unwrap().len()
-    );
+    assert!(idx["generated_at"].is_string() && idx["schema"].is_u64());
+    assert!(idx["categories"].is_array() && idx["languages"].is_array());
     let wanted = [
         "k",
         "url",
@@ -227,7 +225,7 @@ async fn import_then_index_places_status_have_the_design_shapes() {
         "replaced_by",
         "website",
     ];
-    for row in idx["rows"].as_array().unwrap() {
+    for row in idx["streams"].as_array().unwrap() {
         let obj = row.as_object().unwrap();
         for f in wanted {
             assert!(obj.contains_key(f), "row misses field {f}: {row}");
@@ -236,7 +234,7 @@ async fn import_then_index_places_status_have_the_design_shapes() {
         assert!(obj["geo"]["lvl"].is_string() && obj["geo"]["places"].is_array());
     }
     // Flag vocabulary coverage from the real data.
-    let all_flags: std::collections::BTreeSet<String> = idx["rows"]
+    let all_flags: std::collections::BTreeSet<String> = idx["streams"]
         .as_array()
         .unwrap()
         .iter()
@@ -263,7 +261,7 @@ async fn import_then_index_places_status_have_the_design_shapes() {
         );
     }
     // City-level geo with the city code.
-    assert!(idx["rows"]
+    assert!(idx["streams"]
         .as_array()
         .unwrap()
         .iter()
@@ -296,25 +294,25 @@ async fn import_then_index_places_status_have_the_design_shapes() {
         .await,
     )
     .await;
-    for k in ["etag", "countries", "subdivisions", "cities", "regions"] {
+    for k in ["schema", "places"] {
         assert!(places.get(k).is_some(), "places misses {k}");
     }
-    let miami = places["cities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["code"] == "USMIA")
-        .expect("Miami");
+    let all = places["places"].as_array().unwrap();
+    let find = |id: &str| {
+        all.iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("{id}"))
+    };
+    let miami = find("ct/USMIA");
+    assert_eq!(miami["kind"], "city");
     assert!(miami["lat"].as_f64().unwrap() > 25.0 && miami["lon"].as_f64().unwrap() < -79.0);
     assert!(miami["streams"].as_u64().unwrap() >= 1);
-    let us = places["countries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["code"] == "US")
-        .unwrap();
+    let us = find("c/US");
+    assert_eq!(us["kind"], "country");
     assert!(us["streams_within"].as_u64().unwrap() > us["streams"].as_u64().unwrap());
-    assert_ne!(places["regions"].as_array().unwrap().len(), 0);
+    assert!(all
+        .iter()
+        .any(|p| p["kind"] == "region" && p["id"].as_str().unwrap().starts_with("r/")));
 }
 
 #[tokio::test]
@@ -463,7 +461,7 @@ async fn sync_uses_if_none_match_and_a_partial_failure_keeps_the_previous_snapsh
         .await,
     )
     .await;
-    assert_eq!(st["state"], "ready");
+    assert_eq!(st["state"], "idle");
     assert_eq!(st["files"]["streams"]["etag"], "\"v2\"");
 }
 
@@ -502,7 +500,7 @@ async fn snapshot_persists_atomically_and_reloads_on_boot() {
         .await,
     )
     .await;
-    assert_eq!(st["state"], "ready");
+    assert_eq!(st["state"], "idle");
     assert_eq!(st["origin"], "import");
 }
 
@@ -532,7 +530,7 @@ async fn already_added_is_scoped_to_the_callers_visible_sources() {
         .await,
     )
     .await;
-    let rows = idx["rows"].as_array().unwrap();
+    let rows = idx["streams"].as_array().unwrap();
     let a = rows.iter().find(|r| r["ch"] == "NBC.us").unwrap();
     let b = rows.iter().find(|r| r["ch"] == "ShopLC.us").unwrap();
     for (id, row) in [("src-a", a), ("scoped-layout", b)] {
@@ -553,7 +551,7 @@ async fn already_added_is_scoped_to_the_callers_visible_sources() {
         assert_eq!(r.status(), StatusCode::CREATED, "{id}");
     }
     let flagged = |idx: &Value, k: &str| {
-        idx["rows"]
+        idx["streams"]
             .as_array()
             .unwrap()
             .iter()
@@ -655,6 +653,7 @@ impl probe::ProbeRunner for Canned {
                 probed_at: None,
                 bytes: 0,
                 cached: false,
+                network: None,
             }
         })
     }
@@ -684,7 +683,7 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
         .await,
     )
     .await;
-    let row = idx["rows"]
+    let row = idx["streams"]
         .as_array()
         .unwrap()
         .iter()

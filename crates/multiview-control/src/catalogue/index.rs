@@ -83,6 +83,17 @@ pub struct Geo {
     pub places: Vec<String>,
 }
 
+/// `guide` of an index row: a guide is listed upstream (no feed URL exists).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexGuide {
+    /// Guide site.
+    pub site: String,
+    /// Channel id on that site.
+    pub site_id: String,
+    /// Guide language.
+    pub lang: Option<String>,
+}
+
 /// One joined index row (exact design JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRow {
@@ -96,6 +107,8 @@ pub struct IndexRow {
     pub ch: Option<String>,
     /// Feed id.
     pub feed: Option<String>,
+    /// Feed display name (`KSHB-TV`).
+    pub feed_name: Option<String>,
     /// Channel name (or stream title when no channel).
     pub name: String,
     /// Alternative names.
@@ -125,6 +138,10 @@ pub struct IndexRow {
     pub referrer: Option<String>,
     /// Logo key `l:<12 hex>`.
     pub logo: Option<String>,
+    /// Absolute upstream logo URL (what a published playlist carries).
+    pub logo_url: Option<String>,
+    /// A guide listed upstream for this channel/feed.
+    pub guide: Option<IndexGuide>,
     /// Closure date.
     pub closed: Option<String>,
     /// Replacement channel id.
@@ -223,6 +240,110 @@ pub struct Places {
     pub regions: Vec<PlaceRegion>,
 }
 
+/// One gazetteer entry in the web contract's flat form. `id` uses the same
+/// prefixed form as an index row's `area` (`ct/USMKC`, `s/US-KS`, `c/US`,
+/// `r/NAM`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Place {
+    /// Prefixed place id.
+    pub id: String,
+    /// `city`, `subdivision`, `country` or `region`.
+    pub kind: &'static str,
+    /// Display name.
+    pub name: String,
+    /// Alternative names. Upstream publishes none for places, so always empty.
+    pub alt: Vec<String>,
+    /// ISO alpha-2 country (null for a region).
+    pub country: Option<String>,
+    /// Subdivision code for a city / subdivision.
+    pub subdivision: Option<String>,
+    /// Latitude (cities with a gazetteer entry).
+    pub lat: Option<f64>,
+    /// Longitude.
+    pub lon: Option<f64>,
+    /// Flag emoji (countries).
+    pub flag: Option<String>,
+    /// Member country codes (regions).
+    pub members: Vec<String>,
+    /// Streams listing this place directly.
+    pub streams: u32,
+    /// Streams in this place at any level (countries, subdivisions).
+    pub streams_within: u32,
+}
+
+impl Places {
+    /// The flat web-contract list: countries, subdivisions, cities, regions.
+    #[must_use]
+    pub fn flat(&self) -> Vec<Place> {
+        let mut out = Vec::new();
+        for c in &self.countries {
+            out.push(Place {
+                id: format!("c/{}", c.code),
+                kind: "country",
+                name: c.name.clone(),
+                alt: Vec::new(),
+                country: Some(c.code.clone()),
+                subdivision: None,
+                lat: None,
+                lon: None,
+                flag: c.flag.clone(),
+                members: Vec::new(),
+                streams: c.streams,
+                streams_within: c.streams_within,
+            });
+        }
+        for s in &self.subdivisions {
+            out.push(Place {
+                id: format!("s/{}", s.code),
+                kind: "subdivision",
+                name: s.name.clone(),
+                alt: Vec::new(),
+                country: Some(s.country.clone()),
+                subdivision: Some(s.code.clone()),
+                lat: None,
+                lon: None,
+                flag: None,
+                members: Vec::new(),
+                streams: s.streams,
+                streams_within: s.streams_within,
+            });
+        }
+        for c in &self.cities {
+            out.push(Place {
+                id: format!("ct/{}", c.code),
+                kind: "city",
+                name: c.name.clone(),
+                alt: Vec::new(),
+                country: Some(c.country.clone()),
+                subdivision: c.subdivision.clone(),
+                lat: c.lat,
+                lon: c.lon,
+                flag: None,
+                members: Vec::new(),
+                streams: c.streams,
+                streams_within: c.streams,
+            });
+        }
+        for r in &self.regions {
+            out.push(Place {
+                id: format!("r/{}", r.code),
+                kind: "region",
+                name: r.name.clone(),
+                alt: Vec::new(),
+                country: None,
+                subdivision: None,
+                lat: None,
+                lon: None,
+                flag: None,
+                members: r.countries.clone(),
+                streams: r.streams,
+                streams_within: r.streams,
+            });
+        }
+        out
+    }
+}
+
 /// An immutable joined snapshot.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -238,10 +359,26 @@ pub struct Snapshot {
     pub places: Places,
     /// Logo key → upstream URL.
     pub logos: HashMap<String, String>,
+    /// Category `(id, name)` lookup.
+    pub categories: Vec<(String, String)>,
+    /// Language `(code, name)` lookup.
+    pub languages: Vec<(String, String)>,
     by_key: HashMap<String, usize>,
 }
 
 impl Snapshot {
+    /// Attach the category/language display-name lookups.
+    #[must_use]
+    pub fn with_lookups(
+        mut self,
+        categories: Vec<(String, String)>,
+        languages: Vec<(String, String)>,
+    ) -> Self {
+        self.categories = categories;
+        self.languages = languages;
+        self
+    }
+
     /// Row by stable key.
     #[must_use]
     pub fn row(&self, k: &str) -> Option<&IndexRow> {
@@ -269,6 +406,8 @@ impl Snapshot {
             rows,
             places,
             logos,
+            categories: Vec::new(),
+            languages: Vec::new(),
             by_key,
         }
     }
@@ -409,6 +548,13 @@ pub fn build_snapshot(
             .push(l);
     }
 
+    let mut guides_by_channel: HashMap<&str, Vec<&super::model::Guide>> = HashMap::new();
+    for g in &raw.guides {
+        if let Some(ch) = g.channel.as_deref() {
+            guides_by_channel.entry(ch).or_default().push(g);
+        }
+    }
+
     let mut rows: Vec<IndexRow> = Vec::with_capacity(raw.streams.len());
     let mut seen: HashSet<String> = HashSet::new();
     let mut logos: HashMap<String, String> = HashMap::new();
@@ -449,17 +595,35 @@ pub fn build_snapshot(
                 continue;
             }
         }
-        let logo = stream.channel.as_deref().and_then(|ch| {
-            let candidates = logos_by_channel.get(ch)?;
+        let guide = stream.channel.as_deref().and_then(|ch| {
+            let candidates = guides_by_channel.get(ch)?;
             let pick = candidates
+                .iter()
+                .find(|g| g.feed.is_some() && g.feed == stream.feed)
+                .or_else(|| candidates.iter().find(|g| g.feed.is_none()))
+                .or_else(|| candidates.first())?;
+            Some(IndexGuide {
+                site: pick.site.clone(),
+                site_id: pick.site_id.clone(),
+                lang: pick.lang.clone(),
+            })
+        });
+        let (logo, logo_url) = stream.channel.as_deref().map_or((None, None), |ch| {
+            let Some(candidates) = logos_by_channel.get(ch) else {
+                return (None, None);
+            };
+            let Some(pick) = candidates
                 .iter()
                 .find(|l| l.in_use && l.feed.is_some() && l.feed == stream.feed)
                 .or_else(|| candidates.iter().find(|l| l.in_use && l.feed.is_none()))
                 .or_else(|| candidates.iter().find(|l| l.in_use))
-                .or_else(|| candidates.first())?;
+                .or_else(|| candidates.first())
+            else {
+                return (None, None);
+            };
             let key = format!("l:{}", hex12(&pick.url));
             logos.insert(key.clone(), pick.url.clone());
-            Some(key)
+            (Some(key), Some(pick.url.clone()))
         });
         rows.push(IndexRow {
             k,
@@ -467,6 +631,7 @@ pub fn build_snapshot(
             title: stream.title.clone(),
             ch: stream.channel.clone(),
             feed: stream.feed.clone(),
+            feed_name: feed.and_then(|f| f.name.clone()),
             name: channel
                 .and_then(|c| c.name.clone())
                 .unwrap_or_else(|| stream.title.clone()),
@@ -483,13 +648,25 @@ pub fn build_snapshot(
             ua: stream.user_agent.clone(),
             referrer: stream.referrer.clone(),
             logo,
+            logo_url,
+            guide,
             closed: channel.and_then(|c| c.closed.clone()),
             replaced_by: channel.and_then(|c| c.replaced_by.clone()),
             website: channel.and_then(|c| c.website.clone()),
         });
     }
     let places = build_places(raw, gazetteer, &rows);
-    Snapshot::from_parts(etag, synced_at, rows, places, logos)
+    let categories = raw
+        .categories
+        .iter()
+        .filter_map(|c| Some((c.id.clone()?, c.name.clone())))
+        .collect();
+    let languages = raw
+        .languages
+        .iter()
+        .filter_map(|l| Some((l.code.clone()?, l.name.clone())))
+        .collect();
+    Snapshot::from_parts(etag, synced_at, rows, places, logos).with_lookups(categories, languages)
 }
 
 fn build_places(raw: &RawCatalogue, gazetteer: &Gazetteer, rows: &[IndexRow]) -> Places {

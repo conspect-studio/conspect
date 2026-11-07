@@ -201,7 +201,7 @@ async fn upstream_changes_raise_events_warning_and_auto_follow_updates_with_audi
         .find(|l| l["source_id"] == "notify-src")
         .unwrap();
     assert_eq!(n["status"], "updated");
-    assert_eq!(n["change"]["user_agent"], "UA/2");
+    assert_eq!(n["upstream"]["user_agent"], "UA/2");
 
     // Channel A closes upstream: both sources report channel_closed (auto never switches channels).
     send(

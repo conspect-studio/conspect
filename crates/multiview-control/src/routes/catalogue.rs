@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
-use crate::catalogue::links::{self, LinkInfo};
+use crate::catalogue::links;
 use crate::catalogue::probe::{ProbeRequest, ProbeResult};
 use crate::catalogue::service::{index_body, StatusBody};
 use crate::catalogue::sync::SyncOutcome;
@@ -147,7 +147,7 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
         path = "/api/v1/catalogues/iptv-org/index",
         tag = "catalogue",
         responses(
-            (status = 200, description = "`{etag, synced_at, count, rows: IndexRow[]}`; gzip when accepted; `already_added` flagged per caller.", body = serde_json::Value),
+            (status = 200, description = "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; `already_added` flagged per caller.", body = serde_json::Value),
             (status = 304, description = "If-None-Match matched (and the caller has no linked sources)."),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 503, description = "No snapshot yet; refresh or import first.", body = crate::problem::Problem),
@@ -229,12 +229,11 @@ pub(crate) async fn get_index(
     Ok(with_etag(r, &etag))
 }
 
-/// `GET .../places` response: `etag` plus the flattened gazetteer.
+/// `GET .../places` response: `{schema, places[]}` (the web contract).
 #[derive(Serialize)]
-struct PlacesBody<'a> {
-    etag: &'a str,
-    #[serde(flatten)]
-    places: &'a crate::catalogue::index::Places,
+struct PlacesBody {
+    schema: u32,
+    places: Vec<crate::catalogue::index::Place>,
 }
 
 /// `GET /api/v1/catalogues/iptv-org/places` — the gazetteer with stream counts.
@@ -245,7 +244,7 @@ struct PlacesBody<'a> {
         path = "/api/v1/catalogues/iptv-org/places",
         tag = "catalogue",
         responses(
-            (status = 200, description = "`{etag, countries[], subdivisions[], cities[] (lat/lon), regions[]}` with stream counts.", body = serde_json::Value),
+            (status = 200, description = "`{schema, places[{id, kind, name, alt, country, subdivision, lat, lon, flag, members, streams, streams_within}]}`; `id` is prefixed like a row's `area`.", body = serde_json::Value),
             (status = 304, description = "If-None-Match matched."),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 409, description = "No snapshot yet.", body = crate::problem::Problem),
@@ -267,8 +266,8 @@ pub(crate) async fn get_places(
     }
     Ok(with_etag(
         Json(PlacesBody {
-            etag: &etag,
-            places: &places,
+            schema: crate::catalogue::index::SCHEMA_VERSION,
+            places: places.flat(),
         })
         .into_response(),
         &etag,
@@ -421,7 +420,7 @@ pub(crate) async fn get_logo(
         path = "/api/v1/catalogues/iptv-org/links",
         tag = "catalogue",
         responses(
-            (status = 200, description = "`{links: LinkInfo[]}` — status, change diff and ranked alternatives, only for sources the caller may see.", body = serde_json::Value),
+            (status = 200, description = "`{links: [{source_id, status, checked_at, upstream, replaced_by, alternatives}]}` — status, upstream target and ranked alternatives (with cached probe verdict), only for sources the caller may see.", body = serde_json::Value),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 409, description = "Catalogue not configured.", body = crate::problem::Problem),
         ),
@@ -437,11 +436,25 @@ pub(crate) async fn get_links(
         .into_iter()
         .map(|s| s.id)
         .collect();
-    let infos: Vec<LinkInfo> = cat
+    let snapshot = cat.snapshot();
+    let probes = state.catalogue_probe.clone();
+    let verdict_of = |alt: &links::wire::LinkAlternative| {
+        probes
+            .as_ref()?
+            .latest_for(&ProbeRequest {
+                url: alt.url.clone(),
+                user_agent: alt.user_agent.clone(),
+                referrer: alt.referrer.clone(),
+                quality: None,
+            })?
+            .verdict
+    };
+    let infos: Vec<links::wire::WireLink> = cat
         .links
         .all()
         .into_iter()
         .filter(|i| visible.contains(&i.source_id))
+        .map(|i| links::wire::to_wire(&i, snapshot.as_deref(), &verdict_of))
         .collect();
     Ok(Json(serde_json::json!({ "links": infos })))
 }

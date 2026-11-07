@@ -91,6 +91,14 @@ pub struct Alternative {
     pub flags: Vec<Flag>,
     /// Feed id.
     pub feed: Option<String>,
+    /// Channel id.
+    pub ch: Option<String>,
+    /// Required `User-Agent`.
+    pub user_agent: Option<String>,
+    /// Required `Referer`.
+    pub referrer: Option<String>,
+    /// Catalogue labels (`Geo-blocked`, `Not 24/7`).
+    pub labels: Vec<String>,
 }
 
 /// One source's link evaluation.
@@ -112,6 +120,8 @@ pub struct LinkInfo {
     pub alternatives: Vec<Alternative>,
     /// Replacement channel id (for `channel_closed`).
     pub replaced_by: Option<String>,
+    /// RFC 3339 time of the evaluation that produced this (set by the tracker).
+    pub checked_at: Option<String>,
 }
 
 /// A status transition to announce.
@@ -181,6 +191,10 @@ fn alternative(r: &IndexRow) -> Alternative {
         q: r.q.clone(),
         flags: r.flags.clone(),
         feed: r.feed.clone(),
+        ch: r.ch.clone(),
+        user_agent: r.ua.clone(),
+        referrer: r.referrer.clone(),
+        labels: r.labels(),
     }
 }
 
@@ -199,6 +213,7 @@ pub fn evaluate(source: &Source, snapshot: &Snapshot) -> Option<LinkInfo> {
         change: None,
         alternatives: Vec::new(),
         replaced_by: None,
+        checked_at: None,
     };
     if let (Some(linked), Some(now)) = (&origin.stream_url, &url) {
         if linked != now {
@@ -405,9 +420,14 @@ impl LinkTracker {
     /// Re-evaluate all `sources`; returns the transitions since the previous run
     /// and replaces the remembered state (sources no longer linked are forgotten).
     pub fn recompute(&self, sources: &[Source], snapshot: &Snapshot) -> Vec<Transition> {
+        let checked_at = super::store::now_rfc3339();
         let infos: Vec<LinkInfo> = sources
             .iter()
             .filter_map(|s| evaluate(s, snapshot))
+            .map(|mut i| {
+                i.checked_at = Some(checked_at.clone());
+                i
+            })
             .collect();
         let mut g = self
             .last
@@ -705,5 +725,118 @@ mod tests {
         let tr = t.recompute(std::slice::from_ref(&s), &good);
         assert_eq!(tr[0].status, LinkStatus::InSync);
         assert_eq!(t.attention_count(), 0);
+    }
+}
+
+/// Wire shapes of `GET .../links` (the web contract's `LinksResponse`).
+pub mod wire {
+    use serde::Serialize;
+
+    use super::{LinkInfo, LinkStatus};
+    use crate::catalogue::index::{Flag, IndexRow, Snapshot};
+
+    /// URL/headers/labels triple compared in "Review changes".
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct LinkTarget {
+        /// Stream URL.
+        pub url: String,
+        /// `User-Agent`.
+        pub user_agent: Option<String>,
+        /// `Referer`.
+        pub referrer: Option<String>,
+        /// Labels.
+        pub labels: Vec<String>,
+    }
+
+    /// A ranked alternative stream.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct LinkAlternative {
+        /// URL.
+        pub url: String,
+        /// `User-Agent`.
+        pub user_agent: Option<String>,
+        /// `Referer`.
+        pub referrer: Option<String>,
+        /// Labels.
+        pub labels: Vec<String>,
+        /// Row key.
+        pub k: String,
+        /// Channel id.
+        pub ch: Option<String>,
+        /// Feed id.
+        pub feed: Option<String>,
+        /// Quality.
+        pub q: Option<String>,
+        /// Flags.
+        pub flags: Vec<Flag>,
+        /// Latest cached probe verdict for this URL, if one exists.
+        pub verdict: Option<crate::catalogue::probe::Verdict>,
+    }
+
+    /// One link as the web reads it.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct WireLink {
+        /// Source id.
+        pub source_id: String,
+        /// Status.
+        pub status: LinkStatus,
+        /// Evaluation time.
+        pub checked_at: Option<String>,
+        /// What upstream now says (for `updated`).
+        pub upstream: Option<LinkTarget>,
+        /// Replacement channel id.
+        pub replaced_by: Option<String>,
+        /// Ranked alternatives.
+        pub alternatives: Vec<LinkAlternative>,
+    }
+
+    fn target(row: &IndexRow) -> LinkTarget {
+        LinkTarget {
+            url: row.url.clone(),
+            user_agent: row.ua.clone(),
+            referrer: row.referrer.clone(),
+            labels: row.labels(),
+        }
+    }
+
+    /// Convert an evaluation; `verdict_of` looks up a cached probe verdict for an alternative.
+    #[must_use]
+    pub fn to_wire(
+        info: &LinkInfo,
+        snapshot: Option<&Snapshot>,
+        verdict_of: &dyn Fn(&LinkAlternative) -> Option<crate::catalogue::probe::Verdict>,
+    ) -> WireLink {
+        let upstream = info
+            .change
+            .as_ref()
+            .and_then(|c| snapshot?.row(&c.row))
+            .map(target);
+        WireLink {
+            source_id: info.source_id.clone(),
+            status: info.status,
+            checked_at: info.checked_at.clone(),
+            upstream,
+            replaced_by: info.replaced_by.clone(),
+            alternatives: info
+                .alternatives
+                .iter()
+                .map(|a| {
+                    let mut alt = LinkAlternative {
+                        url: a.url.clone(),
+                        user_agent: a.user_agent.clone(),
+                        referrer: a.referrer.clone(),
+                        labels: a.labels.clone(),
+                        k: a.k.clone(),
+                        ch: a.ch.clone(),
+                        feed: a.feed.clone(),
+                        q: a.q.clone(),
+                        flags: a.flags.clone(),
+                        verdict: None,
+                    };
+                    alt.verdict = verdict_of(&alt);
+                    alt
+                })
+                .collect(),
+        }
     }
 }

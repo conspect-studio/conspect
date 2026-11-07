@@ -159,6 +159,9 @@ pub struct ProbeResult {
     pub bytes: u64,
     /// Served from the 15-minute cache.
     pub cached: bool,
+    /// Network-path report (§3a), when diagnostics ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<super::netdiag::NetworkReport>,
 }
 
 /// Request to probe.
@@ -418,11 +421,32 @@ pub trait ProbeRunner: Send + Sync {
     fn run(&self, id: String, req: ProbeRequest) -> super::sync::BoxFuture<'_, ProbeResult>;
 }
 
+/// One member of a batch probe job.
+#[derive(Debug, Clone)]
+struct JobEntry {
+    k: Option<String>,
+    source_id: Option<String>,
+    probe_id: String,
+}
+
+/// What a batch probe member was addressed by.
+#[derive(Debug, Clone)]
+pub struct JobTarget {
+    /// Index row key, when probed by key.
+    pub k: Option<String>,
+    /// Linked source id, when probed by source.
+    pub source_id: Option<String>,
+    /// The resolved request (server-owned; the browser never supplies a URL).
+    pub request: ProbeRequest,
+}
+
 #[derive(Default)]
 struct Shared {
     results: HashMap<String, ProbeResult>,
     order: VecDeque<String>,
     cache: HashMap<String, (Instant, String)>,
+    jobs: HashMap<String, Vec<JobEntry>>,
+    job_order: VecDeque<String>,
     rate: HashMap<String, VecDeque<Instant>>,
 }
 
@@ -561,6 +585,7 @@ impl ProbeService {
             probed_at: None,
             bytes: 0,
             cached: false,
+            network: None,
         };
         {
             let mut g = self.lock();
@@ -605,6 +630,79 @@ impl ProbeService {
         self.lock().results.get(id).cloned()
     }
 
+    /// Submit a batch (<= 50). Each member goes through [`Self::submit`] (same
+    /// semaphore, queue, rate limit and cache); the returned id addresses the
+    /// batch.
+    ///
+    /// # Errors
+    ///
+    /// The first member's submit error (429, validation).
+    pub fn submit_job(
+        self: &Arc<Self>,
+        principal: &str,
+        targets: Vec<JobTarget>,
+    ) -> Result<String, ControlError> {
+        let mut entries = Vec::with_capacity(targets.len());
+        for t in targets {
+            let r = self.submit(principal, t.request)?;
+            entries.push(JobEntry {
+                k: t.k,
+                source_id: t.source_id,
+                probe_id: r.id,
+            });
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut g = self.lock();
+        g.jobs.insert(id.clone(), entries);
+        g.job_order.push_back(id.clone());
+        while g.job_order.len() > MAX_STORED {
+            if let Some(old) = g.job_order.pop_front() {
+                g.jobs.remove(&old);
+            }
+        }
+        Ok(id)
+    }
+
+    /// A batch job as the web reads it, or `None` for an unknown id.
+    #[must_use]
+    pub fn job(&self, id: &str) -> Option<wire::ProbeJob> {
+        let g = self.lock();
+        let entries = g.jobs.get(id)?;
+        let mut results = Vec::new();
+        let mut pending = 0_usize;
+        let mut running = 0_usize;
+        for e in entries {
+            match g.results.get(&e.probe_id) {
+                Some(r) if r.state == "done" => {
+                    results.push(wire::to_wire(r, e.k.clone(), e.source_id.clone()));
+                }
+                Some(r) => {
+                    pending += 1;
+                    if r.state == "running" {
+                        running += 1;
+                    }
+                }
+                None => {
+                    // Evicted from the bounded store before it was read.
+                    results.push(wire::evicted(e.k.clone(), e.source_id.clone(), &self.host));
+                }
+            }
+        }
+        let state = if pending == 0 {
+            "done"
+        } else if running > 0 || !results.is_empty() {
+            "running"
+        } else {
+            "queued"
+        };
+        Some(wire::ProbeJob {
+            id: id.to_owned(),
+            state,
+            results,
+            error: None,
+        })
+    }
+
     /// Latest finished result for a URL+headers (used by the link tracker).
     #[must_use]
     pub fn latest_for(&self, req: &ProbeRequest) -> Option<ProbeResult> {
@@ -642,11 +740,164 @@ fn timeout_result(id: &str, host: &str) -> ProbeResult {
         probed_at: None,
         bytes: 0,
         cached: false,
+        network: None,
     }
 }
 
 #[cfg(feature = "catalogue")]
 pub mod engine;
+
+/// The web contract's probe job/result shapes (`ProbeJob`, `ProbeResult`,
+/// `ProbeFacts`, `ProbeEvent`).
+pub mod wire {
+    use serde::Serialize;
+
+    use super::{ProbeResult as Internal, Verdict};
+
+    /// `ProbeEvent`.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ProbeEvent {
+        /// Event kind.
+        pub kind: String,
+        /// Position in the sampled window. The probe records where an event was
+        /// seen (playlist/segment), not a time, so this is always `null`.
+        pub at: Option<String>,
+        /// Detail.
+        pub detail: Option<String>,
+    }
+
+    /// `ProbeFacts`.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ProbeFacts {
+        /// Width.
+        pub width: Option<u32>,
+        /// Height.
+        pub height: Option<u32>,
+        /// Frame rate.
+        pub fps: Option<f64>,
+        /// Video codec.
+        pub video_codec: Option<String>,
+        /// First audio track's codec.
+        pub audio_codec: Option<String>,
+        /// Measured bitrate.
+        pub bitrate_kbps: Option<u64>,
+        /// Advertised `BANDWIDTH`.
+        pub advertised_kbps: Option<u64>,
+        /// Audio languages.
+        pub audio_languages: Vec<String>,
+        /// Caption kinds seen (`cea608/708`, `webvtt`).
+        pub captions: Vec<String>,
+        /// `data:image/jpeg;base64,…` thumbnail.
+        pub thumbnail: Option<String>,
+    }
+
+    /// `ProbeResult`.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ProbeResult {
+        /// Index key probed.
+        pub k: Option<String>,
+        /// Linked source probed.
+        pub source_id: Option<String>,
+        /// Verdict.
+        pub verdict: Verdict,
+        /// Probing host.
+        pub probed_from: String,
+        /// Completion time.
+        pub probed_at: String,
+        /// Short human detail.
+        pub detail: Option<String>,
+        /// Media facts.
+        pub facts: Option<ProbeFacts>,
+        /// Broadcast events.
+        pub events: Vec<ProbeEvent>,
+        /// Network-path report (§3a).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub network: Option<crate::catalogue::netdiag::NetworkReport>,
+    }
+
+    /// `ProbeJob`.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ProbeJob {
+        /// Job id.
+        pub id: String,
+        /// `queued`, `running`, `done`, `failed`.
+        pub state: &'static str,
+        /// Finished results.
+        pub results: Vec<ProbeResult>,
+        /// Job-level error.
+        pub error: Option<String>,
+    }
+
+    pub(super) fn evicted(k: Option<String>, source_id: Option<String>, host: &str) -> ProbeResult {
+        ProbeResult {
+            k,
+            source_id,
+            verdict: Verdict::Dead,
+            probed_from: host.to_owned(),
+            probed_at: crate::catalogue::store::now_rfc3339(),
+            detail: Some("the result was evicted before it was read".to_owned()),
+            facts: None,
+            events: Vec::new(),
+            network: None,
+        }
+    }
+
+    /// Convert a finished internal result.
+    #[must_use]
+    pub fn to_wire(r: &Internal, k: Option<String>, source_id: Option<String>) -> ProbeResult {
+        let f = &r.facts;
+        let has_facts = f.video_codec.is_some() || !f.audio.is_empty() || f.width.is_some();
+        let mut captions = Vec::new();
+        if f.cea_captions {
+            captions.push("cea608/708".to_owned());
+        }
+        if f.webvtt_renditions > 0 {
+            captions.push("webvtt".to_owned());
+        }
+        let detail = r
+            .stages
+            .iter()
+            .find(|s| s.status == super::StageStatus::Failed)
+            .and_then(|s| s.detail.clone())
+            .or_else(|| Some(r.verdict_basis.to_owned()));
+        ProbeResult {
+            k,
+            source_id,
+            verdict: r.verdict.unwrap_or(Verdict::Dead),
+            probed_from: r.probed_from.clone(),
+            probed_at: r
+                .probed_at
+                .clone()
+                .unwrap_or_else(crate::catalogue::store::now_rfc3339),
+            detail,
+            facts: has_facts.then(|| ProbeFacts {
+                width: f.width,
+                height: f.height,
+                fps: f.fps,
+                video_codec: f.video_codec.clone(),
+                audio_codec: f.audio.first().map(|a| a.codec.clone()),
+                bitrate_kbps: f.measured_bps.map(|b| b / 1000),
+                advertised_kbps: f.advertised_bps.map(|b| b / 1000),
+                audio_languages: f.audio.iter().filter_map(|a| a.language.clone()).collect(),
+                captions,
+                thumbnail: f
+                    .thumbnail_jpeg_base64
+                    .as_ref()
+                    .map(|b| format!("data:image/jpeg;base64,{b}")),
+            }),
+            events: r
+                .events
+                .iter()
+                .map(|e| ProbeEvent {
+                    kind: e.kind.to_owned(),
+                    at: None,
+                    detail: e.detail.clone(),
+                })
+                .collect(),
+            network: r.network.clone(),
+        }
+    }
+}
 
 /// A runner that reports the probe client could not be built.
 #[derive(Debug, Default)]

@@ -83,6 +83,9 @@ pub struct Feed {
     /// Feed id.
     #[serde(default)]
     pub id: String,
+    /// Feed display name (`KSHB-TV`).
+    #[serde(default)]
+    pub name: Option<String>,
     /// Main feed of its channel.
     #[serde(default)]
     pub is_main: bool,
@@ -118,6 +121,28 @@ pub struct Logo {
     /// URL.
     #[serde(default)]
     pub url: String,
+}
+
+/// One `guides.json` row: an EPG guide listed upstream for a channel (or one of
+/// its feeds). It carries **no** feed URL; only the `site`/`site_id` pair that
+/// names where a guide exists.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Guide {
+    /// Channel id (may be absent for an orphaned guide).
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Feed id (channel-level when absent).
+    #[serde(default)]
+    pub feed: Option<String>,
+    /// Guide site (`tvguide.com`).
+    #[serde(default)]
+    pub site: String,
+    /// Channel id on that site.
+    #[serde(default)]
+    pub site_id: String,
+    /// Guide language (ISO 639-1/3).
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 /// One `cities.json` row.
@@ -225,6 +250,9 @@ pub struct RawCatalogue {
     /// `logos.json`.
     #[serde(default)]
     pub logos: Vec<Logo>,
+    /// `guides.json`.
+    #[serde(default)]
+    pub guides: Vec<Guide>,
     /// `cities.json`.
     #[serde(default)]
     pub cities: Vec<City>,
@@ -254,6 +282,7 @@ pub const FILES: &[(&str, bool)] = &[
     ("channels", true),
     ("feeds", true),
     ("logos", false),
+    ("guides", false),
     ("cities", false),
     ("countries", false),
     ("subdivisions", false),
@@ -278,6 +307,7 @@ impl RawCatalogue {
             "channels" => self.channels = p(bytes)?,
             "feeds" => self.feeds = p(bytes)?,
             "logos" => self.logos = p(bytes)?,
+            "guides" => self.guides = p(bytes)?,
             "cities" => self.cities = p(bytes)?,
             "countries" => self.countries = p(bytes)?,
             "subdivisions" => self.subdivisions = p(bytes)?,
@@ -298,6 +328,7 @@ impl RawCatalogue {
             "channels" => self.channels.len(),
             "feeds" => self.feeds.len(),
             "logos" => self.logos.len(),
+            "guides" => self.guides.len(),
             "cities" => self.cities.len(),
             "countries" => self.countries.len(),
             "subdivisions" => self.subdivisions.len(),

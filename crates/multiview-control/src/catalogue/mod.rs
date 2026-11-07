@@ -16,6 +16,7 @@ pub mod gazetteer;
 pub mod index;
 pub mod links;
 pub mod model;
+pub mod netdiag;
 pub mod service;
 pub mod store;
 pub mod sync;
