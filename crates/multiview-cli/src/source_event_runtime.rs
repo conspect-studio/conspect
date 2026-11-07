@@ -730,16 +730,16 @@ mod tests {
             );
         }
         native.mapping(None);
-        assert_eq!(native.id3, [] as [multiview_input::id3::Id3Tag; 0]);
+        assert_eq!(native.id3, Vec::<multiview_input::id3::Id3Tag>::new());
         runtime.shutdown().expect("join");
     }
     #[test]
     fn native_untimed_scte_stays_presence_after_anchor_and_deduplicates() {
+        use crate::source_event_packet::{MetadataKind, MetadataPacket, PacketGate};
         let runtime = Runtime::new().expect("worker");
         let lease = runtime.activate("s", 1).expect("lease");
         let reader = runtime.reader();
         let mut native = NativeEvents::new("s".into(), &lease).expect("connection");
-        use crate::source_event_packet::{MetadataKind, MetadataPacket, PacketGate};
         let mut gate = PacketGate::default();
         assert!(gate
             .push(MetadataPacket {
@@ -810,7 +810,7 @@ mod tests {
         native.mapping(None);
         assert_eq!(
             native.untimed_scte,
-            [] as [std::vec::Vec<multiview_input::scte::NormalizedCueEvent>; 0]
+            Vec::<Vec<multiview_input::scte::NormalizedCueEvent>>::new()
         );
         runtime.shutdown().expect("join");
     }
@@ -835,7 +835,7 @@ mod tests {
         other.observe_scte_untimed(&invalid);
         assert_eq!(
             other.untimed_scte,
-            [] as [std::vec::Vec<multiview_input::scte::NormalizedCueEvent>; 0]
+            Vec::<Vec<multiview_input::scte::NormalizedCueEvent>>::new()
         );
         assert!(other.loss.get());
         runtime.shutdown().expect("join");

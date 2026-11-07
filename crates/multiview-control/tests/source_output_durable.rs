@@ -125,12 +125,12 @@ async fn accepted_sources_and_outputs_survive_failed_projection_with_stable_etag
     assert_eq!(body_json(updated).await["name"], "Accepted source");
     let observed = send(&router, get(src_path, ADMIN_TOKEN)).await;
     assert_eq!(etag(&observed), Some(fresh.clone()));
-    let stale = send(
+    let conflicted = send(
         &router,
         put_json(src_path, ADMIN_TOKEN, Some(&old), &replacement),
     )
     .await;
-    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(conflicted.status(), StatusCode::PRECONDITION_FAILED);
     let listed = body_json(send(&router, get("/api/v1/sources", ADMIN_TOKEN)).await).await;
     assert_eq!(listed[0]["name"], "Accepted source");
     assert_eq!(
@@ -155,12 +155,12 @@ async fn accepted_sources_and_outputs_survive_failed_projection_with_stable_etag
     assert_eq!(body_json(updated).await["name"], "Accepted output");
     let observed = send(&router, get(output_path, ADMIN_TOKEN)).await;
     assert_eq!(etag(&observed), Some(fresh));
-    let stale = send(
+    let conflicted = send(
         &router,
         put_json(output_path, ADMIN_TOKEN, Some(&old), &replacement),
     )
     .await;
-    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(conflicted.status(), StatusCode::PRECONDITION_FAILED);
     let listed = body_json(send(&router, get("/api/v1/outputs", ADMIN_TOKEN)).await).await;
     assert_eq!(listed[0]["name"], "Accepted output");
 }

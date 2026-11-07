@@ -1,6 +1,9 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use multiview_cli::hls_event_observer::{HlsEventObserver, HlsEvidenceSink};
 use multiview_core::source_event::{EventBoundary, SourceEventObservation};
 use multiview_input::hls::MediaPlaylist;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 #[derive(Clone, Default)]
 struct Sink(Arc<Mutex<(Vec<SourceEventObservation>, bool)>>);
@@ -19,7 +22,7 @@ impl HlsEvidenceSink for Sink {
 fn snapshot(assets: &[&str]) -> multiview_input::hls::PlaylistCueMetadata {
     let mut text = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n".to_owned();
     for asset in assets {
-        text.push_str(&format!("#EXT-X-ASSET:CAID={asset}\n#EXTINF:6,\nlive.ts\n"));
+        let _ = write!(text, "#EXT-X-ASSET:CAID={asset}\n#EXTINF:6,\nlive.ts\n");
     }
     MediaPlaylist::parse_cue_metadata(&text).unwrap()
 }
@@ -141,6 +144,6 @@ fn daterange_is_retained_without_fake_timing() {
     assert_eq!(observer.pending_date_ranges(), metadata.observations);
     assert_eq!(
         sink.0.lock().unwrap().0,
-        [] as [multiview_core::source_event::SourceEventObservation; 0]
+        Vec::<multiview_core::source_event::SourceEventObservation>::new()
     );
 }

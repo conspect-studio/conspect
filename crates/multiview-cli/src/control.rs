@@ -2475,6 +2475,12 @@ fn restore_desired_layouts(
     not(feature = "sqlite"),
     allow(clippy::unused_async, reason = "awaits only the sqlite open")
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one sqlite-vs-in-memory boot reconciliation path carries every \
+              layout-restore/seed/prune case; splitting it would scatter the \
+              single early-return control flow across helpers"
+)]
 async fn persist_layouts(
     seeded: &Arc<dyn multiview_control::repository::Repository>,
     boot_model: Option<&multiview_control::boot_model::BootModel>,

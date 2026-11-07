@@ -624,6 +624,12 @@ mod source_event_stress {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the R3 deadlock-vs-starvation stress fixture needs one coherent \
+                  sequence of setup, flood and barrier-synchronized sampling; \
+                  splitting it would scatter the shared state across helpers"
+    )]
     fn stress() {
         let limits = ServiceLimits::default();
         assert_eq!(limits.max_sources, SOURCES);
@@ -648,8 +654,8 @@ mod source_event_stress {
                 },
             );
             cells.push(Cell {
-                x: (source % 8) as f32 / 8.0,
-                y: (source / 8) as f32 / 8.0,
+                x: f32::from(u8::try_from(source % 8).unwrap()) / 8.0,
+                y: f32::from(u8::try_from(source / 8).unwrap()) / 8.0,
                 w: 0.125,
                 h: 0.125,
                 source: Some(id),
@@ -720,11 +726,8 @@ mod source_event_stress {
             }
             costs.sort();
             sample_costs.sort();
-            (
-                sample_costs[TICKS as usize / 2],
-                costs[TICKS as usize / 2],
-                *costs.last().unwrap(),
-            )
+            let mid = usize::try_from(TICKS).unwrap() / 2;
+            (sample_costs[mid], costs[mid], *costs.last().unwrap())
         };
         let baseline = run(0, None);
         // Seed through the real bounded tracker off-clock. Direct publication is

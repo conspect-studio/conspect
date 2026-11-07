@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use multiview_cli::{
     source_event_hls_bridge::channel,
     source_event_service::{ServiceLimits, SourceEventService},
