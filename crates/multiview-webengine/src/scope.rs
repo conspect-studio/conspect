@@ -86,6 +86,12 @@ impl std::fmt::Display for Generation {
 /// `#[non_exhaustive]`: [`Pool`](Self::Pool) is the first of the variants
 /// ADR-0099 decision 11 plans (pooled sources), and consumers must already
 /// carry a wildcard arm.
+///
+/// **Exactness is a property of the backing, never of the variant.** Use
+/// [`ScopeKind::is_exact`] rather than matching on the variant: a
+/// [`Cgroup`](Self::Cgroup) is exact, a [`ProcessTree`](Self::ProcessTree) is
+/// estimated, and a [`Pool`](Self::Pool) is exactly as exact as the backing it
+/// carries — which is how decision 11's "pool figures are exact" is meant.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub enum ScopeKind {
@@ -97,11 +103,24 @@ pub enum ScopeKind {
         root: Pid,
     },
     /// A named browser pool (ADR-0099 decision 11): several sources share one
-    /// browser, so the pool's own figures are exact while each member's share is
-    /// estimated.
+    /// browser, so the pool is accounted for **through its backing**, and each
+    /// member's share of that is estimated.
+    ///
+    /// The pool is **not** exact by itself. Decision 11 says the pool's figures
+    /// are exact — and it is, when the pool's browser runs in its own delegated
+    /// cgroup (`backing: Box::new(ScopeKind::Cgroup(path))`), which is the only
+    /// way the kernel charges every descendant it actually scheduled. A pool
+    /// backed by a process-tree walk is an estimate like any other walk, however
+    /// many members share it, so the reading is labelled accordingly. Carrying
+    /// the backing (rather than a bare name) is what keeps [`is_exact`] honest
+    /// instead of a claim about the deployment's configuration.
+    ///
+    /// [`is_exact`]: Self::is_exact
     Pool {
         /// The pool's stable name.
         id: String,
+        /// Where the pool's figures come from.
+        backing: Box<Self>,
     },
 }
 
@@ -111,13 +130,35 @@ impl ScopeKind {
     /// A cgroup charges every descendant the kernel actually scheduled; a
     /// process-tree walk can miss a short-lived grandchild that exited between
     /// two reads, so it is always labelled estimated (ADR-0099 decision 8). A
-    /// pool is accounted through its own browser's scope, which decision 11
-    /// makes exact; only the per-member split is estimated.
+    /// pool is exact exactly when its backing is — decision 11's "pool figures
+    /// are exact" reads as **exact when the pool has its own cgroup**, never as
+    /// exact by virtue of being pooled.
     #[must_use]
     pub fn is_exact(&self) -> bool {
         match self {
-            Self::Cgroup(_) | Self::Pool { .. } => true,
+            Self::Cgroup(_) => true,
             Self::ProcessTree { .. } => false,
+            Self::Pool { backing, .. } => backing.is_exact(),
+        }
+    }
+
+    /// A named pool accounted for through its own delegated cgroup: the exact
+    /// shape ADR-0099 decision 11 describes.
+    #[must_use]
+    pub fn exact_pool(id: impl Into<String>, cgroup: PathBuf) -> Self {
+        Self::Pool {
+            id: id.into(),
+            backing: Box::new(Self::Cgroup(cgroup)),
+        }
+    }
+
+    /// A named pool with no cgroup of its own: every figure is a process-tree
+    /// estimate, including the pool total.
+    #[must_use]
+    pub fn estimated_pool(id: impl Into<String>, root: Pid) -> Self {
+        Self::Pool {
+            id: id.into(),
+            backing: Box::new(Self::ProcessTree { root }),
         }
     }
 }
@@ -402,7 +443,9 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_scope_is_exact_and_never_a_process_tree() {
+    fn a_pool_is_exact_only_when_its_backing_is() {
+        // ADR-0099 decision 11 reads as "exact when the pool has its own
+        // cgroup": the backing, not the pooling, is what makes a figure exact.
         let mut registry = ScopeRegistry::new();
         let pool = owner("pool-1");
         let issued = registry.next_generation(&pool);
@@ -410,21 +453,59 @@ mod tests {
             .register(ResourceScope::new(
                 pool.clone(),
                 issued,
-                ScopeKind::Pool {
-                    id: "sydney".to_owned(),
-                },
+                ScopeKind::exact_pool("sydney", PathBuf::from("/sys/fs/cgroup/engine/pool")),
             ))
             .expect("registered");
         let scope = registry.get(&pool).expect("a registered pool");
         assert!(
             scope.kind.is_exact(),
-            "ADR-0099 decision 11: pool figures are exact"
+            "a pool with its own cgroup has exact figures"
         );
         assert_eq!(
             scope.kind,
             ScopeKind::Pool {
-                id: "sydney".to_owned()
+                id: "sydney".to_owned(),
+                backing: Box::new(ScopeKind::Cgroup(PathBuf::from(
+                    "/sys/fs/cgroup/engine/pool"
+                ))),
             }
+        );
+
+        // The same pool, backed by a walk: pooled is not the same as exact.
+        let walked = owner("pool-2");
+        let generation = registry.next_generation(&walked);
+        registry
+            .register(ResourceScope::new(
+                walked.clone(),
+                generation,
+                ScopeKind::estimated_pool("sydney", Pid::new(400)),
+            ))
+            .expect("registered");
+        let scope = registry.get(&walked).expect("a registered pool");
+        assert!(
+            !scope.kind.is_exact(),
+            "a pool with no cgroup of its own is an estimate, however many \
+             sources share it"
+        );
+    }
+
+    #[test]
+    fn an_exact_pool_never_reports_itself_exact_by_construction_alone() {
+        // The guard is the backing's `is_exact`, whatever shape it takes: a
+        // process-tree pool stays estimated even nested behind the pool variant.
+        for kind in [
+            ScopeKind::estimated_pool("p", Pid::new(1)),
+            ScopeKind::Pool {
+                id: "p".to_owned(),
+                backing: Box::new(ScopeKind::estimated_pool("inner", Pid::new(2))),
+            },
+        ] {
+            assert!(!kind.is_exact(), "{kind:?}");
+        }
+        assert!(ScopeKind::exact_pool("p", PathBuf::from("/x")).is_exact());
+        assert!(
+            ScopeKind::Cgroup(PathBuf::from("/x")).is_exact(),
+            "a cgroup is exact"
         );
     }
 

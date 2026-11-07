@@ -10,6 +10,14 @@
 //! Everything here is pure logic with no clock of its own: the queue is a data
 //! structure, and the later runner is what actually runs the browsers. There are
 //! no threads, no timers and no allocation beyond the job ids themselves.
+//!
+//! Two rules are worth stating once, in the module that owns them:
+//!
+//! * A trigger that coalesces into a **running** job records at most one pending
+//!   rerun for its fill, queued by [`JobQueue::finish`].
+//! * **Every cancellation discards a pending rerun**, whether it arrives through
+//!   [`JobQueue::cancel`] or as `finish(id, Cancelled)`. A cancelled job never
+//!   leaves a fill that will run itself again.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -474,7 +482,13 @@ impl JobQueue {
     /// The queue's own record is moved through [`Job::transition`], so an
     /// illegal terminal is refused and the job stays running. When a rerun was
     /// requested while this job ran, exactly one new job for the fill is queued
-    /// (the finished job has freed its slot).
+    /// (the finished job has freed its slot) — **unless the job is being
+    /// cancelled**.
+    ///
+    /// **Every cancellation discards a pending rerun.** `finish(id, Cancelled)`
+    /// behaves exactly like [`cancel`](Self::cancel) for reruns: the operator
+    /// said stop, so the fill must not run again by itself. This is stated once,
+    /// here, and both entry points implement it the same way.
     ///
     /// # Errors
     ///
@@ -492,6 +506,11 @@ impl JobQueue {
         }
         let finished = self.running.remove(index);
         self.in_flight.retain(|_, in_flight| in_flight != id);
+        if terminal == JobState::Cancelled {
+            // Cancelling always wins: the rerun is discarded, not queued.
+            self.pending_rerun.remove(&finished.fill);
+            return Ok(terminal);
+        }
         if let Some(rerun) = self.pending_rerun.remove(&finished.fill) {
             self.in_flight.insert(finished.fill.clone(), rerun.clone());
             self.pending.push_back(Job::queued(rerun, finished.fill));
@@ -502,8 +521,9 @@ impl JobQueue {
     /// Cancel a job, whether it is waiting or running.
     ///
     /// A cancelled job is removed from its set, so it never occupies capacity
-    /// and can never be started. A pending rerun for the same fill is discarded
-    /// (the operator cancelled, so the fill must not run again by itself).
+    /// and can never be started. A pending rerun for the same fill is discarded:
+    /// "every cancellation discards a pending rerun" (see
+    /// [`finish`](Self::finish), where the rule is stated once).
     ///
     /// # Errors
     ///
@@ -831,6 +851,115 @@ mod tests {
             "three repeat triggers still queue one rerun"
         );
         assert_eq!(queue.in_flight_for(&fill("radar")), Some(&job_id("j4")));
+    }
+
+    #[test]
+    fn finishing_a_running_job_as_cancelled_discards_its_pending_rerun() {
+        // MEDIUM: `finish(id, Cancelled)` must behave like `cancel(id)` for
+        // reruns. Both are a cancellation, so both discard the pending rerun.
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("radar"), job_id("j1")).expect("room");
+        queue.start_next().expect("slot").expect("a job");
+        queue
+            .trigger(fill("radar"), job_id("j2"))
+            .expect("coalesces");
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), Some(&job_id("j2")));
+
+        assert_eq!(
+            queue
+                .finish(&job_id("j1"), JobState::Cancelled)
+                .expect("cancel"),
+            JobState::Cancelled
+        );
+        assert_eq!(
+            queue.pending_rerun_for(&fill("radar")),
+            None,
+            "the rerun is discarded, not queued"
+        );
+        assert_eq!(
+            queue.pending_len(),
+            0,
+            "nothing was queued behind the cancel"
+        );
+        assert!(
+            !queue.is_fill_active(&fill("radar")),
+            "the fill is idle after a cancelled finish"
+        );
+        assert!(
+            queue.start_next().expect("slot free").is_none(),
+            "the discarded rerun is not started"
+        );
+        // The fill can be triggered again from scratch.
+        assert!(queue
+            .trigger(fill("radar"), job_id("j3"))
+            .expect("room")
+            .queued_new_job());
+        assert_eq!(queue.pending_len(), 1);
+    }
+
+    #[test]
+    fn cancelling_a_running_job_with_a_pending_rerun_discards_it_the_same_way() {
+        // The other entry point into "this fill was cancelled": `cancel`. It must
+        // reach the identical end state as `finish(id, Cancelled)`.
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("radar"), job_id("j1")).expect("room");
+        queue.start_next().expect("slot").expect("a job");
+        queue
+            .trigger(fill("radar"), job_id("j2"))
+            .expect("coalesces");
+
+        assert_eq!(
+            queue.cancel(&job_id("j1")).expect("cancel"),
+            JobState::Cancelled
+        );
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), None);
+        assert_eq!(queue.pending_len(), 0);
+        assert_eq!(queue.running_len(), 0);
+        assert!(!queue.is_fill_active(&fill("radar")));
+
+        // Cancelling the *rerun* (still a pending rerun, not yet a job) also
+        // discards it.
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("radar"), job_id("a1")).expect("room");
+        queue.start_next().expect("slot").expect("a job");
+        queue
+            .trigger(fill("radar"), job_id("a2"))
+            .expect("coalesces");
+        assert!(
+            queue.cancel(&job_id("a2")).is_err(),
+            "not a tracked job yet"
+        );
+        assert_eq!(
+            queue.cancel(&job_id("a1")).expect("cancel"),
+            JobState::Cancelled
+        );
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), None);
+    }
+
+    #[test]
+    fn a_successful_or_failed_finish_still_queues_the_rerun() {
+        // The discard is specific to cancellation: the rerun promise a coalesced
+        // trigger relies on must survive every other terminal state.
+        for terminal in [JobState::Succeeded, JobState::Failed] {
+            let mut queue = JobQueue::new(4, 1);
+            queue.trigger(fill("radar"), job_id("j1")).expect("room");
+            queue.start_next().expect("slot").expect("a job");
+            queue
+                .trigger(fill("radar"), job_id("j2"))
+                .expect("coalesces");
+            queue.finish(&job_id("j1"), terminal).expect("finish");
+            assert_eq!(
+                queue.pending_rerun_for(&fill("radar")),
+                None,
+                "{terminal}: the rerun was consumed"
+            );
+            assert_eq!(queue.pending_len(), 1, "{terminal}: the rerun is queued");
+            assert_eq!(
+                queue.in_flight_for(&fill("radar")),
+                Some(&job_id("j2")),
+                "{terminal}"
+            );
+        }
     }
 
     #[test]

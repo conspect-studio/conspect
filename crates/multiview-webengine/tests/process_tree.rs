@@ -48,7 +48,8 @@ fn chromium_tree() -> ProcTree {
     ProcTree::build(vec![
         ProcSpec::new(100, "chrome-headless-shell", 12, 8)
             .with_parent(1)
-            .with_children(&[101, 102, 103, 104, 105]),
+            .with_children(&[101, 102, 103, 104, 105])
+            .with_pss_kib(ROOT_PSS_KIB),
         ProcSpec::new(101, "chrome-headless-shell", 20, 10)
             .with_parent(100)
             .with_type("renderer")
@@ -112,9 +113,15 @@ fn descendants_ticks() -> u64 {
 const RENDERER_TICKS: u64 = 20 + 10;
 
 /// Every recognised Chromium type plus the unlabelled root, summed.
+///
+/// The root is a contributor like any other member of its own scope, so its own
+/// `smaps_rollup` is part of the expected total.
 fn expected_memory_bytes() -> u64 {
-    (1024 + 2048 + 512 + 4096 + 256) * 1024
+    (ROOT_PSS_KIB + 1024 + 2048 + 512 + 4096 + 256) * 1024
 }
+
+/// The root's own `Pss`, with which [`chromium_tree`]'s root is materialised.
+const ROOT_PSS_KIB: u64 = 1024;
 
 fn record_for(sample: &multiview_webengine::ProcessTreeSample, pid: u32) -> &ProcRecord {
     sample
@@ -128,7 +135,10 @@ fn record_for(sample: &multiview_webengine::ProcessTreeSample, pid: u32) -> &Pro
 fn the_whole_tree_sums_every_chromium_process_type() {
     // The regression test: all six types are present, and the sum covers them.
     let tree = chromium_tree();
-    let sample = sample_process_tree(tree.root(), Pid::new(100), None).expect("a walk");
+    let sample = sample_process_tree(tree.root(), Pid::new(100), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
 
     assert_eq!(
         sample.process_count(),
@@ -194,7 +204,9 @@ fn a_process_tree_produces_a_cpu_cores_reading_from_two_readings() {
 
     let mut first = sampler
         .sample_tree(tree.root(), Pid::new(100))
-        .expect("first walk");
+        .expect("first walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(Sampler::tree_cpu_seconds(&first) * 100.0, 135.0);
     assert_eq!(
         sampler.record(0.0, Sampler::tree_cpu_seconds(&first)),
@@ -222,7 +234,9 @@ fn exited_child_time_is_retained_so_totals_never_go_backwards() {
     // Sample A: the full tree, 135 ticks.
     let first = sampler
         .sample_tree(tree.root(), Pid::new(100))
-        .expect("first walk");
+        .expect("first walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(first.cpu_ticks, expected_ticks());
     assert_eq!(first.exited_cpu_ticks, 0);
 
@@ -230,7 +244,9 @@ fn exited_child_time_is_retained_so_totals_never_go_backwards() {
     tree.remove(101);
     let second = sampler
         .sample_tree(tree.root(), Pid::new(100))
-        .expect("second walk");
+        .expect("second walk")
+        .into_sample()
+        .expect("a live root");
 
     assert_eq!(
         second.live_cpu_ticks,
@@ -273,14 +289,18 @@ fn a_grandchild_exit_in_the_same_interval_is_retained() {
 
     let first = sampler
         .sample_tree(tree.root(), Pid::new(300))
-        .expect("first walk");
+        .expect("first walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(first.process_count(), 2, "child and grandchild");
     assert_eq!(first.cpu_ticks, 10 + 6 + 9);
 
     tree.remove(302);
     let second = sampler
         .sample_tree(tree.root(), Pid::new(300))
-        .expect("second walk");
+        .expect("second walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(
         second.exited_cpu_ticks, 9,
         "the departed grandchild's CPU time is retained"
@@ -300,7 +320,9 @@ fn a_reused_pid_is_a_new_process_and_its_predecessors_time_is_retained() {
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
     let first = sampler
         .sample_tree(tree.root(), Pid::new(100))
-        .expect("first walk");
+        .expect("first walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(first.cpu_ticks, 20 + 30);
     assert_eq!(record_for(&first, 101).starttime, 500);
 
@@ -313,7 +335,9 @@ fn a_reused_pid_is_a_new_process_and_its_predecessors_time_is_retained() {
     );
     let second = sampler
         .sample_tree(tree.root(), Pid::new(100))
-        .expect("second walk");
+        .expect("second walk")
+        .into_sample()
+        .expect("a live root");
 
     assert_eq!(
         record_for(&second, 101).starttime,
@@ -344,7 +368,9 @@ fn a_live_process_whose_ticks_went_down_is_not_booked_as_exited() {
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
     let first = sampler
         .sample_tree(tree.root(), Pid::new(100))
-        .expect("first walk");
+        .expect("first walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(first.cpu_ticks, 20 + 30);
 
     // The same process, same starttime, reporting LESS CPU than before: a
@@ -352,7 +378,9 @@ fn a_live_process_whose_ticks_went_down_is_not_booked_as_exited() {
     tree.update_stat(&ProcSpec::new(101, "chrome", 1, 1).with_parent(100));
     let second = sampler
         .sample_tree(tree.root(), Pid::new(100))
-        .expect("second walk");
+        .expect("second walk")
+        .into_sample()
+        .expect("a live root");
 
     assert_eq!(
         second.exited_cpu_ticks, 0,
@@ -374,7 +402,10 @@ fn a_comm_containing_parens_and_spaces_parses_from_the_last_paren() {
     let body = std::fs::read_to_string(fixture.join("proc/302/stat")).expect("the fixture");
     assert_eq!(parse_stat_comm(&body).as_deref(), Some("odd )( comm"));
 
-    let sample = sample_process_tree(fixture.as_path(), Pid::new(301), None).expect("a walk");
+    let sample = sample_process_tree(fixture.as_path(), Pid::new(301), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(sample.process_count(), 1, "301 has one child, 302");
     let child = record_for(&sample, 302);
     assert_eq!(child.comm, "odd )( comm");
@@ -461,7 +492,10 @@ fn pss_is_preferred_and_the_rss_fallback_is_labelled() {
             .with_type("utility")
             .with_rss_only_kib(4096),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(200), None).expect("a walk");
+    let sample = sample_process_tree(tree.root(), Pid::new(200), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     let renderer = record_for(&sample, 201);
     let utility = record_for(&sample, 202);
     assert_eq!(renderer.memory_source, MemorySource::Pss);
@@ -481,7 +515,7 @@ fn pss_is_preferred_and_the_rss_fallback_is_labelled() {
 }
 
 #[test]
-fn memory_is_unavailable_not_zero_when_smaps_rollup_is_absent() {
+fn memory_is_unavailable_not_zero_when_no_process_supplied_a_figure() {
     let tree = ProcTree::build(vec![
         ProcSpec::new(400, "chrome", 0, 0)
             .with_parent(1)
@@ -491,20 +525,215 @@ fn memory_is_unavailable_not_zero_when_smaps_rollup_is_absent() {
             .with_parent(400)
             .with_type("renderer"),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(400), None).expect("a walk");
+    let sample = sample_process_tree(tree.root(), Pid::new(400), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     let child = record_for(&sample, 401);
     assert_eq!(child.memory_source, MemorySource::Unavailable);
     assert_eq!(
         sample.memory_source,
         MemorySource::Unavailable,
-        "every record was unmeasurable: unknown, never Rss"
+        "no process — root included — was measurable: unknown, never Rss"
+    );
+    assert_eq!(
+        sample.memory_bytes, 0,
+        "an unmeasurable tree reports no bytes rather than a fabricated zero \
+         presented as a reading"
+    );
+}
+
+#[test]
+fn an_alive_root_with_no_descendants_still_reports_its_own_memory() {
+    // The reviewer's gap: a tree whose root is alive and readable but has no
+    // children yet reported `Unavailable`, because only descendants were summed.
+    // The root is a member of its own scope, so its own figure counts.
+    let tree = ProcTree::build(vec![ProcSpec::new(410, "chrome", 5, 5)
+        .with_parent(1)
+        .with_pss_kib(8192)]);
+    let sample = sample_process_tree(tree.root(), Pid::new(410), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
+
+    assert_eq!(sample.process_count(), 0, "still no descendants");
+    assert_eq!(
+        sample.memory_bytes,
+        8192 * 1024,
+        "the root's own Pss is part of its scope's memory"
+    );
+    assert_eq!(
+        sample.memory_source,
+        MemorySource::Pss,
+        "a measured root means the sum is measured, not Unavailable"
+    );
+    assert_ne!(
+        sample.memory_source,
+        MemorySource::Unavailable,
+        "a live readable root is never reported as no figure at all"
+    );
+}
+
+#[test]
+fn the_roots_own_memory_is_summed_into_the_tree_total() {
+    // Both contributors are Pss: root 1024 KiB + child 2048 KiB. Before the fix
+    // the root was excluded, so the total was 2048 KiB short and no test noticed.
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(420, "chrome", 7, 7)
+            .with_parent(1)
+            .with_children(&[421])
+            .with_pss_kib(1024),
+        ProcSpec::new(421, "chrome", 1, 1)
+            .with_parent(420)
+            .with_type("renderer")
+            .with_pss_kib(2048),
+    ]);
+    let sample = sample_process_tree(tree.root(), Pid::new(420), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
+    assert_eq!(sample.process_count(), 1, "the child is not the root");
+    assert_eq!(sample.memory_bytes, (1024 + 2048) * 1024);
+    assert_eq!(
+        sample.memory_source,
+        MemorySource::Pss,
+        "every contributor, root included, supplied Pss"
+    );
+}
+
+#[test]
+fn a_readable_root_with_unreadable_children_is_reported_as_the_weaker_source() {
+    // The root has a figure and a child does not: the sum is mixed, so it is
+    // labelled `Rss` (the weaker *measured* source) rather than `Unavailable` —
+    // a figure does exist for this scope, it is just mixed.
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(430, "chrome", 2, 2)
+            .with_parent(1)
+            .with_children(&[431])
+            .with_pss_kib(512),
+        // No smaps_rollup for the child.
+        ProcSpec::new(431, "chrome", 1, 1)
+            .with_parent(430)
+            .with_type("renderer"),
+    ]);
+    let sample = sample_process_tree(tree.root(), Pid::new(430), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
+    assert_eq!(sample.memory_bytes, 512 * 1024);
+    assert_eq!(
+        sample.memory_source,
+        MemorySource::Rss,
+        "a mixed sum is not Unavailable while any process supplied a figure"
+    );
+}
+
+#[test]
+fn a_reused_root_pid_is_not_merged_into_the_old_scope() {
+    // HIGH: the sampler tracked `(pid, starttime)` for descendants only. When the
+    // browser root exited and the kernel reused its pid, the new process and its
+    // children were charged to the dead scope. Two sweeps of the SAME pid with a
+    // DIFFERENT starttime must never merge.
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(500, "chrome", 12, 8)
+            .with_parent(1)
+            .with_children(&[501]),
+        ProcSpec::new(501, "chrome", 20, 10).with_parent(500),
+    ]);
+    let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
+    let first = sampler
+        .sample_tree(tree.root(), Pid::new(500))
+        .expect("first walk")
+        .into_sample()
+        .expect("a live root");
+    assert_eq!(first.cpu_ticks, 20 + 30);
+    assert_eq!(first.root_starttime, 1_500, "recorded at the first sample");
+
+    // The browser exits and the kernel hands pid 500 to an unrelated process:
+    // same pid, new starttime, its own (much smaller) counter.
+    let mut reused_root = ProcSpec::new(500, "unrelated", 1, 1)
+        .with_parent(1)
+        .with_starttime(99_999);
+    reused_root.children = Some(vec![502]);
+    tree.update_stat(&reused_root);
+
+    let second = sampler
+        .sample_tree(tree.root(), Pid::new(500))
+        .expect("the second walk reads the root");
+    assert_eq!(
+        second,
+        multiview_webengine::TreeSample::RootGone,
+        "a different starttime for the same pid means the scope ended"
+    );
+    assert!(second.root_is_gone());
+    assert!(second.sample().is_none());
+    assert_eq!(
+        second.process_count(),
+        0,
+        "no reading exists for a scope that ended, so nothing is folded in"
+    );
+
+    // The retired scope's state was not replaced by the impostor: the sampler
+    // keeps reporting the ended scope until the caller registers a new
+    // generation.
+    let third = sampler
+        .sample_tree(tree.root(), Pid::new(500))
+        .expect("a third walk");
+    assert!(
+        third.root_is_gone(),
+        "the impostor is never adopted as the old scope"
+    );
+}
+
+#[test]
+fn a_first_sweep_of_a_new_root_records_its_starttime() {
+    // The identity is recorded from the FIRST sample: without it there is
+    // nothing to compare a later sweep against.
+    let tree = chromium_tree();
+    let sample = sample_process_tree(tree.root(), Pid::new(100), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
+    assert_eq!(
+        sample.root_starttime,
+        tree.spec(100).starttime,
+        "the root's own starttime is part of the reading"
+    );
+    let previous = multiview_webengine::PreviousSweep::from_sample(&sample);
+    assert_eq!(
+        previous.root,
+        Some((Pid::new(100), sample.root_starttime)),
+        "the next sweep compares against exactly this identity"
+    );
+}
+
+#[test]
+fn a_stable_root_starttime_does_not_end_the_scope() {
+    // The guard must not fire on an ordinary sweep: same pid, same starttime.
+    let tree = chromium_tree();
+    let first = sample_process_tree(tree.root(), Pid::new(100), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
+    let previous = multiview_webengine::PreviousSweep::from_sample(&first);
+    let second = sample_process_tree(tree.root(), Pid::new(100), Some(&previous))
+        .expect("a walk")
+        .into_sample()
+        .expect("the same process is still the root");
+    assert_eq!(second.root_starttime, tree.spec(100).starttime);
+    assert_eq!(
+        second.cpu_ticks, first.cpu_ticks,
+        "an unchanged tree is still the same scope's reading"
     );
 }
 
 #[test]
 fn an_empty_tree_reports_memory_unavailable_rather_than_a_source() {
     let tree = ProcTree::build(vec![ProcSpec::new(700, "chrome", 4, 4)]);
-    let sample = sample_process_tree(tree.root(), Pid::new(700), None).expect("a walk");
+    let sample = sample_process_tree(tree.root(), Pid::new(700), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(sample.process_count(), 0);
     assert_eq!(sample.memory_bytes, 0);
     assert_eq!(
@@ -528,16 +757,25 @@ fn every_documented_separator_and_source_is_read_through_a_root() {
             "proc/501/stat",
             &kernel_stat_line(501, "chrome", 500, 4, 1, 950),
         )
+        .with_file("proc/500/smaps_rollup", "Pss: 2 kB\n")
         .with_file("proc/501/cmdline", "/opt/chrome\0--type=gpu-process\0")
         .with_file("proc/501/smaps_rollup", "Pss: 1 kB\n");
-    let sample = sample_process_tree(&root, Pid::new(500), None).expect("a walk");
+    let sample = sample_process_tree(&root, Pid::new(500), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(sample.cpu_ticks, 35);
     assert_eq!(sample.process_count(), 1);
     assert_eq!(
         sample.type_usage(ChromiumProcessType::GpuProcess).cpu_ticks,
         5
     );
-    assert_eq!(sample.memory_bytes, 1024);
+    assert_eq!(
+        sample.memory_bytes,
+        (2 + 1) * 1024,
+        "the root's own Pss is part of the total"
+    );
+    assert_eq!(sample.memory_source, MemorySource::Pss);
 
     // A reading against a root whose cgroup files do not exist is an honest
     // error, never a fabricated zero.
@@ -556,7 +794,10 @@ fn an_existing_but_empty_children_file_means_no_children_and_no_scan() {
         ProcSpec::new(801, "chrome", 1, 1).with_parent(800),
     ]);
     let root = CountingRoot::new(tree.root());
-    let sample = sample_process_tree(&root, Pid::new(800), None).expect("a walk");
+    let sample = sample_process_tree(&root, Pid::new(800), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(
         sample.process_count(),
         0,
@@ -580,7 +821,10 @@ fn a_missing_children_file_falls_back_per_node_not_only_when_the_union_is_empty(
         ProcSpec::new(901, "chrome", 3, 3).with_parent(900),
         ProcSpec::new(902, "chrome", 7, 2).with_parent(901),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(900), None).expect("a walk");
+    let sample = sample_process_tree(tree.root(), Pid::new(900), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     assert_eq!(
         sample.process_count(),
         2,
@@ -603,7 +847,10 @@ fn a_two_hundred_process_sweep_reads_stat_once_per_process_and_scans_proc_once()
     let bare = wide_tree(SIZE, false);
     let bare_root = CountingRoot::new(bare.root());
     let started = Instant::now();
-    let bare_sample = sample_process_tree(&bare_root, Pid::new(1), None).expect("a walk");
+    let bare_sample = sample_process_tree(&bare_root, Pid::new(1), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     let bare_elapsed = started.elapsed();
     assert_eq!(bare_sample.process_count(), DESCENDANTS);
     assert_eq!(
@@ -628,7 +875,10 @@ fn a_two_hundred_process_sweep_reads_stat_once_per_process_and_scans_proc_once()
     let full = wide_tree(SIZE, true);
     let full_root = CountingRoot::new(full.root());
     let started = Instant::now();
-    let full_sample = sample_process_tree(&full_root, Pid::new(1), None).expect("a walk");
+    let full_sample = sample_process_tree(&full_root, Pid::new(1), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     let full_elapsed = started.elapsed();
     assert_eq!(full_sample.process_count(), DESCENDANTS);
     assert_eq!(

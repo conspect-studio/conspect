@@ -164,11 +164,31 @@ impl MemorySource {
     }
 }
 
+/// The root process's own identity and reading, taken from one `stat` read.
+///
+/// Its `starttime` is what makes the root's identity checkable across sweeps: a
+/// pid the kernel has reused carries a different one, so the new process is not
+/// folded into the old scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootStat {
+    /// `utime + stime` of the root itself, in clock ticks.
+    pub cpu_ticks: u64,
+    /// `stat` field 22 for the root; `0` when the field could not be parsed.
+    pub starttime: u64,
+}
+
 /// One whole-tree reading.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessTreeSample {
     /// The root the tree was discovered from.
     pub root: Pid,
+    /// The root's `starttime` at this sweep (field 22 of its `stat`; `0` when the
+    /// field could not be parsed).
+    ///
+    /// The root's identity, recorded from the **first** sample on, so a later
+    /// sweep can tell a live root from a pid the kernel reused for a new
+    /// process. See [`TreeSample::RootGone`].
+    pub root_starttime: u64,
     /// Every live descendant (the root is accounted separately, not repeated here).
     pub processes: Vec<ProcRecord>,
     /// Live `utime + stime` across the tree **and** the retained time of exited
@@ -184,10 +204,15 @@ pub struct ProcessTreeSample {
     /// CPU time of children that exited, accumulated by the caller across walks,
     /// in clock ticks.
     pub exited_cpu_ticks: u64,
-    /// Memory summed across the tree, in bytes.
+    /// Memory summed across the tree **including the root**, in bytes.
+    ///
+    /// The root's own `smaps_rollup` is part of the sum: a browser that is alive
+    /// and readable must not be reported as having no memory figure merely
+    /// because it launched no descendants.
     pub memory_bytes: u64,
     /// Whether every contributing process supplied `Pss` (else the sum mixes
-    /// sources and is labelled as such).
+    /// sources and is labelled as such). The root is a contributor too, so a
+    /// root whose memory could not be read weakens the whole sum.
     pub memory_source: MemorySource,
     /// Per-type CPU split of the **live** tree, a fixed array indexed by
     /// [`ChromiumProcessType::index`], so a sweep allocates no map. Every type
@@ -262,6 +287,14 @@ pub struct ProcessTicks {
 /// `ProcRecord` (and its strings) it just produced.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreviousSweep {
+    /// The root's identity at the previous sweep: the pid and the `starttime`
+    /// its `stat` carried.
+    ///
+    /// `None` on a first sweep (nothing to compare against yet). Held here
+    /// rather than only in the returned sample so the **walk itself** can refuse
+    /// to fold a reused pid into a scope: if the kernel recycled the root pid,
+    /// this is the only record of what the old root looked like.
+    pub root: Option<(Pid, u64)>,
     /// Every live descendant at the previous sweep, keyed by pid.
     pub live: BTreeMap<Pid, ProcessTicks>,
     /// The cumulative total the previous sweep published.
@@ -275,6 +308,7 @@ impl PreviousSweep {
     #[must_use]
     pub fn from_sample(sample: &ProcessTreeSample) -> Self {
         Self {
+            root: Some((sample.root, sample.root_starttime)),
             live: sample
                 .processes
                 .iter()
@@ -319,12 +353,110 @@ pub fn exited_since(previous: &BTreeMap<Pid, ProcessTicks>, current: &[ProcRecor
     total_before.saturating_sub(still_live)
 }
 
+/// The outcome of sampling a process tree (ADR-0099 decision 8).
+///
+/// Sampling is **not** infallible-by-construction: the root can end between two
+/// sweeps, or the kernel can reuse its pid for an unrelated process. Both mean
+/// the scope is over, and neither may be folded into the old owner's figures —
+/// the caller retires the scope and registers a new generation instead
+/// ([`scope::ScopeRegistry`](crate::scope::ScopeRegistry)).
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+// The large arm is the point: `Sampled` is the normal outcome of every sweep and
+// a sweep already allocates its record `Vec`, so the enum is left un-boxed to
+// avoid one extra indirection per sample on the accounting path. `RootGone`
+// carries nothing because there is nothing honest to carry — no reading exists
+// for a scope that ended.
+#[allow(clippy::large_enum_variant)]
+pub enum TreeSample {
+    /// The root is the same process it was at the previous sweep (or this is the
+    /// first sweep of the scope): the reading is the scope's own.
+    Sampled(ProcessTreeSample),
+    /// The root's `starttime` changed — the kernel reused the pid for a **new**
+    /// process — so this sweep belongs to nobody.
+    ///
+    /// The caller retires the scope and registers a new generation. The new
+    /// process's figures are deliberately not reported here: charging them to
+    /// the old scope is exactly the misattribution the generation counter
+    /// exists to prevent.
+    RootGone,
+}
+
+impl TreeSample {
+    /// The reading, when the root is still the process the scope was opened for.
+    #[must_use]
+    pub const fn sample(&self) -> Option<&ProcessTreeSample> {
+        match self {
+            Self::Sampled(sample) => Some(sample),
+            Self::RootGone => None,
+        }
+    }
+
+    /// The reading, consuming the result.
+    #[must_use]
+    pub fn into_sample(self) -> Option<ProcessTreeSample> {
+        match self {
+            Self::Sampled(sample) => Some(sample),
+            Self::RootGone => None,
+        }
+    }
+
+    /// Whether the scope this sample was taken for has ended.
+    #[must_use]
+    pub const fn root_is_gone(&self) -> bool {
+        matches!(self, Self::RootGone)
+    }
+
+    /// The reading's process count, or `0` when the root is gone.
+    ///
+    /// Present so a diagnostics or test call site that does not care which arm
+    /// it got still reads naturally; a call site that must not ignore the ended
+    /// scope matches on the enum instead.
+    #[must_use]
+    pub fn process_count(&self) -> usize {
+        self.sample().map_or(0, ProcessTreeSample::process_count)
+    }
+
+    /// The reading's per-type entry for `kind`, or the zero default when the
+    /// root is gone.
+    #[must_use]
+    pub fn type_usage(&self, kind: ChromiumProcessType) -> TypeAccounting {
+        self.sample()
+            .map_or_else(TypeAccounting::default, |sample| sample.type_usage(kind))
+    }
+
+    /// The scopes' per-type CPU split, or zeroes when the root is gone.
+    #[must_use]
+    pub fn by_type(&self) -> TypeAccountingArray {
+        self.sample()
+            .map_or([TypeAccounting::default(); TYPE_COUNT], |sample| {
+                sample.by_type
+            })
+    }
+
+    /// The reading's CPU time in seconds, or `0.0` when the root is gone.
+    ///
+    /// None of these conveniences may be read as "the scope used nothing": a
+    /// root that is gone has **no** figure, and a caller that needs to tell that
+    /// apart matches on [`TreeSample`] rather than using these.
+    #[must_use]
+    pub fn cpu_seconds(&self) -> f64 {
+        self.sample()
+            .map_or(0.0, |sample| ticks_to_seconds(sample.cpu_ticks))
+    }
+}
+
 /// Walk the process tree rooted at `root` and read `proc/<pid>/...` files
 /// through `fs`.
 ///
 /// `previous` is the previous sweep's state (or `None` on the first sample); the
 /// CPU time of processes that have exited since is retained so a total never
 /// goes backwards, and the published total is held at its high-water mark.
+///
+/// The root's identity is checked **first**: when `previous` carries a root
+/// `starttime` and this sweep reads a different one, the kernel has reused the
+/// pid for a new process and the result is [`TreeSample::RootGone`] — the walk
+/// does not even run, let alone report the impostor's CPU as the old scope's.
 ///
 /// # Errors
 ///
@@ -335,8 +467,16 @@ pub fn sample_process_tree<F: FsRoot + ?Sized>(
     fs: &F,
     root: Pid,
     previous: Option<&PreviousSweep>,
-) -> Result<ProcessTreeSample> {
-    let root_ticks = read_root_cpu_ticks(fs, root)?;
+) -> Result<TreeSample> {
+    let root_stat = read_root_stat(fs, root)?;
+    if let Some((previous_root, previous_starttime)) = previous.and_then(|state| state.root) {
+        if previous_root == root && previous_starttime != root_stat.starttime {
+            // The pid is the same but the process is not: the scope ended.
+            return Ok(TreeSample::RootGone);
+        }
+    }
+
+    let (root_memory_bytes, root_memory_source) = read_memory(fs, root);
 
     let mut records: Vec<ProcRecord> = Vec::new();
     walk_tree(fs, root, &mut |record| records.push(record));
@@ -344,9 +484,12 @@ pub fn sample_process_tree<F: FsRoot + ?Sized>(
     let mut by_type: TypeAccountingArray = [TypeAccounting::default(); TYPE_COUNT];
 
     let mut live_ticks = 0_u64;
-    let mut memory_bytes = 0_u64;
-    let mut every_pss = !records.is_empty();
-    let mut every_unavailable = !records.is_empty();
+    let mut memory_bytes = root_memory_bytes;
+    // The sum always has at least one contributor: the root itself. A live root
+    // whose memory is readable must not be reported as having no figure merely
+    // because it has no descendants yet.
+    let mut every_pss = root_memory_source.is_pss();
+    let mut every_unavailable = root_memory_source == MemorySource::Unavailable;
     for record in &records {
         live_ticks = live_ticks.saturating_add(record.cpu_ticks);
         memory_bytes = memory_bytes.saturating_add(record.memory_bytes);
@@ -359,9 +502,9 @@ pub fn sample_process_tree<F: FsRoot + ?Sized>(
         }
     }
 
-    let memory_source = if records.is_empty() || every_unavailable {
-        // Nothing was measurable: an empty tree, or one where every process's
-        // `smaps_rollup` was absent. Unknown, never `Pss` or `Rss`.
+    let memory_source = if every_unavailable {
+        // No process in the tree — root included — supplied a figure. Unknown,
+        // never `Pss` or `Rss`.
         MemorySource::Unavailable
     } else if every_pss {
         MemorySource::Pss
@@ -377,14 +520,15 @@ pub fn sample_process_tree<F: FsRoot + ?Sized>(
             .saturating_add(exited_since(&previous.live, &records))
     });
 
-    let total_live = root_ticks.saturating_add(live_ticks);
+    let total_live = root_stat.cpu_ticks.saturating_add(live_ticks);
     let retained_total = retained.saturating_add(total_live);
     let monotonic = previous.map_or(retained_total, |previous| {
         previous.cpu_ticks.max(retained_total)
     });
 
-    Ok(ProcessTreeSample {
+    Ok(TreeSample::Sampled(ProcessTreeSample {
         root,
+        root_starttime: root_stat.starttime,
         processes: records,
         cpu_ticks: monotonic,
         live_cpu_ticks: total_live,
@@ -393,7 +537,7 @@ pub fn sample_process_tree<F: FsRoot + ?Sized>(
         memory_source,
         by_type,
         accounting: Accounting::Estimated,
-    })
+    }))
 }
 
 /// A `/proc`-wide parent map, built at most **once per sweep**.
@@ -562,13 +706,21 @@ pub fn read_process<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Option<ProcRecord> 
     })
 }
 
-/// The root's own `utime + stime`, erroring when its `/proc` entry cannot be
-/// read or parsed (a live root must exist for the scope to mean anything).
-fn read_root_cpu_ticks<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<u64> {
+/// The root's own identity and CPU time, from one `stat` read.
+///
+/// Errors when the root's `/proc` entry cannot be read or its CPU fields cannot
+/// be parsed: a live root must exist for the scope to mean anything. A missing
+/// `starttime` is **not** an error — it degrades the identity check to the pid
+/// alone, exactly as [`read_process`] does for a descendant.
+fn read_root_stat<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<RootStat> {
     let path = format!("{PROC}/{pid}/stat");
     let stat = fs.read_to_string(&path)?;
-    parse_stat_cpu_ticks(&stat)
-        .ok_or_else(|| Error::parse(path, "could not read utime/stime after the comm paren"))
+    let cpu_ticks = parse_stat_cpu_ticks(&stat)
+        .ok_or_else(|| Error::parse(&path, "could not read utime/stime after the comm paren"))?;
+    Ok(RootStat {
+        cpu_ticks,
+        starttime: parse_stat_starttime(&stat).unwrap_or(0),
+    })
 }
 
 fn ppid_of<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<Option<Pid>> {
