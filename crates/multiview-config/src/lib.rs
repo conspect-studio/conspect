@@ -82,7 +82,9 @@ pub use graphics::{
     DataKind, DataProviderKind, GraphicsBus, GraphicsChannel, GraphicsConfig, GraphicsDataSource,
     GraphicsItem, GraphicsStyle, TemplateSpec, Transition, TransitionKind,
 };
-pub use iptv::{IptvConfig, IptvEntry, IptvEntryKind, MAX_IPTV_ENTRIES};
+pub use iptv::{
+    IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_IDLE_SECS, MAX_IPTV_ENTRIES,
+};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
@@ -236,10 +238,25 @@ pub struct ControlConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemConfig {
+    /// Source demand lifecycle tuning. Absent means the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand: Option<DemandSettings>,
     /// The NDI® SDK runtime license-acceptance gate. Absent ⇒ NDI I/O is refused
     /// (`ndi_unlicensed`) and never started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ndi: Option<NdiSystemConfig>,
+}
+
+/// `[system.demand]`: how sources start and stop around their consumers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandSettings {
+    /// Seconds a source outlives its last consumer. Default 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linger_secs: Option<u32>,
+    /// How many sources may start at once. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_starts: Option<u32>,
 }
 
 /// The operator's NDI® SDK runtime license acceptance (ADR-0008 §7.5).

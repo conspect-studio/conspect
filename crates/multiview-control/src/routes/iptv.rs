@@ -430,6 +430,12 @@ async fn guide(state: AppState, headers: HeaderMap, force_gzip_file: bool) -> Re
     if !publication.config.enabled {
         return not_found();
     }
+    // This request is what makes the guide worth fetching. The wait is bounded,
+    // so a slow feed yields the last good guide or channels with no programmes.
+    state
+        .iptv
+        .request_guide(&publication, iptv::GUIDE_COLD_WAIT)
+        .await;
     let service = std::sync::Arc::clone(&state.iptv);
     let Ok(Ok(snapshot)) =
         tokio::task::spawn_blocking(move || service.current_snapshot(&publication)).await

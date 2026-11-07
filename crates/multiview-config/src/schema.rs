@@ -1043,6 +1043,10 @@ pub struct Source {
     /// `multiview_control::event_automation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<SourceEventsConfig>,
+    /// Optional consumer policy. Absent means the source runs only while a
+    /// consumer needs it (`docs/architecture/demand-driven-sources.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand: Option<SourceDemandPolicy>,
     /// Optional per-source **EPG** (XMLTV) acquisition block.
     ///
     /// Absent means no EPG is configured for this source (the existing,
@@ -1082,6 +1086,21 @@ impl Default for SourceEventsConfig {
             automation: None,
         }
     }
+}
+
+/// Standing demand for one source, for work that has no other consumer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SourceDemandPolicy {
+    /// Keep the source's video and audio running with no other consumer.
+    #[serde(default, skip_serializing_if = "crate::iptv::is_false")]
+    pub always_on: bool,
+    /// Keep the source running so its events are observed for the journal.
+    /// Without this or armed automation, events are observed only while
+    /// something else consumes the source.
+    #[serde(default, skip_serializing_if = "crate::iptv::is_false")]
+    pub journal_events: bool,
 }
 
 /// Upper bound for [`EventAutomationRule::max_duration_s`] (24 h).

@@ -123,6 +123,11 @@ pub use alarm::{
 pub use clock::{ManualTimeSource, MonotonicTimeSource, OutputClock, Tick, TimeSource};
 pub use cycle::{FreezeTile, RoundRobin};
 pub use degrade::{ControlLoop, ControlStep};
+pub use demand::{
+    ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig, DemandLease, DemandManager, DemandPhase,
+    DemandStatus, RailDriver, RailFailure, Rails, SetItem, DEFAULT_LINGER,
+    DEFAULT_MAX_CONCURRENT_STARTS, MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
+};
 pub use drive::{CompositedFrame, CompositorDrive};
 pub use epoch::{
     clock_quality_of, clock_source_of, EpochAnchor, EpochPolicy, EpochSampler, EpochSamplerConfig,
@@ -153,11 +158,6 @@ pub use probe::{
 pub use program::{MultiviewProgram, ProgramId, ProgramKind};
 pub use programset::{Program, ProgramSet};
 pub use ptp::{PtpSample, PtpServo, ServoConfig};
-pub use demand::{
-    ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig, DemandLease, DemandManager, DemandPhase,
-    DemandStatus, RailDriver, Rails, SetItem, DEFAULT_LINGER, DEFAULT_MAX_CONCURRENT_STARTS,
-    MAX_TIMED_LEASES,
-};
 pub use registry::{
     RequestedSize, SourceActor, SourceHandle, SourceInit, SourceKey, SourceRegistry,
 };

@@ -73,7 +73,15 @@ pub struct IptvConfig {
     /// Published entries, in playlist order.
     #[serde(default)]
     pub entries: Vec<IptvEntry>,
+    /// Seconds after the last guide request before guide refreshing stops.
+    /// Absent means [`DEFAULT_GUIDE_IDLE_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_idle_secs: Option<u32>,
 }
+
+/// The default [`IptvConfig::guide_idle_secs`]: six hours, so a client that
+/// re-reads its guide a few times a day keeps it fresh.
+pub const DEFAULT_GUIDE_IDLE_SECS: u32 = 6 * 3600;
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if signature
 pub(crate) const fn is_false(value: &bool) -> bool {

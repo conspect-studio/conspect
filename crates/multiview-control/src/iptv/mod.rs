@@ -19,6 +19,7 @@ pub mod xmltv;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::{BufReader, Read, Write};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -50,6 +51,11 @@ pub const FEED_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_FEEDS: usize = 32;
 /// How often the refresher re-reads the publication while idle.
 pub const PLAN_POLL: Duration = Duration::from_secs(60);
+/// How long a first guide request waits for a fetch before it is answered from
+/// what is cached, which may be channels with no programmes.
+pub const GUIDE_COLD_WAIT: Duration = Duration::from_secs(5);
+/// [`IptvService::last_guide_request`] before any request has arrived.
+const NEVER_REQUESTED: i64 = i64::MIN;
 
 /// One published playlist entry, resolved against the current configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -530,6 +536,10 @@ pub struct IptvService {
     feeds: Mutex<HashMap<String, FeedCache>>,
     snapshot: RwLock<Option<Arc<GuideSnapshot>>>,
     wake: tokio::sync::Notify,
+    /// Unix seconds of the last guide request. Fetching happens only after one.
+    last_guide_request: AtomicI64,
+    /// Fires when a refresh pass finishes, for a request waiting on a cold cache.
+    refreshed: tokio::sync::Notify,
     /// Store-only deployments (no boot model): the in-memory section, once set.
     fallback: RwLock<Fallback>,
     assemble_lock: Mutex<()>,
@@ -567,6 +577,8 @@ impl IptvService {
             feeds: Mutex::new(HashMap::new()),
             snapshot: RwLock::new(None),
             wake: tokio::sync::Notify::new(),
+            last_guide_request: AtomicI64::new(NEVER_REQUESTED),
+            refreshed: tokio::sync::Notify::new(),
             fallback: RwLock::new(Fallback::Unset),
             assemble_lock: Mutex::new(()),
         }
@@ -581,6 +593,57 @@ impl IptvService {
     /// Wake the refresher (publication changed).
     pub fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    /// Record a guide request at `now` and wake the refresher.
+    pub fn note_guide_request(&self, now: i64) {
+        self.last_guide_request.store(now, Ordering::Relaxed);
+        self.wake();
+    }
+
+    /// Record a guide request and, when nothing has been fetched for this
+    /// publication yet, wait up to `wait` for the refresher. Never unbounded: a
+    /// slow feed leaves the caller with whatever is cached.
+    pub async fn request_guide(&self, publication: &Publication, wait: Duration) {
+        let refreshed = self.refreshed.notified();
+        self.note_guide_request(now_unix());
+        let cold = {
+            let feeds = self.feeds.lock().unwrap_or_else(PoisonError::into_inner);
+            publication
+                .feeds
+                .keys()
+                .take(MAX_FEEDS)
+                .any(|url| feeds.get(url).is_none_or(|c| c.status.last_attempt.is_none()))
+        };
+        if cold {
+            let _ = tokio::time::timeout(wait, refreshed).await;
+        }
+    }
+
+    /// Whether a guide was requested within the publication's idle period.
+    #[must_use]
+    pub fn guide_wanted(&self, config: &IptvConfig, now: i64) -> bool {
+        let last = self.last_guide_request.load(Ordering::Relaxed);
+        let idle = config
+            .guide_idle_secs
+            .unwrap_or(multiview_config::DEFAULT_GUIDE_IDLE_SECS);
+        last != NEVER_REQUESTED && now.saturating_sub(last) <= i64::from(idle)
+    }
+
+    /// One refresher pass: fetch only while a guide is wanted. A disabled
+    /// publication still passes through so its cache is dropped.
+    pub async fn refresh_if_wanted(
+        &self,
+        publication: &Publication,
+        dial_policy: &Arc<DialPolicy>,
+        now: i64,
+    ) -> usize {
+        if publication.config.enabled && !self.guide_wanted(&publication.config, now) {
+            return 0;
+        }
+        let attempts = self.refresh_once(publication, dial_policy, now).await;
+        self.refreshed.notify_waiters();
+        attempts
     }
 
     fn fallback_config(&self, state: &AppState) -> Option<IptvConfig> {
@@ -935,9 +998,10 @@ pub fn filter_spooled<S: std::hash::BuildHasher>(
     .map_err(|e| e.to_string())
 }
 
-/// Spawn the guide refresher: a single control-plane task that sleeps while
-/// publication is disabled (re-reading accepted intent every [`PLAN_POLL`] or
-/// on a wake) and, while enabled, refreshes due feeds and swaps the snapshot.
+/// Spawn the guide refresher: a single control-plane task that fetches nothing
+/// until a guide is requested. While a guide is wanted it refreshes due feeds and
+/// swaps the snapshot; after the idle period it goes back to re-reading accepted
+/// intent every [`PLAN_POLL`] or on a wake, which touches no network.
 #[must_use = "the refresher runs until the handle is aborted or the runtime stops"]
 pub fn spawn_refresher(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -947,7 +1011,7 @@ pub fn spawn_refresher(state: AppState) -> tokio::task::JoinHandle<()> {
                     let now = now_unix();
                     state
                         .iptv
-                        .refresh_once(&publication, &state.dial_policy, now)
+                        .refresh_if_wanted(&publication, &state.dial_policy, now)
                         .await;
                 }
                 Err(error) => tracing::warn!(%error, "IPTV refresher cannot read accepted intent"),
@@ -1199,6 +1263,101 @@ mod tests {
         let text = String::from_utf8(snap.plain.to_vec()).unwrap();
         assert!(!text.contains("CNN"), "{text}");
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+
+    fn five_hundred_entry_publication() -> Publication {
+        let mut entries = Vec::new();
+        let mut sources = Vec::new();
+        for i in 0..500 {
+            entries.push(serde_json::json!({
+                "kind": "source", "ref": format!("s{i}"), "allow_direct_source_url": true,
+            }));
+            sources.push(source(serde_json::json!({
+                "id": format!("s{i}"), "kind": "hls", "url": format!("https://cdn.example/{i}.m3u8"),
+                "epg": {"mode": "manual", "url": "https://epg.example/g.xml", "channel_id": format!("{i}")},
+            })));
+        }
+        let config: IptvConfig =
+            serde_json::from_value(serde_json::json!({"enabled": true, "entries": entries}))
+                .unwrap();
+        resolve(config, &sources, &[])
+    }
+
+    fn fake(body: Result<Vec<u8>, String>) -> Arc<FakeFetcher> {
+        Arc::new(FakeFetcher {
+            body: Mutex::new(body),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn five_hundred_entries_fetch_nothing_until_a_guide_is_requested() {
+        let publication = five_hundred_entry_publication();
+        let fake = fake(Ok(guide_xml()));
+        let service = IptvService::new(fake.clone());
+        let policy = Arc::new(DialPolicy::allow_lan());
+        for pass in 0..5 {
+            let now = NOW + pass * REFRESH_SECS * 2;
+            assert_eq!(service.refresh_if_wanted(&publication, &policy, now).await, 0);
+        }
+        assert!(fake.calls.lock().unwrap().is_empty());
+
+        service.note_guide_request(NOW);
+        assert_eq!(service.refresh_if_wanted(&publication, &policy, NOW).await, 1);
+        assert_eq!(fake.calls.lock().unwrap().len(), 1, "one shared feed");
+    }
+
+    #[tokio::test]
+    async fn refreshing_stops_after_the_configured_idle_period() {
+        let mut publication = five_hundred_entry_publication();
+        publication.config.guide_idle_secs = Some(3_600);
+        let fake = fake(Ok(guide_xml()));
+        let service = IptvService::new(fake.clone());
+        let policy = Arc::new(DialPolicy::allow_lan());
+        service.note_guide_request(NOW);
+        assert!(service.guide_wanted(&publication.config, NOW + 3_600));
+        assert!(!service.guide_wanted(&publication.config, NOW + 3_601));
+        assert_eq!(service.refresh_if_wanted(&publication, &policy, NOW).await, 1);
+        let later = NOW + REFRESH_SECS + REFRESH_JITTER_SECS + 3_600;
+        assert_eq!(service.refresh_if_wanted(&publication, &policy, later).await, 0);
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cold_request_is_bounded_and_serves_channels_when_the_feed_hangs() {
+        let publication = five_hundred_entry_publication();
+        let service = IptvService::new(fake(Err("feed down".to_owned())));
+        let started = std::time::Instant::now();
+        service
+            .request_guide(&publication, Duration::from_millis(50))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(2), "request blocked");
+        let snapshot = service.current_snapshot(&publication).unwrap();
+        let text = String::from_utf8(snapshot.plain.to_vec()).unwrap();
+        assert!(text.contains(r#"<channel id="s0">"#), "{text:.200}");
+        assert!(!text.contains("<programme"));
+    }
+
+    #[tokio::test]
+    async fn a_warm_request_returns_at_once_and_a_failure_keeps_last_good() {
+        let (config, sources, outputs) = sample();
+        let publication = resolve(config, &sources, &outputs);
+        let fake = fake(Ok(guide_xml()));
+        let service = IptvService::new(fake.clone());
+        let policy = Arc::new(DialPolicy::allow_lan());
+        service.note_guide_request(NOW);
+        service.refresh_if_wanted(&publication, &policy, NOW).await;
+        let good = service.snapshot().unwrap();
+        *fake.body.lock().unwrap() = Err("feed down".to_owned());
+        let started = std::time::Instant::now();
+        service
+            .request_guide(&publication, Duration::from_secs(30))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(5), "warm cache waited");
+        let later = NOW + REFRESH_SECS + REFRESH_JITTER_SECS;
+        service.note_guide_request(later);
+        service.refresh_if_wanted(&publication, &policy, later).await;
+        assert_eq!(service.snapshot().unwrap().plain, good.plain);
     }
 
     #[test]

@@ -217,6 +217,8 @@ pub struct DemandConfig {
 pub const DEFAULT_LINGER: Duration = Duration::from_secs(30);
 /// The default [`DemandConfig::max_concurrent_starts`].
 pub const DEFAULT_MAX_CONCURRENT_STARTS: usize = 8;
+/// Upper bound on queued [`DemandManager::request_restart`] requests.
+pub const MAX_PENDING_RESTARTS: usize = 64;
 /// Upper bound on concurrent timed leases, so polling cannot pin unbounded
 /// sources.
 pub const MAX_TIMED_LEASES: usize = 64;
@@ -239,7 +241,7 @@ impl Default for DemandConfig {
 /// counting fake in tests.
 ///
 /// [`transition`](RailDriver::transition) and [`store`](RailDriver::store) run
-/// off every hot path and may block. [`supported`](RailDriver::supported),
+/// off every hot path and may block. [`resolve`](RailDriver::resolve),
 /// [`progress`](RailDriver::progress) and [`finite`](RailDriver::finite) run
 /// under the manager's lock and must not.
 pub trait RailDriver<T>: Send + Sync + 'static {
@@ -250,19 +252,29 @@ pub trait RailDriver<T>: Send + Sync + 'static {
     /// Returns the rails now actually running.
     ///
     /// # Errors
-    /// A reason for the operator. The manager retries with backoff.
+    /// [`RailFailure`]: the rails left running and a reason. The manager retries
+    /// with backoff.
     fn transition(
         &self,
         id: &str,
         from: Rails,
         to: Rails,
         requested: Option<RequestedSize>,
-    ) -> Result<Rails, String>;
+    ) -> Result<Rails, RailFailure>;
 
-    /// The rails `id` can run at all: an audio-free kind has no audio rail, an
-    /// unconfigured id has none, and a run with no program bus has no audio.
-    /// Wanted rails outside this set are never started. Must be a wait-free read.
-    fn supported(&self, id: &str) -> Rails;
+    /// `rails` of `id` stopped for good, not as half of a restart: release what
+    /// they retained (a store can hold many frames). Blocking is allowed. Runs
+    /// while the source's transition is still in flight, so no producer of those
+    /// rails can be writing.
+    fn retire(&self, id: &str, rails: Rails) {
+        let _ = (id, rails);
+    }
+
+    /// The rails `id` must run to satisfy consumers asking for `asked`. Usually
+    /// a subset: an audio-free kind has no audio rail, an unconfigured id has
+    /// none, a run with no program bus has no audio. It may also add a rail, when
+    /// a kind carries its audio inside its video receive. Must be a wait-free read.
+    fn resolve(&self, id: &str, asked: Rails) -> Rails;
 
     /// A counter that advances while `rails` of `id` are producing. Must be a
     /// wait-free read.
@@ -274,6 +286,15 @@ pub trait RailDriver<T>: Send + Sync + 'static {
         let _ = id;
         false
     }
+}
+
+/// A failed rail change.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RailFailure {
+    /// The rails still running after the failure.
+    pub running: Rails,
+    /// An operator-safe reason, free of URLs and credentials.
+    pub reason: String,
 }
 
 /// One lease record.
@@ -359,11 +380,14 @@ pub struct SetItem {
     pub size: Option<RequestedSize>,
 }
 
-struct SetSlot {
+struct SetSlot<T> {
     class: ConsumerClass,
     rails: Rails,
     items: SwapCell<Arc<Vec<SetItem>>>,
     dirty: AtomicBool,
+    /// The leases currently held for this set. Touched by the worker and by
+    /// [`ConsumerSet::seed`], never by the output clock.
+    current: Mutex<Vec<(SetItem, DemandLease<T>)>>,
 }
 
 struct Inner<T> {
@@ -375,7 +399,9 @@ struct Inner<T> {
     worker_handle: Mutex<Option<JoinHandle<()>>>,
     stopping: AtomicBool,
     next_lease: AtomicU64,
-    sets: Mutex<Vec<Arc<SetSlot>>>,
+    sets: Mutex<Vec<Arc<SetSlot<T>>>>,
+    /// Restarts requested from the output clock, applied by the worker.
+    restarts: SwapCell<Arc<Vec<Arc<str>>>>,
     /// Transition threads spawned so far, for tests and diagnostics.
     transitions: AtomicU64,
 }
@@ -438,21 +464,21 @@ impl<T> Drop for DemandLease<T> {
 ///
 /// [`publish`](ConsumerSet::publish) is safe on the output-clock thread: it is a
 /// wait-free cell store plus an unpark.
-pub struct ConsumerSet {
-    slot: Arc<SetSlot>,
-    worker: Arc<dyn Fn() + Send + Sync>,
+pub struct ConsumerSet<T> {
+    slot: Arc<SetSlot<T>>,
+    inner: std::sync::Weak<Inner<T>>,
 }
 
-impl Clone for ConsumerSet {
+impl<T> Clone for ConsumerSet<T> {
     fn clone(&self) -> Self {
         Self {
             slot: Arc::clone(&self.slot),
-            worker: Arc::clone(&self.worker),
+            inner: self.inner.clone(),
         }
     }
 }
 
-impl std::fmt::Debug for ConsumerSet {
+impl<T> std::fmt::Debug for ConsumerSet<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConsumerSet")
             .field("class", &self.slot.class)
@@ -460,12 +486,29 @@ impl std::fmt::Debug for ConsumerSet {
     }
 }
 
-impl ConsumerSet {
+impl<T: Send + Sync + 'static> ConsumerSet<T> {
     /// Replace the set's members. Wait-free; the worker applies it.
     pub fn publish(&self, items: Vec<SetItem>) {
         self.slot.items.store(Arc::new(items));
         self.slot.dirty.store(true, Ordering::Release);
-        (self.worker)();
+        if let Some(inner) = self.inner.upgrade() {
+            inner.wake();
+        }
+    }
+
+    /// Replace the set's members and take their leases now, on the caller's
+    /// thread. For boot, before any worker runs. Never call on the output clock.
+    pub fn seed(&self, items: Vec<SetItem>) {
+        self.slot.items.store(Arc::new(items));
+        if let Some(inner) = self.inner.upgrade() {
+            inner.apply_set(&self.slot);
+        }
+    }
+
+    /// The members last published or seeded.
+    #[must_use]
+    pub fn items(&self) -> Arc<Vec<SetItem>> {
+        self.slot.items.load()
     }
 }
 
@@ -493,6 +536,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 stopping: AtomicBool::new(false),
                 next_lease: AtomicU64::new(1),
                 sets: Mutex::new(Vec::new()),
+                restarts: SwapCell::from_pointee(Vec::new()),
                 transitions: AtomicU64::new(0),
             }),
         }
@@ -533,6 +577,12 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         drop(timed);
         let pins = std::mem::take(&mut lock(&self.inner.book).pins);
         drop(pins);
+        // Sets hold leases (and so the manager) alive: break that cycle.
+        let slots: Vec<Arc<SetSlot<T>>> = std::mem::take(&mut *lock(&self.inner.sets));
+        for slot in slots {
+            let leases = std::mem::take(&mut *lock(&slot.current));
+            drop(leases);
+        }
     }
 
     /// Take a lease on `rails` of source `id`. Never blocks on a rail.
@@ -568,7 +618,13 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     /// Take or extend a lease that lapses `ttl` from now, for a consumer with no
     /// close event (JPEG polling). Returns the source's phase, or `None` when
     /// [`MAX_TIMED_LEASES`] are already held.
-    pub fn touch(&self, id: &str, rails: Rails, tag: ConsumerTag, ttl: Duration) -> Option<DemandPhase> {
+    pub fn touch(
+        &self,
+        id: &str,
+        rails: Rails,
+        tag: ConsumerTag,
+        ttl: Duration,
+    ) -> Option<DemandPhase> {
         let key = (Arc::<str>::from(id), tag.clone());
         let until = Instant::now() + ttl;
         {
@@ -596,22 +652,18 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
 
     /// A publishable consumer group needing `rails`.
     #[must_use]
-    pub fn consumer_set(&self, class: ConsumerClass, rails: Rails) -> ConsumerSet {
+    pub fn consumer_set(&self, class: ConsumerClass, rails: Rails) -> ConsumerSet<T> {
         let slot = Arc::new(SetSlot {
             class,
             rails,
             items: SwapCell::from_pointee(Vec::new()),
             dirty: AtomicBool::new(false),
+            current: Mutex::new(Vec::new()),
         });
         lock(&self.inner.sets).push(Arc::clone(&slot));
-        let weak = Arc::downgrade(&self.inner);
         ConsumerSet {
             slot,
-            worker: Arc::new(move || {
-                if let Some(inner) = weak.upgrade() {
-                    inner.wake();
-                }
-            }),
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
@@ -665,6 +717,25 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         self.inner.wake();
     }
 
+    /// [`restart`](Self::restart) from the output-clock thread: a wait-free cell
+    /// update plus an unpark; the worker applies it. Bounded: past
+    /// [`MAX_PENDING_RESTARTS`] the oldest request is shed (a later edit of the
+    /// same source re-requests it).
+    pub fn request_restart(&self, id: &str) {
+        let id: Arc<str> = Arc::from(id);
+        self.inner.restarts.rcu(|pending| {
+            let mut next = pending.as_ref().clone();
+            if !next.contains(&id) {
+                if next.len() >= MAX_PENDING_RESTARTS {
+                    next.remove(0);
+                }
+                next.push(Arc::clone(&id));
+            }
+            next
+        });
+        self.inner.wake();
+    }
+
     /// The reported state of `id`.
     #[must_use]
     pub fn status(&self, id: &str) -> DemandStatus {
@@ -710,8 +781,11 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
 
 fn report<T>(id: &str, entry: &Entry<T>) -> DemandStatus {
     let wanted = entry.wanted();
-    let mut consumers: Vec<ConsumerTag> =
-        entry.leases.values().map(|lease| lease.tag.clone()).collect();
+    let mut consumers: Vec<ConsumerTag> = entry
+        .leases
+        .values()
+        .map(|lease| lease.tag.clone())
+        .collect();
     consumers.sort();
     consumers.dedup();
     DemandStatus {
@@ -741,11 +815,7 @@ impl<T> Inner<T> {
 
 impl<T: Send + Sync + 'static> Inner<T> {
     /// One registry reference for `id`. `None` for an unconfigured source.
-    fn registry_handle(
-        &self,
-        id: &str,
-        size: Option<RequestedSize>,
-    ) -> Option<SourceHandle<T>> {
+    fn registry_handle(&self, id: &str, size: Option<RequestedSize>) -> Option<SourceHandle<T>> {
         let store = self.driver.store(id)?;
         let requested = size.unwrap_or(RequestedSize {
             width: 0,
@@ -760,45 +830,50 @@ impl<T: Send + Sync + 'static> Inner<T> {
             .ok()
     }
 
-    /// Apply dirty consumer sets: take every new lease, then drop the old ones.
-    fn reconcile_sets(self: &Arc<Self>, current: &mut HashMap<usize, Vec<(SetItem, DemandLease<T>)>>) {
-        let slots: Vec<Arc<SetSlot>> = lock(&self.sets).clone();
-        for (index, slot) in slots.iter().enumerate() {
-            if !slot.dirty.swap(false, Ordering::AcqRel) {
+    /// Apply dirty consumer sets.
+    fn reconcile_sets(self: &Arc<Self>) {
+        let slots: Vec<Arc<SetSlot<T>>> = lock(&self.sets).clone();
+        for slot in &slots {
+            if slot.dirty.swap(false, Ordering::AcqRel) {
+                self.apply_set(slot);
+            }
+        }
+    }
+
+    /// Take every lease the set's members need, then drop the ones it no longer
+    /// needs. New before old, so a shared source's count never touches zero.
+    fn apply_set(self: &Arc<Self>, slot: &SetSlot<T>) {
+        let items = slot.items.load();
+        let mut current = lock(&slot.current);
+        let previous = std::mem::take(&mut *current);
+        let mut kept: HashMap<SetItem, DemandLease<T>> = HashMap::new();
+        let mut retired = Vec::new();
+        for (item, lease) in previous {
+            if items.contains(&item) && !kept.contains_key(&item) {
+                kept.insert(item, lease);
+            } else {
+                retired.push(lease);
+            }
+        }
+        let manager = DemandManager {
+            inner: Arc::clone(self),
+        };
+        for item in items.iter() {
+            if current.iter().any(|(have, _)| have == item) {
                 continue;
             }
-            let items = slot.items.load();
-            let previous = current.remove(&index).unwrap_or_default();
-            let mut kept: HashMap<SetItem, DemandLease<T>> = HashMap::new();
-            let mut retired = Vec::new();
-            for (item, lease) in previous {
-                if items.contains(&item) && !kept.contains_key(&item) {
-                    kept.insert(item, lease);
-                } else {
-                    retired.push(lease);
-                }
-            }
-            let mut next = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                if let Some(lease) = kept.remove(item) {
-                    next.push((item.clone(), lease));
-                } else if !next.iter().any(|(have, _)| have == item) {
-                    let manager = DemandManager {
-                        inner: Arc::clone(self),
-                    };
-                    let tag = ConsumerTag {
-                        class: slot.class,
-                        label: Arc::clone(&item.label),
-                    };
-                    let lease = manager.acquire(&item.id, slot.rails, tag, item.size);
-                    next.push((item.clone(), lease));
-                }
-            }
-            current.insert(index, next);
-            // Old leases go last: a shared source's count never touches zero.
-            drop(retired);
-            drop(kept);
+            let lease = kept.remove(item).unwrap_or_else(|| {
+                let tag = ConsumerTag {
+                    class: slot.class,
+                    label: Arc::clone(&item.label),
+                };
+                manager.acquire(&item.id, slot.rails, tag, item.size)
+            });
+            current.push((item.clone(), lease));
         }
+        drop(current);
+        drop(retired);
+        drop(kept);
     }
 
     /// Lapse expired timed leases, returning the next expiry.
@@ -830,7 +905,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let mut sooner = |at: Instant| {
             wake = Some(wake.map_or(at, |current: Instant| current.min(at)));
         };
-        let mut launches: Vec<(Arc<str>, Rails, Rails)> = Vec::new();
+        let mut launches: Vec<(Arc<str>, Rails, Rails, bool)> = Vec::new();
         let mut released = Vec::new();
         {
             let mut book = lock(&self.book);
@@ -844,11 +919,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
             let thread_limit = config.max_concurrent_starts.max(1).saturating_mul(2);
             for (id, entry) in &mut book.entries {
                 let asked = entry.wanted();
-                let supported = self.driver.supported(id);
-                let wanted = Rails {
-                    video: asked.video && supported.video,
-                    audio: asked.audio && supported.audio,
-                };
+                let wanted = self.driver.resolve(id, asked);
                 entry.unstartable = !asked.is_empty() && wanted.is_empty();
                 if !entry.running.is_empty() && !entry.in_flight {
                     self.check_health(id, entry, now);
@@ -889,7 +960,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 }
                 in_flight += 1;
                 entry.in_flight = true;
-                launches.push((Arc::clone(id), entry.running, target));
+                launches.push((Arc::clone(id), entry.running, target, entry.restart));
             }
             // Forget sources nothing wants and nothing runs.
             let finished: Vec<Arc<str>> = book
@@ -910,8 +981,8 @@ impl<T: Send + Sync + 'static> Inner<T> {
             }
         }
         drop(released);
-        for (id, from, to) in launches {
-            self.launch(id, from, to);
+        for (id, from, to, restarting) in launches {
+            self.launch(id, from, to, restarting);
         }
         wake
     }
@@ -943,7 +1014,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
 
     /// Run one transition on a transient thread. The caller holds a start slot
     /// for it, so the thread count is bounded.
-    fn launch(self: &Arc<Self>, id: Arc<str>, from: Rails, to: Rails) {
+    fn launch(self: &Arc<Self>, id: Arc<str>, from: Rails, to: Rails, restarting: bool) {
         self.transitions.fetch_add(1, Ordering::Relaxed);
         let inner = Arc::clone(self);
         let thread_id = Arc::clone(&id);
@@ -955,24 +1026,53 @@ impl<T: Send + Sync + 'static> Inner<T> {
                     .requested_supremum(&SourceKey::from_canonical(&*thread_id));
                 let driver = Arc::clone(&inner.driver);
                 let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    driver.transition(&thread_id, from, to, requested)
+                    let outcome = driver.transition(&thread_id, from, to, requested);
+                    let running = outcome
+                        .as_ref()
+                        .map_or_else(|failure| failure.running, |running| *running);
+                    let stopped = Rails {
+                        video: from.video && !running.video,
+                        audio: from.audio && !running.audio,
+                    };
+                    if !restarting && !stopped.is_empty() {
+                        driver.retire(&thread_id, stopped);
+                    }
+                    outcome
                 }))
-                .unwrap_or_else(|_| Err("the source rail panicked while changing state".to_owned()));
+                .unwrap_or_else(|_| {
+                    Err(RailFailure {
+                        running: from,
+                        reason: "the source rail panicked while changing state".to_owned(),
+                    })
+                });
                 inner.finish(&thread_id, from, to, outcome);
             });
         if let Err(error) = spawned {
             tracing::warn!(source = %id, %error, "could not spawn a rail transition; retrying");
-            self.finish(&id, from, to, Err(error.to_string()));
+            let failure = RailFailure {
+                running: from,
+                reason: "could not start a worker thread".to_owned(),
+            };
+            self.finish(&id, from, to, Err(failure));
         }
     }
 
     /// Record a transition's outcome and wake the worker.
-    fn finish(self: &Arc<Self>, id: &str, from: Rails, to: Rails, outcome: Result<Rails, String>) {
-        let started_video = to.video && !from.video;
-        let handle = started_video.then(|| self.registry_handle(id, None)).flatten();
-        let progress = outcome
+    fn finish(
+        self: &Arc<Self>,
+        id: &str,
+        from: Rails,
+        to: Rails,
+        outcome: Result<Rails, RailFailure>,
+    ) {
+        let running = outcome
             .as_ref()
-            .map_or(0, |running| self.driver.progress(id, *running));
+            .map_or_else(|failure| failure.running, |running| *running);
+        let started_video = running.video && !from.video;
+        let handle = started_video
+            .then(|| self.registry_handle(id, None))
+            .flatten();
+        let progress = self.driver.progress(id, running);
         let mut surplus = None;
         {
             let mut book = lock(&self.book);
@@ -982,9 +1082,14 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 if to.is_empty() {
                     entry.restart = false;
                 }
+                entry.running = running;
+                if !running.video {
+                    surplus = entry.handle.take();
+                } else if handle.is_some() {
+                    entry.handle = handle;
+                }
                 match outcome {
-                    Ok(running) => {
-                        entry.running = running;
+                    Ok(_) => {
                         entry.surplus_since = None;
                         entry.not_before = None;
                         if !from.covers(to) {
@@ -993,16 +1098,11 @@ impl<T: Send + Sync + 'static> Inner<T> {
                             entry.progress = progress;
                             entry.progress_at = now;
                         }
-                        if !running.video {
-                            surplus = entry.handle.take();
-                        } else if handle.is_some() {
-                            entry.handle = handle;
-                        }
                         if running.is_empty() {
                             entry.phase = DemandPhase::Starting;
                         }
                     }
-                    Err(reason) => {
+                    Err(RailFailure { reason, .. }) => {
                         tracing::warn!(source = %id, %reason, "source rail change failed; retrying with backoff");
                         entry.failures = entry.failures.saturating_add(1);
                         entry.phase = DemandPhase::Failed;
@@ -1032,7 +1132,12 @@ enum Desired {
 
 /// Added rails start at once. Surplus rails stop only after the linger, so a
 /// new consumer arriving meanwhile finds them still running.
-fn desired_rails<T>(entry: &mut Entry<T>, wanted: Rails, now: Instant, linger: Duration) -> Desired {
+fn desired_rails<T>(
+    entry: &mut Entry<T>,
+    wanted: Rails,
+    now: Instant,
+    linger: Duration,
+) -> Desired {
     if entry.running == wanted {
         entry.surplus_since = None;
         return Desired::Hold(None);
@@ -1056,10 +1161,18 @@ fn backoff(base: Duration, max: Duration, failures: u32) -> Duration {
 }
 
 fn worker_loop<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
-    let mut sets: HashMap<usize, Vec<(SetItem, DemandLease<T>)>> = HashMap::new();
     while !inner.stopping.load(Ordering::Acquire) {
         let now = Instant::now();
-        inner.reconcile_sets(&mut sets);
+        let restarts = inner.restarts.swap(Arc::new(Vec::new()));
+        if !restarts.is_empty() {
+            let manager = DemandManager {
+                inner: Arc::clone(inner),
+            };
+            for id in restarts.iter() {
+                manager.restart(id);
+            }
+        }
+        inner.reconcile_sets();
         let next_timed = inner.expire_timed(now);
         let next_step = inner.step(now);
         match [next_timed, next_step].into_iter().flatten().min() {
@@ -1092,6 +1205,7 @@ mod tests {
         video_starts: AtomicUsize,
         audio_starts: AtomicUsize,
         video_stops: AtomicUsize,
+        retired: AtomicUsize,
         failing: Mutex<HashSet<String>>,
         attempts: AtomicUsize,
         active: AtomicUsize,
@@ -1108,11 +1222,10 @@ mod tests {
                     .or_insert_with(|| Arc::new(TileStore::with_defaults(id))),
             ))
         }
-        fn supported(&self, id: &str) -> Rails {
-            if id.starts_with("mute") {
-                Rails::VIDEO
-            } else {
-                Rails::ALL
+        fn resolve(&self, id: &str, asked: Rails) -> Rails {
+            Rails {
+                video: asked.video,
+                audio: asked.audio && !id.starts_with("mute"),
             }
         }
         fn transition(
@@ -1121,10 +1234,13 @@ mod tests {
             from: Rails,
             to: Rails,
             _requested: Option<RequestedSize>,
-        ) -> Result<Rails, String> {
+        ) -> Result<Rails, RailFailure> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             if lock(&self.failing).contains(id) && !to.is_empty() {
-                return Err("connection refused".to_owned());
+                return Err(RailFailure {
+                    running: from,
+                    reason: "connection refused".to_owned(),
+                });
             }
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
@@ -1143,6 +1259,11 @@ mod tests {
             }
             lock(&self.running).insert(id.to_owned(), to);
             Ok(to)
+        }
+        fn retire(&self, _id: &str, rails: Rails) {
+            if rails.video {
+                self.retired.fetch_add(1, Ordering::SeqCst);
+            }
         }
         fn progress(&self, _id: &str, _rails: Rails) -> u64 {
             self.progress.load(Ordering::SeqCst)
@@ -1205,13 +1326,21 @@ mod tests {
         let manager = manager(&fake, 150);
         let first = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
         let second = manager.acquire("cam", Rails::VIDEO, tag("b"), None);
-        wait("video start", || fake.video_starts.load(Ordering::SeqCst) == 1);
+        wait("video start", || {
+            fake.video_starts.load(Ordering::SeqCst) == 1
+        });
         drop(first);
         std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(fake.video_stops.load(Ordering::SeqCst), 0, "a lease remains");
+        assert_eq!(
+            fake.video_stops.load(Ordering::SeqCst),
+            0,
+            "a lease remains"
+        );
         let released = Instant::now();
         drop(second);
-        wait("video stop", || fake.video_stops.load(Ordering::SeqCst) == 1);
+        wait("video stop", || {
+            fake.video_stops.load(Ordering::SeqCst) == 1
+        });
         assert!(
             released.elapsed() >= Duration::from_millis(140),
             "stopped before the linger"
@@ -1247,7 +1376,9 @@ mod tests {
             ConsumerTag::new(ConsumerClass::AudioRoute, "program"),
             None,
         );
-        wait("audio start", || fake.audio_starts.load(Ordering::SeqCst) == 1);
+        wait("audio start", || {
+            fake.audio_starts.load(Ordering::SeqCst) == 1
+        });
         assert_eq!(fake.video_starts.load(Ordering::SeqCst), 0);
         assert_eq!(manager.status("msnow").running, Rails::AUDIO);
         drop(lease);
@@ -1273,14 +1404,26 @@ mod tests {
         let manager = manager(&fake, 40);
         let set = manager.consumer_set(ConsumerClass::LayoutCell, Rails::VIDEO);
         set.publish(vec![cell("shared", "c1"), cell("old", "c2")]);
-        wait("both start", || fake.video_starts.load(Ordering::SeqCst) == 2);
+        wait("both start", || {
+            fake.video_starts.load(Ordering::SeqCst) == 2
+        });
         // The shared source moves to another cell: a new lease, same decode.
         set.publish(vec![cell("shared", "c9"), cell("new", "c2")]);
-        wait("new start", || fake.video_starts.load(Ordering::SeqCst) == 3);
+        wait("new start", || {
+            fake.video_starts.load(Ordering::SeqCst) == 3
+        });
         wait("old stops", || fake.video_stops.load(Ordering::SeqCst) == 1);
         std::thread::sleep(Duration::from_millis(120));
-        assert_eq!(fake.video_starts.load(Ordering::SeqCst), 3, "shared never restarts");
-        assert_eq!(fake.video_stops.load(Ordering::SeqCst), 1, "only `old` stopped");
+        assert_eq!(
+            fake.video_starts.load(Ordering::SeqCst),
+            3,
+            "shared never restarts"
+        );
+        assert_eq!(
+            fake.video_stops.load(Ordering::SeqCst),
+            1,
+            "only `old` stopped"
+        );
         assert_eq!(lock(&fake.running).get("old"), Some(&Rails::NONE));
         assert_eq!(lock(&fake.running).get("shared"), Some(&Rails::VIDEO));
         set.publish(Vec::new());
@@ -1351,13 +1494,19 @@ mod tests {
             fake.progress.fetch_add(1, Ordering::SeqCst);
             fake.video_starts.load(Ordering::SeqCst) == 500
         });
-        assert!(fake.peak.load(Ordering::SeqCst) <= 4, "stampede past the bound");
+        assert!(
+            fake.peak.load(Ordering::SeqCst) <= 4,
+            "stampede past the bound"
+        );
         drop(leases);
         wait("every source stopped", || {
             fake.progress.fetch_add(1, Ordering::SeqCst);
             manager.active_len() == 0
         });
-        assert!(fake.peak.load(Ordering::SeqCst) <= 8, "stops share a thread bound");
+        assert!(
+            fake.peak.load(Ordering::SeqCst) <= 8,
+            "stops share a thread bound"
+        );
         manager.shutdown();
     }
 
@@ -1368,12 +1517,16 @@ mod tests {
         let dead: Vec<_> = (0..4)
             .map(|i| manager.acquire(&format!("dead{i}"), Rails::VIDEO, tag("x"), None))
             .collect();
-        wait("slots full", || fake.video_starts.load(Ordering::SeqCst) == 4);
+        wait("slots full", || {
+            fake.video_starts.load(Ordering::SeqCst) == 4
+        });
         let next = manager.acquire("next", Rails::VIDEO, tag("x"), None);
         wait("dead sources stop blocking", || {
             fake.video_starts.load(Ordering::SeqCst) == 5
         });
-        assert_eq!(manager.status("dead0").phase, DemandPhase::Failed);
+        wait("every dead source reads failed", || {
+            (0..4).all(|i| manager.status(&format!("dead{i}")).phase == DemandPhase::Failed)
+        });
         drop((dead, next));
         manager.shutdown();
     }
@@ -1389,7 +1542,9 @@ mod tests {
             fake.progress.fetch_add(1, Ordering::SeqCst);
             manager.status("cam").phase == DemandPhase::Live
         });
-        wait("stalled", || manager.status("cam").phase == DemandPhase::Failed);
+        wait("stalled", || {
+            manager.status("cam").phase == DemandPhase::Failed
+        });
         drop(lease);
         manager.shutdown();
     }
@@ -1398,14 +1553,22 @@ mod tests {
     fn a_timed_lease_lapses_and_a_touch_extends_it() {
         let fake = Arc::new(Fake::default());
         let manager = manager(&fake, 1);
-        let ttl = Duration::from_millis(60);
-        assert!(manager.touch("cam", Rails::VIDEO, tag("jpeg"), ttl).is_some());
+        let ttl = Duration::from_millis(400);
+        assert!(manager
+            .touch("cam", Rails::VIDEO, tag("jpeg"), ttl)
+            .is_some());
         wait("start", || fake.video_starts.load(Ordering::SeqCst) == 1);
         for _ in 0..6 {
             std::thread::sleep(Duration::from_millis(20));
-            assert!(manager.touch("cam", Rails::VIDEO, tag("jpeg"), ttl).is_some());
+            assert!(manager
+                .touch("cam", Rails::VIDEO, tag("jpeg"), ttl)
+                .is_some());
         }
-        assert_eq!(fake.video_stops.load(Ordering::SeqCst), 0, "touches extend it");
+        assert_eq!(
+            fake.video_stops.load(Ordering::SeqCst),
+            0,
+            "touches extend it"
+        );
         wait("lapsed", || manager.active_len() == 0);
         manager.shutdown();
     }
@@ -1420,7 +1583,9 @@ mod tests {
                 .touch(&format!("s{i}"), Rails::VIDEO, tag("jpeg"), ttl)
                 .is_some());
         }
-        assert!(manager.touch("over", Rails::VIDEO, tag("jpeg"), ttl).is_none());
+        assert!(manager
+            .touch("over", Rails::VIDEO, tag("jpeg"), ttl)
+            .is_none());
         manager.shutdown();
     }
 
@@ -1431,11 +1596,22 @@ mod tests {
         manager.restart("idle");
         let lease = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
         wait("start", || fake.video_starts.load(Ordering::SeqCst) == 1);
-        manager.restart("cam");
+        manager.request_restart("cam");
         wait("restart", || fake.video_starts.load(Ordering::SeqCst) == 2);
         assert_eq!(fake.video_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.retired.load(Ordering::SeqCst),
+            0,
+            "last-good survives an edit"
+        );
         assert!(!lock(&fake.running).contains_key("idle"));
         drop(lease);
+        wait("final stop", || manager.active_len() == 0);
+        assert_eq!(
+            fake.retired.load(Ordering::SeqCst),
+            1,
+            "a final stop retires"
+        );
         manager.shutdown();
     }
 
@@ -1453,10 +1629,43 @@ mod tests {
         manager.set_pins("cam", vec![pin("cam"), pin("slate")]);
         wait("pinned", || fake.video_starts.load(Ordering::SeqCst) == 2);
         manager.set_pins("cam", vec![pin("cam")]);
-        wait("slate released", || fake.video_stops.load(Ordering::SeqCst) == 1);
+        wait("slate released", || {
+            fake.video_stops.load(Ordering::SeqCst) == 1
+        });
         assert_eq!(fake.video_starts.load(Ordering::SeqCst), 2);
         manager.set_pins("cam", Vec::new());
         wait("all released", || manager.active_len() == 0);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn a_seeded_set_holds_its_leases_before_the_worker_starts() {
+        let fake = Arc::new(Fake::default());
+        let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(&fake);
+        let registry = SourceRegistry::new();
+        let manager = DemandManager::new(Arc::clone(&registry), driver, config(20));
+        let set = manager.consumer_set(ConsumerClass::LayoutCell, Rails::VIDEO);
+        let size = RequestedSize {
+            width: 320,
+            height: 180,
+        };
+        set.seed(vec![SetItem {
+            id: Arc::from("cam"),
+            label: Arc::from("c1"),
+            size: Some(size),
+        }]);
+        assert_eq!(
+            registry.active_len(),
+            1,
+            "a seeded lease holds a registry entry"
+        );
+        assert_eq!(
+            registry.requested_supremum(&SourceKey::from_canonical("cam")),
+            Some(size)
+        );
+        assert_eq!(manager.status("cam").consumers.len(), 1);
+        manager.start();
+        wait("start", || fake.video_starts.load(Ordering::SeqCst) == 1);
         manager.shutdown();
     }
 
@@ -1470,7 +1679,11 @@ mod tests {
         manager.adopt("boot", Rails::VIDEO);
         manager.start();
         std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(fake.video_starts.load(Ordering::SeqCst), 0, "already running");
+        assert_eq!(
+            fake.video_starts.load(Ordering::SeqCst),
+            0,
+            "already running"
+        );
         set.publish(Vec::new());
         wait("stopped", || fake.video_stops.load(Ordering::SeqCst) == 1);
         manager.shutdown();

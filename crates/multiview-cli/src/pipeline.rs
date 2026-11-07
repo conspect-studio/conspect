@@ -10614,6 +10614,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         live,
         lifecycle: 0,
         anchor_floor: 0,
+        audio_only: false,
     })
 }
 

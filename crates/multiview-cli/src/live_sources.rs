@@ -588,6 +588,47 @@ fn teardown(id: &str, owned: &mut HashMap<String, Producer>, registry: &StopRegi
     await_exits(id, &registered);
 }
 
+/// Stop one rail of source `id` and bounded-wait for it to leave, off the
+/// output clock. The video rail is `id` plus every `{id}/` companion except the
+/// audio decode; the audio rail is `{id}/audio`. `owned` handles are joined
+/// bounded. Producers that overrun the grace window are detached and warned.
+pub fn stop_rail(
+    registry: &StopRegistry,
+    id: &str,
+    video: bool,
+    audio: bool,
+    owned: Vec<JoinHandle<()>>,
+) {
+    let prefix = format!("{id}/");
+    let audio_key = format!("{id}/audio");
+    let registered: Vec<ProducerStop> = match registry.lock() {
+        Ok(mut map) => {
+            let keys: Vec<String> = map
+                .keys()
+                .filter(|key| {
+                    let is_audio = **key == audio_key;
+                    let is_video = !is_audio && (*key == id || key.starts_with(&prefix));
+                    (video && is_video) || (audio && is_audio)
+                })
+                .cloned()
+                .collect();
+            keys.iter().filter_map(|key| map.remove(key)).collect()
+        }
+        Err(poisoned) => {
+            tracing::warn!(source = %id, "stop registry poisoned during a rail stop");
+            drop(poisoned);
+            Vec::new()
+        }
+    };
+    for producer in &registered {
+        producer.stop.store(true, Ordering::Release);
+    }
+    for handle in owned {
+        join_bounded(id, handle);
+    }
+    await_exits(id, &registered);
+}
+
 /// Bounded-wait until every producer's `exited` latch is set (it left), so a
 /// replacement never races a still-writing predecessor on a reused store.
 fn await_exits(id: &str, producers: &[ProducerStop]) {
