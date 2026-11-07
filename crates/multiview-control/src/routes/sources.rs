@@ -278,6 +278,11 @@ pub(crate) fn accepted_sources(state: &AppState) -> ControlResult<Vec<VersionedR
         .map_or_else(|| state.sources.list(), Ok)
 }
 
+/// Whether `id` names an accepted source.
+pub(crate) fn accepted_source_exists(state: &AppState, id: &str) -> bool {
+    accepted_source(state, id).is_ok()
+}
+
 fn accepted_source(state: &AppState, id: &str) -> ControlResult<VersionedResource> {
     accepted_sources(state)?
         .into_iter()

@@ -4040,7 +4040,14 @@ impl Pipeline {
         for event in crate::control::input_streams_events(&self.inventories) {
             publisher.publish_event(event);
         }
-        let input_fragment = crate::control::input_inventories_fragment(&self.inventories);
+        // Boot inventories seed the live map; a source started on demand adds
+        // its own when its rail starts (it was never probed while idle).
+        for (id, inventory) in &self.inventories {
+            set_live_inventory(id, Some(inventory.clone()));
+        }
+        let inventory_cell = live_inventories();
+        let mut inventory_seen = Arc::clone(&inventory_cell.load());
+        let mut input_fragment = crate::control::input_inventories_fragment(&inventory_seen);
         // (The DRM/KMS display heads — and their DEV-B4 audio sinks — were
         // started above, before the egress spawn, so the bake consumer received
         // the audio publishers; `display_publishers` feeds the video mailboxes
@@ -4166,6 +4173,13 @@ impl Pipeline {
             // the control plane's read-only `GET /inputs/{id}/streams` can show
             // every stream (RT-3). The fragment is pre-built (a tiny static clone
             // per tick); a `None` fragment (no inputs probed) is a no-op.
+            // Re-fold only when a demand start changed the map (a pointer compare
+            // per tick; the rebuild is rare and off every input).
+            let latest = inventory_cell.load();
+            if !Arc::ptr_eq(&latest, &inventory_seen) {
+                input_fragment = crate::control::input_inventories_fragment(&latest);
+                inventory_seen = latest;
+            }
             crate::control::insert_input_fragment(&mut snapshot, input_fragment.as_ref());
             // And the per-tile lifecycle states, so a connecting client is
             // seeded with the CURRENT tile states (the `tiles` `$snapshot`)
@@ -7476,6 +7490,7 @@ impl crate::source_rails::RailSpawner for DemandSpawner {
         if let Some(kind) = crate::synth::SyntheticKind::from_source_kind(&source.kind) {
             return self.start_generator(source, kind, store).map(|h| vec![h]);
         }
+        probe_on_start(source);
         // A fresh lifecycle fences any detached writer of a previous run.
         let lifecycle = begin_live_lifecycle(&source.id);
         let produced = self
@@ -14377,6 +14392,54 @@ pub struct LiveAnchor {
 /// first live frame on the output timeline). Written by the video ingest
 /// thread, read by anyone (audio) without blocking (invariants #1/#10).
 pub type LiveAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveAnchor>>>>;
+
+/// The input stream inventories known to the running pipeline: boot-probed
+/// sources plus sources probed when demand started them.
+type InventoryMap =
+    Arc<std::collections::BTreeMap<String, multiview_core::stream::StreamInventory>>;
+
+fn live_inventories() -> &'static multiview_framestore::SwapCell<InventoryMap> {
+    static CELL: std::sync::OnceLock<multiview_framestore::SwapCell<InventoryMap>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        multiview_framestore::SwapCell::from_pointee(std::collections::BTreeMap::new())
+    })
+}
+
+/// Record (or with `None` forget) `id`'s inventory.
+pub(crate) fn set_live_inventory(
+    id: &str,
+    inventory: Option<multiview_core::stream::StreamInventory>,
+) {
+    live_inventories().rcu(|current| {
+        let mut next = current.as_ref().clone();
+        match &inventory {
+            Some(inventory) => {
+                next.insert(id.to_owned(), inventory.clone());
+            }
+            None => {
+                next.remove(id);
+            }
+        }
+        next
+    });
+}
+
+/// Probe a file source's inventory when demand starts it, off the clock on the
+/// demand rail thread. Network sources are inventoried by their own ingest.
+fn probe_on_start(source: &Source) {
+    if let SourceKind::File { path } = &source.kind {
+        match multiview_ffmpeg::Demuxer::open(std::path::Path::new(path)) {
+            Ok(demux) => set_live_inventory(
+                &source.id,
+                Some(demux.inventory().with_input_id(source.id.clone())),
+            ),
+            Err(error) => {
+                tracing::warn!(source = %source.id, %error, "could not probe stream inventory on start");
+            }
+        }
+    }
+}
 
 /// The audio stores each running audio rail publishes into, for the demand
 /// manager's progress check. Written when a rail starts or stops, read wait-free.
