@@ -2442,4 +2442,30 @@ mod tests {
         drop(lease);
         manager.shutdown();
     }
+
+    /// Lease churn on a ready source. `DEMAND_LEASE_CYCLES` sets the count so
+    /// an external malloc counter (LD_PRELOAD) can difference two runs for
+    /// the per-lease allocation figure; it defaults to a small smoke count.
+    #[test]
+    fn lease_cycles_on_a_ready_source_leave_nothing_behind() {
+        let cycles: usize = std::env::var("DEMAND_LEASE_CYCLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let fake = Arc::new(Fake::default());
+        let manager = manager(&fake, 60_000);
+        let standing = manager.acquire("cam", Rails::VIDEO, tag("always_on"), None);
+        wait("ready", || {
+            fake.progress.fetch_add(1, Ordering::SeqCst);
+            manager.status("cam").phase == DemandPhase::Ready
+        });
+        let viewer = tag("viewer");
+        for _ in 0..cycles {
+            drop(manager.acquire("cam", Rails::VIDEO, viewer.clone(), None));
+        }
+        assert_eq!(manager.status("cam").consumers.len(), 1);
+        assert_eq!(fake.video_starts.load(Ordering::SeqCst), 1);
+        drop(standing);
+        manager.shutdown();
+    }
 }
