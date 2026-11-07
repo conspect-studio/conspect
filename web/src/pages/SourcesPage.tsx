@@ -6,6 +6,7 @@
 // (ADR-W015). The LIVE STATUS column reads the realtime tile map the WebSocket
 // hook mirrors into the Query cache; a source outside the running engine shows
 // "—" with an explanation, because honesty beats a fabricated state.
+import { M3uImportButton } from './M3uImportDialog';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import type { ColumnDef } from '@tanstack/react-table';
@@ -1019,7 +1020,12 @@ export function SourcesPage(): JSX.Element {
       emptyMessage={<Trans>No sources configured.</Trans>}
       loadingMessage={<Trans>Loading sources…</Trans>}
       errorPrefix={<Trans>Could not load sources:</Trans>}
-      headerExtras={<ExportConfigButton compact />}
+      headerExtras={
+        <>
+          <M3uImportButton />
+          <ExportConfigButton compact />
+        </>
+      }
       callout={
         <ApplySemanticsCallout
           helpTo="/help/config#sources"

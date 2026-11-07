@@ -17,6 +17,7 @@ import { SalvosPage } from "../pages/SalvosPage";
 import { MediaPlayersPage } from "../pages/MediaPlayersPage";
 import { AlarmsPage } from "../pages/AlarmsPage";
 import { AudioPage } from "../pages/AudioPage";
+import { IptvPage } from "../pages/IptvPage";
 import { DeviceDetailPage } from "../pages/DeviceDetailPage";
 import { DevicesPage } from "../pages/DevicesPage";
 import { ProbesPage } from "../pages/ProbesPage";
@@ -63,6 +64,7 @@ export const router = createBrowserRouter([
       { path: "outputs", element: <OutputsPage /> },
       { path: "overlays", element: <OverlaysPage /> },
       { path: "audio", element: <AudioPage /> },
+      { path: "iptv", element: <IptvPage /> },
       { path: "devices", element: <DevicesPage /> },
       { path: "devices/:id", element: <DeviceDetailPage /> },
       { path: "cast", element: <CastPage /> },
