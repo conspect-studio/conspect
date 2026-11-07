@@ -12618,7 +12618,7 @@ fn open_and_stream(
                 (
                     crate::source_event_packet::MetadataKind::Scte35,
                     stream.time_base(),
-                    u16::try_from(stream.id()).ok(),
+                    u16::try_from(stream.id()).ok().filter(|pid| *pid != 0),
                 ),
             )),
             ffmpeg::codec::Id::TIMED_ID3 => Some((
@@ -12626,7 +12626,7 @@ fn open_and_stream(
                 (
                     crate::source_event_packet::MetadataKind::Id3,
                     stream.time_base(),
-                    u16::try_from(stream.id()).ok(),
+                    u16::try_from(stream.id()).ok().filter(|pid| *pid != 0),
                 ),
             )),
             _ => None,

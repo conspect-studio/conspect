@@ -249,8 +249,9 @@ mod tests {
         assert!(result[0].trusted);
     }
     /// libav stamps a PES-less SCTE-35 section with the last PCR (measured on a
-    /// synthetic TS: section at PCR 113400, first video PTS 133200). A stamp that
-    /// far ahead of the video PTS falls before its bracket, so it stays untrusted.
+    /// synthetic TS: section at PCR 113400, first video PTS 133200). PCR runs behind
+    /// the video PTS by the mux delay, so the stamp falls before its bracket and the
+    /// section stays untrusted.
     /// This gate remains the only path to a splice boundary.
     #[test]
     fn a_pcr_stamped_section_ahead_of_its_video_pts_is_not_trusted() {

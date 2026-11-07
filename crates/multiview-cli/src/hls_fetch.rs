@@ -1079,6 +1079,7 @@ fn coordinate(
                             media_sequence: seg.seq,
                             uri: multiview_input::hls_journal::sanitize_uri(&seg.uri),
                             first_pts: multiview_input::hls_journal::first_pes_pts(&bytes),
+                            pids: multiview_input::hls_journal::metadata_pids(&bytes),
                         });
                     }
                     let gap = std::mem::take(&mut sched.gap);

@@ -294,6 +294,70 @@ fn pes_pts(payload: &[u8]) -> Option<(u8, u64)> {
     Some((stream_id, pts))
 }
 
+/// PIDs that carry markers, read from a segment's own PAT and PMT.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataPids {
+    /// SCTE-35 (`stream_type` 0x86).
+    pub scte35: Vec<u16>,
+    /// Timed ID3 (`stream_type` 0x15).
+    pub id3: Vec<u16>,
+}
+
+fn psi_section(segment: &[u8], pid: u16) -> Option<&[u8]> {
+    segment
+        .chunks_exact(TS_PACKET)
+        .take(MAX_SCANNED_PACKETS)
+        .find_map(|packet| {
+            let &[0x47, b1, b2, b3, ..] = packet else {
+                return None;
+            };
+            let this = (u16::from(b1 & 0x1F) << 8) | u16::from(b2);
+            if this != pid || b1 & 0x40 == 0 || b3 & 0x10 == 0 {
+                return None;
+            }
+            let start = if b3 & 0x20 == 0 {
+                4
+            } else {
+                5 + usize::from(*packet.get(4)?)
+            };
+            let pointer = usize::from(*packet.get(start)?);
+            let section = packet.get(start + 1 + pointer..)?;
+            let &[_, l1, l2, ..] = section else {
+                return None;
+            };
+            let length = (usize::from(l1 & 0x0F) << 8 | usize::from(l2)) + 3;
+            // Multi-packet tables are rare for a PAT/PMT; skip rather than assemble.
+            section.get(..length)
+        })
+}
+
+/// The marker PIDs of a TS segment. Empty when the tables are absent or
+/// span packets. libav reports these PIDs as 0 behind its HLS demuxer.
+#[must_use]
+pub fn metadata_pids(segment: &[u8]) -> MetadataPids {
+    use crate::mpegts::pmt::StreamType;
+    let mut out = MetadataPids::default();
+    let Some(pat) = psi_section(segment, 0).and_then(|s| crate::mpegts::pat::Pat::parse(s).ok())
+    else {
+        return out;
+    };
+    for program in pat.programs.iter().filter(|p| !p.is_network()) {
+        let Some(pmt) = psi_section(segment, program.pid)
+            .and_then(|s| crate::mpegts::pmt::Pmt::parse(s).ok())
+        else {
+            continue;
+        };
+        for stream in &pmt.streams {
+            match stream.stream_type {
+                StreamType::Scte35 => out.scte35.push(stream.pid),
+                StreamType::Other(0x15) => out.id3.push(stream.pid),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// The first video PES PTS of a TS segment, else its first audio PES PTS.
 #[must_use]
 pub fn first_pes_pts(segment: &[u8]) -> Option<u64> {
@@ -386,6 +450,43 @@ PLANNED-DURATION=30,SCTE35-OUT=0xFC302F000000000000FFFFF0140548000\
         p.push(1 | (u8::try_from(pts & 0x7F).unwrap() << 1));
         p.resize(TS_PACKET, 0xFF);
         p
+    }
+
+    fn psi(pid: u16, table: &[u8]) -> Vec<u8> {
+        let mut section = table.to_vec();
+        let length = u16::try_from(section.len() + 4 - 3).unwrap();
+        section[1] = 0xB0 | u8::try_from(length >> 8).unwrap();
+        section[2] = u8::try_from(length & 0xFF).unwrap();
+        let crc = crate::mpegts::crc::crc32_mpeg2(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        let mut packet = vec![
+            0x47,
+            0x40 | u8::try_from(pid >> 8).unwrap(),
+            u8::try_from(pid & 0xFF).unwrap(),
+            0x10,
+            0,
+        ];
+        packet.extend_from_slice(&section);
+        packet.resize(TS_PACKET, 0xFF);
+        packet
+    }
+
+    #[test]
+    fn marker_pids_come_from_the_segment_pmt() {
+        let pat = psi(0, &[0x00, 0, 0, 0, 1, 0xC1, 0, 0, 0, 1, 0xF0, 0x00]);
+        let pmt = psi(
+            0x1000,
+            &[
+                0x02, 0, 0, 0, 1, 0xC1, 0, 0, 0xE1, 0x00, 0xF0, 0x00, //
+                0x1B, 0xE1, 0x00, 0xF0, 0x00, // H.264 on 0x100
+                0x86, 0xE1, 0xE3, 0xF0, 0x00, // SCTE-35 on 0x1E3
+                0x15, 0xE1, 0xE4, 0xF0, 0x00, // timed ID3 on 0x1E4
+            ],
+        );
+        let pids = metadata_pids(&[pat, pmt].concat());
+        assert_eq!(pids.scte35, vec![0x1E3]);
+        assert_eq!(pids.id3, vec![0x1E4]);
+        assert_eq!(metadata_pids(&[0_u8; 188]), MetadataPids::default());
     }
 
     #[test]

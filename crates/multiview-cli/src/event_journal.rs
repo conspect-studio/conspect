@@ -87,6 +87,8 @@ pub enum Observation {
         uri: String,
         /// First PES PTS.
         first_pts: Option<u64>,
+        /// Marker PIDs from the segment's PMT.
+        pids: multiview_input::hls_journal::MetadataPids,
     },
     /// Persist pending repeat counters.
     Flush,
@@ -378,6 +380,7 @@ struct SegmentContext {
 
 #[derive(Default)]
 struct SourceState {
+    pids: multiview_input::hls_journal::MetadataPids,
     pdt_by_sequence: BTreeMap<u64, i64>,
     segments: VecDeque<SegmentContext>,
     pdt: Option<ClockAnchor>,
@@ -408,6 +411,19 @@ impl SourceState {
                 .first_pts
                 .is_some_and(|first| (0..MAX_ANCHOR_DISTANCE_TICKS).contains(&pts_delta(pts, first)))
         })
+    }
+    /// The demuxer's PID when it has one, else the single PID the PMT declares.
+    fn pid_for(&self, kind: PacketKind, reported: Option<u16>) -> Option<u16> {
+        let declared = match kind {
+            PacketKind::Scte35 => &self.pids.scte35,
+            PacketKind::Id3 => &self.pids.id3,
+        };
+        reported
+            .filter(|pid| *pid != 0)
+            .or_else(|| match declared.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            })
     }
     fn transport(&self, pid: Option<u16>, pts: Option<u64>) -> JournalTransport {
         let segment = pts.and_then(|pts| self.segment_at(pts));
@@ -584,8 +600,12 @@ impl JournalWorker {
                 media_sequence,
                 uri,
                 first_pts,
+                pids,
             } => {
                 let state = self.sources.entry(source).or_default();
+                if pids != multiview_input::hls_journal::MetadataPids::default() {
+                    state.pids = pids;
+                }
                 if state.segments.len() == MAX_SEGMENTS {
                     state.segments.pop_front();
                 }
@@ -621,11 +641,8 @@ impl JournalWorker {
         if self.store.repeat(&key, received_ns) {
             return;
         }
-        let transport = self
-            .sources
-            .entry(source.to_owned())
-            .or_default()
-            .transport(pid, pts);
+        let state = self.sources.entry(source.to_owned()).or_default();
+        let transport = state.transport(state.pid_for(PacketKind::Scte35, pid), pts);
         let clocks = self.clocks(source);
         let mut draft = Draft {
             source: source.to_owned(),
@@ -714,7 +731,7 @@ impl JournalWorker {
             return;
         }
         let state = self.sources.entry(source.to_owned()).or_default();
-        let transport = state.transport(pid, pts);
+        let transport = state.transport(state.pid_for(PacketKind::Id3, pid), pts);
         let mut draft = Draft {
             source: source.to_owned(),
             received_ns,
@@ -1232,10 +1249,25 @@ mod tests {
             media_sequence: 7,
             uri: "7.ts".into(),
             first_pts: Some(SPLICE - 900_000),
+            pids: multiview_input::hls_journal::MetadataPids {
+                scte35: vec![0x1E3],
+                id3: Vec::new(),
+            },
+        });
+        // Behind the HLS demuxer libav reports PID 0; the PMT supplies it.
+        w.handle(Observation::Packet {
+            source: "cnn".into(),
+            kind: PacketKind::Scte35,
+            bytes: vec![0xFC],
+            pid: Some(0),
+            pts_90k: Some(SPLICE - 450_000),
+            received_ns: utc,
         });
         w.handle(packet(PacketKind::Scte35, section(), SPLICE - 450_000, utc + 1));
         let rows = records(dir.path());
-        assert_eq!(rows.len(), 2, "the reloaded tag is a repeat");
+        assert_eq!(rows.len(), 3, "the reloaded tag is a repeat");
+        assert_eq!(rows[1].transport.pid, Some(0x1E3));
+        let rows = [rows[0].clone(), rows[2].clone()];
         assert_eq!(rows[0].transport.media_sequence, Some(7));
         assert_eq!(rows[0].transport.segment_uri.as_deref(), Some("7.ts"));
         assert_eq!(rows[0].transport.program_date_time, Some(rfc3339_ns(utc)));

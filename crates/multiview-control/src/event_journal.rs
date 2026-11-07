@@ -137,8 +137,8 @@ pub struct JournalRecord {
     pub summary: String,
     /// Transport context.
     pub transport: JournalTransport,
-    /// 90 kHz PTS of the carrying packet. SCTE-35 sections have no PES header,
-    /// so the demuxer reports the last PCR for them.
+    /// 90 kHz time of the carrying packet. SCTE-35 sections have no PES header, so
+    /// the demuxer reports the last PCR, which trails video PTS by the mux delay.
     pub source_pts: Option<u64>,
     /// `base64` for binary payloads, `text` for HLS tag lines.
     pub raw_encoding: String,
