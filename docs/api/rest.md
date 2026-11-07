@@ -108,6 +108,33 @@ Standard collection/item conventions apply across resources (`GET` list, `POST` 
 | `GET` | `/api/v1/sources/{id}/color` | Resolved 4-axis color + per-axis provenance (RO) |
 | `GET` | `/api/v1/sources/{id}/status` · `/info` · `/tracks` · `/metrics` | Health/state, stream info, A/V/sub tracks, metrics (RO) |
 
+### 3.1.1 Event journal
+
+Every raw marker a source carries (SCTE-35 sections, timed ID3 tags, HLS cue tags) is
+appended, with its full decode and derived times, to
+`.multiview/events/<source>/<YYYY-MM-DD>.jsonl` under the state directory. A dedicated
+thread writes behind a bounded queue, so a stalled disk drops and counts records and
+never back-pressures ingest. Exact repeats within 60 seconds fold into a counter.
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /api/v1/inputs/{id}/events/journal?from=&to=&origin=&limit=&cursor=` | read, per object | One newest-first page |
+| `GET /api/v1/inputs/{id}/events/journal.jsonl` | read, per object | Streamed download, oldest first |
+| `GET /api/v1/events/journal.jsonl` | unscoped admin | Every source |
+
+`{"kind":"repeat","of":<record_id>,...}` lines in a download add to the named record's
+`repeats`; the page route folds them for you. Times under `timing` are predictions from
+the clock named in `clock_source`, never engine state, and no journal field drives an
+overlay or automation.
+
+Retention is set by `[events]`, read at startup:
+
+```toml
+[events]
+journal_retention_days = 14       # default
+journal_max_bytes = 268435456     # default, across all sources
+```
+
 ### 3.2 Layouts (canvas / cells / overlays)
 
 | Method | Path | Purpose |

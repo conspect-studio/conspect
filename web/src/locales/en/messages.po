@@ -89,13 +89,13 @@ msgid "{0} documentation results"
 msgstr "{0} documentation results"
 
 #. placeholder {0}: stats.dropped
-#: src/events/JournalPanel.tsx:106
+#: src/events/JournalPanel.tsx:111
 msgid "{0} observations were dropped since this server started, so this history has gaps."
 msgstr "{0} observations were dropped since this server started, so this history has gaps."
 
 #. placeholder {0}: durationSeconds(marker.duration_ms)
 #. placeholder {0}: durationSeconds(timing.pre_roll_ms)
-#: src/events/JournalPanel.tsx:23
+#: src/events/JournalPanel.tsx:27
 #: src/events/SourceEventsButton.tsx:66
 msgid "{0} seconds"
 msgstr "{0} seconds"
@@ -817,7 +817,7 @@ msgstr "Advisories (saving still allowed):"
 msgid "After adoption"
 msgstr "After adoption"
 
-#: src/events/JournalPanel.tsx:26
+#: src/events/JournalPanel.tsx:30
 msgid "Airs on program (UTC)"
 msgstr "Airs on program (UTC)"
 
@@ -856,7 +856,7 @@ msgstr "Alarms matching the current filter."
 msgid "Align"
 msgstr "Align"
 
-#: src/events/JournalPanel.tsx:80
+#: src/events/JournalPanel.tsx:85
 msgid "All"
 msgstr "All"
 
@@ -1394,7 +1394,7 @@ msgstr "Bounded skew: the decoder runs its own clock, so its presentation drifts
 msgid "Breadcrumb"
 msgstr "Breadcrumb"
 
-#: src/events/JournalPanel.tsx:25
+#: src/events/JournalPanel.tsx:29
 msgid "Break end (UTC)"
 msgstr "Break end (UTC)"
 
@@ -1815,7 +1815,7 @@ msgstr "Cleared only"
 msgid "Clip"
 msgstr "Clip"
 
-#: src/events/JournalPanel.tsx:27
+#: src/events/JournalPanel.tsx:31
 msgid "Clock"
 msgstr "Clock"
 
@@ -2656,7 +2656,7 @@ msgstr "Decode slots the device offers. Binding one creates an ordinary managed 
 msgid "Decode targets"
 msgstr "Decode targets"
 
-#: src/events/JournalPanel.tsx:53
+#: src/events/JournalPanel.tsx:58
 msgid "Decoded"
 msgstr "Decoded"
 
@@ -2841,12 +2841,12 @@ msgstr "Destination URL"
 msgid "Detail"
 msgstr "Detail"
 
-#: src/events/JournalPanel.tsx:121
+#: src/events/JournalPanel.tsx:126
 msgid "Details"
 msgstr "Details"
 
 #. placeholder {0}: record.record_id
-#: src/events/JournalPanel.tsx:44
+#: src/events/JournalPanel.tsx:49
 msgid "Details: {0}"
 msgstr "Details: {0}"
 
@@ -3039,7 +3039,7 @@ msgstr "Document shape"
 msgid "Documentation"
 msgstr "Documentation"
 
-#: src/events/JournalPanel.tsx:102
+#: src/events/JournalPanel.tsx:107
 msgid "Download"
 msgstr "Download"
 
@@ -3738,7 +3738,7 @@ msgstr "Frame-accurate: every node presents the same frame index, with at most a
 msgid "Fresh frames are arriving; the tile shows the newest one. This is the normal state."
 msgstr "Fresh frames are arriving; the tile shows the newest one. This is the normal state."
 
-#: src/events/JournalPanel.tsx:86
+#: src/events/JournalPanel.tsx:91
 msgid "From"
 msgstr "From"
 
@@ -4041,7 +4041,7 @@ msgstr "HH:MM:SS:FF (with frames)"
 msgid "Hidden (decode-skip)"
 msgstr "Hidden (decode-skip)"
 
-#: src/events/JournalPanel.tsx:45
+#: src/events/JournalPanel.tsx:50
 msgid "Hide"
 msgstr "Hide"
 
@@ -4765,7 +4765,7 @@ msgstr "Load asset into player"
 msgid "Load candidates"
 msgstr "Load candidates"
 
-#: src/events/JournalPanel.tsx:127
+#: src/events/JournalPanel.tsx:132
 msgid "Load older records"
 msgstr "Load older records"
 
@@ -4902,7 +4902,7 @@ msgstr "Loading sync groups…"
 msgid "Loading tally state…"
 msgstr "Loading tally state…"
 
-#: src/events/JournalPanel.tsx:112
+#: src/events/JournalPanel.tsx:117
 msgid "Loading the journal…"
 msgstr "Loading the journal…"
 
@@ -5388,7 +5388,7 @@ msgstr "Mute {label}"
 msgid "Mute on the program mix (route {row})"
 msgstr "Mute on the program mix (route {row})"
 
-#: src/events/JournalPanel.tsx:119
+#: src/events/JournalPanel.tsx:124
 #: src/pages/CastPage.tsx:255
 #: src/pages/CastPage.tsx:316
 #: src/pages/DeviceDetailPage.tsx:1042
@@ -5639,7 +5639,7 @@ msgstr "No internet here?"
 msgid "No internet path? Pair this machine by hand instead of with a code."
 msgstr "No internet path? Pair this machine by hand instead of with a code."
 
-#: src/events/JournalPanel.tsx:113
+#: src/events/JournalPanel.tsx:118
 msgid "No journal records match these filters."
 msgstr "No journal records match these filters."
 
@@ -6118,8 +6118,8 @@ msgstr "Optional <0>captions</0> select a caption or subtitle track (auto, telet
 msgid "Optional for display nodes — an enrolled node is located by its keypair identity."
 msgstr "Optional for display nodes — an enrolled node is located by its keypair identity."
 
-#: src/events/JournalPanel.tsx:74
-#: src/events/JournalPanel.tsx:118
+#: src/events/JournalPanel.tsx:79
+#: src/events/JournalPanel.tsx:123
 msgid "Origin"
 msgstr "Origin"
 
@@ -6399,7 +6399,7 @@ msgstr "Position (frames)"
 msgid "Pre-encode canvas approximation"
 msgstr "Pre-encode canvas approximation"
 
-#: src/events/JournalPanel.tsx:23
+#: src/events/JournalPanel.tsx:27
 msgid "Pre-roll"
 msgstr "Pre-roll"
 
@@ -6650,7 +6650,7 @@ msgstr "Raise ticket"
 msgid "Range"
 msgstr "Range"
 
-#: src/events/JournalPanel.tsx:55
+#: src/events/JournalPanel.tsx:60
 msgid "Raw"
 msgstr "Raw"
 
@@ -6671,8 +6671,8 @@ msgid "Read the in-app documentation"
 msgstr "Read the in-app documentation"
 
 #: src/events/SourceEventsButton.tsx:187
-msgid "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time."
-msgstr "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time."
+msgid "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Lifecycle timers use the source presentation clock. Marker times are predictions from the clock each one names, and their countdowns run against this browser's clock."
+msgstr "Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Lifecycle timers use the source presentation clock. Marker times are predictions from the clock each one names, and their countdowns run against this browser's clock."
 
 #: src/docs/registry.ts:208
 #: src/pages/docs/ApiPage.tsx:96
@@ -6758,7 +6758,7 @@ msgstr "Redactions in this pack"
 msgid "Redistributable"
 msgstr "Redistributable"
 
-#: src/events/JournalPanel.tsx:92
+#: src/events/JournalPanel.tsx:97
 msgid "Refresh"
 msgstr "Refresh"
 
@@ -7418,7 +7418,7 @@ msgstr "Short-term (3 s)"
 msgid "Shortcuts: F1 = TAKE (preview to air), F2 = CLEAR (off air), Space = NEXT (cue the next rundown item). Click a rundown row to cue it. Drag rows, or press Alt+↑ / Alt+↓ on a row, to reorder."
 msgstr "Shortcuts: F1 = TAKE (preview to air), F2 = CLEAR (off air), Space = NEXT (cue the next rundown item). Click a rundown row to cue it. Drag rows, or press Alt+↑ / Alt+↓ on a row, to reorder."
 
-#: src/events/JournalPanel.tsx:45
+#: src/events/JournalPanel.tsx:50
 msgid "Show"
 msgstr "Show"
 
@@ -7551,11 +7551,11 @@ msgstr "Specific date & time"
 msgid "Spend buffer where the network is bad (the internet leg), not where it is good (the facility LAN)."
 msgstr "Spend buffer where the network is bad (the internet leg), not where it is good (the facility LAN)."
 
-#: src/events/JournalPanel.tsx:24
+#: src/events/JournalPanel.tsx:28
 msgid "Splice (UTC)"
 msgstr "Splice (UTC)"
 
-#: src/events/JournalPanel.tsx:22
+#: src/events/JournalPanel.tsx:26
 msgid "Splice PTS"
 msgstr "Splice PTS"
 
@@ -7777,7 +7777,7 @@ msgstr "Subtitle track (id / language)"
 msgid "Successive frames differing by less than this per-mille of full-scale luma count as frozen."
 msgstr "Successive frames differing by less than this per-mille of full-scale luma count as frozen."
 
-#: src/events/JournalPanel.tsx:120
+#: src/events/JournalPanel.tsx:125
 msgid "Summary"
 msgstr "Summary"
 
@@ -8147,11 +8147,11 @@ msgstr "The engine must ingest this source before a preview is available. WebRTC
 msgid "The engine. It ingests that feed plus three built-in test patterns into a 2x2 canvas, encodes once, and writes HLS to a named volume."
 msgstr "The engine. It ingests that feed plus three built-in test patterns into a 2x2 canvas, encodes once, and writes HLS to a named volume."
 
-#: src/events/JournalPanel.tsx:111
+#: src/events/JournalPanel.tsx:116
 msgid "The event journal could not be read."
 msgstr "The event journal could not be read."
 
-#: src/events/JournalPanel.tsx:110
+#: src/events/JournalPanel.tsx:115
 msgid "The event journal is busy or unavailable. Try again shortly."
 msgstr "The event journal is busy or unavailable. Try again shortly."
 
@@ -8187,7 +8187,7 @@ msgstr "The identifier is fixed once created. Source, tally, and UMD recall clau
 msgid "The immutable change log: who changed what, and when, on the engine media timeline. Read-only."
 msgstr "The immutable change log: who changed what, and when, on the engine media timeline. Read-only."
 
-#: src/events/JournalPanel.tsx:105
+#: src/events/JournalPanel.tsx:110
 msgid "The journal could not be downloaded."
 msgstr "The journal could not be downloaded."
 
@@ -8596,7 +8596,7 @@ msgstr "This screen is part of an upcoming milestone."
 msgid "This source has never been active; connect it before injecting a test event."
 msgstr "This source has never been active; connect it before injecting a test event."
 
-#: src/events/JournalPanel.tsx:109
+#: src/events/JournalPanel.tsx:114
 msgid "This source has no journal yet."
 msgstr "This source has no journal yet."
 
@@ -8649,7 +8649,7 @@ msgstr "Tile status"
 msgid "Tiles"
 msgstr "Tiles"
 
-#: src/events/JournalPanel.tsx:117
+#: src/events/JournalPanel.tsx:122
 #: src/pages/LogsPage.tsx:172
 msgid "Time"
 msgstr "Time"
@@ -8689,7 +8689,7 @@ msgstr "Timing & sync"
 msgid "Title"
 msgstr "Title"
 
-#: src/events/JournalPanel.tsx:89
+#: src/events/JournalPanel.tsx:94
 msgid "To"
 msgstr "To"
 
@@ -9301,7 +9301,7 @@ msgstr "You can also run the binary directly against a config file with <0>multi
 msgid "You do not have permission to read this source's events."
 msgstr "You do not have permission to read this source's events."
 
-#: src/events/JournalPanel.tsx:108
+#: src/events/JournalPanel.tsx:113
 msgid "You do not have permission to read this source's journal."
 msgstr "You do not have permission to read this source's journal."
 

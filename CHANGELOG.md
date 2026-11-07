@@ -31,6 +31,12 @@ implementation will build against.
 
 ### Added
 
+- **Event journal.** Every raw SCTE-35, timed ID3 and HLS cue observation is recorded off-clock
+  with its full decode, predicted wall-clock and on-air times, per source and day, with bounded
+  retention (`[events]`). Read it in the Events dialog's Journal tab, or through
+  `GET /api/v1/inputs/{id}/events/journal` and `.../journal.jsonl`. The Events panel now shows
+  decoded markers with times, and the source's embedded clock instead of ID3 timestamp rows.
+
 #### Repository scaffold
 - Initial repository structure following the canonical [repository layout][layout]:
   `crates/`, `web/`, `docs/`, `examples/`, `deploy/`, `xtask/`, and `.github/workflows/`.
