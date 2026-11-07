@@ -129,7 +129,8 @@ are flagged in CI is not true today — no DCO workflow exists.
 
 ## E. Parallelism and delegation
 
-- Independent units run **concurrently** in separate worktree lanes. Serial execution of independent
+- Independent units run **concurrently** in separate worktree lanes, bounded by the capacity checks
+  and cleanup requirements in [workspace disk hygiene](../development/working-in-this-monorepo.md#workspace-disk-hygiene). Serial execution of independent
   work is a defect, not caution. Serialize only what contends on a hot shared file.
 - Batch independent tool calls into a single message.
 - Delegate wide reading and mechanical edits to subagents; keep their conclusions, not their transcripts.
@@ -172,6 +173,6 @@ satisfied honestly, say so and stop — those are the only two options.
 ---
 
 Toolchain forensics (lint ordering, clippy traps, mutation exit codes, tool-version gotchas):
-[agent-guardrails](../development/agent-guardrails.md). Agent operations (lanes, build-dir hygiene,
+[agent-guardrails](../development/agent-guardrails.md). Agent operations (lanes, workspace disk hygiene,
 context reload behaviour): [working-in-this-monorepo](../development/working-in-this-monorepo.md).
 The live delivery loop: [ADR-G007](../decisions/ADR-G007.md) + the `orchestrate` skill.
