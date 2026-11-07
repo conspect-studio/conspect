@@ -9,7 +9,7 @@
 //! userinfo and query strings never appear in the report, a curl line or an error.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use multiview_config::device::net_guard::{self, BlockClass};
@@ -41,6 +41,7 @@ pub struct Collector {
     guard: DialGuard,
     egress_lookup: bool,
     egress_url: String,
+    dns: Arc<dyn super::dns::DnsLookup>,
     cache: Mutex<Option<(Instant, NetworkEgress)>>,
 }
 
@@ -187,8 +188,16 @@ impl Collector {
             guard,
             egress_lookup,
             egress_url: EGRESS_URL.to_owned(),
+            dns: Arc::new(super::dns::SystemDns::new()),
             cache: Mutex::new(None),
         }
+    }
+
+    /// Replace the DNS lookup (tests use a stub; no real DNS in tests).
+    #[must_use]
+    pub fn with_dns(mut self, dns: Arc<dyn super::dns::DnsLookup>) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// TEST SEAM: point the egress lookup at a fixture server.
@@ -315,6 +324,7 @@ impl Collector {
             body_excerpt: None,
         };
         let mut tls = None;
+        let mut tls_error: Option<String> = None;
         let mut location = None;
         let mut body = Vec::new();
 
@@ -348,11 +358,16 @@ impl Collector {
         };
         // Drop the placeholder row of a failed lookup (no address to show).
         addresses.retain(|a| !a.ip.is_empty());
-        for ip in &ips {
-            if ip.is_ipv6() {
-                dns.aaaa.push(ip.to_string());
-            } else {
-                dns.a.push(ip.to_string());
+        if let Some(url::Host::Domain(d)) = url.host() {
+            // Real CNAME/A/AAAA/TTL facts; a failure is reported, never invented.
+            dns = self.dns.lookup(d).await;
+        } else {
+            for ip in &ips {
+                if ip.is_ipv6() {
+                    dns.aaaa.push(ip.to_string());
+                } else {
+                    dns.a.push(ip.to_string());
+                }
             }
         }
         let mut picked: Vec<IpAddr> = Vec::new();
@@ -429,6 +444,30 @@ impl Collector {
                         hop.age = header(&resp, "age");
                         hop.cdn_headers = cdn_headers(&resp);
                         tls = tls_facts(&resp);
+                        if url.scheme() == "https" {
+                            // The address is already screened above; the handshake
+                            // only reads version/ALPN/certificate facts.
+                            match super::tls::handshake(sock, &host).await {
+                                Ok(h) => {
+                                    tls = Some(NetworkTls {
+                                        version: h.version,
+                                        alpn: h
+                                            .alpn
+                                            .or_else(|| tls.as_ref().and_then(|t| t.alpn.clone())),
+                                        subject: h.subject.or_else(|| {
+                                            tls.as_ref().and_then(|t| t.subject.clone())
+                                        }),
+                                        issuer: h.issuer.or_else(|| {
+                                            tls.as_ref().and_then(|t| t.issuer.clone())
+                                        }),
+                                        not_after: h.not_after.or_else(|| {
+                                            tls.as_ref().and_then(|t| t.not_after.clone())
+                                        }),
+                                    });
+                                }
+                                Err(e) => tls_error = Some(e),
+                            }
+                        }
                         location = header(&resp, "location");
                         if (400..500).contains(&status) {
                             let b = read_capped(&mut resp, EXCERPT_BYTES).await;
@@ -444,6 +483,13 @@ impl Collector {
             addresses.push(row);
         }
         let _ = started;
+        if let (Some(e), None) = (tls_error, tls.as_ref()) {
+            // No facts at all: say why instead of showing an empty block.
+            tls = Some(NetworkTls {
+                subject: Some(format!("unavailable ({e})")),
+                ..NetworkTls::default()
+            });
+        }
         HostProbe {
             host: NetworkHost {
                 host,

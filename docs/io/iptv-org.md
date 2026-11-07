@@ -26,7 +26,7 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
 
 | Existing | Reuse |
 |---|---|
-| `crate::iptv::fetch` — SSRF-screened, bounded, conditional (`ETag`) `Fetcher` seam (`iptv-net` feature) | catalogue sync and every probe/network dial go through it (extended for per-hop reporting and request headers) |
+| `crate::iptv::fetch` — SSRF-screened, bounded, conditional (`ETag`) `Fetcher` seam (`iptv-net` feature) | catalogue **sync and logo downloads** go through it (`catalogue` implies `iptv-net`; fixed host, 64 MiB / 60 s per file; logos 512 KiB, image types only). The **deep probe and network diagnostics keep `catalogue::guard::DialGuard`** (still `net_guard`-screened) because they need per-address pinned dials, request headers and per-hop detail that `iptv::fetch` does not offer |
 | `Source.playlist_metadata` (`tvg_id`, `name`, `logo`, `group`) | filled on add: `tvg_id = channel@feed`, `name`, `logo`, `group = first category` |
 | `Source.epg` (`mode`, `url`, `channel_id`) | **not** filled on add: `guides.json` gives `site`, `site_id`, `site_name` and `lang` but no feed URL (every `sources` array was empty on 2026-11-07). Index rows carry `guide {site, site_id, lang}` so the UI can show that a guide exists; the operator supplies the XMLTV URL |
 | `Source.events` + HLS cue observer (ADR-0183) | the probe reuses `multiview_input::hls` cue parsing (`PlaylistCueMetadata`) for broadcast-event detection |
@@ -240,8 +240,8 @@ bounds of §3 and every dial screened by `net_guard`.
 |---|---|
 | **Server egress identity** | Public IPv4 and IPv6 as seen from the internet, egress country and CDN edge (Cloudflare `cdn-cgi/trace`: `ip`, `loc`, `colo`), queried per family. Cached 10 min. Fixed host; disable with `[network_diagnostics] egress_lookup = false`. |
 | **Host chain** | Every distinct host involved: master playlist, media playlist, segment host(s), key URI host, every redirect hop. Segment CDNs often differ from the playlist host. |
-| **DNS** (per host) | CNAME chain, A and AAAA records with TTL, the resolver used, `net_guard` class of each address (public / private / blocked). |
-| **Connection** (per host) | Address and family actually used, TCP connect time per address (v6 and v4 tried separately), TLS version, ALPN/HTTP version, certificate subject/SAN/issuer/expiry (parsed with `x509-parser`, already in `Cargo.lock`). |
+| **DNS** (per host) | CNAME chain, A and AAAA records with TTL, the resolver used (hickory-resolver, system config, 3 s per lookup; a failure is shown as text; lookups only describe DNS, every dialled address is still screened), `net_guard` class of each address (public / private / blocked). |
+| **Connection** (per host) | Address and family actually used, TCP connect time per address (v6 and v4 tried separately), TLS version and ALPN (from a small separate, bounded rustls handshake to the already-screened address; certificate not trusted-verified there, facts only),  certificate subject/SAN/issuer/expiry (parsed with `x509-parser`, already in `Cargo.lock`). |
 | **HTTP** (per hop) | Status, redirect `Location` host, response time, `Server`, `Via`, `Age`, CDN identifiers (`cf-ray`, `x-cache`, `x-served-by`, `x-amz-cf-pop`, `x-akamai-*`, `x-cdn`), geo-related headers, and for 4xx a 512-byte text excerpt of the body (block pages often say "not available in your region"). Request headers sent (UA/Referer) are shown. |
 | **Assessment** | Plain-language hints, for example: "Channel country AU; this server egresses from US (DFW) → geo-block likely. Route this host via an AU egress." · "IPv6 path returns 403, IPv4 path returns 200 → prefer IPv4 for this host." · "Playlist OK, segment host `cdn.example` 403 → the CDN, not the origin, blocks." |
 | **Export** | Copy as text/JSON (credentials, userinfo and query strings redacted) and an equivalent `curl` command per hop (`--resolve`, `-4/-6`, headers) for reproducing from another host. |

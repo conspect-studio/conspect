@@ -319,3 +319,46 @@ impl multiview_control::catalogue::sync::Fetcher for NoNet {
         Box::pin(async { Err("offline".to_owned()) })
     }
 }
+
+struct StubDns;
+
+impl multiview_control::catalogue::netdiag::dns::DnsLookup for StubDns {
+    fn lookup<'a>(
+        &'a self,
+        host: &'a str,
+    ) -> BoxFuture<'a, multiview_control::catalogue::netdiag::NetworkDns> {
+        assert_eq!(host, "localhost");
+        Box::pin(async {
+            multiview_control::catalogue::netdiag::NetworkDns {
+                cname: vec!["edge.cdn.example".into()],
+                a: vec!["192.0.2.9".into()],
+                aaaa: vec![],
+                ttl: Some(42),
+                resolver: Some("192.0.2.53".into()),
+                error: None,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn dns_facts_come_from_the_resolver_seam_not_the_dialled_addresses() {
+    let f = fixture().await;
+    let c = collector(&f, false).with_dns(Arc::new(StubDns));
+    let report = c
+        .collect(
+            &req(format!("http://localhost:{}/master.m3u8", f.port)),
+            None,
+        )
+        .await;
+    let dns = &report.hosts[0].dns;
+    assert_eq!(dns.cname, vec!["edge.cdn.example"]);
+    assert_eq!(dns.a, vec!["192.0.2.9"]);
+    assert_eq!(dns.ttl, Some(42));
+    assert_eq!(dns.resolver.as_deref(), Some("192.0.2.53"));
+    // The stub's address was never dialled: only screened, resolved ones are.
+    assert!(report.hosts[0]
+        .addresses
+        .iter()
+        .all(|a| a.ip != "192.0.2.9"));
+}

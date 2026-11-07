@@ -16,6 +16,10 @@ use super::sync::BoxFuture;
 
 #[cfg(feature = "catalogue")]
 pub mod collect;
+#[cfg(feature = "catalogue")]
+pub mod dns;
+#[cfg(feature = "catalogue")]
+pub mod tls;
 
 /// Collects a [`NetworkReport`] for one stream request. The control plane holds it
 /// as a trait object so the routes compile without the `catalogue` feature.
@@ -61,14 +65,20 @@ pub struct NetworkAddress {
 /// DNS answer for a host.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct NetworkDns {
-    /// CNAME chain. The std resolver does not expose it, so this is empty.
+    /// CNAME chain, in answer order (the CDN is usually identifiable here).
     pub cname: Vec<String>,
     /// A records.
     pub a: Vec<String>,
     /// AAAA records.
     pub aaaa: Vec<String>,
-    /// TTL. The std resolver does not expose it, so this is `null`.
+    /// Lowest TTL (seconds) among the address records; `null` when none answered.
     pub ttl: Option<u32>,
+    /// The resolver(s) asked (name-server addresses from the system config).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<String>,
+    /// Why the lookup failed or timed out, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// TLS facts for a host.
