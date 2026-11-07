@@ -98,6 +98,12 @@ pub fn same_media(a: &Source, b: &Source) -> bool {
         if let Some(events) = source.events.as_mut() {
             events.automation = None;
         }
+        // An absent block and a default one observe the same way: adding the
+        // first rule must not read as a media change (review R2-02).
+        if source.events.as_ref() == Some(&multiview_config::schema::SourceEventsConfig::default())
+        {
+            source.events = None;
+        }
         source
     };
     strip(a) == strip(b)
@@ -556,6 +562,33 @@ target = "slate""#
         let mut moved = base.clone();
         moved.kind = multiview_config::SourceKind::Bars;
         assert!(!same_media(&base, &moved));
+    }
+
+    /// Review R2-02: a source with no events block gaining its first rule (and
+    /// losing it again) keeps the same media; an observe change does not.
+    #[test]
+    fn the_first_automation_rule_on_a_source_without_events_keeps_the_same_media() {
+        let bare: Source = serde_json::from_value(serde_json::json!({
+            "id": "w", "kind": "hls", "url": "https://example.test/w.m3u8"
+        }))
+        .unwrap();
+        assert!(bare.events.is_none());
+        for armed in [true, false] {
+            let ruled: Source = serde_json::from_value(serde_json::json!({
+                "id": "w", "kind": "hls", "url": "https://example.test/w.m3u8",
+                "events": {"automation": {"armed": armed,
+                    "on_break_start": {"action": "swap_cell", "target": "s"}}}
+            }))
+            .unwrap();
+            assert!(same_media(&bare, &ruled), "armed={armed}");
+            assert!(same_media(&ruled, &bare), "armed={armed}");
+        }
+        let unobserved: Source = serde_json::from_value(serde_json::json!({
+            "id": "w", "kind": "hls", "url": "https://example.test/w.m3u8",
+            "events": {"observe": false}
+        }))
+        .unwrap();
+        assert!(!same_media(&bare, &unobserved), "observe is media");
     }
 
     #[test]

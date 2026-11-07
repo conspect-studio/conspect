@@ -219,6 +219,97 @@ async fn arming_or_disarming_automation_never_restarts_the_producer() {
     demand.stop_all();
 }
 
+/// Review R2-02: a running source with NO events block gains its first
+/// automation rule (armed, then disarmed, then removed): pins follow, the
+/// producer never restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_rule_on_a_source_without_events_never_restarts_the_producer() {
+    let mut doc = config(false);
+    let mut bare = doc
+        .sources
+        .iter()
+        .find(|s| s.id == "watched")
+        .unwrap()
+        .clone();
+    bare.id = "cam".into();
+    bare.kind = multiview_config::SourceKind::Bars;
+    let rule = bare
+        .events
+        .take()
+        .and_then(|events| events.automation)
+        .unwrap();
+    let ruled = |armed: bool| {
+        let mut source = bare.clone();
+        let mut rule = rule.clone();
+        rule.armed = armed;
+        source.events = Some(multiview_config::schema::SourceEventsConfig {
+            observe: true,
+            automation: Some(rule),
+        });
+        source
+    };
+    doc.sources.push(bare.clone());
+    let mut pipeline = Pipeline::build(&doc).expect("builds");
+    let demand = pipeline.demand();
+    demand.start();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !demand.status("cam").running.video {
+        assert!(
+            std::time::Instant::now() < end,
+            "{:?}",
+            demand.status("cam")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let generation = demand.status("cam").generation;
+    let hub = multiview_cli::live_sources::LiveSourceHub::start_with_ingest(
+        pipeline.stop_registry(),
+        multiview_cli::live_sources::shared_stores(std::collections::HashMap::new()),
+        Some(pipeline.live_ingest_spawner()),
+    );
+    let handle = hub.handle();
+    for (armed, want) in [
+        (Some(true), 1_usize),
+        (Some(false), 0),
+        (Some(true), 1),
+        (None, 0),
+    ] {
+        let source = match armed {
+            Some(armed) => ruled(armed),
+            None => bare.clone(),
+        };
+        let store = pipeline.catalogue().load()["cam"].store().clone();
+        assert_eq!(
+            handle.request_spawn_source(SourceSpawn { source, store }),
+            multiview_cli::live_sources::HubSubmit::Accepted
+        );
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while demand
+            .status("slate")
+            .consumers
+            .iter()
+            .filter(|tag| &*tag.label == "cam")
+            .count()
+            != want
+        {
+            assert!(
+                std::time::Instant::now() < end,
+                "pins never followed armed={armed:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        demand.status("cam").generation,
+        generation,
+        "adding the first rule restarted the producer"
+    );
+    assert!(demand.status("cam").running.video, "still running");
+    hub.shutdown();
+    demand.stop_all();
+}
+
 /// Review DMD-05: deleting a started source through the hub releases its
 /// operator Start, and re-adding the id does not inherit it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
