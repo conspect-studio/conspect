@@ -1553,6 +1553,78 @@ mod tests {
         );
     }
 
+    /// Review R3-02: a barrier-controlled interleaving that orders
+    /// `remove_live_lifecycle` BETWEEN a worker's loop-top lifecycle check and
+    /// its anchor-slot lookup — exactly the race the report names
+    /// (`audio.rs` ~1111 stop/lifecycle check vs ~1133/1169 lookup, against
+    /// removal at ~13994-14004 in the pre-fix numbering). Before the fix,
+    /// `live_anchor_slot` is an unconditional allocating lookup, so the late
+    /// lookup recreates the entry the removal just dropped and both
+    /// registries retain it after the worker exits. The fixed, non-allocating
+    /// `live_anchor_slot_for_lifecycle` must instead observe the removal and
+    /// return `None`, so neither registry is ever recreated.
+    #[test]
+    fn a_late_lookup_after_removal_never_recreates_the_anchor_slot() {
+        use std::sync::Barrier;
+
+        let id = "late-lookup-removal-test";
+        let lifecycle = crate::pipeline::begin_live_lifecycle(id);
+        // Both registries hold the entry right after `begin_live_lifecycle`.
+        assert_eq!(
+            crate::pipeline::retained_lifecycle_ids(id),
+            (1, 1),
+            "begin_live_lifecycle must populate both registries"
+        );
+
+        // Two threads rendezvous at `start`, so the worker's lookup and the
+        // removal are deterministically interleaved: the worker proceeds past
+        // its own barrier wait only once the removal thread has also reached
+        // its barrier, and removal completes (lock dropped) before the
+        // worker's lookup call starts, because the worker then does a SECOND
+        // wait that only the removal thread's completion releases.
+        let start = Arc::new(Barrier::new(2));
+        let removed = Arc::new(Barrier::new(2));
+
+        let worker = {
+            let start = Arc::clone(&start);
+            let removed = Arc::clone(&removed);
+            std::thread::spawn(move || {
+                // Loop-top check: this lifecycle is still current.
+                assert_eq!(crate::pipeline::live_lifecycle(id), lifecycle);
+                start.wait();
+                // Removal (on the other thread) runs here, between the
+                // worker's own check above and its lookup below.
+                removed.wait();
+                // The late, lifecycle-checked lookup: the removal has already
+                // happened, so this must see the retirement and return `None`
+                // — never recreate the dropped slot.
+                crate::pipeline::live_anchor_slot_for_lifecycle(id, lifecycle)
+            })
+        };
+
+        start.wait();
+        // `remove_live_lifecycle` advances to a NEW retirement token and then
+        // drops the entry entirely — the worker's original `lifecycle` must
+        // no longer be current after this returns.
+        let retirement = crate::pipeline::remove_live_lifecycle(id);
+        assert_ne!(
+            retirement, lifecycle,
+            "removal advances past the worker's epoch"
+        );
+        removed.wait();
+
+        let lookup = worker.join().expect("worker thread must not panic");
+        assert!(
+            lookup.is_none(),
+            "a lookup racing after removal must not recreate the slot"
+        );
+        assert_eq!(
+            crate::pipeline::retained_lifecycle_ids(id),
+            (0, 0),
+            "both registries must stay empty after the late-lookup worker exits"
+        );
+    }
+
     #[test]
     fn a_readded_source_publishes_and_its_removed_lifecycle_stays_fenced() {
         let id = "readded-source-test";

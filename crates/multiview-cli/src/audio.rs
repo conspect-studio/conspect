@@ -1130,11 +1130,19 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // not on the fetcher.
         let shared =
             if plan.live && is_hls && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none() {
-                let slot = crate::pipeline::live_anchor_slot(&plan.id);
+                // Review R3-02: a non-allocating, lifecycle-checked lookup. A
+                // worker whose lifecycle has already been retired (a race with
+                // `remove_live_lifecycle` between the loop-top check above and
+                // this lookup) must never recreate the slot that removal just
+                // dropped — `None` here means "already gone", not "not yet
+                // created", so it is read as no video anchor, never allocated.
+                let slot =
+                    crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle);
                 await_shared_url(
                     || crate::hls_fetch::shared_url(&plan.id, plan.lifecycle),
                     || {
-                        slot.load()
+                        slot.as_ref()
+                            .and_then(|slot| slot.load())
                             .filter(|a| a.raw_pts0_ns.is_some() && a.generation > plan.anchor_floor)
                             .map(|a| a.generation)
                     },
@@ -1166,24 +1174,33 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // stream); its tile then simply rides silence.
         if plan.live && store.is_timeline() {
             // Locked to vision: place by the video's PTS → output mapping.
-            let slot = crate::pipeline::live_anchor_slot(&plan.id);
-            multiview_audio::store::audio_decode_loop_anchored(
-                location,
-                ChannelLayout::Stereo,
-                store,
-                stop,
-                &|| {
-                    if plan.lifecycle == 0
-                        || crate::pipeline::live_lifecycle(&plan.id) == plan.lifecycle
-                    {
-                        video_anchor(&slot, plan.anchor_floor)
-                    } else {
-                        None
-                    }
-                },
-                Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
-                &plan.id,
-            );
+            // Review R3-02: the same non-allocating, lifecycle-checked lookup
+            // as above. `None` here means THIS worker's lifecycle has already
+            // been retired (raced with `remove_live_lifecycle` between the
+            // loop-top check and here) — skip the decode connection entirely
+            // rather than recreate the dropped slot; the loop-top check on the
+            // next iteration returns.
+            if let Some(slot) =
+                crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle)
+            {
+                multiview_audio::store::audio_decode_loop_anchored(
+                    location,
+                    ChannelLayout::Stereo,
+                    store,
+                    stop,
+                    &|| {
+                        if plan.lifecycle == 0
+                            || crate::pipeline::live_lifecycle(&plan.id) == plan.lifecycle
+                        {
+                            video_anchor(&slot, plan.anchor_floor)
+                        } else {
+                            None
+                        }
+                    },
+                    Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
+                    &plan.id,
+                );
+            }
         } else {
             audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
         }

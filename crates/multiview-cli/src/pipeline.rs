@@ -13927,6 +13927,36 @@ pub fn live_anchor_slot(id: &str) -> LiveAnchorSlot {
     )
 }
 
+/// A non-allocating, lifecycle-checked lookup for a LIVE AUDIO WORKER (review
+/// R3-02): unlike [`live_anchor_slot`], this never recreates a removed entry.
+///
+/// `lifecycle == 0` is the sole non-worker caller's convention (plan-build
+/// time, before any lifecycle is assigned): it always matches and allocates
+/// exactly as `live_anchor_slot` does. A worker's nonzero `lifecycle` is
+/// checked against the CURRENT token for `id` *and* the slot is looked up,
+/// both under the SAME `anchor_lifecycle()` lock [`remove_live_lifecycle`]
+/// takes (same lock order: tokens, then slots) — so a worker that already
+/// passed its own loop-top lifecycle check can never recreate a slot a
+/// concurrent `remove_live_lifecycle` has just dropped: either this call
+/// observes the removal (token mismatch/absent ⇒ `None`, no allocation) or it
+/// completes entirely before the removal starts (serialized by the lock).
+pub(crate) fn live_anchor_slot_for_lifecycle(id: &str, lifecycle: u64) -> Option<LiveAnchorSlot> {
+    if lifecycle == 0 {
+        return Some(live_anchor_slot(id));
+    }
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied() != Some(lifecycle) {
+        return None;
+    }
+    anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .cloned()
+}
+
 /// The process-wide anchor slots, keyed by live source id. A removed source's
 /// entry is dropped (review R2-04), so the map tracks live sources only.
 fn anchor_slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>> {
