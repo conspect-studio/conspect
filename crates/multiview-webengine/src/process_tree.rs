@@ -66,7 +66,27 @@ pub const CHROMIUM_PROCESS_TYPES: [ChromiumProcessType; 7] = [
     ChromiumProcessType::Unknown,
 ];
 
+/// The number of process types, and therefore the length of a per-type array.
+pub const TYPE_COUNT: usize = CHROMIUM_PROCESS_TYPES.len();
+
 impl ChromiumProcessType {
+    /// This variant's index in [`CHROMIUM_PROCESS_TYPES`].
+    ///
+    /// The per-type accounting is a fixed array indexed by this, so a sweep does
+    /// not allocate a map.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Browser => 0,
+            Self::Renderer => 1,
+            Self::GpuProcess => 2,
+            Self::Utility => 3,
+            Self::Zygote => 4,
+            Self::Ppapi => 5,
+            Self::Unknown => 6,
+        }
+    }
+
     /// The `--type=` value this variant corresponds to, or `None` for
     /// [`Browser`](Self::Browser) (which carries no `--type=`) and
     /// [`Unknown`](Self::Unknown).
@@ -99,6 +119,12 @@ pub struct ProcRecord {
     pub pid: Pid,
     /// `comm` from `/proc/<pid>/stat` (may contain spaces and `)`).
     pub comm: String,
+    /// `starttime` (field 22 of `stat`): the tick the process started.
+    ///
+    /// With the pid this identifies a process across sweeps, so the kernel
+    /// reusing a pid for a *new* process is not mistaken for the same one.
+    /// `0` when the field could not be parsed.
+    pub starttime: u64,
     /// `utime + stime` in clock ticks.
     pub cpu_ticks: u64,
     /// Classified Chromium role.
@@ -113,8 +139,12 @@ pub struct ProcRecord {
 }
 
 /// Where a process's memory figure came from.
+///
+/// `#[non_exhaustive]`: a later slice may add a source (a cgroup's
+/// `memory.current` for a delegated process), so consumers carry a wildcard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MemorySource {
     /// `Pss` from `smaps_rollup` — the proportional-share figure, so the tree
     /// sum does not double-count shared pages.
@@ -159,9 +189,11 @@ pub struct ProcessTreeSample {
     /// Whether every contributing process supplied `Pss` (else the sum mixes
     /// sources and is labelled as such).
     pub memory_source: MemorySource,
-    /// Per-type CPU split of the **live** tree, every known type present (a type
-    /// with no process is a real zero here, unlike an unmeasured GPU figure).
-    pub by_type: BTreeMap<ChromiumProcessType, TypeAccounting>,
+    /// Per-type CPU split of the **live** tree, a fixed array indexed by
+    /// [`ChromiumProcessType::index`], so a sweep allocates no map. Every type
+    /// is present (a type with no process is a real zero here, unlike an
+    /// unmeasured GPU figure).
+    pub by_type: TypeAccountingArray,
     /// Whether the reading is exact or estimated.
     pub accounting: Accounting,
 }
@@ -170,7 +202,7 @@ impl ProcessTreeSample {
     /// The per-type entry for `kind`, which is always present for a single walk.
     #[must_use]
     pub fn type_usage(&self, kind: ChromiumProcessType) -> TypeAccounting {
-        self.by_type.get(&kind).copied().unwrap_or_default()
+        self.by_type.get(kind.index()).copied().unwrap_or_default()
     }
 
     /// The number of live descendant processes sampled (the root is not one of
@@ -180,6 +212,12 @@ impl ProcessTreeSample {
         self.processes.len()
     }
 }
+
+/// Per-type accounting for one walk, indexed by [`ChromiumProcessType::index`].
+pub type TypeAccountingArray = [TypeAccounting; TYPE_COUNT];
+
+/// Per-type CPU seconds for one walk, indexed by [`ChromiumProcessType::index`].
+pub type TypeSecondsArray = [f64; TYPE_COUNT];
 
 /// Per-type CPU and memory subtotal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -208,12 +246,85 @@ pub fn ticks_to_seconds(ticks: u64) -> f64 {
     ticks / hz
 }
 
+/// One process's identity and CPU time, as remembered from a sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessTicks {
+    /// `stat` field 22: distinguishes a reused pid from the same process.
+    pub starttime: u64,
+    /// `utime + stime` at that sweep, in clock ticks.
+    pub cpu_ticks: u64,
+}
+
+/// What the next sweep needs from the previous one.
+///
+/// Deliberately **not** a whole [`ProcessTreeSample`]: a sweep keeps only the
+/// per-pid identity map and the two running totals, so it never clones every
+/// `ProcRecord` (and its strings) it just produced.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreviousSweep {
+    /// Every live descendant at the previous sweep, keyed by pid.
+    pub live: BTreeMap<Pid, ProcessTicks>,
+    /// The cumulative total the previous sweep published.
+    pub cpu_ticks: u64,
+    /// The retained exited total the previous sweep carried.
+    pub exited_cpu_ticks: u64,
+}
+
+impl PreviousSweep {
+    /// Remember `sample` for the next sweep.
+    #[must_use]
+    pub fn from_sample(sample: &ProcessTreeSample) -> Self {
+        Self {
+            live: sample
+                .processes
+                .iter()
+                .map(|record| {
+                    (
+                        record.pid,
+                        ProcessTicks {
+                            starttime: record.starttime,
+                            cpu_ticks: record.cpu_ticks,
+                        },
+                    )
+                })
+                .collect(),
+            cpu_ticks: sample.cpu_ticks,
+            exited_cpu_ticks: sample.exited_cpu_ticks,
+        }
+    }
+}
+
+/// CPU ticks of processes that were live in `previous` and are gone now.
+///
+/// Identity is `(pid, starttime)`: a pid that has disappeared, or whose
+/// `starttime` changed because the kernel reused the pid for a **new** process,
+/// counts as gone and its last recorded ticks are retained. A process that is
+/// still live is never booked as exited — including one whose own counter went
+/// down, which is held by the monotonic total rather than charged twice.
+///
+/// No allocation: the previous totals are summed and the still-live entries are
+/// subtracted.
+#[must_use]
+pub fn exited_since(previous: &BTreeMap<Pid, ProcessTicks>, current: &[ProcRecord]) -> u64 {
+    let total_before = previous
+        .values()
+        .fold(0_u64, |sum, entry| sum.saturating_add(entry.cpu_ticks));
+    let still_live = current.iter().fold(0_u64, |sum, record| {
+        let matched = previous
+            .get(&record.pid)
+            .filter(|before| before.starttime == record.starttime)
+            .map_or(0, |before| before.cpu_ticks);
+        sum.saturating_add(matched)
+    });
+    total_before.saturating_sub(still_live)
+}
+
 /// Walk the process tree rooted at `root` and read `proc/<pid>/...` files
 /// through `fs`.
 ///
-/// `previous` is the previous walk's sample (or `None` on the first sample); its
-/// retained exited-child time is carried forward so a total never goes
-/// backwards.
+/// `previous` is the previous sweep's state (or `None` on the first sample); the
+/// CPU time of processes that have exited since is retained so a total never
+/// goes backwards, and the published total is held at its high-water mark.
 ///
 /// # Errors
 ///
@@ -223,33 +334,48 @@ pub fn ticks_to_seconds(ticks: u64) -> f64 {
 pub fn sample_process_tree<F: FsRoot + ?Sized>(
     fs: &F,
     root: Pid,
-    previous: Option<&ProcessTreeSample>,
+    previous: Option<&PreviousSweep>,
 ) -> Result<ProcessTreeSample> {
-    let retained = previous.map_or(0, |previous| previous.exited_cpu_ticks);
-
-    let mut records: Vec<ProcRecord> = Vec::new();
     let root_ticks = read_root_cpu_ticks(fs, root)?;
 
+    let mut records: Vec<ProcRecord> = Vec::new();
     walk_tree(fs, root, &mut |record| records.push(record));
 
-    let mut by_type: BTreeMap<ChromiumProcessType, TypeAccounting> = BTreeMap::new();
-    for kind in CHROMIUM_PROCESS_TYPES {
-        by_type.insert(kind, TypeAccounting::default());
-    }
+    let mut by_type: TypeAccountingArray = [TypeAccounting::default(); TYPE_COUNT];
 
     let mut live_ticks = 0_u64;
     let mut memory_bytes = 0_u64;
     let mut every_pss = !records.is_empty();
+    let mut every_unavailable = !records.is_empty();
     for record in &records {
         live_ticks = live_ticks.saturating_add(record.cpu_ticks);
         memory_bytes = memory_bytes.saturating_add(record.memory_bytes);
         every_pss &= record.memory_source.is_pss();
-        if let Some(entry) = by_type.get_mut(&record.process_type) {
+        every_unavailable &= record.memory_source == MemorySource::Unavailable;
+        if let Some(entry) = by_type.get_mut(record.process_type.index()) {
             entry.processes = entry.processes.saturating_add(1);
             entry.cpu_ticks = entry.cpu_ticks.saturating_add(record.cpu_ticks);
             entry.memory_bytes = entry.memory_bytes.saturating_add(record.memory_bytes);
         }
     }
+
+    let memory_source = if records.is_empty() || every_unavailable {
+        // Nothing was measurable: an empty tree, or one where every process's
+        // `smaps_rollup` was absent. Unknown, never `Pss` or `Rss`.
+        MemorySource::Unavailable
+    } else if every_pss {
+        MemorySource::Pss
+    } else {
+        // A mixed sum (Pss with an `Rss` or `Unavailable` contributor) is
+        // reported as the weaker measured source.
+        MemorySource::Rss
+    };
+
+    let retained = previous.map_or(0, |previous| {
+        previous
+            .exited_cpu_ticks
+            .saturating_add(exited_since(&previous.live, &records))
+    });
 
     let total_live = root_ticks.saturating_add(live_ticks);
     let retained_total = retained.saturating_add(total_live);
@@ -264,61 +390,109 @@ pub fn sample_process_tree<F: FsRoot + ?Sized>(
         live_cpu_ticks: total_live,
         exited_cpu_ticks: retained,
         memory_bytes,
-        memory_source: if every_pss {
-            MemorySource::Pss
-        } else {
-            MemorySource::Rss
-        },
+        memory_source,
         by_type,
         accounting: Accounting::Estimated,
     })
 }
 
-/// Add `delta` clock ticks to a retained exited-child total, saturating.
+/// A `/proc`-wide parent map, built at most **once per sweep**.
 ///
-/// The sampler calls this when the live total of a tree drops between two walks
-/// because a child exited: the difference is the departed child's CPU time,
-/// which stays charged to the scope so the cumulative figure is monotonic.
-#[must_use]
-pub fn retain_exited(previous: &ProcessTreeSample, current: &ProcessTreeSample) -> u64 {
-    let live_before = previous.live_cpu_ticks;
-    let live_now = current.live_cpu_ticks;
-    current
-        .exited_cpu_ticks
-        .saturating_add(live_before.saturating_sub(live_now))
+/// `/proc/<pid>/task/<tid>/children` is preferred per node (the kernel
+/// maintains it, and it is race-free per thread). This index is the fallback for
+/// a node whose strand is missing or unreadable: the documented alternative in
+/// ADR-0099 decision 8. Building it costs one `stat` read per pid, so the walk
+/// builds it lazily and reuses it, keeping a sweep O(processes) rather than
+/// O(processes x all pids).
+#[derive(Clone, Debug, Default)]
+pub struct PpidIndex {
+    children: BTreeMap<Pid, Vec<Pid>>,
+}
+
+impl PpidIndex {
+    /// Scan every `/proc/<n>/stat` and index its `ppid`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] or [`Error::Parse`] for a `/proc` entry that exists but
+    /// cannot be read or parsed for a reason other than having vanished.
+    pub fn build<F: FsRoot + ?Sized>(fs: &F) -> Result<Self> {
+        let mut children: BTreeMap<Pid, Vec<Pid>> = BTreeMap::new();
+        for entry in fs.read_dir_names(PROC)? {
+            let Ok(pid) = entry.parse::<Pid>() else {
+                continue;
+            };
+            if let Some(parent) = ppid_of(fs, pid)? {
+                children.entry(parent).or_default().push(pid);
+            }
+        }
+        for list in children.values_mut() {
+            list.sort();
+            list.dedup();
+        }
+        Ok(Self { children })
+    }
+
+    /// The children of `parent` in this index, ascending.
+    #[must_use]
+    pub fn children_of(&self, parent: Pid) -> Vec<Pid> {
+        self.children.get(&parent).cloned().unwrap_or_default()
+    }
 }
 
 /// Discover `pid`'s children.
 ///
-/// `/proc/<pid>/task/<tid>/children` is used when the kernel provides it (the
-/// usual case, and the only one that is race-free per thread). When it is absent
-/// — older kernels, or a fixture without it — the fallback scans every
-/// `/proc/<n>/stat` for a matching parent pid, which is the documented
-/// alternative in ADR-0099 decision 8.
+/// Each thread's `task/<tid>/children` strand is used when the kernel provides
+/// it (the usual case). A strand that is **missing or unreadable** falls back to
+/// the `/proc` ppid scan *for that node*; a strand that exists but is empty is
+/// authoritative "no children", so no scan happens.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] or [`Error::Parse`] when the fallback scan finds a `/proc`
-/// entry that cannot be read or parsed.
+/// [`Error::Io`] or [`Error::Parse`] when `pid`'s task directory cannot be
+/// listed, or when the fallback scan finds a `/proc` entry that cannot be read
+/// or parsed.
 pub fn children_of<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<Vec<Pid>> {
-    let mut children: BTreeSet<Pid> = BTreeSet::new();
+    let mut index: Option<PpidIndex> = None;
+    children_of_indexed(fs, pid, &mut index)
+}
+
+/// [`children_of`] against an index that is built at most once and reused.
+fn children_of_indexed<F: FsRoot + ?Sized>(
+    fs: &F,
+    pid: Pid,
+    index: &mut Option<PpidIndex>,
+) -> Result<Vec<Pid>> {
     let task_dir = format!("{PROC}/{pid}/task");
-    for tid_name in fs.read_dir_names(&task_dir)? {
+    let tids = fs.read_dir_names(&task_dir)?;
+    let mut children: BTreeSet<Pid> = BTreeSet::new();
+    // No thread directory at all is itself "no authoritative strand", so the
+    // scan is the only way to discover this node's children.
+    let mut fall_back = tids.is_empty();
+    for tid_name in tids {
         if tid_name.parse::<u32>().is_err() {
             continue;
         }
         let path = format!("{task_dir}/{tid_name}/children");
-        if let Ok(body) = fs.read_to_string(&path) {
-            for token in body.split_whitespace() {
-                if let Ok(child) = token.parse::<Pid>() {
-                    children.insert(child);
+        match fs.read_to_string(&path) {
+            Ok(body) => {
+                for token in body.split_whitespace() {
+                    if let Ok(child) = token.parse::<Pid>() {
+                        children.insert(child);
+                    }
                 }
             }
+            Err(_) => fall_back = true,
         }
     }
-    if children.is_empty() {
-        for child in scan_ppid_children(fs, pid)? {
-            children.insert(child);
+    if fall_back {
+        if index.is_none() {
+            *index = Some(PpidIndex::build(fs)?);
+        }
+        if let Some(index) = index.as_ref() {
+            for child in index.children_of(pid) {
+                children.insert(child);
+            }
         }
     }
     Ok(children.into_iter().collect())
@@ -330,30 +504,23 @@ pub fn children_of<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<Vec<Pid>> {
 ///
 /// [`Error::Io`] or [`Error::Parse`] on an unreadable `/proc` entry.
 pub fn scan_ppid_children<F: FsRoot + ?Sized>(fs: &F, parent: Pid) -> Result<Vec<Pid>> {
-    let mut children = Vec::new();
-    for descendant in fs.read_dir_names(PROC)? {
-        if let Ok(candidate) = descendant.parse::<Pid>() {
-            if ppid_of(fs, candidate)? == Some(parent) {
-                children.push(candidate);
-            }
-        }
-    }
-    children.sort();
-    Ok(children)
+    Ok(PpidIndex::build(fs)?.children_of(parent))
 }
 
 /// Breadth-first walk of the descendants of `root`, calling `visit` on each.
 ///
 /// The walk is cycle-safe (a malformed fixture cannot loop forever) and
 /// fault-tolerant: a descendant whose `/proc` entry disappears between
-/// discovery and read is skipped.
+/// discovery and read is skipped. The ppid fallback index is created lazily and
+/// shared across the whole walk, so a sweep scans `/proc` at most once.
 pub fn walk_tree<F: FsRoot + ?Sized, V: FnMut(ProcRecord)>(fs: &F, root: Pid, visit: &mut V) {
     let mut seen: BTreeSet<Pid> = BTreeSet::new();
     seen.insert(root);
     let mut queue: VecDeque<Pid> = VecDeque::new();
     queue.push_back(root);
+    let mut index: Option<PpidIndex> = None;
     while let Some(pid) = queue.pop_front() {
-        let Ok(children) = children_of(fs, pid) else {
+        let Ok(children) = children_of_indexed(fs, pid, &mut index) else {
             continue;
         };
         for child in children {
@@ -375,6 +542,9 @@ pub fn read_process<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Option<ProcRecord> 
     let stat = fs.read_to_string(&format!("{PROC}/{pid}/stat")).ok()?;
     let cpu_ticks = parse_stat_cpu_ticks(&stat)?;
     let comm = parse_stat_comm(&stat).unwrap_or_default();
+    // Unknown `starttime` degrades identity to the pid alone; a real kernel
+    // line always carries it.
+    let starttime = parse_stat_starttime(&stat).unwrap_or(0);
     let cmdline = fs
         .read_to_string(&format!("{PROC}/{pid}/cmdline"))
         .unwrap_or_default();
@@ -383,6 +553,7 @@ pub fn read_process<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Option<ProcRecord> 
     Some(ProcRecord {
         pid,
         comm,
+        starttime,
         cpu_ticks,
         process_type: chromium_process_type(raw_type.as_deref()),
         raw_type,
@@ -446,6 +617,18 @@ pub fn parse_stat_cpu_ticks(body: &str) -> Option<u64> {
 pub fn parse_stat_ppid(body: &str) -> Option<Pid> {
     let (_, tail) = body.rsplit_once(')')?;
     tail.split_whitespace().nth(1)?.parse::<Pid>().ok()
+}
+
+/// Parse `starttime` (field 22) from a `/proc/<pid>/stat` body.
+///
+/// Counted after the last `)` exactly like [`parse_stat_cpu_ticks`]: field 3
+/// (`state`) is token 0, so `starttime` is token 19. `None` when the body is too
+/// short or the field does not parse — a real kernel line always carries all 52
+/// fields.
+#[must_use]
+pub fn parse_stat_starttime(body: &str) -> Option<u64> {
+    let (_, tail) = body.rsplit_once(')')?;
+    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
 }
 
 /// The `--type=` value from a process `cmdline`, if any.
@@ -545,24 +728,31 @@ pub(crate) fn u64_to_f64(value: u64) -> f64 {
     )
 }
 
-/// Narrow a finite, unit-interval `f64` fraction to `f32` through the `2^24`
-/// integer grid, avoiding the `as` conversion the workspace lints forbid.
+/// Narrow a finite, non-negative `f64` to `f32` on the `2^24` integer grid over
+/// `0.0..=cap`, saturating at `cap`.
+///
+/// Goes through an integer grid rather than an `as` conversion, which the
+/// workspace lints forbid.
 #[must_use]
-pub(crate) fn frac_to_f32(value: f64) -> f32 {
+pub(crate) fn ratio_to_f32(value: f64, cap: f32) -> f32 {
     const SCALE: f64 = 16_777_216.0; // 2^24, exact in both f64 and f32.
-    let scaled = (value.clamp(0.0, 1.0) * SCALE).round();
+    let cap64 = f64::from(cap);
+    if cap64 <= 0.0 {
+        return 0.0;
+    }
+    let scaled = (value.clamp(0.0, cap64) / cap64 * SCALE).round();
     if scaled <= 0.0 {
         return 0.0;
     }
     if scaled >= SCALE {
-        return 1.0;
+        return cap;
     }
     let whole = scaled.trunc();
     if whole <= 0.0 {
         return 0.0;
     }
     let count = u32::try_from(f64_trunc_to_u32_grid(whole)).unwrap_or(0);
-    f32_from_u32(count) / 16_777_216.0_f32
+    f32_from_u32(count) * cap / 16_777_216.0_f32
 }
 
 /// Truncate a finite, non-negative `f64` below `2^24` to a `u64` by reading its
@@ -599,12 +789,68 @@ fn f32_from_u32(value: u32) -> f32 {
 mod tests {
     use super::*;
 
+    /// A kernel-shaped `stat` line: exactly the 50 fields a real kernel writes
+    /// after the comm's `)`, i.e. fields 3..52.
+    ///
+    /// `minflt`/`cminflt`/`majflt`/`cmajflt` (fields 10..13) are distinct and
+    /// nonzero, so a parser that counts from the wrong token reads a different
+    /// number rather than a row of zeros.
+    fn kernel_stat(
+        pid: u32,
+        comm: &str,
+        parent: u32,
+        utime: u64,
+        stime: u64,
+        starttime: u64,
+    ) -> String {
+        format!(
+            "{pid} ({comm}) S {parent} {pid} {pid} 0 -1 4194560 {minflt} {cminflt} {majflt} {cmajflt} \
+             {utime} {stime} 0 0 20 0 5 0 {starttime} \
+             0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+            minflt = 1_000 + pid,
+            cminflt = 2_000 + pid,
+            majflt = 3_000 + pid,
+            cmajflt = 4_000 + pid,
+        )
+    }
+
     #[test]
     fn comm_with_parens_and_spaces_parses_from_the_last_paren() {
-        let body = "1234 (weird )(name) S 1 1234 1234 0 -1 0 0 0 0 0 100 50 0 0 20 0 8 0 999 0 0";
-        assert_eq!(parse_stat_comm(body).as_deref(), Some("weird )(name"));
-        assert_eq!(parse_stat_cpu_ticks(body), Some(150));
-        assert_eq!(parse_stat_ppid(body), Some(Pid::new(1)));
+        let body = kernel_stat(1234, "weird )(name", 1, 100, 50, 999);
+        assert_eq!(parse_stat_comm(&body).as_deref(), Some("weird )(name"));
+        assert_eq!(parse_stat_cpu_ticks(&body), Some(150));
+        assert_eq!(parse_stat_ppid(&body), Some(Pid::new(1)));
+        assert_eq!(parse_stat_starttime(&body), Some(999));
+    }
+
+    #[test]
+    fn a_kernel_shaped_stat_line_has_the_activity_fields_an_off_by_one_parser_would_miss() {
+        let body = kernel_stat(42, "chrome", 1, 7, 3, 555);
+        let fields: Vec<&str> = body
+            .rsplit_once(')')
+            .expect("a comm paren")
+            .1
+            .split_whitespace()
+            .collect();
+        assert_eq!(fields.len(), 50, "fields 3..52, as the kernel writes them");
+        // minflt, cminflt, majflt, cmajflt at tokens 7..10.
+        let minor: Vec<u64> = fields
+            .get(7..11)
+            .expect("four activity fields")
+            .iter()
+            .map(|field| field.parse::<u64>().expect("numeric"))
+            .collect();
+        assert!(minor.iter().all(|value| *value != 0), "{minor:?}");
+        let distinct: BTreeSet<u64> = minor.iter().copied().collect();
+        assert_eq!(distinct.len(), 4, "distinct, so an offset is visible");
+        // The correct reading is utime + stime; a parser one token early would
+        // read cmajflt + utime, which must not coincide.
+        assert_eq!(parse_stat_cpu_ticks(&body), Some(10));
+        assert_ne!(
+            minor.get(3).copied().unwrap_or_default() + 7,
+            10,
+            "the off-by-one reading differs from the correct one"
+        );
     }
 
     #[test]
@@ -612,6 +858,63 @@ mod tests {
         assert_eq!(parse_stat_comm("no parens"), None);
         assert_eq!(parse_stat_cpu_ticks("no parens"), None);
         assert_eq!(parse_stat_cpu_ticks("1 (c) S 1 2 3"), None);
+        assert_eq!(parse_stat_starttime("1 (c) S 1 2 3"), None);
+    }
+
+    #[test]
+    fn every_type_has_a_distinct_index_matching_the_constant_order() {
+        for (expected, kind) in CHROMIUM_PROCESS_TYPES.iter().enumerate() {
+            assert_eq!(kind.index(), expected, "{kind:?}");
+        }
+        assert_eq!(TYPE_COUNT, CHROMIUM_PROCESS_TYPES.len());
+    }
+
+    #[test]
+    fn exited_since_counts_disappeared_processes_and_reused_pids() {
+        let mut previous = BTreeMap::new();
+        previous.insert(
+            Pid::new(10),
+            ProcessTicks {
+                starttime: 5,
+                cpu_ticks: 30,
+            },
+        );
+        previous.insert(
+            Pid::new(11),
+            ProcessTicks {
+                starttime: 6,
+                cpu_ticks: 40,
+            },
+        );
+        previous.insert(
+            Pid::new(12),
+            ProcessTicks {
+                starttime: 7,
+                cpu_ticks: 50,
+            },
+        );
+
+        let record = |pid: u32, starttime: u64, cpu_ticks: u64| ProcRecord {
+            pid: Pid::new(pid),
+            comm: "chrome".to_owned(),
+            starttime,
+            cpu_ticks,
+            process_type: ChromiumProcessType::Browser,
+            raw_type: None,
+            memory_bytes: 0,
+            memory_source: MemorySource::Unavailable,
+        };
+        // 10 is still the SAME process; 11 has a new starttime (a reused pid);
+        // 12 has disappeared.
+        let current = vec![record(10, 5, 35), record(11, 99, 2)];
+        assert_eq!(
+            exited_since(&previous, &current),
+            40 + 50,
+            "the reused pid's old time and the departed process are both retained"
+        );
+        // A process still live but with a LOWER counter is not booked as exited.
+        let reset = vec![record(10, 5, 1), record(11, 6, 40), record(12, 7, 50)];
+        assert_eq!(exited_since(&previous, &reset), 0);
     }
 
     #[test]

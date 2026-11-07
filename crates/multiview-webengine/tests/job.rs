@@ -27,11 +27,11 @@ fn fill(name: &str) -> FillId {
 #[test]
 fn a_job_walks_queued_running_succeeded() {
     let mut job = Job::queued(id("job-1"), fill("radar"));
-    assert_eq!(job.state, JobState::Queued);
-    assert_eq!(job.state.as_str(), "queued");
-    assert!(!job.state.is_terminal());
-    assert!(job.state.is_active(), "a queued job counts as in flight");
-    assert!(job.state.can_transition_to(JobState::Running));
+    assert_eq!(job.state(), JobState::Queued);
+    assert_eq!(job.state().as_str(), "queued");
+    assert!(!job.state().is_terminal());
+    assert!(job.state().is_active(), "a queued job counts as in flight");
+    assert!(job.state().can_transition_to(JobState::Running));
 
     job.set_progress(JobPhase::new("browser_start"), Some(10))
         .expect("10%");
@@ -46,7 +46,7 @@ fn a_job_walks_queued_running_succeeded() {
         job.transition(JobState::Succeeded).expect("finish"),
         JobState::Succeeded
     );
-    assert!(job.state.is_terminal());
+    assert!(job.state().is_terminal());
     assert_eq!(job.percent, Some(100));
     assert_eq!(job.phase.as_str(), JobPhase::DONE);
 }
@@ -108,7 +108,11 @@ fn a_refused_transition_reports_the_job_the_states_and_leaves_it_alone() {
         text.contains("queued") && text.contains("succeeded"),
         "{text}"
     );
-    assert_eq!(job.state, JobState::Queued, "a refused move is not applied");
+    assert_eq!(
+        job.state(),
+        JobState::Queued,
+        "a refused move is not applied"
+    );
 }
 
 #[test]
@@ -146,7 +150,7 @@ fn a_repeat_trigger_for_a_fill_queued_or_running_coalesces() {
     // And while it runs.
     let running = queue.start_next().expect("a slot").expect("a job");
     assert_eq!(running.id, id("job-1"));
-    assert_eq!(running.state, JobState::Running);
+    assert_eq!(running.state(), JobState::Running);
     assert_eq!(
         queue
             .trigger(fill("radar"), id("job-3"))
@@ -162,15 +166,26 @@ fn a_repeat_trigger_for_a_fill_queued_or_running_coalesces() {
         Trigger::Queued(id("job-4"))
     );
 
-    // Once the first job is done, the fill can be triggered again.
+    // The trigger that coalesced into the RUNNING j1 is not dropped: finishing
+    // j1 queues exactly one rerun for that fill (ADR-0100 decision 4).
+    assert_eq!(queue.pending_rerun_for(&fill("radar")), Some(&id("job-3")));
     queue
         .finish(&id("job-1"), JobState::Succeeded)
         .expect("finish");
-    assert!(!queue.is_fill_active(&fill("radar")));
+    assert_eq!(queue.in_flight_for(&fill("radar")), Some(&id("job-3")));
     assert_eq!(
-        queue.trigger(fill("radar"), id("job-5")).expect("room"),
-        Trigger::Queued(id("job-5"))
+        queue.pending_len(),
+        2,
+        "the waiting wind job plus exactly one radar rerun"
     );
+    // A further trigger now coalesces onto the rerun rather than adding a job.
+    assert_eq!(
+        queue
+            .trigger(fill("radar"), id("job-5"))
+            .expect("coalesces"),
+        Trigger::Coalesced(id("job-3"))
+    );
+    assert_eq!(queue.pending_len(), 2, "still exactly one radar rerun");
 }
 
 #[test]
@@ -241,7 +256,7 @@ fn one_runner_never_starts_a_job_for_a_fill_already_running() {
         queue.start_next().expect("a slot").is_none(),
         "nothing else is pending for that fill"
     );
-    assert_eq!(queue.running_ids(), &[id("job-1")]);
+    assert_eq!(queue.running_ids(), vec![id("job-1")]);
 }
 
 #[test]
@@ -294,4 +309,53 @@ fn a_zero_bound_is_raised_so_the_runner_cannot_wedge() {
     assert_eq!(queue.max_concurrent(), 1);
     assert!(queue.trigger(fill("a"), id("job-1")).is_ok());
     assert!(queue.start_next().expect("a slot").is_some());
+}
+
+#[test]
+fn a_cancelled_job_does_not_occupy_capacity() {
+    let mut queue = JobQueue::new(1, 1);
+    queue.trigger(fill("a"), id("job-1")).expect("room");
+    assert!(!queue.could_accept(), "the single slot is taken");
+
+    assert_eq!(
+        queue.cancel(&id("job-1")).expect("cancel"),
+        JobState::Cancelled
+    );
+    assert_eq!(queue.tracked_len(), 0, "the cancelled entry is gone");
+    assert!(queue.could_accept());
+    assert_eq!(
+        queue.trigger(fill("b"), id("job-2")).expect("room"),
+        Trigger::Queued(id("job-2"))
+    );
+}
+
+#[test]
+fn a_duplicate_job_id_is_refused() {
+    let mut queue = JobQueue::new(4, 1);
+    queue.trigger(fill("a"), id("job-1")).expect("room");
+    let error = queue
+        .trigger(fill("b"), id("job-1"))
+        .expect_err("the id is already tracked");
+    assert!(error.to_string().contains("job-1"), "{error}");
+    assert_eq!(queue.pending_len(), 1);
+}
+
+#[test]
+fn the_queue_owns_the_running_record_and_transitions_it() {
+    // `finish` moves the queue's own record through `Job::transition`, so a
+    // non-terminal "finish" is refused and the job keeps running.
+    let mut queue = JobQueue::new(2, 1);
+    queue.trigger(fill("a"), id("job-1")).expect("room");
+    let started = queue.start_next().expect("a slot").expect("a job");
+    assert_eq!(started.state(), JobState::Running);
+    assert!(queue.finish(&id("job-1"), JobState::Running).is_err());
+    assert_eq!(queue.running_len(), 1, "the refused finish changed nothing");
+    assert_eq!(queue.running_ids(), vec![id("job-1")]);
+    assert_eq!(
+        queue
+            .finish(&id("job-1"), JobState::Failed)
+            .expect("finish"),
+        JobState::Failed
+    );
+    assert_eq!(queue.running_len(), 0);
 }

@@ -74,6 +74,29 @@ pub enum Error {
         /// The out-of-range value.
         value: u32,
     },
+
+    /// A scope registration carried a generation older than the next one the
+    /// registry would issue for that owner.
+    ///
+    /// A registration must use [`next_generation`](crate::ScopeRegistry::next_generation):
+    /// accepting an older generation would let a stale scope replace a live one,
+    /// which is the misattribution the generation counter exists to prevent.
+    #[error("stale generation {requested} for owner {owner}: expected at least {expected}")]
+    StaleGeneration {
+        /// The owner the scope was registered for.
+        owner: String,
+        /// The generation the caller tried to register.
+        requested: u64,
+        /// The lowest generation the registry would accept.
+        expected: u64,
+    },
+
+    /// A job id the queue already tracks was used for a second job.
+    #[error("job id {job} is already tracked")]
+    DuplicateJob {
+        /// The job id that is already in the queue.
+        job: String,
+    },
 }
 
 impl Error {

@@ -21,7 +21,9 @@
 //! stays where it is and uses process-tree accounting with the
 //! `CgroupDelegationUnavailable` warning.
 
+use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 use crate::fsroot::{CgroupFs, FsRoot};
@@ -49,15 +51,29 @@ pub const CGROUP_PROCS: &str = "cgroup.procs";
 /// The fixed, non-secret name of the leaf cgroup the boot-time move creates.
 pub const ENGINE_LEAF: &str = "engine";
 
-/// The child-directory name the delegation probe creates and removes. A
-/// reserved name, so a probe can never collide with a real generation scope.
-pub const DELEGATION_PROBE_CHILD: &str = "conspect-delegation-probe";
+/// The reserved prefix of the child-directory name the delegation probe creates
+/// and removes, so a probe can never collide with a real generation scope.
+///
+/// A full name is this prefix plus the process id and a per-process counter
+/// (see [`probe_child_name`]), so two probes — even in the same process — never
+/// contend for one directory.
+pub const DELEGATION_PROBE_PREFIX: &str = "conspect-delegation-probe-";
 
-/// The child-directory name appended to a cgroup path by the probe, and by
-/// [`delegation_status`] for its report.
+/// A fresh, unique probe child name.
+///
+/// `conspect-delegation-probe-<pid>-<counter>`: the pid separates processes and
+/// the counter separates calls within one process, without a clock.
 #[must_use]
-pub fn probe_child_path(root: &str) -> String {
-    merge_cgroup_path(root, DELEGATION_PROBE_CHILD)
+pub fn probe_child_name() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{DELEGATION_PROBE_PREFIX}{}-{counter}", std::process::id())
+}
+
+/// The cgroup path of the probe child `name` under `root`.
+#[must_use]
+pub fn probe_child_path(root: &str, name: &str) -> String {
+    merge_cgroup_path(root, name)
 }
 
 /// Join a cgroup directory and a child name with exactly one `/`.
@@ -307,11 +323,17 @@ impl ControllerSet {
 
 /// Probe `root` for delegation (ADR-0099 decision 9).
 ///
-/// The probe creates [`DELEGATION_PROBE_CHILD`] under `root` and removes it
-/// again. `root` must be a directory; a `create_dir` failure is reported as
-/// [`NotDelegated::CannotCreateChild`] whatever its cause (a read-only
-/// hierarchy, a missing delegation, a permission denial) because the operator
-/// action — the systemd drop-in — is the same for all of them.
+/// The probe creates a uniquely named [`probe_child_name`] under `root` and
+/// removes it again. `root` must be a directory; a `create_dir` failure is
+/// reported as [`NotDelegated::CannotCreateChild`] whatever its cause (a
+/// read-only hierarchy, a missing delegation, a permission denial) because the
+/// operator action — the systemd drop-in — is the same for all of them.
+///
+/// A directory that already exists for a freshly generated name can only be a
+/// stale probe from a crashed run, so an `EEXIST` create is retried **once**
+/// with another fresh name rather than reported as "not delegated". Every
+/// failure path after a create makes a best-effort `rmdir`, so a failed probe
+/// leaves nothing behind.
 ///
 /// # Errors
 ///
@@ -337,13 +359,28 @@ pub fn delegation_status<F: CgroupFs + ?Sized>(fs: &F, root: &str) -> Result<Del
         ));
     }
 
-    let probe = probe_child_path(root);
-    if fs.create_dir(&probe).is_err() {
-        return Ok(DelegationReport::NotDelegated(
-            NotDelegated::CannotCreateChild,
-        ));
+    let mut probe = probe_child_path(root, &probe_child_name());
+    match fs.create_dir(&probe) {
+        Ok(()) => {}
+        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+            // A stale probe holds the name: one retry with a fresh one.
+            probe = probe_child_path(root, &probe_child_name());
+            if fs.create_dir(&probe).is_err() {
+                let _ = fs.remove_dir(&probe);
+                return Ok(DelegationReport::NotDelegated(
+                    NotDelegated::CannotCreateChild,
+                ));
+            }
+        }
+        Err(_) => {
+            return Ok(DelegationReport::NotDelegated(
+                NotDelegated::CannotCreateChild,
+            ))
+        }
     }
     if fs.remove_dir(&probe).is_err() {
+        // Best effort: a failed probe must not leave its directory behind.
+        let _ = fs.remove_dir(&probe);
         return Ok(DelegationReport::NotDelegated(
             NotDelegated::CannotRemoveChild,
         ));
@@ -372,6 +409,13 @@ pub enum LeafMoveStep {
     },
     /// Read the parent's `cgroup.procs` and require it to be empty: a domain
     /// controller cannot be enabled while the parent holds processes.
+    ///
+    /// Failure here means **abort and stay**: this process remains in its
+    /// current cgroup, keeps process-tree accounting, raises the
+    /// `CgroupDelegationUnavailable` warning, and — crucially — **no
+    /// controller is enabled**, because the enable steps follow this one and
+    /// a failed verify must not fall through to them (see
+    /// [`LeafMoveStep::on_failure`]).
     VerifyParentEmpty {
         /// The parent's `cgroup.procs` file.
         path: PathBuf,
@@ -392,6 +436,19 @@ pub enum LeafMoveStep {
     },
 }
 
+/// What the executor does when a leaf-move step fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureAction {
+    /// Abort the move and stay where the process is.
+    ///
+    /// The process keeps its current cgroup and process-tree accounting, and the
+    /// caller raises the `CgroupDelegationUnavailable` warning. No
+    /// `cgroup.subtree_control` controller is enabled: a domain controller
+    /// cannot be enabled while an ancestor holds processes, so continuing past a
+    /// failed verify would be both wrong and futile.
+    AbortAndStay,
+}
+
 impl LeafMoveStep {
     /// A short, stable label for logs and tests.
     #[must_use]
@@ -403,6 +460,19 @@ impl LeafMoveStep {
             Self::VerifyDelegationInPlace { .. } => "verify_delegation_in_place",
             Self::EnableController { .. } => "enable_controller",
         }
+    }
+
+    /// What the executor must do when this step fails.
+    ///
+    /// ADR-0099 decision 8: "if any step fails, Conspect stays where it is, uses
+    /// process-tree accounting, and raises the warning." Exposed as data so the
+    /// abort-and-stay semantics are testable rather than living only in a
+    /// comment: a failed [`VerifyParentEmpty`](Self::VerifyParentEmpty) aborts
+    /// the plan, and nothing after it — in particular no controller enable —
+    /// runs.
+    #[must_use]
+    pub const fn on_failure(&self) -> FailureAction {
+        FailureAction::AbortAndStay
     }
 }
 

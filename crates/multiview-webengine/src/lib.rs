@@ -51,22 +51,25 @@ pub mod scope;
 pub mod usage;
 
 pub use cgroup::{
-    delegation_status, parse_cpu_stat, plan_leaf_move, probe_child_path, read_cgroup_usage,
-    CgroupUsage, ControllerSet, CpuStat, DelegationReport, LeafMoveStep, NotDelegated,
-    CGROUP_CONTROLLERS, CGROUP_PROCS, CGROUP_SUBTREE_CONTROL, CPU_STAT, DELEGATION_PROBE_CHILD,
-    ENGINE_LEAF, MEMORY_CURRENT, MEMORY_PEAK, PIDS_CURRENT, REQUIRED_CONTROLLERS,
+    delegation_status, parse_cpu_stat, plan_leaf_move, probe_child_name, probe_child_path,
+    read_cgroup_usage, CgroupUsage, ControllerSet, CpuStat, DelegationReport, FailureAction,
+    LeafMoveStep, NotDelegated, CGROUP_CONTROLLERS, CGROUP_PROCS, CGROUP_SUBTREE_CONTROL, CPU_STAT,
+    DELEGATION_PROBE_PREFIX, ENGINE_LEAF, MEMORY_CURRENT, MEMORY_PEAK, PIDS_CURRENT,
+    REQUIRED_CONTROLLERS,
 };
 pub use error::{Error, Result};
 pub use fsroot::{CgroupFs, FsRoot, ParsePidError, Pid};
 pub use job::{percent_u8, FillId, Job, JobId, JobPhase, JobQueue, JobState, Trigger};
 pub use process_tree::{
-    children_of, chromium_process_type, chromium_type_arg, parse_stat_comm, parse_stat_cpu_ticks,
-    parse_stat_ppid, read_memory, read_process, retain_exited, sample_process_tree,
-    scan_ppid_children, ticks_to_seconds, walk_tree, ChromiumProcessType, MemorySource, ProcRecord,
-    ProcessTreeSample, TypeAccounting, CHROMIUM_PROCESS_TYPES, PROC, USER_HZ,
+    children_of, chromium_process_type, chromium_type_arg, exited_since, parse_stat_comm,
+    parse_stat_cpu_ticks, parse_stat_ppid, parse_stat_starttime, read_memory, read_process,
+    sample_process_tree, scan_ppid_children, ticks_to_seconds, walk_tree, ChromiumProcessType,
+    MemorySource, PpidIndex, PreviousSweep, ProcRecord, ProcessTicks, ProcessTreeSample,
+    TypeAccounting, TypeAccountingArray, TypeSecondsArray, CHROMIUM_PROCESS_TYPES, PROC,
+    TYPE_COUNT, USER_HZ,
 };
 pub use scope::{Generation, ResourceScope, ScopeKind, ScopeOwner, ScopeRegistry};
 pub use usage::{
-    attribute, cpu_fraction, monotonic_total, type_cpu_seconds, usage_from_cgroup, Accounting,
-    ResourceUsage, Sampler,
+    attribute, cpu_cores, monotonic_total, type_cpu_seconds, usage_from_cgroup, Accounting,
+    ResourceUsage, Sampler, CPU_CORES_CAP,
 };

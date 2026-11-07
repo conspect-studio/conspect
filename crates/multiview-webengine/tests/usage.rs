@@ -17,19 +17,18 @@ mod common;
 use std::fs;
 
 use multiview_webengine::{
-    attribute, cpu_fraction, monotonic_total, read_cgroup_usage, type_cpu_seconds,
-    usage_from_cgroup, Accounting, Generation, JobPhase, Pid, ResourceUsage, Sampler, ScopeOwner,
-    ScopeRegistry,
+    attribute, cpu_cores, monotonic_total, read_cgroup_usage, type_cpu_seconds, usage_from_cgroup,
+    Accounting, Generation, JobPhase, Pid, ResourceUsage, Sampler, ScopeOwner, ScopeRegistry,
 };
 
-fn usage_for(cpu_frac: Option<f32>, cpu_seconds_total: f64) -> ResourceUsage {
+fn usage_for(cpu_cores: Option<f32>, cpu_seconds_total: f64) -> ResourceUsage {
     let mut record = ResourceUsage::unknown_gpu(
         ScopeOwner::new("vt-1"),
         Generation::new(0),
         JobPhase::new("browser_start"),
         Accounting::Estimated,
     );
-    record.cpu_frac = cpu_frac;
+    record.cpu_cores = cpu_cores;
     record.cpu_seconds_total = cpu_seconds_total;
     record
 }
@@ -69,16 +68,37 @@ fn a_record_round_trips_through_json() {
 }
 
 #[test]
-fn the_sampler_needs_two_readings_and_reports_the_interval() {
+fn the_sampler_needs_two_readings_and_reports_the_interval_in_cores() {
     let mut sampler = Sampler::new(Accounting::Estimated);
     assert_eq!(sampler.record(100.0, 10.0), None, "no interval yet");
     assert_eq!(
         sampler.record(101.0, 10.5),
         Some(0.5_f32),
-        "0.5 CPU-s over 1 s"
+        "0.5 CPU-s over 1 s is half a core"
     );
     assert_eq!(sampler.record(103.0, 11.5), Some(0.5_f32));
     assert!((sampler.cpu_seconds_total() - 11.5).abs() < 1e-9);
+}
+
+#[test]
+fn two_cpu_seconds_in_one_second_is_two_cores() {
+    // The unit fix: a process tree that burns two CPU-seconds in one wall-clock
+    // second is using TWO cores, not a saturated `1.0` fraction.
+    let mut sampler = Sampler::new(Accounting::Estimated);
+    assert_eq!(sampler.record(0.0, 0.0), None);
+    assert_eq!(
+        sampler.record(1.0, 2.0),
+        Some(2.0_f32),
+        "two cores fully used"
+    );
+    // And a scope past the documented cap saturates rather than reporting an
+    // absurd number.
+    let mut wide = Sampler::new(Accounting::Estimated);
+    wide.record(0.0, 0.0);
+    assert_eq!(
+        wide.record(1.0, 1.0e9),
+        Some(multiview_webengine::CPU_CORES_CAP)
+    );
 }
 
 #[test]
@@ -95,12 +115,12 @@ fn a_counter_reset_gives_zero_work_and_a_monotonic_total() {
         "the published total must not go backwards"
     );
     // The interval after the reset is measured from the RESET reading (50), not
-    // from the held total (100): 60 - 50 = 10 CPU-seconds over two seconds is
-    // 5.0 cores, which saturates.
+    // from the held total (100): 60 - 50 = 10 CPU-seconds over ONE second is
+    // 10.0 cores (below the cap, so reported as measured).
     assert_eq!(
         sampler.record(2.0, 60.0),
-        Some(1.0_f32),
-        "measured from the reset value, then saturated"
+        Some(10.0_f32),
+        "measured from the reset value, in cores"
     );
     assert!(
         (sampler.cpu_seconds_total() - 100.0).abs() < 1e-9,
@@ -111,7 +131,7 @@ fn a_counter_reset_gives_zero_work_and_a_monotonic_total() {
 }
 
 #[test]
-fn a_non_advancing_clock_yields_no_fraction_and_no_panic() {
+fn a_non_advancing_clock_yields_no_cores_and_no_panic() {
     let mut sampler = Sampler::new(Accounting::Estimated);
     sampler.record(10.0, 5.0);
     assert_eq!(sampler.record(10.0, 6.0), None, "zero elapsed time");
@@ -149,18 +169,18 @@ fn the_cumulative_figure_is_monotonic_across_a_whole_run() {
 }
 
 #[test]
-fn the_first_reading_has_no_fraction_and_that_is_honest() {
+fn the_first_reading_has_no_cores_and_that_is_honest() {
     let mut sampler = Sampler::new(Accounting::Estimated);
-    let first_fraction = sampler.record(0.0, 4.0);
+    let first_cores = sampler.record(0.0, 4.0);
     let record = sampler.release(
         ScopeOwner::new("vt-1"),
         Generation::new(0),
         JobPhase::queued(),
-        first_fraction,
+        first_cores,
         None,
         None,
     );
-    assert_eq!(record.cpu_frac, None, "unknown, not zero");
+    assert_eq!(record.cpu_cores, None, "unknown, not zero");
     assert!((record.cpu_seconds_total - 4.0).abs() < 1e-9);
     assert_eq!(record.phase.as_str(), "queued");
 }
@@ -219,7 +239,7 @@ fn the_per_type_cpu_split_names_the_gpu_process() {
     let seconds = type_cpu_seconds(&sample.by_type);
 
     assert_eq!(
-        seconds.get(&multiview_webengine::ChromiumProcessType::GpuProcess),
+        seconds.get(multiview_webengine::ChromiumProcessType::GpuProcess.index()),
         Some(&0.0_f64)
     );
     assert_eq!(
@@ -241,25 +261,25 @@ fn a_stale_generation_is_not_attributed() {
     // the registry has moved past is dropped, not charged to the new browser.
     let owner = ScopeOwner::new("vt-1");
     let mut registry = ScopeRegistry::new();
-    registry.register(multiview_webengine::ResourceScope::new(
-        owner.clone(),
-        Generation::new(0),
-        multiview_webengine::ScopeKind::ProcessTree { root: Pid::new(1) },
-    ));
-    assert_eq!(
-        attribute(&registry, &owner, Generation::new(0)),
-        Some(Generation::new(0))
-    );
-    registry.register(multiview_webengine::ResourceScope::new(
-        owner.clone(),
-        Generation::new(1),
-        multiview_webengine::ScopeKind::ProcessTree { root: Pid::new(2) },
-    ));
-    assert_eq!(attribute(&registry, &owner, Generation::new(0)), None);
-    assert_eq!(
-        attribute(&registry, &owner, Generation::new(1)),
-        Some(Generation::new(1))
-    );
+    let first = registry.next_generation(&owner);
+    registry
+        .register(multiview_webengine::ResourceScope::new(
+            owner.clone(),
+            first,
+            multiview_webengine::ScopeKind::ProcessTree { root: Pid::new(1) },
+        ))
+        .expect("the next generation is accepted");
+    assert_eq!(attribute(&registry, &owner, first), Some(first));
+    let second = registry.next_generation(&owner);
+    registry
+        .register(multiview_webengine::ResourceScope::new(
+            owner.clone(),
+            second,
+            multiview_webengine::ScopeKind::ProcessTree { root: Pid::new(2) },
+        ))
+        .expect("monotonic");
+    assert_eq!(attribute(&registry, &owner, first), None);
+    assert_eq!(attribute(&registry, &owner, second), Some(second));
     assert_eq!(
         attribute(&registry, &ScopeOwner::new("gone"), Generation::new(0)),
         None
@@ -268,7 +288,7 @@ fn a_stale_generation_is_not_attributed() {
 
 #[test]
 fn the_pure_helpers_agree_with_each_other() {
-    assert_eq!(cpu_fraction(0.0, 1.0, 2.0), Some(0.5_f32));
+    assert_eq!(cpu_cores(0.0, 1.0, 2.0), Some(0.5_f32));
     assert!((monotonic_total(5.0, 4.0) - 5.0).abs() < 1e-9);
     assert!((monotonic_total(5.0, 6.0) - 6.0).abs() < 1e-9);
 }

@@ -16,6 +16,7 @@
     unreachable_pub
 )]
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,10 @@ pub struct ProcSpec {
     pub utime: u64,
     /// `stime`, in clock ticks.
     pub stime: u64,
+    /// `starttime` (field 22 of `stat`), in clock ticks. Defaults to a value
+    /// derived from the pid; change it with [`with_starttime`](Self::with_starttime)
+    /// to model the kernel reusing a pid.
+    pub starttime: u64,
     /// The raw argv content written to `cmdline` (NULs included by the caller).
     pub cmdline: Option<String>,
     /// The `smaps_rollup` body, when the process should have one.
@@ -54,6 +59,7 @@ impl ProcSpec {
             ppid: 1,
             utime,
             stime,
+            starttime: 1_000 + u64::from(pid),
             cmdline: None,
             smaps: None,
             children: None,
@@ -64,6 +70,13 @@ impl ProcSpec {
     #[must_use]
     pub fn with_parent(mut self, parent: u32) -> Self {
         self.ppid = parent;
+        self
+    }
+
+    /// Set `starttime` (field 22), as a kernel would after a pid is reused.
+    #[must_use]
+    pub fn with_starttime(mut self, starttime: u64) -> Self {
+        self.starttime = starttime;
         self
     }
 
@@ -111,15 +124,73 @@ impl ProcSpec {
 
     /// The `/proc/<pid>/stat` body this process materialises as.
     ///
-    /// The field count matches a real kernel line through `stime` (field 15), so
-    /// a parser that counts from the wrong place fails loudly.
+    /// Kernel-shaped: exactly the 50 fields a real kernel writes after the
+    /// closing `)` of `comm`, i.e. fields 3..52. `utime`/`stime` are fields
+    /// 14/15 and `starttime` is field 22, so a parser that counts from the wrong
+    /// token fails loudly. `minflt`/`cminflt`/`majflt`/`cmajflt` (fields 10..13)
+    /// are distinct and nonzero, so a one-token error reads a different number
+    /// rather than a row of zeros.
     #[must_use]
     pub fn stat_body(&self) -> String {
-        format!(
-            "{} ({}) S {} {} {} 0 -1 4194560 0 0 0 0 {} {} 0 0 20 0 5 0 900 0 0\n",
-            self.pid, self.comm, self.ppid, self.pid, self.pid, self.utime, self.stime
+        kernel_stat_line(
+            self.pid,
+            &self.comm,
+            self.ppid,
+            self.utime,
+            self.stime,
+            self.starttime,
         )
     }
+}
+
+/// A kernel-shaped `/proc/<pid>/stat` line.
+///
+/// Exactly the 50 fields a real kernel writes after the closing `)` of `comm`
+/// (fields 3..52). `utime`/`stime` are fields 14/15 and `starttime` is field 22.
+/// `minflt`/`cminflt`/`majflt`/`cmajflt` (fields 10..13) are distinct and
+/// nonzero, derived from the pid, so an off-by-one parser reads a different
+/// number rather than a row of zeros.
+#[must_use]
+pub fn kernel_stat_line(
+    pid: u32,
+    comm: &str,
+    parent: u32,
+    utime: u64,
+    stime: u64,
+    starttime: u64,
+) -> String {
+    let mut fields: Vec<String> = vec![
+        "S".to_owned(),
+        parent.to_string(),
+        pid.to_string(),
+        pid.to_string(),
+        "0".to_owned(),                       // tty_nr
+        "-1".to_owned(),                      // tpgid
+        "4194560".to_owned(),                 // flags
+        (1_000 + u64::from(pid)).to_string(), // minflt
+        (2_000 + u64::from(pid)).to_string(), // cminflt
+        (3_000 + u64::from(pid)).to_string(), // majflt
+        (4_000 + u64::from(pid)).to_string(), // cmajflt
+        utime.to_string(),
+        stime.to_string(),
+        "0".to_owned(),        // cutime
+        "0".to_owned(),        // cstime
+        "20".to_owned(),       // priority
+        "0".to_owned(),        // nice
+        "5".to_owned(),        // num_threads
+        "0".to_owned(),        // itrealvalue
+        starttime.to_string(), // field 22
+    ];
+    // Fields 23..37 (vsize .. cnswap).
+    for _ in 0..15 {
+        fields.push("0".to_owned());
+    }
+    fields.push("17".to_owned()); // field 38: exit_signal
+                                  // Fields 39..52 (processor .. exit_code).
+    for _ in 0..14 {
+        fields.push("0".to_owned());
+    }
+    format!("{pid} ({comm}) {}\n", fields.join(" "))
 }
 
 /// A tempdir holding a written `/proc` tree.
@@ -173,6 +244,15 @@ impl ProcTree {
         fs::remove_dir_all(&base).expect("remove a /proc entry");
     }
 
+    /// Rewrite a process's `stat` in place.
+    ///
+    /// Models what the kernel does between two samples: CPU ticks advance, and a
+    /// reused pid gets a new `starttime`.
+    pub fn update_stat(&self, spec: &ProcSpec) {
+        let base = self.dir.path().join("proc").join(spec.pid.to_string());
+        fs::write(base.join("stat"), spec.stat_body()).expect("rewrite a stat");
+    }
+
     /// The absolute path of a written file, for a direct assertion.
     #[must_use]
     pub fn path(&self, relative: &str) -> PathBuf {
@@ -192,6 +272,11 @@ pub struct FakeRoot {
     pub allow_create: bool,
     /// Whether `rmdir` succeeds at all.
     pub allow_remove: bool,
+    /// How many `mkdir` calls fail with `AlreadyExists` before one succeeds
+    /// (models a stale probe directory left by a crashed run).
+    pub eexist_creates: usize,
+    /// Every path `mkdir` was asked to create, in order.
+    pub create_paths: std::cell::RefCell<Vec<String>>,
     /// Every path a mutating operation was asked to touch.
     pub writes: Vec<String>,
 }
@@ -279,6 +364,11 @@ impl FsRoot for FakeRoot {
 
 impl CgroupFs for FakeRoot {
     fn create_dir(&self, path: &str) -> Result<()> {
+        let attempt = self.create_paths.borrow().len();
+        self.create_paths.borrow_mut().push(path.to_owned());
+        if attempt < self.eexist_creates {
+            return Err(Error::io(path, std::io::ErrorKind::AlreadyExists.into()));
+        }
         if !self.allow_create {
             return Err(Error::io(path, std::io::ErrorKind::PermissionDenied.into()));
         }
@@ -290,6 +380,81 @@ impl CgroupFs for FakeRoot {
             return Err(Error::io(path, std::io::ErrorKind::PermissionDenied.into()));
         }
         Ok(())
+    }
+}
+
+/// A [`FsRoot`] over a real fixture tree that counts the reads a sweep performs.
+///
+/// The efficiency tests use it to prove a sweep is O(processes): the number of
+/// `stat` reads and `children` reads is asserted exactly, so a per-node `/proc`
+/// ppid scan (which would read every pid for every node) fails the test.
+pub struct CountingRoot<'a> {
+    root: &'a Path,
+    stat_reads: Cell<usize>,
+    children_reads: Cell<usize>,
+    total_reads: Cell<usize>,
+}
+
+impl<'a> CountingRoot<'a> {
+    /// Wrap a fixture root.
+    #[must_use]
+    pub fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            stat_reads: Cell::new(0),
+            children_reads: Cell::new(0),
+            total_reads: Cell::new(0),
+        }
+    }
+
+    /// How many `/proc/<pid>/stat` files have been read.
+    #[must_use]
+    pub fn stat_reads(&self) -> usize {
+        self.stat_reads.get()
+    }
+
+    /// How many `/proc/<pid>/task/<tid>/children` files have been read.
+    #[must_use]
+    pub fn children_reads(&self) -> usize {
+        self.children_reads.get()
+    }
+
+    /// How many file reads of any kind have happened.
+    #[must_use]
+    pub fn total_reads(&self) -> usize {
+        self.total_reads.get()
+    }
+
+    /// Forget the counts, for a second measured sweep.
+    pub fn reset(&self) {
+        self.stat_reads.set(0);
+        self.children_reads.set(0);
+        self.total_reads.set(0);
+    }
+}
+
+impl FsRoot for CountingRoot<'_> {
+    fn read_to_string(&self, path: &str) -> Result<String> {
+        self.total_reads
+            .set(self.total_reads.get().saturating_add(1));
+        if path.ends_with("/stat") {
+            self.stat_reads.set(self.stat_reads.get().saturating_add(1));
+        }
+        if path.ends_with("/children") {
+            self.children_reads
+                .set(self.children_reads.get().saturating_add(1));
+        }
+        self.root.read_to_string(path)
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        // `Path::exists` is an inherent method, so the trait method is named
+        // explicitly to keep the root-relative path argument.
+        FsRoot::exists(self.root, path)
+    }
+
+    fn read_dir_names(&self, path: &str) -> Result<Vec<String>> {
+        self.root.read_dir_names(path)
     }
 }
 

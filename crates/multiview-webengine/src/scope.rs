@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fsroot::Pid;
 
 /// The owner a scope's resources are charged to: a source id, a job id, a pool
@@ -82,7 +82,12 @@ impl std::fmt::Display for Generation {
 }
 
 /// What a scope's accounting reads from.
+///
+/// `#[non_exhaustive]`: [`Pool`](Self::Pool) is the first of the variants
+/// ADR-0099 decision 11 plans (pooled sources), and consumers must already
+/// carry a wildcard arm.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
 pub enum ScopeKind {
     /// A delegated cgroup v2 directory: exact kernel accounting.
     Cgroup(PathBuf),
@@ -91,6 +96,13 @@ pub enum ScopeKind {
         /// The root pid the tree is discovered from.
         root: Pid,
     },
+    /// A named browser pool (ADR-0099 decision 11): several sources share one
+    /// browser, so the pool's own figures are exact while each member's share is
+    /// estimated.
+    Pool {
+        /// The pool's stable name.
+        id: String,
+    },
 }
 
 impl ScopeKind {
@@ -98,10 +110,15 @@ impl ScopeKind {
     ///
     /// A cgroup charges every descendant the kernel actually scheduled; a
     /// process-tree walk can miss a short-lived grandchild that exited between
-    /// two reads, so it is always labelled estimated (ADR-0099 decision 8).
+    /// two reads, so it is always labelled estimated (ADR-0099 decision 8). A
+    /// pool is accounted through its own browser's scope, which decision 11
+    /// makes exact; only the per-member split is estimated.
     #[must_use]
     pub fn is_exact(&self) -> bool {
-        matches!(self, Self::Cgroup(_))
+        match self {
+            Self::Cgroup(_) | Self::Pool { .. } => true,
+            Self::ProcessTree { .. } => false,
+        }
     }
 }
 
@@ -160,12 +177,29 @@ impl ScopeRegistry {
 
     /// Register `scope` and return the generation it carries.
     ///
-    /// Replaces any scope currently registered for the same owner.
-    pub fn register(&mut self, scope: ResourceScope) -> Generation {
+    /// Replaces any scope currently registered for the same owner. The
+    /// generation must be at least the owner's [`next_generation`](Self::next_generation):
+    /// a lower one is refused, because accepting it would let a stale scope
+    /// displace a live one and the anti-misattribution guard would then accept
+    /// samples for the wrong browser.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleGeneration`] when `scope.generation` is below the next
+    /// generation this registry would issue for that owner.
+    pub fn register(&mut self, scope: ResourceScope) -> Result<Generation> {
+        let expected = self.next_generation(&scope.owner);
+        if scope.generation < expected {
+            return Err(Error::StaleGeneration {
+                owner: scope.owner.as_str().to_owned(),
+                requested: scope.generation.get(),
+                expected: expected.get(),
+            });
+        }
         let generation = scope.generation;
         self.next.insert(scope.owner.clone(), generation.next());
         self.scopes.insert(scope.owner.clone(), scope);
-        generation
+        Ok(generation)
     }
 
     /// Remove the scope for `owner`, returning it when one was registered.
@@ -256,14 +290,20 @@ mod tests {
         let mut registry = ScopeRegistry::new();
         let src = owner("vt-1");
         assert_eq!(registry.next_generation(&src), Generation::FIRST);
+        let first = registry.next_generation(&src);
         assert_eq!(
-            registry.register(cgroup_scope("vt-1", 0, "/sys/fs/cgroup/engine")),
-            Generation::FIRST
+            registry
+                .register(cgroup_scope("vt-1", first.get(), "/sys/fs/cgroup/engine"))
+                .expect("the next generation is accepted"),
+            first
         );
         assert_eq!(registry.next_generation(&src), Generation::new(1));
+        let second = registry.next_generation(&src);
         assert_eq!(
-            registry.register(cgroup_scope("vt-1", 1, "/sys/fs/cgroup/engine")),
-            Generation::new(1)
+            registry
+                .register(cgroup_scope("vt-1", second.get(), "/sys/fs/cgroup/engine"))
+                .expect("monotonic"),
+            second
         );
         assert_eq!(
             registry.next_generation(&src).get(),
@@ -273,31 +313,69 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_below_the_next_expected_is_refused() {
+        let mut registry = ScopeRegistry::new();
+        let src = owner("vt-1");
+        let issued = registry.next_generation(&src);
+        registry
+            .register(cgroup_scope("vt-1", issued.get(), "/sys/fs/cgroup/engine"))
+            .expect("first registration");
+
+        // Re-registering the same generation would replace a live scope with a
+        // stale one, so it is refused rather than silently applied.
+        let error = registry
+            .register(cgroup_scope("vt-1", issued.get(), "/sys/fs/cgroup/engine"))
+            .expect_err("a stale generation is refused");
+        assert!(
+            error.to_string().contains("stale generation"),
+            "the error names the problem: {error}"
+        );
+        assert_eq!(
+            registry.get(&src).map(|scope| scope.generation),
+            Some(issued),
+            "the refused registration left the live scope alone"
+        );
+
+        // A caller that follows `next_generation` is always accepted.
+        let next = registry.next_generation(&src);
+        assert!(next > issued);
+        assert_eq!(
+            registry
+                .register(cgroup_scope("vt-1", next.get(), "/sys/fs/cgroup/engine"))
+                .expect("the next generation is accepted"),
+            next
+        );
+    }
+
+    #[test]
     fn a_sample_for_a_removed_scope_is_dropped() {
         let mut registry = ScopeRegistry::new();
         let src = owner("vt-1");
-        registry.register(cgroup_scope("vt-1", 0, "/sys/fs/cgroup/engine"));
-        assert!(registry.accepts(&src, Generation::new(0)));
+        let issued = registry.next_generation(&src);
+        registry
+            .register(cgroup_scope("vt-1", issued.get(), "/sys/fs/cgroup/engine"))
+            .expect("registered");
+        assert!(registry.accepts(&src, issued));
         registry.remove(&src);
-        assert!(!registry.accepts(&src, Generation::new(0)));
-        assert!(registry
-            .admit(&src, Generation::new(0))
-            .expect("no io")
-            .is_none());
+        assert!(!registry.accepts(&src, issued));
+        assert!(registry.admit(&src, issued).expect("no io").is_none());
     }
 
     #[test]
     fn a_late_sample_for_an_older_generation_is_dropped() {
         let mut registry = ScopeRegistry::new();
         let src = owner("vt-1");
-        registry.register(cgroup_scope("vt-1", 0, "/sys/fs/cgroup/engine"));
-        registry.register(cgroup_scope("vt-1", 1, "/sys/fs/cgroup/engine"));
+        let older = registry.next_generation(&src);
+        registry
+            .register(cgroup_scope("vt-1", older.get(), "/sys/fs/cgroup/engine"))
+            .expect("registered");
+        let newer = registry.next_generation(&src);
+        registry
+            .register(cgroup_scope("vt-1", newer.get(), "/sys/fs/cgroup/engine"))
+            .expect("registered");
+        assert!(!registry.accepts(&src, older), "old generation is stale");
         assert!(
-            !registry.accepts(&src, Generation::new(0)),
-            "old generation is stale"
-        );
-        assert!(
-            registry.accepts(&src, Generation::new(1)),
+            registry.accepts(&src, newer),
             "current generation is attributed"
         );
         assert_eq!(registry.len(), 1, "one scope per owner");
@@ -306,17 +384,48 @@ mod tests {
     #[test]
     fn snapshot_is_ordered_by_owner_and_carries_the_kind() {
         let mut registry = ScopeRegistry::new();
-        registry.register(ResourceScope::new(
-            owner("b"),
-            Generation::new(0),
-            ScopeKind::ProcessTree { root: Pid::new(10) },
-        ));
-        registry.register(cgroup_scope("a", 3, "/sys/fs/cgroup/engine"));
+        registry
+            .register(ResourceScope::new(
+                owner("b"),
+                Generation::new(0),
+                ScopeKind::ProcessTree { root: Pid::new(10) },
+            ))
+            .expect("registered");
+        registry
+            .register(cgroup_scope("a", 3, "/sys/fs/cgroup/engine"))
+            .expect("registered");
         let snapshot = registry.snapshot();
         let names: Vec<&str> = snapshot.iter().map(|s| s.owner.as_str()).collect();
         assert_eq!(names, vec!["a", "b"]);
         assert!(snapshot.first().is_some_and(|s| s.kind.is_exact()));
         assert!(snapshot.get(1).is_some_and(|s| !s.kind.is_exact()));
+    }
+
+    #[test]
+    fn a_pool_scope_is_exact_and_never_a_process_tree() {
+        let mut registry = ScopeRegistry::new();
+        let pool = owner("pool-1");
+        let issued = registry.next_generation(&pool);
+        registry
+            .register(ResourceScope::new(
+                pool.clone(),
+                issued,
+                ScopeKind::Pool {
+                    id: "sydney".to_owned(),
+                },
+            ))
+            .expect("registered");
+        let scope = registry.get(&pool).expect("a registered pool");
+        assert!(
+            scope.kind.is_exact(),
+            "ADR-0099 decision 11: pool figures are exact"
+        );
+        assert_eq!(
+            scope.kind,
+            ScopeKind::Pool {
+                id: "sydney".to_owned()
+            }
+        );
     }
 
     #[test]
