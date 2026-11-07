@@ -63,6 +63,7 @@ pub mod webrtc;
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use multiview_core::layout::{
     Canvas as CoreCanvas, Cell as CoreCell, FitMode, Layout as CoreLayout,
 };
@@ -92,7 +93,7 @@ pub use media::{
 };
 pub use media_fill::{
     CaptureMode, DuringRefresh, FillRefresh, FrameTiming, MediaFill, MediaFillKind, ParamValue,
-    SlotStorage, TermsAcceptance, ViewBackground, WebCaptureView,
+    SlotStorage, TemplateConstraints, TermsAcceptance, ViewBackground, WebCaptureView,
 };
 pub use multicast::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
@@ -458,10 +459,11 @@ pub struct MultiviewConfig {
     /// Declarative VT clip fills (ADR-0100 Decision 1, authored as
     /// `[[media_fill]]`): the desired state for how a media player's clip is
     /// produced — a `web_capture` of a site template or a `url_fetch`. Each fill
-    /// binds exactly one declared [`MediaPlayer`]; a change is part of the
-    /// restart-class media section in [`ConfigDiff`]. Absent ⇒ no fills (the key
-    /// is not emitted). The job runner, clip manifest and API surface live
-    /// outside this crate.
+    /// binds exactly one declared [`MediaPlayer`]. A fill edit is **job intent**,
+    /// not an engine-topology change: [`ConfigDiff`] reports it as the separate
+    /// live-applicable `media_fills` section, never as restart-class `media`.
+    /// Absent ⇒ no fills (the key is not emitted). The job runner, clip manifest
+    /// and API surface live outside this crate.
     #[serde(default, rename = "media_fill", skip_serializing_if = "Vec::is_empty")]
     pub media_fills: Vec<MediaFill>,
     /// BOM weather locations (`[weather]`): the forecast/observation products
@@ -595,13 +597,47 @@ impl MultiviewConfig {
     ///   (`_name._tcp` / `_name._udp`, optionally `.local.`-suffixed);
     /// - the `[webrtc]` section (ADR-0048 §9) carries a usable non-zero media
     ///   port, session pool, idle-GC horizon, advertised addresses and CORS
-    ///   origins.
+    ///   origins;
+    /// - every `[[media_fill]]` id/template id is well-shaped, its kind payload
+    ///   is consistent, and its view, parameters, URL and terms block pass
+    ///   [`MediaFill::validate_with`] — including any template capture
+    ///   constraint supplied through [`TemplateConstraints`], and (under an
+    ///   injected clock) a `terms.accepted_at` that is not in the future.
+    ///
+    /// This is the clock-free, constraint-free form: see
+    /// [`validate_with`](Self::validate_with) for the deterministic form used by
+    /// callers that own a clock or the template registry.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] (or a more specific variant from the
     /// grid solver / cadence parse) naming the first violated invariant.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with(None, None)
+    }
+
+    /// [`validate`](Self::validate) with an optional [`TemplateConstraints`]
+    /// hook and an optional injected `now` (ADR-0101 Decisions 1/7).
+    ///
+    /// `constraints` supplies the per-template capture rules the generic config
+    /// schema deliberately does not know — `multiview-webengine` provides the
+    /// concrete implementation once templates land (ADR-0101 Decision 1);
+    /// `None` applies none. `now` is the clock a media fill's
+    /// `terms.accepted_at` is checked against; `None` skips that check because
+    /// the default build carries no clock (the API stamps the timestamp and the
+    /// runner enforces the terms-version match — see [`TermsAcceptance`]).
+    ///
+    /// Every other invariant is enforced identically in all three forms.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] (or a more specific variant from the
+    /// grid solver / cadence parse) naming the first violated invariant.
+    pub fn validate_with(
+        &self,
+        constraints: Option<&dyn TemplateConstraints>,
+        now: Option<DateTime<Utc>>,
+    ) -> Result<(), ConfigError> {
         if self.schema_version == 0 {
             return Err(ConfigError::Validation(
                 "schema_version must be >= 1".to_owned(),
@@ -637,7 +673,7 @@ impl MultiviewConfig {
         self.validate_system()?;
         self.validate_placement()?;
         self.validate_routing()?;
-        self.validate_media()?;
+        self.validate_media_with(constraints, now)?;
         self.weather.validate()?;
         self.graphics.validate(&self.weather)?;
         if let Some(timing) = &self.timing {
@@ -653,6 +689,17 @@ impl MultiviewConfig {
         })?;
 
         Ok(())
+    }
+
+    /// [`validate`](Self::validate) with a deterministic injected `now`
+    /// (ADR-0101 Decision 7): a media fill's `terms.accepted_at` may not lead
+    /// `now` by more than five minutes. No template constraints are applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] naming the first violated invariant.
+    pub fn validate_with_now(&self, now: DateTime<Utc>) -> Result<(), ConfigError> {
+        self.validate_with(None, Some(now))
     }
 
     /// Validate per-source kind-specific fields so a config that validates cannot
@@ -801,8 +848,14 @@ impl MultiviewConfig {
     /// - the MVP bound of **at most two** media players is respected;
     /// - every [`MediaFill`] id is unique, its `player` is a declared player,
     ///   at most one fill targets each player, and the fill itself passes
-    ///   [`MediaFill::validate`] (ADR-0100 Decision 1).
-    fn validate_media(&self) -> Result<(), ConfigError> {
+    ///   [`MediaFill::validate_with`] under the caller's optional template
+    ///   constraints and injected clock (ADR-0100 Decision 1, ADR-0101
+    ///   Decision 7).
+    fn validate_media_with(
+        &self,
+        constraints: Option<&dyn TemplateConstraints>,
+        now: Option<DateTime<Utc>>,
+    ) -> Result<(), ConfigError> {
         // Asset ids (also the resolution set for `Still`/player `default` refs).
         let mut asset_ids: HashSet<&str> = HashSet::new();
         if let Some(library) = &self.media_library {
@@ -853,7 +906,7 @@ impl MultiviewConfig {
         let mut filled_players: HashMap<&str, &str> =
             HashMap::with_capacity(self.media_fills.len());
         for fill in &self.media_fills {
-            fill.validate()?;
+            fill.validate_with(constraints, now)?;
             if !fill_ids.insert(fill.id.as_str()) {
                 return Err(ConfigError::Validation(format!(
                     "duplicate media fill id {:?}",
