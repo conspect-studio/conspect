@@ -1043,9 +1043,15 @@ pub struct Source {
     /// `multiview_control::event_automation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<SourceEventsConfig>,
-    /// Optional consumer policy. Absent means the source runs only while a
-    /// consumer needs it (`docs/architecture/demand-driven-sources.md`).
+    /// When the source starts (`docs/architecture/demand-driven-sources.md`).
+    /// Absent means [`SourceActivation::AlwaysOn`]: it starts at boot whether
+    /// or not anything consumes it, exactly as before this setting existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<SourceActivation>,
+    /// Deserialise-only alias for documents written while this setting was
+    /// `demand = { always_on = bool }`. Folded into [`Source::activation`] by
+    /// [`Source::effective_activation`]; never written back.
+    #[serde(default, skip_serializing)]
     pub demand: Option<SourceDemandPolicy>,
     /// Optional per-source **EPG** (XMLTV) acquisition block.
     ///
@@ -1088,19 +1094,65 @@ impl Default for SourceEventsConfig {
     }
 }
 
-/// Standing demand for one source, for work that has no other consumer.
+/// When a source starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceActivation {
+    /// Started at boot and kept running whether or not anything consumes it.
+    /// The default: every existing source behaves as it always has.
+    #[default]
+    AlwaysOn,
+    /// Idle (zero cost: no connection, decoder or thread) until something
+    /// consumes it, and stopped again `close after` its last consumer leaves.
+    OnDemand,
+}
+
+impl SourceActivation {
+    /// The stable wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlwaysOn => "always_on",
+            Self::OnDemand => "on_demand",
+        }
+    }
+}
+
+/// Legacy `demand = { always_on = bool }` block, accepted on read only.
+///
+/// `journal_events` is accepted and ignored: event observation now runs
+/// whenever the source is ready, so an `always_on` source keeps its history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SourceDemandPolicy {
-    /// Keep the source's video and audio running with no other consumer.
-    #[serde(default, skip_serializing_if = "crate::iptv::is_false")]
-    pub always_on: bool,
-    /// Keep the source running so its events are observed for the journal.
-    /// Without this or armed automation, events are observed only while
-    /// something else consumes the source.
-    #[serde(default, skip_serializing_if = "crate::iptv::is_false")]
-    pub journal_events: bool,
+    /// `true` meant always on; `false` meant on demand.
+    #[serde(default)]
+    pub always_on: Option<bool>,
+    /// Ignored (see the type docs).
+    #[serde(default)]
+    pub journal_events: Option<bool>,
+}
+
+impl Source {
+    /// The source's activation, folding in the legacy `demand.always_on`
+    /// alias. An explicit `activation` wins.
+    #[must_use]
+    pub fn effective_activation(&self) -> SourceActivation {
+        if let Some(activation) = self.activation {
+            return activation;
+        }
+        match self.demand.and_then(|d| d.always_on) {
+            Some(false) => SourceActivation::OnDemand,
+            _ => SourceActivation::AlwaysOn,
+        }
+    }
+
+    /// Whether the source idles until consumed.
+    #[must_use]
+    pub fn is_on_demand(&self) -> bool {
+        self.effective_activation() == SourceActivation::OnDemand
+    }
 }
 
 /// Upper bound for [`EventAutomationRule::max_duration_s`] (24 h).

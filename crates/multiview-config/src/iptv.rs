@@ -73,15 +73,31 @@ pub struct IptvConfig {
     /// Published entries, in playlist order.
     #[serde(default)]
     pub entries: Vec<IptvEntry>,
-    /// Seconds after the last guide request before guide refreshing stops.
-    /// Absent means [`DEFAULT_GUIDE_IDLE_SECS`].
+    /// Minutes between background guide refreshes while publication is
+    /// enabled. Absent means [`DEFAULT_GUIDE_REFRESH_MINUTES`]; validated to
+    /// [`MIN_GUIDE_REFRESH_MINUTES`]..=[`MAX_GUIDE_REFRESH_MINUTES`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guide_idle_secs: Option<u32>,
+    pub guide_refresh_minutes: Option<u32>,
 }
 
-/// The default [`IptvConfig::guide_idle_secs`]: six hours, so a client that
-/// re-reads its guide a few times a day keeps it fresh.
-pub const DEFAULT_GUIDE_IDLE_SECS: u32 = 6 * 3600;
+/// The default [`IptvConfig::guide_refresh_minutes`].
+pub const DEFAULT_GUIDE_REFRESH_MINUTES: u32 = 30;
+/// The shortest allowed guide refresh interval: guide publishers rate-limit,
+/// and XMLTV rarely changes faster.
+pub const MIN_GUIDE_REFRESH_MINUTES: u32 = 5;
+/// The longest allowed guide refresh interval (one day), so a guide never
+/// runs out inside its seven-day window.
+pub const MAX_GUIDE_REFRESH_MINUTES: u32 = 24 * 60;
+
+impl IptvConfig {
+    /// The effective refresh interval in minutes, clamped to the valid range.
+    #[must_use]
+    pub fn guide_refresh_minutes(&self) -> u32 {
+        self.guide_refresh_minutes
+            .unwrap_or(DEFAULT_GUIDE_REFRESH_MINUTES)
+            .clamp(MIN_GUIDE_REFRESH_MINUTES, MAX_GUIDE_REFRESH_MINUTES)
+    }
+}
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if signature
 pub(crate) const fn is_false(value: &bool) -> bool {
@@ -140,6 +156,13 @@ impl IptvConfig {
                 "iptv.entries has {} entries, over the limit of {MAX_IPTV_ENTRIES}",
                 self.entries.len()
             )));
+        }
+        if let Some(minutes) = self.guide_refresh_minutes {
+            if !(MIN_GUIDE_REFRESH_MINUTES..=MAX_GUIDE_REFRESH_MINUTES).contains(&minutes) {
+                return Err(ConfigError::Validation(format!(
+                    "iptv.guide_refresh_minutes must be {MIN_GUIDE_REFRESH_MINUTES}..={MAX_GUIDE_REFRESH_MINUTES}, got {minutes}"
+                )));
+            }
         }
         if let Some(base) = &self.public_base_url {
             http_url("iptv.public_base_url", base)?;
