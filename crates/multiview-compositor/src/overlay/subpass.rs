@@ -629,6 +629,35 @@ impl LinearCanvasBuffer {
         yi.checked_mul(w)?.checked_add(xi)
     }
 
+    /// The local `(col, row)` half-open ranges of a `width`×`height` primitive
+    /// placed at signed `(dest_x, dest_y)` whose pixels land inside this
+    /// buffer's region (canvas-clamped). Every local pixel outside these ranges
+    /// is a no-op in [`Self::blend_at`] (negative canvas coordinate or outside
+    /// the region), so walking only these ranges is exact — it just skips the
+    /// per-pixel rejections a band/region buffer would otherwise pay for the
+    /// whole primitive.
+    fn local_clip(
+        &self,
+        dest_x: i32,
+        dest_y: i32,
+        width: u32,
+        height: u32,
+    ) -> (std::ops::Range<u32>, std::ops::Range<u32>) {
+        let axis = |dest: i32, len: u32, origin: u32, extent: u32| -> std::ops::Range<u32> {
+            // Local index `i` lands at canvas `dest + i`; keep those within
+            // `[origin, origin + extent)`, computed in i64 (no overflow).
+            let lo = i64::from(origin) - i64::from(dest);
+            let hi = lo + i64::from(extent);
+            let start = lo.clamp(0, i64::from(len));
+            let end = hi.clamp(start, i64::from(len));
+            u32::try_from(start).unwrap_or(0)..u32::try_from(end).unwrap_or(0)
+        };
+        (
+            axis(dest_x, width, self.origin_x, self.stride),
+            axis(dest_y, height, self.origin_y, self.region_height),
+        )
+    }
+
     /// Blend a premultiplied-linear `src` `over` the pixel at `(x, y)` (clipped).
     fn blend_at(&mut self, x: u32, y: u32, src: PremulRgba) {
         let Some(idx) = self.index(x, y) else {
@@ -747,8 +776,9 @@ fn blend_image(
         return;
     }
     let fade = alpha.clamp(0.0, 1.0);
-    for row in 0..dest.height {
-        for col in 0..dest.width {
+    let (cols, rows) = canvas.local_clip(dest.x, dest.y, dest.width, dest.height);
+    for row in rows {
+        for col in cols.clone() {
             // Nearest-neighbour map dest (col,row) -> source (sx,sy).
             let sx = nearest(col, dest.width, src_width);
             let sy = nearest(row, dest.height, src_height);
@@ -805,8 +835,9 @@ fn blend_glyph(
     coverage: &[u8],
     color: OverlayColor,
 ) {
-    for row in 0..height {
-        for col in 0..width {
+    let (cols, rows) = canvas.local_clip(dest_x, dest_y, width, height);
+    for row in rows {
+        for col in cols.clone() {
             let Some(idx) = pixel_index(width, col, row) else {
                 continue;
             };
@@ -850,8 +881,9 @@ fn blend_filled_rect(
         return;
     }
     let radius = clamp_radius(corner_radius, rect.width, rect.height);
-    for row in 0..rect.height {
-        for col in 0..rect.width {
+    let (cols, rows) = canvas.local_clip(rect.x, rect.y, rect.width, rect.height);
+    for row in rows {
+        for col in cols.clone() {
             let coverage = rect_coverage(rect.width, rect.height, col, row, radius);
             if coverage <= 0.0 {
                 continue;
