@@ -208,7 +208,7 @@ impl SourceEventProvider for RuntimeReader {
                 read.as_ref().is_some_and(|read| {
                     read.epoch == sample.epoch
                         && context.matches(read, sample.frame)
-                        && self.registry.is_current(read)
+                        && self.registry.same_generation(read)
                 })
             })
             .map_or_else(Vec::new, |sample| {
