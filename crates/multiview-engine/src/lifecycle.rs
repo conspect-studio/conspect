@@ -478,6 +478,29 @@ mod tests {
         h.manager.shutdown();
     }
 
+    /// Review DMD-02: after a full idle cycle the next start is a new
+    /// generation, so a late callback from the first start is fenced.
+    #[test]
+    fn a_callback_from_before_an_idle_cycle_is_not_current() {
+        let h = harness();
+        let lease = h.manager.acquire("web", Rails::VIDEO, viewer(), None);
+        wait("started", || h.scopes.get("web").is_some());
+        drop(lease);
+        wait("idle", || {
+            h.manager.active_len() == 0 && h.scopes.is_empty()
+        });
+        let lease = h.manager.acquire("web", Rails::VIDEO, viewer(), None);
+        wait("restarted", || h.scopes.get("web").is_some());
+        assert_eq!(h.scopes.get("web").unwrap().generation, 2);
+        assert!(
+            !h.scopes.is_current("web", 1),
+            "a stale callback reads current"
+        );
+        assert!(h.scopes.is_current("web", 2));
+        drop(lease);
+        h.manager.shutdown();
+    }
+
     #[test]
     fn a_start_past_its_deadline_is_cancelled_and_fails_and_retries_stop_at_the_cap() {
         let h = harness();

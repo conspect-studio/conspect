@@ -331,6 +331,8 @@ pub const MAX_PENDING_RESTARTS: usize = 64;
 /// Upper bound on concurrent timed leases, so polling cannot pin unbounded
 /// sources.
 pub const MAX_TIMED_LEASES: usize = 64;
+/// Upper bound on remembered generations of retired source records.
+pub const MAX_RETIRED_GENERATIONS: usize = 4096;
 
 impl Default for DemandConfig {
     fn default() -> Self {
@@ -545,6 +547,47 @@ struct Book<T> {
     entries: HashMap<Arc<str>, Entry<T>>,
     timed: HashMap<(Arc<str>, ConsumerTag), Timed<T>>,
     pins: BTreeMap<String, Vec<DemandLease<T>>>,
+    /// The last generation of each source whose record was retired, so a
+    /// later start continues from it (review DMD-02). Bounded by
+    /// [`MAX_RETIRED_GENERATIONS`]: past it the map folds into
+    /// `generation_floor`, which every unknown source starts above.
+    retired: HashMap<Arc<str>, u64>,
+    generation_floor: u64,
+}
+
+impl<T> Book<T> {
+    /// The record for `id`, created on first use carrying the generation its
+    /// retired predecessor reached.
+    fn entry(&mut self, id: &str, now: Instant) -> &mut Entry<T> {
+        if !self.entries.contains_key(id) {
+            let key: Arc<str> = Arc::from(id);
+            let mut entry = Entry::new(now);
+            entry.generation = self
+                .retired
+                .remove(id)
+                .unwrap_or(0)
+                .max(self.generation_floor);
+            self.entries.insert(Arc::clone(&key), entry);
+        }
+        // Inserted above when absent.
+        self.entries
+            .get_mut(id)
+            .unwrap_or_else(|| unreachable!("entry inserted above"))
+    }
+
+    /// Forget `id`'s record, remembering its generation.
+    fn retire(&mut self, id: &str) -> Option<Entry<T>> {
+        let (key, entry) = self.entries.remove_entry(id)?;
+        if entry.generation > self.generation_floor {
+            if self.retired.len() >= MAX_RETIRED_GENERATIONS {
+                let highest = self.retired.values().copied().max().unwrap_or(0);
+                self.generation_floor = self.generation_floor.max(highest);
+                self.retired.clear();
+            }
+            self.retired.insert(key, entry.generation);
+        }
+        Some(entry)
+    }
 }
 
 /// One published set member: a source a group of consumers wants.
@@ -717,6 +760,8 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                     entries: HashMap::new(),
                     timed: HashMap::new(),
                     pins: BTreeMap::new(),
+                    retired: HashMap::new(),
+                    generation_floor: 0,
                 }),
                 registry,
                 driver,
@@ -814,10 +859,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         {
             let mut book = lock(&self.inner.book);
             let now = Instant::now();
-            let entry = book
-                .entries
-                .entry(Arc::clone(&key))
-                .or_insert_with(|| Entry::new(now));
+            let entry = book.entry(id, now);
             entry.leases.insert(lease_id, LeaseRecord { rails, tag });
             entry.close_now = false;
             if entry.gave_up {
@@ -921,14 +963,14 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         let mut book = lock(&self.inner.book);
         let now = Instant::now();
         let progress = self.inner.driver.progress(id, rails);
-        let entry = book
-            .entries
-            .entry(Arc::from(id))
-            .or_insert_with(|| Entry::new(now));
+        let entry = book.entry(id, now);
+        let fresh = entry.running.is_empty();
         entry.running = entry.running.union(rails);
         entry.booted = true;
-        // Boot started it: this is its first generation.
-        entry.generation = entry.generation.max(1);
+        // Boot started it: that start is a generation of its own.
+        if fresh {
+            entry.generation = entry.generation.wrapping_add(1);
+        }
         entry.progress = progress;
         entry.progress_at = now;
         if let Some(handle) = handle.flatten() {
@@ -1426,7 +1468,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 .map(|(id, _)| Arc::clone(id))
                 .collect();
             for id in finished {
-                if let Some(entry) = book.entries.remove(&id) {
+                if let Some(entry) = book.retire(&id) {
                     released.push(entry);
                 }
             }
@@ -2440,6 +2482,26 @@ mod tests {
         });
         assert_eq!(manager.status("boot0").generation, 1);
         drop(lease);
+        manager.shutdown();
+    }
+
+    /// Review DMD-02: a stop that retires the record must not reset the
+    /// generation, or a late callback from the earlier start reads current.
+    #[test]
+    fn a_generation_never_repeats_across_an_idle_cycle() {
+        let fake = Arc::new(Fake::default());
+        let manager = manager(&fake, 1);
+        let mut seen = Vec::new();
+        for round in 1..=3 {
+            let lease = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
+            wait("start", || {
+                fake.video_starts.load(Ordering::SeqCst) == round
+            });
+            seen.push(manager.status("cam").generation);
+            drop(lease);
+            wait("record removed", || manager.active_len() == 0);
+        }
+        assert_eq!(seen, vec![1, 2, 3], "generations repeat after idle");
         manager.shutdown();
     }
 
