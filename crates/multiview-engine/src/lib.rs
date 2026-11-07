@@ -111,6 +111,7 @@ pub mod salvo;
 pub mod scheduler;
 pub mod slate;
 pub mod supervisor;
+pub mod switcher;
 pub mod sysref;
 pub mod tally;
 

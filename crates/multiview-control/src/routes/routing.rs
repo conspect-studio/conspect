@@ -23,6 +23,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use multiview_config::audio::{route_gain_db_in_range, MAX_ROUTE_GAIN_DB, MIN_ROUTE_GAIN_DB};
 use multiview_config::routing::StreamRef;
 use multiview_core::stream::{
     StableStreamId, StreamDescriptor, StreamDetail, StreamInventory, StreamKind,
@@ -50,8 +51,21 @@ use crate::state::AppState;
 ///   discrete-track layout comparison when the inventory is absent);
 /// * `coerce` — the operator confirms a down/up-mix to the destination's pinned
 ///   layout (turns a would-be Class-2 audio mismatch into Class-1-with-degradation);
-/// * `primed` — whether the video target source is warm (absent ⇒ assumed primed).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// * `primed` — whether the video target source is warm (absent ⇒ assumed primed);
+/// * `gain_db` — the **audio** contribution gain in dB for the take (absent ⇒
+///   unity, `0.0`); applied by the engine to the routed strip (ADR-0059 §4).
+///   Must be finite and within the documented supported range `-96.0 ..= 24.0`
+///   dB (`MIN_ROUTE_GAIN_DB ..= MAX_ROUTE_GAIN_DB` in `multiview-config`):
+///   anything outside it is rejected here with a `422` (and never enqueued)
+///   because an unbounded gain overflows the mixer's linear conversion
+///   (`10^(10000/20)` is `inf`, and `inf × 0` on a muted strip is `NaN`, which
+///   would contaminate the whole program mix);
+/// * `mute` — whether the **audio** take lands muted (absent ⇒ unmuted); a mute
+///   keeps the strip routed and preserves its gain for an exact unmute.
+///
+/// The audio fields are ignored for non-audio targets. Not `Eq` because
+/// `gain_db` is a float.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RouteTakeRequest {
     /// The destination the take re-points.
@@ -69,6 +83,15 @@ pub struct RouteTakeRequest {
     /// Optional video-target priming hint (absent ⇒ assumed primed).
     #[serde(default)]
     pub primed: Option<bool>,
+    /// Optional audio contribution gain in dB (absent ⇒ unity, `0.0`). Must be
+    /// finite and within `-96.0 ..= 24.0` dB; outside that range the take is
+    /// rejected with `422` and no command is enqueued.
+    #[serde(default)]
+    pub gain_db: Option<f32>,
+    /// Optional audio mute for the take (absent ⇒ unmuted). Mute keeps the
+    /// strip routed and preserves its gain for an exact unmute.
+    #[serde(default)]
+    pub mute: Option<bool>,
 }
 
 /// The `200` body of a hot (Class-1 / Reset-lite) `/routing/{kind}/take`.
@@ -168,6 +191,25 @@ pub(crate) async fn take_route(
     // (a missing/out-of-scope id fails closed).
     crate::auth::authorize_object(&principal, &req.source.input_id)?;
 
+    // A non-finite or out-of-range audio gain would poison the mixer's strip
+    // gain, so the boundary fails it closed (RFC 9457 validation problem) before
+    // any submit — no command is enqueued. The upper bound matters as much as
+    // finiteness: a large-but-finite dB value converts to an infinite linear
+    // gain, and `inf × 0` on a muted strip is `NaN`, which would contaminate the
+    // whole program mix. The engine clamps as well (defence in depth).
+    if let Some(gain_db) = req.gain_db {
+        if !gain_db.is_finite() {
+            return Err(ControlError::Validation(format!(
+                "gain_db must be finite (got {gain_db})"
+            )));
+        }
+        if !route_gain_db_in_range(gain_db) {
+            return Err(ControlError::Validation(format!(
+                "gain_db {gain_db} is outside the supported range {MIN_ROUTE_GAIN_DB}..={MAX_ROUTE_GAIN_DB} dB"
+            )));
+        }
+    }
+
     // Classify against the destination's pinned params (inv #11: surfaced first).
     let plan = classify_request(&state, &req);
 
@@ -175,8 +217,12 @@ pub(crate) async fn take_route(
     // non-blocking (idempotency + shed-503 via `submit_accepted`).
     let source = req.source.clone();
     let target = req.target.clone();
+    // The audio take's gain/mute ride the command (ADR-0059 §4: no more
+    // hardcoded `0.0`/`false`); absent ⇒ unity/unmuted.
+    let gain_db = req.gain_db.unwrap_or(0.0);
+    let mute = req.mute.unwrap_or(false);
     let response = submit_accepted(&state, &idem, |op| {
-        build_route_command(op, &target, &source)
+        build_route_command(op, &target, &source, gain_db, mute)
     })?;
     state.audit(
         &principal.key_id,
@@ -222,7 +268,17 @@ async fn accepted_operation_id(response: Response) -> Result<String, ControlErro
 
 /// Build the `Command::Route*` a crosspoint take submits, desugaring the target +
 /// source into the matching per-stream route command (ADR-0034 / RT-11).
-fn build_route_command(op: OperationId, target: &RouteTarget, source: &StreamRef) -> Command {
+///
+/// `gain_db`/`mute` are the take's audio contribution settings (ADR-0059 §4) and
+/// are carried only by the audio commands; the video/subtitle commands have no
+/// such fields.
+fn build_route_command(
+    op: OperationId,
+    target: &RouteTarget,
+    source: &StreamRef,
+    gain_db: f32,
+    mute: bool,
+) -> Command {
     match target {
         RouteTarget::VideoCell { cell } => Command::RouteVideo {
             op,
@@ -233,15 +289,15 @@ fn build_route_command(op: OperationId, target: &RouteTarget, source: &StreamRef
             op,
             target: channel.clone(),
             source: source.clone(),
-            gain_db: 0.0,
-            mute: false,
+            gain_db,
+            mute,
         },
         RouteTarget::AudioDiscreteTrack { track, .. } => Command::RouteAudio {
             op,
             target: track.clone(),
             source: source.clone(),
-            gain_db: 0.0,
-            mute: false,
+            gain_db,
+            mute,
         },
         RouteTarget::SubtitleLayer { layer } => Command::RouteSubtitle {
             op,

@@ -14,10 +14,9 @@
 //! [`ProgramKind::Multiview`]) from the legacy top-level
 //! `canvas`/`layout`/`cells`/`overlays`/`outputs` block and the engine's
 //! `MultiviewProgram` is constructed from it — so the run path flows through one
-//! `Program` with **zero** behavioural change. The schema-root
-//! `programs: Vec<ProgramSpec>` field, the backward-compat desugaring, and the
-//! per-program output-label cross-validation arrive in MP-5; this module does not
-//! change [`MultiviewConfig`](crate::MultiviewConfig).
+//! `Program` with **zero** behavioural change. MP-5 adds the `programs` schema
+//! root, backward-compatible desugaring, and output-crosspoint validation in
+//! [`MultiviewConfig`](crate::MultiviewConfig). Multi-program execution is MP-7.
 //!
 //! All unions are **internally tagged** by `kind` (never `untagged`) per ADR-0010
 //! / conventions §5, so they round-trip robustly across TOML and JSON.
@@ -165,8 +164,8 @@ impl ProgramKind {
 /// [`ProgramKind::Multiview`]) from the legacy config block via
 /// [`ProgramSpec::main_multiview`], and the engine's `MultiviewProgram` is built
 /// from it — the single seam through which the existing run path now flows. The
-/// `programs: Vec<ProgramSpec>` schema root + backward-compat desugaring arrive
-/// in MP-5.
+/// `programs: Vec<ProgramSpec>` schema root + backward-compat desugaring are
+/// consumed in MP-5 by [`MultiviewConfig`](crate::MultiviewConfig).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ProgramSpec {

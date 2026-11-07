@@ -45,6 +45,7 @@ import {
   TableRow,
 } from '../components/ui/table';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** The start-cast dialog draft. */
 interface StartDraft {
@@ -172,7 +173,7 @@ export function CastPage(): JSX.Element {
       { id: volumeDraft.session.id, request: { level_percent: level } },
       {
         onSuccess: (accepted): void => {
-          toast({
+          followOperation(accepted, t`Cast volume`, {
             title: t`Volume change accepted`,
             description: t`Operation ${accepted.operation_id}; the level arrives on the realtime stream.`,
           });

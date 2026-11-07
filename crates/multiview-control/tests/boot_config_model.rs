@@ -816,6 +816,145 @@ async fn a_resumed_run_does_not_reapply_the_unchanged_boot_file() {
     watch.stop();
 }
 
+/// Explicit single programs must track the live stores after REST edits, while
+/// the adopted snapshot written to active.toml must remain valid as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_main_survives_output_and_cell_mutations() {
+    declared_program_survives_output_and_cell_mutations("main").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_aux_survives_output_and_cell_mutations() {
+    declared_program_survives_output_and_cell_mutations("aux").await;
+}
+
+async fn declared_program_survives_output_and_cell_mutations(program_id: &str) {
+    let mut boot = MultiviewConfig::load_from_toml(BOOT_DOC).expect("boot parses");
+    boot.programs = boot.effective_programs();
+    boot.programs[0].id = program_id.try_into().expect("valid program id");
+    boot.programs[0].display_name = Some("Operator program".to_owned());
+    boot.programs[0].autostart = false;
+    boot.programs[0].on_loss = multiview_config::FailoverSlate::Black;
+    if program_id != "main" {
+        let mut routing = boot.routing_table();
+        routing.video.clear();
+        for output in &mut routing.output {
+            program_id.clone_into(&mut output.program);
+        }
+        boot.routing = Some(routing);
+    }
+    boot.validate().expect("declared program validates");
+    let r = rig(&boot.to_toml().expect("declared program renders"));
+
+    let response = send(
+        &r.router,
+        support::post_json(
+            "/api/v1/outputs/second",
+            OPERATOR_TOKEN,
+            &serde_json::json!({
+                "name": "second",
+                "body": { "id": "second", "kind": "hls", "path": "/tmp/second.m3u8",
+                          "codec": "mpeg2video", "segment_ms": 1000 }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_declared_program_exports_and_persists(&r, program_id, "in_a").await;
+
+    let working = r
+        .state
+        .working_layout_id
+        .as_deref()
+        .expect("working layout");
+    let response = send(
+        &r.router,
+        get(&format!("/api/v1/layouts/{working}"), OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = support::etag(&response).expect("layout etag");
+    let mut layout = body_json(response).await;
+    layout["body"]["cells"][0]["source"]["input_id"] = serde_json::json!("in_b");
+    let response = send(
+        &r.router,
+        put_json(
+            &format!("/api/v1/layouts/{working}"),
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &layout,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = send(
+        &r.router,
+        support::post_json(
+            "/api/v1/commands/apply-layout",
+            OPERATOR_TOKEN,
+            &serde_json::json!({ "layout": working }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_declared_program_exports_and_persists(&r, program_id, "in_b").await;
+}
+
+async fn assert_declared_program_exports_and_persists(
+    r: &Rig,
+    program_id: &str,
+    expected_cell_source: &str,
+) {
+    let response = send(&r.router, get("/api/v1/config/export", OPERATOR_TOKEN)).await;
+    assert_eq!(response.status(), StatusCode::OK, "export must validate");
+    let text = String::from_utf8(support::body_bytes(response).await).expect("TOML export");
+    let exported = MultiviewConfig::load_from_toml(&text).expect("export parses");
+    exported.validate().expect("export validates");
+    assert_eq!(exported.programs.len(), 1, "retain declared program");
+    assert_eq!(exported.programs[0].id.as_str(), program_id);
+    assert_eq!(
+        exported.programs[0].display_name.as_deref(),
+        Some("Operator program")
+    );
+    assert!(!exported.programs[0].autostart);
+    assert_eq!(
+        exported.programs[0].on_loss,
+        multiview_config::FailoverSlate::Black
+    );
+    assert_eq!(exported.programs[0].outputs, exported.outputs);
+    assert_eq!(exported.outputs.len(), 2, "export new output");
+    assert_eq!(
+        serde_json::to_value(&exported.cells[0]).expect("cell JSON")["source"]["input_id"],
+        expected_cell_source,
+        "export changed cell"
+    );
+    persist_running_now(&r.state)
+        .await
+        .expect("persist Running");
+    let active_path = r
+        .state
+        .boot_model
+        .as_ref()
+        .expect("boot model")
+        .active_path();
+    let text = std::fs::read_to_string(active_path).expect("active.toml written");
+    let active = MultiviewConfig::load_from_toml(&text).expect("active parses");
+    active.validate().expect("active validates");
+    assert_eq!(active.programs.len(), 1, "persist declared program");
+    assert_eq!(active.programs[0].id.as_str(), program_id);
+    assert_eq!(
+        active.programs[0].display_name.as_deref(),
+        Some("Operator program")
+    );
+    assert!(!active.programs[0].autostart);
+    assert_eq!(
+        active.programs[0].on_loss,
+        multiview_config::FailoverSlate::Black
+    );
+    assert_eq!(active.programs[0].outputs, active.outputs);
+    assert_eq!(active.outputs.len(), 2, "persist new output");
+}
+
 /// Pin (d): the persisted `active.toml` round-trips
 /// `MultiviewConfig::load_from_toml` + `validate`, and carries the live edit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -29,6 +29,8 @@ import { useOverlays, useSources } from '../resources/queries';
 import { PageHeader } from '../components/PageHeader';
 import { Button } from '../components/ui/button';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
+import { newIdempotencyKey } from '../api/operations';
 
 /** The editor page (new or edit). */
 export function LayoutEditorPage(): JSX.Element {
@@ -81,7 +83,7 @@ export function LayoutEditorPage(): JSX.Element {
     // (`POST /api/v1/layouts/{id}`). For a fresh draft the editor uses an empty
     // id, so we generate one client-side using a random UUID. Existing layouts
     // carry their persisted id from the URL param.
-    const id = payload.id !== '' ? payload.id : crypto.randomUUID();
+    const id = payload.id !== '' ? payload.id : newIdempotencyKey();
     save.mutate(
       { id, input: { name: payload.name, body: payload.body } },
       {
@@ -106,14 +108,14 @@ export function LayoutEditorPage(): JSX.Element {
   // apply leaves the layout saved — the toast says which step failed and why
   // (the 422 problem detail names the reason, e.g. a pinned-canvas mismatch).
   const handleSaveAndApply = (payload: LayoutSavePayload): void => {
-    const id = payload.id !== '' ? payload.id : crypto.randomUUID();
+    const id = payload.id !== '' ? payload.id : newIdempotencyKey();
     save.mutate(
       { id, input: { name: payload.name, body: payload.body } },
       {
         onSuccess: (): void => {
           applyLayoutCommand(id)
             .then((accepted): void => {
-              toast({
+              followOperation(accepted, t`Apply layout`, {
                 title: t`Layout saved & applied live`,
                 description: `${t`Takes effect at the next frame boundary.`} ${t`Operation id`}: ${accepted.operation_id}`,
               });

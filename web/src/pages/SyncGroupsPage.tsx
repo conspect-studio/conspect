@@ -38,6 +38,7 @@ import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Label } from '../components/ui/label';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** The localized label for a claimed sync tier. */
 function tierLabel(tier: SyncTier): JSX.Element {
@@ -211,7 +212,7 @@ export function SyncGroupsPage(): JSX.Element {
   const measureNow = (group: SyncGroupView): void => {
     measureSyncGroup(group.id)
       .then((accepted): void => {
-        toast({
+        followOperation(accepted, t`Skew measurement`, {
           title: t`Measurement running`,
           description: t`Operation ${accepted.operation_id}; the measured skew arrives on the realtime stream.`,
         });

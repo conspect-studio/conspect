@@ -46,6 +46,7 @@ use std::collections::HashSet;
 use multiview_core::stream::StreamKind;
 use serde::{Deserialize, Serialize};
 
+use crate::audio::{route_gain_db_in_range, MAX_ROUTE_GAIN_DB, MIN_ROUTE_GAIN_DB};
 use crate::error::ConfigError;
 
 /// How a [`StreamRef`] picks **which** elementary stream of the requested
@@ -179,6 +180,8 @@ pub struct AudioCrosspoint {
     /// The source elementary stream feeding the target.
     pub source: StreamRef,
     /// Program-bus contribution gain in dB (a level, not a rate; `0.0` ⇒ unity).
+    /// Must be finite and within `-96.0 ..= 24.0` dB
+    /// ([`MIN_ROUTE_GAIN_DB`]` ..= `[`MAX_ROUTE_GAIN_DB`]).
     /// Mirrors [`crate::AudioRoute::gain_db`]; defaults to unity.
     #[serde(default)]
     pub gain_db: f32,
@@ -320,7 +323,8 @@ impl RoutingTable {
     ///   `source.kind` is [`StreamKind::Video`];
     /// * every audio crosspoint's `target` is a selectable track (the program
     ///   bus or a declared discrete track), and the `source.kind` is
-    ///   [`StreamKind::Audio`], with a finite `gain_db`;
+    ///   [`StreamKind::Audio`], with a `gain_db` in the supported
+    ///   `-96.0 ..= 24.0` dB range;
     /// * every subtitle crosspoint's `layer` resolves to a declared layer, and
     ///   the `source.kind` is [`StreamKind::Subtitle`];
     /// * every output crosspoint's `output` resolves to a declared output;
@@ -389,6 +393,12 @@ impl RoutingTable {
                     xp.target, xp.gain_db
                 )));
             }
+            if !route_gain_db_in_range(xp.gain_db) {
+                return Err(ConfigError::Validation(format!(
+                    "audio crosspoint for target {:?}: gain_db {} is outside the supported range {MIN_ROUTE_GAIN_DB}..={MAX_ROUTE_GAIN_DB} dB",
+                    xp.target, xp.gain_db
+                )));
+            }
             if !refs.tracks.contains(xp.target.as_str()) {
                 return Err(ConfigError::Validation(format!(
                     "audio crosspoint binds unknown track/bus target {:?}",
@@ -434,10 +444,10 @@ impl RoutingTable {
     fn validate_output(&self, refs: &RoutingRefs<'_>) -> Result<(), ConfigError> {
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.output.len());
         for xp in &self.output {
-            if xp.program.is_empty() {
+            if !refs.programs.contains(xp.program.as_str()) {
                 return Err(ConfigError::Validation(format!(
-                    "output crosspoint for {:?} has an empty program",
-                    xp.output
+                    "output crosspoint for {:?} references undeclared program {:?}",
+                    xp.output, xp.program
                 )));
             }
             if !refs.outputs.contains(xp.output.as_str()) {
@@ -475,4 +485,6 @@ pub struct RoutingRefs<'a> {
     /// Declared output ids ([`crate::Output::id`] — explicit operator id, or the
     /// derived label).
     pub outputs: HashSet<&'a str>,
+    /// Declared program ids, or the implicit main id for legacy documents.
+    pub programs: HashSet<&'a str>,
 }

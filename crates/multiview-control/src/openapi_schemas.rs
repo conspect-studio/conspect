@@ -1223,7 +1223,8 @@ pub struct AudioRouteDoc {
     /// Whether this input contributes to the mixed program bus.
     #[serde(default)]
     pub include_in_program_bus: bool,
-    /// Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite).
+    /// Program-bus contribution gain in dB (`0.0` ⇒ unity; must be finite and
+    /// within `-96.0 ..= 24.0` dB — the documented supported route-gain range).
     #[serde(default)]
     pub gain_db: f32,
     /// Whether this input is muted on the program bus (its discrete track, if

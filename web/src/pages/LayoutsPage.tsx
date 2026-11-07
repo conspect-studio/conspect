@@ -41,6 +41,7 @@ import {
   TableRow,
 } from '../components/ui/table';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** Count the cells in a layout body (0 when not the editable kind). */
 function cellCount(layout: Layout): number {
@@ -143,7 +144,7 @@ export function LayoutsPage(): JSX.Element {
     setApplying(true);
     applyLayoutCommand(layout.id)
       .then((accepted): void => {
-        toast({
+        followOperation(accepted, t`Apply layout`, {
           title: t`Layout applied live`,
           description: `${t`Takes effect at the next frame boundary.`} ${t`Operation id`}: ${accepted.operation_id}`,
         });

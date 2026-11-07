@@ -36,6 +36,7 @@ import {
   SelectValue,
 } from '../components/ui/select';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** A stream selector strategy (mirrors `StreamSelectorDoc.by`). */
 type SelectorBy = 'best' | 'index' | 'language' | 'stream_id';
@@ -193,7 +194,7 @@ export function RoutingPage(): JSX.Element {
               description: t`Applied as ${outcome.applied.class}. Operation ${outcome.applied.operation_id}.`,
             });
           } else {
-            toast({
+            followOperation(outcome.accepted, t`Routing take`, {
               title: t`Migration accepted`,
               description: t`Operation ${outcome.accepted.operation_id}; the outcome arrives on the realtime stream.`,
             });

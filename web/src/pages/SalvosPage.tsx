@@ -43,6 +43,7 @@ import {
   TableRow,
 } from '../components/ui/table';
 import { toast } from '../components/ui/use-toast';
+import { followOperation } from '../api/operationStatus';
 
 /** Count the recall clauses on a salvo (for an at-a-glance column). */
 function recallCount(salvo: Salvo): number {
@@ -144,12 +145,15 @@ export function SalvosPage(): JSX.Element {
     setPendingDelete(null);
   };
 
+  const actionLabel = (action: SalvoAction): string =>
+    action === 'arm' ? t`Salvo arm` : action === 'take' ? t`Salvo take` : t`Salvo cancel`;
+
   const runAction = (salvo: Salvo, action: SalvoAction): void => {
     operate.mutate(
       { id: salvo.id, action },
       {
         onSuccess: (accepted): void => {
-          toast({
+          followOperation(accepted, `${actionLabel(action)}: ${salvo.id}`, {
             title: t`Command accepted`,
             description: `${t`Operation id`}: ${accepted.operation_id}`,
           });

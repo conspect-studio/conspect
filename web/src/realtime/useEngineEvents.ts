@@ -4,13 +4,12 @@
 // patch them; on `$resync` the UI REBUILDS (discards) the affected state rather
 // than merging. The hook NEVER blocks render — the socket lives in a ref, all
 // state lands via setState/Query-cache writes from event callbacks.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient } from "@tanstack/react-query";
 
-import { RealtimeConnection } from "./connection";
 import type { RealtimeStatus } from "./connection";
-import { mintWsTicket, realtimeWsBaseUrl } from "./ticket";
+import { subscribeRealtimeAll } from "./shared";
 import {
   CONTROL_TOPIC,
   parseDeviceDiscovered,
@@ -325,17 +324,8 @@ export function useEngineEvents(): EngineEvents {
   const [status, setStatus] = useState<RealtimeStatus>("connecting");
   const [lastSeq, setLastSeq] = useState(0);
   const [gaps, setGaps] = useState(0);
-  const connectionRef = useRef<RealtimeConnection | null>(null);
-
   useEffect(() => {
-    const connection = new RealtimeConnection(realtimeWsBaseUrl(), {
-      onStatus: (next): void => {
-        setStatus(next);
-      },
-      onGap: (): void => {
-        setGaps((count) => count + 1);
-      },
-      onEnvelope: (envelope): void => {
+    const unsubscribe = subscribeRealtimeAll((envelope): void => {
         // Control frames may carry seq 0; only advance the displayed cursor for
         // real, sequenced frames so the indicator never regresses.
         if (envelope.seq > 0) {
@@ -404,13 +394,13 @@ export function useEngineEvents(): EngineEvents {
             // Unknown event types are ignored (forward-compatible, §2).
             return;
         }
-      },
-    }, mintWsTicket);
-    connectionRef.current = connection;
-    connection.start();
+      }, setStatus, (): void => {
+        // Missed frames: refetch everything the stream feeds (resume failed).
+        setGaps((count) => count + 1);
+        void queryClient.invalidateQueries();
+      });
     return (): void => {
-      connection.stop();
-      connectionRef.current = null;
+      unsubscribe();
     };
   }, [queryClient]);
 

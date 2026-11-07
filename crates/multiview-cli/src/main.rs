@@ -28,7 +28,7 @@ use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::MultiviewConfig;
 use multiview_control::{command_bus, EngineStateSnapshot};
 #[cfg(feature = "ffmpeg")]
-use multiview_engine::{ActorExit, Program, ProgramId, ProgramSet, RealtimePacer};
+use multiview_engine::{ActorExit, Program, ProgramSet, RealtimePacer};
 use multiview_engine::{CompositorDrive, EnginePublisher, StopSignal};
 use multiview_events::Event;
 use multiview_telemetry::tracing_init::SubscriberBuilder;
@@ -279,8 +279,16 @@ async fn run_pipeline(
         pipeline = pipeline.with_subtitles(track);
     }
     if args.program_audio {
-        tracing::info!("program audio enabled: muxing an AAC program-audio stream");
+        // The legacy override (ADR-0059 §8): `Pipeline::build` already enabled
+        // program audio for a config that declares it, so this force-turns it on
+        // for a document declaring neither.
+        tracing::info!("--program-audio override: muxing an AAC program-audio stream");
         pipeline.enable_program_audio();
+    } else if pipeline.has_program_audio() {
+        tracing::info!(
+            "program audio enabled by config (an `[audio]` or `[switcher]` block): \
+             muxing an AAC program-audio stream"
+        );
     }
     let cadence = pipeline.cadence();
     tracing::info!(
@@ -755,7 +763,7 @@ async fn run_pipeline_until_ctrl_c(
         pipeline.epoch_anchor_slot(),
         pipeline.shared_epoch(),
         multiview_cli::timing_status::TimingStatusOptions {
-            stream_id: multiview_config::ProgramId::MAIN.to_owned(),
+            stream_id: pipeline.program_id().to_string(),
             link_offset_ns: timing_cfg.link_offset_ns(),
             ptp_phc: timing_cfg.ptp_phc.clone(),
             ptp_utc_offset_ns: timing_cfg.ptp_utc_offset_ns(),
@@ -803,9 +811,8 @@ async fn run_pipeline_until_ctrl_c(
         let _ = multiview_control::emit_network_warnings(publisher.as_ref(), mismatch, since_nanos);
     }
 
-    // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive this single
-    // program (id "main") through it — behaviour-identical to today (one program,
-    // the same drive/stop/publisher/preview/drain). See `drive_main_program_in_set`.
+    // MP-1 (ADR-0030 §2.2): build the engine `ProgramSet` and drive the sole
+    // declared (or implicit main) program through it with the same clock.
     let report =
         drive_main_program_in_set(pipeline, cadence, &stop, &publisher, &preview_slot, drain)
             .await?;
@@ -828,11 +835,11 @@ async fn run_pipeline_until_ctrl_c(
     Ok(report)
 }
 
-/// Drive the single legacy `"main"` program through an engine
+/// Drive the sole program through an engine
 /// [`ProgramSet`](multiview_engine::ProgramSet) (MP-1, ADR-0030 §2.2).
 ///
-/// For the legacy single-program config the set has **exactly one** program (id
-/// `"main"`) — behaviour-identical to driving the [`Pipeline`] directly: the same
+/// The set has **exactly one** program (its declared id or implicit `"main"`) —
+/// behaviour-identical to driving the [`Pipeline`] directly: the same
 /// `run_until_serving` drive, the same `StopSignal` (Ctrl-C reaches the program via
 /// the supervisor's per-program stop handle), the same publisher/preview/drain. The
 /// set owns the program's lifecycle (spawn on its own supervised task, stop, join)
@@ -858,10 +865,9 @@ async fn drive_main_program_in_set(
     // the pipeline built before).
     let mut programs: ProgramSet<RealtimePacer> =
         ProgramSet::new(Arc::new(multiview_engine::MonotonicTimeSource::new()));
-    let program_id = ProgramId::new(ProgramId::MAIN).context("the reserved \"main\" program id")?;
-    // The live per-tick counter the `ProgramSet` samples for "main": the pipeline
-    // increments it once per emitted output tick (a single wait-free `fetch_add`),
-    // so `programs.ticks_emitted("main")` is genuinely live, not fabricated.
+    let program_id = pipeline.program_id().clone();
+    // The live per-tick counter the `ProgramSet` samples for this program:
+    // the pipeline increments it once per emitted output tick.
     let main_ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Recover the run's `PipelineReport` from the supervised task.
     let (report_tx, report_rx) =
@@ -900,7 +906,7 @@ async fn drive_main_program_in_set(
     );
     programs
         .start(program)
-        .context("starting the \"main\" program in the ProgramSet")?;
+        .context("starting the single program in the ProgramSet")?;
 
     // Await the single program's NATURAL completion: its run returns when the
     // StopSignal is raised (Ctrl-C), at which point it sends its report. We await
@@ -912,7 +918,7 @@ async fn drive_main_program_in_set(
         Ok(Ok(report)) => Ok(report),
         Ok(Err(reason)) => Err(anyhow::anyhow!(reason)).context("pipeline run until Ctrl-C"),
         Err(_) => Err(anyhow::anyhow!(
-            "the \"main\" program task ended without reporting"
+            "the single program task ended without reporting"
         )),
     }
 }
@@ -936,8 +942,13 @@ async fn run_pipeline(
             "--subtitles needs the `ffmpeg`+`overlay` features (full pipeline); ignoring"
         );
     }
-    if args.program_audio {
-        tracing::warn!("--program-audio needs the `ffmpeg` feature (full pipeline); ignoring");
+    if args.program_audio || config.declares_program_audio() {
+        // Never silently skip declared audio: this build has no libav path, so a
+        // config carrying `[audio]`/`[switcher]` (or the override flag) must say so.
+        tracing::warn!(
+            "program audio (config-declared or `--program-audio`) needs the `ffmpeg` \
+             feature (full pipeline); ignoring"
+        );
     }
     // Conspect S1 startup gate: gate the NEW engine build on the published ladder
     // level (refuse at the block-new-instance rung).
@@ -1109,7 +1120,10 @@ async fn run_software_until_ctrl_c(
         engine.epoch_anchor_slot(),
         multiview_output::SharedEpoch::new(),
         multiview_cli::timing_status::TimingStatusOptions {
-            stream_id: multiview_config::ProgramId::MAIN.to_owned(),
+            stream_id: config.effective_programs().first().map_or_else(
+                || multiview_config::ProgramId::MAIN.to_owned(),
+                |p| p.id.to_string(),
+            ),
             link_offset_ns: timing_cfg.link_offset_ns(),
             ptp_phc: timing_cfg.ptp_phc.clone(),
             ptp_utc_offset_ns: timing_cfg.ptp_utc_offset_ns(),

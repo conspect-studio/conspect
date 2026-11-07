@@ -27,6 +27,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
 
+/// The lowest supported program-bus **route** contribution gain, in dB
+/// (`-96 dB`, ≈ a 16-bit least-significant bit — below it a contribution is
+/// indistinguishable from silence, so the floor costs nothing and keeps
+/// `10^(dB/20)` strictly positive and representable).
+pub const MIN_ROUTE_GAIN_DB: f32 = -96.0;
+
+/// The highest supported program-bus **route** contribution gain, in dB
+/// (`+24 dB`, ≈ 15.85× linear). Beyond it the contribution is almost always a
+/// mistake, and an unbounded value can overflow the mixer's linear gain
+/// (`10^(10000/20)` is `inf`, and `inf × 0` on a muted strip is `NaN`), so the
+/// supported range is closed here and enforced at every layer that carries a
+/// route gain: config validation, the REST take boundary (`422`), and the
+/// engine's own apply path.
+pub const MAX_ROUTE_GAIN_DB: f32 = 24.0;
+
+/// Whether `gain_db` is a supported program-bus route contribution gain: finite
+/// **and** within [`MIN_ROUTE_GAIN_DB`]` ..= `[`MAX_ROUTE_GAIN_DB`].
+///
+/// The dB-domain counterpart of the linear guard the audio mixer applies to a
+/// gain it is handed directly; both exist so a bad gain can never reach the mix.
+#[must_use]
+pub fn route_gain_db_in_range(gain_db: f32) -> bool {
+    gain_db.is_finite() && (MIN_ROUTE_GAIN_DB..=MAX_ROUTE_GAIN_DB).contains(&gain_db)
+}
+
+/// Clamp a program-bus route gain into the supported range, in dB.
+///
+/// This is the **fail-safe** form for the apply path: a finite out-of-range or
+/// infinite value clamps to the nearest endpoint, and a `NaN` — reachable only
+/// from a caller that bypassed config/REST validation — maps to
+/// [`MIN_ROUTE_GAIN_DB`], because an audio failure degrades to silence, never to
+/// a loud unity gain. The result is always finite and in range, so
+/// `10^(result/20)` can never overflow.
+#[must_use]
+pub fn clamp_route_gain_db(gain_db: f32) -> f32 {
+    if gain_db.is_nan() {
+        MIN_ROUTE_GAIN_DB
+    } else {
+        gain_db.clamp(MIN_ROUTE_GAIN_DB, MAX_ROUTE_GAIN_DB)
+    }
+}
+
 /// The channel layout requested for one routed input, internally tagged by
 /// `kind`. Mirrors the **variants** of `multiview_audio::ChannelLayout` (kept
 /// independent here so the pure config schema does not depend on the audio
@@ -91,6 +133,8 @@ pub struct AudioRoute {
     #[serde(default)]
     pub include_in_program_bus: bool,
     /// Program-bus contribution gain in dB (a level, not a rate; `0.0` ⇒ unity).
+    /// Must be finite and within `-96.0 ..= 24.0` dB
+    /// ([`MIN_ROUTE_GAIN_DB`]` ..= `[`MAX_ROUTE_GAIN_DB`]).
     #[serde(default)]
     pub gain_db: f32,
     /// Whether this input is muted (contributes silence to the program bus; its
@@ -101,7 +145,8 @@ pub struct AudioRoute {
 
 impl AudioRoute {
     /// Validate this route's own fields in isolation: a non-empty `input_id`, a
-    /// finite `gain_db`, and a non-empty `target_track` when one is named.
+    /// `gain_db` within [`MIN_ROUTE_GAIN_DB`]` ..= `[`MAX_ROUTE_GAIN_DB`], and a
+    /// non-empty `target_track` when one is named.
     ///
     /// Reference resolution (does `input_id` name a declared source? does
     /// `target_track` collide with another route?) is the routing block's
@@ -109,8 +154,9 @@ impl AudioRoute {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Validation`] for an empty `input_id`, a non-finite
-    /// `gain_db`, or an empty `target_track`/`language`/`title`.
+    /// Returns [`ConfigError::Validation`] for an empty `input_id`, a `gain_db`
+    /// that is non-finite or outside the supported range, or an empty
+    /// `target_track`/`language`/`title`.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.input_id.is_empty() {
             return Err(ConfigError::Validation(
@@ -120,6 +166,12 @@ impl AudioRoute {
         if !self.gain_db.is_finite() {
             return Err(ConfigError::Validation(format!(
                 "audio route for {:?}: gain_db must be finite (got {})",
+                self.input_id, self.gain_db
+            )));
+        }
+        if !route_gain_db_in_range(self.gain_db) {
+            return Err(ConfigError::Validation(format!(
+                "audio route for {:?}: gain_db {} is outside the supported range {MIN_ROUTE_GAIN_DB}..={MAX_ROUTE_GAIN_DB} dB",
                 self.input_id, self.gain_db
             )));
         }

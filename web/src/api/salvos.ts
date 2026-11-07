@@ -20,7 +20,7 @@ import {
   readProblem,
   submitOperation,
 } from './operations';
-import type { AcceptedBody, RequestOptions } from './operations';
+import type { AcceptedOperation, RequestOptions } from './operations';
 import type { components } from './schema';
 
 /** A salvo definition, exactly as the control plane returns it. */
@@ -35,7 +35,7 @@ export interface SalvoWithEtag {
 }
 
 export { OperationApiError } from './operations';
-export type { AcceptedBody, RequestOptions } from './operations';
+export type { AcceptedOperation, RequestOptions } from './operations';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -133,7 +133,7 @@ export async function deleteSalvo(
 export function armSalvo(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/arm`, options);
 }
 
@@ -141,7 +141,7 @@ export function armSalvo(
 export function takeSalvo(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/take`, options);
 }
 
@@ -149,6 +149,6 @@ export function takeSalvo(
 export function cancelSalvo(
   id: string,
   options: RequestOptions = {},
-): Promise<AcceptedBody> {
+): Promise<AcceptedOperation> {
   return submitOperation(`${itemPath(id)}/cancel`, options);
 }

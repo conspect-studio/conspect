@@ -20,6 +20,7 @@ import {
   toSyncGroupView,
   weakestMemberTier,
 } from './api';
+import { resolveOperationEnvelope } from '../realtime/operations';
 
 const server = setupServer();
 
@@ -161,6 +162,43 @@ describe('typed action calls', () => {
     expect(accepted.operation_id).toBe('op-3');
     expect(accepted.impact).toBe('dev');
     expect(accepted.detail).toContain('restarts');
+  });
+
+  it('setDeviceMode completion resolves on the device.mode envelope with corr = operation_id', async () => {
+    server.use(
+      http.post('*/api/v1/devices/dev-a/set-mode', () =>
+        HttpResponse.json(
+          { operation_id: 'op-mode-x', impact: 'dev', detail: 'restarts' },
+          { status: 202 },
+        ),
+      ),
+    );
+    const accepted = await setDeviceMode('dev-a', 'encoder');
+    expect(accepted.completion).toBeDefined();
+    // An unrelated envelope must not complete it.
+    resolveOperationEnvelope({
+      v: 1,
+      t: 'device.mode',
+      topic: 'devices',
+      seq: 1,
+      ts: 1,
+      corr: 'op-other',
+      data: { device_id: 'dev-b' },
+    });
+    const mode = {
+      v: 1,
+      t: 'device.mode',
+      topic: 'devices',
+      seq: 2,
+      ts: 2,
+      corr: 'op-mode-x',
+      data: { device_id: 'dev-a', mode: 'encoder' },
+    } as const;
+    expect(resolveOperationEnvelope(mode)).toBe(true);
+    await expect(accepted.completion).resolves.toMatchObject({
+      operationId: 'op-mode-x',
+      envelope: { t: 'device.mode', corr: 'op-mode-x' },
+    });
   });
 
   it('scanDevices returns the 202 scan envelope (operation id + note)', async () => {
