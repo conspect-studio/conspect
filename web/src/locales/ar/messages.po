@@ -2190,15 +2190,15 @@ msgstr ""
 msgid "Copied {url}"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:245
+#: src/iptv/NetworkDialog.tsx:251
 msgid "Copied as JSON"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:235
+#: src/iptv/NetworkDialog.tsx:241
 msgid "Copied as text"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:256
+#: src/iptv/NetworkDialog.tsx:262
 msgid "Copied curl commands"
 msgstr ""
 
@@ -2211,15 +2211,15 @@ msgstr ""
 msgid "Copy {label}"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:249
+#: src/iptv/NetworkDialog.tsx:255
 msgid "Copy as JSON"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:239
+#: src/iptv/NetworkDialog.tsx:245
 msgid "Copy as text"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:260
+#: src/iptv/NetworkDialog.tsx:266
 msgid "Copy curl"
 msgstr ""
 
@@ -2283,9 +2283,9 @@ msgstr ""
 msgid "Could not compose the bundle"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:235
-#: src/iptv/NetworkDialog.tsx:245
-#: src/iptv/NetworkDialog.tsx:256
+#: src/iptv/NetworkDialog.tsx:241
+#: src/iptv/NetworkDialog.tsx:251
+#: src/iptv/NetworkDialog.tsx:262
 msgid "Could not copy"
 msgstr ""
 
@@ -3171,6 +3171,10 @@ msgstr ""
 #: src/pages/docs/DisplayNodesHelpPage.tsx:16
 #: src/pages/docs/SyncHelpPage.tsx:42
 msgid "Display nodes"
+msgstr ""
+
+#: src/iptv/NetworkDialog.tsx:173
+msgid "DNS lookup failed:"
 msgstr ""
 
 #: src/docs/registry.ts:60
@@ -4334,7 +4338,7 @@ msgstr ""
 msgid "HTTP {0}"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:200
+#: src/iptv/NetworkDialog.tsx:206
 msgid "HTTP hops"
 msgstr ""
 
@@ -4513,7 +4517,7 @@ msgstr ""
 msgid "Inspect the cached elementary-stream inventory of a configured input (read-only). A bindable stream above becomes an input id once you bind it as a source."
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:271
+#: src/iptv/NetworkDialog.tsx:277
 msgid "Inspecting the network path…"
 msgstr ""
 
@@ -5757,7 +5761,7 @@ msgid "Needs headers"
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:944
-#: src/iptv/NetworkDialog.tsx:342
+#: src/iptv/NetworkDialog.tsx:348
 msgid "Network"
 msgstr ""
 
@@ -5773,7 +5777,7 @@ msgstr ""
 msgid "Network fit"
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:302
+#: src/iptv/NetworkDialog.tsx:308
 msgid "Network path"
 msgstr ""
 
@@ -6657,7 +6661,7 @@ msgid "Pending actions"
 msgstr ""
 
 #. placeholder {0}: h.host
-#: src/iptv/NetworkDialog.tsx:171
+#: src/iptv/NetworkDialog.tsx:177
 msgid "Per-family result for {0}"
 msgstr ""
 
@@ -8671,7 +8675,7 @@ msgstr ""
 msgid "The honest sync tier ladder, sync groups, offsets, and measured (never assumed) skew."
 msgstr ""
 
-#: src/iptv/NetworkDialog.tsx:304
+#: src/iptv/NetworkDialog.tsx:310
 msgid "The hosts this server talks to, the addresses it uses, and how the internet sees it."
 msgstr ""
 

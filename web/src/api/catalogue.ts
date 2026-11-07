@@ -196,6 +196,10 @@ export interface NetworkDns {
   readonly a: readonly string[];
   readonly aaaa: readonly string[];
   readonly ttl: number | null;
+  /** Resolver that answered (e.g. the system configuration), when known. */
+  readonly resolver?: string | null;
+  /** Lookup failure text; the record lists are empty when this is set. */
+  readonly error?: string | null;
 }
 
 /** TLS facts for a host. */

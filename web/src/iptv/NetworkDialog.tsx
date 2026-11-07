@@ -35,7 +35,7 @@ export function networkReportText(r: NetworkReport): string {
   for (const h of r.hosts) {
     out.push('', `Host ${h.host} (${h.role})`);
     out.push(
-      `  DNS: CNAME ${h.dns.cname.join(' > ') || '-'}  A ${h.dns.a.join(', ') || '-'}  AAAA ${h.dns.aaaa.join(', ') || '-'}  TTL ${h.dns.ttl === null ? '-' : String(h.dns.ttl)}`,
+      `  DNS: CNAME ${h.dns.cname.join(' > ') || '-'}  A ${h.dns.a.join(', ') || '-'}  AAAA ${h.dns.aaaa.join(', ') || '-'}  TTL ${h.dns.ttl === null ? '-' : String(h.dns.ttl)}${h.dns.error != null ? `  DNS error: ${h.dns.error}` : ''}`,
     );
     for (const a of h.addresses) {
       out.push(
@@ -166,7 +166,13 @@ export function NetworkReportView({ report }: { readonly report: NetworkReport }
               CNAME {h.dns.cname.join(' → ') || '—'} · A {h.dns.a.join(', ') || '—'} · AAAA{' '}
               {h.dns.aaaa.join(', ') || '—'}
               {h.dns.ttl !== null ? ` · TTL ${String(h.dns.ttl)}` : ''}
+              {h.dns.resolver != null ? ` · ${h.dns.resolver}` : ''}
             </p>
+            {h.dns.error != null ? (
+              <p className="text-xs text-destructive" dir="ltr">
+                {t`DNS lookup failed:`} {h.dns.error}
+              </p>
+            ) : null}
             <table className="mt-1 w-full">
               <caption className="sr-only">{t`Per-family result for ${h.host}`}</caption>
               <thead>

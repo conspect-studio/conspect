@@ -33,6 +33,13 @@ const REPORT: NetworkReport = {
       addresses: [{ ip: '192.0.2.20', family: 'ipv4', class: 'public', connect_ms: null, status: null, error: 'timeout' }],
       tls: null,
     },
+    {
+      host: 'keys.example.test',
+      role: 'key',
+      dns: { cname: [], a: [], aaaa: [], ttl: null, resolver: 'system', error: 'no record found for keys.example.test' },
+      addresses: [],
+      tls: null,
+    },
   ],
   hops: [
     {
@@ -89,6 +96,15 @@ describe('Network panel', () => {
     expect(seg).toHaveTextContent('Failed: timeout');
   });
 
+  it('shows a DNS lookup failure for a host instead of empty records', async () => {
+    renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
+    await userEvent.click(await screen.findByRole('button', { name: /^network: kshb 41$/i }));
+    const dialog = await screen.findByRole('dialog');
+    const host = await within(dialog).findByTestId('net-host-keys.example.test');
+    expect(within(host).getByText(/DNS lookup failed:/)).toBeInTheDocument();
+    expect(within(host).getByText(/no record found/)).toBeInTheDocument();
+  });
+
   it('shows an error when the report cannot be fetched', async () => {
     server.use(http.post('*/api/v1/sources/:id/network', () => HttpResponse.json({ title: 'Forbidden', status: 403 }, { status: 403 })));
     renderWithProviders(<MemoryRouter><SourcesPage /></MemoryRouter>);
@@ -108,6 +124,7 @@ describe('Network panel', () => {
     expect(text).toContain('Egress: IPv4 203.0.113.7  IPv6 2001:db8::7  country US  colo DFW');
     expect(text).toContain('IPV6 2001:db8:1::10 [public] connect 12 ms  status 403');
     expect(text).toContain('curl -4');
+    expect(text).toContain('DNS error: no record found for keys.example.test');
     await userEvent.click(within(dialog).getByRole('button', { name: 'Copy as JSON' }));
     await waitFor(() => { expect(writeText).toHaveBeenCalledTimes(2); });
     expect(JSON.parse(String(writeText.mock.calls[1]?.[0]))).toEqual(REPORT);
