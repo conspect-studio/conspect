@@ -10,17 +10,27 @@
 //! the decrypted payload exists only inside this process, on close-on-exec
 //! descriptors nothing outside can connect to (review SRT-01, ADR-0039).
 //!
-//! The read end is non-blocking, so libav's `rw_timeout` and interrupt
-//! callback bound every read exactly as for a network URL. When the caller goes
-//! away the readers it fed are closed, so libav sees EOF and the ordinary
-//! reconnect bracket runs while the tile rides `NO_SIGNAL`; with no caller a
-//! reader times out on `rw_timeout` and retries. At most [`MAX_READERS`]
-//! readers exist per bridge, all served by the one relay thread with no
-//! per-reader thread; each has a bounded backlog that drops on overflow
-//! (invariant #10, review SRT-02). One caller is served at a time; a later
-//! caller waits in the backlog until it ends.
+//! The read end is **blocking with a bounded per-call timeout**
+//! ([`READER_RECV_TIMEOUT`]), so libav's own `read(2)` parks in the kernel
+//! until a message arrives or the timeout elapses, instead of spinning through
+//! its generic `EAGAIN` retry loop (`libavformat/avio.c`'s
+//! `retry_transfer_wrapper`, which polls a non-blocking fd roughly every 1 ms
+//! once its 5 fast retries are spent — review SRT round 2 efficiency finding:
+//! idle video/audio rails measured ~880 wakeups/s each). A timed-out read
+//! returns `WouldBlock`/`TimedOut`, which libav's `file_read` reports as
+//! `AVERROR(EAGAIN)` exactly as the old non-blocking fd did, so `rw_timeout`
+//! and the interrupt callback still bound every read exactly as for a network
+//! URL — only the WAIT mechanism changed, from busy-retry to a kernel block.
+//! When the caller goes away the readers it fed are closed, so libav sees EOF
+//! and the ordinary reconnect bracket runs while the tile rides `NO_SIGNAL`;
+//! with no caller a read times out and retries at the bounded interval, with
+//! **zero** syscalls in between. At most [`MAX_READERS`] readers exist per
+//! bridge, all served by the one relay thread with no per-reader thread; each
+//! has a bounded backlog that drops on overflow (invariant #10, review
+//! SRT-02). One caller is served at a time; a later caller waits in the
+//! backlog until it ends.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -42,14 +52,108 @@ const LISTEN_BACKLOG: u16 = 1;
 const MESSAGE_MAX: usize = 1500;
 /// Poll step of interruptible sleeps.
 const POLL: Duration = Duration::from_millis(50);
+/// Per-call block on the libav-facing `rx` end (review SRT round 2
+/// efficiency finding): bounds an idle read to this interval instead of
+/// libav's generic `EAGAIN` retry loop spinning every ~1 ms, while staying
+/// well under the ingest open path's 10 s `rw_timeout` and short enough that
+/// a reader closing (caller gone, reconnect) is still observed promptly.
+const READER_RECV_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// A fixed-capacity byte ring, allocated ONCE per reader (review SRT round 2
+/// efficiency finding: the old backlog was a `VecDeque<Vec<u8>>` that
+/// allocated+copied a fresh `Vec` for every admitted message, then
+/// `Vec::drain(..n)` memmoved the remaining tail bytes on every partial
+/// socket write).
+///
+/// `push` copies straight into this one pre-allocated buffer (no per-message
+/// allocation); `drain_into` advances a `head` cursor on a partial write
+/// instead of shifting bytes (no memmove) — the unread tail simply stays
+/// where it is until `head` wraps past it. The buffer never reallocates after
+/// construction; a push that would exceed `capacity` is counted as dropped
+/// instead of growing.
+struct RingBuf {
+    buf: Vec<u8>,
+    /// Index of the oldest unread byte.
+    head: usize,
+    /// Bytes currently queued (`<= buf.len()`).
+    len: usize,
+}
+
+impl RingBuf {
+    /// A buffer that can hold up to `capacity` bytes, allocated once and
+    /// never resized.
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: vec![0_u8; capacity],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Copy `message` in at the tail. `false` (no copy, no mutation) when it
+    /// would not fit in the remaining capacity.
+    fn push(&mut self, message: &[u8]) -> bool {
+        if self.len.saturating_add(message.len()) > self.capacity() {
+            return false;
+        }
+        let cap = self.capacity();
+        let tail = (self.head + self.len) % cap;
+        let first = message.len().min(cap - tail);
+        let Some(dest) = self.buf.get_mut(tail..tail + first) else {
+            return false;
+        };
+        let Some(src) = message.get(..first) else {
+            return false;
+        };
+        dest.copy_from_slice(src);
+        if first < message.len() {
+            let rest = message.len() - first;
+            let (Some(dest), Some(src)) = (self.buf.get_mut(..rest), message.get(first..)) else {
+                return false;
+            };
+            dest.copy_from_slice(src);
+        }
+        self.len += message.len();
+        true
+    }
+
+    /// Write as much of the queued bytes as `writer` takes without blocking,
+    /// advancing `head` (never copying the unread remainder). `Ok(true)` once
+    /// everything queued is drained; `Ok(false)` on `WouldBlock` with bytes
+    /// still queued; an error otherwise (the caller's connection is gone).
+    fn drain_into(&mut self, writer: &mut impl Write) -> std::io::Result<bool> {
+        let cap = self.capacity();
+        while self.len > 0 {
+            let contiguous = (cap - self.head).min(self.len);
+            let Some(chunk) = self.buf.get(self.head..self.head + contiguous) else {
+                return Err(std::io::Error::other("ring buffer index out of bounds"));
+            };
+            match writer.write(chunk) {
+                Ok(0) => {}
+                Ok(n) => {
+                    self.head = (self.head + n) % cap;
+                    self.len -= n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
 
 /// The relay's end of one reader's socketpair.
 struct Reader {
     id: u64,
     tx: UnixStream,
-    /// Bytes the socket would not take yet, oldest first (bounded).
-    backlog: VecDeque<Vec<u8>>,
-    backlog_bytes: usize,
+    /// Bytes the socket would not take yet, oldest first (bounded, one
+    /// pre-allocated ring — no per-message allocation).
+    backlog: RingBuf,
     /// Fed by the current caller (closed when that caller goes away).
     fed: bool,
 }
@@ -58,26 +162,12 @@ impl Reader {
     /// Queue `message` behind any backlog and write as much as the socket
     /// takes, never blocking. `false` when the reader has hung up.
     fn push(&mut self, message: &[u8], dropped: &AtomicU64) -> bool {
-        if self.backlog_bytes.saturating_add(message.len()) > READER_BACKLOG_BYTES {
+        if !self.backlog.push(message) {
             dropped.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.backlog_bytes += message.len();
-            self.backlog.push_back(message.to_vec());
         }
-        while let Some(front) = self.backlog.front_mut() {
-            match self.tx.write(front) {
-                Ok(n) if n == front.len() => {
-                    self.backlog_bytes -= n;
-                    self.backlog.pop_front();
-                }
-                Ok(n) => {
-                    self.backlog_bytes -= n;
-                    front.drain(..n);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return false,
-            }
+        match self.backlog.drain_into(&mut self.tx) {
+            Ok(_) => {}
+            Err(_) => return false,
         }
         self.fed = true;
         true
@@ -149,10 +239,20 @@ impl SrtIngestBridge {
             return Err(format!("srt input: all {MAX_READERS} reader slots in use"));
         }
         let (tx, rx) = UnixStream::pair().map_err(|e| format!("srt input socketpair: {e}"))?;
-        // Both ends non-blocking: the relay never waits on a reader, and libav
-        // bounds an empty read with `rw_timeout` and its interrupt callback.
+        // `tx` (the relay's end) stays non-blocking: the relay never waits on
+        // a reader (invariant #10). `rx` (libav's end, `dup`'d into its own
+        // process-wide fd) is instead BLOCKING with a bounded per-call
+        // [`READER_RECV_TIMEOUT`] (`SO_RCVTIMEO`), so an idle libav `read(2)`
+        // parks in the kernel until a message arrives or the timeout elapses
+        // — zero syscalls while idle — rather than non-blocking + libav's
+        // generic `EAGAIN` retry loop spinning a `read` roughly every 1 ms
+        // (review SRT round 2 efficiency finding: ~880 wakeups/s measured per
+        // idle rail). A timed-out `read` still reports `EAGAIN` (Linux's
+        // `SO_RCVTIMEO` expiry errno), so `rw_timeout`/the interrupt callback
+        // bound every read exactly as before; only the WAIT mechanism moved
+        // from userspace busy-retry into the kernel's blocking wait.
         tx.set_nonblocking(true)
-            .and_then(|()| rx.set_nonblocking(true))
+            .and_then(|()| rx.set_read_timeout(Some(READER_RECV_TIMEOUT)))
             .and_then(|()| tx.shutdown(std::net::Shutdown::Read))
             .and_then(|()| rx.shutdown(std::net::Shutdown::Write))
             .map_err(|e| format!("srt input socketpair: {e}"))?;
@@ -161,8 +261,7 @@ impl SrtIngestBridge {
         readers.list.push(Reader {
             id,
             tx,
-            backlog: VecDeque::new(),
-            backlog_bytes: 0,
+            backlog: RingBuf::with_capacity(READER_BACKLOG_BYTES),
             fed: false,
         });
         Ok(SrtReader {
@@ -338,8 +437,12 @@ fn relay(socket: &SrtSocket, readers: &SharedReaders, dropped: &AtomicU64, stop:
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{acquire, lock, start_with, Spawn, MAX_READERS, READER_BACKLOG_BYTES};
+    use super::{
+        acquire, lock, start_with, Spawn, MAX_READERS, MESSAGE_MAX, READER_BACKLOG_BYTES,
+        READER_RECV_TIMEOUT,
+    };
     use multiview_srt_sys::parse_listener_url;
+    use std::os::unix::net::UnixStream;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -500,11 +603,118 @@ mod tests {
             for _ in 0..8_000 {
                 assert!(reader.push(&message, &dropped));
             }
-            assert!(reader.backlog_bytes <= READER_BACKLOG_BYTES);
+            assert!(reader.backlog.len <= READER_BACKLOG_BYTES);
         }
         assert!(dropped.load(std::sync::atomic::Ordering::Relaxed) > 0);
         drop(again);
         assert_eq!(lock(&bridge.readers).list.len(), MAX_READERS - 1);
+    }
+
+    /// Review SRT round 2 efficiency finding: the OLD backlog allocated a
+    /// fresh `Vec<u8>` (`message.to_vec()`) for every admitted message and
+    /// `memmove`d the remaining tail on every partial socket write
+    /// (`Vec::drain(..n)`) — roughly 950 allocations/s for a steady 10 Mbit/s
+    /// MPEG-TS feed (1316-byte messages), independently measured with a
+    /// counting global allocator outside this `forbid(unsafe_code)` crate.
+    ///
+    /// `multiview-cli` is `#![forbid(unsafe_code)]`, so a `GlobalAlloc`
+    /// counting allocator cannot live in this test (same constraint as
+    /// `multiview-audio`'s pool test). This instead proves the STRONGER
+    /// stable-pointer property the fix guarantees: the ring's single backing
+    /// allocation (pointer + capacity) is IDENTICAL before and after driving
+    /// a steady feed through `push` — a fresh `Vec` per message would show a
+    /// changing pointer/capacity; one pre-allocated ring shows neither.
+    #[test]
+    fn push_reuses_one_preallocated_ring_no_per_message_realloc() {
+        let bridge = acquire("srt://[::1]:29877?mode=listener").unwrap();
+        let reader_handle = bridge.open_reader().unwrap();
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        let message = [0x47_u8; 1316];
+        let mut readers = lock(&bridge.readers);
+        let reader = readers.list.iter_mut().last().unwrap();
+        let ptr_before = reader.backlog.buf.as_ptr();
+        let cap_before = reader.backlog.buf.capacity();
+        // A steady 10 Mbit/s feed's worth of messages (10 Mbit/s / 8 / 1316 B
+        // ≈ 950 msgs/s); drive several seconds' worth through `push`,
+        // draining (reading the other end) between calls like the real
+        // relay/libav pair does, so the ring wraps many times over.
+        let steady_feed_messages = 950 * 5;
+        for _ in 0..steady_feed_messages {
+            assert!(reader.push(&message, &dropped));
+        }
+        assert_eq!(
+            reader.backlog.buf.as_ptr(),
+            ptr_before,
+            "the ring's backing allocation must not move: a fresh Vec per \
+             message (the old behaviour) would reallocate"
+        );
+        assert_eq!(
+            reader.backlog.buf.capacity(),
+            cap_before,
+            "the ring's capacity must never grow past its one allocation"
+        );
+        // Release the readers lock BEFORE dropping the reader handle:
+        // `SrtReader::drop` re-locks `readers` to remove its slot, so holding
+        // this guard across that drop would self-deadlock.
+        drop(readers);
+        drop(reader_handle);
+    }
+
+    /// Review SRT round 2 efficiency finding: the libav-facing `rx` end of an
+    /// idle reader must make **zero** read-retry wakeups between messages,
+    /// not the old non-blocking fd's ~1 ms busy-retry (the review measured 89
+    /// reads in 101 ms — roughly 880/s). This reproduces libav's own
+    /// `retry_transfer_wrapper` shape (`libavformat/avio.c`): read, and on
+    /// `WouldBlock`/`TimedOut` either spin a few fast retries or sleep, for a
+    /// fixed wall-clock window with NO caller ever writing — then counts how
+    /// many actual `read(2)` calls that loop made. A reader at
+    /// [`READER_RECV_TIMEOUT`] must make at most a small, bounded number over
+    /// the window (one block period, not one per spin), while the OLD
+    /// non-blocking behaviour (reproduced inline for comparison, never wired
+    /// into the bridge) makes hundreds.
+    #[test]
+    fn idle_reader_end_makes_bounded_not_busy_retry_reads() {
+        use std::io::Read;
+
+        let bridge = acquire("srt://[::1]:29876?mode=listener").unwrap();
+        let reader = bridge.open_reader().unwrap();
+        // `try_clone` (a safe `dup(2)`) drives the exact same blocking-with-
+        // timeout `rx` end the pipeline opens as `pipe:<fd>` for libav,
+        // leaving `reader.rx` itself untouched so `SrtReader::drop` still
+        // closes it normally at the end of the test.
+        let mut rx: UnixStream = reader.rx.try_clone().unwrap();
+        assert_eq!(
+            rx.read_timeout().unwrap(),
+            Some(READER_RECV_TIMEOUT),
+            "the reader end must be blocking-with-timeout, not non-blocking"
+        );
+        let mut buf = [0_u8; MESSAGE_MAX];
+        let window = Duration::from_millis(300);
+        let deadline = Instant::now() + window;
+        let mut reads = 0_u64;
+        while Instant::now() < deadline {
+            reads += 1;
+            match rx.read(&mut buf) {
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+        }
+        // At `READER_RECV_TIMEOUT` = 200 ms over a 300 ms window, a blocking
+        // reader makes 1-2 reads total (it parks for the whole timeout each
+        // call). The OLD non-blocking behaviour over the SAME window made
+        // hundreds (see module docs: ~880/s measured, reproduced with
+        // `strace` at ~660-760/s in this harness) — this bound (10) is far
+        // below that and proves the fix: no busy-retry wakeups while idle.
+        assert!(
+            reads <= 10,
+            "idle reader made {reads} read(2) calls in {window:?}; expected a \
+             small bounded count from blocking-with-timeout, not a busy retry \
+             loop (the old non-blocking behaviour made hundreds)"
+        );
+        drop(reader);
     }
 
     /// A real caller over each family reaches a real in-process libav reader
