@@ -258,12 +258,13 @@ describe('IptvOrgPage', () => {
   it('shows a "Guide listed" badge with the XMLTV note in the detail', async () => {
     renderPage();
     await ready();
-    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'axn black');
-    await userEvent.click(await screen.findByRole('button', { name: /show streams of axn black/i }));
-    await userEvent.click(await screen.findByRole('button', { name: /details for axn black/i }));
+    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), '3sat');
+    await userEvent.click(await screen.findByRole('button', { name: /show streams of 3sat/i }));
+    await userEvent.click((await screen.findAllByRole('button', { name: /details for 3sat/i }))[0]!);
     const detail = await screen.findByTestId('iptv-detail');
-    expect(within(detail).getByText('Guide listed: tvtv.us')).toBeInTheDocument();
-    expect(within(detail).getByText(/supply the XMLTV URL/i)).toBeInTheDocument();
+    // Both real 3sat streams share the SD feed's guide, so each stream row shows it.
+    expect(within(detail).getAllByText('Guide listed: neo.io')).toHaveLength(2);
+    expect(within(detail).getAllByText(/supply the XMLTV URL/i)).toHaveLength(2);
   });
 
   it('bulk add reports per-item results including a partial failure', async () => {

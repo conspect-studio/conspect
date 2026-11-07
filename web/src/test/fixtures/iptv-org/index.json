@@ -1003,7 +1003,11 @@
    "replaced_by": null,
    "website": "https://www.3sat.de/",
    "logo_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/3sat_2019.svg/960px-3sat_2019.svg.png",
-   "guide": null
+   "guide": {
+    "site": "neo.io",
+    "site_id": "3sat",
+    "lang": "de"
+   }
   },
   {
    "k": "s:9780defc39a8",
@@ -1047,7 +1051,11 @@
    "replaced_by": null,
    "website": "https://www.3sat.de/",
    "logo_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/3sat_2019.svg/960px-3sat_2019.svg.png",
-   "guide": null
+   "guide": {
+    "site": "neo.io",
+    "site_id": "3sat",
+    "lang": "de"
+   }
   },
   {
    "k": "s:89e7f0b86e02",
@@ -1127,11 +1135,7 @@
    "replaced_by": null,
    "website": "https://www.axnblack.com/",
    "logo_url": "https://i.imgur.com/Peo1QiZ.png",
-   "guide": {
-    "site": "tvtv.us",
-    "site_id": "axn-black-ro",
-    "lang": "ro"
-   }
+   "guide": null
   },
   {
    "k": "s:ac1c47d53673",
