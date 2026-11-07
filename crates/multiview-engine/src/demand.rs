@@ -262,6 +262,14 @@ pub trait RailDriver<T>: Send + Sync + 'static {
         requested: Option<RequestedSize>,
     ) -> Result<Rails, RailFailure>;
 
+    /// Stop `rails` of `id` for run teardown: producers only. Unlike a
+    /// transition it leaves downstream wiring (the program bus, the frame
+    /// store) alone, so output still draining keeps what was already produced.
+    /// Blocking is allowed. The default is a transition to nothing.
+    fn teardown(&self, id: &str, rails: Rails) {
+        let _ = self.transition(id, rails, Rails::NONE, None);
+    }
+
     /// `rails` of `id` stopped for good, not as half of a restart: release what
     /// they retained (a store can hold many frames). Blocking is allowed. Runs
     /// while the source's transition is still in flight, so no producer of those
@@ -588,8 +596,9 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         }
     }
 
-    /// Stop the worker, then stop every running rail. For run teardown, off the
-    /// output clock. Blocking, bounded by the driver's own grace periods.
+    /// Stop the worker, then every running rail's producers
+    /// ([`RailDriver::teardown`]). For run teardown, off the output clock.
+    /// Blocking, bounded by the driver's own grace periods.
     pub fn stop_all(&self) {
         self.shutdown();
         let running: Vec<(Arc<str>, Rails)> = {
@@ -601,10 +610,9 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 .collect()
         };
         for (id, rails) in running {
-            let outcome = self.inner.driver.transition(&id, rails, Rails::NONE, None);
-            self.inner.driver.retire(&id, rails);
+            self.inner.driver.teardown(&id, rails);
             if let Some(entry) = lock(&self.inner.book).entries.get_mut(&id) {
-                entry.running = outcome.map_or_else(|failure| failure.running, |running| running);
+                entry.running = Rails::NONE;
             }
         }
     }

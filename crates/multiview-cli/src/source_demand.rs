@@ -6,6 +6,8 @@
 //! layout flip, a route, a preview) takes its lease where it happens.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "ffmpeg")]
+use std::sync::Arc;
 
 use multiview_config::{MultiviewConfig, Source};
 use multiview_core::layout::{Cell, Layout};
@@ -464,4 +466,33 @@ pub fn installed_control_demand() -> Option<multiview_control::SharedSourceDeman
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
+}
+
+/// The running pipeline's drain seam, installed when its run starts, for drains
+/// built without one. Process-wide: one run per process.
+#[cfg(feature = "ffmpeg")]
+fn drain_demand_slot() -> &'static multiview_framestore::SwapCell<
+    Option<Arc<DrainDemand<multiview_compositor::pipeline::Nv12Image>>>,
+> {
+    static SLOT: std::sync::OnceLock<
+        multiview_framestore::SwapCell<
+            Option<Arc<DrainDemand<multiview_compositor::pipeline::Nv12Image>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(multiview_framestore::SwapCell::empty)
+}
+
+/// Install (or with `None` clear) the running pipeline's drain seam.
+#[cfg(feature = "ffmpeg")]
+pub fn install_drain_demand(
+    demand: Option<DrainDemand<multiview_compositor::pipeline::Nv12Image>>,
+) {
+    drain_demand_slot().store(demand.map(Arc::new));
+}
+
+/// The running pipeline's drain seam. A wait-free load.
+#[cfg(feature = "ffmpeg")]
+#[must_use]
+pub fn installed_drain_demand() -> Option<DrainDemand<multiview_compositor::pipeline::Nv12Image>> {
+    drain_demand_slot().load().map(|demand| (*demand).clone())
 }

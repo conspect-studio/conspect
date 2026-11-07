@@ -1654,6 +1654,11 @@ impl CommandDrain {
     /// publish, never a rail start (the demand worker does that off-clock).
     #[cfg(feature = "ffmpeg")]
     fn publish_demand(&mut self, drive: &CompositorDrive<Nv12Image>) {
+        if self.demand.is_none() {
+            // A drain built without the seam picks up the running pipeline's
+            // (installed when its run starts): every run path is demand-driven.
+            self.demand = crate::source_demand::installed_drain_demand();
+        }
         let Some(demand) = &self.demand else {
             return;
         };

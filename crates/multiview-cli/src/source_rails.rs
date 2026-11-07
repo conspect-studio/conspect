@@ -333,6 +333,13 @@ impl RailDriver<Nv12Image> for SourceRails {
         Ok(running)
     }
 
+    fn teardown(&self, id: &str, rails: Rails) {
+        let handles = self.owned().remove(id).map_or_else(Vec::new, |owned| {
+            owned.video.into_iter().chain(owned.audio).collect()
+        });
+        crate::live_sources::stop_rail(&self.registry, id, rails.video, rails.audio, handles);
+    }
+
     fn retire(&self, id: &str, rails: Rails) {
         if rails.video {
             if let Some(entry) = self.entry(id) {

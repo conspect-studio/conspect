@@ -3913,6 +3913,7 @@ impl Pipeline {
         #[cfg(feature = "overlay")]
         let tile_spec_apply = Arc::clone(&self.tile_spec_apply);
         demand.start();
+        crate::source_demand::install_drain_demand(self.drain_demand());
         let (egress, hot_tx) = StreamEgress::spawn(
             bake_ctx,
             runners,
@@ -4234,6 +4235,7 @@ impl Pipeline {
         // The clock has stopped (bounded budget reached, or `stop` raised): tear
         // ingest down deterministically (signal + join), then close the egress and
         // finalise. The hot queue is already closed by this point — see below.
+        crate::source_demand::install_drain_demand(None);
         demand.stop_all();
         supervisor.shutdown();
         // Invalidate every startup producer, including any libav worker detached
