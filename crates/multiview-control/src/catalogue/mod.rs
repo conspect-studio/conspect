@@ -138,9 +138,70 @@ pub fn install(
     let probes = probe::ProbeService::with_network(runner, host, collector);
     let state = state.with_catalogue(Arc::clone(&catalogue), probes);
     if catalogue.enabled() {
-        spawn_sync_loop(state.clone(), catalogue);
+        spawn_sync_loop(state.clone(), Arc::clone(&catalogue));
+        if let Some(every) = cfg.probe_linked_every {
+            spawn_probe_linked_loop(state.clone(), every.as_duration());
+        }
     }
     state
+}
+
+/// Most linked sources probed per round (the probe queue bound is 64).
+#[cfg(feature = "catalogue")]
+const PROBE_LINKED_PER_ROUND: usize = 32;
+
+/// One round of `probe_linked_every`: submit a probe for each iptv-org-linked
+/// source through the normal [`probe::ProbeService::submit`] (same semaphore of 4,
+/// queue of 64, 15-minute cache and per-principal rate as the browser's probes).
+/// Stops at the first refusal (rate or queue full) rather than queueing more.
+/// Returns how many probes were admitted.
+#[cfg(feature = "catalogue")]
+pub fn probe_linked_round(state: &AppState) -> usize {
+    let Some(svc) = state.catalogue_probe.as_ref() else {
+        return 0;
+    };
+    let mut admitted = 0;
+    for source in crate::routes::sources::accepted_sources_system(state)
+        .into_iter()
+        .filter(|s| {
+            s.origin
+                .as_ref()
+                .is_some_and(|o| o.provider == links::PROVIDER)
+        })
+        .take(PROBE_LINKED_PER_ROUND)
+    {
+        let Some(url) = links::source_url(&source) else {
+            continue;
+        };
+        let (user_agent, referrer) = links::source_headers(&source);
+        let req = probe::ProbeRequest {
+            url,
+            user_agent,
+            referrer,
+            quality: None,
+        };
+        if svc.submit("system:catalogue-probe", req).is_err() {
+            break;
+        }
+        admitted += 1;
+    }
+    admitted
+}
+
+/// The `probe_linked_every` runner: off unless configured (min 5 min, validated
+/// in the config), first round one period after boot, no catch-up bursts.
+#[cfg(feature = "catalogue")]
+fn spawn_probe_linked_loop(state: AppState, every: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the immediate first tick
+        loop {
+            tick.tick().await;
+            let n = probe_linked_round(&state);
+            tracing::debug!(admitted = n, "iptv-org linked-source probe round");
+        }
+    });
 }
 
 /// A fetcher that always fails (HTTP client could not be built).

@@ -305,3 +305,94 @@ async fn upstream_changes_raise_events_warning_and_auto_follow_updates_with_audi
     assert!(cleared, "warning cleared once every link is back in sync");
     let _ = link_runtime::SYSTEM_ACTOR;
 }
+
+/// Counts the probes the runner is asked to execute.
+struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+impl probe::ProbeRunner for Counting {
+    fn run(&self, id: String, req: probe::ProbeRequest) -> BoxFuture<'_, probe::ProbeResult> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            probe::ProbeResult {
+                id,
+                state: "done",
+                url: req.url,
+                verdict: Some(probe::Verdict::Live),
+                media_checked: false,
+                verdict_basis: "canned",
+                stages: Vec::new(),
+                facts: probe::MediaFacts::default(),
+                events: Vec::new(),
+                probed_from: String::new(),
+                probed_at: None,
+                bytes: 0,
+                cached: false,
+                network: None,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn probe_linked_round_probes_only_linked_sources_through_the_probe_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalogue::new(
+        dir.path().join("cat"),
+        &multiview_config::IptvOrgConfig::default(),
+        Arc::new(NoNet),
+    );
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runs2 = Arc::clone(&runs);
+    let captured: Arc<std::sync::Mutex<Option<multiview_control::AppState>>> = Arc::default();
+    let cap = Arc::clone(&captured);
+    let h = harness_with(move |s| {
+        let s = s.with_catalogue(
+            cat,
+            probe::ProbeService::new(Arc::new(Counting(runs2)), "h".into()),
+        );
+        *cap.lock().unwrap() = Some(s.clone());
+        s
+    });
+    put_source(
+        &h,
+        "linked-1",
+        &link("linked-1", "https://a/1.m3u8", "A.us", "notify"),
+    )
+    .await;
+    put_source(
+        &h,
+        "linked-2",
+        &link("linked-2", "https://c/1.m3u8", "C.us", "notify"),
+    )
+    .await;
+    put_source(
+        &h,
+        "plain",
+        &json!({ "name": "plain", "body": { "id": "plain", "kind": "hls", "url": "https://p/1.m3u8" } }),
+    )
+    .await;
+    let state = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        link_runtime_probe_round(&state),
+        2,
+        "only the two linked sources"
+    );
+    for _ in 0..100 {
+        if runs.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // The second round is served from the 15-minute cache: nothing new runs.
+    assert_eq!(link_runtime_probe_round(&state), 2);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "cache hit"
+    );
+}
+
+fn link_runtime_probe_round(state: &multiview_control::AppState) -> usize {
+    multiview_control::catalogue::probe_linked_round(state)
+}
