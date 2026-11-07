@@ -364,4 +364,31 @@ mod tests {
         };
         assert!(retr("::1", port, "/x", limits).await.is_err());
     }
+
+    /// Live check against ftp.bom.gov.au, only when `BOM_LIVE_FTP=1`.
+    #[tokio::test]
+    async fn live_bom_fetch_when_enabled() {
+        if std::env::var("BOM_LIVE_FTP").as_deref() != Ok("1") {
+            return;
+        }
+        let bytes = retr(
+            "ftp.bom.gov.au",
+            21,
+            &bom_product_path("IDN11060"),
+            FtpLimits::default(),
+        )
+        .await
+        .unwrap();
+        let f = crate::parse_forecast_with_limits(
+            &bytes,
+            crate::Limits {
+                max_bytes: MAX_PRODUCT_BYTES,
+                max_nodes: 400_000,
+                ..crate::Limits::default()
+            },
+        )
+        .unwrap();
+        let s = crate::normalize_forecast(&f, "NSW_PT131").unwrap();
+        assert_eq!(s.days.len(), 7);
+    }
 }
