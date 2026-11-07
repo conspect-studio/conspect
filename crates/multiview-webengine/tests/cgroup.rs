@@ -25,7 +25,7 @@ use common::{FakeRoot, RecordingRoot};
 use multiview_webengine::{
     delegation_status, plan_leaf_move, probe_child_name, probe_child_path, read_cgroup_usage,
     rollback_for, ControllerSet, DelegationReport, FailureAction, LeafMoveStep, NotDelegated,
-    DELEGATION_PROBE_PREFIX, REQUIRED_CONTROLLERS,
+    VerifyMembership, DELEGATION_PROBE_PREFIX, REQUIRED_CONTROLLERS,
 };
 
 /// A tempdir standing in for a delegated service cgroup.
@@ -417,14 +417,22 @@ fn a_failure_at_every_forward_index_yields_exactly_the_reverse_undos_before_it()
         controller,
         path: subtree_control.clone(),
     };
+    let if_in_leaf = LeafMoveStep::IfMember {
+        check: VerifyMembership {
+            pid: 4242,
+            path: leaf.clone(),
+        },
+        then: Box::new(move_back.clone()),
+    };
     let plan = plan_leaf_move(parent, 4242);
 
     assert_eq!(plan.len(), 7, "the forward plan is seven steps");
     let expected: Vec<Vec<LeafMoveStep>> = vec![
         // 0 create_leaf failed: nothing completed, nothing to undo.
         vec![],
-        // 1 move_self failed: the leaf exists but holds nothing yet.
-        vec![remove_leaf.clone()],
+        // 1 move_self failed: the leaf exists, and the (atomic) migration may or
+        //   may not have reached the kernel, so the move back is CONDITIONAL.
+        vec![if_in_leaf.clone(), remove_leaf.clone()],
         // 2 verify_parent_empty failed: the move completed, so put it back.
         vec![move_back.clone(), remove_leaf.clone()],
         // 3 verify_delegation_in_place failed: same two mutations.
@@ -725,4 +733,65 @@ fn the_controller_set_is_a_stable_mask() {
         none.missing_from_required().names(),
         REQUIRED_CONTROLLERS.to_vec()
     );
+}
+
+#[test]
+fn a_failure_at_move_self_moves_back_only_if_the_process_is_in_the_leaf() {
+    // HIGH (review 4): a failed `MoveSelf` write is not proof the process was
+    // not moved. The rollback carries a conditional move back, as data.
+    let parent = "/sys/fs/cgroup/conspect.service";
+    let plan = plan_leaf_move(parent, 4242);
+    let rollback = rollback_for(&plan, 1);
+    let Some(LeafMoveStep::IfMember { check, then }) = rollback.first() else {
+        panic!("the first undo is conditional: {rollback:?}");
+    };
+    assert_eq!(check.pid, 4242);
+    assert_eq!(
+        check.path,
+        std::path::PathBuf::from(format!("{parent}/engine"))
+    );
+    assert_eq!(
+        **then,
+        LeafMoveStep::MoveSelfBack {
+            pid: 4242,
+            to: std::path::PathBuf::from(format!("{parent}/cgroup.procs")),
+        }
+    );
+    assert_eq!(
+        rollback.get(1).map(LeafMoveStep::label),
+        Some("remove_leaf")
+    );
+
+    // The executor's decision: it holds only when /proc/<pid>/cgroup shows the leaf.
+    let mount = "/sys/fs/cgroup";
+    assert!(check.holds("0::/conspect.service/engine\n", mount));
+    assert!(
+        !check.holds("0::/conspect.service\n", mount),
+        "still in the parent: do not write"
+    );
+    assert!(
+        !check.holds("0::/conspect.service/engine-other\n", mount),
+        "a prefix match is not membership"
+    );
+    assert!(
+        !check.holds("12:cpu:/conspect.service/engine\n", mount),
+        "v1 lines never count"
+    );
+    assert!(
+        !check.holds("", mount),
+        "unreadable is false: a doubtful answer never writes"
+    );
+
+    // A MoveSelf that COMPLETED (failure later) keeps the unconditional undo.
+    let later = rollback_for(&plan, 2);
+    assert_eq!(
+        later.first().map(LeafMoveStep::label),
+        Some("move_self_back")
+    );
+    // Only MoveSelf has a conditional undo; the conditional is never in a forward plan.
+    assert!(plan.iter().all(|step| step.label() != "if_member"));
+    assert!(plan
+        .iter()
+        .enumerate()
+        .all(|(i, step)| (i == 1) == step.undo_if_applied().is_some()));
 }

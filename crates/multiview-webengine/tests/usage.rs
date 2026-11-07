@@ -17,9 +17,10 @@ mod common;
 use std::fs;
 
 use multiview_webengine::{
-    attribute, cpu_cores, monotonic_total, read_cgroup_usage, read_starttime, type_cpu_seconds,
-    usage_from_cgroup, Accounting, ExpectedRoot, Generation, JobPhase, Pid, ResourceScope,
-    ResourceUsage, Sampler, ScopeKind, ScopeOwner, ScopeRegistry, TreeSample, TYPE_COUNT,
+    attribute, cpu_cores, monotonic_total, read_cgroup_usage, read_starttime, sample_process_tree,
+    type_cpu_seconds, usage_from_cgroup, Accounting, ExpectedRoot, Generation, JobPhase, Pid,
+    ResourceScope, ResourceUsage, Sampler, ScopeKind, ScopeOwner, ScopeRegistry, TreeSample,
+    TYPE_COUNT,
 };
 
 fn usage_for(cpu_cores: Option<f32>, cpu_seconds_total: f64) -> ResourceUsage {
@@ -270,12 +271,12 @@ fn a_stale_generation_is_not_attributed() {
     let mut registry = ScopeRegistry::new();
     let first = registry.next_generation(&owner);
     registry
-        .register(process_tree_scope(&owner, first, 1, 0))
+        .register(process_tree_scope(&owner, first, 1, 11))
         .expect("the next generation is accepted");
     assert_eq!(attribute(&registry, &owner, first), Some(first));
     let second = registry.next_generation(&owner);
     registry
-        .register(process_tree_scope(&owner, second, 2, 0))
+        .register(process_tree_scope(&owner, second, 2, 12))
         .expect("monotonic");
     assert_eq!(attribute(&registry, &owner, first), None);
     assert_eq!(attribute(&registry, &owner, second), Some(second));
@@ -567,5 +568,120 @@ fn the_per_sweep_collections_do_not_grow_over_fifty_sweeps() {
     assert!(
         after_fifty.0 <= after_two.0 && after_fifty.1 <= after_two.1,
         "retained state grew between sweep 2 ({after_two:?}) and sweep 50 ({after_fifty:?})"
+    );
+}
+
+#[test]
+fn a_root_that_exits_normally_is_root_gone_and_finishes_the_sampler() {
+    // HIGH (review 4): a missing root /proc entry used to propagate NotFound as
+    // an error, leaving the sampler live with its map and every later sweep
+    // erroring. A browser that exits normally is RootGone.
+    let tree = two_hundred_process_tree();
+    let registered = ExpectedRoot::read(tree.root(), Pid::new(1)).expect("a starttime");
+    let mut sampler = Sampler::new(Accounting::Estimated);
+    sampler
+        .sample_tree(tree.root(), registered)
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
+    sampler.record(0.0, 1.0);
+    assert!(sampler.previous_sweep().is_some());
+
+    tree.remove(1); // the browser exits: /proc/1 disappears
+    assert_eq!(
+        sampler
+            .sample_tree(tree.root(), registered)
+            .expect("an exited root is an outcome, not an error"),
+        TreeSample::RootGone
+    );
+    assert!(sampler.is_finished());
+    assert!(sampler.previous_sweep().is_none(), "state cleared");
+    assert!(
+        sampler.cpu_seconds_total().abs() < 1e-9,
+        "held total cleared"
+    );
+    let later = sampler
+        .sample_tree(tree.root(), registered)
+        .expect_err("a later sweep is refused");
+    assert!(
+        matches!(later, multiview_webengine::Error::ScopeEnded { .. }),
+        "{later}"
+    );
+
+    // Without a registration identity (previous-sweep only) it is the same.
+    let bare = sample_process_tree(tree.root(), Pid::new(1), None, None).expect("no error");
+    assert_eq!(bare, TreeSample::RootGone);
+}
+
+#[test]
+fn an_unreadable_or_unparsable_root_is_still_an_error_not_root_gone() {
+    // Only "absent" means gone. A stat that exists but is garbage must not end
+    // the scope silently.
+    let tree = two_hundred_process_tree();
+    std::fs::write(tree.path("proc/1/stat"), "1 (chrome) S 0\n").expect("garble");
+    let registered = ExpectedRoot {
+        pid: Pid::new(1),
+        starttime: 1,
+    };
+    let mut sampler = Sampler::new(Accounting::Estimated);
+    assert!(sampler.sample_tree(tree.root(), registered).is_err());
+    assert!(!sampler.is_finished(), "an error does not finish the scope");
+
+    // A stat with CPU fields but no starttime has no identity: error, not a 0.
+    std::fs::write(
+        tree.path("proc/1/stat"),
+        "1 (chrome) S 0 1 1 0 -1 0 0 0 0 0 5 5\n",
+    )
+    .expect("truncate");
+    assert!(sample_process_tree(tree.root(), Pid::new(1), None, None).is_err());
+}
+
+#[test]
+fn a_zero_registered_starttime_matches_nothing() {
+    // Fail closed even if a zero slips past registration.
+    let tree = two_hundred_process_tree();
+    let zero = ExpectedRoot {
+        pid: Pid::new(1),
+        starttime: 0,
+    };
+    assert_eq!(
+        sample_process_tree(tree.root(), Pid::new(1), Some(&zero), None).expect("a walk"),
+        TreeSample::RootGone,
+        "0 is not 'unchecked'"
+    );
+}
+
+#[test]
+fn the_per_sweep_record_buffer_is_reused_across_sweeps() {
+    // Honest about what this measures: NOT a heap-allocation count. It shows the
+    // per-sweep `Vec<ProcRecord>` is sized from the previous sweep, so after the
+    // first (growing) sweep its capacity is exactly the tree size and stays
+    // stable, instead of regrowing by doubling every sweep. A total heap count
+    // needs valgrind or heaptrack on another host.
+    let tree = two_hundred_process_tree();
+    let registered = ExpectedRoot::read(tree.root(), Pid::new(1)).expect("a starttime");
+    let mut sampler = Sampler::new(Accounting::Estimated);
+    let mut capacities = Vec::new();
+    for _ in 0..50 {
+        let sample = sampler
+            .sample_tree(tree.root(), registered)
+            .expect("a walk")
+            .into_sample()
+            .expect("live");
+        assert_eq!(sample.processes.len(), 199);
+        capacities.push(sample.processes.capacity());
+    }
+    let steady = capacities.get(1).copied().expect("a second sweep");
+    assert_eq!(steady, 199, "sized to the tree, no doubling slack");
+    assert!(
+        capacities
+            .iter()
+            .skip(1)
+            .all(|capacity| *capacity == steady),
+        "capacity is stable from sweep 2 on: {capacities:?}"
+    );
+    assert!(
+        capacities.first().is_some_and(|first| *first >= steady),
+        "only the first sweep grows"
     );
 }

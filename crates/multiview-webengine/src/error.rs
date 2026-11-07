@@ -110,6 +110,16 @@ pub enum Error {
         detail: String,
     },
 
+    /// A scope was refused at registration because it cannot be sampled safely
+    /// (a process-tree scope with no real root `starttime`).
+    #[error("invalid scope for owner {owner}: {detail}")]
+    InvalidScope {
+        /// The owner the scope was registered for.
+        owner: String,
+        /// Why it was refused.
+        detail: &'static str,
+    },
+
     /// A job id the queue already tracks was used for a second job.
     #[error("job id {job} is already tracked")]
     DuplicateJob {

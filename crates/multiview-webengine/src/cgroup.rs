@@ -514,6 +514,62 @@ pub enum LeafMoveStep {
         /// The `cgroup.subtree_control` file.
         path: PathBuf,
     },
+    /// **Undo only.** Run `then` only if `check` holds when the executor reaches
+    /// this step; otherwise skip it.
+    ///
+    /// Produced by [`rollback_for`] for a failure *at*
+    /// [`MoveSelf`](Self::MoveSelf), where the executor cannot tell whether the
+    /// (atomic) kernel migration happened: the process is moved back only if
+    /// `/proc/<pid>/cgroup` shows it in the leaf. A completed `MoveSelf` still
+    /// gets the unconditional [`MoveSelfBack`](Self::MoveSelfBack).
+    IfMember {
+        /// The membership to verify first.
+        check: VerifyMembership,
+        /// The step to run when it holds.
+        then: Box<Self>,
+    },
+}
+
+/// A membership check the executor evaluates **at run time**, before a
+/// conditional undo: "is `pid` currently in the cgroup at `path`?".
+///
+/// It exists because a failed write is not proof of an unmoved process. The
+/// kernel's migration is atomic, but the executor only sees an error return and
+/// cannot always know whether the write reached the kernel (a `write(2)`
+/// interrupted after the migration, a lost reply). The undo for a failure *at*
+/// [`MoveSelf`](LeafMoveStep::MoveSelf) is therefore conditional on the process
+/// actually being in the leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyMembership {
+    /// The process whose `/proc/<pid>/cgroup` is read.
+    pub pid: u32,
+    /// The cgroup directory (absolute, e.g. `/sys/fs/cgroup/svc/engine`) the
+    /// process must be in for the check to hold.
+    pub path: PathBuf,
+}
+
+impl VerifyMembership {
+    /// Whether `proc_cgroup` (the body of `/proc/<pid>/cgroup`) places the
+    /// process in [`path`](Self::path), where `mount` is the cgroup v2 mount
+    /// point (`/sys/fs/cgroup`).
+    ///
+    /// Pure: the executor reads the file and asks. Only the unified (`0::`)
+    /// line counts; anything unreadable, unparsable or outside `mount` is
+    /// `false`, so a doubtful answer never triggers a write.
+    #[must_use]
+    pub fn holds(&self, proc_cgroup: &str, mount: &str) -> bool {
+        let Some(relative) = self.path.to_str().and_then(|path| {
+            path.strip_prefix(mount.trim_end_matches('/'))
+                .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        }) else {
+            return false;
+        };
+        let want = if relative.is_empty() { "/" } else { relative };
+        proc_cgroup
+            .lines()
+            .filter_map(|line| line.strip_prefix("0::"))
+            .any(|actual| actual.trim_end() == want)
+    }
 }
 
 /// What the executor does when a leaf-move step fails.
@@ -547,6 +603,7 @@ impl LeafMoveStep {
             Self::VerifyDelegationInPlace { .. } => "verify_delegation_in_place",
             Self::EnableController { .. } => "enable_controller",
             Self::DisableController { .. } => "disable_controller",
+            Self::IfMember { .. } => "if_member",
         }
     }
 
@@ -597,7 +654,33 @@ impl LeafMoveStep {
             | Self::VerifyDelegationInPlace { .. }
             | Self::MoveSelfBack { .. }
             | Self::RemoveLeaf { .. }
-            | Self::DisableController { .. } => None,
+            | Self::DisableController { .. }
+            | Self::IfMember { .. } => None,
+        }
+    }
+
+    /// The undo to run when this step **failed** and the executor cannot tell
+    /// whether it took effect; `None` when a failure is known to have changed
+    /// nothing.
+    ///
+    /// Only [`MoveSelf`](Self::MoveSelf) qualifies: its kernel migration is
+    /// atomic but a failed write may still have reached the kernel, so the undo
+    /// is [`MoveSelfBack`](Self::MoveSelfBack) guarded by an
+    /// [`IfMember`](Self::IfMember) check on the leaf.
+    #[must_use]
+    pub fn undo_if_applied(&self) -> Option<Self> {
+        match self {
+            Self::MoveSelf { pid, path, back_to } => Some(Self::IfMember {
+                check: VerifyMembership {
+                    pid: *pid,
+                    path: path.parent().map_or_else(PathBuf::new, PathBuf::from),
+                },
+                then: Box::new(Self::MoveSelfBack {
+                    pid: *pid,
+                    to: back_to.clone(),
+                }),
+            }),
+            _ => None,
         }
     }
 }
@@ -624,6 +707,11 @@ impl LeafMoveStep {
 ///   [`RemoveLeaf`](LeafMoveStep::RemoveLeaf): a cgroup that still holds a
 ///   process cannot be removed.
 ///
+/// A failure *at* a [`MoveSelf`](LeafMoveStep::MoveSelf) additionally yields a
+/// conditional [`IfMember`](LeafMoveStep::IfMember) move back, first: the
+/// executor cannot know whether the write reached the kernel, so it checks
+/// `/proc/<pid>/cgroup` and moves back only if the process is in the leaf.
+///
 /// A rollback never contains an
 /// [`EnableController`](LeafMoveStep::EnableController): nothing in the undo
 /// direction turns a controller back on.
@@ -647,6 +735,10 @@ pub fn rollback_for(plan: &[LeafMoveStep], index: usize) -> Vec<LeafMoveStep> {
         .iter()
         .filter_map(LeafMoveStep::undo)
         .collect();
+    // The failing step itself may or may not have taken effect: its conditional
+    // undo (if any) is the latest mutation's, so after the reversal it runs
+    // first.
+    undo.extend(plan.get(index).and_then(LeafMoveStep::undo_if_applied));
     undo.reverse();
     undo
 }
