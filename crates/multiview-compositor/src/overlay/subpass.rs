@@ -35,6 +35,7 @@ use multiview_core::color::ColorInfo;
 
 use crate::blend::{over, LinearRgba, PremulRgba};
 use crate::error::{Error, Result};
+use crate::overlay::color_memo::decode_table;
 use crate::overlay::text::{RasterizedGlyph, RasterizedRun};
 use crate::pipeline::{
     canvas_linear_to_output_yuv, tile_yuv_to_canvas_linear, CanvasColor, Nv12Image,
@@ -1606,12 +1607,20 @@ fn bake_rect_band_into(
         y1: band_y1,
     };
     let mut buffer = LinearCanvasBuffer::region(band);
+    // Exact decode memo: every table entry is the oracle's own output for that
+    // (y8, cb8, cr8), so a lookup equals the call below bit for bit. `None`
+    // (table still building in the background, or another colour pair) means
+    // the oracle runs directly — never a wait.
+    let table = decode_table(color, canvas);
     for y in band.y0..band.y1 {
         for x in band.x0..band.x1 {
             let Some((y8, cb8, cr8)) = image.sample(x, y) else {
                 continue;
             };
-            let lin = tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?;
+            let lin = match table.and_then(|t| t.get(y8, cb8, cr8)) {
+                Some(lin) => lin,
+                None => tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?,
+            };
             if let Some(idx) = buffer.index(x, y) {
                 if let Some(slot) = buffer.pixels.get_mut(idx) {
                     *slot = [lin[0], lin[1], lin[2], 1.0];

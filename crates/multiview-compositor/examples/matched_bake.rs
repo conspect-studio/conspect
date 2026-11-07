@@ -9,6 +9,7 @@
     clippy::indexing_slicing,
     clippy::print_stdout
 )] // Local-only benchmark harness uses bounded fixture indices and intentional output.
+use multiview_compositor::overlay::color_memo::prewarm_overlay_decode_table;
 use multiview_compositor::overlay::subpass::{
     apply_overlays_to_nv12, OverlayColor, OverlayDrawList, OverlayPrimitive, OverlayRect,
 };
@@ -142,6 +143,14 @@ fn report_all_fresh() {
     );
 }
 fn main() {
+    // Production builds the exact decode table in the background on the first
+    // bake; prewarm it here (outside timing) so samples are steady-state.
+    let start = Instant::now();
+    let ready = prewarm_overlay_decode_table(CanvasColor::default());
+    println!(
+        "decode_table_prewarm ready={ready} ms={:.1}",
+        start.elapsed().as_secs_f64() * 1000.
+    );
     let image0 = image(0);
     let list0 = fixture(0);
     report("static_reused_input_and_caption", &[image0], &[list0], 32);
