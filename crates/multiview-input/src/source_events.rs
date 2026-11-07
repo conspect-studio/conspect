@@ -117,6 +117,15 @@ impl ScteSourceEventAdapter {
             self.diagnostics.invalid_identity = self.diagnostics.invalid_identity.saturating_add(1);
             return Ok(out);
         }
+        // F4: a component-mode splice_insert only splices the listed elementary
+        // streams. Component semantics are not represented in source events, so
+        // it must never become a whole-source Start/End boundary.
+        if let crate::scte::splice35::SpliceCommand::Insert(insert) = section.command {
+            if !insert.program_splice {
+                self.diagnostics.unsupported = self.diagnostics.unsupported.saturating_add(1);
+                return Ok(out);
+            }
+        }
         for event in section.normalized_cue_events() {
             let cue = event.cue;
             let edge = semantic_edge(&event);
