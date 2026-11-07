@@ -7,6 +7,7 @@ import {
   fetchLinks,
   fetchPlaces,
   fetchProbe,
+  fetchSourceNetwork,
   fetchStatus,
   startProbe,
 } from './catalogue';
@@ -14,6 +15,7 @@ import type {
   CatalogueIndex,
   CatalogueStatus,
   LinksResponse,
+  NetworkReport,
   PlacesResponse,
   ProbeJob,
   ProbeRequest,
@@ -86,5 +88,17 @@ export function useProbeMutation(
 ): UseMutationResult<readonly ProbeResult[], Error, ProbeRequest> {
   return useMutation<readonly ProbeResult[], Error, ProbeRequest>({
     mutationFn: (request) => runProbe(request, pollMs),
+  });
+}
+
+/** Network-path report for one source (on demand; never auto-polled). */
+export function useSourceNetwork(sourceId: string | null): UseQueryResult<NetworkReport> {
+  return useQuery<NetworkReport>({
+    queryKey: ['catalogue', 'source-network', sourceId],
+    queryFn: () => fetchSourceNetwork(sourceId ?? ''),
+    enabled: sourceId !== null,
+    retry: false,
+    staleTime: 0,
+    gcTime: 0,
   });
 }

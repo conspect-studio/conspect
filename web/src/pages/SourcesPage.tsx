@@ -71,7 +71,7 @@ import { tileForSource, useLiveTiles } from '../resources/useLiveTiles';
 import type { LiveTile } from '../realtime/useEngineEvents';
 import { Button } from '../components/ui/button';
 import { useCatalogueLinks } from '../api/catalogueQueries';
-import { LinkActions, LinkCell, OriginPanel } from '../iptv/SourceLinks';
+import { LinkActions, LinkCell, OriginPanel, SourceNetworkAction } from '../iptv/SourceLinks';
 import type { SourceFormState as SeedForm } from '../resources/forms';
 import { HelpLink } from '../components/HelpLink';
 import { TileStateBadge } from '../components/TileStateBadge';
@@ -1044,6 +1044,7 @@ export function SourcesPage(): JSX.Element {
             locator={ctx.row.original.locator}
             link={linkBySource.get(ctx.row.original.id)}
           />
+          <SourceNetworkAction sourceId={ctx.row.original.id} sourceName={ctx.row.original.name} />
         </div>
       ),
     },

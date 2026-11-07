@@ -94,9 +94,9 @@ describe('text search indexes feed names and stream titles', () => {
   it('finds KSHB (a feed of the NBC channel) by feed name and by title', () => {
     const hit = streams.find((s) => s.title.startsWith('KSHB 41'));
     expect(hit?.feed_name).toBe('KSHB-TV');
-    expect(idx.search('KSHB-TV').map((h) => h.id)).toContain(hit?.k);
-    expect(idx.search('kshb 41').map((h) => h.id)).toContain(hit?.k);
-    expect(idx.search('KSHBTV').map((h) => h.id)).toContain(hit?.k);
+    expect(idx.search('KSHB-TV').map((h) => String(h.id))).toContain(hit?.k);
+    expect(idx.search('kshb 41').map((h) => String(h.id))).toContain(hit?.k);
+    expect(idx.search('KSHBTV').map((h) => String(h.id))).toContain(hit?.k);
   });
 });
 

@@ -1,12 +1,14 @@
 // Renders one probe result: verdict, provenance, media facts and timed events.
 import type { JSX } from 'react';
-import { Trans } from '@lingui/react/macro';
+import { Trans, useLingui } from '@lingui/react/macro';
 
 import type { ProbeResult } from '../api/catalogue';
 import { VerdictBadge } from './Badges';
+import { NetworkButton } from './NetworkDialog';
 
 /** The full probe result (verdict + facts + events). */
 export function ProbeSummary({ result }: { readonly result: ProbeResult }): JSX.Element {
+  const { t } = useLingui();
   const f = result.facts;
   return (
     <div className="space-y-2 text-sm" data-testid="probe-summary">
@@ -18,6 +20,13 @@ export function ProbeSummary({ result }: { readonly result: ProbeResult }): JSX.
             <time dateTime={result.probed_at}>{result.probed_at}</time>
           </Trans>
         </span>
+        {result.network != null || result.source_id !== null ? (
+          <NetworkButton
+            label={t`Network path of this probe`}
+            report={result.network}
+            sourceId={result.source_id}
+          />
+        ) : null}
       </p>
       {result.detail !== null ? <p className="text-xs">{result.detail}</p> : null}
       {f !== null ? (

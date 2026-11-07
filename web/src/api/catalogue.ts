@@ -1,3 +1,5 @@
+// TODO(iptv-org): NetworkReport / fetchSourceNetwork below are hand-typed for
+// design §3a until the OpenAPI schema carries them.
 // IPTV-ORG catalogue API (docs/io/iptv-org.md §2 / §2.2 / §3).
 //
 // TODO(iptv-org): switch to generated schema types. The backend endpoints are
@@ -153,6 +155,95 @@ export interface ProbeFacts {
   readonly thumbnail: string | null;
 }
 
+/** IP family of an address or path. */
+export type IpFamily = 'ipv4' | 'ipv6';
+
+/** `net_guard` class of a resolved address (§3a DNS). CONTRACT: vocabulary. */
+export type AddressClass = 'public' | 'private' | 'blocked';
+
+/** How the internet sees this server (§3a “Server egress identity”). */
+export interface NetworkEgress {
+  readonly ipv4: string | null;
+  readonly ipv6: string | null;
+  /** Egress country (Cloudflare `loc`), ISO alpha-2. */
+  readonly country: string | null;
+  /** CDN edge (Cloudflare `colo`), e.g. `DFW`. */
+  readonly colo: string | null;
+}
+
+/** One resolved address of a host with its per-family connection result. */
+export interface NetworkAddress {
+  readonly ip: string;
+  readonly family: IpFamily;
+  readonly class: AddressClass;
+  readonly connect_ms: number | null;
+  /** HTTP status over this address, when a request was made. */
+  readonly status: number | null;
+  readonly error: string | null;
+}
+
+/** DNS answer for a host. */
+export interface NetworkDns {
+  readonly cname: readonly string[];
+  readonly a: readonly string[];
+  readonly aaaa: readonly string[];
+  readonly ttl: number | null;
+}
+
+/** TLS facts for a host. */
+export interface NetworkTls {
+  readonly version: string | null;
+  readonly alpn: string | null;
+  readonly subject: string | null;
+  readonly issuer: string | null;
+  /** ISO instant. */
+  readonly not_after: string | null;
+}
+
+/** One distinct host in the chain (playlist, segment CDN, key host, redirects). */
+export interface NetworkHost {
+  readonly host: string;
+  /** CONTRACT: free text, e.g. `master`, `media`, `segment`, `key`, `redirect`. */
+  readonly role: string;
+  readonly dns: NetworkDns;
+  readonly addresses: readonly NetworkAddress[];
+  readonly tls: NetworkTls | null;
+}
+
+/** One HTTP hop. `url_redacted` has credentials, userinfo and query removed. */
+export interface NetworkHop {
+  readonly url_redacted: string;
+  readonly status: number | null;
+  readonly ms: number | null;
+  readonly server: string | null;
+  readonly via: string | null;
+  readonly age: string | null;
+  readonly cdn_headers: Readonly<Record<string, string>>;
+  /** ≤ 512 bytes of text for 4xx responses (block pages). */
+  readonly body_excerpt: string | null;
+}
+
+/** The request headers the server sent. */
+export interface NetworkRequestHeaders {
+  readonly user_agent: string | null;
+  readonly referrer: string | null;
+}
+
+/**
+ * The network-path report (§3a): `POST /api/v1/sources/{id}/network` response
+ * and the `network` block of a probe result.
+ */
+export interface NetworkReport {
+  readonly egress: NetworkEgress;
+  readonly hosts: readonly NetworkHost[];
+  readonly hops: readonly NetworkHop[];
+  readonly request_headers: NetworkRequestHeaders;
+  /** Plain-language hints. */
+  readonly assessment: readonly string[];
+  /** One equivalent `curl` command per hop. */
+  readonly curl: readonly string[];
+}
+
 /** One probe result. */
 export interface ProbeResult {
   readonly k: string | null;
@@ -163,6 +254,8 @@ export interface ProbeResult {
   readonly detail: string | null;
   readonly facts: ProbeFacts | null;
   readonly events: readonly ProbeEvent[];
+  /** §3a network-path report; absent when diagnostics are disabled. */
+  readonly network?: NetworkReport | null;
 }
 
 /**
@@ -317,4 +410,32 @@ export function fetchProbe(id: string, o: CatalogueRequestOptions = {}): Promise
 /** Logo URL for a cache key (§5: served same-origin by the control plane). */
 export function logoUrl(key: string): string {
   return `${BASE}/logos/${encodeURIComponent(key)}`;
+}
+
+/**
+ * `POST /api/v1/sources/{id}/network` (operate; per-object authorization).
+ * Lives outside the catalogue prefix because it works for ANY source.
+ */
+export async function fetchSourceNetwork(
+  sourceId: string,
+  o: CatalogueRequestOptions = {},
+): Promise<NetworkReport> {
+  const response = await fetch(
+    `${o.baseUrl ?? ''}/api/v1/sources/${encodeURIComponent(sourceId)}/network`,
+    { method: 'POST', headers: headers(o, true), body: '{}' },
+  );
+  if (!response.ok) {
+    let message = `Request failed (${String(response.status)})`;
+    try {
+      const body: unknown = await response.json();
+      if (typeof body === 'object' && body !== null && 'title' in body && typeof body.title === 'string') {
+        message = body.title;
+      }
+    } catch {
+      // keep the status-only message
+    }
+    throw new CatalogueApiError(message, response.status);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+  return (await response.json()) as NetworkReport;
 }

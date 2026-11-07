@@ -27,6 +27,7 @@ import { SelectField } from '../resources/FormControls';
 import { resourceKeys, useSaveResource } from '../resources/queries';
 import { LinkStatusBadge, VerdictBadge } from './Badges';
 import { useFollowLabel } from './BulkAddDialog';
+import { NetworkButton } from './NetworkDialog';
 import { ProbeSummary } from './ProbeSummary';
 
 /** The read-only provenance panel + follow selector in the source dialog. */
@@ -450,4 +451,16 @@ export function LinkActions({
       </Dialog>
     </>
   );
+}
+
+/** The “Network” action for ANY source row (not only linked ones; design §3a). */
+export function SourceNetworkAction({
+  sourceId,
+  sourceName,
+}: {
+  readonly sourceId: string;
+  readonly sourceName: string;
+}): JSX.Element {
+  const { t } = useLingui();
+  return <NetworkButton label={t`Network: ${sourceName}`} sourceId={sourceId} />;
 }
