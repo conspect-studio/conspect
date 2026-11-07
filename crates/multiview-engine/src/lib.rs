@@ -92,6 +92,7 @@ pub mod alarm;
 pub mod clock;
 pub mod cycle;
 pub mod degrade;
+pub mod demand;
 pub mod drive;
 pub mod epoch;
 pub mod error;
@@ -152,6 +153,11 @@ pub use probe::{
 pub use program::{MultiviewProgram, ProgramId, ProgramKind};
 pub use programset::{Program, ProgramSet};
 pub use ptp::{PtpSample, PtpServo, ServoConfig};
+pub use demand::{
+    ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig, DemandLease, DemandManager, DemandPhase,
+    DemandStatus, RailDriver, Rails, SetItem, DEFAULT_LINGER, DEFAULT_MAX_CONCURRENT_STARTS,
+    MAX_TIMED_LEASES,
+};
 pub use registry::{
     RequestedSize, SourceActor, SourceHandle, SourceInit, SourceKey, SourceRegistry,
 };
