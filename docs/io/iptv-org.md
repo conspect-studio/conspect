@@ -308,6 +308,17 @@ queries Wikidata at runtime. An optional operator basemap style URL is off by de
 A **Link** column (`in sync`, `updated`, …) with **Review changes**, **Switch to alternative**,
 **Unlink**, and **Probe** and **Network** actions.
 
+### 4.4 Data-source attributions
+
+Shown in the in-app “Data sources” footer of `/sources/iptv-org`:
+
+| Data | Licence |
+|---|---|
+| [iptv-org](https://github.com/iptv-org/iptv) channel/stream database | Unlicense — the streams belong to their broadcasters |
+| [Natural Earth](https://www.naturalearthdata.com/) admin-0 / admin-1 boundaries (bundled in `web/public/maps/`, simplified with mapshaper) | Public domain |
+| [Wikidata](https://www.wikidata.org/) city coordinates (P625) | CC0 |
+| [MapLibre GL JS](https://maplibre.org/) | BSD-3-Clause |
+
 ## 5. Security
 
 - Sync egress: one compile-time host, TLS, no redirects.
