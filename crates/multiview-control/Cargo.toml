@@ -409,3 +409,8 @@ required-features = ["catalogue"]
 # Hostile-fixture chaos tests proving the probe bounds hold.
 name = "catalogue_chaos"
 required-features = ["catalogue"]
+
+[[test]]
+# Link tracker end-to-end (events, health warning, follow=auto write path).
+name = "catalogue_links"
+required-features = ["catalogue"]

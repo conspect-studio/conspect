@@ -476,3 +476,234 @@ impl LinkTracker {
             .count()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalogue::gazetteer::Gazetteer;
+    use crate::catalogue::index::build_snapshot;
+    use crate::catalogue::model::RawCatalogue;
+
+    fn snapshot(streams: &str, channels: &str, blocklist: &str) -> Snapshot {
+        let mut raw = RawCatalogue::default();
+        raw.set_file("streams", streams.as_bytes()).unwrap();
+        raw.set_file("channels", channels.as_bytes()).unwrap();
+        raw.set_file("blocklist", blocklist.as_bytes()).unwrap();
+        raw.set_file("feeds", br#"[{"channel":"A.us","id":"SD","is_main":true,"broadcast_area":["c/US"],"languages":["eng"]}]"#).unwrap();
+        build_snapshot(&raw, &Gazetteer::default(), "e".into(), "t".into())
+    }
+
+    const CH: &str = r#"[{"id":"A.us","name":"A","country":"US","categories":["news"]},{"id":"B.us","name":"B","country":"US"}]"#;
+
+    fn src(url: &str, extra: &str) -> Source {
+        serde_json::from_str(&format!(
+            r#"{{"id":"s1","kind":"hls","url":"{url}","origin":{{"provider":"iptv-org","channel":"A.us","feed":"SD","stream_url":"https://a/1.m3u8"{extra}}}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn stream(url: &str, extra: &str) -> String {
+        stream_q(url, "720p", extra)
+    }
+
+    fn stream_q(url: &str, quality: &str, extra: &str) -> String {
+        format!(
+            r#"{{"channel":"A.us","feed":"SD","title":"A","url":"{url}","quality":"{quality}"{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn in_sync_updated_removed_edited_unlinked() {
+        // in_sync
+        let snap = snapshot(
+            &format!("[{}]", stream("https://a/1.m3u8", r#","labels":[]"#)),
+            CH,
+            "[]",
+        );
+        assert_eq!(
+            evaluate(&src("https://a/1.m3u8", ""), &snap)
+                .unwrap()
+                .status,
+            LinkStatus::InSync
+        );
+        // updated: header added upstream for the same URL
+        let snap = snapshot(
+            &format!(
+                "[{}]",
+                stream("https://a/1.m3u8", r#","user_agent":"UA/2""#)
+            ),
+            CH,
+            "[]",
+        );
+        let info = evaluate(&src("https://a/1.m3u8", ""), &snap).unwrap();
+        assert_eq!(info.status, LinkStatus::Updated);
+        assert_eq!(
+            info.change.unwrap().user_agent,
+            Some(Some("UA/2".to_owned()))
+        );
+        // updated: the single stream's URL moved
+        let snap = snapshot(&format!("[{}]", stream("https://a/2.m3u8", "")), CH, "[]");
+        let info = evaluate(&src("https://a/1.m3u8", ""), &snap).unwrap();
+        assert_eq!(info.status, LinkStatus::Updated);
+        assert_eq!(
+            info.change.as_ref().unwrap().url.as_deref(),
+            Some("https://a/2.m3u8")
+        );
+        // stream_removed: URL gone, several alternatives remain (ranked, best first)
+        let two = format!(
+            "[{},{}]",
+            stream_q("https://a/9.m3u8", "360p", ""),
+            stream("https://a/8.m3u8", "")
+        );
+        let snap = snapshot(&two, CH, "[]");
+        let info = evaluate(&src("https://a/1.m3u8", ""), &snap).unwrap();
+        assert_eq!(info.status, LinkStatus::StreamRemoved);
+        assert_eq!(info.alternatives.len(), 2);
+        // edited: operator changed the url
+        let snap = snapshot(&format!("[{}]", stream("https://a/1.m3u8", "")), CH, "[]");
+        assert_eq!(
+            evaluate(&src("https://mine/x.m3u8", ""), &snap)
+                .unwrap()
+                .status,
+            LinkStatus::Edited
+        );
+        // unlinked: channel not in the catalogue at all
+        let snap = snapshot(
+            &format!(
+                "[{}]",
+                stream("https://z/1.m3u8", "").replace("A.us", "B.us")
+            ),
+            CH,
+            "[]",
+        );
+        assert_eq!(
+            evaluate(&src("https://a/1.m3u8", ""), &snap)
+                .unwrap()
+                .status,
+            LinkStatus::Unlinked
+        );
+        // not linked → not tracked
+        let plain: Source =
+            serde_json::from_str(r#"{"id":"p","kind":"hls","url":"https://a/1.m3u8"}"#).unwrap();
+        assert!(evaluate(&plain, &snap).is_none());
+    }
+
+    #[test]
+    fn closed_and_blocklisted() {
+        let closed = r#"[{"id":"A.us","name":"A","closed":"2025-01-01","replaced_by":"B.us"},{"id":"B.us","name":"B"}]"#;
+        let streams = format!(
+            "[{},{}]",
+            stream("https://a/1.m3u8", ""),
+            stream("https://b/1.m3u8", "").replace("A.us", "B.us")
+        );
+        let snap = snapshot(&streams, closed, "[]");
+        let info = evaluate(&src("https://a/1.m3u8", ""), &snap).unwrap();
+        assert_eq!(info.status, LinkStatus::ChannelClosed);
+        assert_eq!(info.replaced_by.as_deref(), Some("B.us"));
+        assert_eq!(
+            info.alternatives.len(),
+            1,
+            "replacement channel's streams are offered"
+        );
+        let snap = snapshot(
+            &format!("[{}]", stream("https://a/1.m3u8", "")),
+            CH,
+            r#"[{"channel":"A.us","reason":"dmca"}]"#,
+        );
+        assert_eq!(
+            evaluate(&src("https://a/1.m3u8", ""), &snap)
+                .unwrap()
+                .status,
+            LinkStatus::Blocklisted
+        );
+    }
+
+    #[test]
+    fn auto_follow_applies_only_updated_and_never_adds_geo_blocked() {
+        let snap = snapshot(&format!("[{}]", stream("https://a/2.m3u8", "")), CH, "[]");
+        let auto = src("https://a/1.m3u8", r#","follow":"auto""#);
+        let info = evaluate(&auto, &snap).unwrap();
+        assert!(auto_applicable(&info).is_some());
+        // notify (default) and manual never auto-apply.
+        assert!(auto_applicable(&evaluate(&src("https://a/1.m3u8", ""), &snap).unwrap()).is_none());
+        assert!(auto_applicable(
+            &evaluate(&src("https://a/1.m3u8", r#","follow":"manual""#), &snap).unwrap()
+        )
+        .is_none());
+        // A change that would add geo_blocked is refused even under auto.
+        let geo = snapshot(
+            &format!(
+                "[{}]",
+                stream("https://a/2.m3u8", r#","labels":["Geo-blocked"]"#)
+            ),
+            CH,
+            "[]",
+        );
+        let info = evaluate(&auto, &geo).unwrap();
+        assert_eq!(info.status, LinkStatus::Updated);
+        assert!(
+            auto_applicable(&info).is_none(),
+            "must not add geo_blocked unattended"
+        );
+        // stream_removed is never auto-applied (no channel switching).
+        let two = format!(
+            "[{},{}]",
+            stream("https://a/8.m3u8", ""),
+            stream("https://a/9.m3u8", "")
+        );
+        let info = evaluate(&auto, &snapshot(&two, CH, "[]")).unwrap();
+        assert_eq!(info.status, LinkStatus::StreamRemoved);
+        assert!(auto_applicable(&info).is_none());
+    }
+
+    #[test]
+    fn apply_change_rewrites_url_headers_and_repins_origin() {
+        let snap = snapshot(
+            &format!(
+                "[{}]",
+                stream("https://a/2.m3u8", r#","user_agent":"UA/9""#)
+            ),
+            CH,
+            "[]",
+        );
+        let s = src("https://a/1.m3u8", "");
+        let info = evaluate(&s, &snap).unwrap();
+        let next = apply_change(&s, info.change.as_ref().unwrap(), "2026-11-07T00:00:00Z").unwrap();
+        next.validate().unwrap();
+        assert_eq!(source_url(&next).as_deref(), Some("https://a/2.m3u8"));
+        assert_eq!(
+            evaluate(&next, &snap).unwrap().status,
+            LinkStatus::InSync,
+            "settles to in_sync after apply"
+        );
+        let o = next.origin.unwrap();
+        assert_eq!(o.stream_url.as_deref(), Some("https://a/2.m3u8"));
+        assert_eq!(o.linked_at.as_deref(), Some("2026-11-07T00:00:00Z"));
+    }
+
+    #[test]
+    fn tracker_reports_transitions_once() {
+        let t = LinkTracker::new();
+        let s = src("https://a/1.m3u8", "");
+        let good = snapshot(&format!("[{}]", stream("https://a/1.m3u8", "")), CH, "[]");
+        assert!(
+            t.recompute(std::slice::from_ref(&s), &good).is_empty(),
+            "first in_sync is silent"
+        );
+        let moved = snapshot(&format!("[{}]", stream("https://a/2.m3u8", "")), CH, "[]");
+        let tr = t.recompute(std::slice::from_ref(&s), &moved);
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            (tr[0].previous, tr[0].status),
+            (Some(LinkStatus::InSync), LinkStatus::Updated)
+        );
+        assert!(
+            t.recompute(std::slice::from_ref(&s), &moved).is_empty(),
+            "no repeat while unchanged"
+        );
+        assert_eq!(t.attention_count(), 1);
+        let tr = t.recompute(std::slice::from_ref(&s), &good);
+        assert_eq!(tr[0].status, LinkStatus::InSync);
+        assert_eq!(t.attention_count(), 0);
+    }
+}

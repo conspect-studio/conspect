@@ -330,3 +330,50 @@ A **Link** column (`in sync`, `updated`, …) with **Review changes**, **Switch 
 | D | Link tracker, events, health warnings, `follow` modes | R2 |
 | E | Web: browser page, map, place search, facets, virtual list, probe panel, add/bulk add; Sources link column + review/switch dialogs | R2 |
 | F | Docs, runbook, e2e | R2 |
+
+## 7. Implementation notes (backend slices A–D)
+
+Where the implementation made a concrete choice or deviates from §2–§3:
+
+- **Feature layout.** The model/join/index/store/link-tracker/probe *analysis* and all
+  routes are pure Rust and **always compiled** (so the OpenAPI document is identical in
+  every build and `xtask` needs no TLS stack). Only network I/O sits behind the
+  `multiview-control` feature `catalogue` (reqwest + rustls: the fixed-host sync client,
+  the logo fetcher, the probe's guarded client). `catalogue-ffmpeg` adds the probe's
+  decode stage (`multiview-ffmpeg::media_probe`). `multiview-cli` forwards both, and the
+  shipped presets (`nvidia`, `apple`, `linux-vaapi`, `full`) enable `catalogue-ffmpeg`.
+  Without `catalogue` the refresh/probe/logo endpoints answer an honest error; without
+  `catalogue-ffmpeg` the probe reports stage 4 `skipped` and `verdict_basis` reads
+  `stages 1-3 only …`, never claiming decoded media.
+- **Dial guard.** Every probe/logo dial — the first URL and every redirect hop (followed
+  manually, max 5, reqwest redirects off) — is screened with `net_guard`: IP literals in
+  `DialGuard::screen_url`, DNS names by a `ScreeningResolver` over the *resolved*
+  addresses. The only way to dial loopback is the test-only
+  `DialGuard::for_tests_allowing_loopback_ports` (feature `_test-seams`, excluded from
+  every release preset by `cargo xtask check-release-features`, never reachable from
+  config or the API); it admits exactly the fixture's `[::1]:<port>`.
+- **`places`** returns `streams` (tagged directly) and `streams_within` (including
+  child places) for countries/subdivisions; cities carry `lat`/`lon` from the committed
+  gazetteer (`crates/multiview-control/assets/iptv-org-gazetteer.tsv`, 1,973 cities, 42 KB;
+  only cities referenced by a feed's `broadcast_area`). The embedded format is TSV, not
+  gzip: it is already smaller than the header cost of compressing it.
+- **`already_added`** is computed per request over the sources the caller may see
+  (`authorize_object`), by `origin.stream_url` (else the source URL). The index `ETag` for
+  such callers also hashes their added set.
+- **Link status** is served at `GET /api/v1/catalogues/iptv-org/links` (per-object
+  scoped; includes the change diff and ranked alternatives) and as a tally on `status`.
+  `catalogue.link_status` is a lossless event on topic `inputs`, scoped by source id. The
+  health warning is one aggregate code, `catalogue-link-attention` (a per-source code would
+  defeat the coalescing key). `follow = auto` goes through `apply_source_update` — the
+  same function behind `PUT /sources/{id}` — as actor `system:catalogue`.
+- **Probe wire.** `POST probes` answers `202` with the job (`queued|running|done`); a
+  15-minute cache hit answers `done` + `cached: true`. The 20 s wall clock cancels the
+  probe future (dropping its sockets), the 16 MiB budget is shared by playlists and
+  segments, and overflow of the 64-deep queue is shed instantly as `429`
+  (`/problems/too-many-requests`). Results are not persisted across restarts.
+- **HLS headers at ingest.** A source with `user_agent`/`referrer` is opened by libav
+  directly (it carries the `user_agent`/`referer` AVOptions); the loopback segment
+  fetcher and WebVTT variant pin do not carry them, so both are skipped for such a
+  source. Sources without the fields are unchanged.
+- **Config.** `DurationString` now also accepts the `h` unit (`6h`); Display is unchanged
+  (a `6h` value re-serializes as `360m`).
