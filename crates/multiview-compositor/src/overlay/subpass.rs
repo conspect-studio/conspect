@@ -35,7 +35,7 @@ use multiview_core::color::ColorInfo;
 
 use crate::blend::{over, LinearRgba, PremulRgba};
 use crate::error::{Error, Result};
-use crate::overlay::color_memo::decode_table;
+use crate::overlay::color_memo::{decode_table, with_encode_cache, EncodeCache};
 use crate::overlay::text::{RasterizedGlyph, RasterizedRun};
 use crate::pipeline::{
     canvas_linear_to_output_yuv, tile_yuv_to_canvas_linear, CanvasColor, Nv12Image,
@@ -1641,6 +1641,34 @@ fn bake_rect_band_into(
     // the caller handed us (full-canvas planes in the serial path: the offset
     // is simply `band_y0` itself, which is correct since there the slice IS the
     // full plane). This matches `composite_band`'s py_start rebasing.
+    // Exact encode memo keyed by the input's f32 bit patterns (persistent
+    // across frames, bounded; see `color_memo`). Slot hint: the band's
+    // row-pair offset in its rect, so concurrent bands usually start on
+    // distinct pool slots (a busy slot is skipped with `try_lock`, never
+    // waited on).
+    let hint = usize::try_from(band_y0.saturating_sub(rect.y0) / 2).unwrap_or(0);
+    with_encode_cache(hint, canvas, |cache| {
+        encode_band(
+            &buffer, band, band_y0, members, canvas, w, out_y, out_uv, cache,
+        )
+    })
+}
+
+/// Re-encode `band`'s member-covered 2×2 blocks of `buffer` into `out_y` /
+/// `out_uv` (rows rebased to `band_y0`), through the exact encode memo when
+/// one is available, otherwise the oracle.
+#[allow(clippy::too_many_arguments)]
+fn encode_band(
+    buffer: &LinearCanvasBuffer,
+    band: DirtyRect,
+    band_y0: u32,
+    members: &[DirtyRect],
+    canvas: CanvasColor,
+    w: usize,
+    out_y: &mut [u8],
+    out_uv: &mut [u8],
+    mut cache: Option<&mut EncodeCache>,
+) -> Result<()> {
     for y in (band.y0..band.y1).step_by(2) {
         let local_y = y.saturating_sub(band_y0);
         for x in (band.x0..band.x1).step_by(2) {
@@ -1661,8 +1689,11 @@ fn bake_rect_band_into(
                     .pixel(px, global_py)
                     .unwrap_or(PremulRgba::TRANSPARENT);
                 let straight = premul.unpremultiplied();
-                let out =
-                    canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
+                let lin = [straight.r, straight.g, straight.b];
+                let out = match cache.as_deref_mut() {
+                    Some(cache) => cache.encode(lin, canvas)?,
+                    None => canvas_linear_to_output_yuv(lin, canvas)?,
+                };
                 write_nv12_pixel(out_y, out_uv, w, px, local_py, out);
             }
         }

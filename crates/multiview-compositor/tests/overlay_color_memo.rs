@@ -1,6 +1,6 @@
 //! Exactness of the overlay bake's colour memos (`overlay::color_memo`).
 //!
-//! The decode table must return exactly what the
+//! The decode table and the encode cache must return exactly what the
 //! transcendental oracle returns — bit for bit — and the memoised bake must
 //! stay byte-identical to `apply_overlays_to_nv12_reference` over random
 //! frames and random draw lists, both before the background decode table is
@@ -16,12 +16,16 @@
     clippy::cast_precision_loss
 )]
 
-use multiview_compositor::overlay::color_memo::{decode_table, prewarm_overlay_decode_table};
+use multiview_compositor::overlay::color_memo::{
+    decode_table, prewarm_overlay_decode_table, EncodeCache, ENCODE_CACHE_ENTRIES,
+};
 use multiview_compositor::overlay::subpass::{
     apply_overlays_to_nv12, apply_overlays_to_nv12_reference, OverlayColor, OverlayDrawList,
     OverlayPrimitive, OverlayRect,
 };
-use multiview_compositor::pipeline::{tile_yuv_to_canvas_linear, CanvasColor, Nv12Image};
+use multiview_compositor::pipeline::{
+    canvas_linear_to_output_yuv, tile_yuv_to_canvas_linear, CanvasColor, Nv12Image,
+};
 use proptest::prelude::*;
 
 fn bits(v: [f32; 3]) -> [u32; 3] {
@@ -60,6 +64,25 @@ fn decode_table_does_not_serve_another_colour_pair() {
     assert!(decode_table(full.output_tag(), canvas).is_none());
 }
 
+#[test]
+fn encode_cache_survives_a_full_eviction_sweep_exactly() {
+    // Far more distinct keys than slots: every lookup still equals the oracle.
+    let canvas = CanvasColor::default();
+    let mut cache = EncodeCache::new(canvas);
+    let n = ENCODE_CACHE_ENTRIES * 3;
+    for round in 0..2 {
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            let lin = [t, 1.0 - t, (t * 7.0).fract()];
+            assert_eq!(
+                cache.encode(lin, canvas).unwrap(),
+                canvas_linear_to_output_yuv(lin, canvas).unwrap(),
+                "round {round} key {i}"
+            );
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -71,6 +94,31 @@ proptest! {
         let table = decode_table(canvas.output_tag(), canvas).unwrap();
         let oracle = tile_yuv_to_canvas_linear(y, cb, cr, canvas.output_tag(), canvas).unwrap();
         prop_assert_eq!(bits(table.get(y, cb, cr).unwrap()), bits(oracle));
+    }
+
+    /// Random linear inputs (in- and out-of-gamut, signed zeros) through a
+    /// tiny-keyspace stream with repeats: hits, misses and collisions all equal
+    /// the oracle.
+    #[test]
+    fn prop_encode_cache_matches_oracle(
+        keys in proptest::collection::vec(
+            (prop_oneof![Just(0.0_f32), Just(-0.0_f32), Just(1.0_f32), -0.25_f32..1.5],
+             -0.25_f32..1.5, -0.25_f32..1.5),
+            1..256,
+        ),
+        repeats in 1_usize..4,
+    ) {
+        let canvas = CanvasColor::default();
+        let mut cache = EncodeCache::new(canvas);
+        for _ in 0..repeats {
+            for &(r, g, b) in &keys {
+                let lin = [r, g, b];
+                prop_assert_eq!(
+                    cache.encode(lin, canvas).unwrap(),
+                    canvas_linear_to_output_yuv(lin, canvas).unwrap()
+                );
+            }
+        }
     }
 }
 
@@ -189,5 +237,9 @@ proptest! {
         let oracle = apply_overlays_to_nv12_reference(&image, &list, canvas).unwrap();
         prop_assert_eq!(fast.y_plane(), oracle.y_plane());
         prop_assert_eq!(fast.uv_plane(), oracle.uv_plane());
+        // Second pass hits the now-warm encode cache: still identical.
+        let again = apply_overlays_to_nv12(&image, &list, canvas).unwrap();
+        prop_assert_eq!(again.y_plane(), oracle.y_plane());
+        prop_assert_eq!(again.uv_plane(), oracle.uv_plane());
     }
 }
