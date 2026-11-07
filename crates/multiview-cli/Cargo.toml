@@ -258,6 +258,12 @@ required-features = ["webrtc-native"]
 # in docs/architecture/conventions.md §4. They are NOT built in CI (they need
 # the vendor toolchains/SDKs installed); they exist so a release build can opt
 # in with one flag.
+# Release-mode cost of a synthetic clock/timer render and of the steady-state
+# generator loop (perf evidence for the reused per-thread renderer).
+[[example]]
+name = "synth_render_cost"
+required-features = ["overlay"]
+
 [features]
 default = ["software"]
 
