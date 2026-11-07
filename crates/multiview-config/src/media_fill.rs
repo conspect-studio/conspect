@@ -32,6 +32,12 @@
 //! follows redirects and contacts hosts itself — a config check can never
 //! substitute for that boundary.
 //!
+//! A `url_fetch` URL is **stored canonically**: the deserialize path keeps the
+//! WHATWG parser's own [`Url::as_str`] rendering, so the fill carries the host
+//! the hygiene screen actually judged (lower-cased, punycoded, and the
+//! alternative IPv4 notations collapsed to a dotted quad) rather than the
+//! operator's spelling, and `serialize → deserialize` stays stable.
+//!
 //! ## Wire shape
 //!
 //! ```toml
@@ -213,6 +219,12 @@ pub enum MediaFillKind {
         /// local/special-use name, or an IP literal that passes
         /// [`screen_ip`]. This is input hygiene only — the OS-enforced egress
         /// boundary at fetch time is still required.
+        ///
+        /// Stored in the parser's **canonical** form ([`Url::as_str`]),
+        /// normalised on the deserialize path (see [`MediaFillWire`]), so a
+        /// validated fill never holds the operator's raw spelling: an
+        /// alternative IPv4 notation is stored as the `127.0.0.1` the screen
+        /// rejected, not as the text that named the loopback.
         url: String,
     },
 }
@@ -253,7 +265,7 @@ impl<'de> Deserialize<'de> for ParamValue {
         /// Visit the scalar shapes a template parameter may take.
         struct ParamVisitor;
 
-        impl<'de> Visitor<'de> for ParamVisitor {
+        impl Visitor<'_> for ParamVisitor {
             type Value = ParamValue;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -876,6 +888,30 @@ fn parse_fetch_url(url: &str) -> Result<Url, String> {
     Ok(parsed)
 }
 
+/// The canonical **stored** form of a `url_fetch` URL: the WHATWG parser's own
+/// [`Url::as_str`] rendering, so a fill stores exactly what the parser
+/// interpreted (lower-cased scheme and host, punycoded IDN, and the
+/// decimal/hex/octal IPv4 notations collapsed to a dotted quad) rather than the
+/// operator's spelling.
+///
+/// Normalisation happens on the **deserialize** path (the wire path), so a
+/// stored fill is canonical before [`validate`](MediaFill::validate) ever sees
+/// it and `serialize → deserialize` stays stable — a canonical URL re-parses to
+/// itself, so a reloaded document is identical to the one it came from.
+///
+/// A URL that fails the hygiene screen ([`parse_fetch_url`]) is kept verbatim so
+/// validation reports the precise reason: normalising first would silently
+/// reinterpret the input (the parser drops tab/newline, for example, which the
+/// raw-whitespace screen must still refuse). Every such URL is rejected by
+/// [`validate`](MediaFill::validate) anyway, so a stored, validated fill is
+/// always canonical.
+fn canonical_fetch_url(url: String) -> String {
+    match parse_fetch_url(&url) {
+        Ok(parsed) => parsed.as_str().to_owned(),
+        Err(_) => url,
+    }
+}
+
 /// Screen a parsed `Domain` fetch host: non-empty, ASCII domain-shaped, and not
 /// a local/special-use name.
 fn screen_fetch_domain(domain: &str, url: &str) -> Result<(), String> {
@@ -1004,7 +1040,9 @@ impl MediaFillWire {
                         self.id
                     )
                 })?;
-                MediaFillKind::UrlFetch { url }
+                MediaFillKind::UrlFetch {
+                    url: canonical_fetch_url(url),
+                }
             }
         };
         Ok(MediaFill {
