@@ -341,15 +341,14 @@ async fn run_capturing(
         Captured { before, after }
     });
 
-    let report = pipeline
-        .run_until_serving(
-            &stop,
-            publisher.as_ref(),
-            &preview_slot,
-            move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
-        )
-        .await
-        .expect("serving run");
+    let report = Box::pin(pipeline.run_until_serving(
+        &stop,
+        publisher.as_ref(),
+        &preview_slot,
+        move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
+    ))
+    .await
+    .expect("serving run");
     assert!(
         !report.faltered,
         "the route take must not falter the output"
@@ -456,15 +455,14 @@ async fn run_command_to_hls(pipeline: &mut Pipeline, config: &MultiviewConfig, c
         stop_for_relay.stop();
     });
 
-    let report = pipeline
-        .run_until_serving(
-            &stop,
-            publisher.as_ref(),
-            &preview_slot,
-            move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
-        )
-        .await
-        .expect("serving run");
+    let report = Box::pin(pipeline.run_until_serving(
+        &stop,
+        publisher.as_ref(),
+        &preview_slot,
+        move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
+    ))
+    .await
+    .expect("serving run");
     assert!(
         !report.faltered,
         "the route take must not falter the output"

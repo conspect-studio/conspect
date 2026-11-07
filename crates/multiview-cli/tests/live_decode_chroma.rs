@@ -226,15 +226,14 @@ async fn live_added_decode_matches_startup_uv_statistics() {
         (startup_frame, live_frame)
     });
 
-    pipeline
-        .run_until_serving(
-            &stop,
-            publisher.as_ref(),
-            &preview_slot,
-            move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
-        )
-        .await
-        .expect("serving run with a live-added decode");
+    Box::pin(pipeline.run_until_serving(
+        &stop,
+        publisher.as_ref(),
+        &preview_slot,
+        move |drive: &mut CompositorDrive<Nv12Image>| drain(drive),
+    ))
+    .await
+    .expect("serving run with a live-added decode");
     let (startup_frame, live_frame) = driver.await.expect("driver task");
     hub.shutdown();
 
