@@ -11473,7 +11473,7 @@
               "string",
               "null"
             ],
-            "description": "Optional `http://` hook POSTed on break start/end."
+            "description": "Optional `http://` hook that receives a `POST` on break start/end."
           }
         }
       },

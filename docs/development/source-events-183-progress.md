@@ -1,6 +1,6 @@
 # Source events implementation ledger (#183)
 
-Status: a working, operator-testable slice is shipped on `feat/rc-events`. Base
+Status: a working, operator-testable slice is shipped on `feat/rc-events`, including armed ad-break automation. Base
 8a2a9725 + the merged `feat/source-event-automation-183` foundation work
 (HLS/SCTE-35/ID3 observation, core tracker, overlay projection, read API,
 web Events panel). This ledger records what changed to make it visible and
@@ -43,20 +43,38 @@ usable, not the full original automation scope (see "Not done" below).
    labelled "Test aid (admin only) — not live evidence", and a `TEST` badge
    on any `test:`-prefixed row.
 
-## Not done (explicitly out of scope for this slice)
+5. **Ad-break automation (armed take/restore).** Per-source
+   `events.automation` rule (disarmed by default) persisted through the
+   canonical durable source path; a management-plane executor
+   (`multiview_control::automation`, 250 ms tokio task, never the clock)
+   reads break status from the source-event service, reserves a
+   `SafetyModel` lease, issues `Command::SwapSource` (and `RouteAudio` for
+   `route_program`/`bars_tone`), restores on confirmed end / watchdog /
+   disarm / rule removal / "Restore now", and cancels auto-restore when the
+   shared `RoutingLedger` shows an operator change to a replaced destination.
+   Optional `webhook_url` (http only, SSRF-screened, 3 s timeout, max 8 in
+   flight) is POSTed on start/end. API: `GET/PUT
+   /api/v1/inputs/{id}/events/automation`, `POST .../arm|disarm|restore`.
+   UI: the Events dialog's "Ad-break automation" section. `bars` uses the
+   first configured Bars source (its existing 1 kHz −18 dBFS EBU line-up
+   tone serves `bars_tone`); no internal sources are created.
+6. **Inherited defects fixed (red→green tests):** F1 owned restore authorizes
+   on destination only; F2 bounded restore-ack reconciliation; F3 only a
+   strictly newer clock supersedes; F4 component-mode splice_insert never
+   becomes a source boundary; S1/S2 reads bound to service, generation and
+   exact evidence.
 
-Per-source automation rules (armed take/restore into bars or a target
-source, with a manual "restore now" override) are **not** implemented in
-this slice — the pure safety-model library (`event_automation.rs`,
-`SafetyModel`) and the `Command::SwapSource`/routing primitives it would
-drive both already exist, but no route/UI arms it. This was cut to ship
-(1)-(4) fully rather than (4)+automation partially, per the ship-rescue
-brief's explicit fallback. A follow-up slice should: add a per-source rule
-resource (disarmed by default) backed by `event_automation::SafetyModel`,
-poll `expired_leases`/matching-end evidence on a control-plane task (never
-the clock thread), execute via `Command::SwapSource` (cell-level swap,
-the documented minimum) or a `Command::Route*`, and add the arm/disarm
-toggle + "restore now" button to the web panel.
+## Not done
+
+- Webhooks are plain `http://` only (no TLS client in the default build).
+- Executor state is in memory: a restart while a replacement is on air does
+  not restore it (the durable config still restores the configured layout
+  binding on restart).
+- Program-output scope is the cell(s) + the source's program-bus audio; there
+  is no separate "program bus video" destination in this engine.
+- Manual-change detection sees commands submitted through the control plane
+  (all REST/salvo/layout/config-watch routes); out-of-band engine changes are
+  not observed.
 
 ## Coordination
 

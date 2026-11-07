@@ -2171,7 +2171,7 @@ pub struct EventAutomationRuleDoc {
     /// Watchdog seconds (1..=86400, default 600).
     #[serde(default)]
     pub max_duration_s: Option<u32>,
-    /// Optional `http://` hook POSTed on break start/end.
+    /// Optional `http://` hook that receives a `POST` on break start/end.
     #[serde(default)]
     pub webhook_url: Option<String>,
 }

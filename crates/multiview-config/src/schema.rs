@@ -1048,7 +1048,7 @@ pub struct EventAutomationRule {
     /// Watchdog: restore after this many seconds even without an end (default 600).
     #[serde(default = "default_max_duration_s")]
     pub max_duration_s: u32,
-    /// Optional `http://` hook POSTed a small JSON payload on break start/end,
+    /// Optional `http://` hook that receives a small JSON `POST` on break start/end,
     /// so external VT/automation systems can react. Dialled through the SSRF
     /// guard with bounded timeouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]

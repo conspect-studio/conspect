@@ -1,6 +1,13 @@
 //! ADR-0183 automation executor state machine, driven by a fake break
 //! provider and a fake command sink (no engine, no clock thread).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::assert_is_empty,
+    clippy::match_same_arms
+)]
 use multiview_config::schema::{BreakActionKind, BreakStartAction, EventAutomationRule};
 use multiview_control::automation::*;
 use multiview_control::command::{Command, OperationId, RoutingLedger, SubmitError};
@@ -25,7 +32,9 @@ impl FakeBreaks {
 }
 impl SourceBreakProvider for FakeBreaks {
     fn break_status(&self, id: &str) -> Option<BreakStatus> {
-        (id == "news").then(|| self.status.lock().unwrap().clone()).flatten()
+        (id == "news")
+            .then(|| self.status.lock().unwrap().clone())
+            .flatten()
     }
 }
 #[derive(Default)]
@@ -178,7 +187,10 @@ fn arm_start_take_end_restore() {
     r.exec.tick(2 * S);
     assert_eq!(
         r.sink.swaps(),
-        vec![("c1".into(), "lineup".into()), ("c3".into(), "lineup".into())]
+        vec![
+            ("c1".into(), "lineup".into()),
+            ("c3".into(), "lineup".into())
+        ]
     );
     let (status, log) = r.exec.status("news");
     assert_eq!(status.phase, Phase::InBreak);
@@ -223,7 +235,11 @@ fn manual_override_during_break_cancels_auto_restore() {
     let before = r.sink.swaps().len();
     r.breaks.set(None);
     r.exec.tick(4 * S);
-    assert_eq!(r.sink.swaps().len(), before, "never overwrite a manual change");
+    assert_eq!(
+        r.sink.swaps().len(),
+        before,
+        "never overwrite a manual change"
+    );
     assert_eq!(r.exec.status("news").0.phase, Phase::Idle);
     assert_eq!(
         r.exec.manual_restore("news"),
@@ -267,7 +283,11 @@ fn rule_deletion_during_break_restores() {
     r.exec.tick(2 * S);
     *r.config.0.lock().unwrap() = view(None);
     r.exec.tick(3 * S);
-    assert_eq!(r.sink.swaps()[2..].len(), 2, "F1: deleted rule still restores");
+    assert_eq!(
+        r.sink.swaps()[2..].len(),
+        2,
+        "F1: deleted rule still restores"
+    );
 }
 
 #[test]

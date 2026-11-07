@@ -644,7 +644,10 @@ mod tests {
         assert_eq!(generation.snapshot.load().events.len(), 1);
         assert!(!generation.active.load(Ordering::Acquire));
     }
-    fn wait_until(view: &SourceEventRegistry, pred: impl Fn(&SourceEventRead) -> bool) -> SourceEventRead {
+    fn wait_until(
+        view: &SourceEventRegistry,
+        pred: impl Fn(&SourceEventRead) -> bool,
+    ) -> SourceEventRead {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             if let Some(read) = view.snapshot("a") {
@@ -652,11 +655,18 @@ mod tests {
                     return read;
                 }
             }
-            assert!(std::time::Instant::now() < deadline, "evidence never published");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "evidence never published"
+            );
             thread::yield_now();
         }
     }
-    fn with_boundary(mut o: SourceEventObservation, boundary: EventBoundary, revision: u64) -> SourceEventObservation {
+    fn with_boundary(
+        mut o: SourceEventObservation,
+        boundary: EventBoundary,
+        revision: u64,
+    ) -> SourceEventObservation {
         o.boundary = boundary;
         o.revision = revision;
         o
@@ -678,13 +688,19 @@ mod tests {
             SubmitOutcome::Queued
         );
         let cancelled = wait_until(&view, |r| !Arc::ptr_eq(&r.evidence, &start.evidence));
-        assert!(!view.is_current(&start), "pre-cancel read must not stay current");
+        assert!(
+            !view.is_current(&start),
+            "pre-cancel read must not stay current"
+        );
         assert!(view.is_current(&cancelled));
         assert!(view.same_generation(&start));
         // Revision of a boundary published after acquisition.
         let revised = with_boundary(
             observation(1),
-            EventBoundary::Start { pts_ns: Some(20), duration_ns: None },
+            EventBoundary::Start {
+                pts_ns: Some(20),
+                duration_ns: None,
+            },
             2,
         );
         assert_eq!(producer.try_observe(revised), SubmitOutcome::Queued);
@@ -695,7 +711,10 @@ mod tests {
         producer.mark_degraded();
         assert!(!view.is_current(&after), "loss must invalidate prior reads");
         let degraded = view.snapshot("a").unwrap();
-        assert!(!view.is_current(&degraded), "degraded evidence is never current");
+        assert!(
+            !view.is_current(&degraded),
+            "degraded evidence is never current"
+        );
         service.shutdown().unwrap();
     }
     /// S2 regression: two private services registering the same id/epoch

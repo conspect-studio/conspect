@@ -212,13 +212,10 @@ fn automation_view(state: &AppState, id: &str) -> crate::error::ControlResult<Au
             id: id.to_owned(),
         });
     }
-    let (status, log) = state
-        .automation
-        .as_ref()
-        .map_or_else(
-            || crate::automation::AutomationExecutor::idle_status(),
-            |executor| executor.status(id),
-        );
+    let (status, log) = state.automation.as_ref().map_or_else(
+        crate::automation::AutomationExecutor::idle_status,
+        |executor| executor.status(id),
+    );
     Ok(AutomationView {
         rule,
         status,

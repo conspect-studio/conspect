@@ -63,7 +63,10 @@ fn until(exec: &AutomationExecutor, phase: Phase) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut now = 1_000_000_000u64;
     while exec.status("news").0.phase != phase {
-        assert!(std::time::Instant::now() < deadline, "never reached {phase:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached {phase:?}"
+        );
         now += 250_000_000;
         exec.tick(now);
         std::thread::yield_now();

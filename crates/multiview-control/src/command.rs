@@ -764,9 +764,7 @@ impl CommandSender {
         // can drain it, so a shed command never bumps a generation.
         let permit = match self.tx.try_reserve() {
             Ok(permit) => permit,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
-                return Err(SubmitError::Full)
-            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => return Err(SubmitError::Full),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
                 return Err(SubmitError::Closed)
             }

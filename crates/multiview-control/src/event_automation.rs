@@ -640,7 +640,8 @@ impl SafetyModel {
             .filter(|e| {
                 e.lease.as_ref().is_some_and(|l| {
                     l.restoring
-                        && monotonic_ns.saturating_sub(l.restore_started_ns) >= RESTORE_ACK_TIMEOUT_NS
+                        && monotonic_ns.saturating_sub(l.restore_started_ns)
+                            >= RESTORE_ACK_TIMEOUT_NS
                 })
             })
             .map(|e| e.id)

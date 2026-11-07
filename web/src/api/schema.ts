@@ -3632,7 +3632,7 @@ export interface components {
             on_break_start: components["schemas"]["BreakStartActionDoc"];
             /** @description Restore the pre-break routing at the confirmed end (default `true`). */
             restore_on_end?: boolean | null;
-            /** @description Optional `http://` hook POSTed on break start/end. */
+            /** @description Optional `http://` hook that receives a `POST` on break start/end. */
             webhook_url?: string | null;
         };
         /** @description The `202` body of a successful salvo fire. */

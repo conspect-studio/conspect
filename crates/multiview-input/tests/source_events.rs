@@ -293,7 +293,7 @@ fn revised_raw_timing_increments_only_its_boundary() {
 }
 
 /// A CRC-valid component-mode `splice_insert` (`program_splice_flag = 0`) with
-/// one component carrying its own splice_time.
+/// one component carrying its own `splice_time`.
 fn component_insert(id: u32, out: bool) -> Vec<u8> {
     let mut b = vec![0xfc, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xf0, 17, 5];
     b.extend(id.to_be_bytes());

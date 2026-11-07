@@ -414,7 +414,10 @@ fn older_clock_epoch_retains_future_epoch_evidence() {
     let event = t.get(&o.key).unwrap();
     assert_eq!(event.project(&at(7)).lifecycle, EventLifecycle::Uncertain);
     assert_eq!(t.prune_terminal(&at(7), |_| true), 0);
-    assert!(t.get(&o.key).is_some(), "epoch-7 clock must retain epoch-8 event");
+    assert!(
+        t.get(&o.key).is_some(),
+        "epoch-7 clock must retain epoch-8 event"
+    );
     let event = t.get(&o.key).unwrap();
     assert_eq!(event.project(&at(8)).lifecycle, EventLifecycle::Active);
     assert_eq!(event.project(&at(9)).lifecycle, EventLifecycle::Superseded);

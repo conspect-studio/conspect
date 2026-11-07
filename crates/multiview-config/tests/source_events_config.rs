@@ -61,7 +61,10 @@ fn events_observe_true_parses_and_round_trips_through_toml_and_json() {
         .expect("parse");
     assert_eq!(
         cfg.sources[0].events,
-        Some(SourceEventsConfig { observe: true, automation: None })
+        Some(SourceEventsConfig {
+            observe: true,
+            automation: None
+        })
     );
     let json = cfg.to_json().expect("to_json");
     assert_eq!(
@@ -81,7 +84,10 @@ fn events_observe_false_parses_to_its_variant() {
         .expect("parse");
     assert_eq!(
         cfg.sources[0].events,
-        Some(SourceEventsConfig { observe: false, automation: None })
+        Some(SourceEventsConfig {
+            observe: false,
+            automation: None
+        })
     );
 }
 
@@ -93,11 +99,17 @@ fn events_table_present_without_observe_defaults_true() {
     let cfg = MultiviewConfig::load_from_toml(&doc_with_events("events = {}")).expect("parse");
     assert_eq!(
         cfg.sources[0].events,
-        Some(SourceEventsConfig { observe: true, automation: None })
+        Some(SourceEventsConfig {
+            observe: true,
+            automation: None
+        })
     );
     assert_eq!(
         SourceEventsConfig::default(),
-        SourceEventsConfig { observe: true, automation: None }
+        SourceEventsConfig {
+            observe: true,
+            automation: None
+        }
     );
 }
 
@@ -123,7 +135,10 @@ fn automation_rule_defaults_disarmed_and_round_trips() {
     let json = cfg.to_json().expect("to_json");
     assert_eq!(MultiviewConfig::load_from_json(&json).expect("json"), cfg);
     let toml_text = cfg.to_toml().expect("to_toml");
-    assert_eq!(MultiviewConfig::load_from_toml(&toml_text).expect("toml"), cfg);
+    assert_eq!(
+        MultiviewConfig::load_from_toml(&toml_text).expect("toml"),
+        cfg
+    );
 }
 
 #[test]

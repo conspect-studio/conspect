@@ -4,9 +4,10 @@ use crate::source_event_service::{
     ServiceLimits, SourceEventProducer, SourceEventRegistry, SourceEventService,
 };
 use multiview_control::source_events::{
-    ActiveBreak, BreakStatus, SourceBreakProvider, SourceEventAvailability, SourceEventDto, SourceEventLabel, SourceEventLifecycle,
-    SourceEventOrigin, SourceEventProvider, SourceEventTestInjector, SourceEventTimer,
-    SourceEventTimerKind, SourceEventsDto, TestEventBoundary, TestEventOutcome,
+    ActiveBreak, BreakStatus, SourceBreakProvider, SourceEventAvailability, SourceEventDto,
+    SourceEventLabel, SourceEventLifecycle, SourceEventOrigin, SourceEventProvider,
+    SourceEventTestInjector, SourceEventTimer, SourceEventTimerKind, SourceEventsDto,
+    TestEventBoundary, TestEventOutcome,
 };
 use multiview_core::{
     event_overlay::{

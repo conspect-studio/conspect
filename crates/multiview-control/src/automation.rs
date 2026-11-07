@@ -15,7 +15,7 @@
 //!   (detected through the [`RoutingLedger`] generation) revokes auto-restore.
 //!
 //! Every action appends to a bounded per-source log (shown in the Events
-//! dialog) and to the audit trail. Optional webhooks are POSTed off-task with
+//! dialog) and to the audit trail. Optional webhooks are sent (`POST`) off-task with
 //! timeouts through the SSRF guard so external VT/automation can react.
 
 use crate::auth::{Principal, Role};
@@ -204,7 +204,7 @@ struct Owned {
     audio: Option<String>,
     keys: Vec<String>,
     /// Ledger generation sum right after our own take/restore commands.
-    owned_generation: u64,
+    written_generation: u64,
     applied_generation: u64,
     rule_restore_on_end: bool,
     webhook: Option<String>,
@@ -417,7 +417,7 @@ impl AutomationExecutor {
                 return;
             }
             let current = self.generation(&owned.keys);
-            if current != owned.owned_generation {
+            if current != owned.written_generation {
                 let _ = run
                     .model
                     .restore_at(owned.lease, current, now_ns, &self.adapter(view));
@@ -440,7 +440,9 @@ impl AutomationExecutor {
             } else if owned.rule_restore_on_end
                 && status.as_ref().is_some_and(|s| {
                     s.epoch != owned.epoch
-                        || s.active.as_ref().is_none_or(|a| a.event_id != owned.event.event_id)
+                        || s.active
+                            .as_ref()
+                            .is_none_or(|a| a.event_id != owned.event.event_id)
                 })
             {
                 Some(RestoreReason::BreakEnd)
@@ -480,7 +482,8 @@ impl AutomationExecutor {
         if run.handled.len() >= MAX_LOG_ENTRIES {
             run.handled.pop_front();
         }
-        run.handled.push_back((status.epoch, event.event_id.clone()));
+        run.handled
+            .push_back((status.epoch, event.event_id.clone()));
         self.take(id, rule, run, view, &event, status.epoch, now_ns);
     }
 
@@ -612,7 +615,9 @@ impl AutomationExecutor {
         let still_current = fresh.as_ref().is_some_and(|s| {
             s.epoch == epoch
                 && !s.degraded
-                && s.active.as_ref().is_some_and(|a| a.event_id == event.event_id)
+                && s.active
+                    .as_ref()
+                    .is_some_and(|a| a.event_id == event.event_id)
         });
         let boundary = Boundary {
             event: event.event_id.clone(),
@@ -681,7 +686,12 @@ impl AutomationExecutor {
         }
         if run
             .model
-            .acknowledge(lease, Outcome::Applied { generation: applied })
+            .acknowledge(
+                lease,
+                Outcome::Applied {
+                    generation: applied,
+                },
+            )
             .is_err()
         {
             run.last_error = Some("take acknowledgement rejected".into());
@@ -689,7 +699,11 @@ impl AutomationExecutor {
         let summary = replaced
             .iter()
             .map(|c| format!("{}: {} → {}", c.cell, c.original, c.replacement))
-            .chain(audio.iter().map(|_| format!("program audio → {replacement}")))
+            .chain(
+                audio
+                    .iter()
+                    .map(|_| format!("program audio → {replacement}")),
+            )
             .collect::<Vec<_>>()
             .join(", ");
         run.last_error = failed.then(|| "Some take commands were shed by a busy bus".into());
@@ -703,7 +717,7 @@ impl AutomationExecutor {
             cells: replaced,
             audio,
             keys,
-            owned_generation: applied,
+            written_generation: applied,
             applied_generation: applied,
             rule_restore_on_end: rule.restore_on_end,
             webhook: rule.webhook_url.clone(),
@@ -731,7 +745,7 @@ impl AutomationExecutor {
         let current = self.generation(&owned.keys);
         // Our own partial restore moved the generation; compare against what
         // WE last wrote and present the applied generation to the model.
-        let presented = if current == owned.owned_generation {
+        let presented = if current == owned.written_generation {
             owned.applied_generation
         } else {
             current
@@ -817,7 +831,7 @@ impl AutomationExecutor {
         let done = owned.cells.is_empty() && owned.audio.is_none();
         let generation = self.generation(&keys);
         if let Some(owned) = run.owned.as_mut() {
-            owned.owned_generation = generation;
+            owned.written_generation = generation;
         }
         if done {
             let _ = run.model.finish_restore(lease, true);
@@ -826,18 +840,18 @@ impl AutomationExecutor {
             self.log(id, run, "restore", "Restored pre-break routing".into());
         } else {
             // F2: the dispatch was (partly) lost; reconcile with bounded retry.
-            match run.model.reconcile_restore(lease, RestoreObservation::Unchanged) {
-                Ok(Reconciled::Retry) => {
-                    run.last_error = Some("Command bus busy; restore will retry".into());
-                }
-                _ => {
-                    run.owned = None;
-                    let detail =
-                        "Restore could not be dispatched after bounded retries; operator action required"
-                            .to_owned();
-                    run.last_error = Some(detail.clone());
-                    self.log(id, run, "restore_failed", detail);
-                }
+            if let Ok(Reconciled::Retry) = run
+                .model
+                .reconcile_restore(lease, RestoreObservation::Unchanged)
+            {
+                run.last_error = Some("Command bus busy; restore will retry".into());
+            } else {
+                run.owned = None;
+                let detail =
+                    "Restore could not be dispatched after bounded retries; operator action required"
+                        .to_owned();
+                run.last_error = Some(detail.clone());
+                self.log(id, run, "restore_failed", detail);
             }
         }
     }
@@ -847,7 +861,7 @@ impl AutomationExecutor {
             return;
         };
         let current = self.generation(&owned.keys);
-        if current != owned.owned_generation {
+        if current != owned.written_generation {
             // Someone else routed a destination mid-restore: never overwrite it.
             let _ = run
                 .model
@@ -864,7 +878,12 @@ impl AutomationExecutor {
         }
         if run
             .model
-            .restore_at(owned.lease, owned.applied_generation, now_ns, &self.adapter(view))
+            .restore_at(
+                owned.lease,
+                owned.applied_generation,
+                now_ns,
+                &self.adapter(view),
+            )
             .is_ok()
         {
             self.dispatch_restore(id, run, view, now_ns);
@@ -895,6 +914,7 @@ impl AutomationExecutor {
         self.log(id, run, "webhook", format!("Webhook {phase} queued"));
     }
 
+    #[allow(clippy::needless_pass_by_value)] // call sites build owned strings inline
     fn log(&self, id: &str, run: &mut Run, action: &str, detail: String) {
         if run.log.len() >= MAX_LOG_ENTRIES {
             run.log.pop_front();
@@ -976,7 +996,11 @@ impl AutomationExecutor {
                 event_id: event.map(|e| e.event_id.clone()),
                 test: event.is_some_and(|e| e.test),
                 since_unix_ms: run.owned.as_ref().map(|o| o.since_unix_ms),
-                replaced: run.owned.as_ref().map(|o| o.cells.clone()).unwrap_or_default(),
+                replaced: run
+                    .owned
+                    .as_ref()
+                    .map(|o| o.cells.clone())
+                    .unwrap_or_default(),
                 audio_replaced: run
                     .owned
                     .as_ref()
@@ -1174,7 +1198,9 @@ pub fn http_webhook_sink(
             let result =
                 tokio::time::timeout(WEBHOOK_TIMEOUT, post_webhook(&url, &payload, &policy)).await;
             match result {
-                Ok(Ok(status)) => tracing::info!(%url, status, "event automation webhook delivered"),
+                Ok(Ok(status)) => {
+                    tracing::info!(%url, status, "event automation webhook delivered");
+                }
                 Ok(Err(error)) => tracing::warn!(%url, %error, "event automation webhook failed"),
                 Err(_) => tracing::warn!(%url, "event automation webhook timed out"),
             }
@@ -1190,8 +1216,7 @@ async fn post_webhook(
     use multiview_config::device::net_guard;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let target = parse_webhook_url(url)?;
-    let addrs: Vec<std::net::SocketAddr> = if let Ok(ip) = target.host.parse::<std::net::IpAddr>()
-    {
+    let addrs: Vec<std::net::SocketAddr> = if let Ok(ip) = target.host.parse::<std::net::IpAddr>() {
         vec![std::net::SocketAddr::new(ip, target.port)]
     } else {
         tokio::net::lookup_host((target.host.as_str(), target.port))

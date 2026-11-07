@@ -1,4 +1,12 @@
 //! F1/F2 regressions for the ADR-0183 safety model's owned-override restore.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::assert_is_empty,
+    clippy::match_same_arms
+)]
 use multiview_control::auth::{Principal, Role};
 use multiview_control::event_automation::*;
 use std::cell::RefCell;
@@ -75,7 +83,8 @@ fn applied(m: &mut SafetyModel, a: &Adapter) -> u64 {
     let Decision::Reserved { id, .. } = m.reserve(&replacement(), &event(), a).unwrap() else {
         panic!("expected reservation")
     };
-    m.acknowledge(id, Outcome::Applied { generation: 8 }).unwrap();
+    m.acknowledge(id, Outcome::Applied { generation: 8 })
+        .unwrap();
     id
 }
 
@@ -88,7 +97,13 @@ fn owned_restore_survives_rule_and_source_deletion() {
         let id = applied(&mut m, &a);
         a.delete(deleted);
         let plan = m.restore(id, 8, &a).unwrap();
-        assert!(matches!(plan.action, Action::Restore { expected_generation: 8, .. }));
+        assert!(matches!(
+            plan.action,
+            Action::Restore {
+                expected_generation: 8,
+                ..
+            }
+        ));
         m.finish_restore(id, true).unwrap();
     }
 }
@@ -107,10 +122,19 @@ fn owned_restore_checks_destination_permission_and_generation() {
     assert_eq!(m.restore_at(id, 8, 200, &a), Err(Rejection::Unauthorized));
     a.principal.role = Role::Operator;
     a.delete("cell");
-    assert_eq!(m.restore_at(id, 8, 200, &a), Err(Rejection::MissingResource));
+    assert_eq!(
+        m.restore_at(id, 8, 200, &a),
+        Err(Rejection::MissingResource)
+    );
     a.missing.borrow_mut().clear();
-    assert_eq!(m.restore_at(id, 9, 200, &a), Err(Rejection::GenerationConflict));
-    assert_eq!(m.restore_at(id, 8, 200, &a), Err(Rejection::GenerationConflict));
+    assert_eq!(
+        m.restore_at(id, 9, 200, &a),
+        Err(Rejection::GenerationConflict)
+    );
+    assert_eq!(
+        m.restore_at(id, 8, 200, &a),
+        Err(Rejection::GenerationConflict)
+    );
 }
 
 /// F2: a dropped restore dispatch becomes reconcilable after a bounded
@@ -123,7 +147,9 @@ fn dropped_restore_dispatch_is_reconciled_and_retried() {
     assert_eq!(m.expired_leases(150), vec![id]);
     m.restore_at(id, 8, 150, &a).unwrap();
     assert!(m.expired_leases(10_000).is_empty());
-    assert!(m.stalled_restores(150 + RESTORE_ACK_TIMEOUT_NS - 1).is_empty());
+    assert!(m
+        .stalled_restores(150 + RESTORE_ACK_TIMEOUT_NS - 1)
+        .is_empty());
     assert_eq!(m.stalled_restores(150 + RESTORE_ACK_TIMEOUT_NS), vec![id]);
     // Destination still at our generation: the restore never landed.
     assert_eq!(
@@ -165,7 +191,10 @@ fn manual_change_revokes_and_retries_are_bounded() {
         m.reconcile_restore(id, RestoreObservation::Changed),
         Ok(Reconciled::Revoked)
     );
-    assert_eq!(m.restore_at(id, 8, 150, &a), Err(Rejection::GenerationConflict));
+    assert_eq!(
+        m.restore_at(id, 8, 150, &a),
+        Err(Rejection::GenerationConflict)
+    );
     assert!(m.expired_leases(u64::MAX).is_empty());
 
     let mut m = SafetyModel::new("source".into(), 8, 2, 1, 0).unwrap();
@@ -173,13 +202,18 @@ fn manual_change_revokes_and_retries_are_bounded() {
     let mut outcome = Reconciled::Retry;
     for attempt in 0..MAX_RESTORE_ATTEMPTS {
         m.restore_at(id, 8, 150, &a).unwrap();
-        outcome = m.reconcile_restore(id, RestoreObservation::Unchanged).unwrap();
+        outcome = m
+            .reconcile_restore(id, RestoreObservation::Unchanged)
+            .unwrap();
         if attempt + 1 < MAX_RESTORE_ATTEMPTS {
             assert_eq!(outcome, Reconciled::Retry);
         }
     }
     assert_eq!(outcome, Reconciled::Revoked);
-    assert_eq!(m.restore_at(id, 8, 150, &a), Err(Rejection::GenerationConflict));
+    assert_eq!(
+        m.restore_at(id, 8, 150, &a),
+        Err(Rejection::GenerationConflict)
+    );
     // Reconciling a lease with no in-flight restore is rejected.
     assert_eq!(
         m.reconcile_restore(id, RestoreObservation::Unchanged),

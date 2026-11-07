@@ -44,8 +44,12 @@ fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> 
     let media_field = |key: &str| key != "epg" && key != "playlist_metadata" && key != "events";
     // `events.automation` is control-plane only (ADR-0183): arming or editing a
     // rule must never restart the producer. `events.observe` stays media.
+    // Effective `observe` (absent block or field => the documented default `true`).
     let observe = |body: &serde_json::Map<String, serde_json::Value>| {
-        body.get("events").map(|events| events.get("observe").cloned())
+        body.get("events")
+            .and_then(|events| events.get("observe"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
     };
     observe(previous) == observe(next)
         && previous
@@ -55,7 +59,7 @@ fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> 
 }
 
 /// Persist an `events.automation` change to one source through the canonical
-/// durable path (commit_resource → store → audit), never restarting ingest
+/// durable path (`commit_resource` → store → audit), never restarting ingest
 /// (ADR-0183). `mutate` edits the stored body; returns the new body.
 ///
 /// # Errors
@@ -129,10 +133,16 @@ mod guide_change_tests {
         let mut armed = source.clone();
         armed["events"] = json!({"automation": {"armed": true,
             "on_break_start": {"action": "swap_cell", "target": "bars"}}});
-        assert!(guide_only_change(&source, &armed), "automation is control-plane only");
+        assert!(
+            guide_only_change(&source, &armed),
+            "automation is control-plane only"
+        );
         let mut observe = source.clone();
         observe["events"] = json!({"observe": false});
-        assert!(!guide_only_change(&source, &observe), "observe restarts ingest");
+        assert!(
+            !guide_only_change(&source, &observe),
+            "observe restarts ingest"
+        );
     }
 
     #[test]
