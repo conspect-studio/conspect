@@ -49,6 +49,9 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
    dialog get the same explicit radio choice the M3U import dialog uses (no preselected value, the add
    button disabled until one is chosen, and the M3U dialog's large-selection warning), writing
    `activation` through the shared `sourceFormToBody` path.
+   **Until then** (agreed with the rc3 owner, 2026-11-07): a single bulk add creates at most
+   `BULK_ADD_MAX = 8` sources, and the dialog states that each new source starts always on and opens
+   a connection and decoder at boot. The cap is lifted by the activation follow-up.
 4. **Build.** Production builds `--features nvidia,web`. The `nvidia` preset enables
    `catalogue-ffmpeg`, which enables `catalogue`; the PR shows the resolved feature check.
 5. **Headers on every rail.** HLS `user_agent`/`referrer` go through the shared loopback fetcher and
