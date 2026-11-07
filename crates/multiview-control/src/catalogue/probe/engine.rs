@@ -319,6 +319,8 @@ impl HttpProbeRunner {
         result.media_checked = media_checked;
         result.verdict_basis = if media_checked {
             "stages 1-4 (playlist, liveness and decoded media)"
+        } else if newest.encrypted {
+            "stages 1-3 only (playlist liveness); segments are encrypted, so media was not decoded"
         } else {
             "stages 1-3 only (playlist liveness); media decode not available in this build"
         };

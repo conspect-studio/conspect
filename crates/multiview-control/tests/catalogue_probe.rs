@@ -509,3 +509,33 @@ async fn without_libav_stage_four_is_skipped_and_labelled() {
         r.verdict_basis
     );
 }
+
+#[tokio::test]
+async fn encrypted_segments_are_not_decoded_and_the_basis_says_why() {
+    // A live AES-128 playlist: liveness is judged, media is not decoded, and
+    // the stated basis names encryption rather than a build limitation.
+    let f = fixture().await;
+    let svc = service_for(&f);
+    let pl = |seq: u64| {
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{seq}\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k.key\"\n#EXTINF:1,\na.ts\n"
+        )
+    };
+    f.routes.set(
+        "/enc.m3u8",
+        Reply::Ok(pl(1).into_bytes(), "application/vnd.apple.mpegurl"),
+    );
+    let r = run(&svc, "a", req(f.url("/enc.m3u8"))).await;
+    assert!(!r.media_checked);
+    let media = r.stages.iter().find(|s| s.name == "media").unwrap();
+    assert!(matches!(
+        media.status,
+        multiview_control::catalogue::probe::StageStatus::Skipped
+    ));
+    assert!(r.verdict_basis.contains("encrypted"), "{}", r.verdict_basis);
+    assert!(
+        !f.hits.lock().unwrap().iter().any(|(p, _)| p == "/a.ts"),
+        "no encrypted segment is fetched"
+    );
+}
