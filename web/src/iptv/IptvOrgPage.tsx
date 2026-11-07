@@ -12,7 +12,6 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { ChevronDown, ChevronRight, LocateFixed, Plus, Radar } from 'lucide-react';
 
 import type { IndexStream, Place, ProbeResult, StreamFlag } from '../api/catalogue';
-import { logoUrl } from '../api/catalogue';
 import {
   useCatalogueIndex,
   useCataloguePlaces,
@@ -28,6 +27,7 @@ import { SelectField } from '../resources/FormControls';
 import { useSources } from '../resources/queries';
 import { DataSourcesFooter, FlagBadge, VerdictBadge, useFlagLabel } from './Badges';
 import { BulkAddDialog } from './BulkAddDialog';
+import { CatalogueLogo } from './CatalogueLogo';
 import { FacetGroup, LocationTree, PlaceSearch, placeLabel } from './Controls';
 import type { MapFocus, MapPin } from './MapView';
 import {
@@ -753,7 +753,7 @@ function GroupRow({
         }}
       />
       {first?.logo != null ? (
-        <img src={logoUrl(first.logo)} alt="" className="size-8 shrink-0 object-contain" loading="lazy" />
+        <CatalogueLogo logoKey={first.logo} className="size-8 shrink-0 object-contain" />
       ) : null}
       <div className="min-w-0 flex-1 space-y-1">
         <p className="flex flex-wrap items-center gap-2">

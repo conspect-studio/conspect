@@ -172,10 +172,14 @@ export function MapView(props: MapViewProps): JSX.Element {
     }
     void (async (): Promise<void> => {
       try {
-        const [maplibregl] = await Promise.all([
+        const [maplibregl, worker] = await Promise.all([
           import('maplibre-gl'),
+          // MapLibre 6 resolves its worker next to its own module; a Vite bundle
+          // does not emit that file, so name the worker asset explicitly.
+          import('maplibre-gl/dist/maplibre-gl-worker.mjs?url'),
           import('maplibre-gl/dist/maplibre-gl.css'),
         ]);
+        maplibregl.setWorkerUrl(worker.default);
         if (life.cancelled) {
           return;
         }
@@ -427,7 +431,9 @@ export function MapView(props: MapViewProps): JSX.Element {
       data-testid="iptv-map"
       data-ready={ready ? 'true' : 'false'}
     >
-      <div ref={container} className="absolute inset-0" />
+      {/* MapLibre's CSS sets `position: relative` on its container, which overrides
+          `absolute inset-0` and collapses it to 0 px tall; size it explicitly. */}
+      <div ref={container} className="h-full w-full" />
       {failed ? (
         <p className="absolute inset-0 grid place-items-center p-4 text-center text-sm text-muted-foreground">
           {t`The map could not start on this device. Use the place search and the list instead — they offer everything the map does.`}
