@@ -344,7 +344,8 @@ impl UnifiedEndpoint {
     ///
     /// [`WebRtcError::Socket`] if converting the bound socket to async fails.
     async fn run_inner(self, stop: Arc<AtomicBool>, probe: &RunProbe) -> Result<()> {
-        self.run_inner_body(stop, probe, MAX_DRAIN_TIME).await
+        self.run_inner_body(stop, probe, MAX_DRAIN_TIME, DRIVER_TICK)
+            .await
     }
 
     #[allow(
@@ -357,6 +358,12 @@ impl UnifiedEndpoint {
         stop: Arc<AtomicBool>,
         probe: &RunProbe,
         time_budget: Duration,
+        // The idle-tick period. Production always passes `DRIVER_TICK`; the
+        // flood test passes a period far longer than the test so that, after
+        // the interval's immediate first tick, the exhaustion handoff is the
+        // ONLY path that drains commands, fires timers, pumps and reaps — so
+        // an effect it observes is attributable to the handoff (PR193-02-R2).
+        tick_period: Duration,
     ) -> Result<()> {
         let bind_addr = self.endpoint.config().bind_addr();
         let local_addr = self.endpoint.local_addr()?;
@@ -401,7 +408,7 @@ impl UnifiedEndpoint {
         let mut push = self.push;
 
         let mut buf = vec![0u8; RECV_BUFFER];
-        let mut tick = tokio::time::interval(DRIVER_TICK);
+        let mut tick = tokio::time::interval(tick_period);
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -552,17 +559,11 @@ impl UnifiedEndpoint {
         if let Some(lane) = serve.as_mut() {
             WhepServeEndpoint::reap(&mut lane.viewers, &lane.shared);
         }
-        // `cfg(test)`-only (review PR193-04 / PR193-02): bumped AFTER every real
-        // servicing step above has run — commands drained, timers ticked,
-        // outbound pumped, GC'd — and gated on the origin the caller threaded
-        // through, not by the caller incrementing a separate counter after the
-        // call returns. A regression that stops invoking this function on the
-        // exhaustion path, invokes it with the wrong origin, OR returns/deletes
-        // any of the real work above (PR193-02) cannot still satisfy this
-        // counter: there is no other place that increments it, and it is placed
-        // after the work it is meant to prove ran. Production runs identical
-        // work regardless of origin, so neither the tag nor this counter exists
-        // outside tests.
+        // `cfg(test)`-only (review PR193-04): counts completed exhaustion
+        // handoffs, gated on the origin the caller threads through, so a
+        // missing handoff call or an early return before this point desyncs it
+        // from `recv_budgets_exhausted`. It does NOT prove the work above ran;
+        // the flood test asserts each step's own effect for that (PR193-02-R2).
         #[cfg(test)]
         if origin == ServiceOrigin::ExhaustionHandoff {
             probe.handoff_services.fetch_add(1, Ordering::Relaxed);
@@ -863,14 +864,39 @@ mod tests {
     /// `tests/unified_socket.rs::offer`), so the flood test can negotiate a
     /// REAL ingest session and observe a REAL effect of servicing — not just an
     /// entry counter (review PR193-02).
-    fn publisher_offer() -> String {
+    fn publisher_offer(peer: SocketAddr) -> String {
         let now = Instant::now();
         let mut s =
             crate::transport::Session::new(&crate::transport::SessionConfig::default(), now);
-        s.add_host_candidate("[::1]:55000".parse::<SocketAddr>().expect("v6 literal"))
-            .expect("host candidate accepted");
+        s.add_host_candidate(peer).expect("host candidate accepted");
         s.create_offer(&[crate::transport::MediaKind::Video])
             .expect("offer built")
+    }
+
+    /// Await `cond` while the flood runs, bounded by COUNT: give up once the
+    /// driver has exhausted `cap` further receive budgets without `cond`
+    /// holding (review PR193-06), with `SAFETY` only as a hang guard. Returns
+    /// whether `cond` held.
+    async fn within_exhaustions(
+        probe: &RunProbe,
+        cap: u64,
+        safety: Duration,
+        mut cond: impl FnMut() -> bool,
+    ) -> bool {
+        let start = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+        tokio::time::timeout(safety, async {
+            loop {
+                if cond() {
+                    return true;
+                }
+                if probe.recv_budgets_exhausted.load(Ordering::Relaxed) - start >= cap {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Invariant #10 / round-2 BLOCKER, plus review PR193-02/PR193-03: under a
@@ -878,31 +904,30 @@ mod tests {
     /// (commands + timers + outbound + GC) must keep pace with the receive
     /// budget, and the runtime itself must stay fair to an unrelated task.
     ///
-    /// Three independent, non-gameable checks:
+    /// Checks, each bounded by exhaustion COUNTS (wall clock is only a hang
+    /// guard, review PR193-06):
     ///
-    /// 1. **Ordering** (not timing): every exhausted receive budget is followed
-    ///    by a deterministic handoff servicing pass *before* the next datagram
-    ///    is read — `handoff_services == recv_budgets_exhausted`. The counter is
-    ///    bumped only after every real step (commands/timers/outbound/GC) has
-    ///    run, so deleting any of that work, or returning early, desyncs the
-    ///    count from the real exhaustions this test independently drives.
-    /// 2. **Real effect**: a genuine WHIP ingest session is registered before
-    ///    the flood starts; a `release()` mid-flood enqueues a teardown command
-    ///    that ONLY the servicing pass applies (closing the session's RTP
-    ///    ring). The ring must close within the bound — an entry-only counter
-    ///    cannot fake this; it requires the command-drain step to actually run.
-    /// 3. **Independent fairness**: a SEPARATE tokio task on the SAME
-    ///    single-threaded runtime (genuinely contending with the driver and
-    ///    the flood for the one worker thread) must get scheduled at least
-    ///    once every `MAX_TOLERATED_GAP` further exhaustions. This proves the
-    ///    runtime keeps scheduling other work under the flood — i.e. the
-    ///    driver's own `tokio::task::yield_now()` (or equivalent) is actually
-    ///    giving up the thread, not merely satisfying this test's own
-    ///    counters. Removing the production `yield_now` makes the observer go
-    ///    tens of exhaustions between scheduling chances (measured on this
-    ///    host: ~3 normally vs ~50-85 with `yield_now` removed) and fails the
-    ///    `max_gap <= MAX_TOLERATED_GAP` assertion — not a timeout, a hard
-    ///    numeric failure.
+    /// 1. **Ordering**: `handoff_services == recv_budgets_exhausted` — a
+    ///    missing handoff call or an early return before the tail increment
+    ///    desyncs the two.
+    /// 2. **Servicing effects owned by the handoff** (review PR193-02-R2). The
+    ///    driver runs with an idle tick far longer than the test, so after its
+    ///    one immediate tick the exhaustion handoff is the only full servicing
+    ///    path. Every command is queued only after saturation and a completed
+    ///    handoff. Then: a mid-flood Register + the session's ICE timer must
+    ///    put a STUN check on the wire to a peer (command drain + timer); a
+    ///    check must arrive while no drained-dry wake ran (the handoff's own
+    ///    outbound pump); a mid-flood Release must close the RTP ring (command
+    ///    drain); and the dead session must be closed in the session table,
+    ///    which only reap/GC does.
+    /// 3. **Independent fairness** (review PR193-03-R2): a separate task on the
+    ///    same current-thread runtime records, at each of ITS polls, how many
+    ///    exhaustions ran since its previous poll, including the final interval
+    ///    up to driver stop. The max must stay `<= MAX_TOLERATED_GAP`. The
+    ///    window must contain `REQUIRED_DRY_FREE_RUN` consecutive exhaustions
+    ///    with no drain reaching `WouldBlock`, so only the production
+    ///    `yield_now` can schedule the observer there (the driver runs
+    ///    `unconstrained`): removing it fails the gap assertion.
     ///
     /// Portable (no Linux-only socket inspection in the production guarantee):
     /// a dedicated OS thread (not a tokio worker) floods the bound socket
@@ -910,9 +935,8 @@ mod tests {
     /// every platform CI runs on (Linux, macOS).
     #[allow(
         clippy::too_many_lines,
-        reason = "three independent non-gameable checks (ordering, real effect, \
-                  independent runtime fairness) in one flood scenario — splitting \
-                  them would re-run the expensive flood setup three times"
+        reason = "ordering, handoff servicing effects and runtime fairness share \
+                  one flood scenario; splitting them would re-run the flood setup"
     )]
     #[tokio::test(flavor = "current_thread")]
     async fn servicing_keeps_pace_with_the_receive_budget_under_flood() {
@@ -952,6 +976,12 @@ mod tests {
         // runtime poll its own timers); the socket then drains, the driver
         // returns `Pending`, and the Tokio timeouts below can fire.
         const SAFETY_TIMEOUT: Duration = Duration::from_secs(120);
+        // Count bound for each servicing-effect phase: give up (and fail on
+        // the phase's assertion) after this many further exhausted budgets.
+        const SERVICE_EXHAUSTION_CAP: u64 = 20_000;
+        // An idle-tick period no test run approaches, so the tick arm fires
+        // exactly once (immediately, before any command is queued).
+        const HANDOFF_ONLY_TICK: Duration = Duration::from_secs(3600);
 
         let cfg = crate::config::EndpointConfig {
             udp_port: 0,
@@ -963,16 +993,20 @@ mod tests {
         let (builder, whip) = builder.with_ingest();
         let endpoint = builder.build();
 
-        // A REAL ingest session, registered before the flood starts, so the
-        // servicing pass's command-drain step has real work to do (PR193-02).
-        let negotiated = whip
-            .negotiate("flood-source", &publisher_offer(), false)
-            .expect("WHIP ingest negotiates a publisher before the flood");
-        let ring = negotiated.ring.clone();
-        assert!(
-            !ring.is_ended(),
-            "freshly-negotiated ring is open before any release"
-        );
+        // The ingest session's remote "publisher": a plain loopback socket
+        // whose address the offer advertises as its host candidate. Once the
+        // driver fires the session's ICE timer, str0m (full ICE) queues STUN
+        // connectivity checks to it and the outbound pump sends them here —
+        // an observable effect of the timer AND pump steps (PR193-02-R2).
+        let peer = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            0,
+            0,
+            0,
+        )))
+        .expect("peer binds a v6 loopback");
+        peer.set_nonblocking(true).expect("peer is non-blocking");
+        let peer_addr = peer.local_addr().expect("peer addr");
 
         let probe = Arc::new(RunProbe::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -1045,15 +1079,6 @@ mod tests {
             })
         };
 
-        // Issue the release BEFORE spawning the driver's own run so the
-        // enqueued command is waiting the instant servicing first runs; the
-        // assertion below still only passes once the driver's servicing pass
-        // actually drains it under the flood.
-        assert!(
-            whip.release("flood-source", negotiated.session_id.as_str()),
-            "release dispatches a teardown command for the live session"
-        );
-
         // Run the driver under the flood. `tokio::task::unconstrained` disables
         // Tokio's OWN cooperative-scheduling auto-yield (its periodic forced
         // yield after an I/O-bound poll budget) for this task, so the ONLY
@@ -1068,39 +1093,118 @@ mod tests {
             let stop = Arc::clone(&stop);
             let driver_done = Arc::clone(&driver_done);
             tokio::spawn(tokio::task::unconstrained(async move {
-                let result = endpoint.run_inner(stop, &probe).await;
+                // Idle tick far longer than the test: after the interval's
+                // immediate first tick (which runs before any command is
+                // queued), the exhaustion handoff is the ONLY servicing path,
+                // so every effect asserted below is the handoff's.
+                let result = endpoint
+                    .run_inner_body(stop, &probe, MAX_DRAIN_TIME, HANDOFF_ONLY_TICK)
+                    .await;
                 driver_done.store(true, Ordering::Release);
                 result
             }))
         };
 
-        // Drive the flood to a DETERMINISTIC number of exhausted budgets rather
-        // than for a fixed wall-clock window: poll the counter until the flood
-        // has genuinely saturated `TARGET_EXHAUSTIONS` budgets, so the
-        // precondition holds regardless of how little CPU a contended runner
-        // gave the flooder. The outer timeout only bounds a wedged regression
-        // that can never reach the target (it would otherwise spin forever).
+        // Saturate first: wait (by count) for `TARGET_EXHAUSTIONS` exhausted
+        // budgets AND at least one completed handoff, so every command below is
+        // queued strictly AFTER the idle tick's one immediate firing and after
+        // the flood has demonstrably reached the handoff path (PR193-02-R2).
         let saturated = tokio::time::timeout(SAFETY_TIMEOUT, async {
-            loop {
-                if probe.recv_budgets_exhausted.load(Ordering::Relaxed) >= TARGET_EXHAUSTIONS {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
+            while probe.recv_budgets_exhausted.load(Ordering::Relaxed) < TARGET_EXHAUSTIONS
+                || probe.handoff_services.load(Ordering::Relaxed) == 0
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await;
+        assert!(
+            saturated.is_ok(),
+            "the flood must exhaust {TARGET_EXHAUSTIONS} receive budgets and \
+             complete a handoff before any command is queued (hang guard hit)"
+        );
 
-        // The ring must end (the Release command was serviced) within the same
-        // bound, despite the permanent flood — the real-effect check (PR193-02).
-        let serviced = tokio::time::timeout(SAFETY_TIMEOUT, async {
-            loop {
-                if ring.is_ended() {
-                    return true;
+        // Mid-flood Register: ONLY a handoff can drain it now.
+        let negotiated = whip
+            .negotiate("flood-source", &publisher_offer(peer_addr), false)
+            .expect("WHIP ingest negotiates a publisher mid-flood");
+        let ring = negotiated.ring.clone();
+        assert!(!ring.is_ended(), "freshly-negotiated ring is open");
+
+        // TIMER + PUMP effect. Any STUN check at the peer proves the session
+        // was registered (command drain) and its ICE timer fired (nothing else
+        // makes str0m queue a check: the junk flood is never accepted). A
+        // check that arrives while NO drained-dry wake ran proves the
+        // HANDOFF's pump sent it — the dry branch is the only other pump, and
+        // the idle tick no longer fires. "Clean" = the peer socket was empty
+        // at the previous sample and `drained_dry` has not moved since.
+        let mut stun_seen = 0u64;
+        let mut armed_dry: Option<u64> = None;
+        let mut clean_stun = false;
+        let mut datagram = [0u8; 1500];
+        let pumped = within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+            let dry_now = probe.drained_dry.load(Ordering::Relaxed);
+            let clean_window = armed_dry == Some(dry_now);
+            while let Ok((len, _)) = peer.recv_from(&mut datagram) {
+                // STUN Binding Request: type 0x0001 + magic cookie.
+                let is_check = len >= 8
+                    && datagram[..2] == [0x00, 0x01]
+                    && datagram[4..8] == [0x21, 0x12, 0xA4, 0x42];
+                if is_check {
+                    stun_seen += 1;
+                    clean_stun |= clean_window;
                 }
-                tokio::time::sleep(Duration::from_millis(2)).await;
             }
+            if clean_stun {
+                return true;
+            }
+            armed_dry = Some(dry_now);
+            false
         })
         .await;
+        assert!(
+            stun_seen > 0,
+            "the ingest session's ICE timer never fired under the flood: no STUN \
+             check reached the peer within {SERVICE_EXHAUSTION_CAP} exhausted \
+             budgets (handoff timer step starved or deleted, PR193-02-R2)"
+        );
+        assert!(
+            pumped,
+            "{stun_seen} STUN checks arrived but none while only the exhaustion \
+             handoff could have pumped them, within {SERVICE_EXHAUSTION_CAP} \
+             exhausted budgets (handoff outbound pump starved or deleted, \
+             PR193-02-R2)"
+        );
+
+        // COMMAND-DRAIN effect: a mid-flood Release closes the ring only when
+        // the handoff drains it.
+        assert!(
+            whip.release("flood-source", negotiated.session_id.as_str()),
+            "release dispatches a teardown command for the live session"
+        );
+        let released = within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+            ring.is_ended()
+        })
+        .await;
+        assert!(
+            released,
+            "under a permanent flood the handoff must drain the Release command \
+             (close the ring) within {SERVICE_EXHAUSTION_CAP} exhausted budgets \
+             (handoff command drain starved or deleted, PR193-02-R2)"
+        );
+
+        // REAP/GC effect: only the driver's reap step closes the released
+        // (now dead) session in the table; `release` itself only forgets the
+        // source.
+        let reaped = within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+            whip.session_closed_in_table(&negotiated.session_id)
+        })
+        .await;
+        assert!(
+            reaped,
+            "the handoff's reap/GC step must close the released session in the \
+             table within {SERVICE_EXHAUSTION_CAP} exhausted budgets (handoff \
+             reap starved or deleted, PR193-02-R2)"
+        );
 
         // Keep the flood saturating while the observer measures, until the
         // window holds `FAIRNESS_WINDOW_EXHAUSTIONS` further exhaustions AND a
@@ -1140,12 +1244,6 @@ mod tests {
         let handoffs = probe.handoff_services.load(Ordering::Relaxed);
 
         assert!(
-            saturated.is_ok(),
-            "the flood must exhaust at least {TARGET_EXHAUSTIONS} receive budgets \
-             within the bound (got {exhausted}); the flood never saturated — the \
-             driver wedged or inbound never landed"
-        );
-        assert!(
             exhausted >= TARGET_EXHAUSTIONS,
             "the flood must exhaust at least {TARGET_EXHAUSTIONS} receive budgets \
              (got {exhausted}); the flood was not saturating"
@@ -1159,13 +1257,6 @@ mod tests {
              exhausted receive budget, independent of idle-tick servicing: \
              {handoffs} handoffs != {exhausted} exhausted budgets — the rest of \
              the driver was starved (invariant #10 BLOCKER)"
-        );
-        assert!(
-            serviced.is_ok() && serviced.expect("serviced timeout checked above"),
-            "under a permanent inbound flood the driver must still service the \
-             release command (close the ring) within the bound — an entry-only \
-             counter cannot prove this; the real command-drain step was starved \
-             or skipped (review PR193-02)"
         );
         assert!(
             window.is_ok(),
