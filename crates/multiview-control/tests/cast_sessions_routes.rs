@@ -1220,3 +1220,100 @@ async fn started_unix_ns_appears_once_the_receiver_accepts_the_load() {
     let list = body_json(resp).await;
     assert_eq!(list[0]["started_unix_ns"].as_i64(), Some(NOW_UNIX_NS));
 }
+
+/// Review H1 (PR #190): a promoted cast device is persisted configuration, so
+/// with an accepted `desired.json` present it must be committed through that
+/// envelope — otherwise it would vanish on the next restart.
+#[tokio::test]
+async fn save_commits_the_promoted_device_to_the_desired_envelope() {
+    const BOOT: &str = r##"schema_version = 1
+[canvas]
+width = 64
+height = 64
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "in_a"
+kind = "bars"
+[[cells]]
+id = "cell_a"
+area = "a"
+[cells.source]
+input_id = "in_a"
+[[outputs]]
+id = "out-b"
+kind = "hls"
+path = "/tmp/cast-save-durable.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    std::fs::write(&path, BOOT).unwrap();
+    let config = multiview_config::MultiviewConfig::load_from_toml(BOOT).unwrap();
+    let seeded = multiview_control::seed_resources(&config).unwrap();
+    let boot_path = path.clone();
+    let mut committed = None;
+    let h = harness_with(|state| {
+        let state = state
+            .with_device_pollers(scripted_cast_registry())
+            .with_cast_delivery(delivery())
+            .with_seeded_resources(seeded)
+            .with_base_document(serde_json::to_value(&config).unwrap())
+            .with_boot_model(Arc::new(multiview_control::boot_model::BootModel::new(
+                boot_path,
+                config.clone(),
+                config.clone(),
+                multiview_config::StartMode::Boot,
+                false,
+                None,
+            )));
+        committed = Some(state.clone());
+        state
+    });
+    let state = committed.unwrap();
+    let layouts = multiview_control::boot_model::layout_library(&state).unwrap();
+    let initial: multiview_config::MultiviewConfig = serde_json::from_value(
+        multiview_control::boot_model::current_desired_config(&state).unwrap(),
+    )
+    .unwrap();
+    multiview_control::boot_model::commit_desired(&state, initial, layouts)
+        .await
+        .unwrap();
+
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/cast/sessions",
+            OPERATOR_TOKEN,
+            &start_body(Some("out-b")),
+        ),
+    )
+    .await;
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let resp = send(
+        &h.router,
+        post_json(
+            &format!("/api/v1/cast/sessions/{id}/save"),
+            OPERATOR_TOKEN,
+            &serde_json::json!({ "device_id": "dev-lounge" }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let desired = multiview_control::boot_model::load_desired(&path)
+        .unwrap()
+        .expect("accepted envelope");
+    assert!(
+        desired.config.devices.iter().any(|d| d.id == "dev-lounge"),
+        "the promoted device must be durable accepted intent"
+    );
+}

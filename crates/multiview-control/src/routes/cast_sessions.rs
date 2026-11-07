@@ -543,6 +543,29 @@ pub(crate) async fn save_cast_session(
     // create — a duplicate id is the store's honest 409 and nothing else has
     // happened yet.
     state.device_pollers.clear_tombstone(&request.device_id);
+    // Review H1: the promoted device is persisted config. Serialize with every
+    // other durable mutation and commit the desired envelope before the store
+    // projection; a duplicate id is refused (409) before any durable write.
+    let _mutation = state.lock_config_mutation().await;
+    crate::boot_model::require_absent(
+        state.devices.get(&request.device_id),
+        DEVICE_KIND,
+        &request.device_id,
+    )
+    .map_err(|err| match err {
+        ControlError::Validation(_) => {
+            ControlError::Conflict(format!("device {:?} already exists", request.device_id))
+        }
+        other => other,
+    })?;
+    crate::boot_model::commit_resource(
+        &state,
+        "devices",
+        &request.device_id,
+        Some(body.clone()),
+        None,
+    )
+    .await?;
     let versioned = state
         .devices
         .create(&request.device_id, ResourceInput { name, body })
