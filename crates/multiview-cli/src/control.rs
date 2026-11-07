@@ -1363,6 +1363,23 @@ pub fn command_drain_with_demand(
     }
 }
 
+/// [`command_drain_with_live_sources`] plus the demand seam.
+#[cfg(feature = "ffmpeg")]
+pub fn command_drain_with_live_sources_and_demand(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    live: crate::live_sources::LiveSourceHandle,
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_live_sources(live)
+        .with_demand(demand);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
 /// [`command_drain_with_audio_and_players`] plus the demand seam (the
 /// non-overlay production run path).
 #[cfg(feature = "ffmpeg")]
@@ -1654,11 +1671,6 @@ impl CommandDrain {
     /// publish, never a rail start (the demand worker does that off-clock).
     #[cfg(feature = "ffmpeg")]
     fn publish_demand(&mut self, drive: &CompositorDrive<Nv12Image>) {
-        if self.demand.is_none() {
-            // A drain built without the seam picks up the running pipeline's
-            // (installed when its run starts): every run path is demand-driven.
-            self.demand = crate::source_demand::installed_drain_demand();
-        }
         let Some(demand) = &self.demand else {
             return;
         };

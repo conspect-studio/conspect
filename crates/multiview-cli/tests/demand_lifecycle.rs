@@ -132,11 +132,12 @@ async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linge
         pipeline.stop_registry(),
         multiview_cli::live_sources::shared_stores(std::collections::HashMap::new()),
     );
-    let mut drain = control::command_drain_with_live_sources(
+    let mut drain = control::command_drain_with_live_sources_and_demand(
         command_rx,
         config.clone(),
         Arc::clone(&publisher),
         hub.handle(),
+        pipeline.drain_demand(),
     );
 
     let watcher = demand.clone();
