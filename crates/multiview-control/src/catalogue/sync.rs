@@ -167,7 +167,7 @@ pub async fn fetch_changed(
 ) -> Result<BTreeMap<String, (Vec<u8>, Option<String>)>, String> {
     let prior = store.load_manifest().unwrap_or_default();
     let mut changed = BTreeMap::new();
-    for (name, _) in FILES {
+    for (name, required) in FILES {
         // Only offer an ETag for a file we really hold, so a 304 can never leave a hole.
         let etag = if store.has_file(name) {
             prior
@@ -178,11 +178,13 @@ pub async fn fetch_changed(
         } else {
             None
         };
-        match fetcher
-            .fetch(name, etag)
-            .await
-            .map_err(|e| format!("{name}: {e}"))?
-        {
+        let fetched = match fetcher.fetch(name, etag).await {
+            Ok(f) => f,
+            // An optional file (guides) that cannot be fetched must not fail the sync.
+            Err(_) if !*required && !store.has_file(name) => continue,
+            Err(e) => return Err(format!("{name}: {e}")),
+        };
+        match fetched {
             FetchOutcome::NotModified => {}
             FetchOutcome::Body { bytes, etag } => {
                 changed.insert((*name).to_owned(), (bytes, etag));
