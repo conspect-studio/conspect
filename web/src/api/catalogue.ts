@@ -28,6 +28,12 @@ export type StreamProto = 'hls' | 'rtmp' | 'srt' | 'rtsp' | 'mmsh' | 'other';
 export type GeoLevel = 'city' | 'subdivision' | 'country' | 'region' | 'none';
 
 /** One joined index row — one stream (§2.2). */
+export interface IndexGuide {
+  readonly site: string;
+  readonly site_id: string;
+  readonly lang: string | null;
+}
+
 export interface IndexStream {
   /** Stable key: sha256(url)[..12] prefixed `s:`. */
   readonly k: string;
@@ -57,6 +63,10 @@ export interface IndexStream {
   readonly ref: string | null;
   /** Logo cache key (`l:…`) served by `/logos/{k}`. */
   readonly logo: string | null;
+  /** Absolute upstream logo URL (what a published playlist carries), or null. */
+  readonly logo_url: string | null;
+  /** A guide is listed upstream (no feed URL is published), or null. */
+  readonly guide: IndexGuide | null;
   readonly closed: string | null;
   readonly replaced_by: string | null;
   readonly website: string | null;

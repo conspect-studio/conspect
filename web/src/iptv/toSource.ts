@@ -1,7 +1,6 @@
 // Map an IPTV-ORG stream onto the ordinary source form (ONE code path for
 // “Add as source” and “Bulk add”): the same SourceFormState → sourceFormToBody.
 import type { IndexStream } from '../api/catalogue';
-import { logoUrl } from '../api/catalogue';
 import { emptySourceForm } from '../resources/forms';
 import type { OriginFollow, SourceFormKind, SourceFormState } from '../resources/forms';
 
@@ -89,7 +88,7 @@ export function toSourceForm(
     // rc3 `playlist_metadata` (epg-playlist): tvg_id = channel@feed, name, logo, group.
     metaTvgId: s.ch !== null ? `${s.ch}@${s.feed ?? ''}`.replace(/@$/, '') : '',
     metaName: s.title,
-    metaLogo: s.logo !== null && typeof window !== 'undefined' ? `${window.location.origin}${logoUrl(s.logo)}` : '',
+    metaLogo: s.logo_url ?? '',
     metaGroup: s.cats[0] !== undefined ? (catNames.get(s.cats[0]) ?? s.cats[0]) : '',
     origin: {
       provider: 'iptv-org',
