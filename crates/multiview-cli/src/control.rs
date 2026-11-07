@@ -246,6 +246,9 @@ where
             .with_source_events(provider)
             .with_source_event_test_injector(injector);
     }
+    if let Some(reader) = crate::event_journal::reader() {
+        state = state.with_event_journal(reader);
+    }
     // Stored layouts persist across restarts (#176): seeding installs a fresh
     // in-memory store holding the config's working layout; move that layout into
     // the persistent store (if any) and serve from it.

@@ -1,5 +1,5 @@
 // Fixture construction deliberately fails loudly on impossible fixture sizes.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
 use multiview_input::id3::{marker_descriptor, parse, Id3Error};
 
@@ -194,4 +194,50 @@ fn unknown_frame_id_is_named_without_claiming_more_than_the_evidence() {
     assert_eq!(d.name, "ID3 X123");
     assert_eq!(d.type_id.as_deref(), Some("X123"));
     assert_eq!(d.detail, None);
+}
+
+fn priv_tag(frames: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (owner, data) in frames {
+        let mut payload = owner.as_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(data);
+        body.extend_from_slice(b"PRIV");
+        let size = u32::try_from(payload.len()).unwrap();
+        body.extend_from_slice(&[0, 0, u8::try_from(size >> 7).unwrap(), u8::try_from(size & 0x7f).unwrap()]);
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&payload);
+    }
+    let size = u32::try_from(body.len()).unwrap();
+    let mut tag = b"ID3\x04\x00\x00".to_vec();
+    tag.extend_from_slice(&[0, 0, u8::try_from(size >> 7).unwrap(), u8::try_from(size & 0x7f).unwrap()]);
+    tag.extend_from_slice(&body);
+    tag
+}
+
+#[test]
+fn elemental_utc_priv_is_a_clock_reference_paired_with_the_apple_pts() {
+    let bytes = priv_tag(&[
+        (multiview_input::id3::APPLE_TS_OWNER, &900_000_u64.to_be_bytes()),
+        (multiview_input::id3::ELEMENTAL_UTC_OWNER, b"2024-03-21T10:02:11Z"),
+    ]);
+    let tag = multiview_input::id3::parse(&bytes).unwrap();
+    assert!(multiview_input::id3::is_clock_only(&tag));
+    let clock = multiview_input::id3::clock_reference(&tag).unwrap();
+    assert_eq!(clock.utc_ns, 1_711_015_331_000_000_000);
+    assert_eq!(clock.pts_90khz, Some(900_000));
+    assert_eq!(clock.resolution_ms, 1000);
+    let decoded = multiview_input::id3::decode_tag(&tag);
+    assert_eq!(decoded.frames[1].owner.as_deref(), Some(multiview_input::id3::ELEMENTAL_UTC_OWNER));
+    assert_eq!(decoded.frames[1].utc_ns, Some(1_711_015_331_000_000_000));
+    assert_eq!(decoded.frames[0].transport_timestamp_90khz, Some(900_000));
+}
+
+#[test]
+fn other_priv_owners_are_events_not_clocks() {
+    let bytes = priv_tag(&[("com.example.marker", b"\x01\x02")]);
+    let tag = multiview_input::id3::parse(&bytes).unwrap();
+    assert!(!multiview_input::id3::is_clock_only(&tag));
+    assert!(multiview_input::id3::clock_reference(&tag).is_none());
+    assert_eq!(multiview_input::id3::decode_tag(&tag).frames[0].data_hex.as_deref(), Some("0102"));
 }

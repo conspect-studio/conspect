@@ -242,7 +242,7 @@ impl SourceEventProvider for RuntimeReader {
                     })
                     .collect()
             });
-        Some(SourceEventsDto::new(
+        let snapshot = SourceEventsDto::new(
             id,
             epoch,
             if valid {
@@ -252,7 +252,11 @@ impl SourceEventProvider for RuntimeReader {
             },
             read.as_ref().is_some_and(|read| read.degraded),
             rows,
-        ))
+        );
+        Some(match crate::event_journal::live_summary(id) {
+            Some(live) => snapshot.with_decoded(live.clock.clone(), live.markers.clone()),
+            None => snapshot,
+        })
     }
 }
 impl SourceBreakProvider for RuntimeReader {
@@ -552,6 +556,11 @@ impl NativeEvents {
             self.mark_degraded();
             return;
         };
+        // Per-segment clock stamps are a clock reference, not event evidence:
+        // the journal keeps them and the panel shows them as the source clock.
+        if multiview_input::id3::is_clock_only(&tag) {
+            return;
+        }
         if self.id3.contains(&tag) {
             return;
         }

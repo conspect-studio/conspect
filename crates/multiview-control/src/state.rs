@@ -726,6 +726,8 @@ pub struct AppState {
     pub preview: crate::preview::SharedPreview,
     /// Optional read-only source-event adapter; absent until wired by the binary.
     pub source_events: Option<crate::source_events::SharedSourceEvents>,
+    /// Optional raw marker journal reader; absent until wired by the binary.
+    pub event_journal: Option<crate::event_journal::JournalReader>,
     /// Optional operator test-injection adapter (ADR-0183 item 5); absent
     /// until wired by the binary. Administer-only; never a general evidence
     /// submission surface.
@@ -1008,6 +1010,7 @@ impl AppState {
             ack_clock: Arc::new(system_ack_clock),
             preview: crate::preview::no_preview(),
             source_events: None,
+            event_journal: None,
             source_event_test_injector: None,
             automation: None,
             whep: crate::preview::no_whep(),
@@ -1287,6 +1290,13 @@ impl AppState {
         provider: crate::source_events::SharedSourceEvents,
     ) -> Self {
         self.source_events = Some(provider);
+        self
+    }
+
+    /// Attach the raw marker journal reader.
+    #[must_use]
+    pub fn with_event_journal(mut self, reader: crate::event_journal::JournalReader) -> Self {
+        self.event_journal = Some(reader);
         self
     }
 

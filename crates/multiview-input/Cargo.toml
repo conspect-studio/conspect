@@ -50,6 +50,8 @@ multiview-ffmpeg = { workspace = true }
 # crate stays `unsafe_code = forbid`.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Decodes base64 SCTE-35 cue payloads for the journal. Pure Rust, already locked.
+base64 = "0.22"
 
 # NDI® ingest (the off-by-default `ndi` feature, ADR-0008 / IN-3). This is the
 # OUT-3 runtime-load FFI leaf crate: it resolves the operator-provided NDI runtime
@@ -62,7 +64,6 @@ serde_json = { workspace = true }
 multiview-ndi-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
-base64 = "0.22"
 proptest = "1.11.0"
 # Generate adversarial `C=1` (zlib) bombs at test time to *verify* — not merely
 # assert — the SAP inflate cap (ADR-0041 Decision 8): the deflate side of the

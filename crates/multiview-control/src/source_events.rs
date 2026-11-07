@@ -276,6 +276,59 @@ pub struct SourceEventsDto {
     /// Bounded structured event history; an empty list is valid.
     #[cfg_attr(feature = "openapi", schema(max_items = 256))]
     events: Vec<SourceEventDto>,
+    /// The source's latest embedded wall clock, when it carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_clock: Option<SourceClockDto>,
+    /// Newest decoded markers first, with predicted times.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(max_items = 32))]
+    markers: Option<Vec<SourceMarkerDto>>,
+}
+
+/// The source's embedded wall clock. A clock reference, never an event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SourceClockDto {
+    /// Latest decoded source UTC time.
+    pub utc: String,
+    /// Source clock minus host receive time, in milliseconds. Includes the
+    /// stream's delivery delay, so a live source reads negative.
+    pub offset_ms: i64,
+    /// Which embedded clock this is.
+    pub clock_source: crate::event_journal::JournalClockSource,
+    /// Host time of that reading.
+    pub observed_at: String,
+}
+
+/// One decoded marker with predicted times. Display evidence only: lifecycle
+/// and automation stay on [`SourceEventDto`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SourceMarkerDto {
+    /// Journal record holding the full decode.
+    pub record_id: String,
+    /// Short name.
+    pub name: String,
+    /// Host receive time.
+    pub received_at: String,
+    /// Predicted splice wall-clock on the source, UTC.
+    pub start_at: Option<String>,
+    /// Predicted break end on the source, UTC.
+    pub end_at: Option<String>,
+    /// Predicted instant the splice reaches this multiview's output, UTC.
+    pub airs_at: Option<String>,
+    /// Predicted instant the break end reaches this multiview's output, UTC.
+    pub airs_end_at: Option<String>,
+    /// Declared duration.
+    pub duration_ms: Option<u64>,
+    /// Clock used for the wall-clock fields.
+    pub clock_source: Option<crate::event_journal::JournalClockSource>,
+    /// Estimated uncertainty of that clock.
+    pub uncertainty_ms: Option<u64>,
+    /// `splice_event_id` or `segmentation_event_id`.
+    pub event_id: Option<String>,
+    /// Decoded UPID with its type name.
+    pub upid: Option<String>,
 }
 impl SourceEventsDto {
     /// Construct a snapshot, dropping oversized/invalid rows and excess history.
@@ -297,7 +350,20 @@ impl SourceEventsDto {
             availability,
             degraded: degraded || events.len() != original_len,
             events,
+            source_clock: None,
+            markers: None,
         }
+    }
+    /// Attach the decoded clock and marker summary.
+    #[must_use]
+    pub fn with_decoded(
+        mut self,
+        source_clock: Option<SourceClockDto>,
+        markers: Vec<SourceMarkerDto>,
+    ) -> Self {
+        self.source_clock = source_clock;
+        self.markers = Some(markers);
+        self
     }
     pub(crate) fn matches_source(&self, id: &str) -> bool {
         self.source_id == id && self.source_id.len() <= MAX_SOURCE_EVENT_ID_BYTES

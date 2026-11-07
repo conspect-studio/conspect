@@ -578,6 +578,14 @@ async fn run_pipeline_until_ctrl_c(
     // The Running document seeds the stores/drain; the boot file (config_path)
     // stays the watch + promote target (ADR-W024).
     let config = &start.running;
+    let journal_limits = config.events.unwrap_or_default();
+    multiview_cli::event_journal::start(
+        multiview_control::boot_model::state_dir_for(config_path).join("events"),
+        multiview_control::event_journal::JournalLimits {
+            retention_days: journal_limits.journal_retention_days,
+            max_bytes: journal_limits.journal_max_bytes,
+        },
+    );
     let stop = StopSignal::new();
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
     let preview_slot = multiview_cli::preview::program_slot();
@@ -845,6 +853,9 @@ async fn run_pipeline_until_ctrl_c(
         signal,
     })
     .await;
+    // Ask the journal thread to persist pending repeat counters. Not joined, so
+    // a counter still queued at process exit can be lost; its record is not.
+    multiview_cli::event_journal::flush();
     Ok(report)
 }
 

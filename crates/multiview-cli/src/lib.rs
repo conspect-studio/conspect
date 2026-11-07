@@ -77,6 +77,7 @@ pub mod cli;
 /// the Web/API uses; an invalid file changes nothing (warn + health event).
 pub mod config_watch;
 pub mod control;
+pub mod event_journal;
 pub mod hls_event_observer;
 /// The Conspect entitlement-plane wiring for the cli (CONSPECT-2b/10, ADR-0050):
 /// the shared lease store, the published [`licence::WatermarkSignal`] the engine

@@ -101,6 +101,7 @@ pub use routing::{
 };
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
+    EventsConfig,
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
     ColorOverride, DisplayModeSpec, EpgMode, EpgSource, Fps, Layout, MetadataCapability,
     MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, Output,
@@ -412,6 +413,9 @@ pub struct MultiviewConfig {
     /// Boxed: one pointer in the (often moved/cloned) config document.
     #[serde(default, skip_serializing_if = "graphics::is_empty_boxed")]
     pub graphics: Box<GraphicsConfig>,
+    /// `[events]`: retention bounds of the raw marker journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventsConfig>,
 }
 
 /// Shape-check the id a weather / graphics source references.

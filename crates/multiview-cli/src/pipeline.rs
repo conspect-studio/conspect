@@ -12605,7 +12605,11 @@ fn open_and_stream(
     // recognized but remains unavailable until its native adapter is wired.
     let metadata_streams: std::collections::HashMap<
         usize,
-        (crate::source_event_packet::MetadataKind, ffmpeg::Rational),
+        (
+            crate::source_event_packet::MetadataKind,
+            ffmpeg::Rational,
+            Option<u16>,
+        ),
     > = input
         .streams()
         .filter_map(|stream| match stream.parameters().id() {
@@ -12614,6 +12618,7 @@ fn open_and_stream(
                 (
                     crate::source_event_packet::MetadataKind::Scte35,
                     stream.time_base(),
+                    u16::try_from(stream.id()).ok(),
                 ),
             )),
             ffmpeg::codec::Id::TIMED_ID3 => Some((
@@ -12621,6 +12626,7 @@ fn open_and_stream(
                 (
                     crate::source_event_packet::MetadataKind::Id3,
                     stream.time_base(),
+                    u16::try_from(stream.id()).ok(),
                 ),
             )),
             _ => None,
@@ -12673,6 +12679,20 @@ fn open_and_stream(
     if let (Some(events), Some(bridge)) = (source_events.as_mut(), hls_event_bridge.take()) {
         let _ = events.attach_hls(bridge);
     }
+    // Raw evidence goes to the off-clock journal from the demux thread, ahead of
+    // the provenance gate, so an untrusted or oversized packet is still recorded.
+    let event_journal = source_events
+        .as_ref()
+        .and_then(|_| crate::event_journal::feed());
+    let journal_source = plan.id.clone();
+    if event_journal.is_some() && plan.live {
+        let anchor = Arc::clone(&plan.live_anchor);
+        let origin = Arc::clone(&plan.output_origin);
+        crate::event_journal::register_output(
+            &plan.id,
+            Arc::new(move || journal_output_anchor(&anchor, &origin)),
+        );
+    }
     // Metadata has a separate fixed budget: never consume video read-ahead slots.
     let (metadata_tx, metadata_rx) =
         std::sync::mpsc::sync_channel::<crate::source_event_packet::MetadataPacket>(32);
@@ -12688,8 +12708,31 @@ fn open_and_stream(
                 Some(ReadItem::Packet((video_fence, packet)))
             }
             Ok(()) => {
-                if let Some(&(kind, tb)) = metadata_streams.get(&packet.stream()) {
+                if let Some(&(kind, tb, pid)) = metadata_streams.get(&packet.stream()) {
                     if let Some(bytes) = packet.data() {
+                        if let Some(journal) = &event_journal {
+                            journal.offer(crate::event_journal::Observation::Packet {
+                                source: journal_source.clone(),
+                                kind: match kind {
+                                    crate::source_event_packet::MetadataKind::Scte35 => {
+                                        crate::event_journal::PacketKind::Scte35
+                                    }
+                                    crate::source_event_packet::MetadataKind::Id3 => {
+                                        crate::event_journal::PacketKind::Id3
+                                    }
+                                },
+                                bytes: bytes.to_vec(),
+                                pid,
+                                pts_90k: packet.pts().and_then(|pts| {
+                                    crate::event_journal::to_90k(
+                                        pts,
+                                        tb.numerator(),
+                                        tb.denominator(),
+                                    )
+                                }),
+                                received_ns: crate::event_journal::wall_now_ns(),
+                            });
+                        }
                         if bytes.len() <= 4096 {
                             if metadata_tx
                                 .try_send(crate::source_event_packet::MetadataPacket {
@@ -14199,6 +14242,25 @@ fn publish_live_frame_for(
         publish_live_anchor(slot, (at, pts), raw);
     }
     true
+}
+
+/// Which source PTS reaches the output at which host wall-clock, from the
+/// anchor the stamper published. Two lock-free loads; runs on the journal thread.
+fn journal_output_anchor(
+    anchor: &LiveAnchorSlot,
+    origin: &crate::timing_status::EpochAnchorSlot,
+) -> Option<crate::event_journal::OutputAnchor> {
+    let run = origin.load()?;
+    let live = anchor.load()?;
+    let raw_ns = live.raw_pts0_ns?;
+    let output_now = run.time().now_nanos().saturating_sub(run.seed_nanos());
+    let ahead = live.out0.as_nanos().saturating_sub(output_now);
+    let ticks = i128::from(raw_ns) * 9 / 100_000;
+    let modulus = i128::from(multiview_input::scte::decode::PTS_MODULUS);
+    Some(crate::event_journal::OutputAnchor {
+        raw_pts_90k: u64::try_from(ticks.rem_euclid(modulus)).ok()?,
+        wall_ns: crate::event_journal::wall_now_ns().saturating_add(ahead),
+    })
 }
 
 /// Publish a fresh anchor into `slot`, bumping its generation.

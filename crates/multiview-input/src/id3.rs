@@ -242,3 +242,179 @@ fn private_timestamp(payload: &[u8]) -> Result<Option<u64>, Id3Error> {
     }
     Ok(Some(timestamp))
 }
+
+/// Owner of the Elemental/MediaLive per-segment UTC wall-clock `PRIV` frame.
+pub const ELEMENTAL_UTC_OWNER: &str = "com.elementaltechnologies.timestamp.utc";
+/// Owner of the Apple HLS transport-stream timestamp `PRIV` frame.
+pub const APPLE_TS_OWNER: &str = "com.apple.streaming.transportStreamTimestamp";
+
+/// One frame, decoded for the event journal (read-only evidence).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DecodedFrame {
+    /// Four-character frame id.
+    pub frame_id: String,
+    /// Raw status/format flags.
+    pub flags: u16,
+    /// `PRIV` owner, or `TXXX`/`WXXX` description.
+    pub owner: Option<String>,
+    /// Printable text value (`T***`, `W***`, or a text `PRIV` body).
+    pub text: Option<String>,
+    /// Remaining binary data, as hex.
+    pub data_hex: Option<String>,
+    /// Decoded Apple transport timestamp (33-bit, 90 kHz).
+    pub transport_timestamp_90khz: Option<u64>,
+    /// Decoded Elemental UTC wall clock, nanoseconds past the Unix epoch.
+    pub utc_ns: Option<i64>,
+}
+
+/// A whole tag, decoded for the event journal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DecodedTag {
+    /// ID3 major version.
+    pub version: u8,
+    /// Frames in wire order.
+    pub frames: Vec<DecodedFrame>,
+}
+
+/// An embedded source wall clock read from a tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockReference {
+    /// Encoder wall clock, nanoseconds past the Unix epoch.
+    pub utc_ns: i64,
+    /// The 33-bit PTS that clock names, when the tag carries one.
+    pub pts_90khz: Option<u64>,
+    /// Resolution of `utc_ns` in milliseconds.
+    pub resolution_ms: u64,
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+fn printable_text(bytes: &[u8]) -> Option<String> {
+    let trimmed = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    (!trimmed.is_empty() && trimmed.iter().all(|b| (0x20..=0x7e).contains(b)))
+        .then(|| trimmed.iter().copied().map(char::from).collect())
+}
+
+/// Elemental writes the UTC instant as RFC 3339 text, normally to the second.
+/// Any other body is left undecoded (the journal keeps it as hex).
+fn elemental_utc(body: &[u8]) -> Option<(i64, u64)> {
+    let text = printable_text(body)?;
+    let ns = crate::hls::parse_rfc3339_ns(&text)?;
+    let resolution = if text.contains('.') { 1 } else { 1000 };
+    Some((ns, resolution))
+}
+
+fn decode_frame(frame: &Id3Frame) -> DecodedFrame {
+    let frame_id = String::from_utf8_lossy(&frame.id).into_owned();
+    let mut out = DecodedFrame {
+        frame_id,
+        flags: frame.flags,
+        owner: None,
+        text: None,
+        data_hex: None,
+        transport_timestamp_90khz: frame.transport_timestamp_90khz,
+        utc_ns: None,
+    };
+    let payload = frame.payload.as_slice();
+    match &frame.id {
+        b"PRIV" => {
+            let split = payload.iter().position(|&b| b == 0);
+            let (owner, body) = split.map_or((payload, &[][..]), |at| {
+                (
+                    payload.get(..at).unwrap_or_default(),
+                    payload.get(at + 1..).unwrap_or_default(),
+                )
+            });
+            out.owner = printable_text(owner);
+            if out.owner.as_deref() == Some(ELEMENTAL_UTC_OWNER) {
+                out.utc_ns = elemental_utc(body).map(|(ns, _)| ns);
+            }
+            out.text = printable_text(body);
+            if out.text.is_none() && !body.is_empty() {
+                out.data_hex = Some(hex_string(body));
+            }
+        }
+        [b'T' | b'W', ..] => {
+            let (encoding, rest) = payload.split_first().map_or((0, payload), |(e, r)| (*e, r));
+            let ascii = matches!(encoding, 0 | 3);
+            if &frame.id == b"TXXX" || &frame.id == b"WXXX" {
+                let split = rest.iter().position(|&b| b == 0);
+                let (description, value) = split.map_or((rest, &[][..]), |at| {
+                    (
+                        rest.get(..at).unwrap_or_default(),
+                        rest.get(at + 1..).unwrap_or_default(),
+                    )
+                });
+                out.owner = ascii.then(|| printable_text(description)).flatten();
+                out.text = ascii.then(|| printable_text(value)).flatten();
+            } else if &frame.id == b"WXXX" || frame.id.first() == Some(&b'W') {
+                out.text = printable_text(payload);
+            } else {
+                out.text = ascii.then(|| printable_text(rest)).flatten();
+            }
+            if out.text.is_none() {
+                out.data_hex = Some(hex_string(payload));
+            }
+        }
+        _ => out.data_hex = Some(hex_string(payload)),
+    }
+    out
+}
+
+/// Decode every frame for the journal. Never interprets break semantics.
+#[must_use]
+pub fn decode_tag(tag: &Id3Tag) -> DecodedTag {
+    DecodedTag {
+        version: tag.version,
+        frames: tag.frames.iter().map(decode_frame).collect(),
+    }
+}
+
+/// The encoder wall clock this tag carries, if any (Elemental UTC `PRIV`,
+/// paired with the Apple transport timestamp when both are present).
+#[must_use]
+pub fn clock_reference(tag: &Id3Tag) -> Option<ClockReference> {
+    let mut utc = None;
+    let mut pts = None;
+    for frame in &tag.frames {
+        if &frame.id != b"PRIV" {
+            continue;
+        }
+        if let Some(ts) = frame.transport_timestamp_90khz {
+            pts = Some(ts);
+        }
+        let payload = frame.payload.as_slice();
+        if let Some(body) = payload
+            .strip_prefix(ELEMENTAL_UTC_OWNER.as_bytes())
+            .and_then(|rest| rest.strip_prefix(&[0]))
+        {
+            utc = elemental_utc(body);
+        }
+    }
+    let (utc_ns, resolution_ms) = utc?;
+    Some(ClockReference {
+        utc_ns,
+        pts_90khz: pts,
+        resolution_ms,
+    })
+}
+
+/// Whether every frame is a clock stamp (Elemental UTC / Apple transport
+/// timestamp): such tags are a source clock reference, never an event.
+#[must_use]
+pub fn is_clock_only(tag: &Id3Tag) -> bool {
+    !tag.frames.is_empty()
+        && tag.frames.iter().all(|frame| {
+            &frame.id == b"PRIV"
+                && (frame.transport_timestamp_90khz.is_some()
+                    || frame
+                        .payload
+                        .starts_with(format!("{ELEMENTAL_UTC_OWNER}\0").as_bytes()))
+        })
+}
