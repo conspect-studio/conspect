@@ -558,21 +558,30 @@ struct Book<T> {
 impl<T> Book<T> {
     /// The record for `id`, created on first use carrying the generation its
     /// retired predecessor reached.
-    fn entry(&mut self, id: &str, now: Instant) -> &mut Entry<T> {
-        if !self.entries.contains_key(id) {
-            let key: Arc<str> = Arc::from(id);
+    fn entry(&mut self, key: &Arc<str>, now: Instant) -> &mut Entry<T> {
+        let retired = &mut self.retired;
+        let floor = self.generation_floor;
+        self.entries.entry(Arc::clone(key)).or_insert_with(|| {
             let mut entry = Entry::new(now);
-            entry.generation = self
-                .retired
-                .remove(id)
-                .unwrap_or(0)
-                .max(self.generation_floor);
-            self.entries.insert(Arc::clone(&key), entry);
-        }
-        // Inserted above when absent.
-        self.entries
-            .get_mut(id)
-            .unwrap_or_else(|| unreachable!("entry inserted above"))
+            entry.generation = retired.remove(key).unwrap_or(0).max(floor);
+            entry
+        })
+    }
+
+    /// Forget every source nothing wants and nothing runs.
+    fn retire_finished(&mut self) -> Vec<Entry<T>> {
+        let finished: Vec<Arc<str>> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.leases.is_empty()
+                    && entry.running.is_empty()
+                    && !entry.in_flight
+                    && !entry.restart
+            })
+            .map(|(id, _)| Arc::clone(id))
+            .collect();
+        finished.iter().filter_map(|id| self.retire(id)).collect()
     }
 
     /// Forget `id`'s record, remembering its generation.
@@ -859,7 +868,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         {
             let mut book = lock(&self.inner.book);
             let now = Instant::now();
-            let entry = book.entry(id, now);
+            let entry = book.entry(&key, now);
             entry.leases.insert(lease_id, LeaseRecord { rails, tag });
             entry.close_now = false;
             if entry.gave_up {
@@ -962,8 +971,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         let handle = rails.video.then(|| self.inner.registry_handle(id, None));
         let mut book = lock(&self.inner.book);
         let now = Instant::now();
-        let progress = self.inner.driver.progress(id, rails);
-        let entry = book.entry(id, now);
+        let entry = book.entry(&Arc::from(id), now);
         let fresh = entry.running.is_empty();
         entry.running = entry.running.union(rails);
         entry.booted = true;
@@ -971,7 +979,12 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         if fresh {
             entry.generation = entry.generation.wrapping_add(1);
         }
-        entry.progress = progress;
+        // Boot started these rails from nothing, so any media they already
+        // published is this generation's: the baseline is zero, not a sample
+        // (review DMD-07).
+        if fresh {
+            entry.progress = 0;
+        }
         entry.progress_at = now;
         if let Some(handle) = handle.flatten() {
             entry.handle = Some(handle);
@@ -1380,8 +1393,8 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let mut sooner = |at: Instant| {
             wake = Some(wake.map_or(at, |current: Instant| current.min(at)));
         };
-        let mut launches: Vec<(Arc<str>, Rails, Rails, bool, u64)> = Vec::new();
-        let mut released = Vec::new();
+        let mut launches: Vec<Launch> = Vec::new();
+        let released;
         let mut events = Notes::default();
         {
             let mut book = lock(&self.book);
@@ -1444,39 +1457,27 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 in_flight += 1;
                 entry.in_flight = true;
                 entry.booted = false;
-                launches.push((
-                    Arc::clone(id),
-                    entry.running,
-                    target,
-                    entry.restart,
-                    entry.generation,
-                ));
+                // The readiness baseline is taken before the start runs, so
+                // media published during the start call counts (review DMD-07).
+                let baseline = self.driver.progress(id, target);
+                launches.push(Launch {
+                    id: Arc::clone(id),
+                    from: entry.running,
+                    to: target,
+                    restarting: entry.restart,
+                    generation: entry.generation,
+                    baseline,
+                });
             }
             for (id, entry) in &mut book.entries {
                 self.note(id, entry, &mut events);
             }
-            // Forget sources nothing wants and nothing runs.
-            let finished: Vec<Arc<str>> = book
-                .entries
-                .iter()
-                .filter(|(_, entry)| {
-                    entry.leases.is_empty()
-                        && entry.running.is_empty()
-                        && !entry.in_flight
-                        && !entry.restart
-                })
-                .map(|(id, _)| Arc::clone(id))
-                .collect();
-            for id in finished {
-                if let Some(entry) = book.retire(&id) {
-                    released.push(entry);
-                }
-            }
+            released = book.retire_finished();
         }
         drop(released);
         self.emit(&events);
-        for (id, from, to, restarting, generation) in launches {
-            self.launch(&id, from, to, restarting, generation);
+        for launch in launches {
+            self.launch(launch);
         }
         wake
     }
@@ -1513,14 +1514,16 @@ impl<T: Send + Sync + 'static> Inner<T> {
 
     /// Run one transition on a transient thread. The caller holds a start slot
     /// for it, so the thread count is bounded.
-    fn launch(
-        self: &Arc<Self>,
-        id: &Arc<str>,
-        from: Rails,
-        to: Rails,
-        restarting: bool,
-        generation: u64,
-    ) {
+    fn launch(self: &Arc<Self>, launch: Launch) {
+        let Launch {
+            id,
+            from,
+            to,
+            restarting,
+            generation,
+            baseline,
+        } = launch;
+        let id = &id;
         self.transitions.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + self.start_timeout(id);
         let inner = Arc::clone(self);
@@ -1553,7 +1556,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                         reason: "the source rail panicked while changing state".to_owned(),
                     })
                 });
-                inner.finish(&thread_id, from, to, outcome);
+                inner.finish(&thread_id, from, to, baseline, outcome);
             });
         if let Err(error) = spawned {
             tracing::warn!(source = %id, %error, "could not spawn a rail transition; retrying");
@@ -1561,7 +1564,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 running: from,
                 reason: "could not start a worker thread".to_owned(),
             };
-            self.finish(id, from, to, Err(failure));
+            self.finish(id, from, to, baseline, Err(failure));
         }
     }
 
@@ -1571,6 +1574,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
         id: &str,
         from: Rails,
         to: Rails,
+        baseline: u64,
         outcome: Result<Rails, RailFailure>,
     ) {
         let running = outcome
@@ -1580,7 +1584,6 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let handle = started_video
             .then(|| self.registry_handle(id, None))
             .flatten();
-        let progress = self.driver.progress(id, running);
         let mut surplus = None;
         let mut events = Notes::default();
         {
@@ -1607,7 +1610,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                         if !from.covers(to) {
                             entry.phase = DemandPhase::Starting;
                             entry.detail = None;
-                            entry.progress = progress;
+                            entry.progress = baseline;
                             entry.progress_at = now;
                         }
                         if running.is_empty() {
@@ -1713,6 +1716,17 @@ fn backoff(base: Duration, max: Duration, failures: u32) -> Duration {
     base.saturating_mul(1_u32 << exponent).min(max)
 }
 
+/// One transition to run on its own thread.
+struct Launch {
+    id: Arc<str>,
+    from: Rails,
+    to: Rails,
+    restarting: bool,
+    generation: u64,
+    /// Progress sampled before the transition (the readiness baseline).
+    baseline: u64,
+}
+
 /// What one pass learned, emitted after the book lock is released.
 #[derive(Default)]
 struct Notes {
@@ -1783,6 +1797,8 @@ mod tests {
         peak: AtomicUsize,
         hold: Option<Duration>,
         progress: AtomicU64,
+        /// Publish one frame inside the start call, then nothing (a short file).
+        publish_on_start: AtomicBool,
     }
 
     impl RailDriver<u8> for Fake {
@@ -1821,6 +1837,9 @@ mod tests {
             self.active.fetch_sub(1, Ordering::SeqCst);
             if to.video && !from.video {
                 self.video_starts.fetch_add(1, Ordering::SeqCst);
+                if self.publish_on_start.load(Ordering::SeqCst) {
+                    self.progress.fetch_add(1, Ordering::SeqCst);
+                }
             }
             if from.video && !to.video {
                 self.video_stops.fetch_add(1, Ordering::SeqCst);
@@ -2502,6 +2521,39 @@ mod tests {
             wait("record removed", || manager.active_len() == 0);
         }
         assert_eq!(seen, vec![1, 2, 3], "generations repeat after idle");
+        manager.shutdown();
+    }
+
+    /// Review DMD-07: media published during the start call itself (a short
+    /// file) is readiness evidence; no second frame is needed.
+    #[test]
+    fn media_published_inside_the_start_call_makes_the_source_ready() {
+        let fake = Arc::new(Fake::default());
+        fake.publish_on_start.store(true, Ordering::SeqCst);
+        let manager = manager(&fake, 10);
+        let lease = manager.acquire("clip", Rails::VIDEO, tag("a"), None);
+        wait("ready from the first frame", || {
+            manager.status("clip").phase == DemandPhase::Ready
+        });
+        drop(lease);
+        manager.shutdown();
+    }
+
+    /// Review DMD-07: a boot-started input that already published all its
+    /// media before adoption reads ready.
+    #[test]
+    fn an_adopted_input_that_already_published_reads_ready() {
+        let fake = Arc::new(Fake::default());
+        let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(&fake);
+        let manager = DemandManager::new(SourceRegistry::new(), driver, config(10));
+        let lease = manager.acquire("clip", Rails::VIDEO, tag("a"), None);
+        fake.progress.store(1, Ordering::SeqCst);
+        manager.adopt("clip", Rails::VIDEO);
+        manager.start();
+        wait("ready", || {
+            manager.status("clip").phase == DemandPhase::Ready
+        });
+        drop(lease);
         manager.shutdown();
     }
 
