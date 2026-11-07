@@ -2335,6 +2335,9 @@ impl CommandDrain {
             );
             return;
         }
+        if self.policy_only_upsert(source, drive) {
+            return;
+        }
         let id = source.id.clone();
         // Reuse the registered store on an edit-by-id so the tile holds
         // last-good while the hub swaps the producer behind it.
@@ -2423,6 +2426,40 @@ impl CommandDrain {
             }
             slot.store(Arc::new(audio_free));
         }
+    }
+
+    /// An upsert that changes only presentation or standing policy
+    /// ([`multiview_config::Source::same_media`]) of a registered source, on a
+    /// run with no demand manager: there are no leases to re-read, so the
+    /// running producer is left alone and only the working-config mirror
+    /// follows (review R3-03). Returns `true` when it handled the upsert. A
+    /// byte-identical re-apply is NOT policy-only: it still respawns, the
+    /// documented retry for a shed spawn. A demand-managed run returns `false`:
+    /// its hub re-reads the pins and keeps the producer (`update_policy`).
+    fn policy_only_upsert(
+        &mut self,
+        source: &multiview_config::Source,
+        drive: &CompositorDrive<Nv12Image>,
+    ) -> bool {
+        #[cfg(feature = "ffmpeg")]
+        if self.demand.is_some() {
+            return false;
+        }
+        if drive.store(&source.id).is_none() {
+            return false;
+        }
+        let Some(slot) = self.config.sources.iter_mut().find(|s| s.id == source.id) else {
+            return false;
+        };
+        if *slot == *source || !slot.same_media(source) {
+            return false;
+        }
+        slot.clone_from(source);
+        tracing::debug!(
+            source = %source.id,
+            "upsert_source: policy/presentation-only edit; the producer keeps running"
+        );
+        true
     }
 
     /// Apply a `RemoveSource` (ADR-W018 live remove) at the frame boundary:

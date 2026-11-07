@@ -46,6 +46,22 @@ pub struct ProducerStop {
     exited: Arc<AtomicBool>,
 }
 
+impl ProducerStop {
+    /// Whether `self` and `other` are the registration of the SAME producer
+    /// thread (a teardown + respawn registers a new one). Lets a caller prove
+    /// an edit left the running producer alone (review R3-03).
+    #[must_use]
+    pub fn is_same_producer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.exited, &other.exited)
+    }
+
+    /// Whether this producer has been asked to stop.
+    #[must_use]
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+}
+
 /// The per-source producer teardown handles, keyed by source id.
 ///
 /// Registered at spawn (startup supervisors and the hub alike) and consumed by
