@@ -485,10 +485,11 @@ pub struct DiagnosticsPermit {
 
 fn cache_key(r: &ProbeRequest) -> String {
     format!(
-        "{}\u{0}{}\u{0}{}",
+        "{}\u{0}{}\u{0}{}\u{0}{}",
         r.url,
         r.user_agent.as_deref().unwrap_or(""),
-        r.referrer.as_deref().unwrap_or("")
+        r.referrer.as_deref().unwrap_or(""),
+        r.quality.as_deref().unwrap_or("")
     )
 }
 
@@ -528,7 +529,7 @@ impl ProbeService {
     fn try_reserve(&self) -> Option<AdmissionSlot> {
         use std::sync::atomic::Ordering;
         self.admitted
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_CONCURRENT + MAX_QUEUED).then_some(n + 1)
             })
             .ok()
@@ -1145,6 +1146,19 @@ mod tests {
             referrer: None,
             quality: quality.map(str::to_owned),
         }
+    }
+
+    #[tokio::test]
+    async fn cache_key_separates_quality() {
+        let svc = ProbeService::new(Arc::new(Instant0), "h".into());
+        let a = svc.submit("p", req(Some("720p"))).unwrap();
+        let a2 = svc.submit("p", req(Some("720p"))).unwrap();
+        let b = svc.submit("p", req(Some("1080p"))).unwrap();
+        assert_eq!(a.id, a2.id, "same quality shares the cache entry");
+        assert_ne!(
+            a.id, b.id,
+            "different quality must not share a cached verdict"
+        );
     }
 
     #[tokio::test]
