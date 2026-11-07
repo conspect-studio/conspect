@@ -85,6 +85,7 @@ fn added_keys(
     utoipa::path(
         get,
         path = "/api/v1/catalogues/iptv-org/status",
+        operation_id = "get_catalogue_status",
         tag = "catalogue",
         responses(
             (status = 200, description = "Sync state, counts, ETags, last error and the caller-scoped link-status tally.", body = serde_json::Value),
@@ -146,6 +147,7 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
     utoipa::path(
         get,
         path = "/api/v1/catalogues/iptv-org/index",
+        operation_id = "get_catalogue_index",
         tag = "catalogue",
         responses(
             (status = 200, description = "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; `already_added` flagged per caller.", body = serde_json::Value),
@@ -243,6 +245,7 @@ struct PlacesBody {
     utoipa::path(
         get,
         path = "/api/v1/catalogues/iptv-org/places",
+        operation_id = "get_catalogue_places",
         tag = "catalogue",
         responses(
             (status = 200, description = "`{schema, places[{id, kind, name, alt, country, subdivision, lat, lon, flag, members, streams, streams_within}]}`; `id` is prefixed like a row's `area`.", body = serde_json::Value),
@@ -281,6 +284,7 @@ pub(crate) async fn get_places(
     utoipa::path(
         post,
         path = "/api/v1/catalogues/iptv-org/refresh",
+        operation_id = "refresh_catalogue",
         tag = "catalogue",
         responses(
             (status = 200, description = "`{outcome: unchanged|updated, changed[]}`; a failed sync keeps the previous snapshot.", body = serde_json::Value),
@@ -317,6 +321,7 @@ pub(crate) async fn post_refresh(
     utoipa::path(
         post,
         path = "/api/v1/catalogues/iptv-org/import",
+        operation_id = "import_catalogue",
         tag = "catalogue",
         request_body(content = serde_json::Value, description = "A JSON object keyed by upstream file name (`streams`, `channels`, `feeds`, `logos`, `cities`, `countries`, `subdivisions`, `regions`, `blocklist`, `categories`, `languages`), optionally gzip'd. Replaces the named files; the rest stay as persisted.", content_type = "application/json"),
         responses(
@@ -371,6 +376,7 @@ pub(crate) async fn after_sync(
     utoipa::path(
         get,
         path = "/api/v1/catalogues/iptv-org/logos/{k}",
+        operation_id = "get_catalogue_logo",
         tag = "catalogue",
         params(("k" = String, Path, description = "Logo key `l:<hex>` from an index row.")),
         responses(
@@ -419,6 +425,7 @@ pub(crate) async fn get_logo(
     utoipa::path(
         get,
         path = "/api/v1/catalogues/iptv-org/links",
+        operation_id = "list_catalogue_links",
         tag = "catalogue",
         responses(
             (status = 200, description = "`{links: [{source_id, status, checked_at, upstream, replaced_by, alternatives}]}` — status, upstream target and ranked alternatives (with cached probe verdict), only for sources the caller may see.", body = serde_json::Value),
@@ -484,6 +491,7 @@ const MAX_PROBE_BATCH: usize = 50;
     utoipa::path(
         post,
         path = "/api/v1/catalogues/iptv-org/probes",
+        operation_id = "create_catalogue_probe",
         tag = "catalogue",
         request_body = ProbeBody,
         responses(
@@ -577,6 +585,7 @@ pub(crate) async fn post_probe(
     utoipa::path(
         get,
         path = "/api/v1/catalogues/iptv-org/probes/{id}",
+        operation_id = "get_catalogue_probe",
         tag = "catalogue",
         params(("id" = String, Path, description = "Probe job id.")),
         responses(
@@ -607,6 +616,7 @@ pub(crate) async fn get_probe(
     utoipa::path(
         post,
         path = "/api/v1/sources/{id}/network",
+        operation_id = "create_source_network_report",
         tag = "catalogue",
         params(("id" = String, Path, description = "Source id.")),
         responses(

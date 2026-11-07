@@ -1,12 +1,10 @@
-// TODO(iptv-org): NetworkReport / fetchSourceNetwork below are hand-typed for
-// design §3a until the OpenAPI schema carries them.
-// IPTV-ORG catalogue API (docs/io/iptv-org.md §2 / §2.2 / §3).
+// Catalogue (IPTV-ORG) API types, hand-written on purpose.
 //
-// TODO(iptv-org): switch to generated schema types. The backend endpoints are
-// not in `schema.ts` yet, so the wire types are hand-written here and ONLY here
-// (one file ⇒ the swap to generated types is a single-file change). Fields that
-// the design doc does not pin down are marked `CONTRACT:` — the lead reconciles
-// them with the backend at integration.
+// The backend returns these bodies as untyped JSON, so the generated
+// `schema.ts` types every catalogue response as `unknown`; these interfaces
+// are the contract. `crates/multiview-control/tests/catalogue_contract.rs`
+// serialises real endpoint output and asserts every field declared here is
+// present, so a backend change that drops a field fails that test.
 import { getStoredToken } from './token';
 
 /** Computed-server-side flag vocabulary (§2.2). `already_added` is client-derived. */

@@ -974,7 +974,7 @@
           "catalogue"
         ],
         "summary": "`POST /api/v1/catalogues/iptv-org/import` — offline bundle import (administer).",
-        "operationId": "post_import",
+        "operationId": "import_catalogue",
         "requestBody": {
           "description": "A JSON object keyed by upstream file name (`streams`, `channels`, `feeds`, `logos`, `cities`, `countries`, `subdivisions`, `regions`, `blocklist`, `categories`, `languages`), optionally gzip'd. Replaces the named files; the rest stay as persisted.",
           "content": {
@@ -1022,7 +1022,7 @@
           "catalogue"
         ],
         "summary": "`GET /api/v1/catalogues/iptv-org/index` — the joined stream index.",
-        "operationId": "get_index",
+        "operationId": "get_catalogue_index",
         "responses": {
           "200": {
             "description": "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; `already_added` flagged per caller.",
@@ -1064,7 +1064,7 @@
           "catalogue"
         ],
         "summary": "`GET /api/v1/catalogues/iptv-org/links` — per-source link status (caller-scoped).",
-        "operationId": "get_links",
+        "operationId": "list_catalogue_links",
         "responses": {
           "200": {
             "description": "`{links: [{source_id, status, checked_at, upstream, replaced_by, alternatives}]}` — status, upstream target and ranked alternatives (with cached probe verdict), only for sources the caller may see.",
@@ -1103,7 +1103,7 @@
           "catalogue"
         ],
         "summary": "`GET /api/v1/catalogues/iptv-org/logos/{k}` — bounded server-side logo cache.",
-        "operationId": "get_logo",
+        "operationId": "get_catalogue_logo",
         "parameters": [
           {
             "name": "k",
@@ -1151,7 +1151,7 @@
           "catalogue"
         ],
         "summary": "`GET /api/v1/catalogues/iptv-org/places` — the gazetteer with stream counts.",
-        "operationId": "get_places",
+        "operationId": "get_catalogue_places",
         "responses": {
           "200": {
             "description": "`{schema, places[{id, kind, name, alt, country, subdivision, lat, lon, flag, members, streams, streams_within}]}`; `id` is prefixed like a row's `area`.",
@@ -1193,7 +1193,7 @@
           "catalogue"
         ],
         "summary": "`POST /api/v1/catalogues/iptv-org/probes` — start a probe job (operate).",
-        "operationId": "post_probe",
+        "operationId": "create_catalogue_probe",
         "requestBody": {
           "content": {
             "application/json": {
@@ -1272,7 +1272,7 @@
           "catalogue"
         ],
         "summary": "`GET /api/v1/catalogues/iptv-org/probes/{id}` — a probe job.",
-        "operationId": "get_probe",
+        "operationId": "get_catalogue_probe",
         "parameters": [
           {
             "name": "id",
@@ -1312,7 +1312,7 @@
           "catalogue"
         ],
         "summary": "`POST /api/v1/catalogues/iptv-org/refresh` — sync now (administer).",
-        "operationId": "post_refresh",
+        "operationId": "refresh_catalogue",
         "responses": {
           "200": {
             "description": "`{outcome: unchanged|updated, changed[]}`; a failed sync keeps the previous snapshot.",
@@ -1361,7 +1361,7 @@
           "catalogue"
         ],
         "summary": "`GET /api/v1/catalogues/iptv-org/status`.",
-        "operationId": "get_status",
+        "operationId": "get_catalogue_status",
         "responses": {
           "200": {
             "description": "Sync state, counts, ETags, last error and the caller-scoped link-status tally.",
@@ -8558,7 +8558,7 @@
           "catalogue"
         ],
         "summary": "`POST /api/v1/sources/{id}/network` — the §3a network-path report for any\nexisting source (operate; per-object authorization).",
-        "operationId": "post_source_network",
+        "operationId": "create_source_network_report",
         "parameters": [
           {
             "name": "id",
