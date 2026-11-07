@@ -203,9 +203,9 @@ async fn follow_auto_survives_restart_and_header_edits_stay_media() {
         .headers()
         .get("x-multiview-apply")
         .map(|v| v.to_str().unwrap().to_owned());
-    assert_ne!(
+    assert_eq!(
         ua_apply.as_deref(),
-        Some("live"),
+        Some("restart"),
         "UA-only edit is media: {ua_apply:?}"
     );
 
@@ -223,9 +223,9 @@ async fn follow_auto_survives_restart_and_header_edits_stay_media() {
         .headers()
         .get("x-multiview-apply")
         .map(|v| v.to_str().unwrap().to_owned());
-    assert_ne!(
+    assert_eq!(
         rf_apply.as_deref(),
-        Some("live"),
+        Some("restart"),
         "referrer-only edit is media: {rf_apply:?}"
     );
 
@@ -244,6 +244,13 @@ async fn follow_auto_survives_restart_and_header_edits_stay_media() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.headers()
+            .get("x-multiview-apply")
+            .map(|v| v.to_str().unwrap()),
+        Some("live"),
+        "origin-only edit must not restart the producer"
+    );
     assert_eq!(stored_source(&path)["origin"]["follow"], "notify");
     let _ = body_json(r).await;
 }

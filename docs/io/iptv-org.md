@@ -387,3 +387,32 @@ Where the implementation made a concrete choice or deviates from §2–§3:
   fetcher and WebVTT variant pin do not carry them, so both are skipped for such a
   source. Sources without the fields are unchanged.
 - **Config.** Durations use the existing `ms`/`s`/`m` units; there is no `h` unit (an existing test pins `30h` as rejected), so six hours is `360m`.
+
+## 8. Measured cost (efficiency requirement)
+
+Measured 2026-11-07 on the integration branch against the live iptv-org snapshot (18,599 index rows),
+debug build, `multiview run --software` with a synthetic 2×2 layout, on the devcontainer host. A
+release build is smaller and faster; host checks on mda001 are listed at the end.
+
+| Item | Measured | Notes |
+|---|---|---|
+| Server memory, catalogue on vs off | RSS 339 MB vs 195 MB, **+144 MB** | Snapshot rows, places, logo map and the cached gzip index. |
+| Server CPU at idle, catalogue on vs off | 12.08 vs 12.29 cores (the synthetic engine) | No measurable idle cost: no timer work between syncs. |
+| Sync cadence | every 360 min (6 h), jittered; minimum 10 min | Configurable `[catalogues.iptv_org] interval`. |
+| Sync bandwidth, first or changed | 6.5 MB gzip on the wire for all files | `guides.json` is the largest at 2.6 MB. |
+| Sync bandwidth, unchanged | 0 B body per file (HTTP 304 via `If-None-Match`) | A forced refresh with nothing changed took 2.5 s wall. |
+| Disk | 8.4 MB under `.multiview/catalogues/iptv-org/` | gzip files plus manifest. |
+| `GET …/index` | 2.2 MB gzip; served from a cached gzip body | ETag 304 when unchanged. |
+| `GET …/places` | 203 KB gzip | |
+| Probe limits | 4 concurrent, queue 64 (then 429), 20 s, 16 MiB, 60/min per principal, 15 min cache | Decode runs on the blocking pool, never the engine. |
+| Web: lazy browser page chunk | 60.8 KB (18.2 KB gzip) | Loaded only on `/sources/iptv-org`. |
+| Web: MapLibre | 1,078 KB (286 KB gzip) + worker 507 KB (143 KB gzip) + CSS 70 KB (10 KB gzip) | Lazy: the main chunk contains no MapLibre code. |
+| Web: boundaries | 392 KB (115 KB gzip) | Lazy, fetched by the map only. |
+
+**Known cost to fix:** for a caller who already has linked sources, the index body is rebuilt and
+re-gzipped per request to mark `already_added`, which took about 3 s per request in this debug build.
+The web derives `already_added` itself from the stream URLs, so the server flag is redundant for the
+UI; the fix is to stop marking it server-side so every caller gets the shared cached body.
+
+**Host checks still needed on mda001 (release build):** RSS delta, sync wall time and CPU with a
+changed upstream, and probe CPU while the engine runs at full load.

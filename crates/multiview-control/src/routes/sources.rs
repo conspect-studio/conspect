@@ -41,7 +41,10 @@ fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> 
         // An unchanged body is not a guide edit; it keeps the canonical path.
         return false;
     }
-    let media_field = |key: &str| key != "epg" && key != "playlist_metadata" && key != "events";
+    // `origin` is catalogue provenance/follow metadata, not media; `user_agent`
+    // and `referrer` are replayed on the wire and stay media.
+    let media_field =
+        |key: &str| !matches!(key, "epg" | "playlist_metadata" | "events" | "origin");
     // `events.automation` is control-plane only (ADR-0183): arming or editing a
     // rule must never restart the producer. `events.observe` stays media.
     // Effective `observe` (absent block or field => the documented default `true`).
@@ -137,6 +140,15 @@ mod guide_change_tests {
             guide_only_change(&source, &armed),
             "automation is control-plane only"
         );
+        let mut origin = source.clone();
+        origin["origin"] = json!({"provider":"iptv-org","channel":"A.us","follow":"notify"});
+        assert!(guide_only_change(&source, &origin), "origin is metadata");
+        let mut ua = source.clone();
+        ua["user_agent"] = json!("UA/9");
+        assert!(!guide_only_change(&source, &ua), "user_agent is media");
+        let mut rf = source.clone();
+        rf["referrer"] = json!("https://r/");
+        assert!(!guide_only_change(&source, &rf), "referrer is media");
         let mut observe = source.clone();
         observe["events"] = json!({"observe": false});
         assert!(
