@@ -401,8 +401,22 @@ pub struct MultiviewConfig {
     /// The Graphics (CG) module (`[graphics]`): typed data sources, prepared
     /// items and playout channels. Absent ⇒ empty. Legacy `[weather]`
     /// locations remain effective `bom_weather` data sources.
-    #[serde(default, skip_serializing_if = "GraphicsConfig::is_empty")]
-    pub graphics: GraphicsConfig,
+    ///
+    /// Boxed: one pointer in the (often moved/cloned) config document.
+    #[serde(default, skip_serializing_if = "graphics::is_empty_boxed")]
+    pub graphics: Box<GraphicsConfig>,
+}
+
+/// Shape-check the id a weather / graphics source references.
+fn graphics_kind_refs(source_id: &str, kind: &SourceKind) -> Result<(), ConfigError> {
+    match kind {
+        SourceKind::Weather { location, .. } => weather::validate_source_ref(source_id, location),
+        SourceKind::Graphic { item: target }
+        | SourceKind::GraphicsChannel {
+            channel: target, ..
+        } => graphics::validate_source_ref(source_id, "target", target),
+        _ => Ok(()),
+    }
 }
 
 /// Parse a `#RGB` / `#RRGGBB` hex color into its `(r, g, b)` bytes.
@@ -1446,12 +1460,16 @@ impl Source {
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] naming the violated rule.
+    #[allow(clippy::too_many_lines)]
+    // reason: one exhaustive per-kind match (every SourceKind must be classified
+    // here, so a new kind cannot skip validation); splitting it would hide that.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.id.is_empty() {
             return Err(ConfigError::Validation(
                 "a source has an empty id".to_owned(),
             ));
         }
+        graphics_kind_refs(&self.id, &self.kind)?;
         if let Some(pin) = &self.gpu_pin {
             pin.validate().map_err(|e| {
                 ConfigError::Validation(format!("source {:?} gpu_pin: {e}", self.id))
@@ -1556,17 +1574,15 @@ impl Source {
             // stream-id 512-byte cap + passphrase-reference consistency; the
             // URL's reachability is a runtime concern.
             SourceKind::Srt { srt: Some(opts), .. } => validate_srt_options(&self.id, opts)?,
-            SourceKind::Weather { location, .. } => weather::validate_source_ref(&self.id, location)?,
-            SourceKind::Graphic { item } => graphics::validate_source_ref(&self.id, "item", item)?,
-            SourceKind::GraphicsChannel { channel, .. } => {
-                graphics::validate_source_ref(&self.id, "channel", channel)?;
-            }
             // Network/synthetic kinds carry no kind-specific field that can be
             // validated structurally here (a URL's reachability is a runtime
             // concern, not a config one). The `youtube` URL is resolved at
             // ingest by an external `yt-dlp` (ADR-0015), so like the other URL
             // kinds it is accepted as-is at config time.
             SourceKind::Bars
+            | SourceKind::Weather { .. }
+            | SourceKind::Graphic { .. }
+            | SourceKind::GraphicsChannel { .. }
             | SourceKind::Rtsp { .. }
             | SourceKind::Hls { .. }
             | SourceKind::Youtube { .. }

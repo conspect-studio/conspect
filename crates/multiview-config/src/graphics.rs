@@ -398,11 +398,19 @@ fn check_name(what: &str, id: &str, name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Serialization skip predicate for the boxed section.
+#[allow(clippy::borrowed_box)] // reason: serde passes `&Box<T>` for a `Box<T>` field.
+#[must_use]
+pub fn is_empty_boxed(g: &Box<GraphicsConfig>) -> bool {
+    g.is_empty()
+}
+
 /// Whether `s` is a `#RRGGBB` colour.
 #[must_use]
 pub fn is_hex_rgb(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 7 && b[0] == b'#' && b[1..].iter().all(u8::is_ascii_hexdigit)
+    s.len() == 7
+        && s.strip_prefix('#')
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The data sources in effect: `[graphics.data_sources]` plus any legacy

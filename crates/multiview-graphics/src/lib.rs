@@ -462,8 +462,12 @@ pub fn scale_alpha(alpha: Option<&[u8]>, len: usize, opacity: u8, out: &mut Vec<
     }
     out.clear();
     match alpha {
-        Some(a) => out.extend(a.iter().take(len).map(|v| lut[usize::from(*v)])),
-        None => out.resize(len, lut[255]),
+        Some(a) => out.extend(
+            a.iter()
+                .take(len)
+                .map(|v| lut.get(usize::from(*v)).copied().unwrap_or(opacity)),
+        ),
+        None => out.resize(len, opacity),
     }
     out.resize(len, 0);
 }

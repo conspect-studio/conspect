@@ -796,6 +796,274 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/graphics/channels": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/channels` (role: read; scoped rows only). */
+        get: operations["list_channels"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/channels/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/channels/{id}` — status (role: read; per-object). */
+        get: operations["get_channel"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/channels/{id}/clear": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/graphics/channels/{id}/clear` — program off air (role:
+         *     write; per-object).
+         */
+        post: operations["clear"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/channels/{id}/cue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/graphics/channels/{id}/cue` (role: write; per-object on the
+         *     channel and the item).
+         */
+        post: operations["cue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/channels/{id}/next": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/graphics/channels/{id}/next` — cue the next rundown entry
+         *     (role: write; per-object).
+         */
+        post: operations["next"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/channels/{id}/rundown": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/channels/{id}/rundown` (same as the channel status). */
+        get: operations["get_rundown"];
+        /**
+         * `PUT /api/v1/graphics/channels/{id}/rundown` — replace the rundown (and
+         *     optionally the transition preset / name); creates the channel when new
+         *     (role: write; per-object on the channel and every listed item).
+         */
+        put: operations["put_rundown"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/channels/{id}/take": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/graphics/channels/{id}/take` — preview to air (role: write;
+         *     per-object).
+         */
+        post: operations["take"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/data-sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/data-sources` (role: read; scoped rows only). */
+        get: operations["list_data_sources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/data-sources/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/data-sources/{id}` (role: read; per-object). */
+        get: operations["get_data_source"];
+        /** `PUT /api/v1/graphics/data-sources/{id}` (role: write; per-object). */
+        put: operations["put_data_source"];
+        post?: never;
+        /** `DELETE /api/v1/graphics/data-sources/{id}` (role: administer; per-object). */
+        delete: operations["delete_data_source"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/items` (role: read; scoped rows only). */
+        get: operations["list_items"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/items/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/items/{id}` (role: read; per-object). */
+        get: operations["get_item"];
+        /**
+         * `PUT /api/v1/graphics/items/{id}` (role: write; per-object on the item and
+         *     its data source).
+         */
+        put: operations["put_item"];
+        post?: never;
+        /**
+         * `DELETE /api/v1/graphics/items/{id}` (role: administer; per-object). The
+         *     item leaves every rundown; if it is on air it is cut to clear.
+         */
+        delete: operations["delete_item"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/items/{id}/thumbnail.jpg": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/items/{id}/thumbnail.jpg` (role: read; per-object). */
+        get: operations["item_thumbnail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/graphics/templates` (role: read). */
+        get: operations["list_templates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/graphics/templates/{id}/sample.jpg": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/graphics/templates/{id}/sample.jpg` — a sample render bound
+         *     to the first in-scope data source of the right kind (role: read).
+         */
+        get: operations["template_sample"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health": {
         parameters: {
             query?: never;
@@ -3037,6 +3305,30 @@ export interface components {
             /** @description The input the channel is fed from, or [`None`] for silence. */
             input?: string | null;
         };
+        /** @description A channel with its live PVW/PGM state. */
+        ChannelView: {
+            /** @description Channel id. */
+            id: string;
+            /** @description Operator-facing name. */
+            name: string;
+            /** @description Cued item id. */
+            preview?: string | null;
+            /** @description Suggested source id carrying the preview bus (`<channel>-preview`). */
+            preview_source: string;
+            /** @description On-air item id. */
+            program?: string | null;
+            /** @description Suggested source id carrying the program bus (`<channel>`). */
+            program_source: string;
+            /** @description Ordered item ids. */
+            rundown: string[];
+            /**
+             * Format: int64
+             * @description Increments on every program change.
+             */
+            seq: number;
+            /** @description Transition preset. */
+            transition: components["schemas"]["TransitionDoc"];
+        };
         /** @description `OpenAPI` mirror of [`crate::routes::tally::ClearOverrideRequest`]. */
         ClearOverrideRequestDoc: {
             /** @description The tally target whose override is cleared. */
@@ -3160,6 +3452,11 @@ export interface components {
             /** @description Whether to consent to the outbound daily telemetry pipe. */
             enabled: boolean;
         };
+        /** @description `POST cue` body. */
+        CueInput: {
+            /** @description The item to put on preview. */
+            item: string;
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_core::stream::DataKind`].
          * @enum {string}
@@ -3205,6 +3502,48 @@ export interface components {
          * @enum {string}
          */
         DataRequestState: "pending" | "approved" | "denied" | "expired";
+        /** @description A data source document (`[[graphics.data_sources]]`). */
+        DataSourceDoc: {
+            /** @description BOM forecast area code (`bom_weather`). */
+            aac?: string | null;
+            /** @description BOM forecast product id (`bom_weather`). */
+            forecast_product?: string | null;
+            /** @description Data source id. */
+            id: string;
+            /** @description Provider kind (`bom_weather`). */
+            kind: string;
+            /** @description Display name. */
+            name: string;
+            /** @description BOM observation product id (`bom_weather`). */
+            observation_product?: string | null;
+            /** @description Observation station WMO id (`bom_weather`). */
+            station_wmo?: string | null;
+        };
+        /** @description `PUT` body for a data source. */
+        DataSourceInput: {
+            /** @description BOM forecast area code. */
+            aac?: string | null;
+            /** @description BOM forecast product id. */
+            forecast_product?: string | null;
+            /** @description Provider kind (`bom_weather`). */
+            kind: string;
+            /** @description Display name. */
+            name: string;
+            /** @description BOM observation product id. */
+            observation_product?: string | null;
+            /** @description Observation station WMO id. */
+            station_wmo?: string | null;
+        };
+        /** @description A data source with its live status. */
+        DataSourceView: {
+            /** @description The configured source. */
+            source: components["schemas"]["DataSourceDoc"];
+            /** @description `ok` | `pending` | `error` | `expired`. */
+            status: string;
+            /** @description Item ids bound to this source. */
+            used_by: string[];
+            weather?: null | components["schemas"]["WeatherLocationView"];
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::DetectionZone` (normalized
          *     sub-rectangle of a tile, `0.0..=1.0` on both axes).
@@ -3573,6 +3912,11 @@ export interface components {
             value: number;
         };
         /**
+         * @description `OpenAPI` mirror of `multiview_config::GraphicsBus`.
+         * @enum {string}
+         */
+        GraphicsBusDoc: "program" | "preview";
+        /**
          * @description `OpenAPI` mirror of [`multiview_licence::HardwareClass`].
          *
          *     Serde-equivalent: a unit enum rendered `snake_case`.
@@ -3706,6 +4050,33 @@ export interface components {
             sub: string;
             /** @description The NMOS per-API access grant — `x-nmos-api`. */
             "x-nmos-api"?: components["schemas"]["NmosApiClaim"];
+        };
+        /** @description A graphics item. */
+        ItemDoc: {
+            /** @description Bound data source id. */
+            data_source?: string | null;
+            /** @description Item id. */
+            id: string;
+            /** @description Provider-specific key. */
+            key?: string | null;
+            /** @description Operator-facing name. */
+            name: string;
+            /** @description Style options. */
+            style?: components["schemas"]["StyleDoc"];
+            /** @description Template id. */
+            template: string;
+        };
+        /** @description `PUT` body for an item. */
+        ItemInput: {
+            /** @description Bound data source id. */
+            data_source?: string | null;
+            /** @description Provider-specific key. */
+            key?: string | null;
+            /** @description Operator-facing name. */
+            name: string;
+            style?: null | components["schemas"]["StyleDoc"];
+            /** @description Template id. */
+            template: string;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).
@@ -4364,6 +4735,10 @@ export interface components {
          * @enum {string}
          */
         PipelineStage: "decode" | "composite" | "encode";
+        /** @description `POST take|clear|next` body (all fields optional; send `{}`). */
+        PlayoutInput: {
+            transition?: null | components["schemas"]["TransitionDoc"];
+        };
         /**
          * @description The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
          *     transports this build can serve, so the SPA picks WHEP vs the JPEG ladder
@@ -4839,6 +5214,14 @@ export interface components {
             /** @description The destination layer id. */
             layer: string;
         };
+        /** @description `PUT /channels/{id}/rundown` body. */
+        RundownInput: {
+            /** @description New channel name (unchanged when absent; required to create). */
+            name?: string | null;
+            /** @description Ordered item ids (full replacement). */
+            rundown: string[];
+            transition?: null | components["schemas"]["TransitionDoc"];
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_config::Salvo`].
          *
@@ -5153,6 +5536,18 @@ export interface components {
             /** @description `seven_day` (default) or `today`. */
             template?: components["schemas"]["WeatherTemplateDoc"];
         } | {
+            /** @description The `[[graphics.items]]` id. */
+            item: string;
+            /** @enum {string} */
+            kind: "graphic";
+        } | {
+            /** @description `program` (default) or `preview`. */
+            bus?: components["schemas"]["GraphicsBusDoc"];
+            /** @description The `[[graphics.channels]]` id. */
+            channel: string;
+            /** @enum {string} */
+            kind: "graphics_channel";
+        } | {
             /** @enum {string} */
             kind: "rtsp";
             /** @description Source URL. */
@@ -5433,6 +5828,15 @@ export interface components {
             /** @description The stable stream id string (e.g. `v/pid:256`). */
             id: string;
         };
+        /** @description Item style. */
+        StyleDoc: {
+            /** @description Accent colour `#RRGGBB`. */
+            accent?: string | null;
+            /** @description `gradient` (opaque) or `transparent`. */
+            background?: string;
+            /** @description Theme name (reserved). */
+            theme?: string | null;
+        };
         /**
          * @description The full entitlement-routing answer the `GET /support/entitlement` endpoint
          *     returns: whether the machine is eligible for entitled support, the route, and
@@ -5607,6 +6011,23 @@ export interface components {
             /** @description The schema version (stable across machine + portal). */
             version: string;
         };
+        /** @description A built-in template. */
+        TemplateDoc: {
+            /** @description The data kind it binds (`weather`), or null. */
+            data_kind?: string | null;
+            /** @description What it draws. */
+            description: string;
+            /** @description Template family (`weather`). */
+            family: string;
+            /** @description Data fields it reads. */
+            fields: string[];
+            /** @description Template id (`family.variant`). */
+            id: string;
+            /** @description Display name. */
+            name: string;
+            /** @description Style options it honours. */
+            style_options: string[];
+        };
         /** @description Request body for the operator test-injection aid. */
         TestEventRequest: {
             /** @description `"start"` or `"end"` — see [`TestEventBoundary`]. */
@@ -5778,6 +6199,16 @@ export interface components {
              * @description Fixed UTC offset in minutes (legacy / no-DST). Ignored when set.
              */
             tz_offset_minutes?: number;
+        };
+        /** @description A transition preset. */
+        TransitionDoc: {
+            /**
+             * Format: int32
+             * @description Mix duration in output frames (1–600).
+             */
+            frames: number;
+            /** @description `cut` or `mix`. */
+            kind: string;
         };
         /**
          * @description The optional JSON body a transport verb may carry: an `asset` (for `load`)
@@ -7904,6 +8335,739 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Problem"];
                 };
+            };
+        };
+    };
+    list_channels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description In-scope channels with PVW/PGM. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"][];
+                };
+            };
+        };
+    };
+    get_channel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Channel id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The channel with PVW/PGM. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"];
+                };
+            };
+            /** @description Out of scope. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    clear: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Channel id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlayoutInput"];
+            };
+        };
+        responses: {
+            /** @description The channel after the clear. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"];
+                };
+            };
+            /** @description Unknown channel. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    cue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Channel id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CueInput"];
+            };
+        };
+        responses: {
+            /** @description The channel after the cue. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown channel or item. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    next: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Channel id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlayoutInput"];
+            };
+        };
+        responses: {
+            /** @description The channel after the cue. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"];
+                };
+            };
+            /** @description Unknown channel. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description End of rundown. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_rundown: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Channel id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The channel with its rundown. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"];
+                };
+            };
+            /** @description Unknown id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_rundown: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Channel id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RundownInput"];
+            };
+        };
+        responses: {
+            /** @description The channel. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown item / invalid preset. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    take: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Channel id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlayoutInput"];
+            };
+        };
+        responses: {
+            /** @description The channel after the take. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelView"];
+                };
+            };
+            /** @description Unknown channel. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Nothing cued. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_data_sources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description In-scope data sources with status. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataSourceView"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_data_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Data source id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The data source. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataSourceView"];
+                };
+            };
+            /** @description Out of scope. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_data_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Data source id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DataSourceInput"];
+            };
+        };
+        responses: {
+            /** @description Replaced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataSourceView"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DataSourceView"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_data_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Data source id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Still bound by an item. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_items: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description In-scope items. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemDoc"][];
+                };
+            };
+        };
+    };
+    get_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Item id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The item. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemDoc"];
+                };
+            };
+            /** @description Out of scope. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Item id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ItemInput"];
+            };
+        };
+        responses: {
+            /** @description Replaced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemDoc"];
+                };
+            };
+            /** @description Created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemDoc"];
+                };
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid body. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Item id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not authorized. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    item_thumbnail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Item id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description JPEG thumbnail. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": unknown;
+                };
+            };
+            /** @description Unknown id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Rendering unavailable in this build. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_templates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Built-in templates. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateDoc"][];
+                };
+            };
+        };
+    };
+    template_sample: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Template id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description JPEG sample. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/jpeg": unknown;
+                };
+            };
+            /** @description Unknown template. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Rendering unavailable in this build. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

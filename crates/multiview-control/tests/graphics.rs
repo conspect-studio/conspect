@@ -23,6 +23,7 @@ fn sydney() -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)] // reason: one linear end-to-end operator story.
 async fn graphics_playout_end_to_end_with_authz_and_events() {
     let hub = multiview_graphics::GraphicsHub::new(multiview_config::GraphicsConfig::default());
     let h = harness_with(|state| state.with_graphics(hub.clone()));

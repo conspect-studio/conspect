@@ -342,7 +342,7 @@ pub fn weather_specs(config: &GraphicsConfig) -> Vec<multiview_weather::service:
 /// config-file watcher).
 #[must_use]
 pub fn effective_graphics(config: &MultiviewConfig) -> GraphicsConfig {
-    let mut g = config.graphics.clone();
+    let mut g = (*config.graphics).clone();
     g.data_sources = multiview_config::graphics::effective_data_sources(&g, &config.weather);
     g
 }

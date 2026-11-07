@@ -253,6 +253,20 @@ export interface GpuMetrics {
 /** GPU/accelerator hardware vendor (selects which per-engine signals to expect). */
 export type GpuVendor = "nvidia" | "intel" | "amd" | "apple" | "other";
 
+/** Data body of `graphics.channel_state`: a graphics playout channel's preview/program after a cue / take / clear / next. Envelope `id` = channel id. */
+export interface GraphicsChannelEvent {
+  /** The verb that produced this state: cue, take, clear, next or rundown. */
+  readonly action: string;
+  /** Graphics channel id (matches the envelope `id`). */
+  readonly channel: string;
+  /** Cued (preview) item id, if any. */
+  readonly preview?: string;
+  /** On-air (program) item id, if any. */
+  readonly program?: string;
+  /** Increments on every program change. */
+  readonly seq: number;
+}
+
 /** Data body of `health.warning.raised` and `health.warning.cleared`. A richer sibling of `Alert`: the `code` is the stable dedupe key, and `remediation` carries the concrete fix. Capability-mismatch codes are latched build-time facts (raised once, cleared on reconfigure/restart). */
 export interface HealthWarning {
   /** Whether the condition is currently active (raise vs clear). */
