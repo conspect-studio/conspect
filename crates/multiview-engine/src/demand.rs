@@ -456,6 +456,14 @@ struct Entry<T> {
     running: Rails,
     /// A transition thread owns this source.
     in_flight: bool,
+    /// When the in-flight start must have returned (review DMD-03).
+    open_deadline: Option<Instant>,
+    /// The in-flight start missed its deadline: it no longer holds a start
+    /// slot and its eventual result belongs to a dead attempt.
+    timed_out: bool,
+    /// Running rails came from a timed-out attempt: stop them, then start
+    /// afresh (a new generation) if still wanted.
+    stale: bool,
     /// A stop-then-start was requested (the source was edited).
     restart: bool,
     /// When the running rails last exceeded what is wanted.
@@ -491,6 +499,9 @@ impl<T> Entry<T> {
             leases: HashMap::new(),
             running: Rails::NONE,
             in_flight: false,
+            open_deadline: None,
+            timed_out: false,
+            stale: false,
             restart: false,
             surplus_since: None,
             phase: DemandPhase::Starting,
@@ -513,7 +524,7 @@ impl<T> Entry<T> {
     /// Where a `starting` source is.
     fn starting_phase(&self) -> Option<StartingPhase> {
         (self.phase == DemandPhase::Starting).then(|| {
-            if self.in_flight {
+            if self.in_flight && !self.timed_out {
                 StartingPhase::Opening
             } else if self.running.is_empty() {
                 StartingPhase::Queued
@@ -532,7 +543,7 @@ impl<T> Entry<T> {
     /// Occupies a start slot: a transition in flight, or a rail awaiting its
     /// first frame.
     fn holds_start_slot(&self) -> bool {
-        self.in_flight
+        (self.in_flight && !self.timed_out)
             || (!self.booted && self.phase == DemandPhase::Starting && !self.running.is_empty())
     }
 }
@@ -578,6 +589,7 @@ impl<T> Book<T> {
                     && entry.running.is_empty()
                     && !entry.in_flight
                     && !entry.restart
+                    && !entry.stale
             })
             .map(|(id, _)| Arc::clone(id))
             .collect();
@@ -1398,13 +1410,24 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let mut events = Notes::default();
         {
             let mut book = lock(&self.book);
+            // Expire overdue starts first, so the slots they free are usable
+            // in this same pass (review DMD-03).
+            if let Some(at) = self.expire_opens(&mut book, now) {
+                sooner(at);
+            }
             let mut slots_used = book
                 .entries
                 .values()
                 .filter(|entry| entry.holds_start_slot())
                 .count();
             // Oldest-first is unnecessary: a blocked source retries next pass.
-            let mut in_flight = book.entries.values().filter(|e| e.in_flight).count();
+            // A timed-out start keeps its thread (at most one per source, as no
+            // source launches again until its transition returns) but no slot.
+            let mut in_flight = book
+                .entries
+                .values()
+                .filter(|e| e.in_flight && !e.timed_out)
+                .count();
             let thread_limit = config.max_concurrent_starts.max(1).saturating_mul(2);
             for (id, entry) in &mut book.entries {
                 let asked = entry.wanted();
@@ -1422,7 +1445,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 } else {
                     bounds.close_after.unwrap_or(config.close_after)
                 };
-                let target = if entry.restart {
+                let target = if entry.restart || entry.stale {
                     Rails::NONE
                 } else {
                     match desired_rails(entry, wanted, now, close_after) {
@@ -1457,6 +1480,11 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 in_flight += 1;
                 entry.in_flight = true;
                 entry.booted = false;
+                let deadline = now + self.start_timeout(id);
+                entry.open_deadline = starting.then_some(deadline);
+                if starting {
+                    sooner(deadline);
+                }
                 // The readiness baseline is taken before the start runs, so
                 // media published during the start call counts (review DMD-07).
                 let baseline = self.driver.progress(id, target);
@@ -1467,6 +1495,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                     restarting: entry.restart,
                     generation: entry.generation,
                     baseline,
+                    deadline,
                 });
             }
             for (id, entry) in &mut book.entries {
@@ -1480,6 +1509,38 @@ impl<T: Send + Sync + 'static> Inner<T> {
             self.launch(launch);
         }
         wake
+    }
+
+    /// Expire every overdue in-flight start; returns the next start deadline.
+    fn expire_opens(&self, book: &mut Book<T>, now: Instant) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        for entry in book.entries.values_mut() {
+            if let Some(deadline) = entry.open_deadline.filter(|_| !entry.timed_out) {
+                if now >= deadline {
+                    self.expire_open(entry, now);
+                } else {
+                    next = Some(next.map_or(deadline, |at| at.min(deadline)));
+                }
+            }
+        }
+        next
+    }
+
+    /// An in-flight start missed its deadline: release its start slot and read
+    /// failed. Its thread keeps the source (no second transition overlaps it);
+    /// whatever it eventually returns is stopped as stale. Book lock held.
+    fn expire_open(&self, entry: &mut Entry<T>, now: Instant) {
+        entry.timed_out = true;
+        entry.failures = entry.failures.saturating_add(1);
+        entry.phase = DemandPhase::Failed;
+        "start timeout".clone_into(&mut entry.reason);
+        entry.detail = Some("the start did not finish in time; still retrying".to_owned());
+        let delay = backoff(
+            self.config.backoff_base,
+            self.config.backoff_max,
+            entry.failures,
+        );
+        entry.not_before = Some(now + delay);
     }
 
     /// Update phase from progress. Book lock held; `progress` must stay cheap.
@@ -1522,10 +1583,10 @@ impl<T: Send + Sync + 'static> Inner<T> {
             restarting,
             generation,
             baseline,
+            deadline,
         } = launch;
         let id = &id;
         self.transitions.fetch_add(1, Ordering::Relaxed);
-        let deadline = Instant::now() + self.start_timeout(id);
         let inner = Arc::clone(self);
         let thread_id = Arc::clone(id);
         let spawned = std::thread::Builder::new()
@@ -1591,11 +1652,14 @@ impl<T: Send + Sync + 'static> Inner<T> {
             let now = Instant::now();
             if let Some(entry) = book.entries.get_mut(id) {
                 entry.in_flight = false;
+                entry.open_deadline = None;
+                let late = std::mem::take(&mut entry.timed_out);
                 if running.is_empty() {
                     entry.close_now = false;
                 }
                 if to.is_empty() {
                     entry.restart = false;
+                    entry.stale = false;
                 }
                 entry.running = running;
                 if !running.video {
@@ -1604,6 +1668,13 @@ impl<T: Send + Sync + 'static> Inner<T> {
                     entry.handle = handle;
                 }
                 match outcome {
+                    // A start that returned after its deadline belongs to a dead
+                    // attempt: it stays failed (already counted and backed off)
+                    // and what it started is stopped before any new generation.
+                    _ if late => {
+                        entry.stale = !running.is_empty();
+                        "start returned after its timeout".clone_into(&mut entry.reason);
+                    }
                     Ok(_) => {
                         entry.surplus_since = None;
                         entry.not_before = None;
@@ -1725,6 +1796,8 @@ struct Launch {
     generation: u64,
     /// Progress sampled before the transition (the readiness baseline).
     baseline: u64,
+    /// When a start must have returned.
+    deadline: Instant,
 }
 
 /// What one pass learned, emitted after the book lock is released.
@@ -1799,6 +1872,8 @@ mod tests {
         progress: AtomicU64,
         /// Publish one frame inside the start call, then nothing (a short file).
         publish_on_start: AtomicBool,
+        /// Sources whose start blocks until removed from this set (a wedged open).
+        wedged: Mutex<HashSet<String>>,
     }
 
     impl RailDriver<u8> for Fake {
@@ -1828,6 +1903,11 @@ mod tests {
                     running: from,
                     reason: "connection refused".to_owned(),
                 });
+            }
+            if to.video && !from.video {
+                while lock(&self.wedged).contains(id) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
@@ -2554,6 +2634,52 @@ mod tests {
             manager.status("clip").phase == DemandPhase::Ready
         });
         drop(lease);
+        manager.shutdown();
+    }
+
+    /// Review DMD-03: a start that never returns times out, frees its start
+    /// slot and reads failed; its late completion is fenced and stopped.
+    #[test]
+    fn a_wedged_open_times_out_frees_its_slot_and_its_late_start_is_stopped() {
+        let fake = Arc::new(Fake::default());
+        for i in 0..4 {
+            lock(&fake.wedged).insert(format!("wedged{i}"));
+        }
+        let manager = manager(&fake, 10);
+        let wedged: Vec<_> = (0..4)
+            .map(|i| manager.acquire(&format!("wedged{i}"), Rails::VIDEO, tag("x"), None))
+            .collect();
+        wait("all four opening", || {
+            (0..4).all(|i| {
+                manager.status(&format!("wedged{i}")).starting == Some(StartingPhase::Opening)
+            })
+        });
+        let healthy = manager.acquire("healthy", Rails::VIDEO, tag("x"), None);
+        wait("a queued source starts past the wedged opens", || {
+            fake.video_starts.load(Ordering::SeqCst) == 1
+        });
+        wait("wedged opens read failed", || {
+            (0..4).all(|i| manager.status(&format!("wedged{i}")).phase == DemandPhase::Failed)
+        });
+        assert_eq!(
+            manager.status("wedged0").detail.as_deref(),
+            Some("the start did not finish in time; still retrying")
+        );
+        let stale = manager.status("wedged0").generation;
+        // Stop during opening, then the open finally returns.
+        drop(wedged);
+        lock(&fake.wedged).clear();
+        wait("late starts stopped", || {
+            (0..4).all(|i| lock(&fake.running).get(&format!("wedged{i}")) == Some(&Rails::NONE))
+        });
+        wait("wedged records retired", || manager.active_len() == 1);
+        let healthy_again = manager.acquire("wedged0", Rails::VIDEO, tag("x"), None);
+        wait("restarts", || manager.status("wedged0").running.video);
+        assert!(
+            manager.status("wedged0").generation > stale,
+            "late start fenced"
+        );
+        drop((healthy, healthy_again));
         manager.shutdown();
     }
 
