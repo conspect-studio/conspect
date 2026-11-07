@@ -5,9 +5,15 @@
 //! against a **next** (just-loaded) one and reports, per section, exactly what
 //! changed — the unit the config-file watcher turns into apply actions: source
 //! changes ride the live `UpsertSource`/`RemoveSource` machinery, a
-//! layout/cells change rides the apply-layout path, a pinned-canvas change is
-//! Class-2 (restart), and every other changed section is named for the
-//! reseed + requires-restart surface.
+//! layout/cells change rides the apply-layout path, an overlay change rides the
+//! live `UpsertOverlay`/`RemoveOverlay` path, a pinned-canvas change is Class-2
+//! (restart), and every other changed section is named so a file edit is never
+//! silently dropped. [`ConfigDiff::changed_sections`] is the per-section
+//! **reporting** surface, not a restart verdict: the apply layer decides
+//! live-follow vs restart per section — the management-plane sections
+//! (`graphics`, `weather`, `iptv`) and `media_fills` (a fill edit is job
+//! intent, ADR-0100 Decision 1) take effect without an engine restart, while
+//! the remaining sections are restart-pending today.
 //!
 //! Pure and total: no I/O, no clocks, no allocation beyond the reported
 //! changes. Comparison is over the typed schema (`PartialEq`), so semantic
@@ -135,7 +141,14 @@ pub struct ConfigDiff {
     /// Every other changed section, by its authored TOML name (`outputs`,
     /// `overlays`, `probes`, `audio`, `control`, `placement`, `salvos`,
     /// `tally_profiles`, `walls`, `devices`, `sync_groups`, `routing`,
-    /// `discovery`, `timing`, `webrtc`, `schema_version`). Sorted + deduplicated.
+    /// `discovery`, `timing`, `webrtc`, `schema_version`, `media`,
+    /// `media_fills`). Sorted + deduplicated.
+    ///
+    /// This is the per-section **reporting** surface, not a restart verdict:
+    /// the apply layer classifies each name. In particular `media` holds only
+    /// the restart-class media library / player set, while a fill edit is
+    /// reported separately as `media_fills` — live-applicable job intent
+    /// (ADR-0100 Decision 1) that never triggers a media restart.
     pub changed_sections: BTreeSet<&'static str>,
 }
 
@@ -227,17 +240,24 @@ impl ConfigDiff {
         let canvas_signal_changed = running_signal != next_signal;
         let canvas_cosmetic_changed = !canvas_signal_changed && running_canvas != next_canvas;
 
-        // Media library + player channels (ADR-0057) and the declarative VT
-        // clip fills bound to them (ADR-0100 Decision 1): a restart-class
-        // section. The live load/cue/play/vamp verbs are command-bus actions
-        // (ADR-0097) and a fill edit is job intent, but neither is applied by
-        // the config-file diff, so a change to the declared set is a controlled
+        // Media library + player channels (ADR-0057): a restart-class section.
+        // The live load/cue/play/vamp verbs are command-bus actions (ADR-0097),
+        // and neither the declared asset set nor the declared player set is
+        // applied by the config-file diff, so a change to either is a controlled
         // reset, never a silent hot-swap.
+        //
+        // The declarative VT clip fills bound to those players (ADR-0100
+        // Decision 1) are deliberately NOT in `media`: a fill edit is
+        // job-intent, not an engine-topology change — it must not be
+        // restart-class. It is surfaced as its own live-applicable
+        // `media_fills` section (the same shape the other management-plane
+        // sections below use): the change is reported so a file edit is never
+        // silently dropped, and the fill store / job runner follow the new
+        // definition without an engine restart.
         let media_changed = running_media_library != next_media_library
-            || running_media_players != next_media_players
-            || running_media_fills != next_media_fills;
+            || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 22] = [
+        let sectioned: [(&'static str, bool); 23] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
@@ -280,6 +300,12 @@ impl ConfigDiff {
             // as a changed section (controlled reset) rather than claiming hot-apply.
             ("system", running_system != next_system),
             ("media", media_changed),
+            // A fill edit is job intent (ADR-0100 Decision 1), NOT restart-class:
+            // it is reported as its own live-applicable section so the fill
+            // store / runner follow the file without an engine restart. Kept
+            // SEPARATE from `media` so a fill edit never reports (or triggers) a
+            // media restart, while a library/player edit still does.
+            ("media_fills", running_media_fills != next_media_fills),
             // Weather locations are management-plane data (the poller re-reads
             // them); no engine restart is needed, but the change is surfaced.
             ("weather", running_weather != next_weather),

@@ -1,10 +1,12 @@
 //! Declarative VT clip fills — the `[[media_fill]]` schema, its defaults, its
-//! validation rules and its restart-class diff (ADR-0100 Decisions 1/3/7/10/12,
-//! ADR-0101 Decisions 3/7).
+//! validation rules and its diff section (ADR-0100 Decisions 1/3/7/10/12,
+//! ADR-0101 Decisions 1/3/7).
 //!
 //! This layer is **pure data + validation** (no browser, no job runner, no
 //! API): it proves a fill document round-trips, that the authored defaults
-//! survive, and that every rule the ADRs demand is refused with a clear reason.
+//! survive, that every rule the ADRs demand is refused with a clear reason, and
+//! that a fill edit is reported as live job intent (`media_fills`) rather than
+//! as a restart-class media change.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -12,9 +14,10 @@
     clippy::indexing_slicing
 )]
 
+use chrono::{DateTime, Utc};
 use multiview_config::{
     CaptureMode, ConfigDiff, DuringRefresh, FillRefresh, FrameTiming, MediaFillKind,
-    MultiviewConfig, ParamValue, SlotStorage, ViewBackground,
+    MultiviewConfig, ParamValue, SlotStorage, TemplateConstraints, ViewBackground,
 };
 
 // ---------------------------------------------------------------------------
@@ -262,18 +265,48 @@ fn full_fill_document_round_trips_through_toml_and_json() {
     assert_eq!(back, cfg);
 }
 
+/// Defaults are proven **behaviourally**, not by asserting a fixed serialized
+/// key list (which breaks on any unrelated field addition): omitting a
+/// default-valued field must produce exactly the same document as writing that
+/// default out, and both forms must round-trip through JSON and TOML.
 #[test]
-fn defaults_are_applied_and_not_emitted() {
-    let minimal = merge(
+fn omitted_defaults_equal_explicit_defaults_and_round_trip() {
+    let lean = merge(
         web_fill(),
         serde_json::json!({
             "view": { "width": 1024, "height": 768 },
             "refresh": { "mode": "one_shot" }
         }),
     );
-    let cfg = doc_with_fill(&minimal);
+    let verbose = merge(
+        web_fill(),
+        serde_json::json!({
+            "during_refresh": "play_last",
+            "storage": "disk",
+            "view": {
+                "width": 1024, "height": 768,
+                "capture": "steps", "timing": "equal",
+                "frame_ms": 600, "end_hold_ms": 1000,
+                "crossfade_ms": 0, "background": "opaque",
+                "params": {}
+            },
+            "refresh": { "mode": "one_shot" }
+        }),
+    );
+    let cfg = doc_with_fill(&lean);
     cfg.validate().expect("minimal fill should validate");
+    let with_defaults = doc_with_fill(&verbose);
+    with_defaults
+        .validate()
+        .expect("explicit-defaults fill should validate");
 
+    // Omission ≡ explicit default (the authored wire says the same thing).
+    assert_eq!(
+        cfg, with_defaults,
+        "omitting a default must equal writing it out"
+    );
+
+    // The defaults really were applied (spot the scalar-valued ones).
     let fill = &cfg.media_fills[0];
     assert_eq!(fill.during_refresh, DuringRefresh::PlayLast);
     assert_eq!(fill.storage, SlotStorage::Disk);
@@ -288,29 +321,20 @@ fn defaults_are_applied_and_not_emitted() {
     assert_eq!(view.background, ViewBackground::Opaque);
     assert!(view.params.is_empty());
 
-    // A default-valued field is skipped on serialize (matching media.rs style).
-    // Inspect the fill's own wire form so an unrelated document key (e.g. the
-    // canvas `background`) cannot satisfy the assertion.
-    let wire = serde_json::to_value(fill).expect("serialize fill");
-    let mut keys: Vec<&str> = wire
-        .as_object()
-        .expect("fill is an object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        vec!["id", "kind", "player", "refresh", "template", "terms", "view"],
-        "{wire}"
-    );
-    let view_wire = wire
-        .get("view")
-        .and_then(serde_json::Value::as_object)
-        .expect("view is an object");
-    let mut view_keys: Vec<&str> = view_wire.keys().map(String::as_str).collect();
-    view_keys.sort_unstable();
-    assert_eq!(view_keys, vec!["height", "width"], "{wire}");
+    // Both authored forms round-trip, and the round-trip stays equal to the
+    // explicit-defaults document (so a dropped default would fail here).
+    for text in [
+        cfg.to_json().expect("serialize JSON"),
+        cfg.to_toml().expect("serialize TOML"),
+    ] {
+        let back = if text.trim_start().starts_with('{') {
+            MultiviewConfig::load_from_json(&text).expect("reparse JSON")
+        } else {
+            MultiviewConfig::load_from_toml(&text).expect("reparse TOML")
+        };
+        assert_eq!(back, cfg, "round trip changed the document");
+        assert_eq!(back, with_defaults, "round trip lost a default");
+    }
 }
 
 #[test]
@@ -448,6 +472,47 @@ fn fill_referencing_an_unknown_player_is_rejected() {
 }
 
 #[test]
+fn fill_ids_must_be_1_to_64_id_characters() {
+    let long_id = "a".repeat(65);
+    for id in ["", " ", "has space", "bad!", "../escape", long_id.as_str()] {
+        let cfg = doc_with_fill(&merge(web_fill(), serde_json::json!({ "id": id })));
+        let err = validation_error(&cfg);
+        assert!(err.contains("media fill id"), "{id:?}: {err}");
+        assert!(err.contains("[A-Za-z0-9_-]"), "{id:?}: {err}");
+    }
+    // The full allowed alphabet, at the length boundary, is accepted.
+    let id = format!("{}{}", "a".repeat(62), "Z9");
+    doc_with_fill(&merge(web_fill(), serde_json::json!({ "id": id })))
+        .validate()
+        .expect("64 id characters including - and _ are accepted");
+    doc_with_fill(&merge(web_fill(), serde_json::json!({ "id": "a-b_C9" })))
+        .validate()
+        .expect("hyphen and underscore ids are accepted");
+}
+
+#[test]
+fn template_ids_must_be_1_to_64_id_characters() {
+    let long_template = "t".repeat(65);
+    for template in ["", "bad id", "bad!", long_template.as_str()] {
+        let cfg = doc_with_fill(&merge(
+            web_fill(),
+            serde_json::json!({ "template": template }),
+        ));
+        let err = validation_error(&cfg);
+        assert!(err.contains("template id"), "{template:?}: {err}");
+        assert!(err.contains("[A-Za-z0-9_-]"), "{template:?}: {err}");
+    }
+    // Uppercase IS in the id alphabet, so a shape-valid id passes the id check
+    // and fails later on the terms-template match instead (proving the id rule
+    // is the documented alphabet, not a lowercase-only one).
+    let err = validation_error(&doc_with_fill(&merge(
+        web_fill(),
+        serde_json::json!({ "template": "WINDY" }),
+    )));
+    assert!(err.contains("does not match"), "{err}");
+}
+
+#[test]
 fn two_fills_on_one_player_are_rejected() {
     let cfg = doc_with_players_and_fills(
         &serde_json::json!([{ "id": "vt-1" }]),
@@ -523,15 +588,60 @@ fn view_edges_are_bounded() {
     cfg.validate().expect("endpoint geometry should validate");
 }
 
+/// A fake template registry: `windy` declares ADR-0101 Decision 3's desktop
+/// floor, every other template declares none. The generic config must learn
+/// this only through the injected hook — it holds no site knowledge.
+struct FakeTemplates;
+
+impl TemplateConstraints for FakeTemplates {
+    fn min_width(&self, template: &str) -> Option<u32> {
+        (template == "windy").then_some(1024)
+    }
+}
+
 #[test]
-fn windy_requires_the_desktop_width() {
+fn template_width_floor_comes_only_from_the_injected_constraints() {
     let cfg = doc_with_fill(&with_view(
         web_fill(),
         &serde_json::json!({ "width": 960, "height": 540 }),
     ));
-    let err = validation_error(&cfg);
-    assert!(err.contains("windy"), "{err}");
+
+    // Without constraints the generic config applies no per-template floor: the
+    // hard-coded windy rule is gone from the schema.
+    cfg.validate()
+        .expect("the schema itself carries no per-template width rule");
+
+    // With the template registry injected, the declared floor is enforced.
+    let err = cfg
+        .validate_with(Some(&FakeTemplates), None)
+        .expect_err("the declared floor must be enforced")
+        .to_string();
+    assert!(err.contains("template constraint"), "{err}");
     assert!(err.contains("1024"), "{err}");
+
+    // At the floor it passes.
+    let wide = doc_with_fill(&with_view(
+        web_fill(),
+        &serde_json::json!({ "width": 1024, "height": 576 }),
+    ));
+    wide.validate_with(Some(&FakeTemplates), None)
+        .expect("a width at the floor passes");
+
+    // A template that declares no floor is unconstrained by the hook.
+    let other = doc_with_fill(&merge(
+        web_fill(),
+        serde_json::json!({
+            "template": "bom",
+            "view": { "width": 960, "height": 540 },
+            "terms": {
+                "user": "u", "accepted_at": "2026-11-07T00:00:00Z",
+                "template": "bom", "terms_version": "v1"
+            }
+        }),
+    ));
+    other
+        .validate_with(Some(&FakeTemplates), None)
+        .expect("a template with no floor passes");
 }
 
 #[test]
@@ -616,6 +726,98 @@ fn terms_accepted_at_must_be_rfc3339() {
     assert!(err.contains("RFC 3339"), "{err}");
 }
 
+/// Build a `web_capture` fill whose terms block is `user`/`terms_version` as
+/// given (RFC 3339 stamp and matching template otherwise valid).
+fn web_fill_with_terms(user: &str, terms_version: &str) -> serde_json::Value {
+    merge(
+        web_fill(),
+        serde_json::json!({
+            "terms": {
+                "user": user,
+                "accepted_at": "2026-11-07T00:00:00Z",
+                "template": "windy",
+                "terms_version": terms_version
+            }
+        }),
+    )
+}
+
+#[test]
+fn terms_user_must_be_non_blank_trimmed_bounded_and_control_free() {
+    // Blank / whitespace-only.
+    for user in ["", "   ", "\t"] {
+        let err = validation_error(&doc_with_fill(&web_fill_with_terms(user, "v1")));
+        assert!(err.contains("terms.user"), "{user:?}: {err}");
+    }
+    // Padded: the API stamps this value, so it must already be trimmed.
+    let err = validation_error(&doc_with_fill(&web_fill_with_terms(
+        " operator@example.com ",
+        "v1",
+    )));
+    assert!(err.contains("trimmed"), "{err}");
+    // Over 256 characters.
+    let err = validation_error(&doc_with_fill(&web_fill_with_terms(&"u".repeat(257), "v1")));
+    assert!(err.contains("terms.user"), "{err}");
+    assert!(err.contains("256"), "{err}");
+    // A control character.
+    let err = validation_error(&doc_with_fill(&web_fill_with_terms("oper\u{7f}ator", "v1")));
+    assert!(err.contains("control character"), "{err}");
+    // The boundary length is accepted.
+    doc_with_fill(&web_fill_with_terms(&"u".repeat(256), "v1"))
+        .validate()
+        .expect("256 characters is within the bound");
+}
+
+#[test]
+fn terms_version_must_be_non_blank_trimmed_bounded_and_control_free() {
+    for version in ["", "  "] {
+        let err = validation_error(&doc_with_fill(&web_fill_with_terms("u", version)));
+        assert!(err.contains("terms.terms_version"), "{version:?}: {err}");
+    }
+    let err = validation_error(&doc_with_fill(&web_fill_with_terms("u", " v1 ")));
+    assert!(err.contains("trimmed"), "{err}");
+    let err = validation_error(&doc_with_fill(&web_fill_with_terms("u", &"v".repeat(65))));
+    assert!(err.contains("terms.terms_version"), "{err}");
+    assert!(err.contains("64"), "{err}");
+    let err = validation_error(&doc_with_fill(&web_fill_with_terms("u", "v1\u{1}")));
+    assert!(err.contains("control character"), "{err}");
+    doc_with_fill(&web_fill_with_terms("u", &"v".repeat(64)))
+        .validate()
+        .expect("64 characters is within the bound");
+}
+
+#[test]
+fn terms_accepted_at_may_not_lead_an_injected_clock() {
+    let cfg = doc_with_fill(&web_fill_with_terms("u", "v1"));
+    let now = |text: &str| {
+        DateTime::parse_from_rfc3339(text)
+            .expect("test clock parses")
+            .with_timezone(&Utc)
+    };
+
+    // The stamp is 10 minutes ahead of the injected clock: forged / mis-stamped.
+    let err = cfg
+        .validate_with_now(now("2026-11-06T23:50:00Z"))
+        .expect_err("a 10-minute future stamp must be rejected")
+        .to_string();
+    assert!(err.contains("future"), "{err}");
+    // The fill-level seam rejects it too.
+    assert!(cfg.media_fills[0]
+        .validate_with_now(now("2026-11-06T23:50:00Z"))
+        .is_err());
+
+    // Exactly at the 5-minute allowance and inside it: accepted.
+    cfg.validate_with_now(now("2026-11-06T23:55:00Z"))
+        .expect("exactly 5 minutes of skew is allowed");
+    cfg.validate_with_now(now("2026-11-06T23:57:00Z"))
+        .expect("3 minutes of skew is allowed");
+
+    // The normal `validate` has no clock at all, so the future check is skipped
+    // (documented: the API stamps and the runner enforces the version match).
+    cfg.validate()
+        .expect("without a clock the future check cannot run");
+}
+
 #[test]
 fn url_fetch_requires_a_parseable_https_url() {
     for url in [
@@ -656,12 +858,208 @@ fn url_fetch_rejects_non_public_ip_literal_hosts() {
     }
 }
 
+#[test]
+fn url_fetch_normalises_ipv4_notations_before_screening() {
+    // The WHATWG parser normalises decimal and hex IPv4 to a real `Ipv4` host;
+    // the screen therefore sees 127.0.0.1 even though the text is not an IP.
+    for url in ["https://2130706433/", "https://0x7f.1/"] {
+        let cfg = doc_with_fill(&url_fill(url));
+        let err = validation_error(&cfg);
+        assert!(err.contains("SSRF guard"), "{url}: {err}");
+        assert!(err.contains("127.0.0.1"), "{url}: {err}");
+    }
+}
+
+#[test]
+fn url_fetch_rejects_local_and_special_use_hosts() {
+    for url in [
+        "https://localhost/clip.mp4",
+        "https://localhost./clip.mp4",
+        "https://foo.localhost/clip.mp4",
+        "https://printer.local/clip.mp4",
+        "https://svc.internal/clip.mp4",
+        "https://a.home.arpa/clip.mp4",
+    ] {
+        let cfg = doc_with_fill(&url_fill(url));
+        let err = validation_error(&cfg);
+        assert!(
+            err.contains("local/special-use"),
+            "{url} must be refused as a local name: {err}"
+        );
+    }
+}
+
+#[test]
+fn url_fetch_accepts_and_normalises_idn_hosts() {
+    // A Unicode IDN name is punycoded by the parser and accepted...
+    for url in [
+        "https://bücher.example/clip.mp4",
+        "https://xn--bcher-kva.example/clip.mp4",
+    ] {
+        let cfg = doc_with_fill(&url_fill(url));
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("{url} should validate: {e}"));
+    }
+}
+
+#[test]
+fn url_fetch_is_bounded_to_2048_bytes() {
+    let base = "https://media.example.com/";
+    let at_limit = format!("{base}{}", "a".repeat(2048 - base.len()));
+    assert_eq!(at_limit.len(), 2048);
+    doc_with_fill(&url_fill(&at_limit))
+        .validate()
+        .expect("a 2048-byte URL is accepted");
+    let too_long = format!("{at_limit}a");
+    let err = validation_error(&doc_with_fill(&url_fill(&too_long)));
+    assert!(err.contains("2048"), "{err}");
+}
+
+#[test]
+fn url_fetch_rejects_raw_whitespace_and_control_characters() {
+    for url in [
+        "https://invalid host/clip.mp4",
+        "https://exam\nple.com/clip.mp4",
+        "https://example.com/\u{7f}",
+    ] {
+        let cfg = doc_with_fill(&url_fill(url));
+        let err = validation_error(&cfg);
+        assert!(
+            err.contains("whitespace") || err.contains("control"),
+            "{url:?}: {err}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Diff: a fill change is part of the restart-class `media` section.
+// Validation — template parameters (ADR-0101 Decision 1).
+// ---------------------------------------------------------------------------
+
+/// A one-entry parameter map.
+fn one_param(key: &str, value: serde_json::Value) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(key.to_owned(), value);
+    serde_json::Value::Object(map)
+}
+
+/// A fill whose view carries `params`.
+fn fill_with_params(params: serde_json::Value) -> MultiviewConfig {
+    doc_with_fill(&with_view(
+        web_fill(),
+        &serde_json::json!({ "width": 1920, "height": 1080, "params": params }),
+    ))
+}
+
+#[test]
+fn toml_non_finite_param_floats_are_rejected_at_parse_time() {
+    const PARAM_FILL: &str = r#"
+[[media_fill]]
+id = "p1"
+player = "vt-1"
+kind = "web_capture"
+template = "windy"
+refresh = { mode = "one_shot" }
+[media_fill.view]
+width = 1920
+height = 1080
+[media_fill.view.params]
+lat = LITERAL
+[media_fill.terms]
+user = "u"
+accepted_at = "2026-11-07T00:00:00Z"
+template = "windy"
+terms_version = "v1"
+"#;
+    for literal in ["nan", "inf", "-inf"] {
+        let doc = format!("{BASE_TOML}{}", PARAM_FILL.replace("LITERAL", literal));
+        let err = MultiviewConfig::load_from_toml(&doc)
+            .expect_err("a non-finite float must fail to parse")
+            .to_string();
+        assert!(err.contains("not finite"), "{literal}: {err}");
+    }
+    // A finite float still parses and validates.
+    let doc = format!("{BASE_TOML}{}", PARAM_FILL.replace("LITERAL", "-33.946"));
+    MultiviewConfig::load_from_toml(&doc)
+        .expect("a finite float parses")
+        .validate()
+        .expect("a finite float validates");
+}
+
+#[test]
+fn json_integers_above_i64_max_are_rejected_at_parse_time() {
+    let with_big = |number: serde_json::Value| {
+        merge(
+            base_doc(),
+            serde_json::json!({
+                "media_fill": [with_view(
+                    web_fill(),
+                    &serde_json::json!({
+                        "width": 1920, "height": 1080,
+                        "params": { "big": number }
+                    })
+                )]
+            }),
+        )
+    };
+    let err = MultiviewConfig::load_from_json(
+        &with_big(serde_json::json!(9_223_372_036_854_775_808u64)).to_string(),
+    )
+    .expect_err("a u64 above i64::MAX must be an error, not a float")
+    .to_string();
+    assert!(err.contains("i64"), "{err}");
+    // `i64::MAX` itself is accepted.
+    MultiviewConfig::load_from_json(&with_big(serde_json::json!(i64::MAX)).to_string())
+        .expect("i64::MAX parses")
+        .validate()
+        .expect("i64::MAX validates");
+}
+
+#[test]
+fn param_maps_are_bounded_shaped_and_control_free() {
+    // At most 32 entries.
+    let mut many = serde_json::Map::new();
+    for index in 0..33 {
+        many.insert(format!("p{index}"), serde_json::json!(index));
+    }
+    let err = validation_error(&fill_with_params(serde_json::Value::Object(many)));
+    assert!(err.contains("exceeds the bound"), "{err}");
+
+    // Keys are 1..=64 characters of [a-z0-9_].
+    let long_key = "k".repeat(65);
+    for key in ["", "Zoom", "has space", "dash-key", long_key.as_str()] {
+        let err = validation_error(&fill_with_params(one_param(key, serde_json::json!(1))));
+        assert!(err.contains("template parameter key"), "{key:?}: {err}");
+    }
+
+    // String values: at most 1024 characters, no control characters.
+    let err = validation_error(&fill_with_params(one_param(
+        "note",
+        serde_json::json!("x".repeat(1025)),
+    )));
+    assert!(err.contains("1024"), "{err}");
+    let err = validation_error(&fill_with_params(one_param(
+        "note",
+        serde_json::json!("a\u{7}b"),
+    )));
+    assert!(err.contains("control character"), "{err}");
+
+    // Valid shapes: bool, integer, float, a bounded string and every key class.
+    fill_with_params(serde_json::json!({
+        "hide_ui": true, "zoom": 10, "lat": -33.946, "note_2": "x".repeat(1024)
+    }))
+    .validate()
+    .expect("valid parameter shapes must validate");
+}
+
+// ---------------------------------------------------------------------------
+// Diff: a fill edit is live job intent (`media_fills`), a player/library edit
+// stays restart-class (`media`). `ConfigDiff` has no per-section
+// "requires restart" flag — `changed_sections` is the reporting surface the
+// apply layer classifies — so the section membership IS the assertion.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_fill_change_reports_the_media_section() {
+fn a_fill_change_reports_the_live_media_fills_section_and_not_media() {
     let doc = format!("{BASE_TOML}{FULL_FILLS_TOML}");
     let running = MultiviewConfig::load_from_toml(&doc).expect("running doc");
     let next = MultiviewConfig::load_from_toml(&doc.replace("minutes = 5", "minutes = 10"))
@@ -669,17 +1067,56 @@ fn a_fill_change_reports_the_media_section() {
 
     let diff = ConfigDiff::between(&running, &next);
     assert!(
-        diff.changed_sections.contains("media"),
-        "a fill change must ride the media restart-class section: {:?}",
+        diff.changed_sections.contains("media_fills"),
+        "a fill change must be reported as live job intent: {:?}",
         diff.changed_sections
     );
     assert!(
-        diff.changed_sections.len() == 1,
-        "{:?}",
+        !diff.changed_sections.contains("media"),
+        "a fill edit must NOT be restart-class media: {:?}",
         diff.changed_sections
+    );
+    assert_eq!(
+        diff.changed_sections.iter().copied().collect::<Vec<_>>(),
+        vec!["media_fills"],
+        "a lone fill edit is exactly one section"
     );
 
     // An unchanged fill set is not a diff.
     let same = ConfigDiff::between(&running, &running);
     assert!(same.is_empty(), "{same:?}");
+}
+
+#[test]
+fn a_player_change_still_reports_the_restart_class_media_section() {
+    let running = MultiviewConfig::load_from_toml(BASE_TOML).expect("running doc");
+    // Rename a declared player: the player set is restart-class, not job intent.
+    let next =
+        MultiviewConfig::load_from_toml(&BASE_TOML.replace("vt-2", "vt-3")).expect("next doc");
+
+    let diff = ConfigDiff::between(&running, &next);
+    assert!(
+        diff.changed_sections.contains("media"),
+        "a player change is restart-class media: {:?}",
+        diff.changed_sections
+    );
+    assert!(
+        !diff.changed_sections.contains("media_fills"),
+        "no fill changed, so media_fills must not fire: {:?}",
+        diff.changed_sections
+    );
+
+    // A fill edit and a player edit together report both sections (the renamed
+    // player id is replaced consistently in the player declaration and the
+    // fill that binds it, so only the two independent deltas remain).
+    let doc = format!("{BASE_TOML}{FULL_FILLS_TOML}");
+    let both_running = MultiviewConfig::load_from_toml(&doc).expect("running doc");
+    let both_next = MultiviewConfig::load_from_toml(
+        &doc.replace("minutes = 5", "minutes = 10")
+            .replace("vt-2", "vt-3"),
+    )
+    .expect("changed doc");
+    let both = ConfigDiff::between(&both_running, &both_next);
+    assert!(both.changed_sections.contains("media"), "{both:?}");
+    assert!(both.changed_sections.contains("media_fills"), "{both:?}");
 }
