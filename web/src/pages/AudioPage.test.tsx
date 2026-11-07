@@ -37,11 +37,29 @@ const ROUTING = {
   selectable_tracks: ["prog", "cam1-clean"],
 };
 
+/** An output currently selecting the discrete track the ROUTING document
+ * above declares (`cam1-clean`) — the fixture the pending-impact warning and
+ * the outputs_updated note exercise. */
+const OUTPUTS = [
+  {
+    id: "hls-out",
+    name: "HLS",
+    body: {
+      id: "hls-out",
+      kind: "hls",
+      path: "/tmp/out.m3u8",
+      codec: "h264",
+      audio: { mode: "tracks", tracks: ["prog", "cam1-clean"] },
+    },
+  },
+];
+
 /** The last PUT body + If-Match header the mock server saw. */
 let lastPut: { body: unknown; ifMatch: string | null } | undefined;
 
 const server = setupServer(
   http.get("*/api/v1/sources", () => HttpResponse.json(SOURCES)),
+  http.get("*/api/v1/outputs", () => HttpResponse.json(OUTPUTS)),
   http.get("*/api/v1/audio-routing", () =>
     HttpResponse.json(ROUTING, { headers: { ETag: 'W/"7"' } }),
   ),
@@ -171,5 +189,61 @@ describe("AudioPage", () => {
       expect(status).toHaveTextContent(/applied live/i);
     });
     expect(status).not.toHaveTextContent(/restart/i);
+  });
+
+  it("warns inline, BEFORE saving, that an output carrying the renamed track will be updated", async () => {
+    renderAudio();
+    const trackField = await screen.findByLabelText(/discrete track name/i);
+    await userEvent.clear(trackField);
+    await userEvent.type(trackField, "us-cnn");
+    // The warning appears before any save attempt.
+    const alert = await screen.findByRole("alert", {
+      name: /this save will update the following outputs/i,
+    });
+    expect(alert).toHaveTextContent(/HLS/);
+    expect(alert).toHaveTextContent(/cam1-clean/);
+    expect(alert).toHaveTextContent(/us-cnn/);
+    expect(lastPut).toBeUndefined();
+  });
+
+  it("shows no pending-impact warning when the edit does not touch a selected track", async () => {
+    renderAudio();
+    const rate = await screen.findByLabelText(/sample rate/i);
+    await userEvent.clear(rate);
+    await userEvent.type(rate, "44100");
+    expect(screen.queryByTestId("audio-pending-impact")).not.toBeInTheDocument();
+  });
+
+  it("shows the server's outputs_updated report as a success note after saving", async () => {
+    server.use(
+      http.put("*/api/v1/audio-routing", async ({ request }) => {
+        lastPut = {
+          body: await request.json(),
+          ifMatch: request.headers.get("if-match"),
+        };
+        return HttpResponse.json(
+          {
+            ...ROUTING,
+            configured: true,
+            outputs_updated: [
+              {
+                output: "hls-out",
+                removed: [],
+                renamed: [{ from: "cam1-clean", to: "us-cnn" }],
+              },
+            ],
+          },
+          { headers: { ETag: 'W/"8"', "X-Multiview-Apply": "restart" } },
+        );
+      }),
+    );
+    renderAudio();
+    const trackField = await screen.findByLabelText(/discrete track name/i);
+    await userEvent.clear(trackField);
+    await userEvent.type(trackField, "us-cnn");
+    await userEvent.click(screen.getByTestId("audio-save"));
+    const note = await screen.findByTestId("audio-outputs-updated-note");
+    expect(note).toHaveTextContent(/hls-out/);
+    expect(note).toHaveTextContent(/cam1-clean.*us-cnn/);
   });
 });

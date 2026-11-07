@@ -42,7 +42,31 @@ use crate::concurrency::{IfMatch, Version};
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
 use crate::typed_resources::{with_apply, ApplyMode};
-use multiview_config::{AudioRouting, PROGRAM_TRACK};
+use multiview_config::{propagate_routing_change, AudioRouting, PROGRAM_TRACK};
+
+/// One discrete-track rename a routing replace's propagation applied.
+#[derive(Debug, Clone, Serialize)]
+struct RenamedTrack {
+    /// The track name this output's selection carried before the replace.
+    from: String,
+    /// The name it now carries.
+    to: String,
+}
+
+/// One output a routing replace's rename/removal propagation rewrote
+/// (ADR-R005 §4.3), as reported to the caller: which discrete tracks it lost
+/// and which were renamed in place. Mirrors
+/// [`multiview_config::OutputAudioUpdate`], but named by the output's stable
+/// REST/API id (the config crate only knows the output's slot index).
+#[derive(Debug, Clone, Serialize)]
+struct OutputsUpdatedEntry {
+    /// The output's stable REST id (`/api/v1/outputs/{id}`).
+    output: String,
+    /// Track names dropped from this output's selection.
+    removed: Vec<String>,
+    /// Discrete tracks this output's selection now follows under a new name.
+    renamed: Vec<RenamedTrack>,
+}
 
 /// The wire envelope both verbs return: whether a document is configured, the
 /// document itself (`null` when unconfigured), and the **selectable tracks**
@@ -57,11 +81,24 @@ struct AudioRoutingState {
     routing: Option<AudioRouting>,
     /// `"prog"` + every declared discrete track, in declaration order.
     selectable_tracks: Vec<String>,
+    /// Outputs a successful `PUT`'s rename/removal propagation rewrote
+    /// (ADR-R005 §4.3), in output order. Always empty on `GET`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    outputs_updated: Vec<OutputsUpdatedEntry>,
 }
 
 impl AudioRoutingState {
-    /// Project a store snapshot onto the wire envelope.
+    /// Project a store snapshot onto the wire envelope (`GET`, or a `PUT` that
+    /// propagated nothing).
     fn from_snapshot(routing: Option<AudioRouting>) -> Self {
+        Self::from_snapshot_with_updates(routing, Vec::new())
+    }
+
+    /// Project a store snapshot plus the outputs a `PUT` rewrote.
+    fn from_snapshot_with_updates(
+        routing: Option<AudioRouting>,
+        outputs_updated: Vec<OutputsUpdatedEntry>,
+    ) -> Self {
         let selectable_tracks = routing.as_ref().map_or_else(
             || vec![PROGRAM_TRACK.to_owned()],
             |r| {
@@ -75,6 +112,7 @@ impl AudioRoutingState {
             configured: routing.is_some(),
             routing,
             selectable_tracks,
+            outputs_updated,
         }
     }
 }
@@ -82,6 +120,28 @@ impl AudioRoutingState {
 /// Attach the document `ETag` to a response carrying the routing state.
 fn state_response(status: StatusCode, routing: Option<AudioRouting>, version: Version) -> Response {
     let mut response = (status, Json(AudioRoutingState::from_snapshot(routing))).into_response();
+    if let Ok(value) = header::HeaderValue::from_str(&version.to_etag()) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+}
+
+/// Attach the document `ETag` to a `PUT` response, additionally reporting the
+/// outputs the rename/removal propagation rewrote.
+fn state_response_with_updates(
+    status: StatusCode,
+    routing: Option<AudioRouting>,
+    version: Version,
+    outputs_updated: Vec<OutputsUpdatedEntry>,
+) -> Response {
+    let mut response = (
+        status,
+        Json(AudioRoutingState::from_snapshot_with_updates(
+            routing,
+            outputs_updated,
+        )),
+    )
+        .into_response();
     if let Ok(value) = header::HeaderValue::from_str(&version.to_etag()) {
         response.headers_mut().insert(header::ETAG, value);
     }
@@ -148,6 +208,99 @@ pub(crate) async fn get_audio_routing(
     Ok(state_response(StatusCode::OK, routing, version))
 }
 
+/// Compute the rename/removal propagation (ADR-R005 §4.3) against the
+/// `prospective` config's outputs (mutated in place), enforcing per-object
+/// authorization on every output it would touch before returning. Returns the
+/// wire-shaped report for the response (empty when nothing was touched).
+///
+/// # Errors
+///
+/// [`ControlError::Forbidden`] naming every output the principal may not
+/// modify; [`ControlError::Repository`] if the output identity map is
+/// inconsistent with the prospective config (a bug, never a user error).
+fn apply_routing_propagation(
+    principal: &Principal,
+    old_routing: Option<&AudioRouting>,
+    routing: &AudioRouting,
+    prospective: &mut multiview_config::MultiviewConfig,
+    output_ids: &[String],
+) -> ControlResult<Vec<OutputsUpdatedEntry>> {
+    let updates = propagate_routing_change(old_routing, routing, &mut prospective.outputs);
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Per-object authorization (BOLA, ADR-W005/ADR-W026): every output this
+    // propagation touches must be one the caller may write, not merely the
+    // audio-routing singleton itself.
+    let mut denied: Vec<&str> = Vec::new();
+    let mut ids: Vec<&str> = Vec::with_capacity(updates.len());
+    for update in &updates {
+        let Some(output_id) = output_ids.get(update.output_index) else {
+            return Err(ControlError::Repository(
+                "output identity map is inconsistent with the prospective config".into(),
+            ));
+        };
+        if crate::auth::authorize_object(principal, output_id).is_err() {
+            denied.push(output_id);
+        }
+        ids.push(output_id);
+    }
+    if !denied.is_empty() {
+        return Err(ControlError::Forbidden(format!(
+            "this routing change would rename/remove discrete tracks on output(s) {denied:?}, \
+             which this principal is not authorized to modify; the routing document was not \
+             changed"
+        )));
+    }
+    Ok(updates
+        .iter()
+        .zip(ids)
+        .map(|(update, output_id)| OutputsUpdatedEntry {
+            output: output_id.to_owned(),
+            removed: update.removed.clone(),
+            renamed: update
+                .renamed
+                .iter()
+                .map(|(from, to)| RenamedTrack {
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+/// Best-effort sync of the legacy output-store projection for every output
+/// the propagation rewrote (mirrors `update_output`'s own warn-on-fail
+/// pattern): the accepted (desired) record is already authoritative and
+/// already carries the rewritten selection, so a failure here never reverts
+/// or blocks the response — only a stale read-model cache.
+fn sync_output_projections(state: &AppState, outputs_updated: &[OutputsUpdatedEntry]) {
+    for entry in outputs_updated {
+        let Ok(accepted) = crate::boot_model::accepted_resources(state, "outputs") else {
+            continue;
+        };
+        let Some(versioned) = accepted
+            .unwrap_or_default()
+            .into_iter()
+            .find(|resource| resource.resource.id == entry.output)
+        else {
+            continue;
+        };
+        let input = crate::resource_store::ResourceInput {
+            name: versioned.resource.name.clone(),
+            body: versioned.resource.body.clone(),
+        };
+        if let Err(error) = state.outputs.update(&entry.output, input) {
+            tracing::warn!(
+                output = %entry.output,
+                %error,
+                "audio-routing propagation committed; output store projection failed"
+            );
+        }
+    }
+}
+
 /// `PUT /api/v1/audio-routing` — replace the singleton document (role: write;
 /// `If-Match` required → `428`/`412`).
 #[cfg_attr(
@@ -180,15 +333,33 @@ pub(crate) async fn put_audio_routing(
     let _mutation = state.lock_config_mutation().await;
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a missing/stale `If-Match` is reported even when the body is invalid.
-    let (_, current) = crate::boot_model::accepted_audio(&state)?;
+    let (old_routing, current) = crate::boot_model::accepted_audio(&state)?;
     if_match.require(AUDIO_ROUTING_KIND, AUDIO_ROUTING_ID, current)?;
     let routing = validated_routing(&body)?;
     // Validate the entire prospective configuration and persist intent before
     // the store ETag or the live program-bus command can change.
+    //
+    // ADR-R005 §4.3 (the rename/removal deadlock fix): a routing replace that
+    // renames or drops a `target_track` an output's `audio.tracks` selects
+    // must rewrite that selection in the SAME atomic commit, never require the
+    // operator to stage an intermediate document by hand. Compute the
+    // propagation against the PROSPECTIVE config's outputs (the same document
+    // the new routing will be validated against) and reject up front, naming
+    // every affected output, if the caller lacks per-object authorization on
+    // any of them — before any store or file changes.
+    let mut outputs_updated: Vec<OutputsUpdatedEntry> = Vec::new();
     if state.boot_model.is_some() {
         let value = serde_json::to_value(&routing)
             .map_err(|e| ControlError::Repository(format!("audio serialization: {e}")))?;
-        let prospective = crate::boot_model::prospective_config(&state, "audio", value)?;
+        let mut prospective = crate::boot_model::prospective_config(&state, "audio", value)?;
+        let output_ids = crate::boot_model::output_ids_for_config(&state, &prospective)?;
+        outputs_updated = apply_routing_propagation(
+            &principal,
+            old_routing.as_ref(),
+            &routing,
+            &mut prospective,
+            &output_ids,
+        )?;
         crate::boot_model::commit_desired(
             &state,
             prospective,
@@ -210,6 +381,7 @@ pub(crate) async fn put_audio_routing(
         }
         tracing::warn!("accepted audio committed; store projection failed");
     }
+    sync_output_projections(&state, &outputs_updated);
     // The committed candidate is already validated. Never let a fallible
     // read of the projection or envelope suppress publication to the live bus.
     state.audit(
@@ -219,6 +391,15 @@ pub(crate) async fn put_audio_routing(
         AUDIO_ROUTING_ID,
         serde_json::to_value(&routing).ok(),
     );
+    for entry in &outputs_updated {
+        state.audit(
+            &principal.key_id,
+            AuditAction::Update,
+            crate::resource_store::OUTPUT_KIND,
+            &entry.output,
+            None,
+        );
+    }
     // Hand the new table to the running bus's bounded mailbox (wait-free; the
     // bake consumer applies it at its next tick). Never touches the bus here.
     let mode = match state.live_apply.audio_routing.as_ref() {
@@ -234,6 +415,6 @@ pub(crate) async fn put_audio_routing(
     })?;
     Ok(with_apply(
         mode,
-        state_response(StatusCode::OK, Some(routing), version),
+        state_response_with_updates(StatusCode::OK, Some(routing), version, outputs_updated),
     ))
 }

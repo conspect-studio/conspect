@@ -11,6 +11,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { UseMutationResult, UseQueryResult } from '@tanstack/react-query';
 
 import { getStoredToken } from '../api/token';
+import { listResources } from './api';
 import { ApiError } from './queries';
 import { AUDIO_CHANNELS } from './audioForms';
 import type {
@@ -18,6 +19,29 @@ import type {
   AudioRouteDocument,
   AudioRoutingDocument,
 } from './audioForms';
+
+/** One discrete-track rename a routing `PUT`'s propagation applied. */
+export interface RenamedTrack {
+  /** The track name the output's selection carried before the replace. */
+  readonly from: string;
+  /** The name it now carries. */
+  readonly to: string;
+}
+
+/**
+ * One output a routing `PUT`'s rename/removal propagation rewrote
+ * (ADR-R005 §4.3): the server already rewrote the output's `audio.tracks`
+ * selection in the SAME atomic commit as the routing replace — this entry is
+ * purely informational (what changed), never something the UI must re-apply.
+ */
+export interface OutputsUpdatedEntry {
+  /** The output's stable id (`/api/v1/outputs/{id}`). */
+  readonly output: string;
+  /** Track names dropped from this output's selection. */
+  readonly removed: readonly string[];
+  /** Discrete tracks this output's selection now follows under a new name. */
+  readonly renamed: readonly RenamedTrack[];
+}
 
 /** The wire envelope of `GET`/`PUT /api/v1/audio-routing`. */
 export interface AudioRoutingState {
@@ -27,6 +51,11 @@ export interface AudioRoutingState {
   readonly routing: AudioRoutingDocument | null;
   /** `"prog"` + every declared discrete track, in declaration order. */
   readonly selectable_tracks: readonly string[];
+  /**
+   * Outputs a successful `PUT`'s rename/removal propagation rewrote, in
+   * output order. Absent/empty on `GET`, or a `PUT` that propagated nothing.
+   */
+  readonly outputs_updated?: readonly OutputsUpdatedEntry[];
 }
 
 /** The envelope plus the `ETag` the server stamped it with. */
@@ -90,13 +119,31 @@ function isRoutingDocument(value: unknown): value is AudioRoutingDocument {
 }
 
 /** Structural guard for the wire envelope. */
+function isRenamedTrack(value: unknown): value is RenamedTrack {
+  return isRecord(value) && typeof value.from === 'string' && typeof value.to === 'string';
+}
+
+function isOutputsUpdatedEntry(value: unknown): value is OutputsUpdatedEntry {
+  return (
+    isRecord(value) &&
+    typeof value.output === 'string' &&
+    Array.isArray(value.removed) &&
+    value.removed.every((track) => typeof track === 'string') &&
+    Array.isArray(value.renamed) &&
+    value.renamed.every(isRenamedTrack)
+  );
+}
+
 export function isAudioRoutingState(value: unknown): value is AudioRoutingState {
   return (
     isRecord(value) &&
     typeof value.configured === 'boolean' &&
     (value.routing === null || isRoutingDocument(value.routing)) &&
     Array.isArray(value.selectable_tracks) &&
-    value.selectable_tracks.every((track) => typeof track === 'string')
+    value.selectable_tracks.every((track) => typeof track === 'string') &&
+    (value.outputs_updated === undefined ||
+      (Array.isArray(value.outputs_updated) &&
+        value.outputs_updated.every(isOutputsUpdatedEntry)))
   );
 }
 
@@ -247,6 +294,61 @@ export function useSaveAudioRouting(
     },
     onSettled: (): void => {
       void queryClient.invalidateQueries({ queryKey: audioRoutingKey });
+    },
+  });
+}
+
+/**
+ * One output's audio selection, read directly from its raw resource body
+ * (`GET /api/v1/outputs`) rather than the typed {@link OutputView} (which
+ * does not carry `audio`) — used ONLY to compute the Audio page's pre-save
+ * warning (which outputs currently carry a track the operator is about to
+ * rename or remove).
+ */
+export interface OutputAudioSelection {
+  /** The output's stable id. */
+  readonly id: string;
+  /** The output's operator label. */
+  readonly name: string;
+  /** The selected tracks when `mode = "tracks"`; empty otherwise. */
+  readonly tracks: readonly string[];
+}
+
+function isTrackList(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+/** Project a raw output body's `audio.tracks` list, or `[]` when absent. */
+function tracksFromBody(body: Record<string, unknown>): readonly string[] {
+  const audio = body.audio;
+  if (!isRecord(audio) || audio.mode !== 'tracks') {
+    return [];
+  }
+  return isTrackList(audio.tracks) ? audio.tracks : [];
+}
+
+/**
+ * List every output's current discrete-track selection (best-effort; a
+ * fetch failure degrades to an empty list rather than blocking the Audio
+ * page, which has its own primary read).
+ */
+export function useOutputAudioSelections(): UseQueryResult<
+  readonly OutputAudioSelection[],
+  ApiError
+> {
+  return useQuery<readonly OutputAudioSelection[], ApiError>({
+    queryKey: ['outputs', 'audio-selections'],
+    queryFn: async (): Promise<readonly OutputAudioSelection[]> => {
+      try {
+        const records = await listResources('outputs');
+        return records.map((record) => ({
+          id: record.id,
+          name: record.name,
+          tracks: tracksFromBody(record.body),
+        }));
+      } catch (error) {
+        throw toApiError(error);
+      }
     },
   });
 }

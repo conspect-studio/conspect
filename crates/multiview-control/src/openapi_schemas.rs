@@ -1281,6 +1281,33 @@ pub struct AudioRoutingDoc {
     pub routes: Vec<AudioRouteDoc>,
 }
 
+/// One discrete-track rename a routing `PUT`'s propagation applied to an
+/// output (ADR-R005 §4.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct RenamedTrackDoc {
+    /// The track name the output's selection carried before the replace.
+    pub from: String,
+    /// The name it now carries.
+    pub to: String,
+}
+
+/// One output a routing `PUT`'s rename/removal propagation rewrote
+/// (ADR-R005 §4.3): a renamed or removed discrete `target_track` the output's
+/// `mode = "tracks"` selection carried is rewritten in the SAME atomic commit
+/// as the routing replace — never left dangling, never requiring a
+/// hand-staged intermediate PUT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct OutputsUpdatedEntryDoc {
+    /// The output's stable REST id (`/api/v1/outputs/{id}`).
+    pub output: String,
+    /// Track names dropped from this output's selection.
+    pub removed: Vec<String>,
+    /// Discrete tracks this output's selection now follows under a new name.
+    pub renamed: Vec<RenamedTrackDoc>,
+}
+
 /// The response envelope of `GET`/`PUT /api/v1/audio-routing`.
 ///
 /// The GET is **404-free**: an unconfigured deployment answers
@@ -1296,6 +1323,10 @@ pub struct AudioRoutingStateDoc {
     /// `"prog"` + every declared discrete track, in declaration order — the
     /// set per-output `audio.tracks` selections resolve against.
     pub selectable_tracks: Vec<String>,
+    /// Outputs a successful `PUT`'s rename/removal propagation rewrote
+    /// (ADR-R005 §4.3), in output order. Always empty on `GET`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs_updated: Vec<OutputsUpdatedEntryDoc>,
 }
 
 /// `OpenAPI` mirror of `multiview_config::Output` (tagged by `kind`) — the body

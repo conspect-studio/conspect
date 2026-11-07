@@ -19,6 +19,7 @@ import type { ColumnDef } from '@tanstack/react-table';
 
 import { OutputFromDeviceSection } from '../devices/FromDevice';
 import { useOutputs } from '../resources/queries';
+import { useAudioRouting } from '../resources/audioRouting';
 import type { SaveResourceVars } from '../resources/queries';
 import type { OutputKind, OutputView } from '../resources/types';
 import { OUTPUT_KINDS } from '../resources/types';
@@ -27,6 +28,7 @@ import {
   OUTPUT_RUNNABLE,
   outputFormFromRecord,
   outputFormToBody,
+  parseTrackList,
   PIN_VENDORS,
   validateOutputForm,
 } from '../resources/forms';
@@ -45,6 +47,7 @@ import {
   CheckboxField,
   DerivedUrlField,
   ExportConfigButton,
+  FieldErrorMessage,
   FormField,
   SecretField,
   SelectField,
@@ -556,15 +559,111 @@ function CodecFields({
   );
 }
 
+/**
+ * The discrete-track picker for `audioMode = 'tracks'`: when the current
+ * audio-routing document's `selectable_tracks` are known, offer ONLY those as
+ * checkboxes (the Outputs page must never let an operator select a track
+ * that does not currently exist — AUD-9). A track this output already
+ * carries but the routing document no longer declares (stale after an
+ * external edit) is still shown, checked, so editing never silently drops it;
+ * it is clearly distinguished as unknown. Falls back to the legacy free-text
+ * comma list only while the routing document has not loaded yet.
+ */
+function AudioTracksField({
+  form,
+  setForm,
+  error,
+  selectableTracks,
+}: {
+  readonly form: OutputFormState;
+  readonly setForm: (next: OutputFormState) => void;
+  readonly error: FieldErrors<OutputField>['audioTracks'];
+  readonly selectableTracks: readonly string[] | undefined;
+}): JSX.Element {
+  const { t } = useLingui();
+  if (selectableTracks === undefined) {
+    return (
+      <FormField
+        id="output-audio-tracks"
+        label={t`Tracks (comma-separated)`}
+        value={form.audioTracks}
+        placeholder="prog, commentary"
+        error={error}
+        hint={
+          <Trans>
+            Names declared by the audio routing block; the program bus is
+            always available as "prog".
+          </Trans>
+        }
+        onChange={(next): void => {
+          setForm({ ...form, audioTracks: next });
+        }}
+      />
+    );
+  }
+  const selected = parseTrackList(form.audioTracks);
+  const unknownSelected = selected.filter((track) => !selectableTracks.includes(track));
+  const options = [...selectableTracks, ...unknownSelected];
+  const toggle = (track: string, checked: boolean): void => {
+    const next = checked
+      ? [...selected, track]
+      : selected.filter((existing) => existing !== track);
+    setForm({ ...form, audioTracks: next.join(', ') });
+  };
+  return (
+    <fieldset className="flex flex-col gap-1">
+      <legend className="text-sm font-medium">
+        <Trans>Tracks</Trans>
+      </legend>
+      {options.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          <Trans>No tracks declared yet on the Audio page.</Trans>
+        </p>
+      ) : (
+        options.map((track) => (
+          <div key={track} className="flex items-center gap-2">
+            <CheckboxField
+              id={`output-audio-track-${track}`}
+              label={track}
+              checked={selected.includes(track)}
+              onChange={(checked): void => {
+                toggle(track, checked);
+              }}
+            />
+            {unknownSelected.includes(track) ? (
+              <span className="text-xs text-destructive">
+                <Trans>not currently declared</Trans>
+              </span>
+            ) : null}
+          </div>
+        ))
+      )}
+      {error !== undefined ? (
+        <p role="alert" className="text-sm text-destructive">
+          <FieldErrorMessage code={error} />
+        </p>
+      ) : null}
+      <p className="text-xs text-muted-foreground">
+        <Trans>
+          Names declared by the audio routing block; the program bus is
+          always available as "prog".
+        </Trans>
+      </p>
+    </fieldset>
+  );
+}
+
 /** The collapsible Advanced block (audio selection + GPU pin). */
 function OutputAdvancedFields({
   form,
   setForm,
   errors,
+  selectableTracks,
 }: {
   readonly form: OutputFormState;
   readonly setForm: (next: OutputFormState) => void;
   readonly errors: FieldErrors<OutputField>;
+  readonly selectableTracks: readonly string[] | undefined;
 }): JSX.Element {
   const { t } = useLingui();
   const audioLabel = (choice: OutputAudioChoice): JSX.Element => {
@@ -589,21 +688,11 @@ function OutputAdvancedFields({
         }}
       />
       {form.audioMode === 'tracks' ? (
-        <FormField
-          id="output-audio-tracks"
-          label={t`Tracks (comma-separated)`}
-          value={form.audioTracks}
-          placeholder="prog, commentary"
+        <AudioTracksField
+          form={form}
+          setForm={setForm}
           error={errors.audioTracks}
-          hint={
-            <Trans>
-              Names declared by the audio routing block; the program bus is
-              always available as "prog".
-            </Trans>
-          }
-          onChange={(next): void => {
-            setForm({ ...form, audioTracks: next });
-          }}
+          selectableTracks={selectableTracks}
         />
       ) : null}
       <CheckboxField
@@ -645,6 +734,8 @@ function OutputAdvancedFields({
 export function OutputsPage(): JSX.Element {
   const { t } = useLingui();
   const outputs = useOutputs();
+  const routing = useAudioRouting();
+  const selectableTracks = routing.data?.state.selectable_tracks;
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
   const playbackCollisions = hlsPlaybackCollisionIds(outputs.data ?? []);
 
@@ -814,7 +905,12 @@ export function OutputsPage(): JSX.Element {
           <RunnabilityNote kind={form.kind} />
           <OutputKindFields form={form} setForm={setForm} errors={errors} />
           <CodecFields form={form} setForm={setForm} errors={errors} />
-          <OutputAdvancedFields form={form} setForm={setForm} errors={errors} />
+          <OutputAdvancedFields
+            form={form}
+            setForm={setForm}
+            errors={errors}
+            selectableTracks={selectableTracks}
+          />
         </>
       )}
     />

@@ -344,6 +344,8 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::openapi_schemas::AudioRouteDoc,
         crate::openapi_schemas::AudioRoutingDoc,
         crate::openapi_schemas::AudioRoutingStateDoc,
+        crate::openapi_schemas::OutputsUpdatedEntryDoc,
+        crate::openapi_schemas::RenamedTrackDoc,
         crate::openapi_schemas::OverlayBodyDoc,
         crate::openapi_schemas::ProbeBodyDoc,
         crate::openapi_schemas::ProbeKindDoc,

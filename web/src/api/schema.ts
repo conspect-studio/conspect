@@ -2688,6 +2688,11 @@ export interface components {
         AudioRoutingStateDoc: {
             /** @description Whether an audio-routing document is configured. */
             configured: boolean;
+            /**
+             * @description Outputs a successful `PUT`'s rename/removal propagation rewrote
+             *     (ADR-R005 §4.3), in output order. Always empty on `GET`.
+             */
+            outputs_updated?: components["schemas"]["OutputsUpdatedEntryDoc"][];
             routing?: null | components["schemas"]["AudioRoutingDoc"];
             /**
              * @description `"prog"` + every declared discrete track, in declaration order — the
@@ -4270,6 +4275,21 @@ export interface components {
             id3?: boolean;
         };
         /**
+         * @description One output a routing `PUT`'s rename/removal propagation rewrote
+         *     (ADR-R005 §4.3): a renamed or removed discrete `target_track` the output's
+         *     `mode = "tracks"` selection carried is rewritten in the SAME atomic commit
+         *     as the routing replace — never left dangling, never requiring a
+         *     hand-staged intermediate PUT.
+         */
+        OutputsUpdatedEntryDoc: {
+            /** @description The output's stable REST id (`/api/v1/outputs/{id}`). */
+            output: string;
+            /** @description Track names dropped from this output's selection. */
+            removed: string[];
+            /** @description Discrete tracks this output's selection now follows under a new name. */
+            renamed: components["schemas"]["RenamedTrackDoc"][];
+        };
+        /**
          * @description `OpenAPI` mirror of `multiview_config::Overlay` — the body accepted by
          *     `POST`/`PUT /api/v1/overlays/{id}`.
          *
@@ -4586,6 +4606,16 @@ export interface components {
         RelaySetRequest: {
             /** @description Whether this machine should relay neighbours' heartbeats (brief §9.2). */
             enabled: boolean;
+        };
+        /**
+         * @description One discrete-track rename a routing `PUT`'s propagation applied to an
+         *     output (ADR-R005 §4.3).
+         */
+        RenamedTrackDoc: {
+            /** @description The track name the output's selection carried before the replace. */
+            from: string;
+            /** @description The name it now carries. */
+            to: string;
         };
         /** @description The `POST /api/v1/support/tickets/{id}/reply` request body. */
         ReplyRequest: {
