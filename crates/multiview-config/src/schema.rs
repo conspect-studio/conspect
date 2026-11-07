@@ -2738,6 +2738,26 @@ impl Output {
         }
     }
 
+    /// Mutable access to the per-output audio selection (ADR-R005 §4.3: a
+    /// routing rename/removal must rewrite every referencing output's
+    /// selection in the SAME atomic commit — see
+    /// `multiview_config::audio::propagate_routing_change`).
+    pub fn audio_mut(&mut self) -> &mut Option<OutputAudio> {
+        match self {
+            Output::RtspServer { audio, .. }
+            | Output::LlHls { audio, .. }
+            | Output::Hls { audio, .. }
+            | Output::Ndi { audio, .. }
+            | Output::Rtmp { audio, .. }
+            | Output::Srt { audio, .. }
+            | Output::Rist { audio, .. }
+            | Output::Webrtc { audio, .. }
+            | Output::WhipPush { audio, .. }
+            | Output::Aes67 { audio, .. }
+            | Output::Display { audio, .. } => audio,
+        }
+    }
+
     /// The per-output **metadata intent** ([`OutputMetadata`], ADR-0088), if
     /// any. `None` ⇒ the engine's honest defaults (a derived title, the canvas
     /// language/color tags).

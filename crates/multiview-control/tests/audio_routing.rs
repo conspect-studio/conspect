@@ -505,6 +505,8 @@ fn openapi_document_lists_the_audio_routing_surface() {
         "AudioRouteDoc",
         "AudioRoutingDoc",
         "AudioRoutingStateDoc",
+        "OutputsUpdatedEntryDoc",
+        "RenamedTrackDoc",
     ] {
         assert!(
             api["components"]["schemas"].get(schema).is_some(),
@@ -514,6 +516,37 @@ fn openapi_document_lists_the_audio_routing_surface() {
     let routes: Vec<(&str, &str)> = ApiDoc::rest_routes().to_vec();
     assert!(routes.contains(&("GET", "/api/v1/audio-routing")));
     assert!(routes.contains(&("PUT", "/api/v1/audio-routing")));
+}
+
+/// The `AudioRoutingStateDoc` mirror accepts the response envelope both with
+/// and without `outputs_updated` (absent ⇒ a plain `GET`/no-propagation
+/// `PUT`; present ⇒ the rename/removal report), matching the server's
+/// `skip_serializing_if = "Vec::is_empty"` field.
+#[test]
+fn audio_routing_state_doc_accepts_outputs_updated_present_or_absent() {
+    use multiview_control::openapi_schemas::AudioRoutingStateDoc;
+
+    let without: Result<AudioRoutingStateDoc, _> = serde_json::from_value(json!({
+        "configured": false,
+        "routing": null,
+        "selectable_tracks": ["prog"]
+    }));
+    assert!(without.is_ok(), "{:?}", without.err());
+
+    let with: Result<AudioRoutingStateDoc, _> = serde_json::from_value(json!({
+        "configured": true,
+        "routing": { "sample_rate_hz": 48_000, "routes": [] },
+        "selectable_tracks": ["prog"],
+        "outputs_updated": [
+            { "output": "output-0", "removed": ["au-abc"], "renamed": [{ "from": "x", "to": "y" }] }
+        ]
+    }));
+    assert!(with.is_ok(), "{:?}", with.err());
+    let state = with.unwrap();
+    assert_eq!(state.outputs_updated.len(), 1);
+    assert_eq!(state.outputs_updated[0].output, "output-0");
+    assert_eq!(state.outputs_updated[0].renamed[0].from, "x");
+    assert_eq!(state.outputs_updated[0].renamed[0].to, "y");
 }
 
 #[tokio::test]

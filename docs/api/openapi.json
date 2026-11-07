@@ -11036,6 +11036,13 @@
             "type": "boolean",
             "description": "Whether an audio-routing document is configured."
           },
+          "outputs_updated": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OutputsUpdatedEntryDoc"
+            },
+            "description": "Outputs a successful `PUT`'s rename/removal propagation rewrote\n(ADR-R005 §4.3), in output order. Always empty on `GET`."
+          },
           "routing": {
             "oneOf": [
               {
@@ -15205,6 +15212,35 @@
         },
         "additionalProperties": false
       },
+      "OutputsUpdatedEntryDoc": {
+        "type": "object",
+        "description": "One output a routing `PUT`'s rename/removal propagation rewrote\n(ADR-R005 §4.3): a renamed or removed discrete `target_track` the output's\n`mode = \"tracks\"` selection carried is rewritten in the SAME atomic commit\nas the routing replace — never left dangling, never requiring a\nhand-staged intermediate PUT.",
+        "required": [
+          "output",
+          "removed",
+          "renamed"
+        ],
+        "properties": {
+          "output": {
+            "type": "string",
+            "description": "The output's stable REST id (`/api/v1/outputs/{id}`)."
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Track names dropped from this output's selection."
+          },
+          "renamed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RenamedTrackDoc"
+            },
+            "description": "Discrete tracks this output's selection now follows under a new name."
+          }
+        }
+      },
       "OverlayBodyDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of `multiview_config::Overlay` — the body accepted by\n`POST`/`PUT /api/v1/overlays/{id}`.\n\nOverlay kinds carry a large, kind-dependent parameter set captured verbatim\n(lossless round-trip), so the schema documents the common envelope and\nleaves the per-kind extras additive.",
@@ -15850,6 +15886,24 @@
           }
         },
         "additionalProperties": false
+      },
+      "RenamedTrackDoc": {
+        "type": "object",
+        "description": "One discrete-track rename a routing `PUT`'s propagation applied to an\noutput (ADR-R005 §4.3).",
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "The track name the output's selection carried before the replace."
+          },
+          "to": {
+            "type": "string",
+            "description": "The name it now carries."
+          }
+        }
       },
       "ReplacedCell": {
         "type": "object",

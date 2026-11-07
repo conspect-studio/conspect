@@ -14,7 +14,8 @@
 )]
 
 use multiview_config::{
-    AudioChannels, AudioRouting, ConfigError, MultiviewConfig, OutputAudio, OutputAudioMode,
+    propagate_routing_change, AudioChannels, AudioRouting, ConfigError, MultiviewConfig,
+    OutputAudio, OutputAudioMode,
 };
 
 /// A complete, valid document carrying a program bus + two discrete tracks and a
@@ -316,4 +317,136 @@ fn resolve_honours_program_and_tracks_modes() {
     let program: OutputAudio =
         serde_json::from_value(serde_json::json!({ "mode": "program" })).expect("program");
     assert_eq!(program.resolve(&["trk_a"]), (true, Vec::<&str>::new()));
+}
+
+/// A renamed `target_track` (same `input_id`, different track name) must
+/// rewrite an output's `mode = "tracks"` selection in the SAME atomic commit
+/// as the routing replace (ADR-R005 §4.3 — the preferred deadlock fix).
+#[test]
+fn propagate_routing_change_rewrites_a_renamed_track_in_every_referencing_output() {
+    let mut cfg = parse(BASE);
+    let old_audio = cfg.audio.clone();
+    // Rename cam_a's discrete track trk_a -> trk_z (same input_id, new name).
+    let new_doc = BASE.replace(r#"target_track = "trk_a""#, r#"target_track = "trk_z""#);
+    let new_cfg = parse(&new_doc);
+    let new_audio = new_cfg.audio.clone().expect("new audio block");
+
+    let updates = propagate_routing_change(old_audio.as_ref(), &new_audio, &mut cfg.outputs);
+
+    assert_eq!(updates.len(), 1, "exactly one output referenced trk_a");
+    assert_eq!(
+        updates[0].renamed,
+        vec![("trk_a".to_owned(), "trk_z".to_owned())]
+    );
+    assert_eq!(updates[0].removed, Vec::<String>::new());
+
+    let selection = cfg.outputs[0].audio().expect("audio selection");
+    assert_eq!(
+        selection.tracks,
+        vec!["prog".to_owned(), "trk_z".to_owned(), "trk_b".to_owned()],
+        "the renamed track replaces the old name in place"
+    );
+
+    // The rewritten output now validates against the NEW routing document.
+    cfg.audio = Some(new_audio);
+    cfg.validate().expect("rewritten output validates");
+}
+
+/// Removing a route's discrete track (or the whole route) must drop that
+/// track from every output selection that referenced it.
+#[test]
+fn propagate_routing_change_drops_a_removed_track_from_every_referencing_output() {
+    let mut cfg = parse(BASE);
+    let old_audio = cfg.audio.clone();
+    // cam_b no longer declares a discrete track at all.
+    let new_doc = BASE.replace(
+        r#"target_track = "trk_b"
+language = "deu""#,
+        r#"language = "deu""#,
+    );
+    let new_cfg = parse(&new_doc);
+    let new_audio = new_cfg.audio.clone().expect("new audio block");
+
+    let updates = propagate_routing_change(old_audio.as_ref(), &new_audio, &mut cfg.outputs);
+
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].removed, vec!["trk_b".to_owned()]);
+    assert_eq!(updates[0].renamed, Vec::<(String, String)>::new());
+
+    let selection = cfg.outputs[0].audio().expect("audio selection");
+    assert_eq!(
+        selection.tracks,
+        vec!["prog".to_owned(), "trk_a".to_owned()],
+        "the removed track is dropped, the rest survives"
+    );
+
+    cfg.audio = Some(new_audio);
+    cfg.validate().expect("rewritten output validates");
+}
+
+/// An output whose selection would become empty after removal falls back to
+/// `["prog"]` rather than landing an invalid empty `mode = "tracks"` list.
+#[test]
+fn propagate_routing_change_falls_back_to_prog_when_a_selection_would_empty() {
+    let doc = BASE.replace(
+        r#"tracks = ["prog", "trk_a", "trk_b"]"#,
+        r#"tracks = ["trk_a", "trk_b"]"#,
+    );
+    let mut cfg = parse(&doc);
+    let old_audio = cfg.audio.clone();
+    // Remove BOTH discrete tracks (no target_track on either route).
+    let new_doc = doc
+        .replace(
+            r#"target_track = "trk_a"
+language = "eng""#,
+            r#"language = "eng""#,
+        )
+        .replace(
+            r#"target_track = "trk_b"
+language = "deu""#,
+            r#"language = "deu""#,
+        );
+    let new_cfg = parse(&new_doc);
+    let new_audio = new_cfg.audio.clone().expect("new audio block");
+
+    let updates = propagate_routing_change(old_audio.as_ref(), &new_audio, &mut cfg.outputs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(
+        updates[0].removed,
+        vec!["trk_a".to_owned(), "trk_b".to_owned()]
+    );
+
+    let selection = cfg.outputs[0].audio().expect("audio selection");
+    assert_eq!(
+        selection.tracks,
+        vec!["prog".to_owned()],
+        "an emptied tracks list falls back to the program bus"
+    );
+
+    cfg.audio = Some(new_audio);
+    cfg.validate().expect("fallback selection validates");
+}
+
+/// No routing change at all (identical document) yields no updates and
+/// touches no output.
+#[test]
+fn propagate_routing_change_is_a_no_op_when_nothing_changed() {
+    let mut cfg = parse(BASE);
+    let audio = cfg.audio.clone().expect("audio block");
+    let before = cfg.outputs.clone();
+    let updates = propagate_routing_change(Some(&audio), &audio, &mut cfg.outputs);
+    assert_eq!(updates.len(), 0);
+    assert_eq!(cfg.outputs, before);
+}
+
+/// A first-ever routing document (`old = None`) has nothing to propagate
+/// against — it can declare any tracks without touching existing outputs.
+#[test]
+fn propagate_routing_change_with_no_prior_document_is_a_no_op() {
+    let mut cfg = parse(BASE);
+    let audio = cfg.audio.clone().expect("audio block");
+    let before = cfg.outputs.clone();
+    let updates = propagate_routing_change(None, &audio, &mut cfg.outputs);
+    assert_eq!(updates.len(), 0);
+    assert_eq!(cfg.outputs, before);
 }

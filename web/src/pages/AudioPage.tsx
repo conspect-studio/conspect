@@ -16,13 +16,19 @@ import { Trans, useLingui } from '@lingui/react/macro';
 import { Plus, Trash2 } from 'lucide-react';
 
 import { useSources } from '../resources/queries';
-import { useAudioRouting, useSaveAudioRouting } from '../resources/audioRouting';
+import {
+  useAudioRouting,
+  useOutputAudioSelections,
+  useSaveAudioRouting,
+} from '../resources/audioRouting';
+import type { OutputsUpdatedEntry } from '../resources/audioRouting';
 import {
   audioFormFromDocument,
   audioFormToDocument,
   AUDIO_CHANNELS,
   declaredTracks,
   emptyAudioRoute,
+  pendingTrackImpacts,
   PROGRAM_TRACK,
   validateAudioForm,
 } from '../resources/audioForms';
@@ -31,6 +37,7 @@ import type {
   AudioFormErrors,
   AudioFormState,
   AudioRouteRow,
+  PendingTrackImpact,
 } from '../resources/audioForms';
 import {
   ApplySemanticsCallout,
@@ -276,11 +283,88 @@ function SelectableTracks({ form }: { readonly form: AudioFormState }): JSX.Elem
   );
 }
 
+/**
+ * BEFORE-save warning (ADR-R005 §4.3 UX): an output currently carries a track
+ * the edited form is about to rename or remove. The save itself is no longer
+ * blocked (the server propagates the change atomically), but the operator
+ * should see which outputs will be rewritten before clicking Save.
+ */
+function PendingTrackWarning({
+  impacts,
+}: {
+  readonly impacts: readonly PendingTrackImpact[];
+}): JSX.Element | null {
+  if (impacts.length === 0) {
+    return null;
+  }
+  return (
+    <section
+      role="alert"
+      aria-labelledby="audio-pending-impact-heading"
+      className="rounded-md border border-amber-500/60 bg-amber-500/10 p-4 text-sm"
+    >
+      <h2 id="audio-pending-impact-heading" className="font-medium">
+        <Trans>This save will update the following outputs</Trans>
+      </h2>
+      <ul className="mt-2 flex flex-col gap-1">
+        {impacts.map((impact) => (
+          <li key={impact.outputId} data-testid="audio-pending-impact">
+            {impact.renamed.map(([from, to]) => (
+              <span key={`${from}->${to}`} className="block">
+                <Trans>
+                  Output "{impact.outputName}" carries track {from}; it will be
+                  updated to {to}.
+                </Trans>
+              </span>
+            ))}
+            {impact.removed.map((track) => (
+              <span key={track} className="block">
+                <Trans>
+                  Output "{impact.outputName}" carries track {track}; it will
+                  be removed from its selection.
+                </Trans>
+              </span>
+            ))}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** AFTER-save note: the server's description of every output the rename/
+ * removal propagation actually rewrote (authoritative — this is what
+ * happened, not a client-side prediction). */
+function OutputsUpdatedNote({
+  entries,
+}: {
+  readonly entries: readonly OutputsUpdatedEntry[];
+}): JSX.Element | null {
+  if (entries.length === 0) {
+    return null;
+  }
+  return (
+    <p role="status" data-testid="audio-outputs-updated-note" className="text-sm text-muted-foreground">
+      <Trans>Updated outputs:</Trans>{' '}
+      {entries
+        .map((entry) => {
+          const parts: string[] = [
+            ...entry.renamed.map((r) => `${r.from} → ${r.to}`),
+            ...entry.removed.map((track) => `${track} removed`),
+          ];
+          return `${entry.output} (${parts.join(', ')})`;
+        })
+        .join('; ')}
+    </p>
+  );
+}
+
 /** Audio routing management (the document the per-output selections resolve against). */
 export function AudioPage(): JSX.Element {
   const { t } = useLingui();
   const sources = useSources();
   const routing = useAudioRouting();
+  const outputSelections = useOutputAudioSelections();
   const save = useSaveAudioRouting();
 
   // The operator's edits own the form once they start; until then the form is
@@ -292,6 +376,9 @@ export function AudioPage(): JSX.Element {
   const [errors, setErrors] = useState<AudioFormErrors | undefined>(undefined);
   const [status, setStatus] = useState<'idle' | 'live' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = useState<string | undefined>(undefined);
+  const [outputsUpdated, setOutputsUpdated] = useState<
+    readonly OutputsUpdatedEntry[]
+  >([]);
 
   const form =
     edited ??
@@ -302,9 +389,19 @@ export function AudioPage(): JSX.Element {
 
   const sourceIds = (sources.data ?? []).map((source) => source.id);
 
+  // The document currently on the server (unedited) — the baseline the
+  // pending-impact warning diffs the operator's in-progress edits against.
+  const serverForm =
+    routing.data !== undefined ? audioFormFromDocument(routing.data.state.routing) : undefined;
+  const pendingImpacts =
+    form !== undefined && serverForm !== undefined && outputSelections.data !== undefined
+      ? pendingTrackImpacts(serverForm, form, outputSelections.data)
+      : [];
+
   const update = (next: AudioFormState): void => {
     setEdited(next);
     setStatus('idle');
+    setOutputsUpdated([]);
     if (errors !== undefined) {
       setErrors(validateAudioForm(next));
     }
@@ -327,6 +424,7 @@ export function AudioPage(): JSX.Element {
           setSavedEtag(result.etag);
           setStatus(result.apply === 'live' ? 'live' : 'saved');
           setSaveError(undefined);
+          setOutputsUpdated(result.state.outputs_updated ?? []);
         },
         onError: (error): void => {
           setStatus('error');
@@ -480,6 +578,8 @@ export function AudioPage(): JSX.Element {
             </TableBody>
           </Table>
 
+          <PendingTrackWarning impacts={pendingImpacts} />
+
           <div className="flex flex-wrap items-center gap-2">
             <Button
               type="button"
@@ -525,6 +625,7 @@ export function AudioPage(): JSX.Element {
               ) : null}
             </p>
           </div>
+          <OutputsUpdatedNote entries={outputsUpdated} />
 
           <SelectableTracks form={form} />
 

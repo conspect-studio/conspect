@@ -69,8 +69,9 @@ use multiview_core::stream::StreamKind as CoreStreamKind;
 pub use api::{ApiConfig, ApiKeyConfig, ApiKeyRole};
 use audio::PROGRAM_TRACK as PROGRAM_TRACK_NAME;
 pub use audio::{
-    AudioChannels, AudioRoute, AudioRouting, OutputAudio, OutputAudioCapability, OutputAudioMode,
-    TrackCapacity, TrackDelivery, PROGRAM_TRACK,
+    diff_track_changes, propagate_routing_change, AudioChannels, AudioRoute, AudioRouting,
+    OutputAudio, OutputAudioCapability, OutputAudioMode, OutputAudioUpdate, TrackCapacity,
+    TrackDelivery, PROGRAM_TRACK,
 };
 pub use device::{Device, DeviceAuth, DeviceDisplay, DeviceDriver, DisplayAssign, ReconnectPolicy};
 pub use diff::{ConfigDiff, OverlayChange, SourceChange};
