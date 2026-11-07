@@ -187,12 +187,10 @@ pub(crate) struct AutomationPut {
 }
 
 fn automation_view(state: &AppState, id: &str) -> crate::error::ControlResult<AutomationView> {
-    let document = crate::boot_model::current_desired_config(state)?;
-    let sources = document
-        .get("sources")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let sources: Vec<serde_json::Value> = crate::routes::sources::accepted_sources(state)?
+        .into_iter()
+        .map(|entry| entry.resource.body)
+        .collect();
     let mut found = false;
     let mut rule = None;
     let mut bars_sources = Vec::new();

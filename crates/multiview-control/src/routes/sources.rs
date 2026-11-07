@@ -263,7 +263,7 @@ fn live_apply_remove(state: &AppState, id: &str) -> ApplyMode {
 }
 
 /// Read accepted intent rather than a lagging, fallible SQLite projection.
-fn accepted_sources(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
+pub(crate) fn accepted_sources(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
     crate::boot_model::accepted_resources(state, "sources")?
         .map_or_else(|| state.sources.list(), Ok)
 }

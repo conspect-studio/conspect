@@ -1019,18 +1019,13 @@ impl StateConfigProvider {
         self.invalidate();
     }
     fn compose(state: &crate::state::AppState) -> ConfigView {
-        let Ok(document) = crate::boot_model::current_desired_config(state) else {
-            return ConfigView::default();
-        };
-        let sources = document
-            .get("sources")
-            .and_then(serde_json::Value::as_array)
-            .map(|sources| {
-                sources
-                    .iter()
-                    .filter_map(|body| {
+        let sources = crate::routes::sources::accepted_sources(state)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|entry| {
                         let source: multiview_config::Source =
-                            serde_json::from_value(body.clone()).ok()?;
+                            serde_json::from_value(entry.resource.body).ok()?;
                         Some(SourceView {
                             bars: matches!(source.kind, multiview_config::SourceKind::Bars),
                             rule: source.events.and_then(|e| e.automation),
@@ -1040,6 +1035,8 @@ impl StateConfigProvider {
                     .collect()
             })
             .unwrap_or_default();
+        let document = crate::boot_model::current_desired_config(state)
+            .unwrap_or_else(|_| serde_json::json!({}));
         let cells = document
             .get("cells")
             .and_then(serde_json::Value::as_array)
