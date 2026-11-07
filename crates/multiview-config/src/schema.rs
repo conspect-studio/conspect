@@ -1175,6 +1175,46 @@ impl Source {
     pub fn is_on_demand(&self) -> bool {
         self.effective_activation() == SourceActivation::OnDemand
     }
+
+    /// Whether `self` and `other` define the same **media**: they differ at
+    /// most in the fields that never touch the producer —
+    /// presentation (`epg`, `playlist_metadata`) and standing policy
+    /// (`events.automation`, `activation` and its legacy `demand` alias).
+    /// This is the one definition of "media-affecting" that the control plane
+    /// (guide-only edits), the engine drain and the demand hub all share
+    /// (reviews DMD-09, R2-02, R3-02). `events.observe` stays media.
+    #[must_use]
+    pub fn same_media(&self, other: &Self) -> bool {
+        // Compare field by field; no clone of either document.
+        let observe = |s: &Self| s.events.as_ref().is_none_or(|events| events.observe);
+        let Self {
+            id,
+            display_name,
+            kind,
+            auth,
+            color_override,
+            captions,
+            gpu_pin,
+            wallclock,
+            // Presentation and policy: never media.
+            events: _,
+            activation: _,
+            demand: _,
+            epg: _,
+            playlist_metadata: _,
+        } = self;
+        *id == other.id
+            && *display_name == other.display_name
+            && *kind == other.kind
+            && *auth == other.auth
+            && *color_override == other.color_override
+            && *captions == other.captions
+            && *gpu_pin == other.gpu_pin
+            && *wallclock == other.wallclock
+            // An absent events block and a default one observe the same way;
+            // `automation` is policy (review R2-02).
+            && observe(self) == observe(other)
+    }
 }
 
 /// Upper bound for [`EventAutomationRule::max_duration_s`] (24 h).

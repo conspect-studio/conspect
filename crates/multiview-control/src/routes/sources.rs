@@ -31,31 +31,31 @@ fn parse_stored_source(body: &serde_json::Value) -> Option<multiview_config::Sou
     serde_json::from_value(body.clone()).ok()
 }
 
-/// Compare media configuration without cloning arbitrary source documents.
-/// Only EPG and IPTV presentation metadata may bypass the engine command path.
+/// Whether an edit changes no media-affecting field: only presentation (EPG,
+/// playlist metadata) and standing policy (`events.automation`, activation)
+/// differ. Uses the one shared definition, [`multiview_config::Source::same_media`],
+/// the engine also applies (review R3-02), so control and engine never
+/// disagree about what restarts a producer. Such an edit bypasses the media
+/// upsert; a policy part is forwarded separately as a pins-only update.
 fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
-    let (Some(previous), Some(next)) = (previous.as_object(), next.as_object()) else {
-        return false;
-    };
     if previous == next {
         // An unchanged body is not a guide edit; it keeps the canonical path.
         return false;
     }
-    let media_field = |key: &str| key != "epg" && key != "playlist_metadata" && key != "events";
-    // `events.automation` is control-plane only (ADR-0183): arming or editing a
-    // rule must never restart the producer. `events.observe` stays media.
-    // Effective `observe` (absent block or field => the documented default `true`).
-    let observe = |body: &serde_json::Map<String, serde_json::Value>| {
-        body.get("events")
-            .and_then(|events| events.get("observe"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true)
+    match (parse_stored_source(previous), parse_stored_source(next)) {
+        (Some(previous), Some(next)) => previous.same_media(&next),
+        // A document that does not parse keeps the canonical path.
+        _ => false,
+    }
+}
+
+/// Whether standing policy (automation rule or effective activation) differs:
+/// what keeps a source, or its replacement, running under demand.
+fn policy_changed(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
+    let activation = |body: &serde_json::Value| {
+        parse_stored_source(body).map(|source| source.effective_activation())
     };
-    observe(previous) == observe(next)
-        && previous
-            .iter()
-            .filter(|(key, _)| media_field(key))
-            .eq(next.iter().filter(|(key, _)| media_field(key)))
+    automation_changed(previous, next) || activation(previous) != activation(next)
 }
 
 /// Whether `events.automation` differs between two stored source bodies.
@@ -222,6 +222,14 @@ mod guide_change_tests {
             guide_only_change(&source, &armed),
             "automation is control-plane only"
         );
+        // Presentation and policy in ONE edit are still not media (R3-02).
+        let mut combined = armed.clone();
+        combined["playlist_metadata"] = json!({"name":"News"});
+        combined["activation"] = json!("on_demand");
+        assert!(guide_only_change(&source, &combined));
+        let mut moved = combined.clone();
+        moved["url"] = json!("https://example.com/other");
+        assert!(!guide_only_change(&combined, &moved), "a url edit is media");
         let mut observe = source.clone();
         observe["events"] = json!({"observe": false});
         assert!(
@@ -619,8 +627,8 @@ pub(crate) async fn update_source(
                 model.adopt_source(next.clone());
             }
         }
-        if automation_changed(&current.resource.body, &versioned.resource.body) {
-            // An automation edit changes which sources its rule keeps running:
+        if policy_changed(&current.resource.body, &versioned.resource.body) {
+            // A policy edit changes which sources its rule keeps running:
             // the same pins-only path the automation routes use (review
             // R2-01). The hub sees unchanged media and never restarts it.
             submit_policy_update(&state, next)

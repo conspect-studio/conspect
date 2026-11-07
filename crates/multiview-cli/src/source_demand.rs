@@ -89,27 +89,13 @@ pub fn standing_pins(source: &Source) -> Vec<StandingPin> {
     pins
 }
 
-/// Whether `a` and `b` define the same media: they differ at most in standing
-/// policy (armed automation, activation), which changes leases, never the
-/// producer (review DMD-09).
+/// Whether `a` and `b` define the same media: they differ at most in
+/// presentation (EPG, playlist metadata) or standing policy (armed automation,
+/// activation), which change leases, never the producer (reviews DMD-09,
+/// R3-02). The single shared definition is [`Source::same_media`].
 #[must_use]
 pub fn same_media(a: &Source, b: &Source) -> bool {
-    let strip = |source: &Source| {
-        let mut source = source.clone();
-        source.activation = None;
-        source.demand = None;
-        if let Some(events) = source.events.as_mut() {
-            events.automation = None;
-        }
-        // An absent block and a default one observe the same way: adding the
-        // first rule must not read as a media change (review R2-02).
-        if source.events.as_ref() == Some(&multiview_config::schema::SourceEventsConfig::default())
-        {
-            source.events = None;
-        }
-        source
-    };
-    strip(a) == strip(b)
+    a.same_media(b)
 }
 
 /// The audio-route consumers of a routing document: any route names a consumer,
