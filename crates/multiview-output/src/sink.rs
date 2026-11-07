@@ -55,6 +55,9 @@ use crate::hls::{
 };
 use crate::metadata::{DisplayMatrix, MetadataScope, MuxMetadata};
 
+mod push;
+pub use push::{is_srt_listener_url, PushRunReport};
+
 /// Nanoseconds in one second (the internal timeline unit, invariant #3).
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -257,6 +260,32 @@ fn stream_index_for(
             "unsupported stream kind for this mux sink".to_owned(),
         )),
     }
+}
+
+/// Apply OUTMETA metadata + the optional display matrix to `muxer` before its
+/// header (shared by [`PacketMuxSink`] and the resilient push writers).
+fn apply_mux_metadata(
+    muxer: &mut Muxer,
+    metadata: &MuxMetadata,
+    display_matrix: Option<DisplayMatrix>,
+    video_index: usize,
+) -> Result<()> {
+    for entry in metadata.entries() {
+        match entry.scope {
+            MetadataScope::Format => muxer
+                .set_format_metadata(&entry.key, &entry.value)
+                .map_err(ff)?,
+            MetadataScope::Stream { index } => muxer
+                .set_stream_metadata(index, &entry.key, &entry.value)
+                .map_err(ff)?,
+        }
+    }
+    if let Some(matrix) = display_matrix {
+        muxer
+            .set_stream_display_matrix(video_index, matrix)
+            .map_err(ff)?;
+    }
+    Ok(())
 }
 
 /// Map a `multiview-ffmpeg` error onto this crate's output error taxonomy.
@@ -1120,6 +1149,16 @@ struct SingleRoutes<'r> {
     tracks: &'r TrackIndices,
 }
 
+/// The muxer stream `packet` writes to under `routes`, or `None` when this sink
+/// does not carry it (an unselected discrete track / deselected program audio).
+fn route_packet(routes: &SingleRoutes<'_>, packet: &EncodedPacket) -> Result<Option<usize>> {
+    match packet.kind() {
+        StreamKind::AudioTrack(track) => Ok(track_stream_index(routes.tracks, track)),
+        StreamKind::Audio if routes.drop_program_audio => Ok(None),
+        kind => stream_index_for(kind, routes.video, routes.audio).map(Some),
+    }
+}
+
 fn drive_packets_to_single_muxer<P: PacketSource>(
     muxer: &mut Muxer,
     routes: &SingleRoutes<'_>,
@@ -1127,13 +1166,8 @@ fn drive_packets_to_single_muxer<P: PacketSource>(
 ) -> Result<EncodeStats> {
     let mut stats = EncodeStats::default();
     while let Some(packet) = source.next_packet()? {
-        let index = match packet.kind() {
-            StreamKind::AudioTrack(track) => match track_stream_index(routes.tracks, track) {
-                Some(index) => index,
-                None => continue,
-            },
-            StreamKind::Audio if routes.drop_program_audio => continue,
-            kind => stream_index_for(kind, routes.video, routes.audio)?,
+        let Some(index) = route_packet(routes, &packet)? else {
+            continue;
         };
         // Keyframe stats track the VIDEO GOP only; AAC packets are all flagged
         // key, which would otherwise inflate the count.
@@ -1596,22 +1630,7 @@ impl PacketMuxSink {
     /// stream-scoped entries their stream. Shared by the single-mux and the
     /// per-segment paths so every container of a run carries the same metadata.
     fn apply_metadata(&self, muxer: &mut Muxer, video_index: usize) -> Result<()> {
-        for entry in self.metadata.entries() {
-            match entry.scope {
-                MetadataScope::Format => muxer
-                    .set_format_metadata(&entry.key, &entry.value)
-                    .map_err(ff)?,
-                MetadataScope::Stream { index } => muxer
-                    .set_stream_metadata(index, &entry.key, &entry.value)
-                    .map_err(ff)?,
-            }
-        }
-        if let Some(matrix) = self.display_matrix {
-            muxer
-                .set_stream_display_matrix(video_index, matrix)
-                .map_err(ff)?;
-        }
-        Ok(())
+        apply_mux_metadata(muxer, &self.metadata, self.display_matrix, video_index)
     }
 
     /// Mux the whole `source` packet stream, seeding every muxer stream from

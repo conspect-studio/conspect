@@ -92,6 +92,9 @@ pub mod rtcp;
 /// packets so the muxer's interleaved write never aborts on non-monotonic DTS
 /// while B-frame reorder is preserved — distinct from the encoder path's
 /// `out_pts = f(tick)`. Pure `i64` arithmetic; always compiled (no `ffmpeg`).
+/// Lock-free live link state + reconnect back-off for resilient push outputs
+/// (SRT/RTMP/RIST): pure Rust, always compiled.
+pub mod push_link;
 pub mod restamp;
 pub mod rtsp;
 pub mod rtsp_server;

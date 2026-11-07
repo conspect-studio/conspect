@@ -714,10 +714,86 @@ impl SrtConfig {
             .join("&");
         // IPv6-first: an IPv6 literal host must be bracketed (`srt://[::1]:port`)
         // so the `:` of the address is not read as the port separator. Already
-        // bracketed or non-IPv6 hosts pass through unchanged.
+        // bracketed or non-IPv6 hosts pass through unchanged. The model keeps
+        // the configured host verbatim; the libav boundary applies
+        // [`listener_bind_host`] for a wildcard listener.
         let host = bracket_ipv6_host(&self.host);
         Ok(format!("srt://{host}:{}?{query}", self.port))
     }
+}
+
+/// The IPv4 wildcard an SRT **listener** binds when asked for "any address".
+pub const SRT_LISTENER_WILDCARD: &str = "0.0.0.0";
+
+/// Whether `host` names the unspecified ("any") address: empty, `::`, `[::]`,
+/// or `0.0.0.0`.
+#[must_use]
+pub fn is_wildcard_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.is_empty()
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// The bind host an SRT listener actually uses for `host`.
+///
+/// **Why `[::]` is lowered (production finding, FFmpeg 8.1 + libsrt 1.5.4):**
+/// libsrt 1.5 refuses `srt_bind` on the IPv6 wildcard unless `SRTO_IPV6ONLY`
+/// was set explicitly on the socket ("Operation not supported: Bad
+/// parameters"), and FFmpeg's `libsrt.c` exposes no `ipv6only` `AVOption` nor
+/// any hook to set it on the socket it creates. So a dual-stack `[::]` SRT
+/// listener is impossible through the FFmpeg URL API; the closest working bind
+/// is the IPv4 wildcard. Every wildcard spelling (empty, `::`, `[::]`) is
+/// therefore lowered to [`SRT_LISTENER_WILDCARD`]. A **specific** address
+/// (IPv4 or IPv6, e.g. `[2001:db8::10]`) is passed through unchanged — that is
+/// how an operator gets an IPv6 SRT listener.
+#[must_use]
+pub fn listener_bind_host(host: &str) -> &str {
+    if is_wildcard_host(host) {
+        SRT_LISTENER_WILDCARD
+    } else {
+        host
+    }
+}
+
+/// Rewrite an opaque `srt://host:port?…` URL so a **listener** on a wildcard
+/// host binds [`SRT_LISTENER_WILDCARD`] (see [`listener_bind_host`]).
+///
+/// A URL is a listener when its query carries `mode=listener`. Caller /
+/// rendezvous URLs, specific hosts, and anything that does not parse as
+/// `srt://host:port` are returned unchanged.
+#[must_use]
+pub fn lower_listener_url(url: &str) -> String {
+    let (authority, query) = match url.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (url, None),
+    };
+    let is_listener = query.is_some_and(|q| {
+        q.split('&')
+            .any(|pair| pair.eq_ignore_ascii_case("mode=listener"))
+    });
+    if !is_listener {
+        return url.to_owned();
+    }
+    let Some(host_port) = authority.strip_prefix("srt://") else {
+        return url.to_owned();
+    };
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return url.to_owned();
+    };
+    if !is_wildcard_host(host) {
+        return url.to_owned();
+    }
+    let mut lowered = format!("srt://{SRT_LISTENER_WILDCARD}:{port}");
+    if let Some(query) = query {
+        lowered.push('?');
+        lowered.push_str(query);
+    }
+    lowered
 }
 
 /// Wrap a bare IPv6 literal host in `[...]` for use in a `host:port` URL; leave

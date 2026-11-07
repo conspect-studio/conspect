@@ -8897,11 +8897,15 @@ fn srt_resolved_url(
     srt: Option<&SrtOptions>,
     redact: bool,
 ) -> Result<String, SrtError> {
+    // A wildcard listener (`[::]`, `::`, empty host) cannot bind through
+    // FFmpeg's libsrt: lower it to the IPv4 wildcard (see
+    // `multiview_input::srt::listener_bind_host`). Specific hosts pass through.
     let Some(opts) = srt else {
+        let lowered = multiview_input::srt::lower_listener_url(base_url);
         return Ok(if redact {
-            redact_srt_url(base_url)
+            redact_srt_url(&lowered)
         } else {
-            base_url.to_owned()
+            lowered
         });
     };
     if matches!(opts.backend, Some(backend) if backend != SrtBackend::Ffmpeg) {
@@ -9004,7 +9008,7 @@ fn srt_resolved_url(
             lowered.push_str(pair);
         }
     }
-    Ok(lowered)
+    Ok(multiview_input::srt::lower_listener_url(&lowered))
 }
 
 /// Mask any passphrase already present in an opaque legacy URL for diagnostics.
@@ -16594,6 +16598,41 @@ mod srt_wiring_tests {
         .unwrap();
         assert_eq!(srt_resolved_url(base, Some(&opts), false).unwrap(),
             "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
+    }
+
+    #[test]
+    fn srt_wildcard_listener_lowers_to_ipv4_wildcard_specific_hosts_pass_through() {
+        // Legacy opaque URL (no typed block).
+        assert_eq!(
+            srt_resolved_url("srt://[::]:9000?mode=listener", None, false).unwrap(),
+            "srt://0.0.0.0:9000?mode=listener"
+        );
+        // Typed listener mode on the IPv6 wildcard.
+        let listener = serde_json::from_value(serde_json::json!({"mode": "listener"})).unwrap();
+        assert_eq!(
+            srt_resolved_url("srt://[::]:9000", Some(&listener), false).unwrap(),
+            "srt://0.0.0.0:9000?mode=listener"
+        );
+        let legacy = serde_json::from_value(serde_json::json!({"listener": true})).unwrap();
+        assert_eq!(
+            srt_resolved_url("srt://[::]:9000?latency=1000", Some(&legacy), false).unwrap(),
+            "srt://0.0.0.0:9000?mode=listener&latency=1000"
+        );
+        // A specific IPv6 listener and a caller to [::] are untouched.
+        assert_eq!(
+            srt_resolved_url("srt://[2001:db8::10]:9000", Some(&listener), false).unwrap(),
+            "srt://[2001:db8::10]:9000?mode=listener"
+        );
+        assert_eq!(
+            srt_resolved_url("srt://[::1]:9000?mode=caller", None, false).unwrap(),
+            "srt://[::1]:9000?mode=caller"
+        );
+        // Redacted diagnostics carry the same bind host.
+        assert_eq!(
+            srt_resolved_url("srt://[::]:9000?mode=listener&passphrase=abcdefghijk", None, true)
+                .unwrap(),
+            "srt://0.0.0.0:9000?mode=listener&passphrase=***"
+        );
     }
 
     #[test]
