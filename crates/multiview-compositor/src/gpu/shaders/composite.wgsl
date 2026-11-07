@@ -9,13 +9,21 @@
 // here at sample time, never materializing an RGBA tile. Output is the single
 // linear Rgba16Float canvas (straight, un-premultiplied, for the encode pass).
 //
+// Per-pixel alpha (NV12+A, ADR-0058): a tile with an alpha plane carries its
+// full-resolution STRAIGHT R8 alpha in one layer of `a_planes` (only alpha
+// tiles consume a layer). It is multiplied into the uniform opacity at the
+// single premultiply step below, so alpha is premultiplied exactly once, in
+// linear light, after primaries conversion (invariant #8 order untouched).
+// Opaque tiles never touch `a_planes`.
+//
 // `common.wgsl` is prepended at load time (transfer fns, mat3_apply, ids).
 
 struct TileParams {
     // x,y: destination top-left on canvas (pixels). z,w: source w,h (pixels).
     placement: vec4<u32>,
-    // x,y: destination rect w,h on canvas (pixels). z,w: padding. The source is
-    // scaled into this rect (scale-at-composite); equal to src w,h for a 1:1 tile.
+    // x,y: destination rect w,h on canvas (pixels). The source is scaled into
+    // this rect (scale-at-composite); equal to src w,h for a 1:1 tile.
+    // z: has-alpha flag (1 = sample `a_planes`, 0 = opaque). w: alpha layer.
     dst_size: vec4<u32>,
     // x: opacity [0,1]. y: tile transfer id. z,w: padding.
     opacity_transfer: vec4<f32>,
@@ -45,6 +53,16 @@ struct CompositeUniforms {
 @group(0) @binding(2) var y_planes: texture_2d_array<f32>;
 @group(0) @binding(3) var uv_planes: texture_2d_array<f32>;
 @group(0) @binding(4) var canvas_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var a_planes: texture_2d_array<f32>;
+
+// Straight per-pixel alpha at integer tile-local (sx, sy), full resolution
+// (no subsampling), or 1.0 for an opaque tile. Mirrors `pipeline::tile_alpha`.
+fn sample_tile_alpha(t: TileParams, sx: u32, sy: u32) -> f32 {
+    if t.dst_size.z == 0u {
+        return 1.0;
+    }
+    return textureLoad(a_planes, vec2<i32>(i32(sx), i32(sy)), i32(t.dst_size.w), 0).r;
+}
 
 // Nearest-neighbour NV12 fetch at integer tile-local (sx, sy), matching the
 // CPU reference's chroma replication (no siting interpolation in the oracle).
@@ -128,8 +146,9 @@ fn composite_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // 4. primaries convert into the canvas gamut (linear).
         let lin = mat3_apply(t.prim0, t.prim1, t.prim2, lin_tile);
 
-        // 5. premultiplied-alpha source-over in linear light.
-        let a = clamp(t.opacity_transfer.x, 0.0, 1.0);
+        // 5. premultiplied-alpha source-over in linear light. Straight
+        //    per-pixel alpha folds into the opacity here, premultiplied ONCE.
+        let a = clamp(t.opacity_transfer.x, 0.0, 1.0) * sample_tile_alpha(t, sx, sy);
         let src = vec4<f32>(lin * a, a);
         let inv = 1.0 - src.a;
         acc = src + acc * inv;
