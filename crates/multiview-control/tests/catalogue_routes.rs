@@ -635,3 +635,162 @@ async fn disabled_catalogue_answers_conflict_and_probe_needs_write() {
     );
     let _ = BTreeMap::<u8, u8>::new();
 }
+
+/// A runner that answers instantly with a canned verdict (route-level tests).
+struct Canned;
+impl probe::ProbeRunner for Canned {
+    fn run(&self, id: String, req: probe::ProbeRequest) -> BoxFuture<'_, probe::ProbeResult> {
+        Box::pin(async move {
+            probe::ProbeResult {
+                id,
+                state: "done",
+                url: req.url,
+                verdict: Some(probe::Verdict::Live),
+                media_checked: false,
+                verdict_basis: "canned",
+                stages: Vec::new(),
+                facts: probe::MediaFacts::default(),
+                events: Vec::new(),
+                probed_from: String::new(),
+                probed_at: None,
+                bytes: 0,
+                cached: false,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = catalogue_in(dir.path(), FixtureFetcher::new());
+    let cat2 = Arc::clone(&cat);
+    let h = harness_with(move |s| {
+        s.with_catalogue(
+            cat2,
+            probe::ProbeService::new(Arc::new(Canned), "route-host".into()),
+        )
+    });
+    send(
+        &h.router,
+        post_json("/api/v1/catalogues/iptv-org/import", ADMIN_TOKEN, &bundle()),
+    )
+    .await;
+    let idx = body_json(
+        send(
+            &h.router,
+            get("/api/v1/catalogues/iptv-org/index", ADMIN_TOKEN),
+        )
+        .await,
+    )
+    .await;
+    let row = idx["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["ua"].is_string())
+        .expect("a header-gated row");
+
+    // viewer cannot start a probe; operator can.
+    let by_k = json!({ "k": row["k"] });
+    assert_eq!(
+        send(
+            &h.router,
+            post_json("/api/v1/catalogues/iptv-org/probes", VIEWER_TOKEN, &by_k)
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let resp = send(
+        &h.router,
+        post_json("/api/v1/catalogues/iptv-org/probes", OPERATOR_TOKEN, &by_k),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("/probes/"));
+    let job = body_json(resp).await;
+    assert_eq!(job["url"], row["url"]);
+    let id = job["id"].as_str().unwrap().to_owned();
+
+    // Poll until done (any authenticated reader).
+    let mut done = Value::Null;
+    for _ in 0..40 {
+        let v = body_json(
+            send(
+                &h.router,
+                get(
+                    &format!("/api/v1/catalogues/iptv-org/probes/{id}"),
+                    VIEWER_TOKEN,
+                ),
+            )
+            .await,
+        )
+        .await;
+        if v["state"] == "done" {
+            done = v;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(done["verdict"], "live");
+    assert_eq!(done["probed_from"], "route-host");
+    assert_eq!(
+        send(
+            &h.router,
+            get(
+                "/api/v1/catalogues/iptv-org/probes/does-not-exist",
+                VIEWER_TOKEN
+            )
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Validation: neither k nor url, unknown k, non-http url, CR/LF header.
+    for bad in [
+        json!({}),
+        json!({"k": "s:nope"}),
+        json!({"url": "file:///etc/passwd"}),
+        json!({"url": "https://x/y.m3u8", "user_agent": "a\r\nb"}),
+    ] {
+        let st = send(
+            &h.router,
+            post_json("/api/v1/catalogues/iptv-org/probes", OPERATOR_TOKEN, &bad),
+        )
+        .await
+        .status();
+        assert!(
+            matches!(st, StatusCode::UNPROCESSABLE_ENTITY | StatusCode::NOT_FOUND),
+            "{bad} -> {st}"
+        );
+    }
+
+    // The 60/min per-principal limit surfaces as 429 problem+json.
+    let mut limited = None;
+    for i in 0..70 {
+        let r = send(
+            &h.router,
+            post_json(
+                "/api/v1/catalogues/iptv-org/probes",
+                OPERATOR_TOKEN,
+                &json!({"url": format!("https://example.com/{i}.m3u8")}),
+            ),
+        )
+        .await;
+        if r.status() == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(body_json(r).await);
+            break;
+        }
+    }
+    let p = limited.expect("rate limit reached");
+    assert_eq!(p["type"], "/problems/too-many-requests");
+    assert_eq!(p["status"], 429);
+}

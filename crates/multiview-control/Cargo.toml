@@ -399,3 +399,13 @@ workspace = true
 # Catalogue routes/sync run against a local fixture server over reqwest.
 name = "catalogue_routes"
 required-features = ["catalogue"]
+
+[[test]]
+# Deep-probe tests: local ::1 fixture server + the test-only dial-guard seam.
+name = "catalogue_probe"
+required-features = ["catalogue"]
+
+[[test]]
+# Hostile-fixture chaos tests proving the probe bounds hold.
+name = "catalogue_chaos"
+required-features = ["catalogue"]
