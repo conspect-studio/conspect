@@ -32,6 +32,22 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
 | `Source.events` + HLS cue observer (ADR-0183) | the probe reuses `multiview_input::hls` cue parsing (`PlaylistCueMetadata`) for broadcast-event detection |
 | M3U import dialog (`POST /api/v1/sources/import/m3u`) | unchanged; the browser is the rich alternative for iptv-org specifically |
 
+### Integration rules (release/mda001-rc3)
+
+1. **Durable writes.** Any new persisted resource or config mutation, including `follow = "auto"`
+   applying an upstream change, commits through `commit_resource` under `lock_config_mutation`, with
+   names and versions in the envelope. Otherwise the edit is lost on restart. The catalogue snapshot,
+   logo cache and probe results are derived caches, not configuration.
+2. **Media versus metadata.** HLS `user_agent` and `referrer` change media behaviour, so they stay out
+   of the metadata-only path (`guide_only_change` in `routes/sources.rs`). An `origin`-only change may
+   use that path.
+3. **Activation is the operator's choice.** Add and bulk add from the browser require an explicit
+   **Always on** or **On demand** choice, with no silent default. Show the selected count and a warning
+   for large selections (a 500-source always-on add opens 500 connections). The `activation` field
+   comes from `feat/rc-demand-driven-sources` and is not merged yet; do not depend on it until it is.
+4. **Build.** `catalogue` is enabled by the `multiview-cli` `web` feature, because production builds
+   `--features nvidia,web`.
+
 ---
 
 ## 1. Upstream data (measured 2026-11-07)
