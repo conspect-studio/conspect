@@ -121,11 +121,11 @@ fn start(spec: ListenerSpec) -> Result<SrtIngestBridge, String> {
         .name("multiview-srt-relay".to_owned())
         .spawn(move || accept_readers(&local, &relay_readers, &relay_stop))
         .map_err(|e| format!("srt relay thread: {e}"))?;
-    let listen_stop = Arc::clone(&stop);
-    let listen_dropped = Arc::clone(&dropped);
+    let srt_stop = Arc::clone(&stop);
+    let srt_dropped = Arc::clone(&dropped);
     std::thread::Builder::new()
         .name("multiview-srt-listen".to_owned())
-        .spawn(move || listen(&spec, &readers, &listen_dropped, &listen_stop))
+        .spawn(move || listen(&spec, &readers, &srt_dropped, &srt_stop))
         .map_err(|e| format!("srt listener thread: {e}"))?;
     Ok(SrtIngestBridge {
         local_url: format!("tcp://[::1]:{port}"),
