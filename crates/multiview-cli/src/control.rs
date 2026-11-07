@@ -254,22 +254,10 @@ where
         if let Some(desired) = multiview_control::boot_model::load_desired(model.boot_path())
             .map_err(std::io::Error::other)?
         {
-            let mapped = multiview_control::resource_store::InMemoryOutputStore::new();
-            for (id, output) in desired.output_ids.iter().zip(desired.config.outputs.iter()) {
-                let body = serde_json::to_value(output).map_err(std::io::Error::other)?;
-                let name = body
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("output")
-                    .to_owned();
-                multiview_control::resource_store::ResourceRepository::create(
-                    &mapped,
-                    id,
-                    multiview_control::resource_store::ResourceInput { name, body },
-                )
-                .map_err(std::io::Error::other)?;
-            }
-            state = state.with_outputs_store(Arc::new(mapped));
+            // Names and ETags continue from accepted intent; reseeding would
+            // restart every counter at 1 and let a stale tag match again.
+            state = multiview_control::boot_model::restore_accepted_stores(state, &desired)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         }
         model
             .restore_desired_layout_id()
@@ -3908,6 +3896,97 @@ input_id = "in_b"
              router serves a single request (no startup TOCTOU for promote)"
         );
 
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
+    /// Review H1/H2: the real boot path restores accepted names and versions.
+    /// Reseeding here would restart every `ETag` at 1, so a stale tag could match.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_and_serve_restores_accepted_names_and_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let boot_path = dir.path().join("multiview.toml");
+        let mut config = config_with_hls_outputs(&[("out-a", "/tmp/restore-accepted.m3u8")]);
+        std::fs::write(&boot_path, config.to_toml().expect("render boot")).expect("boot file");
+        config.overlays = vec![serde_json::from_value(serde_json::json!({
+            "id": "ov_clock", "kind": "clock", "target": "canvas"
+        }))
+        .expect("overlay")];
+        let body = serde_json::json!({
+            "canvas": config.canvas, "layout": config.layout, "cells": config.cells,
+        });
+        let desired = multiview_control::boot_model::DesiredState {
+            version: 1,
+            selected_layout_id: "working".to_owned(),
+            layouts: vec![multiview_control::Layout {
+                id: "working".to_owned(),
+                name: "working".to_owned(),
+                body: body.clone(),
+            }],
+            selected_body: body,
+            output_ids: (0..config.outputs.len())
+                .map(|index| format!("output-{index}"))
+                .collect(),
+            layout_versions: std::collections::BTreeMap::new(),
+            resource_versions: [(
+                "overlays".to_owned(),
+                [("ov_clock".to_owned(), 7_u64)].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            resource_names: [(
+                "overlays".to_owned(),
+                [("ov_clock".to_owned(), "Studio clock".to_owned())]
+                    .into_iter()
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+            config: config.clone(),
+        };
+        desired.validate().expect("valid envelope");
+        let state_dir = dir.path().join(".multiview");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(
+            state_dir.join("desired.json"),
+            serde_json::to_vec(&desired).expect("serialize"),
+        )
+        .expect("write desired");
+        let boot_model = Arc::new(multiview_control::boot_model::BootModel::new(
+            boot_path,
+            config.clone(),
+            config.clone(),
+            multiview_config::StartMode::Resume,
+            true,
+            None,
+        ));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+        let (commands, _rx) = multiview_control::command_bus(8);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_addr, handle, state) = bind_and_serve(
+            "[::1]:0",
+            &config,
+            publisher,
+            commands,
+            multiview_control::no_preview(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            multiview_control::LiveApplyCaps::default(),
+            multiview_control::LiveSourceCapability::synthetic_only(),
+            Some(boot_model),
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .expect("bind + serve should start");
+        let overlay = state.overlays.get("ov_clock").expect("restored overlay");
+        assert_eq!(overlay.version.get(), 7);
+        assert_eq!(overlay.resource.name, "Studio clock");
         shutdown_tx.send(()).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }

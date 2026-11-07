@@ -4592,19 +4592,15 @@ msgstr "Live ephemeral cast sessions."
 msgid "Live host and accelerator utilisation streaming from the engine."
 msgstr "Live host and accelerator utilisation streaming from the engine."
 
-#: src/preview/PreviewSurface.tsx:157
+#: src/preview/PreviewSurface.tsx:164
 msgid "Live input preview failed."
 msgstr "Live input preview failed."
 
-#: src/preview/PreviewSurface.tsx:157
+#: src/preview/PreviewSurface.tsx:164
 msgid "Live input preview is busy. Another viewer has the session."
 msgstr "Live input preview is busy. Another viewer has the session."
 
-#: src/preview/PreviewSurface.tsx:149
-msgid "Live input video is unavailable on this server."
-msgstr "Live input video is unavailable on this server."
-
-#: src/preview/PreviewSurface.tsx:170
+#: src/preview/PreviewSurface.tsx:177
 msgid "Live preview is busy. Another viewer has the session."
 msgstr "Live preview is busy. Another viewer has the session."
 

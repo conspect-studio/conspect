@@ -35,7 +35,7 @@ use crate::concurrency::{IdempotencyKey, IfMatch};
 use crate::error::{ControlError, ControlResult};
 use crate::routes::submit_accepted;
 use crate::state::AppState;
-use crate::tally_state::{TallyEntry, VersionedProfile, TALLY_PROFILE_KIND};
+use crate::tally_state::{target_key, TallyEntry, VersionedProfile, TALLY_PROFILE_KIND};
 
 /// The body of a `PUT /api/v1/tally/override` request: force `target`'s lamp to
 /// `color`. A `color` of [`None`] is rejected here (use `DELETE` to clear); the
@@ -85,7 +85,20 @@ pub(crate) async fn list_tally(
     principal: Principal,
 ) -> ControlResult<Json<Vec<TallyEntry>>> {
     principal.role.require(Action::Read)?;
-    Ok(Json(state.tally.list()))
+    // Per-object ROW visibility (BOLA, ADR-W005/ADR-W025): a scoped principal
+    // must see only the resolved tally state for targets it is allowed to
+    // touch — the SAME object id an override on that target would be checked
+    // against (`target_key`: `tile:<n>` / `element:<name>`). An unscoped
+    // principal (admin / unrestricted operator) keeps every row.
+    let entries = state
+        .tally
+        .list()
+        .into_iter()
+        .filter(|entry| {
+            crate::auth::authorize_object(&principal, &target_key(&entry.target)).is_ok()
+        })
+        .collect();
+    Ok(Json(entries))
 }
 
 /// `GET /api/v1/tally/profiles` — list tally profiles (role: read).
@@ -107,22 +120,31 @@ pub(crate) async fn list_profiles(
     principal: Principal,
 ) -> ControlResult<Json<Vec<TallyProfile>>> {
     principal.role.require(Action::Read)?;
+    // Per-object ROW visibility (BOLA, ADR-W005/ADR-W025): a tally profile is
+    // object-scoped by its OWN id (`get_profile` 403s an out-of-scope id), so
+    // the list must drop rows outside the allowlist — by the same parity as
+    // `list_devices`/`list_overlays`. A no-op for an unscoped principal.
     let profiles = state
         .tally_profiles
         .list()?
         .into_iter()
         .map(|v| v.profile)
+        .filter(|profile| crate::auth::authorize_object(&principal, &profile.id).is_ok())
         .collect();
     Ok(Json(profiles))
 }
 
-/// `GET /api/v1/tally/profiles/{id}` — fetch one tally profile (role: read).
+/// `GET /api/v1/tally/profiles/{id}` — fetch one tally profile (role: read;
+/// per-object authz).
 pub(crate) async fn get_profile(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<String>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
+    // Per-object authz BEFORE the lookup (BOLA, ADR-W005): a refused id must
+    // give no existence information.
+    crate::auth::authorize_object(&principal, &id)?;
     let versioned = state.tally_profiles.get(&id)?;
     Ok(profile_response(StatusCode::OK, &versioned))
 }
@@ -158,16 +180,40 @@ pub(crate) async fn put_profile(
     Json(mut profile): Json<TallyProfile>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
+    // Per-object authz BEFORE any lookup (BOLA, ADR-W005): a refused id must
+    // give no existence information.
+    crate::auth::authorize_object(&principal, &id)?;
     profile.id.clone_from(&id);
     profile
         .validate()
         .map_err(|e| ControlError::Validation(e.to_string()))?;
+    // The profile body binds protocol indices to cells by id: authorize each
+    // referenced cell too (BOLA) — a scoped principal may not bind an index to
+    // a cell outside its allowlist, even when it owns the profile itself.
+    for rule in &profile.index_cells {
+        crate::auth::authorize_object(&principal, &rule.cell)?;
+    }
 
     // On a replace, require a matching If-Match against the live version.
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
+    let durable = crate::boot_model::config_value(&profile)?;
     match state.tally_profiles.get(&id) {
         Ok(current) => {
             if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
-            let versioned = state.tally_profiles.put(profile)?;
+            crate::boot_model::commit_resource(
+                &state,
+                "tally_profiles",
+                &id,
+                Some(durable.clone()),
+                None,
+            )
+            .await?;
+            let versioned = state
+                .tally_profiles
+                .put(profile)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             // ADR-W024 round 6: a tally profile is runtime-mutable running state
             // composed into active.toml; audit (the ONE persist choke point) so
             // the persister captures the edit. A pure store edit (no engine
@@ -182,7 +228,18 @@ pub(crate) async fn put_profile(
             Ok(profile_response(StatusCode::OK, &versioned))
         }
         Err(ControlError::NotFound { .. }) => {
-            let versioned = state.tally_profiles.put(profile)?;
+            crate::boot_model::commit_resource(
+                &state,
+                "tally_profiles",
+                &id,
+                Some(durable.clone()),
+                None,
+            )
+            .await?;
+            let versioned = state
+                .tally_profiles
+                .put(profile)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             state.audit(
                 &principal.key_id,
                 AuditAction::Create,
@@ -196,7 +253,8 @@ pub(crate) async fn put_profile(
     }
 }
 
-/// `DELETE /api/v1/tally/profiles/{id}` — delete a profile (role: administer).
+/// `DELETE /api/v1/tally/profiles/{id}` — delete a profile (role: administer;
+/// per-object authz).
 pub(crate) async fn delete_profile(
     State(state): State<AppState>,
     principal: Principal,
@@ -204,9 +262,19 @@ pub(crate) async fn delete_profile(
     Path(id): Path<String>,
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Administer)?;
+    // Per-object authz BEFORE the lookup (BOLA, ADR-W005): a refused id must
+    // give no existence information.
+    crate::auth::authorize_object(&principal, &id)?;
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.tally_profiles.get(&id)?;
     if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
-    state.tally_profiles.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "tally_profiles", &id, None, None).await?;
+    state
+        .tally_profiles
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     // ADR-W024 round 6: removing a runtime-mutable tally profile changes the
     // composed running state — audit so the persister rewrites active.toml.
     state.audit(
@@ -247,6 +315,9 @@ pub(crate) async fn set_override(
     Json(req): Json<OverrideRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
+    // Per-object authz BEFORE any lookup/submit (BOLA, ADR-W005): a scoped
+    // principal may only force the lamp on a target within its allowlist.
+    crate::auth::authorize_object(&principal, &target_key(&req.target))?;
     let target = req.target.clone();
     let color = req.color;
     let response = submit_accepted(&state, &idem, |op| Command::SetTallyOverride {
@@ -283,6 +354,9 @@ pub(crate) async fn clear_override(
     Json(req): Json<ClearOverrideRequest>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
+    // Per-object authz BEFORE any lookup/submit (BOLA, ADR-W005): a scoped
+    // principal may only clear the override on a target within its allowlist.
+    crate::auth::authorize_object(&principal, &target_key(&req.target))?;
     let target = req.target.clone();
     let response = submit_accepted(&state, &idem, |op| Command::SetTallyOverride {
         op,

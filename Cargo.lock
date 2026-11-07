@@ -2952,6 +2952,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "ffmpeg-next",
+ "flate2",
  "getrandom 0.4.3",
  "multiview-audio",
  "multiview-compositor",

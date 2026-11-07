@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -30,6 +30,46 @@ pub const DISABLE_ENV: &str = "MULTIVIEW_DISABLE_HLS_FETCH";
 
 /// Completed segments kept for the local playlist (bounded memory).
 const WINDOW: usize = 8;
+/// Longest accepted request or header line, terminator included.
+const MAX_LINE_BYTES: usize = 8 * 1024;
+/// Most header lines accepted in one request.
+const MAX_HEADERS: usize = 64;
+/// Most bytes accepted in one request head.
+const MAX_HEAD_BYTES: usize = 32 * 1024;
+/// How long a whole request head may take once its first byte arrives.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// How long a keep-alive connection may sit between requests.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Socket timeout slice, which bounds how late shutdown is noticed.
+const IO_POLL: Duration = Duration::from_millis(100);
+/// Concurrent loopback connections per source. libav holds a playlist and a
+/// segment connection per rail, so this leaves room for reconnect overlap.
+const MAX_CONNECTIONS: usize = 16;
+/// How long a response may go with no byte accepted by the socket. A paced
+/// demuxer legitimately stops reading for a while, so this is not tight.
+const WRITE_STALL: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(30)
+};
+/// Hard limit on one response, so a trickling reader cannot pin a segment.
+const RESPONSE_DEADLINE: Duration = if cfg!(test) {
+    Duration::from_secs(4)
+} else {
+    Duration::from_secs(120)
+};
+/// Largest single socket write, which bounds how late shutdown is noticed.
+const WRITE_CHUNK: usize = 64 * 1024;
+/// The refusal for a connection over [`MAX_CONNECTIONS`].
+const TOO_MANY_CONNECTIONS: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// Most unread bytes discarded after a refusal.
+const REFUSAL_DRAIN_BYTES: usize = 256 * 1024;
+/// Longest time spent discarding input after a refusal.
+const REFUSAL_DRAIN_DEADLINE: Duration = Duration::from_secs(1);
+/// The refusal for a request head over its bounds.
+const HEAD_TOO_LARGE: &[u8] =
+    b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 /// Segments fetched concurrently.
 const IN_FLIGHT: usize = 3;
 /// Parallel ranges per segment after the probe range.
@@ -340,14 +380,6 @@ impl FetchStats {
     }
 }
 
-/// The process-wide [`FetchStats`] for source `id` (one `Arc` per id).
-pub fn stats(id: &str) -> Arc<FetchStats> {
-    static STATS: OnceLock<Mutex<HashMap<String, Arc<FetchStats>>>> = OnceLock::new();
-    let map = STATS.get_or_init(Default::default);
-    let mut map = map.lock().unwrap_or_else(PoisonError::into_inner);
-    Arc::clone(map.entry(id.to_owned()).or_default())
-}
-
 // Control-plane/coordinator only: never acquired by the output path.
 type ObservationGate = Mutex<Option<crate::hls_event_observer::HlsEventObserver>>;
 
@@ -364,6 +396,9 @@ struct FetchRegistration {
     generation: u64,
     url: Option<String>,
     observation_active: Option<std::sync::Weak<ObservationGate>>,
+    /// Kept across generations so throttle and bypass state outlive a
+    /// reconnect, and dropped with the registration when the source is removed.
+    stats: Option<Arc<FetchStats>>,
 }
 
 fn urls() -> &'static Mutex<HashMap<String, FetchRegistration>> {
@@ -372,30 +407,67 @@ fn urls() -> &'static Mutex<HashMap<String, FetchRegistration>> {
 }
 
 /// Invalidate the old fetcher before the replacement audio or video starts.
+/// `generation` is the caller's lifecycle token, which fetchers present later,
+/// so it survives [`forget_source`] without a parallel counter to keep in step.
 /// URL publication uses the registry lock. Observation invalidation completes
 /// before this returns: it waits for the old off-clock batch, then retires its
 /// sink outside URL/window locks. It is not an output-path operation.
-pub(crate) fn begin_generation(id: &str) -> u64 {
+pub(crate) fn begin_generation_at(id: &str, generation: u64) {
     let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
     let entry = map.entry(id.to_owned()).or_default();
     let old = entry.observation_active.take().and_then(|w| w.upgrade());
-    entry.generation = entry.generation.saturating_add(1);
+    entry.generation = generation;
     entry.url = None;
-    let generation = entry.generation;
     drop(map);
     // Completion fence: wait for an in-flight batch, then invalidate its sink.
     // Never invoke a sink callback while holding the URL/window locks.
     retire_observer(old);
-    generation
+}
+
+/// Next-generation shorthand for tests that do not own a lifecycle token.
+#[cfg(test)]
+fn begin_generation(id: &str) -> u64 {
+    let next = urls()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(id)
+        .map_or(1, |entry| entry.generation.saturating_add(1));
+    begin_generation_at(id, next);
+    next
+}
+
+/// Drop a removed source's registration and stats, so retained entries track
+/// the live source count rather than every id the process has ever seen.
+/// Only the named generation is dropped, so a newer lifecycle keeps its entry.
+/// An absent entry fences stale workers exactly as a newer generation does:
+/// every lookup below refuses it, and none of them recreates it.
+pub(crate) fn forget_source(id: &str, generation: u64) {
+    let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
+    if map
+        .get(id)
+        .is_some_and(|entry| entry.generation == generation)
+    {
+        map.remove(id);
+    }
+}
+
+/// This lifecycle's [`FetchStats`], or `None` once it no longer owns the id.
+fn stats_for(id: &str, generation: u64) -> Option<Arc<FetchStats>> {
+    urls()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_mut(id)
+        .filter(|entry| entry.generation == generation)
+        .map(|entry| Arc::clone(entry.stats.get_or_insert_with(Default::default)))
 }
 
 /// Install the local fetch only while its lifecycle still owns this id.
 fn publish_url(id: &str, generation: u64, local_url: &str) -> Result<(), String> {
     let mut map = urls().lock().unwrap_or_else(PoisonError::into_inner);
-    let entry = map.entry(id.to_owned()).or_default();
-    if entry.generation != generation {
-        return Err("source replaced before fetch publication".to_owned());
-    }
+    let entry = map
+        .get_mut(id)
+        .filter(|entry| entry.generation == generation)
+        .ok_or("source replaced before fetch publication")?;
     entry.url = Some(local_url.to_owned());
     Ok(())
 }
@@ -557,7 +629,7 @@ impl HlsFetcher {
             drop(map);
             retire_observer(old);
         }
-        let st = stats(source_id);
+        let st = stats_for(source_id, generation).ok_or("source replaced before fetch start")?;
         if st.bypass_next.swap(false, Ordering::AcqRel) {
             return Err("bypassed after the fetcher gave up on this origin".to_owned());
         }
@@ -1087,16 +1159,25 @@ fn spawn_server(source_id: &str, listener: TcpListener, shared: Arc<Shared>) -> 
         .set_nonblocking(true)
         .map_err(|e| format!("loopback nonblocking: {e}"))?;
     let id = source_id.to_owned();
+    let active = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new()
         .name(format!("multiview-hls-srv-{source_id}"))
         .spawn(move || {
             while !shared.stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let Some(slot) = ConnectionSlot::acquire(&active) else {
+                            refuse_connection(&stream);
+                            continue;
+                        };
                         let shared = Arc::clone(&shared);
+                        // A failed spawn drops the closure, and the slot with it.
                         let _ = std::thread::Builder::new()
                             .name(format!("multiview-hls-conn-{id}"))
-                            .spawn(move || serve_connection(stream, &shared));
+                            .spawn(move || {
+                                let _slot = slot;
+                                serve_connection(stream, &shared);
+                            });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(20));
@@ -1109,9 +1190,172 @@ fn spawn_server(source_id: &str, listener: TcpListener, shared: Arc<Shared>) -> 
     Ok(())
 }
 
+/// One admitted connection, released when its thread ends.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl ConnectionSlot {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        // Count first: the slot's Drop undoes this on the refused path too.
+        let slot = Self(Arc::clone(active));
+        (active.fetch_add(1, Ordering::AcqRel) < MAX_CONNECTIONS).then_some(slot)
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Best-effort refusal on the accept thread, which must never block on a client.
+fn refuse_connection(mut stream: &TcpStream) {
+    if stream.set_nonblocking(true).is_ok() {
+        let _ = stream.write(TOO_MANY_CONNECTIONS);
+    }
+}
+
+/// Write `bytes`, giving up on shutdown, on [`WRITE_STALL`] without progress,
+/// or at `deadline`. A socket timeout alone is not enough: any progress resets
+/// it, so a trickling client could hold the buffer indefinitely.
+fn write_bounded(w: &mut TcpStream, bytes: &[u8], stop: &AtomicBool, deadline: Instant) -> bool {
+    let mut rest = bytes;
+    let mut progressed = Instant::now();
+    while !rest.is_empty() {
+        let now = Instant::now();
+        if stop.load(Ordering::Acquire)
+            || now >= deadline
+            || now.duration_since(progressed) >= WRITE_STALL
+        {
+            return false;
+        }
+        let chunk = rest.get(..WRITE_CHUNK.min(rest.len())).unwrap_or_default();
+        match w.write(chunk) {
+            Ok(0) => return false,
+            Ok(written) => {
+                rest = rest.get(written..).unwrap_or_default();
+                progressed = Instant::now();
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// One outcome of reading a bounded request line.
+enum LineRead {
+    Line(Vec<u8>),
+    /// EOF, socket fault, shutdown, or an expired deadline.
+    Closed,
+    /// The line or the whole request head exceeded its bound.
+    TooLarge,
+}
+
+/// Limits and deadlines for one request head.
+struct HeadBudget {
+    /// When an idle keep-alive connection is dropped.
+    idle_until: Instant,
+    /// Set at the request's first byte: a continuous sender cannot extend it.
+    request_until: Option<Instant>,
+    bytes_left: usize,
+}
+
+impl HeadBudget {
+    fn new() -> Self {
+        Self {
+            idle_until: Instant::now() + IDLE_TIMEOUT,
+            request_until: None,
+            bytes_left: MAX_HEAD_BYTES,
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now >= self.request_until.unwrap_or(self.idle_until)
+    }
+}
+
+/// Read one line without allocating past [`MAX_LINE_BYTES`], polling so that
+/// shutdown and the deadlines apply even to a client that sends nothing.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    stop: &AtomicBool,
+    budget: &mut HeadBudget,
+) -> LineRead {
+    let mut line = Vec::new();
+    loop {
+        let now = Instant::now();
+        if stop.load(Ordering::Acquire) || budget.expired(now) {
+            return LineRead::Closed;
+        }
+        let available = match reader.fill_buf() {
+            Ok([]) => return LineRead::Closed,
+            Ok(available) => available,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return LineRead::Closed,
+        };
+        budget.request_until.get_or_insert(now + REQUEST_DEADLINE);
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if line.len() + take > MAX_LINE_BYTES || take > budget.bytes_left {
+            return LineRead::TooLarge;
+        }
+        line.extend_from_slice(available.get(..take).unwrap_or_default());
+        reader.consume(take);
+        budget.bytes_left -= take;
+        if newline.is_some() {
+            return LineRead::Line(line);
+        }
+    }
+}
+
+/// Send the 431, then discard a bounded amount of unread input. Closing with
+/// bytes still queued makes the kernel send RST, which destroys the refusal
+/// before the client reads it. Bounded by bytes and time, so a client that
+/// keeps sending cannot hold the connection open.
+fn refuse_head(writer: &mut TcpStream, reader: &mut BufReader<TcpStream>) {
+    if writer.write_all(HEAD_TOO_LARGE).is_err()
+        || writer.shutdown(std::net::Shutdown::Write).is_err()
+    {
+        return;
+    }
+    let deadline = Instant::now() + REFUSAL_DRAIN_DEADLINE;
+    let mut left = REFUSAL_DRAIN_BYTES;
+    let mut scratch = [0_u8; 4096];
+    while left > 0 && Instant::now() < deadline {
+        match std::io::Read::read(reader, &mut scratch) {
+            Ok(0) => return,
+            Ok(read) => left = left.saturating_sub(read),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 fn serve_connection(stream: TcpStream, shared: &Shared) {
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+    let _ = stream.set_read_timeout(Some(IO_POLL));
+    let _ = stream.set_write_timeout(Some(IO_POLL));
     let _ = stream.set_nodelay(true);
     let Ok(write_half) = stream.try_clone() else {
         return;
@@ -1122,22 +1366,36 @@ fn serve_connection(stream: TcpStream, shared: &Shared) {
         if shared.stop.load(Ordering::Acquire) {
             return;
         }
-        let mut request_line = String::new();
-        match reader.read_line(&mut request_line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
+        let mut budget = HeadBudget::new();
+        let request_line = match read_bounded_line(&mut reader, &shared.stop, &mut budget) {
+            LineRead::Line(line) => String::from_utf8_lossy(&line).into_owned(),
+            LineRead::Closed => return,
+            LineRead::TooLarge => {
+                refuse_head(&mut writer, &mut reader);
+                return;
+            }
+        };
         let mut range: Option<(u64, Option<u64>)> = None;
         let mut close = false;
+        let mut headers = 0_usize;
         loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
+            let line = match read_bounded_line(&mut reader, &shared.stop, &mut budget) {
+                LineRead::Line(line) => line,
+                LineRead::Closed => return,
+                LineRead::TooLarge => {
+                    refuse_head(&mut writer, &mut reader);
+                    return;
+                }
+            };
+            let line = String::from_utf8_lossy(&line);
             let line = line.trim_end();
             if line.is_empty() {
                 break;
+            }
+            headers += 1;
+            if headers > MAX_HEADERS {
+                refuse_head(&mut writer, &mut reader);
+                return;
             }
             if let Some((k, v)) = line.split_once(':') {
                 let v = v.trim();
@@ -1160,11 +1418,17 @@ fn serve_connection(stream: TcpStream, shared: &Shared) {
                 .and_then(|n| shared.segment(n))
                 .map(|b| (b, "video/mp2t"))
         };
+        let deadline = Instant::now() + RESPONSE_DEADLINE;
         let ok = match body {
-            Some((bytes, ctype)) => write_body(&mut writer, &bytes, ctype, range),
-            None => writer
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                .is_ok(),
+            Some((bytes, ctype)) => {
+                write_body(&mut writer, &bytes, ctype, range, &shared.stop, deadline)
+            }
+            None => write_bounded(
+                &mut writer,
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                &shared.stop,
+                deadline,
+            ),
         };
         if !ok || close {
             return;
@@ -1185,13 +1449,15 @@ fn write_body(
     bytes: &[u8],
     ctype: &str,
     range: Option<(u64, Option<u64>)>,
+    stop: &AtomicBool,
+    deadline: Instant,
 ) -> bool {
     let len = u64::try_from(bytes.len()).unwrap_or(0);
     let (status, start, end) = match range {
         Some((a, b)) if a < len => (206, a, b.unwrap_or(len - 1).min(len - 1)),
         Some(_) if len > 0 => {
             let head = format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\n\r\n");
-            return w.write_all(head.as_bytes()).is_ok();
+            return write_bounded(w, head.as_bytes(), stop, deadline);
         }
         _ => (200, 0, len.saturating_sub(1)),
     };
@@ -1213,7 +1479,9 @@ fn write_body(
         let _ = write!(head, "Content-Range: bytes {start}-{end}/{len}\r\n");
     }
     head.push_str("\r\n");
-    w.write_all(head.as_bytes()).is_ok() && w.write_all(slice).is_ok() && w.flush().is_ok()
+    write_bounded(w, head.as_bytes(), stop, deadline)
+        && write_bounded(w, slice, stop, deadline)
+        && w.flush().is_ok()
 }
 
 #[cfg(test)]
@@ -1226,6 +1494,307 @@ fn write_body(
 // reason: a compact fake origin and byte-range assertions in test code.
 mod tests {
     use super::*;
+
+    fn loopback_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            window: Mutex::new(Window {
+                target_duration: 6.0,
+                segments: VecDeque::new(),
+                next_local: 0,
+                failed: None,
+            }),
+            ready: Condvar::new(),
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    fn loopback_client(shared: &Arc<Shared>) -> TcpStream {
+        let listener = TcpListener::bind("[::1]:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        spawn_server("bounds", listener, Arc::clone(shared)).expect("server");
+        let client = TcpStream::connect(address).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client timeout");
+        client
+    }
+
+    /// The whole response, or panic when the server never answers or closes.
+    fn response_of(client: &mut TcpStream) -> String {
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(client, &mut response).expect("server closed the connection");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn retained(prefix: &str) -> usize {
+        urls()
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|id| id.starts_with(prefix))
+            .count()
+    }
+
+    #[test]
+    fn churned_source_ids_do_not_accumulate() {
+        let prefix = "churn-";
+        for n in 0..multiview_config::MAX_ADMITTED_SOURCES * 4 {
+            let id = format!("{prefix}{n}");
+            let token = crate::pipeline::begin_live_lifecycle(&id);
+            assert!(stats_for(&id, token).is_some());
+            crate::pipeline::remove_live_lifecycle(&id);
+        }
+        assert_eq!(retained(prefix), 0, "removed ids must not be retained");
+    }
+
+    #[test]
+    fn a_readded_source_publishes_and_its_removed_lifecycle_stays_fenced() {
+        let id = "readded-source-test";
+        let old = crate::pipeline::begin_live_lifecycle(id);
+        let old_stats = stats_for(id, old).expect("stats");
+        crate::pipeline::remove_live_lifecycle(id);
+        assert!(publish_url(id, old, "http://[::1]:1/live.m3u8").is_err());
+        assert!(stats_for(id, old).is_none());
+        assert_eq!(
+            retained(id),
+            0,
+            "a stale worker must not recreate the entry"
+        );
+        // The lifecycle token continues across removal; publication must too.
+        let new = crate::pipeline::begin_live_lifecycle(id);
+        assert!(new > old);
+        publish_url(id, new, "http://[::1]:2/live.m3u8").expect("re-added publish");
+        assert_eq!(
+            shared_url(id, new).as_deref(),
+            Some("http://[::1]:2/live.m3u8")
+        );
+        assert_eq!(shared_url(id, old), None);
+        assert!(publish_url(id, old, "http://[::1]:1/live.m3u8").is_err());
+        let new_stats = stats_for(id, new).expect("stats");
+        assert!(
+            !Arc::ptr_eq(&old_stats, &new_stats),
+            "a removal resets stats"
+        );
+        crate::pipeline::remove_live_lifecycle(id);
+    }
+
+    #[test]
+    fn stats_survive_a_same_id_reconnect() {
+        let id = "stats-reconnect-test";
+        let first = crate::pipeline::begin_live_lifecycle(id);
+        let before = stats_for(id, first).expect("stats");
+        let second = crate::pipeline::begin_live_lifecycle(id);
+        let after = stats_for(id, second).expect("stats");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "bypass/throttle state persists"
+        );
+        crate::pipeline::remove_live_lifecycle(id);
+    }
+
+    #[test]
+    fn forgetting_an_old_generation_keeps_the_new_one() {
+        let id = "forget-fence-test";
+        let old = begin_generation(id);
+        let new = begin_generation(id);
+        forget_source(id, old);
+        publish_url(id, new, "http://[::1]:3/live.m3u8").expect("newer lifecycle kept");
+        forget_source(id, new);
+        assert_eq!(retained(id), 0);
+    }
+
+    /// Large enough that a client which stops reading blocks the server's write
+    /// however far the kernel grows the loopback socket buffers.
+    const STALLING_SEGMENT: usize = 64 * 1024 * 1024;
+
+    /// A server holding one large segment, plus the test's own handle to it.
+    fn stalling_server() -> (Arc<Shared>, Arc<Vec<u8>>, TcpStream) {
+        let shared = loopback_shared();
+        shared.publish(6.0, false, vec![0; STALLING_SEGMENT]);
+        let segment = shared.segment(0).expect("published segment");
+        let mut client = loopback_client(&shared);
+        client
+            .write_all(b"GET /s/0.ts HTTP/1.1\r\n\r\n")
+            .expect("request");
+        await_count(
+            &segment,
+            3,
+            Duration::from_secs(5),
+            "connection took the segment",
+        );
+        (shared, segment, client)
+    }
+
+    fn await_count(segment: &Arc<Vec<u8>>, want: usize, within: Duration, what: &str) {
+        let deadline = Instant::now() + within;
+        while Arc::strong_count(segment) != want {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: {} references, wanted {want}",
+                Arc::strong_count(segment)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_stalled_reader_releases_an_evicted_segment() {
+        let (shared, segment, client) = stalling_server();
+        for _ in 0..WINDOW {
+            shared.publish(6.0, false, vec![0; 1]);
+        }
+        assert!(shared.segment(0).is_none(), "evicted from the window");
+        // Only this test and the stalled connection still hold it.
+        await_count(&segment, 2, Duration::from_secs(1), "eviction");
+        await_count(
+            &segment,
+            1,
+            WRITE_STALL * 3,
+            "a stalled write kept the buffer",
+        );
+        drop(client);
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn a_trickling_reader_cannot_outlive_the_response_deadline() {
+        let (shared, segment, mut client) = stalling_server();
+        let trickling = Arc::new(AtomicBool::new(true));
+        let keep_reading = Arc::clone(&trickling);
+        let reader = std::thread::spawn(move || {
+            let mut scratch = [0_u8; 4096];
+            while keep_reading.load(Ordering::Acquire) {
+                if !matches!(std::io::Read::read(&mut client, &mut scratch), Ok(n) if n > 0) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        // Progress keeps the stall timer quiet, so only the deadline can fire.
+        await_count(
+            &segment,
+            2,
+            RESPONSE_DEADLINE * 3,
+            "a trickle held the buffer",
+        );
+        trickling.store(false, Ordering::Release);
+        reader.join().expect("reader");
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_blocked_write() {
+        let (shared, segment, client) = stalling_server();
+        shared.stop.store(true, Ordering::Release);
+        await_count(
+            &segment,
+            2,
+            WRITE_STALL / 2,
+            "shutdown left the write blocked",
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn connections_past_the_cap_are_refused_and_a_freed_slot_is_reused() {
+        let shared = loopback_shared();
+        let listener = TcpListener::bind("[::1]:0").expect("bind");
+        let address = listener.local_addr().expect("addr");
+        spawn_server("flood", listener, Arc::clone(&shared)).expect("server");
+        let answered = |client: &mut TcpStream| {
+            client.write_all(b"GET /missing HTTP/1.1\r\n\r\n").is_ok() && {
+                let mut scratch = [0_u8; 256];
+                matches!(std::io::Read::read(client, &mut scratch), Ok(n)
+                    if String::from_utf8_lossy(scratch.get(..n).unwrap_or_default())
+                        .starts_with("HTTP/1.1 404"))
+            }
+        };
+        let connect = || {
+            let client = TcpStream::connect(address).expect("connect");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            client
+        };
+        let mut held: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| connect()).collect();
+        for client in &mut held {
+            assert!(answered(client), "connections within the cap are served");
+        }
+        let mut over = connect();
+        assert!(!answered(&mut over), "a connection past the cap was served");
+        held.pop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if answered(&mut connect()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "a freed slot was never reused");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn an_unterminated_request_line_is_refused_at_its_bound() {
+        let shared = loopback_shared();
+        let mut client = loopback_client(&shared);
+        client
+            .write_all(&vec![b'a'; MAX_LINE_BYTES * 4])
+            .expect("send");
+        assert!(response_of(&mut client).starts_with("HTTP/1.1 431"));
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn an_unterminated_header_line_is_refused_at_its_bound() {
+        let shared = loopback_shared();
+        let mut client = loopback_client(&shared);
+        client
+            .write_all(b"GET /live.m3u8 HTTP/1.1\r\nX-Long: ")
+            .expect("send");
+        client
+            .write_all(&vec![b'a'; MAX_LINE_BYTES * 4])
+            .expect("send");
+        assert!(response_of(&mut client).starts_with("HTTP/1.1 431"));
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn too_many_headers_are_refused() {
+        let shared = loopback_shared();
+        let mut client = loopback_client(&shared);
+        let mut head = String::from("GET /live.m3u8 HTTP/1.1\r\n");
+        for index in 0..=MAX_HEADERS {
+            let _ = write!(head, "X-{index}: 1\r\n");
+        }
+        client.write_all(head.as_bytes()).expect("send");
+        assert!(response_of(&mut client).starts_with("HTTP/1.1 431"));
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn many_legal_lines_cannot_exceed_the_head_budget() {
+        let shared = loopback_shared();
+        let mut client = loopback_client(&shared);
+        let filler = "a".repeat(MAX_LINE_BYTES - 16);
+        let mut head = String::from("GET /live.m3u8 HTTP/1.1\r\n");
+        for index in 0..8 {
+            let _ = write!(head, "X-{index}: {filler}\r\n");
+        }
+        client.write_all(head.as_bytes()).expect("send");
+        assert!(response_of(&mut client).starts_with("HTTP/1.1 431"));
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn a_silent_connection_notices_shutdown() {
+        let shared = loopback_shared();
+        let mut client = loopback_client(&shared);
+        client.write_all(b"GET /live").expect("partial request");
+        std::thread::sleep(IO_POLL);
+        shared.stop.store(true, Ordering::Release);
+        assert_eq!(response_of(&mut client), "", "closed without a response");
+    }
 
     const LIVE: &str = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:30712\n#EXT-X-PROGRAM-DATE-TIME:2026-11-03T21:14:58.150Z\n#EXTINF:5.600,\na/1.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:5.600,\nhttps://cdn.example.net/2.ts?m=1\n";
 

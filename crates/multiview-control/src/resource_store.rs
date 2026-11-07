@@ -240,6 +240,20 @@ impl<K: ResourceKind> InMemoryResourceStore<K> {
         Self::default()
     }
 
+    /// A store holding `entries` at their exact versions (restart restore).
+    #[must_use]
+    pub fn from_versioned(entries: impl IntoIterator<Item = VersionedResource>) -> Self {
+        Self {
+            items: Mutex::new(
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.resource.id.clone(), entry))
+                    .collect(),
+            ),
+            _kind: PhantomData,
+        }
+    }
+
     /// Lock the inner map, recovering from a poisoned lock (a panic in another
     /// request must not wedge the whole control plane).
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, VersionedResource>> {

@@ -238,10 +238,21 @@ async fn failed_desired_write_does_not_publish_source_or_command() {
         response.status().is_server_error(),
         "a failed disk write is not acknowledged"
     );
+    // The failed atomic write must not have replaced the obstruction: it is
+    // still a directory at this exact path. `canonicalize()` resolves the
+    // platform temp root's symlinks (e.g. macOS's `/var` -> `/private/var`),
+    // so comparing its canonicalized form against the un-canonicalized
+    // `desired_obstruction` is wrong on any such host — it previously failed
+    // CI on `macos-latest` for that reason, not because the obstruction had
+    // moved. `symlink_metadata` (no canonicalization) + `is_dir()` verifies
+    // the same "still a directory here" fact without that false mismatch.
     let desired_obstruction = state_dir.join("desired.json");
-    assert_eq!(
-        desired_obstruction.canonicalize().unwrap(),
+    assert!(
         desired_obstruction
+            .symlink_metadata()
+            .expect("obstruction still exists")
+            .is_dir(),
+        "a failed atomic rename must not replace the obstruction"
     );
     std::fs::remove_dir(&desired_obstruction).expect("remove the test obstruction");
     let after = send(&r.router, get("/api/v1/sources/in_a", OPERATOR_TOKEN)).await;
