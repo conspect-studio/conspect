@@ -7415,8 +7415,9 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     fn source_removed(&self, id: &str) {
         if let Some((catalogue, manager)) = &self.demand {
             crate::source_rails::catalogue_remove(catalogue, id);
-            manager.set_pins(id, Vec::new());
-            manager.restart(id);
+            // Every pin it owns (standing and an operator Start) and every
+            // timed lease on it (review DMD-05).
+            manager.remove_source(id);
         }
         let lifecycle = remove_live_lifecycle(id);
         if let Some(lease) = self.source_events.activate(id, lifecycle) {

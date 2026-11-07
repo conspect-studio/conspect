@@ -1020,6 +1020,43 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         drop(previous);
     }
 
+    /// Source `id` was deleted (review DMD-05): drop every pin it owns (its
+    /// standing set and an operator Start) and every timed lease on it, then
+    /// reconcile so its rails stop. Leases other consumers still hold cannot
+    /// start it: a deleted source resolves to no rails.
+    pub fn remove_source(&self, id: &str) {
+        let (pins, timed) = {
+            let mut book = lock(&self.inner.book);
+            let keys: Vec<(String, PinKind)> = book
+                .pins
+                .range((id.to_owned(), PinKind::Standing)..=(id.to_owned(), PinKind::Manual))
+                .map(|(key, _)| key.clone())
+                .collect();
+            let pins: Vec<_> = keys
+                .iter()
+                .filter_map(|key| book.pins.remove(key))
+                .collect();
+            let timed_keys: Vec<_> = book
+                .timed
+                .keys()
+                .filter(|(source, _)| &**source == id)
+                .cloned()
+                .collect();
+            let timed: Vec<_> = timed_keys
+                .iter()
+                .filter_map(|key| book.timed.remove(key))
+                .collect();
+            if let Some(entry) = book.entries.get_mut(id) {
+                entry.close_now = true;
+                entry.surplus_since = None;
+            }
+            (pins, timed)
+        };
+        drop(pins);
+        drop(timed);
+        self.restart(id);
+    }
+
     /// Record rails the run started itself before the worker existed.
     pub fn adopt(&self, id: &str, rails: Rails) {
         // Only rails the kind can run: a clock asked for "all" has no audio.
@@ -2778,6 +2815,34 @@ mod tests {
         assert_eq!(lock(&fake.running).get("slow"), Some(&Rails::NONE));
         assert_eq!(manager.status("slow").running, Rails::NONE);
         drop(lease);
+    }
+
+    /// Review DMD-05: deleting a source releases its operator Start and timed
+    /// leases, so repeated create/Start/delete leaves nothing and a reused id
+    /// starts clean.
+    #[test]
+    fn removing_a_source_releases_its_start_and_timed_leases() {
+        let fake = Arc::new(Fake::default());
+        let manager = manager(&fake, 60_000);
+        for round in 1..=5 {
+            manager.start_source("cam");
+            assert!(manager
+                .touch("cam", Rails::VIDEO, tag("jpeg"), Duration::from_secs(60))
+                .is_some());
+            wait("started", || {
+                fake.video_starts.load(Ordering::SeqCst) == round
+            });
+            manager.remove_source("cam");
+            wait("nothing left", || manager.active_len() == 0);
+        }
+        assert_eq!(
+            manager.status("cam").consumers,
+            Vec::new(),
+            "no inherited Start"
+        );
+        assert_eq!(lock(&manager.inner.book).pins.len(), 0);
+        assert_eq!(lock(&manager.inner.book).timed.len(), 0);
+        manager.shutdown();
     }
 
     /// Lease churn on a ready source. `DEMAND_LEASE_CYCLES` sets the count so

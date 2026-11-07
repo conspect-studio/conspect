@@ -206,3 +206,35 @@ async fn arming_or_disarming_automation_never_restarts_the_producer() {
     hub.shutdown();
     demand.stop_all();
 }
+
+/// Review DMD-05: deleting a started source through the hub releases its
+/// operator Start, and re-adding the id does not inherit it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_started_source_releases_its_start() {
+    let mut pipeline = Pipeline::build(&config(false)).expect("builds");
+    let demand = pipeline.demand();
+    let spawner = pipeline.live_ingest_spawner();
+    let slate = config(false)
+        .sources
+        .into_iter()
+        .find(|s| s.id == "slate")
+        .unwrap();
+    for _ in 0..3 {
+        let store = multiview_cli::source_rails::empty_store("slate");
+        assert!(spawner.catalogue(&SourceSpawn {
+            source: slate.clone(),
+            store
+        }));
+        demand.start_source("slate");
+        assert!(holders(&demand.status("slate").consumers)
+            .contains(&(ConsumerClass::Manual, "operator".into())));
+        spawner.source_removed("slate");
+        assert!(
+            !holders(&demand.status("slate").consumers)
+                .iter()
+                .any(|(class, _)| *class == ConsumerClass::Manual),
+            "deleted source keeps its Start"
+        );
+    }
+    demand.stop_all();
+}
