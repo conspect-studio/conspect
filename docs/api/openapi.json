@@ -18379,6 +18379,17 @@
                 "description": "The mandatory NDI attribution — present iff `ndi` is compiled."
               }
             ]
+          },
+          "youtube": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/YoutubeCapability",
+                "description": "Whether this build can resolve a `youtube` source (ADR-0015): the\n`youtube` Cargo feature compiled in AND a `yt-dlp` binary found +\nprobed at startup. `None` on a build without the `youtube` feature at\nall (the capability does not exist, as opposed to existing-but-\nunavailable) — mirrors how [`ndi_attribution`](Self::ndi_attribution)\ndistinguishes \"not compiled\" from \"compiled but inert\"."
+              }
+            ]
           }
         }
       },
@@ -19341,6 +19352,31 @@
           "ticket": {
             "type": "string",
             "description": "The opaque single-use ticket. Present it once as `?ticket=` within\n`expires_in_secs`; it is consumed on the first WS/SSE upgrade."
+          }
+        }
+      },
+      "YoutubeCapability": {
+        "type": "object",
+        "description": "The `youtube` source kind's resolve capability (ADR-0015): whether this\nbuild can actually resolve a live `YouTube` URL right now.",
+        "required": [
+          "compiled",
+          "available"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "Whether a `yt-dlp` binary was found and successfully probed\n(`yt-dlp --version`) at startup. Always `false` when\n[`compiled`](Self::compiled) is `false`."
+          },
+          "compiled": {
+            "type": "boolean",
+            "description": "Whether the `youtube` Cargo feature is compiled into this binary. A\n`false` here means the build simply cannot run the resolver at all,\nregardless of whether `yt-dlp` is installed."
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The probed `yt-dlp --version` output — present only when\n[`available`](Self::available) is `true`."
           }
         }
       }

@@ -271,6 +271,28 @@ pub struct SystemConfig {
     /// (`ndi_unlicensed`) and never started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ndi: Option<NdiSystemConfig>,
+    /// `YouTube` live-ingest resolver settings (ADR-0015). Absent ⇒ `yt-dlp` is
+    /// discovered on `PATH` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube: Option<YoutubeSystemConfig>,
+}
+
+/// Process-wide `YouTube` resolver settings (ADR-0015 §6).
+///
+/// `yt-dlp` is discovered at runtime, never vendored. The service user's `PATH`
+/// may not include where an operator installed it (e.g. `~/.local/bin`), so this
+/// lets an operator pin an explicit path. The `MULTIVIEW_YOUTUBE_YT_DLP_PATH`
+/// environment variable (12-factor; matches the existing `MULTIVIEW_*` env
+/// pattern) takes precedence over this config field when both are set, mirroring
+/// how other `MULTIVIEW_*` overrides are read directly from the process
+/// environment rather than only from config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct YoutubeSystemConfig {
+    /// An explicit path to the `yt-dlp` binary. Absent ⇒ resolved on `PATH` as
+    /// `"yt-dlp"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yt_dlp_path: Option<String>,
 }
 
 /// The operator's NDI® SDK runtime license acceptance (ADR-0008 §7.5).

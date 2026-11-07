@@ -286,6 +286,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::system::BuildInfo,
         crate::system::EffectiveLicense,
         crate::system::NdiAttribution,
+        crate::system::YoutubeCapability,
         crate::repository::Layout,
         crate::repository::LayoutInput,
         crate::resource_store::Resource,

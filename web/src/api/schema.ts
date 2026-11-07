@@ -6414,6 +6414,7 @@ export interface components {
             /** @description The compositor's resolved acceleration tier. */
             compositor: components["schemas"]["CompositorCapability"];
             ndi_attribution?: null | components["schemas"]["NdiAttribution"];
+            youtube?: null | components["schemas"]["YoutubeCapability"];
         };
         /** @description The `200` body of a hot (Class-1 / Reset-lite) `/routing/{kind}/take`. */
         TakeApplied: {
@@ -6883,6 +6884,29 @@ export interface components {
              *     `expires_in_secs`; it is consumed on the first WS/SSE upgrade.
              */
             ticket: string;
+        };
+        /**
+         * @description The `youtube` source kind's resolve capability (ADR-0015): whether this
+         *     build can actually resolve a live `YouTube` URL right now.
+         */
+        YoutubeCapability: {
+            /**
+             * @description Whether a `yt-dlp` binary was found and successfully probed
+             *     (`yt-dlp --version`) at startup. Always `false` when
+             *     [`compiled`](Self::compiled) is `false`.
+             */
+            available: boolean;
+            /**
+             * @description Whether the `youtube` Cargo feature is compiled into this binary. A
+             *     `false` here means the build simply cannot run the resolver at all,
+             *     regardless of whether `yt-dlp` is installed.
+             */
+            compiled: boolean;
+            /**
+             * @description The probed `yt-dlp --version` output — present only when
+             *     [`available`](Self::available) is `true`.
+             */
+            version?: string | null;
         };
     };
     responses: never;

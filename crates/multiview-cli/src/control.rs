@@ -221,6 +221,44 @@ where
     #[cfg(not(feature = "gpu"))]
     let compositor_adapter: Option<multiview_hal::AdapterReport> = None;
 
+    // Probe `yt-dlp --version` once at startup for the `youtube` capability
+    // report (ADR-0015 §6 / ADR-W030): the SAME explicit path precedence
+    // (`MULTIVIEW_YOUTUBE_YT_DLP_PATH` else `[system.youtube] yt_dlp_path`) the
+    // per-source resolver uses. Logged at INFO on success so an operator can
+    // confirm the discovered path/version without reading the capability API.
+    // Absent/failed ⇒ `None` — the capability honestly reports unavailable
+    // (mirrors the NDI runtime-probe posture), never a startup failure.
+    #[cfg(feature = "youtube")]
+    let youtube_probe = {
+        let resolver_config = match crate::youtube_resolver_path(config) {
+            Some(path) => multiview_input::youtube::ResolverConfig::new(
+                path,
+                multiview_input::youtube::ResolverConfig::default().timeout,
+            ),
+            None => multiview_input::youtube::ResolverConfig::default(),
+        };
+        match multiview_input::youtube::probe_version(&resolver_config).await {
+            Ok(version) => {
+                tracing::info!(
+                    yt_dlp_path = %resolver_config.yt_dlp_path,
+                    yt_dlp_version = %version,
+                    "discovered yt-dlp for youtube live ingest (ADR-0015)"
+                );
+                Some(version)
+            }
+            Err(e) => {
+                tracing::info!(
+                    yt_dlp_path = %resolver_config.yt_dlp_path,
+                    error = %e,
+                    "yt-dlp not found/usable; youtube sources will report unavailable until it is installed"
+                );
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "youtube"))]
+    let youtube_probe: Option<String> = None;
+
     let mut state = AppState::new(
         publisher,
         commands,
@@ -337,6 +375,7 @@ where
     // engine channel (invariant #10).
     .with_capabilities(crate::system_capabilities::resolve_system_capabilities(
         compositor_adapter.as_ref(),
+        youtube_probe,
     ))
     // The `[discovery]` browse configuration: the operator-configured
     // zowietek-control service type (the vendor's type is unverified — only a
@@ -1016,6 +1055,10 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
         .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let offsets = crate::av_sync::offsets();
+    // The last `youtube` resolve-failure reason per source (ADR-0015), empty on
+    // a build without the `youtube` feature or when nothing has ever failed.
+    #[cfg(feature = "youtube")]
+    let youtube_reasons = crate::youtube_status::last_errors();
     let tiles: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(id, state)| {
@@ -1031,6 +1074,16 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
             // measured.
             if let (Some(o), Some(obj)) = (offsets.get(id), tile.as_object_mut()) {
                 obj.insert("av_offset_ms".to_owned(), serde_json::json!(o));
+            }
+            // The honest `youtube` resolve-failure reason (e.g. "not a live
+            // stream (status: upcoming)", "yt-dlp not found on the server"),
+            // under the documented `reason` field (realtime-api.md §3's tiles
+            // `$snapshot`) — the same field name a client already defensively
+            // parses. Absent for every non-`youtube` source and for a healthy
+            // one.
+            #[cfg(feature = "youtube")]
+            if let (Some(reason), Some(obj)) = (youtube_reasons.get(id), tile.as_object_mut()) {
+                obj.insert("reason".to_owned(), serde_json::json!(reason));
             }
             tile
         })
@@ -3652,6 +3705,35 @@ input_id = "in_b"
         // The base fields are untouched by the fold.
         assert_eq!(snap["v"], 1);
         assert_eq!(snap["tick"], 7);
+    }
+
+    /// A `youtube` source's recorded resolve-failure reason (ADR-0015) rides
+    /// the same `reason` field a client already defensively parses
+    /// (realtime-api.md §3), and clears once the source resolves again.
+    #[cfg(feature = "youtube")]
+    #[test]
+    fn fold_tile_states_carries_the_youtube_resolve_failure_reason() {
+        let id = "control-test-youtube-reason-tile";
+        crate::youtube_status::record(id, Some("not a live stream (status: upcoming)"));
+
+        let mut states = std::collections::HashMap::new();
+        states.insert(id.to_owned(), multiview_core::traits::SourceState::NoSignal);
+        let mut snap = state_snapshot(1, 0, 64, 64);
+        fold_tile_states(&mut snap, &states);
+
+        let tiles = snap["tiles"].as_array().expect("tiles array");
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(
+            tiles[0]["reason"],
+            serde_json::json!("not a live stream (status: upcoming)")
+        );
+
+        // A later successful resolve clears the stored reason, so a fresh fold
+        // never carries a stale one forward.
+        crate::youtube_status::record(id, None);
+        let mut snap2 = state_snapshot(2, 0, 64, 64);
+        fold_tile_states(&mut snap2, &states);
+        assert!(snap2["tiles"][0].get("reason").is_none());
     }
 
     #[test]
