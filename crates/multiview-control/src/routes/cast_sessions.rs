@@ -538,11 +538,6 @@ pub(crate) async fn save_cast_session(
     // The same typed validation every devices-store write runs (ADR-W015).
     let body = validated_body(TypedCollection::Devices, &request.device_id, &body)?;
     let name = display_name.unwrap_or_else(|| request.device_id.clone());
-    // Mirror the devices create route's ordering: clear any tombstone BEFORE
-    // the store insert (the ordering that keeps stop/start race-free), then
-    // create — a duplicate id is the store's honest 409 and nothing else has
-    // happened yet.
-    state.device_pollers.clear_tombstone(&request.device_id);
     // Review H1: the promoted device is persisted config. Serialize with every
     // other durable mutation and commit the desired envelope before the store
     // projection; a duplicate id is refused (409) before any durable write.
@@ -566,6 +561,9 @@ pub(crate) async fn save_cast_session(
         Some(name.clone()),
     )
     .await?;
+    // Mirror the devices create route: clear any tombstone only while owning
+    // the config lock, so an in-flight delete cannot tombstone after this.
+    state.device_pollers.clear_tombstone(&request.device_id);
     let versioned = state
         .devices
         .create(&request.device_id, ResourceInput { name, body })

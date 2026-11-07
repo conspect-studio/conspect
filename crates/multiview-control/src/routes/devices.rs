@@ -170,12 +170,6 @@ pub(crate) async fn create_device(
         name: input.name,
         body: validated_body(TypedCollection::Devices, &id, &input.body)?,
     };
-    // A fresh create clears any delete tombstone for this id BEFORE the store
-    // insert (the ordering that keeps the registry's stop/start race-free: a
-    // delete that races THIS create tombstones only after observing the insert
-    // below, so this clear can never erase that delete's tombstone — see
-    // `DevicePollerRegistry::clear_tombstone`).
-    state.device_pollers.clear_tombstone(&id);
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
     crate::boot_model::require_absent(state.devices.get(&id), DEVICE_KIND, &id)?;
@@ -187,6 +181,10 @@ pub(crate) async fn create_device(
         Some(input.name.clone()),
     )
     .await?;
+    // A fresh create clears any delete tombstone only once it owns the config
+    // lock. A delete holds that lock across its store delete and poller stop,
+    // so its tombstone is already set here and cannot land after this clear.
+    state.device_pollers.clear_tombstone(&id);
     let versioned = state
         .devices
         .create(&id, input)

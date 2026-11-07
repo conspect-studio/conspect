@@ -235,3 +235,42 @@ async fn first_layout_commit_continues_an_existing_repository_version() {
     .await;
     assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
 }
+
+/// The review's exact case: a pre-existing `SQLite` layout past version 1.
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_layout_commit_continues_a_sqlite_repository_version() {
+    use multiview_control::Repository as _;
+    let (_dir, _path, mut state) = fresh();
+    let id = state.working_layout_id.clone().unwrap();
+    let seeded = state.repository.get_layout(&id).unwrap();
+    let sqlite = multiview_control::sqlite::SqliteRepository::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let input = |name: &str| LayoutInput {
+        name: name.into(),
+        body: seeded.layout.body.clone(),
+    };
+    sqlite.create_layout(&id, input("v1")).unwrap();
+    sqlite.update_layout(&id, input("v2")).unwrap();
+    sqlite.update_layout(&id, input("v3")).unwrap();
+    state.repository = Arc::new(sqlite);
+    let router = multiview_control::router(state);
+    let uri = format!("/api/v1/layouts/{id}");
+    let initial = etag(&send(&router, get(&uri, ADMIN_TOKEN)).await).unwrap();
+    assert_eq!(version(&initial), 3);
+    let replacement = json!({"name": "renamed", "body": seeded.layout.body});
+    let first = send(
+        &router,
+        put_json(&uri, ADMIN_TOKEN, Some(&initial), &replacement),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(version(&etag(&first).unwrap()) > 3);
+    let refused = send(
+        &router,
+        put_json(&uri, ADMIN_TOKEN, Some(&initial), &replacement),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
+}

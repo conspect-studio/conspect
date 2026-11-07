@@ -1317,3 +1317,51 @@ segment_ms = 1000
         "the promoted device must be durable accepted intent"
     );
 }
+
+/// Review H1 follow-up: a delete holds the config lock across its store delete
+/// and poller stop. A create queued behind it must clear the tombstone only
+/// once it owns the lock, or the delete's late tombstone refuses its poller.
+#[tokio::test]
+async fn a_create_queued_behind_a_delete_still_starts_its_poller() {
+    let registry = scripted_cast_registry();
+    let mut captured = None;
+    let h = harness_with(|state| {
+        let state = state
+            .with_device_pollers(Arc::clone(&registry))
+            .with_cast_delivery(delivery());
+        captured = Some(state.clone());
+        state
+    });
+    let state = captured.unwrap();
+    // Stand in for the in-flight delete: it owns the lock until its stop ends.
+    let delete_in_flight = state.lock_config_mutation().await;
+    let router = h.router.clone();
+    let create = tokio::spawn(async move {
+        send(
+            &router,
+            post_json(
+                "/api/v1/devices/dev-queued",
+                OPERATOR_TOKEN,
+                &serde_json::json!({
+                    "name": "queued",
+                    "body": {
+                        "id": "dev-queued",
+                        "driver": "cast",
+                        "address": "[2001:db8::20]:8009",
+                        "display": { "assign": { "output": "out-a" } }
+                    }
+                }),
+            ),
+        )
+        .await
+        .status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    registry.stop("dev-queued").await;
+    drop(delete_in_flight);
+    assert_eq!(create.await.unwrap(), StatusCode::CREATED);
+    assert!(
+        registry.is_running("dev-queued"),
+        "the delete's tombstone refused the newer create's poller"
+    );
+}
