@@ -69,7 +69,13 @@ and it costs O(1) plus at most one LUT pass per tick.
 ### Alpha and the compositor
 
 A transparent graphic (the clear channel, a fade, or a `transparent`-style
-item) carries an NV12 + straight-alpha plane. The GPU compositor rejects alpha
-tiles, and that frame is composited on the CPU path (the existing behaviour for
-alpha media). An opaque gradient item settles without an alpha plane. For a
+item) carries an NV12 + straight-alpha plane. Both compositors blend it the
+same way: the straight alpha is multiplied into the tile opacity and
+premultiplied exactly once, in linear light, at the fixed premultiply step
+(ADR-0058). The GPU compositor uploads only the alpha planes that exist into a
+pooled, grow-only `R8` texture array (one layer per alpha tile) and samples it
+in the composite shader, so an alpha tile keeps the whole multiview on the GPU.
+The run backend re-composites a frame on the CPU only after a genuine GPU
+failure (`GpuRuntime`/`GpuLimit`); that fallback is per frame, counted
+(`RunBackend::gpu_cpu_fallback_frames`) and logged at `warn`. An opaque gradient item settles without an alpha plane. For a
 full-screen opaque graphic, use a `gradient` item on a `graphic` source.

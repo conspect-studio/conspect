@@ -466,12 +466,27 @@ impl RunBackend {
         match self {
             Self::Cpu(cpu) => cpu.composite(canvas_w, canvas_h, canvas, background, tiles),
             #[cfg(feature = "wgpu")]
-            Self::Gpu(gpu) => match gpu.composite(canvas_w, canvas_h, canvas, background, tiles) {
-                Err(crate::error::Error::GpuAlphaUnsupported) => {
-                    crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)
-                }
-                result => result,
-            },
+            Self::Gpu(gpu) => gpu_or_frame_fallback(
+                gpu,
+                gpu.composite(canvas_w, canvas_h, canvas, background, tiles),
+                canvas_w,
+                canvas_h,
+                canvas,
+                background,
+                tiles,
+            ),
+        }
+    }
+
+    /// Frames the GPU backend re-composited on the CPU after a genuine GPU
+    /// failure since construction ([`RunBackend::composite`]). `0` for the CPU
+    /// backend. Alpha tiles never count: the GPU composites them itself.
+    #[must_use]
+    pub fn gpu_cpu_fallback_frames(&self) -> u64 {
+        match self {
+            Self::Cpu(_) => 0,
+            #[cfg(feature = "wgpu")]
+            Self::Gpu(gpu) => gpu.cpu_fallback_frames(),
         }
     }
 
@@ -507,9 +522,53 @@ impl RunBackend {
             #[cfg(feature = "wgpu")]
             Self::Gpu(gpu) => {
                 let _ = n_threads;
-                gpu.composite(canvas_w, canvas_h, canvas, background, tiles)
+                gpu_or_frame_fallback(
+                    gpu,
+                    gpu.composite(canvas_w, canvas_h, canvas, background, tiles),
+                    canvas_w,
+                    canvas_h,
+                    canvas,
+                    background,
+                    tiles,
+                )
             }
         }
+    }
+}
+
+/// Per-frame CPU fallback for a **genuine GPU failure** only.
+///
+/// A `GpuRuntime` (submit / map / lock failure) or `GpuLimit` (more tiles than
+/// the GPU arrays hold) error re-composites THIS frame on the CPU reference so
+/// the output clock still gets a frame (invariant #1); the next frame tries the
+/// GPU again. Each fallback is counted and logged at `warn` (rate-limited to
+/// power-of-two counts so a persistently failing device cannot flood the log).
+/// Every other error (geometry, unsupported/unresolved colour) is a request
+/// error the CPU would reject too, so it propagates unchanged. Alpha tiles are
+/// NOT a fallback reason: the GPU samples per-tile alpha itself (ADR-0058).
+#[cfg(feature = "wgpu")]
+fn gpu_or_frame_fallback(
+    gpu: &crate::gpu::GpuCompositor,
+    result: Result<Nv12Image>,
+    canvas_w: u32,
+    canvas_h: u32,
+    canvas: CanvasColor,
+    background: LinearRgba,
+    tiles: &[Tile<'_>],
+) -> Result<Nv12Image> {
+    match result {
+        Err(err @ (crate::error::Error::GpuRuntime(_) | crate::error::Error::GpuLimit(_))) => {
+            let frames = gpu.record_cpu_fallback();
+            if frames.is_power_of_two() {
+                tracing::warn!(
+                    error = %err,
+                    fallback_frames = frames,
+                    "GPU composite failed; compositing this frame on the CPU reference"
+                );
+            }
+            crate::pipeline::composite(canvas_w, canvas_h, canvas, background, tiles)
+        }
+        other => other,
     }
 }
 
