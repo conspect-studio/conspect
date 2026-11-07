@@ -1881,7 +1881,11 @@ impl<T: Send + Sync + 'static> Inner<T> {
                     // and what it started is stopped before any new generation.
                     _ if late => {
                         entry.stale = !running.is_empty();
-                        "start returned after its timeout".clone_into(&mut entry.reason);
+                        // Expired just now, by this completion: that is the
+                        // timeout itself, already reasoned.
+                        if entry.reason.is_empty() {
+                            "start returned after its timeout".clone_into(&mut entry.reason);
+                        }
                     }
                     Ok(_) => {
                         entry.surplus_since = None;

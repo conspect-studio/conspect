@@ -1105,5 +1105,9 @@ async fn an_automation_only_put_reaches_the_engine_as_a_policy_update() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(h.commands.try_drain().is_empty());
+    assert_eq!(
+        h.commands.try_drain().len(),
+        0,
+        "guide edits submit nothing"
+    );
 }
