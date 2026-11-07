@@ -178,6 +178,9 @@ pub mod wallclock;
 /// renderer needs the `overlay` feature.
 pub mod synth;
 
+/// The BOM weather synthetic source: render worker side + poller spawn.
+pub mod weather_source;
+
 /// The **media-player transport** state machine (ADR-0057 + ADR-0097): the
 /// pure, deterministic playout core (load/cue/play/pause/stop/seek, in-place
 /// loop, and the vamp-and-exit extension) that drives a pre-declared

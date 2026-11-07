@@ -854,6 +854,21 @@ pub enum SourceKind {
         /// `media_players`.
         player: String,
     },
+    /// A BOM weather graphic (seven-day outlook or today's detail) rendered
+    /// in-process from the management-plane weather cache — a synthetic source
+    /// like `clock`. `location` references a `[weather]` location id; an
+    /// unknown/unfetched location renders an honest "unavailable" card.
+    Weather {
+        /// The `[[weather.locations]]` id to draw.
+        location: String,
+        /// `seven_day` (default) or `today`.
+        #[serde(default)]
+        template: crate::weather::WeatherTemplate,
+        /// `gradient` (default, opaque) or `transparent` (alpha panels for
+        /// layering over a looped media cell).
+        #[serde(default)]
+        background: crate::weather::WeatherBackground,
+    },
     /// AES67 / SMPTE ST 2110-30 PCM-audio RTP input (open-audio over IP).
     ///
     /// Tier 0 binding is a static SDP session (RFC 4566/8866) pasted or fetched
@@ -916,7 +931,11 @@ impl SourceKind {
     pub const fn is_synthetic(&self) -> bool {
         matches!(
             self,
-            Self::Bars | Self::Solid { .. } | Self::Clock { .. } | Self::Timer { .. }
+            Self::Bars
+                | Self::Solid { .. }
+                | Self::Clock { .. }
+                | Self::Timer { .. }
+                | Self::Weather { .. }
         )
     }
 

@@ -321,7 +321,11 @@ where
     // The `[discovery]` browse configuration: the operator-configured
     // zowietek-control service type (the vendor's type is unverified — only a
     // configured string is ever recognised) plus any extra DNS-SD types.
-    .with_discovery_config(config.discovery.clone().unwrap_or_default());
+    .with_discovery_config(config.discovery.clone().unwrap_or_default())
+    // BOM weather: the management-plane poller (a tokio task, never an engine
+    // thread) publishing into the process-global snapshot store the weather
+    // source workers read. Idle until a location is configured.
+    .with_weather(crate::weather_source::spawn_weather_service(config));
     // The Boot/Loaded/Running model (ADR-W024): installed for a config-file
     // run so the boot-model/revert/promote routes are live; absent ⇒ those
     // routes honestly report `modeled: false`.
@@ -2120,6 +2124,7 @@ impl CommandDrain {
                 source.kind,
                 multiview_config::SourceKind::Clock { .. }
                     | multiview_config::SourceKind::Timer { .. }
+                    | multiview_config::SourceKind::Weather { .. }
                     | multiview_config::SourceKind::Solid { .. }
             ) {
                 audio_free.insert(id);

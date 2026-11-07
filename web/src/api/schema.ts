@@ -2174,6 +2174,55 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/weather/locations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/weather/locations` — every in-scope location with its latest
+         *     data (role: read).
+         */
+        get: operations["list_locations"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/weather/locations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/weather/locations/{id}` — one location (role: read;
+         *     per-object authz).
+         */
+        get: operations["get_location"];
+        /**
+         * `PUT /api/v1/weather/locations/{id}` — create or replace a location
+         *     (role: write; per-object authz).
+         */
+        put: operations["put_location"];
+        post?: never;
+        /**
+         * `DELETE /api/v1/weather/locations/{id}` — remove a location (role:
+         *     administer; per-object authz). Weather sources bound to it then render an
+         *     honest "unavailable" card.
+         */
+        delete: operations["delete_location"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/whep/{output_id}": {
         parameters: {
             query?: never;
@@ -3496,6 +3545,15 @@ export interface components {
          * @enum {string}
          */
         FirstLine: "partner" | "conspect" | "community";
+        /** @description Fetch freshness of one product. */
+        FreshnessDoc: {
+            /** @description Last attempt, good or bad (RFC 3339 UTC). */
+            attempted_at?: string | null;
+            /** @description Last error (cleared on success). */
+            error?: string | null;
+            /** @description Last successful fetch (RFC 3339 UTC). */
+            fetched_at?: string | null;
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::GpuLimit`].
          *
@@ -5086,6 +5144,15 @@ export interface components {
             /** @enum {string} */
             kind: "timer";
         }) | {
+            /** @description `gradient` (default, opaque) or `transparent` (alpha panels). */
+            background?: components["schemas"]["WeatherBackgroundDoc"];
+            /** @enum {string} */
+            kind: "weather";
+            /** @description The weather location id. */
+            location: string;
+            /** @description `seven_day` (default) or `today`. */
+            template?: components["schemas"]["WeatherTemplateDoc"];
+        } | {
             /** @enum {string} */
             kind: "rtsp";
             /** @description Source URL. */
@@ -5810,6 +5877,71 @@ export interface components {
              */
             restart_pending: string[];
         };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::WeatherBackground`.
+         * @enum {string}
+         */
+        WeatherBackgroundDoc: "gradient" | "transparent";
+        /** @description A configured location (the `[[weather.locations]]` document). */
+        WeatherLocationDoc: {
+            /** @description BOM forecast area code (e.g. `NSW_PT131`). */
+            aac: string;
+            /** @description BOM forecast product id (e.g. `IDN11060`). */
+            forecast_product: string;
+            /** @description Location id (`[A-Za-z0-9_-]`, 1–64). */
+            id: string;
+            /** @description Display name drawn on the graphic. */
+            name: string;
+            /** @description BOM observation product id (e.g. `IDN60920`). */
+            observation_product?: string | null;
+            /** @description Observation station WMO id (e.g. `94768`). */
+            station_wmo?: string | null;
+        };
+        /** @description The `PUT` body: the location without its id (the id is the path). */
+        WeatherLocationInput: {
+            /** @description BOM forecast area code. */
+            aac: string;
+            /** @description BOM forecast product id. */
+            forecast_product: string;
+            /** @description Display name. */
+            name: string;
+            /** @description BOM observation product id. */
+            observation_product?: string | null;
+            /** @description Observation station WMO id. */
+            station_wmo?: string | null;
+        };
+        /** @description One location with its latest data and freshness. */
+        WeatherLocationView: {
+            /** @description Required on-screen attribution. */
+            attribution: string;
+            /**
+             * @description Normalized forecast: `{product, aac, area_name, issued_utc,
+             *     issued_local, expires_utc, days: [{date, weekday, icon_code, max_c,
+             *     min_c, precis, rain_chance, rain_range, start_local}]}` or `null`.
+             */
+            forecast?: Record<string, never> | null;
+            /** @description Forecast product freshness. */
+            forecast_freshness: components["schemas"]["FreshnessDoc"];
+            /** @description The configured location. */
+            location: components["schemas"]["WeatherLocationDoc"];
+            /**
+             * @description Latest observation: `{station_name, wmo_id, time_local, time_display,
+             *     air_temp_c, apparent_temp_c, rel_humidity_pct, wind_dir, wind_kmh,
+             *     gust_kmh, pressure_hpa, rain_since_9am_mm}` or `null`.
+             */
+            observation?: Record<string, never> | null;
+            observation_freshness?: null | components["schemas"]["FreshnessDoc"];
+            /**
+             * @description `ok` | `pending` (no data yet) | `error` (last fetch failed, may still
+             *     hold last-good data) | `expired` (forecast past its expiry).
+             */
+            status: string;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::WeatherTemplate`.
+         * @enum {string}
+         */
+        WeatherTemplateDoc: "seven_day" | "today";
         /**
          * @description The `POST /api/v1/ws/ticket` response: a short-lived, single-use realtime auth
          *     ticket the browser passes as `?ticket=` on the WS/SSE upgrade (ADR-RT011).
@@ -12376,6 +12508,205 @@ export interface operations {
             };
             /** @description Authenticated but not authorized to read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_locations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description All in-scope locations with freshness, id-sorted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WeatherLocationView"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_location: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Location id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The location with normalized forecast days, latest observation and freshness. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WeatherLocationView"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read this location. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No location with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_location: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Location id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WeatherLocationInput"];
+            };
+        };
+        responses: {
+            /** @description The location was replaced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WeatherLocationView"];
+                };
+            };
+            /** @description The location was created. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WeatherLocationView"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to write this location. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The body is not a valid location (detail names the field). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    delete_location: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Location id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The location was deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to administer this location. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No location with that id. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -101,6 +101,16 @@ pub enum SyntheticKind {
         /// Draw the overrun a11y badge (`OVER` / `ELAPSED`) past the target.
         overrun_badge: bool,
     },
+    /// A BOM weather graphic for one `[weather]` location (re-rendered only
+    /// when that location's published data revision changes).
+    Weather {
+        /// The weather location id.
+        location: String,
+        /// Seven-day outlook or today's detail.
+        template: multiview_config::WeatherTemplate,
+        /// Opaque gradient or transparent (alpha) background.
+        background: multiview_config::WeatherBackground,
+    },
 }
 
 impl SyntheticKind {
@@ -157,6 +167,15 @@ impl SyntheticKind {
                 overrun_prefix: overrun_prefix.clone(),
                 overrun_badge: *overrun_badge,
             }),
+            SourceKind::Weather {
+                location,
+                template,
+                background,
+            } => Some(Self::Weather {
+                location: location.clone(),
+                template: *template,
+                background: *background,
+            }),
             _ => None,
         }
     }
@@ -165,7 +184,10 @@ impl SyntheticKind {
     /// re-render, not just republish a cached frame).
     #[must_use]
     pub const fn animated(&self) -> bool {
-        matches!(self, Self::Clock { .. } | Self::Timer { .. })
+        matches!(
+            self,
+            Self::Clock { .. } | Self::Timer { .. } | Self::Weather { .. }
+        )
     }
 
     /// Whether this source's display advances at the **frame** cadence (an
@@ -325,6 +347,18 @@ pub fn render_at(
                 },
             )
         }
+        SyntheticKind::Weather {
+            location,
+            template,
+            background,
+        } => crate::weather_source::render_weather(
+            crate::weather_source::snapshot(location).as_deref(),
+            *template,
+            *background,
+            width,
+            height,
+            canvas,
+        ),
         // Without the `overlay` feature a clock/timer cannot be baked; the caller
         // falls back honestly (ADR-0027) rather than panicking.
         #[cfg(not(feature = "overlay"))]
@@ -365,6 +399,13 @@ struct ClockRender<'a> {
 /// (`hh_mm_ss_ff`) changes once per **frame** — `second·fps + frame_index`.
 #[must_use]
 fn render_key(kind: &SyntheticKind, now: WallTime, frame_in_second: u64) -> i64 {
+    if let SyntheticKind::Weather { location, .. } = kind {
+        // Re-render only when the published data revision changes. A
+        // momentarily locked store keeps the cached frame (key `i64::MIN`
+        // never matches a real revision, so it is mapped to "unchanged" by the
+        // generator via `weather_key_or_cached`).
+        return crate::weather_source::render_key(location).unwrap_or(i64::MIN);
+    }
     if !kind.animated() {
         return 0;
     }
@@ -771,14 +812,14 @@ fn draw_metadata_strip(
 /// `u32 -> f32` without an `as` cast (dimensions fit u16 well within 8K).
 #[cfg(feature = "overlay")]
 #[must_use]
-fn f32_of(v: u32) -> f32 {
+pub(crate) fn f32_of(v: u32) -> f32 {
     f32::from(u16::try_from(v).unwrap_or(u16::MAX))
 }
 
 /// `u32 -> i32` saturating (no `as` cast).
 #[cfg(feature = "overlay")]
 #[must_use]
-fn i32_of(v: u32) -> i32 {
+pub(crate) fn i32_of(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
@@ -787,7 +828,7 @@ fn i32_of(v: u32) -> i32 {
 /// signed — there is no float-to-int cast anywhere on the path.
 #[cfg(feature = "overlay")]
 #[must_use]
-fn round_to_i32(value: f32) -> i32 {
+pub(crate) fn round_to_i32(value: f32) -> i32 {
     if !value.is_finite() {
         return 0;
     }
@@ -834,7 +875,7 @@ fn unit_vector_deg(deg: f32) -> (f32, f32) {
 /// when the run has no drawable glyphs.
 #[cfg(feature = "overlay")]
 #[must_use]
-fn run_bbox(
+pub(crate) fn run_bbox(
     run: &multiview_compositor::overlay::text::RasterizedRun,
 ) -> Option<(i32, i32, i32, i32)> {
     let mut min_x = i32::MAX;
@@ -861,7 +902,7 @@ fn run_width(run: &multiview_compositor::overlay::text::RasterizedRun) -> i32 {
 /// tinted `color`. Only the straight coverage (alpha) is carried; the linear
 /// `color` supplies the tint (overlay-rendering.md §4.1).
 #[cfg(feature = "overlay")]
-fn push_run_offset(
+pub(crate) fn push_run_offset(
     list: &mut multiview_compositor::overlay::subpass::OverlayDrawList,
     run: &multiview_compositor::overlay::text::RasterizedRun,
     off_x: i32,
@@ -1002,7 +1043,7 @@ pub(crate) fn generator_loop_fenced(
         let frame_in_second = multiview_config::timer::frame_index(subsecond_ns, cadence);
         let key = render_key(&kind, now, frame_in_second);
         let frame = match &cached {
-            Some((k, f)) if *k == key => Arc::clone(f),
+            Some((k, f)) if *k == key || key == i64::MIN => Arc::clone(f),
             _ => match render_at(&kind, width, height, canvas, now, subsecond_ns, cadence) {
                 Ok(image) => {
                     let f = Arc::new(image);

@@ -7,6 +7,15 @@ use quick_xml::{events::Event, Reader, XmlVersion};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+pub use chrono;
+pub mod ftp;
+pub mod model;
+pub mod service;
+pub use model::{
+    icon_for_code, normalize_forecast, normalize_observation, DayForecast, ForecastSummary,
+    Freshness, LocationWeather, Observation, Published, WeatherIcon, WeatherStore,
+};
+
 /// Resource ceilings applied before and during XML parsing.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -21,6 +30,88 @@ pub struct Limits {
     /// Maximum stations or areas.
     pub max_items: usize,
 }
+impl Value {
+    fn numeric(&self) -> Option<f64> {
+        self.value
+            .as_deref()?
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+    }
+}
+impl ForecastPeriod {
+    /// Temperature in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn temperature(&self) -> Option<(&str, f64)> {
+        self.measurement(&[
+            "air_temperature",
+            "air_temperature_maximum",
+            "air_temperature_minimum",
+        ])
+    }
+    /// Relative humidity in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn humidity(&self) -> Option<(&str, f64)> {
+        self.measurement(&["relative_humidity"])
+    }
+    /// Wind speed in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn wind(&self) -> Option<(&str, f64)> {
+        self.measurement(&["wind_speed", "wind_speed_max", "wind_speed_10m"])
+    }
+    /// Pressure in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn pressure(&self) -> Option<(&str, f64)> {
+        self.measurement(&["air_pressure", "pressure", "mslp"])
+    }
+    /// Rainfall in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn rain(&self) -> Option<(&str, f64)> {
+        self.measurement(&["rainfall", "precipitation", "precipitation_amount"])
+    }
+    fn measurement(&self, keys: &[&str]) -> Option<(&str, f64)> {
+        let v = self
+            .elements
+            .iter()
+            .find(|v| keys.contains(&v.kind.as_str()))?;
+        Some((v.units.as_deref()?, v.numeric()?))
+    }
+}
+impl ObservationPeriod {
+    /// Temperature in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn temperature(&self) -> Option<(&str, f64)> {
+        self.measurement(&["air_temperature"])
+    }
+    /// Relative humidity in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn humidity(&self) -> Option<(&str, f64)> {
+        self.measurement(&["relative_humidity"])
+    }
+    /// Wind speed in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn wind(&self) -> Option<(&str, f64)> {
+        self.measurement(&["wind", "wind_speed", "wind_speed_kt"])
+    }
+    /// Pressure in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn pressure(&self) -> Option<(&str, f64)> {
+        self.measurement(&["pressure", "air_pressure", "mslp"])
+    }
+    /// Rainfall in the source-declared unit when present and numeric.
+    #[must_use]
+    pub fn rain(&self) -> Option<(&str, f64)> {
+        self.measurement(&["rainfall", "precipitation"])
+    }
+    fn measurement(&self, keys: &[&str]) -> Option<(&str, f64)> {
+        let v = self
+            .elements
+            .iter()
+            .find(|v| keys.contains(&v.kind.as_str()))?;
+        Some((v.units.as_deref()?, v.numeric()?))
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -316,13 +407,62 @@ fn date(s: &str, field: &str) -> Result<DateTime<Utc>, ParseError> {
             value: s.into(),
         })
 }
+fn is_numeric_forecast_field(kind: &str) -> bool {
+    matches!(
+        kind,
+        "air_temperature_maximum"
+            | "air_temperature_minimum"
+            | "air_temperature"
+            | "wind_speed"
+            | "wind_speed_max"
+            | "relative_humidity"
+            | "probability_of_precipitation"
+            | "amount"
+            | "pressure"
+            | "air_pressure"
+    )
+}
+fn is_numeric_observation_field(kind: &str) -> bool {
+    matches!(
+        kind,
+        "air_temperature"
+            | "dew_point"
+            | "relative_humidity"
+            | "wind_speed"
+            | "wind_speed_kt"
+            | "gust_knot"
+            | "pressure"
+            | "air_pressure"
+            | "mslp"
+            | "rainfall"
+            | "precipitation"
+    )
+}
+fn is_forecast_id(id: &str) -> bool {
+    matches!(
+        id,
+        "IDN11060" | "IDV10753" | "IDQ11295" | "IDS10044" | "IDW14199" | "IDT16710" | "IDD10207"
+    )
+}
+fn is_observation_id(id: &str) -> bool {
+    matches!(
+        id,
+        "IDN60920" | "IDV60920" | "IDQ60920" | "IDS60920" | "IDW60920" | "IDT60920" | "IDD60920"
+    )
+}
 fn provenance(root: &Node, id: &str) -> Result<Provenance, ParseError> {
+    if root.name != "product" {
+        return Err(ParseError::Product("unexpected root element"));
+    }
     let a = child(root, "amoc").ok_or(ParseError::Product("amoc missing"))?;
     let get = |k: &str| child(a, k).map(|n| n.text.as_str());
     let product_id = get("identifier")
         .ok_or(ParseError::Product("identifier missing"))?
         .to_owned();
-    if product_id != id {
+    if product_id != id
+        && !(id == "IDN11060" && is_forecast_id(&product_id))
+        && !(id == "IDN60920" && is_observation_id(&product_id))
+    {
         return Err(ParseError::Product("unexpected product identifier"));
     }
     let issued = date(
@@ -357,9 +497,22 @@ pub fn parse_forecast(b: &[u8]) -> Result<Forecast, ParseError> {
 ///
 /// # Errors
 /// Returns an error for malformed XML, invalid product fields, or configured bounds.
+#[allow(clippy::too_many_lines)]
 pub fn parse_forecast_with_limits(b: &[u8], l: Limits) -> Result<Forecast, ParseError> {
     let r = tree(b, l)?;
-    let p = provenance(&r, "IDN11060")?;
+    let product = child(
+        child(&r, "amoc").ok_or(ParseError::Product("amoc missing"))?,
+        "identifier",
+    )
+    .ok_or(ParseError::Product("identifier missing"))?
+    .text
+    .as_str();
+    if !is_forecast_id(product) {
+        return Err(ParseError::Product(
+            "unexpected forecast product identifier",
+        ));
+    }
+    let p = provenance(&r, product)?;
     let forecast = child(&r, "forecast").ok_or(ParseError::Product("forecast missing"))?;
     let mut nodes = Vec::new();
     descendants(forecast, "area", &mut nodes);
@@ -390,16 +543,17 @@ pub fn parse_forecast_with_limits(b: &[u8], l: Limits) -> Result<Forecast, Parse
             let sl =
                 attr(n, "start-time-local").ok_or(ParseError::Product("local start missing"))?;
             let el = attr(n, "end-time-local").ok_or(ParseError::Product("local end missing"))?;
-            date(&sl, "local start")?;
-            date(&el, "local end")?;
+            if date(&sl, "local start")? != start || date(&el, "local end")? != end {
+                return Err(ParseError::InvalidValue {
+                    field: "forecast local/UTC mismatch".into(),
+                    value: format!("{sl}..{el}"),
+                });
+            }
             let mut vals = Vec::new();
             for c in &n.children {
                 if c.name == "element" || c.name == "text" {
                     let kind = attr(c, "type").unwrap_or_default();
-                    if c.name == "element"
-                        && kind != "forecast_icon_code"
-                        && !c.text.is_empty()
-                        && kind != "precipitation_range"
+                    if c.name == "element" && is_numeric_forecast_field(&kind) && !c.text.is_empty()
                     {
                         let number =
                             c.text
@@ -467,7 +621,19 @@ pub fn parse_observations(b: &[u8]) -> Result<Observations, ParseError> {
 /// Returns an error for malformed XML, invalid product fields, or configured bounds.
 pub fn parse_observations_with_limits(b: &[u8], l: Limits) -> Result<Observations, ParseError> {
     let r = tree(b, l)?;
-    let p = provenance(&r, "IDN60920")?;
+    let product = child(
+        child(&r, "amoc").ok_or(ParseError::Product("amoc missing"))?,
+        "identifier",
+    )
+    .ok_or(ParseError::Product("identifier missing"))?
+    .text
+    .as_str();
+    if !is_observation_id(product) {
+        return Err(ParseError::Product(
+            "unexpected observation product identifier",
+        ));
+    }
+    let p = provenance(&r, product)?;
     let observations =
         child(&r, "observations").ok_or(ParseError::Product("observations missing"))?;
     let mut ns = Vec::new();
@@ -483,7 +649,12 @@ pub fn parse_observations_with_limits(b: &[u8], l: Limits) -> Result<Observation
             let tl = attr(n, "time-local")
                 .ok_or(ParseError::Product("local observation time missing"))?;
             let time = date(&tu, "observation time")?;
-            date(&tl, "local observation time")?;
+            if date(&tl, "local observation time")? != time {
+                return Err(ParseError::InvalidValue {
+                    field: "observation local/UTC mismatch".into(),
+                    value: tl.clone(),
+                });
+            }
             let mut vals = Vec::new();
             let mut levels = Vec::new();
             descendants(n, "level", &mut levels);
@@ -491,11 +662,7 @@ pub fn parse_observations_with_limits(b: &[u8], l: Limits) -> Result<Observation
                 for e in level.children.iter().filter(|e| e.name == "element") {
                     let kind =
                         attr(e, "type").ok_or(ParseError::Product("element type missing"))?;
-                    if !e.text.is_empty()
-                        && attr(e, "units").as_deref() != Some("knots")
-                        && !kind.ends_with("_dir")
-                        && kind != "cloud"
-                    {
+                    if !e.text.is_empty() && is_numeric_observation_field(&kind) {
                         let number =
                             e.text
                                 .parse::<f64>()

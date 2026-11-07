@@ -54,6 +54,7 @@ pub mod timer;
 pub mod timing;
 pub mod tls;
 pub mod wall;
+pub mod weather;
 pub mod webrtc;
 
 use std::collections::{HashMap, HashSet};
@@ -109,6 +110,7 @@ pub use timer::{
 pub use timing::{TimingConfig, MAX_LINK_OFFSET_MS, MAX_PTP_UTC_OFFSET_S};
 pub use tls::TlsConfig;
 pub use wall::{HeadConfig, WallBezel, WallConfig};
+pub use weather::{WeatherBackground, WeatherConfig, WeatherLocation, WeatherTemplate};
 pub use webrtc::{DurationString, IceServerConfig, IceServerKindConfig, WebrtcConfig};
 
 /// The cold-start policy (ADR-W024): where `multiview run` takes its starting
@@ -386,6 +388,11 @@ pub struct MultiviewConfig {
     /// Bound onto the canvas by [`SourceKind::MediaPlayer`].
     #[serde(default)]
     pub media_players: Vec<MediaPlayer>,
+    /// BOM weather locations (`[weather]`): the forecast/observation products
+    /// the management-plane poller fetches and `weather` sources render.
+    /// Absent ⇒ no locations (nothing is fetched).
+    #[serde(default, skip_serializing_if = "WeatherConfig::is_empty")]
+    pub weather: WeatherConfig,
 }
 
 /// Parse a `#RGB` / `#RRGGBB` hex color into its `(r, g, b)` bytes.
@@ -526,6 +533,7 @@ impl MultiviewConfig {
         self.validate_placement()?;
         self.validate_routing()?;
         self.validate_media()?;
+        self.weather.validate()?;
         if let Some(timing) = &self.timing {
             timing.validate()?;
         }
@@ -1537,6 +1545,7 @@ impl Source {
             // stream-id 512-byte cap + passphrase-reference consistency; the
             // URL's reachability is a runtime concern.
             SourceKind::Srt { srt: Some(opts), .. } => validate_srt_options(&self.id, opts)?,
+            SourceKind::Weather { location, .. } => weather::validate_source_ref(&self.id, location)?,
             // Network/synthetic kinds carry no kind-specific field that can be
             // validated structurally here (a URL's reachability is a runtime
             // concern, not a config one). The `youtube` URL is resolved at
