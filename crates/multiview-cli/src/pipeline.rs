@@ -12808,8 +12808,12 @@ fn open_and_stream(
             let Some(url) = resolved_youtube_url.as_deref() else {
                 return Err("youtube source did not resolve a manifest url".to_owned());
             };
-            let open_url =
-                main_demuxer_open_url(url, &plan.location, variant_height(plan), &plan.http_headers);
+            let open_url = main_demuxer_open_url(
+                url,
+                &plan.location,
+                variant_height(plan),
+                &plan.http_headers,
+            );
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
