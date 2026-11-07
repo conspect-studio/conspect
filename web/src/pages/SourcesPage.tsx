@@ -47,6 +47,7 @@ import type {
   TimerFormat,
   TimerOnTarget,
   TimerTargetType,
+  SourceActivationChoice,
   WallClockChoice,
 } from '../resources/forms';
 import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
@@ -69,6 +70,7 @@ import type { LiveTile } from '../realtime/useEngineEvents';
 import { HelpLink } from '../components/HelpLink';
 import { TileStateBadge } from '../components/TileStateBadge';
 import { SourceDemandBadge } from '../components/SourceDemandBadge';
+import { SourceLifecycleActions } from '../components/SourceLifecycleActions';
 import { useSourceStatus } from '../api/sourceStatus';
 import type { SourceDemand } from '../api/sourceStatus';
 import { useSystemCapabilities } from '../api/systemQueries';
@@ -92,24 +94,31 @@ function fromTransportChoice(value: RtspTransportChoice): RtspTransport {
   return value === 'auto' ? '' : value;
 }
 const WALLCLOCK_CHOICES: readonly WallClockChoice[] = ['default', 'use', 'discard'];
+const ACTIVATION_CHOICES: readonly SourceActivationChoice[] = ['always_on', 'on_demand'];
 
 /**
- * The status cell: the demand state (idle / starting / live / failed, with who
- * consumes the source) plus the tile lifecycle while it runs. Idle is normal: a
- * source nobody consumes is not started and costs nothing.
+ * The status cell: the lifecycle state (idle / starting / ready / failed, with
+ * who uses the source), the tile signal state while it runs (a separate axis),
+ * and manual Start / Stop. Idle is normal: an idle source is not started and
+ * costs nothing.
  */
 function SourceStatusCell({
+  id,
+  name,
   tile,
   demand,
 }: {
+  readonly id: string;
+  readonly name: string;
   readonly tile: LiveTile | undefined;
   readonly demand: SourceDemand | undefined;
 }): JSX.Element {
   const running = demand !== undefined && (demand.video_running || demand.audio_running);
   return (
-    <span className="inline-flex items-center gap-1.5">
+    <span className="inline-flex flex-wrap items-center gap-1.5">
       <SourceDemandBadge demand={demand} />
-      {running && tile !== undefined && demand.phase !== 'live' ? <TileStateBadge state={tile.state} /> : null}
+      {running && tile !== undefined ? <TileStateBadge state={tile.state} /> : null}
+      <SourceLifecycleActions id={id} name={name} demand={demand} />
     </span>
   );
 }
@@ -696,6 +705,14 @@ function SourceAdvancedFields({
         return <Trans>Stored sidecar (not decoded per source)</Trans>;
     }
   };
+  const activationLabel = (choice: SourceActivationChoice): JSX.Element => {
+    switch (choice) {
+      case 'always_on':
+        return <Trans>Always on (started at boot)</Trans>;
+      case 'on_demand':
+        return <Trans>On demand (idle until something uses it)</Trans>;
+    }
+  };
   const wallclockLabel = (choice: WallClockChoice): JSX.Element => {
     switch (choice) {
       case 'default':
@@ -850,6 +867,16 @@ function SourceAdvancedFields({
           />
         </div>
       ) : null}
+
+      <SelectField<SourceActivationChoice>
+        label={t`Start`}
+        value={form.activation}
+        options={ACTIVATION_CHOICES}
+        optionLabel={activationLabel}
+        onChange={(next): void => {
+          setForm({ ...form, activation: next });
+        }}
+      />
 
       <SelectField<WallClockChoice>
         label={t`Wall-clock handling`}
@@ -1023,6 +1050,8 @@ export function SourcesPage(): JSX.Element {
       ),
       cell: (ctx): JSX.Element => (
         <SourceStatusCell
+          id={ctx.row.original.id}
+          name={ctx.row.original.name}
           tile={tileForSource(tiles, ctx.row.original.id)}
           demand={demand.data?.get(ctx.row.original.id)}
         />

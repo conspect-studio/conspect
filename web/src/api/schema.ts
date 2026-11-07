@@ -2148,10 +2148,11 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Every source's demand state (role: read; per-object row visibility).
-         * @description `idle` means nothing consumes the source, so it costs nothing; it is not a
-         *     fault. Consumers start it (`starting`), it then runs (`live`) or keeps
-         *     retrying with backoff (`failed`).
+         * Every source's lifecycle state (role: read; per-object row visibility).
+         * @description `idle` means the source is not started, so it costs nothing; it is not a
+         *     fault. An `always_on` source (the default) is started at boot; an
+         *     `on_demand` source starts when something consumes it. It reads `starting`,
+         *     then `ready`, or `failed` while it retries with backoff.
          */
         get: operations["list_source_status"];
         put?: never;
@@ -2182,6 +2183,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{id}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a source now (role: write; per-object authz; audited).
+         * @description Holds the source `ready` until Stop, whatever its activation. Never waits
+         *     for the source: the response is the state right after the request
+         *     (normally `starting`).
+         */
+        post: operations["start_source"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{id}/status": {
         parameters: {
             query?: never;
@@ -2193,6 +2216,28 @@ export interface paths {
         get: operations["get_source_status"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{id}/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop a source now (role: write; per-object authz; audited).
+         * @description Refused with 409 while anything else uses the source; the problem detail
+         *     names every consumer (an `always_on` setting counts). Set the source
+         *     `on_demand` to let it stop.
+         */
+        post: operations["stop_source"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4338,6 +4383,12 @@ export interface components {
             enabled?: boolean;
             /** @description Published entries in playlist order. */
             entries?: components["schemas"]["IptvEntryDoc"][];
+            /**
+             * Format: int32
+             * @description Minutes between background guide refreshes while publication is
+             *     enabled (default 30, 5..=1440).
+             */
+            guide_refresh_minutes?: number | null;
             /** @description Optional absolute public base URL for playlist links (default: request Host). */
             public_base_url?: string | null;
         };
@@ -5886,6 +5937,11 @@ export interface components {
          * @enum {string}
          */
         SnapshotStatus: "ready";
+        /**
+         * @description When a source starts (`sources[].activation`).
+         * @enum {string}
+         */
+        SourceActivationView: "always_on" | "on_demand";
         /** @description `OpenAPI` mirror of `multiview_config::SourceAuth` (reference-only secret). */
         SourceAuthDoc: {
             /** @description A secret reference (e.g. `op://Servers/cam/credentials`), never plaintext. */
@@ -5896,6 +5952,7 @@ export interface components {
          *     `POST`/`PUT /api/v1/sources/{id}`.
          */
         SourceBodyDoc: components["schemas"]["SourceKindDoc"] & {
+            activation?: null | components["schemas"]["SourceActivationView"];
             auth?: null | components["schemas"]["SourceAuthDoc"];
             captions?: null | components["schemas"]["CaptionSelectorDoc"];
             color_override?: null | components["schemas"]["ColorOverrideDoc"];
@@ -5933,34 +5990,46 @@ export interface components {
         SourceConsumerView: {
             /**
              * @description `layout_cell`, `audio_route`, `subtitle_route`, `preview`, `hls_session`,
-             *     `event_automation`, `event_journal` or `always_on`.
+             *     `event_automation`, `always_on` or `manual` (an operator Start).
              */
             kind: string;
             /** @description The consumer's identity within its kind (a cell, a route target, ...). */
             label: string;
         };
         /**
-         * @description A source's demand phase.
+         * @description A source's lifecycle state. A separate axis from the tile signal state
+         *     (`LIVE` / `STALE` / `NO_SIGNAL`) and from tally.
          * @enum {string}
          */
-        SourceDemandPhase: "idle" | "starting" | "live" | "failed";
+        SourceDemandPhase: "idle" | "starting" | "ready" | "failed";
         /**
          * @description One source's demand state. Flat booleans keep the wire shape simple for
          *     the SPA (one per rail per direction).
          */
         SourceDemandView: {
+            /**
+             * @description The source's configured activation. Filled by the API from the
+             *     accepted document; providers may leave the default.
+             */
+            activation: components["schemas"]["SourceActivationView"];
             /** @description Whether its audio rail is running. */
             audio_running: boolean;
             /** @description Whether consumers want its audio. */
             audio_wanted: boolean;
             /** @description Who is consuming it. */
             consumers: components["schemas"]["SourceConsumerView"][];
+            /**
+             * Format: int64
+             * @description While `starting`: milliseconds left before the start timeout.
+             */
+            deadline_in_ms?: number | null;
             /** @description Why it is failed. Operator-safe: never a URL or credential. */
             detail?: string | null;
             /** @description The source id. */
             id: string;
             /** @description The phase. */
             phase: components["schemas"]["SourceDemandPhase"];
+            starting_phase?: null | components["schemas"]["SourceStartingPhase"];
             /** @description Whether its video rail is running (a lingering rail runs with no consumer). */
             video_running: boolean;
             /** @description Whether consumers want its video. */
@@ -6198,6 +6267,11 @@ export interface components {
             /** @description Human-friendly name. */
             name: string;
         };
+        /**
+         * @description Where a `starting` source is.
+         * @enum {string}
+         */
+        SourceStartingPhase: "queued" | "opening" | "awaiting_media";
         /** @description `OpenAPI` mirror of `multiview_config::SourceWallClock` (ADR-0038 verb). */
         SourceWallClockDoc: {
             /** @description `use` (rebase when Trusted) or `discard` (reclock-to-house). */
@@ -13666,6 +13740,65 @@ export interface operations {
             };
         };
     };
+    start_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Source id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Start requested; the body is the source's state. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceDemandView"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to operate this source. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such source. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description This run cannot start sources. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_source_status: {
         parameters: {
             query?: never;
@@ -13707,6 +13840,65 @@ export interface operations {
             };
             /** @description No such source. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    stop_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Source id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Stop requested; the body is the source's state. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceDemandView"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to operate this source. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such source. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Still in use; the detail names every consumer. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

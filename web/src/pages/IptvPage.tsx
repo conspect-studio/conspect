@@ -7,7 +7,15 @@ import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { ArrowDown, ArrowUp, Copy, Plus, Trash2 } from 'lucide-react';
 
-import { moveEntry, normalizeIptv as normalize, useIptv, useSaveIptv } from '../api/iptv';
+import {
+  GUIDE_REFRESH_DEFAULT,
+  GUIDE_REFRESH_MAX,
+  GUIDE_REFRESH_MIN,
+  moveEntry,
+  normalizeIptv as normalize,
+  useIptv,
+  useSaveIptv,
+} from '../api/iptv';
 import type { IptvConfig, IptvEntry, IptvWithEtag, NormalizedConfig } from '../api/iptv';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
@@ -67,9 +75,16 @@ function IptvEditor({ data }: { readonly data: IptvWithEtag }): JSX.Element {
     setEntries([...draft.entries, { kind, ref, allow_direct_source_url: kind === 'source' }]);
     setPick('');
   };
+  const refresh = draft.guide_refresh_minutes;
+  const refreshInvalid =
+    refresh !== null &&
+    (!Number.isInteger(refresh) || refresh < GUIDE_REFRESH_MIN || refresh > GUIDE_REFRESH_MAX);
   const submit = (): void => {
+    if (refreshInvalid) return;
+    const { guide_refresh_minutes: refreshMinutes, ...rest } = draft;
     const clean: IptvConfig = {
-      ...draft,
+      ...rest,
+      ...(refreshMinutes === null ? {} : { guide_refresh_minutes: refreshMinutes }),
       entries: draft.entries.map((e) => {
         const entry: IptvEntry = { kind: e.kind, ref: e.ref, allow_direct_source_url: e.allow_direct_source_url ?? false };
         for (const key of ['tvg_id', 'name', 'logo', 'group'] as const) {
@@ -106,7 +121,7 @@ function IptvEditor({ data }: { readonly data: IptvWithEtag }): JSX.Element {
           </Trans>
         }
         actions={
-          <Button disabled={!dirty || save.isPending} onClick={submit}>
+          <Button disabled={!dirty || save.isPending || refreshInvalid} onClick={submit}>
             <Trans>Save</Trans>
           </Button>
         }
@@ -137,6 +152,35 @@ function IptvEditor({ data }: { readonly data: IptvWithEtag }): JSX.Element {
                 setDraft({ ...draft, public_base_url: value === '' ? null : value });
               }}
             />
+          </div>
+          <div className="space-y-1">
+            <label htmlFor="iptv-guide-refresh" className="text-sm font-medium">
+              <Trans>Guide refresh (minutes)</Trans>
+            </label>
+            <Input
+              id="iptv-guide-refresh"
+              type="number"
+              inputMode="numeric"
+              min={GUIDE_REFRESH_MIN}
+              max={GUIDE_REFRESH_MAX}
+              value={refresh ?? ''}
+              placeholder={String(GUIDE_REFRESH_DEFAULT)}
+              aria-invalid={refreshInvalid}
+              aria-describedby="iptv-guide-refresh-hint"
+              onChange={(event): void => {
+                const value = event.target.value.trim();
+                setDraft({ ...draft, guide_refresh_minutes: value === '' ? null : Number(value) });
+              }}
+            />
+            <p
+              id="iptv-guide-refresh-hint"
+              className={refreshInvalid ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}
+            >
+              <Trans>
+                How often guide feeds are fetched in the background while publication is enabled.
+                Blank means {GUIDE_REFRESH_DEFAULT}. Allowed: {GUIDE_REFRESH_MIN} to {GUIDE_REFRESH_MAX}.
+              </Trans>
+            </p>
           </div>
           {[{ label: t`Playlist URL`, url: playlistUrl }, { label: t`Guide URL`, url: guideUrl }].map((row) => (
             <div key={row.label} className="flex flex-wrap items-center gap-2 text-sm">
@@ -239,8 +283,9 @@ function IptvEditor({ data }: { readonly data: IptvWithEtag }): JSX.Element {
         <CardContent>
           <p className="mb-2 text-xs text-muted-foreground">
             <Trans>
-              Upstream XMLTV feeds of published sources with an EPG set, refreshed about every 30
-              minutes while publication is enabled. Guide last assembled: {formatTime(state.guide_generated_at)}
+              Upstream XMLTV feeds of published sources with an EPG set, refreshed in the background
+              every {state.config.guide_refresh_minutes ?? GUIDE_REFRESH_DEFAULT} minutes while
+              publication is enabled. Guide last assembled: {formatTime(state.guide_generated_at)}
             </Trans>
           </p>
           {state.feeds.length === 0 ? (

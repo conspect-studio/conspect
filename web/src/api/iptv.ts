@@ -153,8 +153,10 @@ export function candidateToSourceBody(
   entry: M3uEntry,
   id: string,
   urlTvg: string | undefined,
+  activation?: 'always_on' | 'on_demand',
 ): Record<string, unknown> {
   const body: Record<string, unknown> = { id, kind: 'hls', url: entry.url };
+  if (activation !== undefined) body.activation = activation;
   if (urlTvg !== undefined && entry.tvg_id) {
     body.epg = { mode: 'manual', url: urlTvg, channel_id: entry.tvg_id };
   }
@@ -173,7 +175,14 @@ export interface NormalizedConfig {
   readonly enabled: boolean;
   readonly public_base_url: string | null;
   readonly entries: readonly IptvEntry[];
+  /** Minutes between background guide refreshes; null = the default (30). */
+  readonly guide_refresh_minutes: number | null;
 }
+
+/** The default, minimum and maximum guide refresh interval in minutes. */
+export const GUIDE_REFRESH_DEFAULT = 30;
+export const GUIDE_REFRESH_MIN = 5;
+export const GUIDE_REFRESH_MAX = 1440;
 
 /** Fill defaults so the editor never handles `undefined` collections. */
 export function normalizeIptv(config: IptvConfig): NormalizedConfig {
@@ -181,6 +190,7 @@ export function normalizeIptv(config: IptvConfig): NormalizedConfig {
     enabled: config.enabled ?? false,
     public_base_url: config.public_base_url ?? null,
     entries: config.entries ?? [],
+    guide_refresh_minutes: config.guide_refresh_minutes ?? null,
   };
 }
 

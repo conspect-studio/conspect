@@ -38,6 +38,11 @@ describe('M3U import helpers', () => {
     expect(bare).toEqual({ id: 'x', kind: 'hls', url: 'https://cdn/y.m3u8', playlist_metadata: { name: 'X' } });
   });
 
+  it('writes the activation an import chose', () => {
+    const body = candidateToSourceBody({ name: 'X', url: 'https://cdn/y.m3u8' }, 'x', undefined, 'on_demand');
+    expect(body.activation).toBe('on_demand');
+  });
+
   it('reorders entries', () => {
     expect(moveEntry(['a', 'b', 'c'], 2, -1)).toEqual(['a', 'c', 'b']);
     expect(moveEntry(['a', 'b'], 0, -1)).toEqual(['a', 'b']);

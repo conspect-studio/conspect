@@ -1,5 +1,6 @@
-// Source demand badge: idle / starting / live / failed, with icon + text and
-// the consumers in the accessible description (never colour alone).
+// Source lifecycle badge: idle / starting / ready / failed, with icon + text and
+// who uses the source in the accessible description (never colour alone). This
+// is not the tile signal state (Live / Stale / No signal) and not tally.
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { CircleDot, CirclePause, Loader2, TriangleAlert } from 'lucide-react';
@@ -24,10 +25,10 @@ function useConsumerLabel(): (kind: string) => string {
         return t`HLS session`;
       case 'event_automation':
         return t`event automation`;
-      case 'event_journal':
-        return t`event journal`;
       case 'always_on':
-        return t`always on`;
+        return t`Always on setting`;
+      case 'manual':
+        return t`started by an operator`;
       default:
         return kind;
     }
@@ -40,33 +41,53 @@ function useConsumerSummary(): (demand: SourceDemand | undefined) => string {
   const label = useConsumerLabel();
   return (demand: SourceDemand | undefined): string => {
     if (demand === undefined || demand.consumers.length === 0) {
-      return t`No consumer: this source is not running and costs nothing.`;
+      return t`Not in use: this source is not running and costs nothing.`;
     }
-    const parts = demand.consumers.map((c) => `${label(c.kind)} ${c.label}`);
-    return t`Consumed by: ${parts.join(', ')}`;
+    const parts = demand.consumers.map((c) => (c.kind === 'always_on' ? label(c.kind) : `${label(c.kind)} ${c.label}`));
+    return t`In use by: ${parts.join(', ')}`;
   };
 }
 
-/** A demand-state pill. An absent status reads as idle. */
+/** Where a starting source is, as a short phrase. */
+function useStartingPhase(): (demand: SourceDemand | undefined) => string | null {
+  const { t } = useLingui();
+  return (demand: SourceDemand | undefined): string | null => {
+    switch (demand?.starting_phase) {
+      case 'queued':
+        return t`waiting for a start slot`;
+      case 'opening':
+        return t`opening`;
+      case 'awaiting_media':
+        return t`waiting for first media`;
+      default:
+        return null;
+    }
+  };
+}
+
+/** A lifecycle pill. An absent status reads as idle. */
 export function SourceDemandBadge({ demand }: { readonly demand: SourceDemand | undefined }): JSX.Element {
   const summary = useConsumerSummary()(demand);
+  const startingPhase = useStartingPhase()(demand);
   const phase = demand?.phase ?? 'idle';
   const detail = demand?.detail;
   const title = detail !== undefined && detail !== null ? `${summary} ${detail}` : summary;
   switch (phase) {
-    case 'live':
+    case 'ready':
       return (
         <Badge variant="live" title={title}>
           <CircleDot className="size-3.5" aria-hidden="true" />
-          <span><Trans>Live</Trans></span>
+          <span><Trans>Ready</Trans></span>
           <span className="sr-only">{title}</span>
         </Badge>
       );
     case 'starting':
       return (
-        <Badge variant="reconnecting" title={title}>
+        <Badge variant="outline" title={title}>
           <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
-          <span><Trans>Starting</Trans></span>
+          <span>
+            {startingPhase === null ? <Trans>Starting</Trans> : <Trans>Starting: {startingPhase}</Trans>}
+          </span>
           <span className="sr-only">{title}</span>
         </Badge>
       );

@@ -1188,6 +1188,10 @@ pub struct IptvConfigDoc {
     /// Published entries in playlist order.
     #[serde(default)]
     pub entries: Vec<IptvEntryDoc>,
+    /// Minutes between background guide refreshes while publication is
+    /// enabled (default 30, 5..=1440).
+    #[serde(default)]
+    pub guide_refresh_minutes: Option<u32>,
 }
 
 /// `OpenAPI` mirror of `multiview_config::Source` — the body accepted by
@@ -1225,6 +1229,10 @@ pub struct SourceBodyDoc {
     /// Optional IPTV playlist presentation metadata (epg-playlist).
     #[serde(default)]
     pub playlist_metadata: Option<PlaylistMetadataDoc>,
+    /// When the source starts: `always_on` (default; started at boot) or
+    /// `on_demand` (idle until something consumes it).
+    #[serde(default)]
+    pub activation: Option<crate::source_demand::SourceActivationView>,
 }
 
 /// `OpenAPI` mirror of `multiview_config::audio::OutputAudioMode`.

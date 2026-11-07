@@ -365,6 +365,17 @@ export function captionModesForValue(value: CaptionsMode): readonly CaptionsMode
 }
 
 /** The wall-clock verb (schema `WallClockUse`), plus 'default' = omit. */
+/** When a source starts. */
+export type SourceActivationChoice = 'always_on' | 'on_demand';
+
+/** A stored body's activation, reading the legacy `demand.always_on` alias. */
+function activationOf(body: Record<string, unknown>): SourceActivationChoice {
+  if (body.activation === 'on_demand') return 'on_demand';
+  if (body.activation === 'always_on') return 'always_on';
+  const legacy = asRecord(body.demand);
+  return legacy?.always_on === false ? 'on_demand' : 'always_on';
+}
+
 export type WallClockChoice = 'default' | 'use' | 'discard';
 
 /** The editable state behind the source form (numbers kept as input strings). */
@@ -442,6 +453,11 @@ export interface SourceFormState {
   readonly gpuPinStableId: string;
   /** Wall-clock verb ('default' = no `wallclock` block). */
   readonly wallclock: WallClockChoice;
+  /**
+   * When the source starts: 'always_on' (the default; started at boot) or
+   * 'on_demand' (idle until something uses it).
+   */
+  readonly activation: SourceActivationChoice;
   /** `auth.secret_ref` ('' = no `auth` block; never a plaintext secret). */
   readonly authSecretRef: string;
   /**
@@ -551,6 +567,7 @@ export function emptySourceForm(): SourceFormState {
     gpuPinVendor: 'nvidia',
     gpuPinStableId: '',
     wallclock: 'default',
+    activation: 'always_on',
     authSecretRef: '',
     webrtcToken: '',
     webrtcAudio: true,
@@ -598,6 +615,10 @@ const SOURCE_MANAGED_KEYS: readonly string[] = [
   'captions',
   'gpu_pin',
   'wallclock',
+  // Lifecycle (`activation`, plus the read-only legacy `demand` alias it
+  // replaces: a save writes `activation` and drops `demand`).
+  'activation',
+  'demand',
   // `webrtc` (WHIP ingest) source keys.
   'token',
   'audio',
@@ -783,6 +804,9 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
   }
   if (form.wallclock !== 'default') {
     body.wallclock = { use: form.wallclock };
+  }
+  if (form.activation === 'on_demand') {
+    body.activation = 'on_demand';
   }
   const epg = epgBody(form);
   if (epg !== undefined) {
@@ -978,6 +1002,7 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
     gpuPinVendor: asPinVendor(gpuPin?.vendor),
     gpuPinStableId: asString(gpuPin?.stable_id) ?? '',
     wallclock: wallclockUse === 'use' || wallclockUse === 'discard' ? wallclockUse : 'default',
+    activation: activationOf(body),
     authSecretRef: asString(auth?.secret_ref) ?? '',
     webrtcToken: kind === 'webrtc' ? (asString(body.token) ?? '') : '',
     // The schema default accepts publisher audio (`audio: true`); an absent key

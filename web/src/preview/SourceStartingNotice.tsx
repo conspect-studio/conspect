@@ -8,7 +8,7 @@ import { useSourceStatus } from '../api/sourceStatus';
 /** "Starting…" / "Failed, retrying" notice for source `id`, or nothing. */
 export function SourceStartingNotice({ id }: { readonly id: string }): JSX.Element | null {
   const status = useSourceStatus().data?.get(id);
-  if (status === undefined || status.phase === 'live') return null;
+  if (status === undefined || status.phase === 'ready') return null;
   if (status.phase === 'failed') {
     return (
       <p role="status" className="text-sm text-muted-foreground" data-testid="source-failed">
@@ -19,7 +19,7 @@ export function SourceStartingNotice({ id }: { readonly id: string }): JSX.Eleme
   }
   return (
     <p role="status" className="text-sm text-muted-foreground" data-testid="source-starting">
-      <Trans>Starting the source… it was idle because nothing was consuming it.</Trans>
+      <Trans>Starting the source… it was idle because nothing was using it.</Trans>
     </p>
   );
 }

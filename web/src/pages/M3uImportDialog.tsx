@@ -25,6 +25,9 @@ import { toast } from '../components/ui/use-toast';
 import { writeResource } from '../resources/api';
 import { resourceKeys, useSources } from '../resources/queries';
 
+/** Above this many always-on imports the dialog warns about the cost. */
+const LARGE_ALWAYS_ON = 20;
+
 /** The Sources-page "Import from M3U" button + dialog. */
 export function M3uImportButton(): JSX.Element {
   const { t } = useLingui();
@@ -37,12 +40,15 @@ export function M3uImportButton(): JSX.Element {
   const [catalogue, setCatalogue] = useState<M3uCatalogue | undefined>(undefined);
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
   const [busy, setBusy] = useState(false);
+  // No silent default: the operator must choose for every import.
+  const [activation, setActivation] = useState<'always_on' | 'on_demand' | null>(null);
   const [error, setError] = useState<string | undefined>(undefined);
 
   const reset = (): void => {
     setCatalogue(undefined);
     setSelected(new Set());
     setError(undefined);
+    setActivation(null);
   };
 
   const load = async (): Promise<void> => {
@@ -66,7 +72,7 @@ export function M3uImportButton(): JSX.Element {
   };
 
   const create = async (): Promise<void> => {
-    if (catalogue === undefined) return;
+    if (catalogue === undefined || activation === null) return;
     setBusy(true);
     const taken = new Set((sources.data ?? []).map((source) => source.id));
     const urlTvg = catalogue.url_tvg[0];
@@ -80,7 +86,7 @@ export function M3uImportButton(): JSX.Element {
         await writeResource(
           'sources',
           id,
-          { name: entry.name, body: candidateToSourceBody(entry, id, urlTvg) },
+          { name: entry.name, body: candidateToSourceBody(entry, id, urlTvg, activation) },
           true,
         );
         created += 1;
@@ -238,9 +244,40 @@ export function M3uImportButton(): JSX.Element {
               </div>
             ) : null}
           </div>
+          {catalogue !== undefined ? (
+            <fieldset className="space-y-1 text-sm" data-testid="m3u-activation">
+              <legend className="font-medium"><Trans>Start the {String(selected.size)} selected source(s)</Trans></legend>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="m3u-activation"
+                  checked={activation === 'on_demand'}
+                  onChange={(): void => { setActivation('on_demand'); }}
+                />
+                <Trans>On demand: idle and free until something uses them</Trans>
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="m3u-activation"
+                  checked={activation === 'always_on'}
+                  onChange={(): void => { setActivation('always_on'); }}
+                />
+                <Trans>Always on: each opens a connection and decodes from boot</Trans>
+              </label>
+              {activation === 'always_on' && selected.size > LARGE_ALWAYS_ON ? (
+                <p role="alert" className="text-xs text-destructive">
+                  <Trans>
+                    {String(selected.size)} always-on sources open {String(selected.size)} connections and
+                    decoders at once. Choose On demand unless every one must run all the time.
+                  </Trans>
+                </p>
+              ) : null}
+            </fieldset>
+          ) : null}
           <DialogFooter>
             <Button
-              disabled={busy || selected.size === 0}
+              disabled={busy || selected.size === 0 || activation === null}
               onClick={(): void => {
                 void create();
               }}

@@ -29,10 +29,10 @@ const server = setupServer(
     HttpResponse.json([
       {
         id: 'idle', phase: 'idle', video_wanted: false, audio_wanted: false,
-        video_running: false, audio_running: false, consumers: [],
+        video_running: false, audio_running: false, consumers: [], activation: 'on_demand',
       },
       {
-        id: 'live', phase: 'live', video_wanted: true, audio_wanted: true,
+        id: 'live', phase: 'ready', video_wanted: true, audio_wanted: true, activation: 'always_on',
         video_running: true, audio_running: true,
         consumers: [{ kind: 'layout_cell', label: 'cell-1' }],
       },
@@ -52,7 +52,7 @@ describe('MonitoringPage demand states', () => {
     renderWithProviders(<MemoryRouter><MonitoringPage /></MemoryRouter>);
     expect(await screen.findByTestId('input-idle')).toBeInTheDocument();
     expect(screen.getByText('Idle')).toBeInTheDocument();
-    expect(screen.getByText('Live')).toBeInTheDocument();
+    expect(screen.getByText('Ready')).toBeInTheDocument();
     await waitFor(() => { expect(jpegPolls).toContain('live.jpg'); });
     expect(jpegPolls).not.toContain('idle.jpg');
     expect(screen.queryByText(/No signal/i)).toBeNull();

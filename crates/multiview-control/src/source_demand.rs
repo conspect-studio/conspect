@@ -39,7 +39,7 @@ pub enum SourceStartingPhase {
 }
 
 /// When a source starts (`sources[].activation`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SourceActivationView {

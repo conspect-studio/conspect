@@ -1,8 +1,9 @@
-// Source demand status (`GET /api/v1/sources/status`): whether each configured
-// source is idle (nothing consumes it, so it costs nothing), starting, live or
-// failed, and who consumes it. Idle is normal, never a fault.
-import { useQuery } from '@tanstack/react-query';
-import type { UseQueryResult } from '@tanstack/react-query';
+// Source lifecycle status (`GET /api/v1/sources/status`): whether each
+// configured source is idle (not started, so it costs nothing), starting, ready
+// or failed, and who uses it. Idle is normal, never a fault. Manual Start / Stop
+// (`POST /api/v1/sources/{id}/start|stop`).
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import type { UseMutationResult, UseQueryResult } from '@tanstack/react-query';
 
 import { apiUrl, buildHeaders, OperationApiError, readProblem } from './operations';
 import type { RequestOptions } from './operations';
@@ -46,5 +47,43 @@ export function useSourceStatus(): UseQueryResult<ReadonlyMap<string, SourceDema
     queryFn: () => getSourceStatus(),
     select: (list) => new Map(list.map((s) => [s.id, s])),
     refetchInterval: 3000,
+  });
+}
+
+/** Start or Stop. */
+export type SourceAction = 'start' | 'stop';
+
+/** Ask the server to start or stop source `id`. A refused Stop throws the
+ * problem, whose detail names who still uses the source. */
+export async function postSourceAction(
+  id: string,
+  action: SourceAction,
+  options: RequestOptions = {},
+): Promise<SourceDemand> {
+  const response = await fetch(
+    apiUrl(options, `/api/v1/sources/${encodeURIComponent(id)}/${action}`),
+    { method: 'POST', headers: buildHeaders(options, true), body: '{}' },
+  );
+  if (!response.ok) {
+    throw await readProblem(response);
+  }
+  const body: unknown = await response.json();
+  const list: unknown = [body];
+  if (!isDemandList(list) || list[0] === undefined) {
+    throw new OperationApiError('The server returned an unexpected source status.');
+  }
+  return list[0];
+}
+
+/** Start / Stop a source, refreshing the status list afterwards. */
+export function useSourceAction(): UseMutationResult<
+  SourceDemand,
+  OperationApiError,
+  { readonly id: string; readonly action: SourceAction }
+> {
+  const client = useQueryClient();
+  return useMutation<SourceDemand, OperationApiError, { readonly id: string; readonly action: SourceAction }>({
+    mutationFn: ({ id, action }) => postSourceAction(id, action),
+    onSettled: () => client.invalidateQueries({ queryKey: sourceStatusKey }),
   });
 }

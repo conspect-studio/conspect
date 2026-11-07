@@ -7969,8 +7969,8 @@
         "tags": [
           "sources"
         ],
-        "summary": "Every source's demand state (role: read; per-object row visibility).",
-        "description": "`idle` means nothing consumes the source, so it costs nothing; it is not a\nfault. Consumers start it (`starting`), it then runs (`live`) or keeps\nretrying with backoff (`failed`).",
+        "summary": "Every source's lifecycle state (role: read; per-object row visibility).",
+        "description": "`idle` means the source is not started, so it costs nothing; it is not a\nfault. An `always_on` source (the default) is started at boot; an\n`on_demand` source starts when something consumes it. It reads `starting`,\nthen `ready`, or `failed` while it retries with backoff.",
         "operationId": "list_source_status",
         "responses": {
           "200": {
@@ -8294,6 +8294,79 @@
         }
       }
     },
+    "/api/v1/sources/{id}/start": {
+      "post": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "Start a source now (role: write; per-object authz; audited).",
+        "description": "Holds the source `ready` until Stop, whatever its activation. Never waits\nfor the source: the response is the state right after the request\n(normally `starting`).",
+        "operationId": "start_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Start requested; the body is the source's state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDemandView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to operate this source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This run cannot start sources.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/{id}/status": {
       "get": {
         "tags": [
@@ -8345,6 +8418,79 @@
           },
           "404": {
             "description": "No such source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{id}/stop": {
+      "post": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "Stop a source now (role: write; per-object authz; audited).",
+        "description": "Refused with 409 while anything else uses the source; the problem detail\nnames every consumer (an `always_on` setting counts). Set the source\n`on_demand` to let it stop.",
+        "operationId": "stop_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Stop requested; the body is the source's state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDemandView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to operate this source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Still in use; the detail names every consumer.",
             "content": {
               "application/json": {
                 "schema": {
@@ -13658,6 +13804,15 @@
             },
             "description": "Published entries in playlist order."
           },
+          "guide_refresh_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Minutes between background guide refreshes while publication is\nenabled (default 30, 5..=1440).",
+            "minimum": 0
+          },
           "public_base_url": {
             "type": [
               "string",
@@ -17045,6 +17200,14 @@
           "ready"
         ]
       },
+      "SourceActivationView": {
+        "type": "string",
+        "description": "When a source starts (`sources[].activation`).",
+        "enum": [
+          "always_on",
+          "on_demand"
+        ]
+      },
       "SourceAuthDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of `multiview_config::SourceAuth` (reference-only secret).",
@@ -17067,6 +17230,17 @@
           {
             "type": "object",
             "properties": {
+              "activation": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SourceActivationView",
+                    "description": "When the source starts: `always_on` (default; started at boot) or\n`on_demand` (idle until something consumes it)."
+                  }
+                ]
+              },
               "auth": {
                 "oneOf": [
                   {
@@ -17203,7 +17377,7 @@
         "properties": {
           "kind": {
             "type": "string",
-            "description": "`layout_cell`, `audio_route`, `subtitle_route`, `preview`, `hls_session`,\n`event_automation`, `event_journal` or `always_on`."
+            "description": "`layout_cell`, `audio_route`, `subtitle_route`, `preview`, `hls_session`,\n`event_automation`, `always_on` or `manual` (an operator Start)."
           },
           "label": {
             "type": "string",
@@ -17213,11 +17387,11 @@
       },
       "SourceDemandPhase": {
         "type": "string",
-        "description": "A source's demand phase.",
+        "description": "A source's lifecycle state. A separate axis from the tile signal state\n(`LIVE` / `STALE` / `NO_SIGNAL`) and from tally.",
         "enum": [
           "idle",
           "starting",
-          "live",
+          "ready",
           "failed"
         ]
       },
@@ -17231,9 +17405,14 @@
           "audio_wanted",
           "video_running",
           "audio_running",
-          "consumers"
+          "consumers",
+          "activation"
         ],
         "properties": {
+          "activation": {
+            "$ref": "#/components/schemas/SourceActivationView",
+            "description": "The source's configured activation. Filled by the API from the\naccepted document; providers may leave the default."
+          },
           "audio_running": {
             "type": "boolean",
             "description": "Whether its audio rail is running."
@@ -17249,6 +17428,15 @@
             },
             "description": "Who is consuming it."
           },
+          "deadline_in_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "While `starting`: milliseconds left before the start timeout.",
+            "minimum": 0
+          },
           "detail": {
             "type": [
               "string",
@@ -17263,6 +17451,17 @@
           "phase": {
             "$ref": "#/components/schemas/SourceDemandPhase",
             "description": "The phase."
+          },
+          "starting_phase": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceStartingPhase",
+                "description": "While `starting`: where it is."
+              }
+            ]
           },
           "video_running": {
             "type": "boolean",
@@ -17986,6 +18185,15 @@
             "description": "Human-friendly name."
           }
         }
+      },
+      "SourceStartingPhase": {
+        "type": "string",
+        "description": "Where a `starting` source is.",
+        "enum": [
+          "queued",
+          "opening",
+          "awaiting_media"
+        ]
       },
       "SourceWallClockDoc": {
         "type": "object",
