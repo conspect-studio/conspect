@@ -767,6 +767,32 @@ async fn cmd_swap(
     Ok(response)
 }
 
+/// Fold one stored-layout key into the desired config document.
+///
+/// A stored layout's `canvas` carries only the geometry it authored (size and
+/// rate). Fields it omits, such as `pixel_format`, `background` and `color`,
+/// keep their running values instead of failing the whole apply.
+fn merge_selected_layout_key(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    if key == "canvas" {
+        if let (Some(current), Some(stored)) = (
+            object
+                .get_mut(key)
+                .and_then(serde_json::Value::as_object_mut),
+            value.as_object(),
+        ) {
+            for (field, field_value) in stored {
+                current.insert(field.clone(), field_value.clone());
+            }
+            return;
+        }
+    }
+    object.insert(key.into(), value.clone());
+}
+
 /// `POST /api/v1/commands/apply-layout` — apply a **stored** layout to the
 /// running multiview, live, at the next frame boundary (role: write;
 /// per-object authz; 202) — ADR-W019, invariant #11 Class-1.
@@ -876,7 +902,7 @@ pub(crate) async fn cmd_apply_layout(
                 let value = stored.layout.body.get(key).ok_or_else(|| {
                     ControlError::Validation(format!("selected layout has no {key}"))
                 })?;
-                object.insert(key.into(), value.clone());
+                merge_selected_layout_key(object, key, value);
             }
             let config: multiview_config::MultiviewConfig =
                 serde_path_to_error::deserialize(document).map_err(|e| {
