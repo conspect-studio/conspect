@@ -313,6 +313,15 @@ where
             .as_ref()
             .and_then(|control| control.public_host.clone()),
     )
+    // The `[control] public_scheme` override (ADR-0101 scheme derivation):
+    // only needed when a front end does NOT set `X-Forwarded-Proto` (the
+    // production nginx config does).
+    .with_public_scheme(
+        config
+            .control
+            .as_ref()
+            .and_then(|control| control.public_scheme.clone()),
+    )
     .with_live_apply(live_apply)
     // The run-path live-apply capability (ADR-W018): which source kinds the
     // running engine can take live — synthetic always, network/file only when

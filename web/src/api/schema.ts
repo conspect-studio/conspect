@@ -4416,6 +4416,15 @@ export interface components {
              *     output has no viewer-reachable address — see `notes` for why.
              */
             url?: string | null;
+            /**
+             * @description The exact shell command an operator pastes to open this URL in VLC
+             *     (`None` when [`url`](Self::url) is `None`). For an SRT row this is
+             *     VLC's own `vlc --srt-latency=<ms> srt://host:port` form — NOT
+             *     `vlc <url>` — because VLC's `srt://` access does not read the
+             *     ffmpeg-style `latency=`/`streamid=` URL query options; every other
+             *     kind uses `vlc <url>`.
+             */
+            vlc_command?: string | null;
         };
         /**
          * @description The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview

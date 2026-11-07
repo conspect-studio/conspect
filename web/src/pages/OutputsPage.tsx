@@ -307,6 +307,7 @@ function PlaybackUrlsSection({ outputId }: { readonly outputId: string }): JSX.E
           idPrefix={`output-playback-${outputId}-${String(index)}`}
           label={entry.label}
           url={entry.url ?? undefined}
+          vlcCommand={entry.vlc_command ?? undefined}
           notes={entry.notes ?? []}
         />
       ))}

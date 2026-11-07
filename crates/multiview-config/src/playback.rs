@@ -33,6 +33,17 @@ pub struct PlaybackUrl {
     /// push-destination redaction, a missing-host explanation. Never a
     /// secret.
     pub notes: Vec<String>,
+    /// The exact shell command an operator pastes to open this URL in VLC.
+    /// `None` when [`url`](Self::url) is `None` (nothing to open). For every
+    /// kind except SRT this is `vlc <url>` (VLC's own URL scheme handles
+    /// ffmpeg-style `srt://…?latency=…` query options correctly ONLY for
+    /// RIST/HLS/WHEP-style URLs — SRT is the one exception: VLC's `srt://`
+    /// access does not read `latency=` from the URL query the way
+    /// ffmpeg/ffplay do, so an SRT row instead carries `vlc
+    /// --srt-latency=<ms> srt://host:port` (VLC's own millisecond CLI
+    /// option, with the `latency=`/`streamid=` query parameters dropped from
+    /// the pasted command since VLC does not consume them from the URL).
+    pub vlc_command: Option<String>,
 }
 
 /// Inputs the derivation needs beyond the [`Output`] itself: the public host
@@ -40,7 +51,7 @@ pub struct PlaybackUrl {
 /// mount route for an HLS/LL-HLS output (the control plane derives this from
 /// the **same** mount mapping the DEV-D1 HLS delivery router uses — see
 /// `hls_mount_segment` in this module).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PlaybackContext<'a> {
     /// The externally-reachable hostname (no scheme, no port): `[control]
     /// public_host` when configured, else the request `Host` header's
@@ -62,6 +73,66 @@ pub struct PlaybackContext<'a> {
     /// The playlist file name under [`hls_route`](Self::hls_route) (the
     /// configured path's final component), e.g. `"multiview.m3u8"`.
     pub hls_playlist: Option<&'a str>,
+    /// The scheme (`"http"` or `"https"`) to use for every absolute viewer
+    /// URL this module builds (the HLS playlist, and the WHEP play URL when
+    /// a public host is known). Callers resolve this BEFORE calling this
+    /// module — see [`resolve_public_scheme`] — because the production front
+    /// end (nginx) terminates TLS and forwards plain HTTP, so the control
+    /// plane's own listener scheme is never the right answer. Defaults to
+    /// `"http"` (an un-proxied direct request) via [`Default`].
+    pub scheme: &'a str,
+}
+
+impl Default for PlaybackContext<'_> {
+    fn default() -> Self {
+        Self {
+            public_host: None,
+            public_host_is_ip_literal: false,
+            hls_route: None,
+            hls_playlist: None,
+            scheme: "http",
+        }
+    }
+}
+
+/// Resolve the scheme (`"http"` or `"https"`) used to build an absolute
+/// viewer URL (the HLS playlist, the WHEP play URL), in priority order:
+///
+/// 1. the request's `X-Forwarded-Proto` header value, when it is exactly
+///    `"http"` or `"https"` — the production nginx front end sets this on
+///    every proxied request; anything else (absent, multi-valued, a bogus
+///    token) is IGNORED rather than trusted, since a header is
+///    client-influenced right up to the first trusted proxy hop;
+/// 2. an explicit `[control] public_scheme` config override, when it is
+///    exactly `"http"` or `"https"` (validated at config load — see
+///    `MultiviewConfig::validate`);
+/// 3. `"https"` when `[control] public_host` is explicitly CONFIGURED
+///    (not merely falling back to the request `Host` header) — an operator
+///    who configured a public host is behind the HTTPS-terminating
+///    production front end this derivation exists for;
+/// 4. `"http"` otherwise — an un-proxied direct request with no public host
+///    configured.
+#[must_use]
+pub fn resolve_public_scheme(
+    forwarded_proto: Option<&str>,
+    configured_scheme: Option<&str>,
+    public_host_is_configured: bool,
+) -> &'static str {
+    match forwarded_proto {
+        Some("https") => return "https",
+        Some("http") => return "http",
+        _ => {}
+    }
+    match configured_scheme {
+        Some("https") => return "https",
+        Some("http") => return "http",
+        _ => {}
+    }
+    if public_host_is_configured {
+        "https"
+    } else {
+        "http"
+    }
 }
 
 /// Map an output id to the URL-segment-safe mount name the DEV-D1 `/hls/{…}`
@@ -202,7 +273,18 @@ fn format_host(host: &str) -> String {
 
 /// Build the viewer `srt://host:port?mode=caller&latency=…&streamid=…` URL for
 /// a listener bind at `bind_host:port`, substituting the public host for a
-/// wildcard/loopback bind. Returns `None` when no public host is known.
+/// wildcard/loopback bind.
+///
+/// **Latency unit (verified defect, same boundary as
+/// `multiview_input::srt::SrtConfig::to_url`):** `latency_ms` is
+/// milliseconds (the model/engine convention and the unit VLC's own
+/// `--srt-latency` CLI option takes), but the `srt://` URL's `latency=`
+/// query option is the FFmpeg/libsrt `AVOption` convention, which is
+/// **microseconds** (`latency=200000` ⇒ 200 ms — ADR-0039 §3). This emits
+/// the exact `×1000` conversion `multiview-input` already uses, via checked
+/// `u64` arithmetic (the stored field is `u32`; a `u32::MAX` latency would
+/// overflow a `u32` product, so the multiply happens in the wider type and
+/// is still checked rather than silently wrapped).
 fn srt_caller_url(
     public_host: &str,
     port: &str,
@@ -212,12 +294,31 @@ fn srt_caller_url(
     use std::fmt::Write as _;
     let mut url = format!("srt://{}:{port}?mode=caller", format_host(public_host));
     if let Some(latency) = latency_ms {
-        let _ = write!(url, "&latency={latency}");
+        if let Some(latency_us) = u64::from(latency).checked_mul(1000) {
+            let _ = write!(url, "&latency={latency_us}");
+        }
     }
     if let Some(id) = stream_id {
         let _ = write!(url, "&streamid={}", percent_encode(id));
     }
     url
+}
+
+/// Build the `vlc --srt-latency=<ms> srt://host:port` command for an SRT
+/// caller URL: VLC's `srt://` access module does NOT read `latency=`/
+/// `streamid=` from the URL query the way ffmpeg/ffplay do, so pasting the
+/// ffmpeg-style URL straight into `vlc <url>` silently drops the configured
+/// latency. VLC instead takes latency via its own `--srt-latency` CLI
+/// option, in **milliseconds** — the model's native unit, so no conversion
+/// is needed here (unlike [`srt_caller_url`]'s query option). The stream id
+/// has no VLC CLI equivalent and is intentionally omitted from this command
+/// (it stays in the pasted URL's `notes`, not silently dropped unexplained).
+fn srt_vlc_command(public_host: &str, port: &str, latency_ms: Option<u32>) -> String {
+    let base = format!("srt://{}:{port}", format_host(public_host));
+    match latency_ms {
+        Some(latency) => format!("vlc --srt-latency={latency} {base}"),
+        None => format!("vlc {base}"),
+    }
 }
 
 /// Percent-encode a query value: alphanumerics and the unreserved `-_.~` pass
@@ -244,7 +345,7 @@ impl Output {
             Output::Rist { url, rist, .. } => rist_playback_urls(url, rist.as_ref(), ctx),
             Output::Rtmp { url, .. } | Output::WhipPush { url, .. } => vec![push_only(url)],
             Output::Hls { .. } | Output::LlHls { .. } => hls_playback_urls(ctx),
-            Output::Webrtc { id, .. } => webrtc_playback_url(id.as_deref(), self),
+            Output::Webrtc { id, .. } => webrtc_playback_url(id.as_deref(), self, ctx),
             Output::RtspServer { .. }
             | Output::Ndi { .. }
             | Output::Aes67 { .. }
@@ -257,6 +358,7 @@ impl Output {
                      receiver)"
                         .to_owned(),
                 ],
+                vlc_command: None,
             }],
         }
     }
@@ -281,6 +383,7 @@ fn srt_playback_urls(
             label: "SRT (listener)".to_owned(),
             url: None,
             notes: vec![format!("could not parse the configured SRT bind {url:?}")],
+            vlc_command: None,
         }];
     };
     let latency_ms = srt.and_then(|o| o.latency_ms);
@@ -304,9 +407,11 @@ fn srt_playback_urls(
                  carries a Host header, to derive a viewer URL"
                     .to_owned(),
             ],
+            vlc_command: None,
         }];
     };
 
+    let vlc_command = srt_vlc_command(public_host, &port, latency_ms);
     let mut notes = Vec::new();
     if encrypted {
         notes.push(
@@ -315,10 +420,16 @@ fn srt_playback_urls(
                 .to_owned(),
         );
     }
+    // VLC: vlc --srt-latency=<ms> srt://host:port (VLC's `srt://` access
+    // does not read `latency=`/`streamid=` from the URL query the way
+    // ffmpeg/ffplay do — its millisecond `--srt-latency` CLI option is the
+    // correct way to set latency when opening this URL in VLC).
+    notes.push(format!("VLC: {vlc_command}"));
     vec![PlaybackUrl {
         label: "SRT (caller)".to_owned(),
         url: Some(srt_caller_url(public_host, &port, latency_ms, stream_id)),
         notes,
+        vlc_command: Some(vlc_command),
     }]
 }
 
@@ -345,12 +456,15 @@ fn rist_playback_urls(
                  carries a Host header, to derive a viewer URL"
                     .to_owned(),
             ],
+            vlc_command: None,
         }];
     };
+    let url = format!("rist://{}:{port}", format_host(public_host));
     vec![PlaybackUrl {
         label: "RIST".to_owned(),
-        url: Some(format!("rist://{}:{port}", format_host(public_host))),
+        url: Some(url.clone()),
         notes: vec![],
+        vlc_command: Some(format!("vlc {url}")),
     }]
 }
 
@@ -361,6 +475,7 @@ fn push_only(url: &str) -> PlaybackUrl {
         label: "Destination".to_owned(),
         url: None,
         notes: vec![format!("pushes to {}", redact_destination(url))],
+        vlc_command: None,
     }
 }
 
@@ -389,6 +504,7 @@ fn hls_playback_urls(ctx: &PlaybackContext<'_>) -> Vec<PlaybackUrl> {
             notes: vec![
                 "no usable playlist file name could be derived from the configured path".to_owned(),
             ],
+            vlc_command: None,
         }];
     };
     let Some(public_host) = ctx.public_host else {
@@ -400,29 +516,46 @@ fn hls_playback_urls(ctx: &PlaybackContext<'_>) -> Vec<PlaybackUrl> {
                  carries a Host header, to derive an absolute playlist URL"
                     .to_owned(),
             ],
+            vlc_command: None,
         }];
     };
+    let url = format!(
+        "{}://{}{route}/{playlist}",
+        ctx.scheme,
+        format_host(public_host)
+    );
     vec![PlaybackUrl {
         label: "HLS playlist".to_owned(),
-        url: Some(format!(
-            "http://{}{route}/{playlist}",
-            format_host(public_host)
-        )),
+        url: Some(url.clone()),
         notes: vec![],
+        vlc_command: Some(format!("vlc {url}")),
     }]
 }
 
 /// The WHEP play URL, when this is a `webrtc` output (`POST
-/// /api/v1/whep/{output_id}` — relative; a WHEP client resolves it against
-/// the page/API origin, so no public host is needed).
-fn webrtc_playback_url(explicit_id: Option<&str>, output: &Output) -> Vec<PlaybackUrl> {
+/// /api/v1/whep/{output_id}`). Absolute (same scheme/host derivation as the
+/// HLS playlist URL) when a public host is known, so a copied URL stays
+/// correct outside the page's own origin (e.g. pasted into another tool);
+/// relative (resolved against the page/API origin) when no public host is
+/// known — still correct for the SPA's own fetch, just not portable.
+fn webrtc_playback_url(
+    explicit_id: Option<&str>,
+    output: &Output,
+    ctx: &PlaybackContext<'_>,
+) -> Vec<PlaybackUrl> {
     let id = explicit_id.map_or_else(|| output.id(), ToOwned::to_owned);
+    let path = format!("/api/v1/whep/{}", percent_encode_path(&id));
+    let url = match ctx.public_host {
+        Some(public_host) => format!("{}://{}{path}", ctx.scheme, format_host(public_host)),
+        None => path,
+    };
     vec![PlaybackUrl {
         label: "WHEP".to_owned(),
-        url: Some(format!("/api/v1/whep/{}", percent_encode_path(&id))),
+        url: Some(url),
         notes: vec![
             "a WHEP URL is viewed by a WebRTC client (e.g. a browser), not VLC/ffplay".to_owned(),
         ],
+        vlc_command: None,
     }]
 }
 
@@ -478,11 +611,20 @@ mod tests {
             public_host_is_ip_literal: is_ip_literal(host),
             hls_route: None,
             hls_playlist: None,
+            scheme: "http",
         }
     }
 
     #[test]
     fn srt_listener_yields_caller_url() {
+        // CORRECTION (verified defect, see commit message): this test used
+        // to pin `latency=120` — the bug itself (the 120 ms configured
+        // latency emitted verbatim into the ffmpeg/libsrt `latency=` query
+        // option, which is MICROSECONDS, so VLC/ffplay would have requested
+        // 1000x too little buffering). The correct emission is the exact
+        // `×1000` conversion (`120_000`), matching
+        // `multiview_input::srt::SrtConfig::to_url`'s own ADR-0039 §3
+        // conversion.
         let srt = SrtOptions {
             mode: Some(SrtMode::Listener),
             latency_ms: Some(120),
@@ -503,7 +645,45 @@ mod tests {
         assert_eq!(urls.len(), 1);
         assert_eq!(
             urls[0].url.as_deref(),
-            Some("srt://viewer.example:9000?mode=caller&latency=120")
+            Some("srt://viewer.example:9000?mode=caller&latency=120000")
+        );
+        assert_eq!(
+            urls[0].vlc_command.as_deref(),
+            Some("vlc --srt-latency=120 srt://viewer.example:9000")
+        );
+        assert!(urls[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("VLC: vlc --srt-latency=120 srt://viewer.example:9000")));
+    }
+
+    #[test]
+    fn srt_latency_at_u32_max_converts_via_checked_widened_arithmetic() {
+        // The ×1000 conversion happens in `u64` (checked, never wrapped): a
+        // `u32::MAX` `latency_ms` still fits comfortably in `u64`, so the
+        // query option is still emitted correctly rather than silently
+        // dropped or overflow-truncated.
+        let srt = SrtOptions {
+            mode: Some(SrtMode::Listener),
+            latency_ms: Some(u32::MAX),
+            ..Default::default()
+        };
+        let output = Output::Srt {
+            id: None,
+            url: "srt://[::]:9000".into(),
+            codec: "h264".into(),
+            gpu_pin: None,
+            audio: None,
+            metadata: None,
+            orientation: None,
+            srt: Some(srt),
+        };
+        let ctx = ctx_with_host("viewer.example");
+        let urls = output.playback_urls(&ctx);
+        let expected_us = u64::from(u32::MAX) * 1000;
+        assert_eq!(
+            urls[0].url.as_deref(),
+            Some(format!("srt://viewer.example:9000?mode=caller&latency={expected_us}").as_str())
         );
     }
 
@@ -738,11 +918,42 @@ mod tests {
             public_host_is_ip_literal: false,
             hls_route: Some("/hls/program"),
             hls_playlist: Some("multiview.m3u8"),
+            scheme: "http",
         };
         let urls = output.playback_urls(&ctx);
         assert_eq!(
             urls[0].url.as_deref(),
             Some("http://viewer.example/hls/program/multiview.m3u8")
+        );
+    }
+
+    #[test]
+    fn hls_mount_resolves_absolute_url_with_https_scheme() {
+        let output = Output::Hls {
+            id: Some("program".into()),
+            path: "/var/lib/multiview/hls/program/multiview.m3u8".into(),
+            codec: "h264".into(),
+            segment_ms: None,
+            gpu_pin: None,
+            audio: None,
+            metadata: None,
+            orientation: None,
+        };
+        let ctx = PlaybackContext {
+            public_host: Some("viewer.example"),
+            public_host_is_ip_literal: false,
+            hls_route: Some("/hls/program"),
+            hls_playlist: Some("multiview.m3u8"),
+            scheme: "https",
+        };
+        let urls = output.playback_urls(&ctx);
+        assert_eq!(
+            urls[0].url.as_deref(),
+            Some("https://viewer.example/hls/program/multiview.m3u8")
+        );
+        assert_eq!(
+            urls[0].vlc_command.as_deref(),
+            Some("vlc https://viewer.example/hls/program/multiview.m3u8")
         );
     }
 
@@ -850,5 +1061,73 @@ mod tests {
         let resolved = resolve_hls_mounts(&pairs);
         assert_eq!(resolved["a/b"].route, "/hls/a-b");
         assert_eq!(resolved["a-b"].route, "/hls/a-b-2");
+    }
+
+    #[test]
+    fn scheme_host_plus_forwarded_proto_https_gives_https() {
+        // The production nginx front end: Host passed through, plus
+        // `X-Forwarded-Proto: https` — the primary signal, trusted outright.
+        assert_eq!(resolve_public_scheme(Some("https"), None, true), "https");
+    }
+
+    #[test]
+    fn scheme_forwarded_proto_http_wins_even_with_a_configured_host() {
+        assert_eq!(resolve_public_scheme(Some("http"), None, true), "http");
+    }
+
+    #[test]
+    fn scheme_config_override_wins_over_the_public_host_default() {
+        // No forwarded-proto signal; an explicit `public_scheme = "http"`
+        // override wins over the "public_host configured ⇒ https" default.
+        assert_eq!(resolve_public_scheme(None, Some("http"), true), "http");
+        assert_eq!(resolve_public_scheme(None, Some("https"), false), "https");
+    }
+
+    #[test]
+    fn scheme_bogus_forwarded_proto_values_are_ignored() {
+        // Neither "http" nor "https" exactly ⇒ ignored, falls through to the
+        // next signal — never trusted as a guess.
+        assert_eq!(
+            resolve_public_scheme(Some("HTTPS"), None, true),
+            "https" // falls through to the public_host-configured default
+        );
+        assert_eq!(
+            resolve_public_scheme(Some("https,http"), None, false),
+            "http" // falls through to the un-proxied-direct-request default
+        );
+        assert_eq!(resolve_public_scheme(Some(""), None, false), "http");
+    }
+
+    #[test]
+    fn scheme_defaults_to_https_only_when_public_host_is_configured() {
+        assert_eq!(resolve_public_scheme(None, None, true), "https");
+        assert_eq!(resolve_public_scheme(None, None, false), "http");
+    }
+
+    #[test]
+    fn webrtc_output_yields_absolute_url_when_public_host_is_known() {
+        let output = Output::Webrtc {
+            id: Some("pgm-webrtc".into()),
+            label: "Program WebRTC".into(),
+            max_viewers: 8,
+            token: None,
+            codec: "h264".into(),
+            gpu_pin: None,
+            audio: None,
+            metadata: None,
+            orientation: None,
+        };
+        let ctx = PlaybackContext {
+            public_host: Some("viewer.example"),
+            public_host_is_ip_literal: false,
+            hls_route: None,
+            hls_playlist: None,
+            scheme: "https",
+        };
+        let urls = output.playback_urls(&ctx);
+        assert_eq!(
+            urls[0].url.as_deref(),
+            Some("https://viewer.example/api/v1/whep/pgm-webrtc")
+        );
     }
 }

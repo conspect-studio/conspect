@@ -138,3 +138,37 @@ fn public_host_must_not_carry_a_path() {
         "names the field: {err}"
     );
 }
+
+#[test]
+fn public_scheme_is_optional_and_round_trips() {
+    let cfg = MultiviewConfig::load_from_toml(&base("")).unwrap();
+    cfg.validate().expect("no public_scheme is valid");
+    assert_eq!(
+        cfg.control.as_ref().and_then(|c| c.public_scheme.clone()),
+        None
+    );
+
+    let cfg = MultiviewConfig::load_from_toml(&base("public_scheme = \"https\"\n")).unwrap();
+    cfg.validate().expect("https validates");
+    assert_eq!(
+        cfg.control
+            .as_ref()
+            .and_then(|c| c.public_scheme.as_deref()),
+        Some("https")
+    );
+    let toml_text = cfg.to_toml().expect("serializes");
+    let reparsed = MultiviewConfig::load_from_toml(&toml_text).expect("re-parses");
+    assert_eq!(cfg, reparsed);
+}
+
+#[test]
+fn public_scheme_rejects_anything_other_than_http_or_https() {
+    let cfg = MultiviewConfig::load_from_toml(&base("public_scheme = \"ftp\"\n")).unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("a non http/https scheme is rejected");
+    assert!(
+        err.to_string().contains("public_scheme"),
+        "names the field: {err}"
+    );
+}

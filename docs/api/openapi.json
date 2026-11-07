@@ -13112,6 +13112,13 @@
               "null"
             ],
             "description": "The URL a viewer pastes into VLC/ffplay/a browser. Absent when this\noutput has no viewer-reachable address — see `notes` for why."
+          },
+          "vlc_command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The exact shell command an operator pastes to open this URL in VLC\n(`None` when [`url`](Self::url) is `None`). For an SRT row this is\nVLC's own `vlc --srt-latency=<ms> srt://host:port` form — NOT\n`vlc <url>` — because VLC's `srt://` access does not read the\nffmpeg-style `latency=`/`streamid=` URL query options; every other\nkind uses `vlc <url>`."
           }
         }
       },

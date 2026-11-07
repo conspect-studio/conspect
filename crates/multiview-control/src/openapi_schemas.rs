@@ -2205,6 +2205,14 @@ pub struct PlaybackUrlDoc {
     /// redacted push destination, a missing-host explanation. Never a secret.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// The exact shell command an operator pastes to open this URL in VLC
+    /// (`None` when [`url`](Self::url) is `None`). For an SRT row this is
+    /// VLC's own `vlc --srt-latency=<ms> srt://host:port` form — NOT
+    /// `vlc <url>` — because VLC's `srt://` access does not read the
+    /// ffmpeg-style `latency=`/`streamid=` URL query options; every other
+    /// kind uses `vlc <url>`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub vlc_command: Option<String>,
 }
 
 /// `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body.

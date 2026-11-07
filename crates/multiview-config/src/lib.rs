@@ -88,8 +88,8 @@ pub use multicast::{
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use playback::{
-    hls_mount_segment, host_header_hostname, is_ip_literal, resolve_hls_mounts, HlsMountRoute,
-    PlaybackContext, PlaybackUrl,
+    hls_mount_segment, host_header_hostname, is_ip_literal, resolve_hls_mounts,
+    resolve_public_scheme, HlsMountRoute, PlaybackContext, PlaybackUrl,
 };
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
@@ -189,6 +189,18 @@ pub struct ControlConfig {
     /// is substituted in per-URL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_host: Option<String>,
+    /// An explicit override for the scheme (`"http"` or `"https"`) used to
+    /// build an absolute viewer URL (the HLS playlist, the WHEP play URL) —
+    /// see [`multiview_config::resolve_public_scheme`] for the full
+    /// priority order. Absent ⇒ the per-request `X-Forwarded-Proto` header
+    /// decides, falling back to `"https"` when
+    /// [`public_host`](Self::public_host) is configured, else `"http"`. Set
+    /// this only when the front end does NOT set `X-Forwarded-Proto` (the
+    /// production nginx config does, so this override is normally
+    /// unnecessary). Validated as exactly `"http"` or `"https"` by
+    /// [`MultiviewConfig::validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_scheme: Option<String>,
     /// The outbound-dial SSRF allowlist (SEC-02/SEC-04, CWE-918, ADR-M013): the
     /// operator CIDRs the managed-device poller and Cast session actor lock their
     /// outbound dial to. IPv6-first (e.g. `["fd00:db8::/32", "192.168.0.0/16"]`);
@@ -874,6 +886,13 @@ impl MultiviewConfig {
                     return Err(ConfigError::Validation(format!(
                         "control.public_host {host:?} must be a bare hostname/IP literal (no \
                          path, query, or port) — bracket an IPv6 literal as [::1]"
+                    )));
+                }
+            }
+            if let Some(scheme) = &control.public_scheme {
+                if scheme != "http" && scheme != "https" {
+                    return Err(ConfigError::Validation(format!(
+                        "control.public_scheme {scheme:?} must be exactly \"http\" or \"https\""
                     )));
                 }
             }

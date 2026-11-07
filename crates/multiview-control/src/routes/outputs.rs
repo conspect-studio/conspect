@@ -355,6 +355,21 @@ pub(crate) async fn get_output_playback(
         .as_deref()
         .is_some_and(multiview_config::is_ip_literal);
 
+    // Resolve the scheme for an absolute viewer URL (ADR-0101 scheme
+    // derivation): the request's own `X-Forwarded-Proto` header (the
+    // production nginx front end sets this), else the `[control]
+    // public_scheme` override, else "https" when `public_host` is
+    // explicitly CONFIGURED (not merely the Host-header fallback), else
+    // plain "http" for an un-proxied direct request.
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok());
+    let scheme = multiview_config::resolve_public_scheme(
+        forwarded_proto,
+        state.public_scheme.as_deref(),
+        configured_host.is_some(),
+    );
+
     // The HLS/LL-HLS mount route: resolved across EVERY accepted HLS/LL-HLS
     // output (not just this one), in declaration order, so a mount-name
     // collision resolves identically to the actual `/hls/{…}` router
@@ -387,6 +402,7 @@ pub(crate) async fn get_output_playback(
         public_host_is_ip_literal,
         hls_route: this_mount.map(|m| m.route.as_str()),
         hls_playlist: this_mount.and_then(|m| m.playlist.as_deref()),
+        scheme,
     };
     let urls = output
         .playback_urls(&ctx)
@@ -395,6 +411,7 @@ pub(crate) async fn get_output_playback(
             label: u.label,
             url: u.url,
             notes: u.notes,
+            vlc_command: u.vlc_command,
         })
         .collect();
     Ok(Json(OutputPlaybackResponse { urls }))
