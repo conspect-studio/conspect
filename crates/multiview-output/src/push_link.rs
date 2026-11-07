@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(snap.peers, vec!["[::1]:5000".to_owned()]);
         s.client_detached(Some("[::1]:5000"));
         s.client_detached(None); // saturates, never underflows
-        assert!(s.snapshot().peers.is_empty());
+        assert_eq!(s.snapshot().peers, Vec::<String>::new());
         assert_eq!(s.snapshot().state, PushLinkState::Listening);
         s.add_dropped(3);
         assert_eq!(s.snapshot().dropped, 3);

@@ -5136,7 +5136,7 @@ fn consumer_main(
                 kind: "encode",
                 reason: e.to_string(),
             })?;
-        fan_packets(&sink_txs, &mut live, &policies, packets);
+        fan_packets(&sink_txs, &mut live, policies, packets);
         // Program audio (AUD-4 + RT-8b), OFF the engine hot loop: when the bus is
         // present, mix program audio up to THIS frame's output tick index — catching
         // up the samples for any ticks `DropOnOverload` shed since the last surviving
@@ -5263,7 +5263,7 @@ fn consumer_main(
                     kind: "encode-audio",
                     reason: e.to_string(),
                 })?;
-            fan_packets(&sink_txs, &mut live, &policies, audio_packets);
+            fan_packets(&sink_txs, &mut live, policies, audio_packets);
             // #152: discrete tracks, same tick, same sample budget (inv #3).
             if !selected_tracks.is_empty() {
                 #[cfg(feature = "overlay")]
@@ -5278,7 +5278,7 @@ fn consumer_main(
                     &selected_tracks,
                     block.frame_count(),
                 )?;
-                fan_packets(&sink_txs, &mut live, &policies, packets);
+                fan_packets(&sink_txs, &mut live, policies, packets);
             }
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
@@ -5298,7 +5298,7 @@ fn consumer_main(
         kind: "encode",
         reason: e.to_string(),
     })?;
-    fan_packets(&sink_txs, &mut live, &policies, tail);
+    fan_packets(&sink_txs, &mut live, policies, tail);
     drop(sink_txs);
     Ok(())
 }

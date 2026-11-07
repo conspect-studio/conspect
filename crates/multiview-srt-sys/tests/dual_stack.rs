@@ -1,5 +1,5 @@
 //! One `[::]` listener must accept real callers over IPv6 AND IPv4 — the
-//! operator requirement FFmpeg's libsrt protocol cannot meet. Peers are the
+//! operator requirement `FFmpeg`'s libsrt protocol cannot meet. Peers are the
 //! `ffmpeg` CLI's own libsrt caller, so the handshake is independent of this
 //! crate. Skips only when libsrt or the CLI is genuinely absent.
 #![allow(
@@ -71,8 +71,16 @@ fn accept_and_read(listener: &SrtListener, caller_host: &str, port: u16) -> std:
 
 #[test]
 fn one_wildcard_listener_accepts_ipv6_and_ipv4_callers() {
-    if SrtLib::shared().is_err() {
-        eprintln!("SKIP: libsrt not present");
+    let cli_has_srt = Command::new("ffmpeg")
+        .args(["-hide_banner", "-protocols"])
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.trim() == "srt")
+        });
+    if SrtLib::shared().is_err() || !cli_has_srt {
+        eprintln!("SKIP: libsrt or an SRT-capable ffmpeg CLI is not present");
         return;
     }
     let port = 21_000 + u16::try_from(std::process::id() % 20_000).unwrap();

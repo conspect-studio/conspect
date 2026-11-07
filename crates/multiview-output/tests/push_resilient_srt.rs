@@ -126,9 +126,7 @@ fn start(url: String, listener: bool, pace: Option<Duration>) -> Run {
     Run { stop, link, handle }
 }
 
-fn paced() -> Option<Duration> {
-    Some(Duration::from_millis(33))
-}
+const PACED: Option<Duration> = Some(Duration::from_millis(33));
 
 fn wait_for(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
@@ -178,11 +176,7 @@ fn assert_decoded(mut child: Child, who: &str) {
 #[test]
 fn listener_serves_two_sequential_callers() {
     let port = port();
-    let run = start(
-        format!("srt://127.0.0.1:{port}?mode=listener"),
-        true,
-        paced(),
-    );
+    let run = start(format!("srt://127.0.0.1:{port}?mode=listener"), true, PACED);
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -203,7 +197,7 @@ fn listener_serves_two_sequential_callers() {
 #[test]
 fn wildcard_listener_is_dual_stack_and_reports_real_peers() {
     let port = port();
-    let run = start(format!("srt://[::]:{port}?mode=listener"), true, paced());
+    let run = start(format!("srt://[::]:{port}?mode=listener"), true, PACED);
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -230,7 +224,7 @@ fn wildcard_listener_is_dual_stack_and_reports_real_peers() {
 #[test]
 fn explicit_ipv4_wildcard_listener_still_serves_ipv4_callers() {
     let port = port();
-    let run = start(format!("srt://0.0.0.0:{port}?mode=listener"), true, paced());
+    let run = start(format!("srt://0.0.0.0:{port}?mode=listener"), true, PACED);
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -247,7 +241,7 @@ fn explicit_ipv4_wildcard_listener_still_serves_ipv4_callers() {
 #[test]
 fn caller_churn_never_slows_the_producer() {
     let port = port();
-    let run = start(format!("srt://[::]:{port}?mode=listener"), true, paced());
+    let run = start(format!("srt://[::]:{port}?mode=listener"), true, PACED);
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -281,11 +275,7 @@ fn caller_churn_never_slows_the_producer() {
 #[test]
 fn listener_serves_two_simultaneous_callers() {
     let port = port();
-    let run = start(
-        format!("srt://127.0.0.1:{port}?mode=listener"),
-        true,
-        paced(),
-    );
+    let run = start(format!("srt://127.0.0.1:{port}?mode=listener"), true, PACED);
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -316,11 +306,7 @@ fn caller_reconnects_after_the_peer_goes_away() {
             .expect("spawn ffmpeg listener peer")
     };
     // The push starts with NO peer: it must retry rather than die.
-    let run = start(
-        format!("srt://127.0.0.1:{port}?mode=caller"),
-        false,
-        paced(),
-    );
+    let run = start(format!("srt://127.0.0.1:{port}?mode=caller"), false, PACED);
     std::thread::sleep(Duration::from_millis(700));
     assert_decoded(peer(20), "first peer");
     wait_for("detach", Duration::from_secs(15), || {
@@ -349,11 +335,7 @@ fn no_peer_never_blocks_the_producer_and_counts_drops() {
 #[test]
 fn teardown_is_bounded_while_waiting_for_a_caller() {
     let port = port();
-    let run = start(
-        format!("srt://127.0.0.1:{port}?mode=listener"),
-        true,
-        paced(),
-    );
+    let run = start(format!("srt://127.0.0.1:{port}?mode=listener"), true, PACED);
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -378,7 +360,7 @@ fn encrypted_listener_admits_only_the_right_passphrase() {
     let run = start(
         format!("srt://[::]:{port}?mode=listener&pbkeylen=32&passphrase={secret}"),
         true,
-        paced(),
+        PACED,
     );
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening

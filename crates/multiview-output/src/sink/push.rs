@@ -14,7 +14,7 @@
 //!   [`Muxer::create_push`], whose `AVIOInterruptCB` makes the blocking connect
 //!   abortable, keeps one session, and reconnects with back-off (0.5 s → 5 s,
 //!   jittered) when it ends. *Listener* mode (SRT `mode=listener`) holds **one**
-//!   native socket from `multiview-srt-sys` for the whole run, because FFmpeg's
+//!   native socket from `multiview-srt-sys` for the whole run, because `FFmpeg`'s
 //!   libsrt can neither bind dual-stack `[::]` nor keep listening after an
 //!   accept. Each caller gets its own writer while the socket keeps accepting,
 //!   so there is no re-listen gap and N callers share one encode.
@@ -340,7 +340,8 @@ fn caller_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &Writ
             }
         };
         let started = Instant::now();
-        let Some(writer) = start_session(shared, muxer, spec, Some(redact_target(url))) else {
+        let Some(writer) = start_session(shared, muxer, spec, Some(redact_target(url).as_str()))
+        else {
             sleep_unless_stopped(shared, backoff.next_delay());
             continue;
         };
@@ -402,6 +403,7 @@ fn accept_callers(
             Err(SrtError::Interrupted) => return None,
             Err(e) => return Some(e),
         };
+        let peer = peer.map(|p| p.to_string());
         reap_finished(shared);
         if shared.link.clients() >= MAX_LISTENER_CLIENTS {
             tracing::warn!(
@@ -413,9 +415,7 @@ fn accept_callers(
         let writer = socket_writer(socket, Arc::clone(&shared.stop));
         match Muxer::create_with_writer(muxer_name, LIVE_PAYLOAD, writer) {
             Ok(muxer) => {
-                if let Some(handle) =
-                    start_session(shared, muxer, spec, peer.map(|p| p.to_string()))
-                {
+                if let Some(handle) = start_session(shared, muxer, spec, peer.as_deref()) {
                     shared.writers().push(handle);
                 }
             }
@@ -454,13 +454,13 @@ fn start_session(
     shared: &Shared,
     muxer: Muxer,
     spec: &WriterSpec,
-    peer: Option<String>,
+    peer: Option<&str>,
 ) -> Option<JoinHandle<()>> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(CLIENT_QUEUE_CAP);
     let spec = spec.clone();
     let link = Arc::clone(&shared.link);
-    link.client_attached(peer.clone());
-    let writer_peer = peer.clone();
+    link.client_attached(peer.map(ToOwned::to_owned));
+    let writer_peer = peer.map(ToOwned::to_owned);
     let spawned = std::thread::Builder::new()
         .name("multiview-push-writer".to_owned())
         .spawn(move || writer_main(muxer, &rx, &spec, &link, writer_peer.as_deref()));
@@ -471,7 +471,7 @@ fn start_session(
             Some(handle)
         }
         Err(e) => {
-            shared.link.client_detached(peer.as_deref());
+            shared.link.client_detached(peer);
             shared.link.set_error(format!("spawn push writer: {e}"));
             None
         }

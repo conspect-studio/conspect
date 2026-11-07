@@ -2,10 +2,10 @@
 //!
 //! # Why this crate exists
 //!
-//! FFmpeg's `libsrt` URL protocol (8.1.1, byte-identical to 8.1) cannot bind the
+//! `FFmpeg`'s `libsrt` URL protocol (8.1.1, byte-identical to 8.1) cannot bind the
 //! IPv6 wildcard: libsrt 1.5 rejects `srt_bind` on `[::]` unless
 //! `SRTO_IPV6ONLY` was set explicitly (`api.cpp`: "when binding to :: (IPv6
-//! wildcard), SRTO_IPV6ONLY option must be set explicitly to 0 or 1" →
+//! wildcard), `SRTO_IPV6ONLY` option must be set explicitly to 0 or 1" →
 //! `MJ_NOTSUP/MN_INVAL`, surfaced as "Operation not supported: Bad parameters"),
 //! and `libsrt.c` exposes no option to set it. The repository rule is
 //! dual-stack `[::]`, so the listener half of SRT (both an SRT *output* that

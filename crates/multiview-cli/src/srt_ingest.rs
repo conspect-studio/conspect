@@ -115,20 +115,18 @@ fn start(spec: ListenerSpec) -> Result<SrtIngestBridge, String> {
     let stop = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicU64::new(0));
     let readers: Readers = Arc::new(Mutex::new(Vec::new()));
-    {
-        let (stop, readers) = (Arc::clone(&stop), Arc::clone(&readers));
-        std::thread::Builder::new()
-            .name("multiview-srt-relay".to_owned())
-            .spawn(move || accept_readers(&local, &readers, &stop))
-            .map_err(|e| format!("srt relay thread: {e}"))?;
-    }
-    {
-        let (stop, dropped) = (Arc::clone(&stop), Arc::clone(&dropped));
-        std::thread::Builder::new()
-            .name("multiview-srt-listen".to_owned())
-            .spawn(move || listen(&spec, &readers, &dropped, &stop))
-            .map_err(|e| format!("srt listener thread: {e}"))?;
-    }
+    let relay_stop = Arc::clone(&stop);
+    let relay_readers = Arc::clone(&readers);
+    std::thread::Builder::new()
+        .name("multiview-srt-relay".to_owned())
+        .spawn(move || accept_readers(&local, &relay_readers, &relay_stop))
+        .map_err(|e| format!("srt relay thread: {e}"))?;
+    let listen_stop = Arc::clone(&stop);
+    let listen_dropped = Arc::clone(&dropped);
+    std::thread::Builder::new()
+        .name("multiview-srt-listen".to_owned())
+        .spawn(move || listen(&spec, &readers, &listen_dropped, &listen_stop))
+        .map_err(|e| format!("srt listener thread: {e}"))?;
     Ok(SrtIngestBridge {
         local_url: format!("tcp://[::1]:{port}"),
         stop,
