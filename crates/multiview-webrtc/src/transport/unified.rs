@@ -809,6 +809,29 @@ mod tests {
         Ok(count)
     }
 
+    /// Stops and joins the flood OS thread on EVERY exit path — normal return,
+    /// a failed assertion or a timeout `expect` — so a failing flood test can
+    /// never detach a sender that keeps flooding loopback for the rest of the
+    /// test process (review PR193-05). Dropping a `JoinHandle` only detaches;
+    /// this guard raises both stop flags first, then joins.
+    struct FloodGuard {
+        stop: Arc<AtomicBool>,
+        flood_stop: Arc<AtomicBool>,
+        flooder: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for FloodGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.flood_stop.store(true, Ordering::Release);
+            if let Some(flooder) = self.flooder.take() {
+                // A flooder panic must not double-panic during unwinding; the
+                // original failure is what the test reports.
+                let _ = flooder.join();
+            }
+        }
+    }
+
     /// Build a publisher offer with a host candidate (mirrors
     /// `tests/unified_socket.rs::offer`), so the flood test can negotiate a
     /// REAL ingest session and observe a REAL effect of servicing — not just an
@@ -919,7 +942,12 @@ mod tests {
         // no platform-specific socket inspection sits on this path, only a
         // plain blocking `send_to` loop (review PR193-01).
         let flood_stop = Arc::new(AtomicBool::new(false));
-        let flooder = {
+        let mut flood_guard = FloodGuard {
+            stop: Arc::clone(&stop),
+            flood_stop: Arc::clone(&flood_stop),
+            flooder: None,
+        };
+        flood_guard.flooder = Some({
             let flood_stop = Arc::clone(&flood_stop);
             std::thread::spawn(move || {
                 let s = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
@@ -938,7 +966,7 @@ mod tests {
                     }
                 }
             })
-        };
+        });
 
         // The INDEPENDENT fairness observer: a separate task on the SAME
         // single-threaded runtime, genuinely contending with the driver for
@@ -1052,10 +1080,11 @@ mod tests {
         );
 
         stop.store(true, Ordering::Release);
-        flood_stop.store(true, Ordering::Relaxed);
         let stopped = tokio::time::timeout(Duration::from_secs(30), driver).await;
         let _ = tokio::time::timeout(Duration::from_secs(30), observer).await;
-        let _ = flooder.join();
+        // Stop + join the flooder now (the guard also does this on any panic
+        // path above, review PR193-05).
+        drop(flood_guard);
 
         let exhausted = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
         let handoffs = probe.handoff_services.load(Ordering::Relaxed);
