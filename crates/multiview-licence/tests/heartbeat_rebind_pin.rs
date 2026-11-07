@@ -57,12 +57,32 @@ fn bound_identity() -> multiview_licence::heartbeat::DeviceIdentity {
     }
 }
 
+fn fixture_client(
+    server: Arc<FakeLicenceServer>,
+    store: Arc<LeaseStore>,
+    pinned: multiview_licence::heartbeat::PinnedRoot,
+    config: HeartbeatConfig,
+    identity: multiview_licence::heartbeat::DeviceIdentity,
+    signer: Arc<dyn multiview_licence::heartbeat::DeviceSigner>,
+) -> HeartbeatClient<FakeLicenceServer> {
+    let now_ms = server.kit().now_ms();
+    HeartbeatClient::with_clock(
+        server,
+        store,
+        pinned,
+        config,
+        identity,
+        Arc::new(move || now_ms),
+    )
+    .with_signer(signer)
+}
+
 fn client(
     server: Arc<FakeLicenceServer>,
     store: Arc<LeaseStore>,
 ) -> HeartbeatClient<FakeLicenceServer> {
     let pinned = server.pinned_root();
-    HeartbeatClient::with_device_signer(
+    fixture_client(
         server,
         store,
         pinned,
@@ -236,7 +256,7 @@ async fn an_activate_pin_is_not_replayed_by_a_subsequent_renew() {
     let store = Arc::new(LeaseStore::new());
     // An UNBOUND device with activate ENABLED — the first cycle takes the ACTIVATE path.
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::with_device_signer(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -346,7 +366,7 @@ async fn rebind_uses_the_store_learned_binding_not_the_instance_id() {
     // An UNBOUND identity (binding_id: None) with a DISTINCT instance_id — so the only
     // correct binding source is the store-learned one.
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::with_device_signer(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -427,7 +447,7 @@ async fn rebind_prefers_the_learned_binding_over_a_present_stale_configured_id()
         )
         .expect("seed the store binding");
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::with_device_signer(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,
@@ -494,7 +514,7 @@ async fn rebind_prefers_the_store_binding_over_a_present_stale_configured_id() {
         "precondition: the store has the binding anchor"
     );
     let pinned = server.pinned_root();
-    let client = HeartbeatClient::with_device_signer(
+    let client = fixture_client(
         Arc::clone(&server),
         Arc::clone(&store),
         pinned,

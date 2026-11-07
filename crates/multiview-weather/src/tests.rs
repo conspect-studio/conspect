@@ -78,3 +78,19 @@ fn parser_enforces_each_resource_limit() {
         ));
     }
 }
+
+#[test]
+fn text_entities_resolve_and_undeclared_entities_are_rejected() {
+    let doc = FORECAST.replace("Sunny.", "Sun &amp; cloud &#x2013; 30&#176;C &lt;5%");
+    let p = parse_forecast(doc.as_bytes()).unwrap();
+    let texts = format!("{:?}", p.areas[0].periods[0]);
+    assert!(
+        texts.contains("Sun & cloud \u{2013} 30\u{b0}C <5%"),
+        "{texts}"
+    );
+    let bad = FORECAST.replace("Sunny.", "Sunny &bogus;");
+    assert!(matches!(
+        parse_forecast(bad.as_bytes()),
+        Err(ParseError::Xml(_))
+    ));
+}
