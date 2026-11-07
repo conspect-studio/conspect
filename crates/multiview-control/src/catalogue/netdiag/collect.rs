@@ -225,7 +225,11 @@ impl Collector {
     }
 
     /// One family of the egress lookup.
-    async fn trace(&self, url: &url::Url, v6: bool) -> Option<(IpAddr, Option<String>, Option<String>)> {
+    async fn trace(
+        &self,
+        url: &url::Url,
+        v6: bool,
+    ) -> Option<(IpAddr, Option<String>, Option<String>)> {
         let local = if v6 {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         } else {
@@ -279,7 +283,8 @@ impl Collector {
             *self
                 .cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), e.clone()));
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((Instant::now(), e.clone()));
         }
         e
     }
@@ -377,7 +382,8 @@ impl Collector {
             match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(sock)).await
             {
                 Ok(Ok(_)) => {
-                    row.connect_ms = Some(u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+                    row.connect_ms =
+                        Some(u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
                 }
                 Ok(Err(e)) => {
                     row.error = Some(format!("connect: {}", clean(&e.to_string(), 120)));
@@ -399,7 +405,9 @@ impl Collector {
                     continue;
                 }
             };
-            let mut rb = client.get(url.as_str()).header("Accept-Encoding", "identity");
+            let mut rb = client
+                .get(url.as_str())
+                .header("Accept-Encoding", "identity");
             if let Some(ua) = &req.user_agent {
                 rb = rb.header(reqwest::header::USER_AGENT, ua);
             }
@@ -413,7 +421,8 @@ impl Collector {
                     if used.is_none() {
                         used = Some(ip);
                         hop.status = Some(status);
-                        hop.ms = Some(u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX));
+                        hop.ms =
+                            Some(u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX));
                         hop.server = header(&resp, "server");
                         hop.via = header(&resp, "via");
                         hop.age = header(&resp, "age");
@@ -456,7 +465,9 @@ impl Collector {
             if acc.hops.len() >= MAX_HOPS {
                 break;
             }
-            let Ok(mut url) = url::Url::parse(&raw) else { break };
+            let Ok(mut url) = url::Url::parse(&raw) else {
+                break;
+            };
             // No credentials are ever sent or shown.
             let _ = url.set_username("");
             let _ = url.set_password(None);
@@ -480,7 +491,8 @@ impl Collector {
             acc.curl.push(curl_for_addr(
                 url.as_str(),
                 headers,
-                hp.used.map(|ip| (ip, url.port_or_known_default().unwrap_or(0))),
+                hp.used
+                    .map(|ip| (ip, url.port_or_known_default().unwrap_or(0))),
             ));
             if !acc.hosts.iter().any(|h| h.host == hp.host.host) {
                 acc.hosts.push(hp.host);
@@ -519,7 +531,11 @@ impl Collector {
     /// Collect the report for `req`. `channel_country` (ISO alpha-2) feeds the
     /// geo hint of the assessment. Bounded by a 15 s budget; a timeout keeps what
     /// was learned so far.
-    pub async fn collect(&self, req: &ProbeRequest, channel_country: Option<&str>) -> NetworkReport {
+    pub async fn collect(
+        &self,
+        req: &ProbeRequest,
+        channel_country: Option<&str>,
+    ) -> NetworkReport {
         let headers = NetworkRequestHeaders {
             user_agent: req.user_agent.clone(),
             referrer: req.referrer.as_deref().map(redact_url),

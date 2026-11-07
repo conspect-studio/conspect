@@ -17,6 +17,9 @@ pub mod index;
 pub mod links;
 pub mod model;
 pub mod netdiag;
+
+/// A shared network-diagnostics collector.
+pub type NetworkCollectorHandle = std::sync::Arc<dyn netdiag::NetworkCollector>;
 pub mod service;
 pub mod store;
 pub mod sync;
@@ -121,8 +124,10 @@ pub fn install(
     };
     let catalogue = Catalogue::new(dir, cfg, fetcher);
     let guard = guard::DialGuard::new(Arc::clone(&state.dial_policy));
-    let collector: Arc<dyn netdiag::NetworkCollector> =
-        Arc::new(netdiag::collect::Collector::new(guard.clone(), egress_lookup));
+    let collector: Arc<dyn netdiag::NetworkCollector> = Arc::new(netdiag::collect::Collector::new(
+        guard.clone(),
+        egress_lookup,
+    ));
     let runner: Arc<dyn probe::ProbeRunner> = match probe::engine::HttpProbeRunner::new(guard) {
         Ok(r) => Arc::new(r),
         Err(e) => {

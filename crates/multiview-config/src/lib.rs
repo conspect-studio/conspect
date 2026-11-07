@@ -32,7 +32,6 @@
 pub mod api;
 pub mod audio;
 pub mod catalogues;
-pub mod network_diagnostics;
 pub mod device;
 pub mod diff;
 pub mod discovery;
@@ -45,6 +44,7 @@ pub mod layout_doc;
 pub mod limits;
 pub mod media;
 pub mod multicast;
+pub mod network_diagnostics;
 pub mod origin;
 pub mod placement;
 pub mod probe;
@@ -76,7 +76,6 @@ pub use audio::{
     TrackDelivery, PROGRAM_TRACK,
 };
 pub use catalogues::{CataloguesConfig, IptvOrgConfig};
-pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use device::{Device, DeviceAuth, DeviceDisplay, DeviceDriver, DisplayAssign, ReconnectPolicy};
 pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
@@ -96,6 +95,7 @@ pub use multicast::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
     RejectedGroup,
 };
+pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};

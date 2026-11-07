@@ -189,7 +189,9 @@ pub fn curl_for_addr(
 ) -> String {
     let base = curl_for(url, headers);
     let Some((ip, port)) = used else { return base };
-    let Some(host) = host_of(url) else { return base };
+    let Some(host) = host_of(url) else {
+        return base;
+    };
     let fam = if ip.is_ipv6() { "-6" } else { "-4" };
     let host = host.trim_matches(['[', ']']);
     base.replacen(

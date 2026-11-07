@@ -24,6 +24,8 @@ pub struct NetworkDiagnosticsConfig {
 
 impl Default for NetworkDiagnosticsConfig {
     fn default() -> Self {
-        Self { egress_lookup: true }
+        Self {
+            egress_lookup: true,
+        }
     }
 }
