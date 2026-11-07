@@ -904,6 +904,13 @@ const fn is_true(value: &bool) -> bool {
     *value
 }
 
+/// Skip-serializing predicate for a default-`false` bool field (so an unset
+/// flag never appears in the canonical JSON/TOML wire form).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl SourceKind {
     /// Whether this kind is produced **in-process** (`bars`/`solid`/`clock`,
     /// ADR-0027) rather than decoded from external media.
@@ -987,6 +994,314 @@ pub struct Source {
     /// trust *tier* is measured at runtime, never authored. See [`SourceWallClock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallclock: Option<SourceWallClock>,
+    /// Optional per-source **EPG** (XMLTV) acquisition block.
+    ///
+    /// Absent means no EPG is configured for this source (the existing,
+    /// pre-EPG documents deserialize and re-serialize byte-identically). See
+    /// [`EpgSource`]. The block is **presentation only**: it never changes the
+    /// source's media identity or the ingest path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epg: Option<EpgSource>,
+    /// Optional IPTV **playlist presentation** metadata.
+    ///
+    /// Absent means no playlist metadata is authored. See [`PlaylistMetadata`].
+    /// **Presentation only** — it never affects the source's media identity,
+    /// ingest, or decode path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_metadata: Option<PlaylistMetadata>,
+}
+
+/// How a source's EPG (electronic programme guide) is obtained.
+///
+/// Serializes as a snake-case string (`"automatic"` / `"manual"` /
+/// `"disabled"`). `#[non_exhaustive]` for forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EpgMode {
+    /// Resolve the guide automatically (the default; no `url` is required).
+    #[default]
+    Automatic,
+    /// Use the explicitly authored [`EpgSource::url`] **and**
+    /// [`EpgSource::channel_id`] — both are required in this mode.
+    Manual,
+    /// Do not fetch a guide for this source.
+    ///
+    /// Previously authored `url`/`channel_id`/`secret_ref` values are
+    /// **retained** (never used, never an error) so an operator can re-enable
+    /// the guide without re-typing them.
+    Disabled,
+}
+
+/// Optional per-source EPG (XMLTV) acquisition block.
+///
+/// This is **configuration only** — it carries no acquisition, caching or
+/// scheduling behaviour, and it never alters the source's media identity or
+/// ingest: two documents differing only in this block describe the same media.
+///
+/// Credentials are **references**: [`EpgSource::secret_ref`] names a
+/// secret-manager entry (e.g. `op://…` or `env:VAR`); a raw credential in the
+/// URL (`https://user:pass@…`) is rejected by [`EpgSource::validate`].
+///
+/// The whole block is optional on [`Source`], so pre-EPG documents are
+/// unaffected; `#[non_exhaustive]` for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct EpgSource {
+    /// How the guide is obtained. Defaults to [`EpgMode::Automatic`].
+    #[serde(default)]
+    pub mode: EpgMode,
+    /// Optional HTTP(S) URL of an XMLTV feed.
+    ///
+    /// Must be `http://` or `https://` with a non-empty host and no embedded
+    /// credentials. Omitted from the wire form when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Optional **exact** provider channel id (the id as it appears in the
+    /// XMLTV feed, e.g. `bbc1.uk`) — never a display name or a fuzzy match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// Optional secret-manager reference for the feed's credentials (e.g.
+    /// `op://Servers/epg/credentials` or `env:EPG_TOKEN`). **Never** a raw
+    /// credential: the value is a reference the runtime resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    /// Whether the feed may resolve to a private/link-local network address
+    /// (e.g. a guide served from the LAN). Defaults to `false` — an operator
+    /// must opt in explicitly. This task carries the flag only; no resolution
+    /// or fetch policy is enforced here.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_private_network: bool,
+}
+
+impl EpgSource {
+    /// Maximum accepted byte length of [`EpgSource::url`].
+    pub const URL_MAX_BYTES: usize = 2048;
+    /// Maximum accepted byte length of [`EpgSource::channel_id`].
+    pub const CHANNEL_ID_MAX_BYTES: usize = 512;
+    /// Maximum accepted byte length of [`EpgSource::secret_ref`].
+    pub const SECRET_REF_MAX_BYTES: usize = 512;
+
+    /// Validate this EPG block for the source named `owner`.
+    ///
+    /// Every present string is bounded in bytes and free of control
+    /// characters; `url` must be a credential-free HTTP(S) URL; in
+    /// [`EpgMode::Manual`] both `url` and `channel_id` are required;
+    /// [`EpgMode::Disabled`] retains configured settings without requiring
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] naming the violated rule.
+    pub fn validate(&self, owner: &str) -> Result<(), ConfigError> {
+        if let Some(url) = &self.url {
+            validate_http_url("epg.url", owner, url, Self::URL_MAX_BYTES)?;
+        }
+        if let Some(id) = &self.channel_id {
+            require_bounded_text("epg.channel_id", owner, id, Self::CHANNEL_ID_MAX_BYTES)?;
+            if id.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "source {owner:?}: epg.channel_id is blank — it must be the exact provider \
+                     channel id from the XMLTV feed"
+                )));
+            }
+        }
+        if let Some(secret_ref) = &self.secret_ref {
+            require_bounded_text(
+                "epg.secret_ref",
+                owner,
+                secret_ref,
+                Self::SECRET_REF_MAX_BYTES,
+            )?;
+            if secret_ref.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "source {owner:?}: epg.secret_ref is blank — it is a secret-manager reference \
+                     (e.g. `op://Servers/epg/credentials` or `env:EPG_TOKEN`); it is never a \
+                     raw credential"
+                )));
+            }
+        }
+        match self.mode {
+            EpgMode::Manual => {
+                if self.url.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "source {owner:?}: epg.mode is \"manual\" but epg.url is unset — a manual \
+                         EPG requires an explicit XMLTV url as well as a channel_id"
+                    )));
+                }
+                if self.channel_id.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "source {owner:?}: epg.mode is \"manual\" but epg.channel_id is unset — a \
+                         manual EPG requires the exact provider channel id as well as the url"
+                    )));
+                }
+            }
+            // Neither requires a url; `disabled` deliberately keeps whatever
+            // was authored (already structurally validated above).
+            EpgMode::Automatic | EpgMode::Disabled => {}
+        }
+        Ok(())
+    }
+}
+
+/// Optional IPTV **playlist presentation** metadata for a source.
+///
+/// Mirrors the presentation fields an M3U/IPTV playlist exposes (`tvg-id`,
+/// `tvg-name`, `tvg-logo`, `group-title`) so a source can be exported/imported
+/// without losing how it is displayed. **Presentation only**: it never affects
+/// the source's media identity, ingest, decode or output — the engine's
+/// pipeline bases its decisions on [`Source::id`] and [`Source::kind`] alone.
+///
+/// The whole block is optional on [`Source`], so pre-EPG documents are
+/// unaffected; `#[non_exhaustive]` for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct PlaylistMetadata {
+    /// Optional `tvg-id`: the EPG channel id this entry presents. Distinct from
+    /// [`EpgSource::channel_id`] (the id used to *fetch* the guide).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tvg_id: Option<String>,
+    /// Optional `tvg-name`: the channel name an IPTV playlist displays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+    /// Optional `group-title`: the playlist section this entry appears under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl PlaylistMetadata {
+    /// Maximum accepted byte length of [`PlaylistMetadata::tvg_id`].
+    pub const TVG_ID_MAX_BYTES: usize = 512;
+    /// Maximum accepted byte length of [`PlaylistMetadata::name`].
+    pub const NAME_MAX_BYTES: usize = 256;
+    /// Maximum accepted byte length of [`PlaylistMetadata::logo`].
+    pub const LOGO_URL_MAX_BYTES: usize = 2048;
+    /// Maximum accepted byte length of [`PlaylistMetadata::group`].
+    pub const GROUP_MAX_BYTES: usize = 256;
+
+    /// Validate this presentation block for the source named `owner`.
+    ///
+    /// Presentation fields are optional, but when present each is bounded in
+    /// bytes, free of control characters, non-blank, and `logo` must be a
+    /// credential-free HTTP(S) URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] naming the violated rule.
+    pub fn validate(&self, owner: &str) -> Result<(), ConfigError> {
+        let text_fields = [
+            (
+                "playlist_metadata.tvg_id",
+                self.tvg_id.as_deref(),
+                Self::TVG_ID_MAX_BYTES,
+            ),
+            (
+                "playlist_metadata.name",
+                self.name.as_deref(),
+                Self::NAME_MAX_BYTES,
+            ),
+            (
+                "playlist_metadata.group",
+                self.group.as_deref(),
+                Self::GROUP_MAX_BYTES,
+            ),
+        ];
+        for (field, value, max_bytes) in text_fields {
+            let Some(value) = value else { continue };
+            require_bounded_text(field, owner, value, max_bytes)?;
+            if value.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "source {owner:?}: {field} is blank — omit the field instead of setting it \
+                     to whitespace"
+                )));
+            }
+        }
+        if let Some(logo) = &self.logo {
+            validate_http_url(
+                "playlist_metadata.logo",
+                owner,
+                logo,
+                Self::LOGO_URL_MAX_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Reject control characters and over-long values for an authored string.
+///
+/// `field` is the document-path label (e.g. `epg.url`) used in the message;
+/// `owner` is the owning source id.
+fn require_bounded_text(
+    field: &str,
+    owner: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ConfigError> {
+    if let Some(ch) = value.chars().find(|c| c.is_control()) {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} contains a control character (U+{:04X}) — authored text \
+             must be printable",
+            u32::from(ch)
+        )));
+    }
+    if value.len() > max_bytes {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} is {} bytes, over the {max_bytes}-byte limit",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a credential-free HTTP(S) URL: bounded, no control characters or
+/// whitespace, an `http`/`https` scheme, a non-empty host, and no `userinfo@`
+/// (credentials belong in a `secret_ref`, never in the URL).
+fn validate_http_url(
+    field: &str,
+    owner: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ConfigError> {
+    require_bounded_text(field, owner, value, max_bytes)?;
+    let scheme_ok = value.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    });
+    if !scheme_ok {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} {value:?} must be an http(s) URL (https recommended)"
+        )));
+    }
+    let authority = value
+        .split_once("://")
+        .map_or("", |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} must not embed credentials (userinfo) — put them behind \
+             `secret_ref` instead"
+        )));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} {value:?} contains whitespace — an http(s) URL cannot \
+             contain spaces or tabs"
+        )));
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "source {owner:?}: {field} {value:?} has no host"
+        )));
+    }
+    Ok(())
 }
 
 /// Per-source wall-clock configuration (ADR-0038, SYNC-0): the operator's

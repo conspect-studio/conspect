@@ -94,11 +94,12 @@ pub use routing::{
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
-    ColorOverride, DisplayModeSpec, Fps, Layout, MetadataCapability, MetadataField,
-    OrientationMechanism, OrientationMode, OrientationTagCapability, Output, OutputFlip,
-    OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata, Overlay, Rect,
-    RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
-    SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
+    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, Fps, Layout, MetadataCapability,
+    MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, Output,
+    OutputFlip, OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata,
+    Overlay, PlaylistMetadata, Rect, RistAesBits, RistEncryption, RistOptions, RistPeer,
+    RistProfile, RistUrlError, Source, SourceAuth, SourceKind, SrtBackend, SrtEncryption,
+    SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -1560,6 +1561,24 @@ impl Source {
             // AES67's binding (SDP / multicast group / PTP domain) is a runtime
             // ingest concern, like the network URL kinds — accepted as authored.
             | SourceKind::Aes67 { .. } => {}
+        }
+        self.validate_presentation()?;
+        Ok(())
+    }
+
+    /// Structural validation for the presentation-only blocks (EPG and IPTV
+    /// playlist metadata) — a separate helper to keep [`Source::validate`]
+    /// readable.
+    ///
+    /// Both blocks are ordinary authored config, checked here so document-level
+    /// `validate()` covers them; neither participates in media identity or the
+    /// ingest path.
+    fn validate_presentation(&self) -> Result<(), ConfigError> {
+        if let Some(epg) = &self.epg {
+            epg.validate(&self.id)?;
+        }
+        if let Some(metadata) = &self.playlist_metadata {
+            metadata.validate(&self.id)?;
         }
         Ok(())
     }
