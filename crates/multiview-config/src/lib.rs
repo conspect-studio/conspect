@@ -31,6 +31,7 @@
 
 pub mod api;
 pub mod audio;
+pub mod catalogues;
 pub mod device;
 pub mod diff;
 pub mod discovery;
@@ -73,6 +74,7 @@ pub use audio::{
     OutputAudio, OutputAudioCapability, OutputAudioMode, OutputAudioUpdate, TrackCapacity,
     TrackDelivery, PROGRAM_TRACK,
 };
+pub use catalogues::{CataloguesConfig, IptvOrgConfig};
 pub use device::{Device, DeviceAuth, DeviceDisplay, DeviceDriver, DisplayAssign, ReconnectPolicy};
 pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
@@ -336,6 +338,9 @@ pub struct MultiviewConfig {
     /// Absent ⇒ only the built-in Cast + NDI types are browsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery: Option<DiscoveryConfig>,
+    /// External source catalogues (`[catalogues.iptv_org]`, ADR-M015).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogues: Option<CataloguesConfig>,
     /// The management control-plane listener. When present, `multiview run`
     /// serves the API + docs (+ web UI) alongside the engine; absent ⇒ headless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,6 +569,9 @@ impl MultiviewConfig {
         self.validate_devices()?;
         self.validate_sync_groups()?;
         self.validate_discovery()?;
+        if let Some(iptv) = self.catalogues.as_ref().and_then(|c| c.iptv_org.as_ref()) {
+            iptv.validate()?;
+        }
         self.validate_api()?;
         self.validate_control()?;
         self.validate_webrtc()?;
