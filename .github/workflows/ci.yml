@@ -726,6 +726,7 @@ jobs:
           --features ffmpeg,aes67
           --lib aes67
       - name: test multiview-cli --features ffmpeg,aes67 (audio lib tests)
+        id: audio-lib-tests
         # The ffmpeg-linked `audio`-module lib unit tests (route-seam crossfade +
         # mailbox backpressure, player/vamp-window looping, shared-URL fetcher wait,
         # loudness telemetry on real decoded audio) never ran in CI before this step:
@@ -745,7 +746,9 @@ jobs:
         # tests (live/VOD playlist parsing, byte-range scheduling, 403/429 backoff,
         # gzip decoding, dispatch/retirement lifecycle fencing). Deliberately scoped
         # to `--lib hls_fetch` only — NOT the full ffmpeg suite (issue #163:
-        # `streaming_encode` hangs there).
+        # `streaming_encode` hangs there). Independent of the audio step, so it
+        # runs (and reports) even when that step fails; the job still fails.
+        if: ${{ success() || steps.audio-lib-tests.outcome == 'failure' }}
         timeout-minutes: 10
         run: >
           cargo test

@@ -7888,9 +7888,19 @@ segment_ms = 1000
             }
             std::thread::sleep(Duration::from_millis(40));
         }
+        let final_anchor = live_anchor_slot("edited-http").load();
         assert!(
             (25..=45).contains(&crossings),
-            "program B tone: crossings={crossings}"
+            "program B tone: crossings={crossings}; bus tick {first_tick}..{tick}; B store \
+             cursor={} buffered={}; anchor gen={:?} out0_ns={:?} raw_pts0_ns={:?}; \
+             lifecycle now={} (B {b_lifecycle}); B segment hits={}",
+            new_store.read_cursor(),
+            new_store.buffered_frames(),
+            final_anchor.as_ref().map(|a| a.generation),
+            final_anchor.as_ref().map(|a| a.out0.as_nanos()),
+            final_anchor.as_ref().and_then(|a| a.raw_pts0_ns),
+            live_lifecycle("edited-http"),
+            b_hits.load(Ordering::Acquire),
         );
         hub.shutdown();
         origin_stop.store(true, Ordering::Release);
