@@ -8,7 +8,8 @@
     clippy::panic,
     clippy::too_many_lines,
     clippy::as_conversions,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing
 )]
 
 mod support;

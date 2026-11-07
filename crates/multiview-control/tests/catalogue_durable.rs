@@ -2,7 +2,14 @@
 //! survives a restart (committed through `commit_resource` into the boot file), an
 //! HLS `user_agent`/`referrer`-only edit is media (never the metadata-only path),
 //! and an `origin`-only edit may take it.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines
+)]
 mod support;
 
 use std::sync::Arc;
