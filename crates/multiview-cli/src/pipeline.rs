@@ -7003,7 +7003,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
-        let lifecycle = begin_live_lifecycle(id);
+        let lifecycle = remove_live_lifecycle(id);
         if let Some(lease) = self.source_events.activate(id, lifecycle) {
             lease.retire();
         }
@@ -13961,8 +13961,16 @@ fn advance_live_lifecycle(id: &str, tokens: &mut std::collections::HashMap<Strin
         pts0: MediaTime::ZERO,
         raw_pts0_ns: None,
     })));
-    crate::hls_fetch::begin_generation(id);
+    crate::hls_fetch::begin_generation_at(id, *token);
     *token
+}
+
+/// End a removed source's lifecycle and release its fetch registration. The
+/// token stays in place: a re-add must continue it so stale workers stay fenced.
+pub(crate) fn remove_live_lifecycle(id: &str) -> u64 {
+    let lifecycle = begin_live_lifecycle(id);
+    crate::hls_fetch::forget_source(id, lifecycle);
+    lifecycle
 }
 
 /// Invalidate an ending run only if its startup producer still owns this id.
