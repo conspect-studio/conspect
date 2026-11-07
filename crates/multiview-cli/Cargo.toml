@@ -321,7 +321,7 @@ qsv = ["multiview-hal/qsv"]
 # Pure Rust (rust-embed); requires the web build (`npm --prefix web run build`)
 # to have produced `web/dist` first. GPU-free and LGPL-clean, so a software
 # build can serve the full management UI: `run --features web,overlay`.
-web = ["multiview-control/embed-web"]
+web = ["multiview-control/embed-web", "multiview-control/iptv-net"]
 
 # Persist stored layouts to `<config-dir>/.multiview/layouts.db` (SQLite) so they
 # survive a restart. Off by default; on in the platform presets.

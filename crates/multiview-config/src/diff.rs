@@ -179,6 +179,7 @@ impl ConfigDiff {
             media_library: running_media_library,
             media_players: running_media_players,
             weather: running_weather,
+            iptv: running_iptv,
         } = running;
         let MultiviewConfig {
             schema_version: next_schema_version,
@@ -206,6 +207,7 @@ impl ConfigDiff {
             media_library: next_media_library,
             media_players: next_media_players,
             weather: next_weather,
+            iptv: next_iptv,
         } = next;
 
         // Canvas: the pinned signal is geometry + cadence BY VALUE (the
@@ -228,7 +230,7 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 20] = [
+        let sectioned: [(&'static str, bool); 21] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
@@ -274,6 +276,9 @@ impl ConfigDiff {
             // Weather locations are management-plane data (the poller re-reads
             // them); no engine restart is needed, but the change is surfaced.
             ("weather", running_weather != next_weather),
+            // Publication-only (epg-playlist): served from accepted intent at
+            // request time; surfaced so a file edit is never silently dropped.
+            ("iptv", running_iptv != next_iptv),
         ];
         for (name, changed) in sectioned {
             if changed {

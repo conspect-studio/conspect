@@ -13,6 +13,7 @@ import {
   Radio,
   Route,
   Send,
+  Tv,
   Layers,
   Logs,
   Clapperboard,
@@ -50,6 +51,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { path: "/layouts", label: <Trans>Layouts</Trans>, Icon: LayoutGrid },
   { path: "/sources", label: <Trans>Sources</Trans>, Icon: Radio },
   { path: "/outputs", label: <Trans>Outputs</Trans>, Icon: Send },
+  { path: "/iptv", label: <Trans>IPTV playlist</Trans>, Icon: Tv },
   { path: "/overlays", label: <Trans>Overlays</Trans>, Icon: Layers },
   { path: "/audio", label: <Trans>Audio</Trans>, Icon: Volume2 },
   // Devices sits between Outputs and Monitoring (managed-devices.md §9).

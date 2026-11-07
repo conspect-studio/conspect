@@ -431,6 +431,9 @@ where
     if state.boot_model.is_some() {
         state.install_watch_handle(multiview_control::config_watch::ConfigWatchHandle::new());
     }
+    // IPTV guide refresher (epg-playlist): one control-plane task that only
+    // fetches while `[iptv] enabled`; never touches the engine (inv #1/#10).
+    drop(multiview_control::iptv::spawn_refresher(state.clone()));
     let mut app = multiview_control::router(state.clone());
     for mount in hls_mounts(config) {
         app = app.nest(

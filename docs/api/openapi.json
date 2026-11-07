@@ -2690,6 +2690,126 @@
         }
       }
     },
+    "/api/v1/iptv": {
+      "get": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "`GET /api/v1/iptv` — the publication document and status (role: read).",
+        "operationId": "get_iptv",
+        "responses": {
+          "200": {
+            "description": "The IPTV publication (ETag in the response header). Entries are filtered to the caller's object scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IptvState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "iptv"
+        ],
+        "summary": "`PUT /api/v1/iptv` — replace the publication (role: write; `If-Match`).",
+        "operationId": "put_iptv",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IptvConfigDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The replaced publication (new ETag). Applies live: the playlist/guide are served from accepted intent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IptvState"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to write, or an entry references an object outside the caller's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "If-Match precondition failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid document: unknown output/source reference, a non-HLS output, a source entry without allow_direct_source_url, or a structural error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "No If-Match precondition was sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/layouts": {
       "get": {
         "tags": [
@@ -6336,6 +6456,67 @@
           },
           "403": {
             "description": "Authenticated but not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/import/m3u": {
+      "post": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "`POST /api/v1/sources/import/m3u` — parse a catalogue into source\ncandidates (role: write). Creates nothing: the client creates the selected\ncandidates through `POST /api/v1/sources/{id}`.",
+        "operationId": "import_m3u",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/M3uImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The parsed catalogue: header guide URL(s) and candidates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/M3uCatalogue"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to write.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Neither/both of url and text, a refused URL, a failed fetch, or an unparseable/oversized catalogue.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11101,6 +11282,107 @@
           "unlicensed-build"
         ]
       },
+      "EpgModeDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::EpgMode` (epg-playlist).",
+        "enum": [
+          "automatic",
+          "manual",
+          "disabled"
+        ]
+      },
+      "EpgSourceDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::EpgSource` (epg-playlist):\na source's optional per-source EPG (XMLTV) acquisition block.",
+        "properties": {
+          "allow_private_network": {
+            "type": "boolean",
+            "description": "Whether the feed may resolve to a private/link-local network address."
+          },
+          "channel_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional exact provider channel id (as it appears in the XMLTV feed)."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/EpgModeDoc",
+            "description": "How the guide is obtained. Defaults to `automatic`."
+          },
+          "secret_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional secret-manager reference for the feed's credentials."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional HTTP(S) XMLTV feed URL (credential-free)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "FeedStatus": {
+        "type": "object",
+        "description": "One feed's operator-visible status.",
+        "required": [
+          "url",
+          "channels",
+          "programmes"
+        ],
+        "properties": {
+          "channels": {
+            "type": "integer",
+            "description": "Channels kept from this feed.",
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last error, if the last attempt failed."
+          },
+          "last_attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the last attempt."
+          },
+          "last_success": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the last successful fetch (or 304)."
+          },
+          "next_attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the next scheduled attempt."
+          },
+          "programmes": {
+            "type": "integer",
+            "description": "Programmes kept from this feed.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "description": "The feed URL with credentials and query removed."
+          }
+        }
+      },
       "FiredBody": {
         "type": "object",
         "description": "The `202` body of a successful salvo fire.",
@@ -11347,6 +11629,135 @@
             "format": "int32",
             "description": "The zero-based source/display index in the tally protocol.",
             "minimum": 0
+          }
+        }
+      },
+      "IptvConfigDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::IptvConfig` (`[iptv]`).",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether `/iptv/playlist.m3u8` and `/iptv/guide.xml` are served (default false)."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IptvEntryDoc"
+            },
+            "description": "Published entries in playlist order."
+          },
+          "public_base_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional absolute public base URL for playlist links (default: request Host)."
+          }
+        }
+      },
+      "IptvEntryDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::IptvEntry`.",
+        "required": [
+          "kind",
+          "ref"
+        ],
+        "properties": {
+          "allow_direct_source_url": {
+            "type": "boolean",
+            "description": "Explicit permission to publish a source's upstream URL (required for sources)."
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`group-title` override."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/IptvEntryKindDoc",
+            "description": "Whether `ref` names an output or a source."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-logo` override (credential-free http(s) URL)."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Display-name override."
+          },
+          "ref": {
+            "type": "string",
+            "description": "The referenced output id or source id."
+          },
+          "tvg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Published `tvg-id` override (also the guide channel id)."
+          }
+        }
+      },
+      "IptvEntryKindDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::IptvEntryKind`.",
+        "enum": [
+          "output",
+          "source"
+        ]
+      },
+      "IptvState": {
+        "type": "object",
+        "description": "The `GET`/`PUT /api/v1/iptv` response envelope.",
+        "required": [
+          "config",
+          "entries",
+          "feeds",
+          "playlist_path",
+          "guide_path"
+        ],
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/IptvConfigDoc",
+            "description": "The publication document (entries filtered to the caller's scope)."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolvedEntry"
+            },
+            "description": "Every entry resolved against the current configuration."
+          },
+          "feeds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeedStatus"
+            },
+            "description": "Per upstream XMLTV feed refresh status."
+          },
+          "guide_generated_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds the current guide snapshot was assembled, if any."
+          },
+          "guide_path": {
+            "type": "string",
+            "description": "Server path of the published guide."
+          },
+          "playlist_path": {
+            "type": "string",
+            "description": "Server path of the published playlist."
           }
         }
       },
@@ -11797,6 +12208,107 @@
           }
         ],
         "description": "`OpenAPI` mirror of `multiview_config::LoudnessTarget` (tagged by `kind`,\n`snake_case`)."
+      },
+      "M3uCatalogue": {
+        "type": "object",
+        "description": "A parsed catalogue.",
+        "required": [
+          "url_tvg",
+          "entries",
+          "skipped"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/M3uEntry"
+            },
+            "description": "The entries, in file order."
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Lines skipped because they were malformed (e.g. a URL without a usable\nscheme) — informational.",
+            "minimum": 0
+          },
+          "url_tvg": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The header's XMLTV guide URL(s) (`url-tvg` / `x-tvg-url`; a\ncomma-separated value is split), in declaration order."
+          }
+        }
+      },
+      "M3uEntry": {
+        "type": "object",
+        "description": "One catalogue candidate.",
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`group-title`, if present."
+          },
+          "name": {
+            "type": "string",
+            "description": "The display name (text after the `#EXTINF` comma), or the URL when absent."
+          },
+          "tvg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-id`, if present."
+          },
+          "tvg_logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-logo`, if present."
+          },
+          "tvg_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`tvg-name`, if present."
+          },
+          "url": {
+            "type": "string",
+            "description": "The absolute stream URL."
+          }
+        }
+      },
+      "M3uImportRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/sources/import/m3u` request body: exactly one of `url`/`text`.",
+        "properties": {
+          "allow_private_network": {
+            "type": "boolean",
+            "description": "Permit a catalogue on a private/LAN address (loopback, link-local and\nmetadata addresses are always refused)."
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pasted catalogue text (at most 2 MiB)."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An http(s) URL of an extended-M3U catalogue to fetch (bounded, SSRF-screened)."
+          }
+        },
+        "additionalProperties": false
       },
       "MediaFormat": {
         "type": "string",
@@ -13009,6 +13521,41 @@
           "encode"
         ]
       },
+      "PlaylistMetadataDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):\noptional IPTV playlist presentation metadata for a source.",
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `group-title`: the playlist section this entry appears under."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-name`: the channel name an IPTV playlist displays."
+          },
+          "tvg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-id`: the EPG channel id this entry presents."
+          }
+        },
+        "additionalProperties": false
+      },
       "PreviewCapabilities": {
         "type": "object",
         "description": "The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview\ntransports this build can serve, so the SPA picks WHEP vs the JPEG ladder\n(ADR-W020) **before** issuing an offer.",
@@ -13446,6 +13993,67 @@
           "body": {
             "type": "string",
             "description": "The reply text to append to the thread."
+          }
+        }
+      },
+      "ResolvedEntry": {
+        "type": "object",
+        "description": "One published playlist entry, resolved against the current configuration.",
+        "required": [
+          "kind",
+          "ref",
+          "tvg_id",
+          "name",
+          "group"
+        ],
+        "properties": {
+          "epg_feed": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The upstream XMLTV feed (redacted) this entry's guide comes from."
+          },
+          "group": {
+            "type": "string",
+            "description": "Group title."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`output` or `source`."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Logo URL, if any."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "ref": {
+            "type": "string",
+            "description": "The referenced id."
+          },
+          "tvg_id": {
+            "type": "string",
+            "description": "Published `tvg-id` (also the guide channel id)."
+          },
+          "unavailable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the entry is not published right now."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The playable URL: an absolute URL for sources, a server path\n(`/hls/…`) for outputs. `None` when not playable (see `unavailable`)."
           }
         }
       },
@@ -14219,6 +14827,17 @@
                 ],
                 "description": "Human-friendly display name."
               },
+              "epg": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EpgSourceDoc",
+                    "description": "Optional per-source EPG (XMLTV) acquisition block (epg-playlist)."
+                  }
+                ]
+              },
               "gpu_pin": {
                 "oneOf": [
                   {
@@ -14236,6 +14855,17 @@
                   "null"
                 ],
                 "description": "Stable input id; may be omitted (the path id is injected)."
+              },
+              "playlist_metadata": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PlaylistMetadataDoc",
+                    "description": "Optional IPTV playlist presentation metadata (epg-playlist)."
+                  }
+                ]
               },
               "wallclock": {
                 "oneOf": [
@@ -16475,6 +17105,10 @@
     {
       "name": "sources",
       "description": "Source (managed input) resource CRUD"
+    },
+    {
+      "name": "iptv",
+      "description": "Managed IPTV playlist + XMLTV guide publication"
     },
     {
       "name": "inputs",

@@ -879,6 +879,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/iptv": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/iptv` — the publication document and status (role: read). */
+        get: operations["get_iptv"];
+        /** `PUT /api/v1/iptv` — replace the publication (role: write; `If-Match`). */
+        put: operations["put_iptv"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/layouts": {
         parameters: {
             query?: never;
@@ -1725,6 +1743,27 @@ export interface paths {
         get: operations["list_sources"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/import/m3u": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/sources/import/m3u` — parse a catalogue into source
+         *     candidates (role: write). Creates nothing: the client creates the selected
+         *     candidates through `POST /api/v1/sources/{id}`.
+         */
+        post: operations["import_m3u"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3528,6 +3567,53 @@ export interface components {
          * @enum {string}
          */
         EnforcementLevelDoc: "active" | "warning" | "config-locked" | "watermark" | "block-new-instance" | "unlicensed-build";
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::EpgMode` (epg-playlist).
+         * @enum {string}
+         */
+        EpgModeDoc: "automatic" | "manual" | "disabled";
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::EpgSource` (epg-playlist):
+         *     a source's optional per-source EPG (XMLTV) acquisition block.
+         */
+        EpgSourceDoc: {
+            /** @description Whether the feed may resolve to a private/link-local network address. */
+            allow_private_network?: boolean;
+            /** @description Optional exact provider channel id (as it appears in the XMLTV feed). */
+            channel_id?: string | null;
+            /** @description How the guide is obtained. Defaults to `automatic`. */
+            mode?: components["schemas"]["EpgModeDoc"];
+            /** @description Optional secret-manager reference for the feed's credentials. */
+            secret_ref?: string | null;
+            /** @description Optional HTTP(S) XMLTV feed URL (credential-free). */
+            url?: string | null;
+        };
+        /** @description One feed's operator-visible status. */
+        FeedStatus: {
+            /** @description Channels kept from this feed. */
+            channels: number;
+            /** @description The last error, if the last attempt failed. */
+            error?: string | null;
+            /**
+             * Format: int64
+             * @description Unix seconds of the last attempt.
+             */
+            last_attempt?: number | null;
+            /**
+             * Format: int64
+             * @description Unix seconds of the last successful fetch (or 304).
+             */
+            last_success?: number | null;
+            /**
+             * Format: int64
+             * @description Unix seconds of the next scheduled attempt.
+             */
+            next_attempt?: number | null;
+            /** @description Programmes kept from this feed. */
+            programmes: number;
+            /** @description The feed URL with credentials and query removed. */
+            url: string;
+        };
         /** @description The `202` body of a successful salvo fire. */
         FiredBody: {
             /** @description The queued action id (also the pending-action + audit correlation id). */
@@ -3675,6 +3761,55 @@ export interface components {
              * @description The zero-based source/display index in the tally protocol.
              */
             index: number;
+        };
+        /** @description `OpenAPI` mirror of `multiview_config::IptvConfig` (`[iptv]`). */
+        IptvConfigDoc: {
+            /** @description Whether `/iptv/playlist.m3u8` and `/iptv/guide.xml` are served (default false). */
+            enabled?: boolean;
+            /** @description Published entries in playlist order. */
+            entries?: components["schemas"]["IptvEntryDoc"][];
+            /** @description Optional absolute public base URL for playlist links (default: request Host). */
+            public_base_url?: string | null;
+        };
+        /** @description `OpenAPI` mirror of `multiview_config::IptvEntry`. */
+        IptvEntryDoc: {
+            /** @description Explicit permission to publish a source's upstream URL (required for sources). */
+            allow_direct_source_url?: boolean;
+            /** @description `group-title` override. */
+            group?: string | null;
+            /** @description Whether `ref` names an output or a source. */
+            kind: components["schemas"]["IptvEntryKindDoc"];
+            /** @description `tvg-logo` override (credential-free http(s) URL). */
+            logo?: string | null;
+            /** @description Display-name override. */
+            name?: string | null;
+            /** @description The referenced output id or source id. */
+            ref: string;
+            /** @description Published `tvg-id` override (also the guide channel id). */
+            tvg_id?: string | null;
+        };
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::IptvEntryKind`.
+         * @enum {string}
+         */
+        IptvEntryKindDoc: "output" | "source";
+        /** @description The `GET`/`PUT /api/v1/iptv` response envelope. */
+        IptvState: {
+            /** @description The publication document (entries filtered to the caller's scope). */
+            config: components["schemas"]["IptvConfigDoc"];
+            /** @description Every entry resolved against the current configuration. */
+            entries: components["schemas"]["ResolvedEntry"][];
+            /** @description Per upstream XMLTV feed refresh status. */
+            feeds: components["schemas"]["FeedStatus"][];
+            /**
+             * Format: int64
+             * @description Unix seconds the current guide snapshot was assembled, if any.
+             */
+            guide_generated_at?: number | null;
+            /** @description Server path of the published guide. */
+            guide_path: string;
+            /** @description Server path of the published playlist. */
+            playlist_path: string;
         };
         /**
          * @description An IS-10 JWT **claims set** (the decoded token body).
@@ -3930,6 +4065,48 @@ export interface components {
              * @description Integrated-loudness target in LKFS (e.g. `-24.0`).
              */
             target_lkfs: number;
+        };
+        /** @description A parsed catalogue. */
+        M3uCatalogue: {
+            /** @description The entries, in file order. */
+            entries: components["schemas"]["M3uEntry"][];
+            /**
+             * @description Lines skipped because they were malformed (e.g. a URL without a usable
+             *     scheme) — informational.
+             */
+            skipped: number;
+            /**
+             * @description The header's XMLTV guide URL(s) (`url-tvg` / `x-tvg-url`; a
+             *     comma-separated value is split), in declaration order.
+             */
+            url_tvg: string[];
+        };
+        /** @description One catalogue candidate. */
+        M3uEntry: {
+            /** @description `group-title`, if present. */
+            group?: string | null;
+            /** @description The display name (text after the `#EXTINF` comma), or the URL when absent. */
+            name: string;
+            /** @description `tvg-id`, if present. */
+            tvg_id?: string | null;
+            /** @description `tvg-logo`, if present. */
+            tvg_logo?: string | null;
+            /** @description `tvg-name`, if present. */
+            tvg_name?: string | null;
+            /** @description The absolute stream URL. */
+            url: string;
+        };
+        /** @description `POST /api/v1/sources/import/m3u` request body: exactly one of `url`/`text`. */
+        M3uImportRequest: {
+            /**
+             * @description Permit a catalogue on a private/LAN address (loopback, link-local and
+             *     metadata addresses are always refused).
+             */
+            allow_private_network?: boolean;
+            /** @description Pasted catalogue text (at most 2 MiB). */
+            text?: string | null;
+            /** @description An http(s) URL of an extended-M3U catalogue to fetch (bounded, SSRF-screened). */
+            url?: string | null;
         };
         /**
          * @description The media format of a sender/receiver (the IS-04 `format` URN family).
@@ -4365,6 +4542,20 @@ export interface components {
          */
         PipelineStage: "decode" | "composite" | "encode";
         /**
+         * @description `OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):
+         *     optional IPTV playlist presentation metadata for a source.
+         */
+        PlaylistMetadataDoc: {
+            /** @description Optional `group-title`: the playlist section this entry appears under. */
+            group?: string | null;
+            /** @description Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image. */
+            logo?: string | null;
+            /** @description Optional `tvg-name`: the channel name an IPTV playlist displays. */
+            name?: string | null;
+            /** @description Optional `tvg-id`: the EPG channel id this entry presents. */
+            tvg_id?: string | null;
+        };
+        /**
          * @description The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
          *     transports this build can serve, so the SPA picks WHEP vs the JPEG ladder
          *     (ADR-W020) **before** issuing an offer.
@@ -4591,6 +4782,30 @@ export interface components {
         ReplyRequest: {
             /** @description The reply text to append to the thread. */
             body: string;
+        };
+        /** @description One published playlist entry, resolved against the current configuration. */
+        ResolvedEntry: {
+            /** @description The upstream XMLTV feed (redacted) this entry's guide comes from. */
+            epg_feed?: string | null;
+            /** @description Group title. */
+            group: string;
+            /** @description `output` or `source`. */
+            kind: string;
+            /** @description Logo URL, if any. */
+            logo?: string | null;
+            /** @description Display name. */
+            name: string;
+            /** @description The referenced id. */
+            ref: string;
+            /** @description Published `tvg-id` (also the guide channel id). */
+            tvg_id: string;
+            /** @description Why the entry is not published right now. */
+            unavailable?: string | null;
+            /**
+             * @description The playable URL: an absolute URL for sources, a server path
+             *     (`/hls/…`) for outputs. `None` when not playable (see `unavailable`).
+             */
+            url?: string | null;
         };
         /**
          * @description A persisted management resource: a stable `id`, a display `name`, and the
@@ -5002,9 +5217,11 @@ export interface components {
             color_override?: null | components["schemas"]["ColorOverrideDoc"];
             /** @description Human-friendly display name. */
             display_name?: string | null;
+            epg?: null | components["schemas"]["EpgSourceDoc"];
             gpu_pin?: null | components["schemas"]["DevicePinDoc"];
             /** @description Stable input id; may be omitted (the path id is injected). */
             id?: string | null;
+            playlist_metadata?: null | components["schemas"]["PlaylistMetadataDoc"];
             wallclock?: null | components["schemas"]["SourceWallClockDoc"];
         };
         /**
@@ -8121,6 +8338,113 @@ export interface operations {
             };
         };
     };
+    get_iptv: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The IPTV publication (ETag in the response header). Entries are filtered to the caller's object scope. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IptvState"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    put_iptv: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IptvConfigDoc"];
+            };
+        };
+        responses: {
+            /** @description The replaced publication (new ETag). Applies live: the playlist/guide are served from accepted intent. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IptvState"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to write, or an entry references an object outside the caller's scope. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description If-Match precondition failed. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Invalid document: unknown output/source reference, a non-HLS output, a source entry without allow_direct_source_url, or a structural error. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No If-Match precondition was sent. */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_layouts: {
         parameters: {
             query?: never;
@@ -11066,6 +11390,57 @@ export interface operations {
             };
             /** @description Authenticated but not authorized to read. */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    import_m3u: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["M3uImportRequest"];
+            };
+        };
+        responses: {
+            /** @description The parsed catalogue: header guide URL(s) and candidates. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["M3uCatalogue"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to write. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Neither/both of url and text, a refused URL, a failed fetch, or an unparseable/oversized catalogue. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

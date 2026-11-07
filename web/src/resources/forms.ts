@@ -454,9 +454,32 @@ export interface SourceFormState {
    * (schema default true). `false` answers the audio m-line `inactive`.
    */
   readonly webrtcAudio: boolean;
+  /**
+   * EPG acquisition mode ('automatic' omits `epg` entirely unless another EPG
+   * field is set, matching the schema default — ADR epg-playlist).
+   */
+  readonly epgMode: EpgModeChoice;
+  /** `epg.url`: the XMLTV feed URL (required in 'manual' mode). */
+  readonly epgUrl: string;
+  /** `epg.channel_id`: the exact provider channel id (required in 'manual'). */
+  readonly epgChannelId: string;
+  /** `playlist_metadata.tvg_id`. */
+  readonly metaTvgId: string;
+  /** `playlist_metadata.name`. */
+  readonly metaName: string;
+  /** `playlist_metadata.logo`. */
+  readonly metaLogo: string;
+  /** `playlist_metadata.group`. */
+  readonly metaGroup: string;
   /** Unmanaged body fields preserved verbatim across an edit. */
   readonly extra: Readonly<Record<string, unknown>>;
 }
+
+/** The editable `epg.mode` choices (mirrors the config `EpgMode` enum). */
+export type EpgModeChoice = 'automatic' | 'manual' | 'disabled';
+
+/** The `epg.mode` choices offered in the UI, in display order. */
+export const EPG_MODES: readonly EpgModeChoice[] = ['automatic', 'manual', 'disabled'];
 
 /** The source-form fields that can carry a validation error. */
 export type SourceField =
@@ -475,7 +498,11 @@ export type SourceField =
   | 'captionsTrack'
   | 'captionsField'
   | 'captionsPath'
-  | 'gpuPinStableId';
+  | 'gpuPinStableId'
+  | 'epgUrl'
+  | 'epgChannelId'
+  | 'metaName'
+  | 'metaLogo';
 
 /** Default fill colour for a fresh `solid` source. */
 export const SOLID_DEFAULT_COLOR = '#101014';
@@ -527,6 +554,13 @@ export function emptySourceForm(): SourceFormState {
     authSecretRef: '',
     webrtcToken: '',
     webrtcAudio: true,
+    epgMode: 'automatic',
+    epgUrl: '',
+    epgChannelId: '',
+    metaTvgId: '',
+    metaName: '',
+    metaLogo: '',
+    metaGroup: '',
     extra: {},
   };
 }
@@ -567,6 +601,10 @@ const SOURCE_MANAGED_KEYS: readonly string[] = [
   // `webrtc` (WHIP ingest) source keys.
   'token',
   'audio',
+  // EPG + IPTV playlist presentation (epg-playlist): presentation only, never
+  // media identity.
+  'epg',
+  'playlist_metadata',
 ];
 
 /** Whether a source kind's locator is its `url`. */
@@ -746,7 +784,70 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
   if (form.wallclock !== 'default') {
     body.wallclock = { use: form.wallclock };
   }
+  const epg = epgBody(form);
+  if (epg !== undefined) {
+    body.epg = epg;
+  }
+  const playlistMetadata = playlistMetadataBody(form);
+  if (playlistMetadata !== undefined) {
+    body.playlist_metadata = playlistMetadata;
+  }
   return body;
+}
+
+/**
+ * Build the `epg` block, or `undefined` to omit it entirely (the schema
+ * default: no EPG configured). Omitted whenever every field is at its default
+ * (automatic mode, no url/channel_id) so an untouched source round-trips with
+ * no new key — otherwise every set field is written, letting `disabled` mode
+ * retain previously authored url/channel_id (schema: EpgMode::Disabled keeps
+ * them for a later re-enable).
+ */
+function epgBody(form: SourceFormState): Record<string, unknown> | undefined {
+  const url = form.epgUrl.trim();
+  const channelId = form.epgChannelId.trim();
+  if (form.epgMode === 'automatic' && url === '' && channelId === '') {
+    return undefined;
+  }
+  const epg: Record<string, unknown> = {};
+  if (form.epgMode !== 'automatic') {
+    epg.mode = form.epgMode;
+  }
+  if (url !== '') {
+    epg.url = url;
+  }
+  if (channelId !== '') {
+    epg.channel_id = channelId;
+  }
+  return epg;
+}
+
+/**
+ * Build the `playlist_metadata` block, or `undefined` to omit it (no
+ * presentation metadata authored).
+ */
+function playlistMetadataBody(form: SourceFormState): Record<string, unknown> | undefined {
+  const tvgId = form.metaTvgId.trim();
+  const name = form.metaName.trim();
+  const logo = form.metaLogo.trim();
+  const group = form.metaGroup.trim();
+  if (tvgId === '' && name === '' && logo === '' && group === '') {
+    return undefined;
+  }
+  const meta: Record<string, unknown> = {};
+  if (tvgId !== '') {
+    meta.tvg_id = tvgId;
+  }
+  if (name !== '') {
+    meta.name = name;
+  }
+  if (logo !== '') {
+    meta.logo = logo;
+  }
+  if (group !== '') {
+    meta.group = group;
+  }
+  return meta;
 }
 
 /** The internally-tagged `CaptionSelector` payload, or `undefined` to omit. */
@@ -819,6 +920,8 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
   const gpuPin = asRecord(body.gpu_pin);
   const wallclock = asRecord(body.wallclock);
   const wallclockUse = asString(wallclock?.use);
+  const epg = asRecord(body.epg);
+  const playlistMetadata = asRecord(body.playlist_metadata);
 
   const captionsMode: CaptionsMode =
     captions === undefined
@@ -880,6 +983,13 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
     // The schema default accepts publisher audio (`audio: true`); an absent key
     // means "accept", so only an explicit `false` clears the toggle.
     webrtcAudio: kind === 'webrtc' ? body.audio !== false : true,
+    epgMode: EPG_MODES.find((mode) => mode === asString(epg?.mode)) ?? 'automatic',
+    epgUrl: asString(epg?.url) ?? '',
+    epgChannelId: asString(epg?.channel_id) ?? '',
+    metaTvgId: asString(playlistMetadata?.tvg_id) ?? '',
+    metaName: asString(playlistMetadata?.name) ?? '',
+    metaLogo: asString(playlistMetadata?.logo) ?? '',
+    metaGroup: asString(playlistMetadata?.group) ?? '',
     extra: extraOf(body, SOURCE_MANAGED_KEYS),
   };
 }
@@ -1029,6 +1139,21 @@ export function validateSourceForm(
   }
   if (form.gpuPinEnabled && form.gpuPinStableId.trim() === '') {
     errors.gpuPinStableId = 'required';
+  }
+  if (form.epgMode === 'manual') {
+    if (form.epgUrl.trim() === '') {
+      errors.epgUrl = 'required';
+    } else if (!isValidUrl(form.epgUrl, ['http', 'https'])) {
+      errors.epgUrl = 'scheme-http';
+    }
+    if (form.epgChannelId.trim() === '') {
+      errors.epgChannelId = 'required';
+    }
+  } else if (form.epgUrl.trim() !== '' && !isValidUrl(form.epgUrl, ['http', 'https'])) {
+    errors.epgUrl = 'scheme-http';
+  }
+  if (form.metaLogo.trim() !== '' && !isValidUrl(form.metaLogo, ['http', 'https'])) {
+    errors.metaLogo = 'scheme-http';
   }
   return errors;
 }

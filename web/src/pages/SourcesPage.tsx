@@ -6,6 +6,7 @@
 // (ADR-W015). The LIVE STATUS column reads the realtime tile map the WebSocket
 // hook mirrors into the Query cache; a source outside the running engine shows
 // "—" with an explanation, because honesty beats a fabricated state.
+import { M3uImportButton } from './M3uImportDialog';
 import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import type { ColumnDef } from '@tanstack/react-table';
@@ -18,6 +19,7 @@ import {
   captionModesForValue,
   CLOCK_FACES,
   emptySourceForm,
+  EPG_MODES,
   IANA_TIMEZONES,
   PIN_VENDORS,
   sourceFormFromRecord,
@@ -34,6 +36,7 @@ import {
 import type {
   CaptionsMode,
   ClockFace,
+  EpgModeChoice,
   FieldErrors,
   PinVendor,
   RtspTransport,
@@ -815,8 +818,112 @@ function SourceAdvancedFields({
           setForm({ ...form, authSecretRef: next });
         }}
       />
+
+      <div className="mt-2 flex flex-col gap-3 border-t pt-3">
+        <h4 className="text-sm font-medium">
+          <Trans>Upstream EPG (electronic programme guide)</Trans>
+        </h4>
+        <SelectField<EpgModeChoice>
+          label={t`EPG mode`}
+          value={form.epgMode}
+          options={EPG_MODES}
+          optionLabel={epgModeLabel}
+          onChange={(next): void => {
+            setForm({ ...form, epgMode: next });
+          }}
+        />
+        {form.epgMode !== 'disabled' ? (
+          <>
+            <FormField
+              id="source-epg-url"
+              label={t`XMLTV guide URL`}
+              value={form.epgUrl}
+              placeholder="https://guide.example.net/xmltv.xml"
+              error={errors.epgUrl}
+              required={form.epgMode === 'manual'}
+              hint={<Trans>Required in manual mode; credential-free http(s) only.</Trans>}
+              onChange={(next): void => {
+                setForm({ ...form, epgUrl: next });
+              }}
+            />
+            <FormField
+              id="source-epg-channel-id"
+              label={t`Provider channel id`}
+              value={form.epgChannelId}
+              placeholder="bbc1.uk"
+              error={errors.epgChannelId}
+              required={form.epgMode === 'manual'}
+              hint={<Trans>The exact channel id as it appears in the XMLTV feed.</Trans>}
+              onChange={(next): void => {
+                setForm({ ...form, epgChannelId: next });
+              }}
+            />
+          </>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            <Trans>Disabled — any previously configured URL/channel id is retained for later re-enable.</Trans>
+          </p>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-3 border-t pt-3">
+        <h4 className="text-sm font-medium">
+          <Trans>IPTV playlist presentation</Trans>
+        </h4>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField
+            id="source-meta-tvg-id"
+            label={t`tvg-id`}
+            value={form.metaTvgId}
+            placeholder="bbc1.uk"
+            onChange={(next): void => {
+              setForm({ ...form, metaTvgId: next });
+            }}
+          />
+          <FormField
+            id="source-meta-name"
+            label={t`Display name`}
+            value={form.metaName}
+            placeholder="BBC One"
+            error={errors.metaName}
+            onChange={(next): void => {
+              setForm({ ...form, metaName: next });
+            }}
+          />
+          <FormField
+            id="source-meta-logo"
+            label={t`Logo URL`}
+            value={form.metaLogo}
+            placeholder="https://logos.example.net/bbc1.png"
+            error={errors.metaLogo}
+            onChange={(next): void => {
+              setForm({ ...form, metaLogo: next });
+            }}
+          />
+          <FormField
+            id="source-meta-group"
+            label={t`Group / category`}
+            value={form.metaGroup}
+            placeholder="UK Terrestrial"
+            onChange={(next): void => {
+              setForm({ ...form, metaGroup: next });
+            }}
+          />
+        </div>
+      </div>
     </AdvancedSection>
   );
+}
+
+function epgModeLabel(mode: EpgModeChoice): JSX.Element {
+  switch (mode) {
+    case 'automatic':
+      return <Trans>Automatic (resolve the guide automatically)</Trans>;
+    case 'manual':
+      return <Trans>Manual (explicit XMLTV URL + channel id)</Trans>;
+    case 'disabled':
+      return <Trans>Disabled (no guide fetched for this source)</Trans>;
+  }
 }
 
 /** Sources management (ingest). */
@@ -919,7 +1026,12 @@ export function SourcesPage(): JSX.Element {
       emptyMessage={<Trans>No sources configured.</Trans>}
       loadingMessage={<Trans>Loading sources…</Trans>}
       errorPrefix={<Trans>Could not load sources:</Trans>}
-      headerExtras={<ExportConfigButton compact />}
+      headerExtras={
+        <>
+          <M3uImportButton />
+          <ExportConfigButton compact />
+        </>
+      }
       callout={
         <ApplySemanticsCallout
           helpTo="/help/config#sources"

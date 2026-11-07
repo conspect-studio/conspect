@@ -37,6 +37,7 @@ pub mod discovery;
 pub mod error;
 pub mod failover;
 pub mod grid;
+pub mod iptv;
 pub mod layout_doc;
 pub mod limits;
 pub mod media;
@@ -75,6 +76,7 @@ pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
 pub use error::ConfigError;
 pub use failover::{default_failover_slate, FailoverSlate};
+pub use iptv::{IptvConfig, IptvEntry, IptvEntryKind, MAX_IPTV_ENTRIES};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
@@ -95,11 +97,12 @@ pub use routing::{
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
-    ColorOverride, DisplayModeSpec, Fps, Layout, MetadataCapability, MetadataField,
-    OrientationMechanism, OrientationMode, OrientationTagCapability, Output, OutputFlip,
-    OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata, Overlay, Rect,
-    RistAesBits, RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source,
-    SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
+    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, Fps, Layout, MetadataCapability,
+    MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, Output,
+    OutputFlip, OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata,
+    Overlay, PlaylistMetadata, Rect, RistAesBits, RistEncryption, RistOptions, RistPeer,
+    RistProfile, RistUrlError, Source, SourceAuth, SourceKind, SrtBackend, SrtEncryption,
+    SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -393,6 +396,10 @@ pub struct MultiviewConfig {
     /// Absent ⇒ no locations (nothing is fetched).
     #[serde(default, skip_serializing_if = "WeatherConfig::is_empty")]
     pub weather: WeatherConfig,
+    /// Managed IPTV playlist + XMLTV guide publication (epg-playlist). Absent ⇒
+    /// nothing is published (`/iptv/*` answers 404). Presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iptv: Option<IptvConfig>,
 }
 
 /// Parse a `#RGB` / `#RRGGBB` hex color into its `(r, g, b)` bytes.
@@ -510,6 +517,12 @@ impl MultiviewConfig {
         }
 
         self.validate_unique_ids()?;
+        if let Some(iptv) = &self.iptv {
+            // Structural only: references are resolved when the publication is
+            // edited and again when it is served, so deleting a published
+            // source/output is never blocked — it simply drops out.
+            iptv.validate(None, None)?;
+        }
         if self.sources.len() > MAX_ADMITTED_SOURCES {
             return Err(ConfigError::Validation(format!(
                 "sources exceeds the live source capacity of {MAX_ADMITTED_SOURCES}"
@@ -1569,6 +1582,24 @@ impl Source {
             // AES67's binding (SDP / multicast group / PTP domain) is a runtime
             // ingest concern, like the network URL kinds — accepted as authored.
             | SourceKind::Aes67 { .. } => {}
+        }
+        self.validate_presentation()?;
+        Ok(())
+    }
+
+    /// Structural validation for the presentation-only blocks (EPG and IPTV
+    /// playlist metadata) — a separate helper to keep [`Source::validate`]
+    /// readable.
+    ///
+    /// Both blocks are ordinary authored config, checked here so document-level
+    /// `validate()` covers them; neither participates in media identity or the
+    /// ingest path.
+    fn validate_presentation(&self) -> Result<(), ConfigError> {
+        if let Some(epg) = &self.epg {
+            epg.validate(&self.id)?;
+        }
+        if let Some(metadata) = &self.playlist_metadata {
+            metadata.validate(&self.id)?;
         }
         Ok(())
     }
