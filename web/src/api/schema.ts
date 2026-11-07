@@ -2114,6 +2114,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Every source's demand state (role: read; per-object row visibility).
+         * @description `idle` means nothing consumes the source, so it costs nothing; it is not a
+         *     fault. Consumers start it (`starting`), it then runs (`live`) or keeps
+         *     retrying with backoff (`failed`).
+         */
+        get: operations["list_source_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{id}": {
         parameters: {
             query?: never;
@@ -2129,6 +2151,23 @@ export interface paths {
         post: operations["create_source"];
         /** `DELETE /api/v1/sources/{id}` — delete a source (role: administer; If-Match). */
         delete: operations["delete_source"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One source's demand state (role: read; per-object authz). */
+        get: operations["get_source_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -5827,6 +5866,40 @@ export interface components {
              *     [`unverified`](SourceCandidate::unverified).
              */
             url?: string | null;
+        };
+        /** @description One consumer of a source. */
+        SourceConsumerView: {
+            /**
+             * @description `layout_cell`, `audio_route`, `subtitle_route`, `preview`, `hls_session`,
+             *     `event_automation`, `event_journal` or `always_on`.
+             */
+            kind: string;
+            /** @description The consumer's identity within its kind (a cell, a route target, ...). */
+            label: string;
+        };
+        /**
+         * @description A source's demand phase.
+         * @enum {string}
+         */
+        SourceDemandPhase: "idle" | "starting" | "live" | "failed";
+        /** @description One source's demand state. */
+        SourceDemandView: {
+            /** @description Whether its audio rail is running. */
+            audio_running: boolean;
+            /** @description Whether consumers want its audio. */
+            audio_wanted: boolean;
+            /** @description Who is consuming it. */
+            consumers: components["schemas"]["SourceConsumerView"][];
+            /** @description Why it is failed. Operator-safe: never a URL or credential. */
+            detail?: string | null;
+            /** @description The source id. */
+            id: string;
+            /** @description The phase. */
+            phase: components["schemas"]["SourceDemandPhase"];
+            /** @description Whether its video rail is running (a lingering rail runs with no consumer). */
+            video_running: boolean;
+            /** @description Whether consumers want its video. */
+            video_wanted: boolean;
         };
         /**
          * @description Availability of the latched presentation clock, not ingest health.
@@ -13129,6 +13202,44 @@ export interface operations {
             };
         };
     };
+    list_source_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every configured source's demand state, id-sorted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceDemandView"][];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Authenticated but not authorized to read. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     get_source: {
         parameters: {
             query?: never;
@@ -13353,6 +13464,56 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_source_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Source id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The source's demand state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceDemandView"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read this source. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No such source. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

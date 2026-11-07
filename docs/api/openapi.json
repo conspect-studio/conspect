@@ -7841,6 +7841,51 @@
         }
       }
     },
+    "/api/v1/sources/status": {
+      "get": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "Every source's demand state (role: read; per-object row visibility).",
+        "description": "`idle` means nothing consumes the source, so it costs nothing; it is not a\nfault. Consumers start it (`starting`), it then runs (`live`) or keeps\nretrying with backoff (`failed`).",
+        "operationId": "list_source_status",
+        "responses": {
+          "200": {
+            "description": "Every configured source's demand state, id-sorted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SourceDemandView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Authenticated but not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/{id}": {
       "get": {
         "tags": [
@@ -8115,6 +8160,68 @@
           },
           "412": {
             "description": "If-Match precondition failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/{id}/status": {
+      "get": {
+        "tags": [
+          "sources"
+        ],
+        "summary": "One source's demand state (role: read; per-object authz).",
+        "operationId": "get_source_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The source's demand state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDemandView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such source.",
             "content": {
               "application/json": {
                 "schema": {
@@ -16890,6 +16997,87 @@
               "null"
             ],
             "description": "The served URL, IPv6-first where known. `None` when the vendor does not\ndocument its mount path — the operator supplies it and it is flagged\n[`unverified`](SourceCandidate::unverified)."
+          }
+        }
+      },
+      "SourceConsumerView": {
+        "type": "object",
+        "description": "One consumer of a source.",
+        "required": [
+          "kind",
+          "label"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`layout_cell`, `audio_route`, `subtitle_route`, `preview`, `hls_session`,\n`event_automation`, `event_journal` or `always_on`."
+          },
+          "label": {
+            "type": "string",
+            "description": "The consumer's identity within its kind (a cell, a route target, ...)."
+          }
+        }
+      },
+      "SourceDemandPhase": {
+        "type": "string",
+        "description": "A source's demand phase.",
+        "enum": [
+          "idle",
+          "starting",
+          "live",
+          "failed"
+        ]
+      },
+      "SourceDemandView": {
+        "type": "object",
+        "description": "One source's demand state.",
+        "required": [
+          "id",
+          "phase",
+          "video_wanted",
+          "audio_wanted",
+          "video_running",
+          "audio_running",
+          "consumers"
+        ],
+        "properties": {
+          "audio_running": {
+            "type": "boolean",
+            "description": "Whether its audio rail is running."
+          },
+          "audio_wanted": {
+            "type": "boolean",
+            "description": "Whether consumers want its audio."
+          },
+          "consumers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceConsumerView"
+            },
+            "description": "Who is consuming it."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it is failed. Operator-safe: never a URL or credential."
+          },
+          "id": {
+            "type": "string",
+            "description": "The source id."
+          },
+          "phase": {
+            "$ref": "#/components/schemas/SourceDemandPhase",
+            "description": "The phase."
+          },
+          "video_running": {
+            "type": "boolean",
+            "description": "Whether its video rail is running (a lingering rail runs with no consumer)."
+          },
+          "video_wanted": {
+            "type": "boolean",
+            "description": "Whether consumers want its video."
           }
         }
       },

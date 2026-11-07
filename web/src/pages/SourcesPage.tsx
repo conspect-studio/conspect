@@ -68,6 +68,9 @@ import { tileForSource, useLiveTiles } from '../resources/useLiveTiles';
 import type { LiveTile } from '../realtime/useEngineEvents';
 import { HelpLink } from '../components/HelpLink';
 import { TileStateBadge } from '../components/TileStateBadge';
+import { SourceDemandBadge } from '../components/SourceDemandBadge';
+import { useSourceStatus } from '../api/sourceStatus';
+import type { SourceDemand } from '../api/sourceStatus';
 
 /** The form-kind options offered in the picker (no legacy alias). */
 const FORM_KINDS: readonly SourceFormKind[] = SOURCE_KINDS.filter(
@@ -88,27 +91,25 @@ function fromTransportChoice(value: RtspTransportChoice): RtspTransport {
 }
 const WALLCLOCK_CHOICES: readonly WallClockChoice[] = ['default', 'use', 'discard'];
 
-/** The realtime status cell: the tile badge, or an honest "not running" dash. */
-function SourceStatusCell({ tile }: { readonly tile: LiveTile | undefined }): JSX.Element {
-  const { t } = useLingui();
-  if (tile === undefined) {
-    return (
-      <span
-        className="text-sm text-muted-foreground"
-        title={t`This source is not part of the running engine, so it has no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart.`}
-      >
-        <span aria-hidden="true">—</span>
-        <span className="sr-only">
-          <Trans>
-            Not in the running engine — no live state. Synthetic sources join
-            live once a tile binds them; other kinds join after a config export
-            + restart.
-          </Trans>
-        </span>
-      </span>
-    );
-  }
-  return <TileStateBadge state={tile.state} />;
+/**
+ * The status cell: the demand state (idle / starting / live / failed, with who
+ * consumes the source) plus the tile lifecycle while it runs. Idle is normal: a
+ * source nobody consumes is not started and costs nothing.
+ */
+function SourceStatusCell({
+  tile,
+  demand,
+}: {
+  readonly tile: LiveTile | undefined;
+  readonly demand: SourceDemand | undefined;
+}): JSX.Element {
+  const running = demand !== undefined && (demand.video_running || demand.audio_running);
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <SourceDemandBadge demand={demand} />
+      {running && tile !== undefined && demand.phase !== 'live' ? <TileStateBadge state={tile.state} /> : null}
+    </span>
+  );
 }
 
 /** The kind-specific locator + parameter fields. */
@@ -931,6 +932,7 @@ export function SourcesPage(): JSX.Element {
   const { t } = useLingui();
   const sources = useSources();
   const tiles = useLiveTiles();
+  const demand = useSourceStatus();
 
   const columns = (
     onEdit: (row: SourceView) => void,
@@ -959,7 +961,7 @@ export function SourcesPage(): JSX.Element {
       id: 'status',
       header: (): JSX.Element => (
         <span className="inline-flex items-center gap-1.5">
-          <Trans>Live status</Trans>
+          <Trans>Status</Trans>
           <HelpLink
             to="/help/concepts/resilience#tile-lifecycle"
             label={t`About tile lifecycle states`}
@@ -968,7 +970,10 @@ export function SourcesPage(): JSX.Element {
         </span>
       ),
       cell: (ctx): JSX.Element => (
-        <SourceStatusCell tile={tileForSource(tiles, ctx.row.original.id)} />
+        <SourceStatusCell
+          tile={tileForSource(tiles, ctx.row.original.id)}
+          demand={demand.data?.get(ctx.row.original.id)}
+        />
       ),
     },
     {
