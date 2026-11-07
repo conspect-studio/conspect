@@ -506,18 +506,6 @@ impl UnifiedEndpoint {
         #[cfg(test)] origin: ServiceOrigin,
     ) {
         probe.driver_services.fetch_add(1, Ordering::Relaxed);
-        // `cfg(test)`-only (review PR193-04): bumped from INSIDE the servicing
-        // pass itself, gated on the origin the caller threaded through — not by
-        // the caller incrementing a separate counter after the call returns. A
-        // regression that stops invoking this function on the exhaustion path
-        // (or invokes it with the wrong origin) cannot still satisfy this
-        // counter, because there is no other place that increments it (round-2
-        // review finding). Production runs identical work regardless of
-        // origin, so neither the tag nor this counter exists outside tests.
-        #[cfg(test)]
-        if origin == ServiceOrigin::ExhaustionHandoff {
-            probe.handoff_services.fetch_add(1, Ordering::Relaxed);
-        }
         // Drain pending register/release commands for each lane.
         Self::drain_commands(ingest.as_mut(), serve.as_mut());
         // Advance each role's timers / feeds.
@@ -544,6 +532,21 @@ impl UnifiedEndpoint {
         }
         if let Some(lane) = serve.as_mut() {
             WhepServeEndpoint::reap(&mut lane.viewers, &lane.shared);
+        }
+        // `cfg(test)`-only (review PR193-04 / PR193-02): bumped AFTER every real
+        // servicing step above has run — commands drained, timers ticked,
+        // outbound pumped, GC'd — and gated on the origin the caller threaded
+        // through, not by the caller incrementing a separate counter after the
+        // call returns. A regression that stops invoking this function on the
+        // exhaustion path, invokes it with the wrong origin, OR returns/deletes
+        // any of the real work above (PR193-02) cannot still satisfy this
+        // counter: there is no other place that increments it, and it is placed
+        // after the work it is meant to prove ran. Production runs identical
+        // work regardless of origin, so neither the tag nor this counter exists
+        // outside tests.
+        #[cfg(test)]
+        if origin == ServiceOrigin::ExhaustionHandoff {
+            probe.handoff_services.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -810,26 +813,52 @@ mod tests {
         Ok(count)
     }
 
-    /// Invariant #10 / round-2 BLOCKER: under a sustained inbound flood the
-    /// driver's servicing pass (commands + timers + outbound + GC) must keep pace
-    /// with the receive budget — every exhausted budget is followed by a
-    /// deterministic servicing pass **before** the next datagram is read, not by
-    /// probabilistic `select!` fairness.
+    /// Build a publisher offer with a host candidate (mirrors
+    /// `tests/unified_socket.rs::offer`), so the flood test can negotiate a
+    /// REAL ingest session and observe a REAL effect of servicing — not just an
+    /// entry counter (review PR193-02).
+    fn publisher_offer() -> String {
+        let now = Instant::now();
+        let mut s =
+            crate::transport::Session::new(&crate::transport::SessionConfig::default(), now);
+        s.add_host_candidate("[::1]:55000".parse::<SocketAddr>().expect("v6 literal"))
+            .expect("host candidate accepted");
+        s.create_offer(&[crate::transport::MediaKind::Video])
+            .expect("offer built")
+    }
+
+    /// Invariant #10 / round-2 BLOCKER, plus review PR193-02: under a sustained
+    /// inbound flood the driver's servicing pass (commands + timers + outbound
+    /// + GC) must keep pace with the receive budget — every exhausted budget is
+    /// followed by a deterministic servicing pass **before** the next datagram
+    /// is read, not by probabilistic `select!` fairness, AND that pass must
+    /// have real, observable effect (not just an entry-only counter).
     ///
-    /// The discriminating assertion is an **ordering** one, not a timing one
-    /// (timing cannot tell a starved loop from a lucky scheduler): after the
-    /// driver has run under a saturating flood, the number of servicing passes
-    /// must be at least the number of exhausted receive budgets. The round-1 loop
-    /// (drain as a bare statement, unbiased `select!`, no `yield_now`) serviced
-    /// only when the tick arm happened to win, so `driver_services` lagged far
-    /// behind `recv_budgets_exhausted`; the bounded-handoff fix services once per
-    /// exhausted budget, so it keeps pace.
+    /// Two checks:
+    ///
+    /// 1. **Ordering** (not timing): after the driver has run under a
+    ///    saturating flood, `handoff_services == recv_budgets_exhausted`. The
+    ///    counter is bumped only AFTER every real servicing step
+    ///    (commands/timers/outbound/GC) has run, so deleting any of that work
+    ///    or returning early desyncs the count from the exhaustions this test
+    ///    independently drives (closing PR193-02's entry-counter loophole).
+    /// 2. **Real effect**: a genuine WHIP ingest session is registered before
+    ///    the flood starts; a `release()` mid-flood enqueues a teardown
+    ///    command that ONLY the servicing pass's command-drain step applies
+    ///    (closing the session's RTP ring). The ring must close within the
+    ///    bound.
     ///
     /// Refill a confirmed-queued flood before each of eight driver wakes. A
     /// generous injected time budget isolates the receive COUNT cap from host
     /// scheduling; the handoff must service each exhausted budget before another
     /// wake reads the socket.
     #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "two independent non-gameable checks (ordering, real effect) \
+                  in one flood scenario — splitting them would re-run the \
+                  expensive flood setup twice"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn servicing_keeps_pace_with_the_receive_budget_under_flood() {
         use std::sync::atomic::AtomicBool;
@@ -843,8 +872,25 @@ mod tests {
         };
         let builder = UnifiedEndpoint::bind(cfg).expect("the single shared socket binds once");
         let bound = builder.local_addr().expect("a bound local addr");
-        let (builder, _whip) = builder.with_ingest();
+        let (builder, whip) = builder.with_ingest();
         let endpoint = builder.build();
+
+        // A REAL ingest session, registered before the flood starts, so the
+        // servicing pass's command-drain step has real work to do (PR193-02).
+        let negotiated = whip
+            .negotiate("flood-source", &publisher_offer(), false)
+            .expect("WHIP ingest negotiates a publisher before the flood");
+        let ring = negotiated.ring.clone();
+        assert!(
+            !ring.is_ended(),
+            "freshly-negotiated ring is open before any release"
+        );
+        // Issue the release NOW: this enqueues a `Release` command the
+        // driver's servicing pass must drain + apply under the flood.
+        assert!(
+            whip.release("flood-source", negotiated.session_id.as_str()),
+            "release dispatches a teardown command for the live session"
+        );
 
         // Each wake must have a complete count budget waiting in the kernel.
         let _ =
@@ -940,6 +986,17 @@ mod tests {
              exhausted receive budget, independent of idle-tick servicing: \
              {handoffs} handoffs != {exhausted} exhausted budgets — the rest of \
              the driver was starved (invariant #10 BLOCKER)"
+        );
+        // The real-effect check (PR193-02): the release command enqueued
+        // before the flood started must have been drained and applied by one
+        // of the servicing passes above — an entry-only counter cannot fake
+        // this closing of the ring.
+        assert!(
+            ring.is_ended(),
+            "under a permanent inbound flood the driver must still service the \
+             release command (close the ring) — an entry-only counter cannot \
+             prove this; the real command-drain step was starved or skipped \
+             (review PR193-02)"
         );
         assert!(
             matches!(stopped, Ok(Ok(Ok(())))),
