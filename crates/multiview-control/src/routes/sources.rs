@@ -751,7 +751,7 @@ pub(crate) async fn apply_source_update(
             // A policy edit changes which sources its rule keeps running:
             // the same pins-only path the automation routes use (review
             // R2-01). The hub sees unchanged media and never restarts it.
-            submit_policy_update(&state, next)
+            submit_policy_update(state, next)
         } else {
             ApplyMode::Live
         }
