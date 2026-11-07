@@ -14252,15 +14252,12 @@ fn journal_output_anchor(
 ) -> Option<crate::event_journal::OutputAnchor> {
     let run = origin.load()?;
     let live = anchor.load()?;
-    let raw_ns = live.raw_pts0_ns?;
-    let output_now = run.time().now_nanos().saturating_sub(run.seed_nanos());
-    let ahead = live.out0.as_nanos().saturating_sub(output_now);
-    let ticks = i128::from(raw_ns) * 9 / 100_000;
-    let modulus = i128::from(multiview_input::scte::decode::PTS_MODULUS);
-    Some(crate::event_journal::OutputAnchor {
-        raw_pts_90k: u64::try_from(ticks.rem_euclid(modulus)).ok()?,
-        wall_ns: crate::event_journal::wall_now_ns().saturating_add(ahead),
-    })
+    crate::event_journal::output_anchor_now(
+        live.raw_pts0_ns?,
+        live.out0.as_nanos(),
+        run.time().now_nanos().saturating_sub(run.seed_nanos()),
+        crate::event_journal::wall_now_ns(),
+    )
 }
 
 /// Publish a fresh anchor into `slot`, bumping its generation.

@@ -4,9 +4,12 @@ import { Trans, useLingui } from '@lingui/react/macro';
 import { Button } from '../components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '../components/ui/dialog';
 import { OperationApiError } from '../api/operations';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
 import { AutomationPanel } from './AutomationPanel';
-import { nanosecondsToSeconds, useInjectTestEvent, useSourceEvents } from './sourceEvents';
-import type { SourceEvent } from './sourceEvents';
+import { JournalPanel } from './JournalPanel';
+import { ClockNote, Countdown } from './eventTime';
+import { durationSeconds, localTime, nanosecondsToSeconds, useInjectTestEvent, useSourceEvents } from './sourceEvents';
+import type { SourceClock, SourceEvent, SourceMarker } from './sourceEvents';
 import type { SourceView } from '../resources/types';
 
 function EventRow({ event, timingAvailable }: { readonly event: SourceEvent; readonly timingAvailable: boolean }): JSX.Element {
@@ -48,6 +51,35 @@ function EventRow({ event, timingAvailable }: { readonly event: SourceEvent; rea
       ? <p>{timerLabels[event.timer.kind]}: <Trans>{seconds} seconds</Trans></p>
       : showTimer ? <p><Trans>No reliable timing readout.</Trans></p> : null}
   </li>;
+}
+
+/** One decoded marker: what it is and when it happens, in local time. */
+function MarkerRow({ marker, now }: { readonly marker: SourceMarker; readonly now: number }): JSX.Element {
+  return <li className="space-y-1 rounded border p-3">
+    <p className="break-all font-medium">{marker.name}</p>
+    {marker.start_at
+      ? <p>
+          {localTime(marker.start_at)}{marker.end_at ? <> → {localTime(marker.end_at)}</> : null}
+          {' '}<Countdown at={marker.start_at} now={now} />
+        </p>
+      : <p><Trans>Time not known.</Trans></p>}
+    {typeof marker.duration_ms === 'number' ? <p><Trans>Duration</Trans>: <Trans>{durationSeconds(marker.duration_ms)} seconds</Trans></p> : null}
+    {marker.airs_at
+      ? <p><Trans>Airs on program at</Trans> {localTime(marker.airs_at)}{marker.airs_end_at ? <> → {localTime(marker.airs_end_at)}</> : null} <Countdown at={marker.airs_at} now={now} /></p>
+      : null}
+    {marker.event_id ? <p className="break-all text-xs text-muted-foreground"><Trans>Event ID</Trans>: {marker.event_id}</p> : null}
+    {marker.upid ? <p className="break-all text-xs text-muted-foreground"><Trans>UPID</Trans>: {marker.upid}</p> : null}
+    <p className="text-xs text-muted-foreground"><ClockNote source={marker.clock_source} uncertaintyMs={marker.uncertainty_ms} /></p>
+  </li>;
+}
+
+/** The source's embedded clock: a reference line, never an event row. */
+function SourceClockLine({ clock }: { readonly clock: SourceClock }): JSX.Element {
+  const offset = (clock.offset_ms / 1000).toFixed(1);
+  return <p className="text-sm">
+    <Trans>Source clock</Trans>: {localTime(clock.utc)} ({clock.utc.replace(/\.\d+/, '')}), <Trans>{offset} s against this host</Trans>
+    {' — '}<ClockNote source={clock.clock_source} />
+  </p>;
 }
 
 /** What observation status text to show, independent of the live snapshot. */
@@ -97,6 +129,7 @@ function TestInjectionControls({ id }: { readonly id: string }): JSX.Element {
 }
 
 function SourceEventsPanel({ id, eventObservation }: { readonly id: string; readonly eventObservation: SourceView['eventObservation'] }): JSX.Element {
+  const { t } = useLingui();
   const query = useSourceEvents(id);
   if (query.isError) {
     const status = query.error instanceof OperationApiError ? query.error.status : undefined;
@@ -108,13 +141,25 @@ function SourceEventsPanel({ id, eventObservation }: { readonly id: string; read
   }
   if (query.data === undefined) return <p role="status"><Trans>Loading source events…</Trans></p>;
   const snapshot = query.data;
+  const markers = snapshot.markers ?? [];
+  // A decoded marker says everything an untimed presence row says, and more.
+  const events = markers.length === 0
+    ? snapshot.events
+    : snapshot.events.filter((event) => !event.event_id.startsWith('untimed-scte:'));
   return <div className="space-y-3">
     <p className="text-sm text-muted-foreground">{observationStatusText(eventObservation)}</p>
     {snapshot.availability !== 'available' ? <p role="status"><Trans>Presentation timing is unavailable or stale. Timing is uncertain.</Trans></p> : null}
     {snapshot.degraded ? <p role="status"><Trans>Degraded event evidence: information may be incomplete.</Trans></p> : null}
-    {snapshot.events.length === 0
+    {snapshot.source_clock ? <SourceClockLine clock={snapshot.source_clock} /> : null}
+    {markers.length > 0
+      ? <ul aria-label={t`Decoded markers`} className="max-h-96 space-y-2 overflow-auto">{markers.map((marker) => <MarkerRow key={marker.record_id} marker={marker} now={query.dataUpdatedAt} />)}</ul>
+      : null}
+    {events.length === 0 && markers.length === 0
       ? <p><Trans>No source events in the current server snapshot. When this source airs an ad break, a badge/countdown overlay will appear automatically on its multiview tile.</Trans></p>
-      : <ul className="max-h-96 space-y-2 overflow-auto">{snapshot.events.map((event, index) => <EventRow key={`${event.epoch}:${event.event_id}:${String(index)}`} event={event} timingAvailable={snapshot.availability === 'available'} />)}</ul>}
+      : null}
+    {events.length > 0
+      ? <ul className="max-h-96 space-y-2 overflow-auto">{events.map((event, index) => <EventRow key={`${event.epoch}:${event.event_id}:${String(index)}`} event={event} timingAvailable={snapshot.availability === 'available'} />)}</ul>
+      : null}
     <AutomationPanel id={id} />
     <TestInjectionControls id={id} />
   </div>;
@@ -136,12 +181,21 @@ export function SourceEventsButton({ id, name, eventObservation }: {
   return <>
     <Button variant="outline" size="sm" onClick={() => { setOpen(true); }} aria-label={t`Events: ${name}`}><Trans>Events</Trans></Button>
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent>
+      <DialogContent className="max-h-[90vh] max-w-4xl overflow-auto">
         <DialogHeader>
           <DialogTitle><Trans>Source events</Trans> — {name}</DialogTitle>
           <DialogDescription><Trans>Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time.</Trans></DialogDescription>
         </DialogHeader>
-        {open ? <SourceEventsPanel key={id} id={id} eventObservation={eventObservation ?? 'observing'} /> : null}
+        {open
+          ? <Tabs defaultValue="events">
+              <TabsList>
+                <TabsTrigger value="events"><Trans>Events</Trans></TabsTrigger>
+                <TabsTrigger value="journal"><Trans>Journal</Trans></TabsTrigger>
+              </TabsList>
+              <TabsContent value="events"><SourceEventsPanel key={id} id={id} eventObservation={eventObservation ?? 'observing'} /></TabsContent>
+              <TabsContent value="journal"><JournalPanel key={id} id={id} /></TabsContent>
+            </Tabs>
+          : null}
       </DialogContent>
     </Dialog>
   </>;

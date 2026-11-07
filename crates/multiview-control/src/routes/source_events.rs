@@ -126,7 +126,11 @@ fn journal_unavailable() -> Response {
 
 /// Authorize one source and find its journal. A source that has left the
 /// running set stays readable while its history is retained.
-fn journal_for(state: &AppState, principal: &Principal, id: &str) -> Result<JournalReader, Response> {
+async fn journal_for(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<JournalReader, Response> {
     principal
         .role
         .require(Action::Read)
@@ -137,7 +141,15 @@ fn journal_for(state: &AppState, principal: &Principal, id: &str) -> Result<Jour
         .source_events
         .as_ref()
         .is_some_and(|provider| provider.source_events(id).is_some());
-    if known || reader.has_source(id) {
+    if known {
+        return Ok(reader);
+    }
+    let probe = reader.clone();
+    let owned = id.to_owned();
+    let retained = tokio::task::spawn_blocking(move || probe.has_source(&owned))
+        .await
+        .map_err(|_| journal_unavailable())?;
+    if retained {
         Ok(reader)
     } else {
         Err(Problem::new(404, "not-found", "Unknown source").into_response())
@@ -179,7 +191,7 @@ async fn read_page(
     id: String,
     params: &JournalParams,
 ) -> Result<Response, Response> {
-    let reader = journal_for(state, principal, &id)?;
+    let reader = journal_for(state, principal, &id).await?;
     let query = journal_query(params)?;
     let permit = Arc::clone(&reader.permits)
         .try_acquire_owned()
@@ -262,7 +274,7 @@ pub(crate) async fn get_event_journal_dump(
     Path(id): Path<String>,
     Query(params): Query<JournalParams>,
 ) -> Response {
-    let result = journal_for(&state, &principal, &id).and_then(|reader| {
+    let result = journal_for(&state, &principal, &id).await.and_then(|reader| {
         let query = journal_query(&params)?;
         let filename = format!(
             "{}-events.jsonl",

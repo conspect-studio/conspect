@@ -146,6 +146,28 @@ pub struct OutputAnchor {
     /// Host wall-clock of that PTS on the output timeline.
     pub wall_ns: i64,
 }
+/// The mapping as of now. The published anchor only changes on a re-anchor, so
+/// on a stable source it can be hours old; walking it forward by the output time
+/// elapsed since keeps the distance to any marker small, and keeps it inside the
+/// half-circle where 33-bit PTS deltas are unambiguous. The mapping itself is
+/// unchanged: the stamper re-anchors if frames leave it, and `anchor_due`
+/// republishes on any raw jump.
+#[must_use]
+pub fn output_anchor_now(
+    raw_pts0_ns: i64,
+    out0_ns: i64,
+    output_now_ns: i64,
+    wall_now_ns: i64,
+) -> Option<OutputAnchor> {
+    let raw_now_ns =
+        i128::from(raw_pts0_ns) + i128::from(output_now_ns) - i128::from(out0_ns);
+    let ticks = (raw_now_ns * 9).div_euclid(100_000);
+    Some(OutputAnchor {
+        raw_pts_90k: u64::try_from(ticks.rem_euclid(i128::from(PTS_MODULUS))).ok()?,
+        wall_ns: wall_now_ns,
+    })
+}
+
 /// Reads a source's current source-to-output mapping, lock-free.
 pub type OutputMap = Arc<dyn Fn() -> Option<OutputAnchor> + Send + Sync>;
 
@@ -1041,6 +1063,22 @@ mod tests {
         let t = section_timing(&decoded(), Some(SPLICE), NOW, &clocks);
         assert_eq!(t.airs_at, Some(rfc3339_ns(NOW + 12_000_000_000)));
         assert_eq!(t.airs_end_at, Some(rfc3339_ns(NOW + 319_000_000_000)));
+    }
+
+    #[test]
+    fn an_hours_old_output_anchor_still_places_a_marker() {
+        // Anchored six hours ago: the frame at raw 0 aired at output time 2 s.
+        let hours = 6 * 3600 * 1_000_000_000_i64;
+        let now = output_anchor_now(0, 2_000_000_000, 2_000_000_000 + hours, NOW).unwrap();
+        assert_eq!(now.raw_pts_90k, 6 * 3600 * 90_000);
+        let clocks = Clocks {
+            output: Some(now),
+            ..Clocks::default()
+        };
+        assert_eq!(clocks.airs(now.raw_pts_90k + 90_000), Some(NOW + 1_000_000_000));
+        // A frame still inside the jitter hold has not aired yet.
+        let held = output_anchor_now(9_000_000_000, 5_000_000_000, 4_000_000_000, NOW).unwrap();
+        assert_eq!(held.raw_pts_90k, 8 * 90_000);
     }
 
     #[test]

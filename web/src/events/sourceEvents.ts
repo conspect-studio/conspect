@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import type { UseMutationResult } from '@tanstack/react-query';
 import { useQuery } from '@tanstack/react-query';
 import { createApiClient } from '../api/client';
@@ -127,4 +127,107 @@ export function useAutomationCommand(id: string): UseMutationResult<AutomationVi
       queryClient.setQueryData(automationKey(id), view);
     },
   });
+}
+
+export type JournalPage = components['schemas']['JournalPage'];
+export type JournalRecord = components['schemas']['JournalRecord'];
+export type SourceMarker = components['schemas']['SourceMarkerDto'];
+export type SourceClock = components['schemas']['SourceClockDto'];
+export type ClockSource = components['schemas']['JournalClockSource'];
+
+/** Journal filters; empty values mean "no filter". */
+export interface JournalFilters {
+  readonly origin: '' | 'scte35' | 'id3' | 'hls';
+  /** RFC 3339, or empty. */
+  readonly from: string;
+  /** RFC 3339, or empty. */
+  readonly to: string;
+}
+
+function journalParams(filters: JournalFilters) {
+  return {
+    ...(filters.origin === '' ? {} : { origin: filters.origin }),
+    ...(filters.from === '' ? {} : { from: filters.from }),
+    ...(filters.to === '' ? {} : { to: filters.to }),
+  };
+}
+
+/** Newest-first journal pages. Mounted only while the Journal tab is open. */
+export function useEventJournal(id: string, filters: JournalFilters) {
+  return useInfiniteQuery({
+    queryKey: ['inputs', id, 'events', 'journal', filters],
+    initialPageParam: undefined as string | undefined,
+    queryFn: async ({ pageParam, signal }): Promise<JournalPage> => {
+      const { data, response } = await createApiClient().GET('/api/v1/inputs/{id}/events/journal', {
+        params: {
+          path: { id },
+          query: { ...journalParams(filters), limit: 100, ...(pageParam === undefined ? {} : { cursor: pageParam }) },
+        },
+        signal,
+        cache: 'no-store',
+      });
+      if (!response.ok || data?.source_id !== id) {
+        throw new OperationApiError('Event journal request failed', response.status);
+      }
+      return data;
+    },
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    retry: false,
+    gcTime: 0,
+    staleTime: 0,
+  });
+}
+
+/** Fetch the filtered journal as JSONL and save it. A plain link cannot carry the bearer token. */
+export async function downloadJournal(id: string, filters: JournalFilters): Promise<void> {
+  const { data, response } = await createApiClient().GET('/api/v1/inputs/{id}/events/journal.jsonl', {
+    params: { path: { id }, query: journalParams(filters) },
+    parseAs: 'blob',
+    cache: 'no-store',
+  });
+  if (!response.ok || data === undefined) {
+    throw new OperationApiError('Event journal download failed', response.status);
+  }
+  const url = URL.createObjectURL(data);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${id}-events.jsonl`;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** Epoch milliseconds of an RFC 3339 time. Nanosecond digits are cut first:
+ * only three fractional digits are portable to `Date`. */
+export function instantMs(value: string): number {
+  return Date.parse(value.replace(/(\.\d{3})\d+/, '$1'));
+}
+
+/** Local wall-clock time with tenths, in the browser's time zone. */
+export function localTime(value: string): string {
+  return new Date(instantMs(value)).toLocaleTimeString(undefined, {
+    hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 1, hour12: false,
+  });
+}
+
+/** Whole seconds from `now` until `value`; negative once it has passed. */
+export function secondsUntil(value: string, now: number): number {
+  return Math.round((instantMs(value) - now) / 1000);
+}
+
+/** Milliseconds as decimal seconds, without trailing zeros on whole values. */
+export function durationSeconds(ms: number): string {
+  return (ms / 1000).toFixed(ms % 1000 === 0 ? 0 : 3);
+}
+
+/** Lowercase hex pairs of a journal payload, sixteen bytes per line. */
+export function rawHex(record: Pick<JournalRecord, 'raw' | 'raw_encoding'>): string {
+  const bytes = record.raw_encoding === 'base64'
+    ? Uint8Array.from(atob(record.raw), (c) => c.charCodeAt(0))
+    : new TextEncoder().encode(record.raw);
+  const pairs = Array.from(bytes, (b) => b.toString(16).padStart(2, '0'));
+  const lines: string[] = [];
+  for (let at = 0; at < pairs.length; at += 16) lines.push(pairs.slice(at, at + 16).join(' '));
+  return lines.join('\n');
 }
