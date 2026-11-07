@@ -62,6 +62,21 @@ pub struct Muxer {
     /// its `AVIOContext`, which holds a copy of the callback) is closed before
     /// this box is freed. `None` for file muxers (no callback installed).
     interrupt: Option<Box<IoInterrupt>>,
+    /// The caller-owned byte sink of [`Muxer::create_with_writer`]. libav holds a
+    /// raw pointer to it; `Drop` frees the `AVIOContext` before this box goes.
+    writer: Option<Box<PacketWriter>>,
+}
+
+/// A byte sink for [`Muxer::create_with_writer`]. Returns `false` when the
+/// transport failed, which libav reports as a write error.
+pub type PacketWriter = Box<dyn FnMut(&[u8]) -> bool + Send>;
+
+impl Drop for Muxer {
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            push_ffi::free_custom_io(&mut self.output);
+        }
+    }
 }
 
 /// Lock-free interrupt state polled by a push muxer's `AVIOInterruptCB`.
@@ -123,6 +138,7 @@ impl Muxer {
             header_written: false,
             trailer_written: false,
             interrupt: None,
+            writer: None,
         })
     }
 
@@ -141,6 +157,7 @@ impl Muxer {
             header_written: false,
             trailer_written: false,
             interrupt: None,
+            writer: None,
         })
     }
 
@@ -183,6 +200,7 @@ impl Muxer {
             header_written: false,
             trailer_written: false,
             interrupt: None,
+            writer: None,
         })
     }
 
@@ -220,6 +238,32 @@ impl Muxer {
             header_written: false,
             trailer_written: false,
             interrupt: Some(interrupt),
+            writer: None,
+        })
+    }
+
+    /// A muxer whose bytes go to `writer` instead of a libav protocol, in
+    /// `packet_size` chunks (one SRT live message for MPEG-TS). No I/O happens
+    /// here; `writer` runs on the thread driving this muxer.
+    ///
+    /// # Errors
+    /// [`FfmpegError::Mux`] when the context or its I/O cannot be allocated.
+    pub fn create_with_writer(
+        format_name: &str,
+        packet_size: usize,
+        writer: PacketWriter,
+    ) -> Result<Self> {
+        ensure_initialized()?;
+        let mut writer = Box::new(writer);
+        let output = push_ffi::open_output_with_writer(format_name, packet_size, &mut writer)?;
+        Ok(Self {
+            output,
+            streams: Vec::new(),
+            options: MuxOptions::new(),
+            header_written: false,
+            trailer_written: false,
+            interrupt: None,
+            writer: Some(writer),
         })
     }
 
@@ -568,8 +612,106 @@ mod push_ffi {
     use ffmpeg_next as ffmpeg;
     use libc::{c_int, c_void};
 
-    use super::IoInterrupt;
+    use super::{IoInterrupt, PacketWriter};
     use crate::error::{FfmpegError, Result};
+
+    /// `extern "C"` write callback: forwards one buffer to the owned writer.
+    /// A panic in the writer is contained here and reported as an I/O error.
+    extern "C" fn write_cb(opaque: *mut c_void, buf: *const u8, size: c_int) -> c_int {
+        let Ok(len) = usize::try_from(size) else {
+            return ffi::AVERROR(libc::EINVAL);
+        };
+        if opaque.is_null() || buf.is_null() {
+            return ffi::AVERROR(libc::EINVAL);
+        }
+        // SAFETY: `opaque` is the `PacketWriter` box installed in
+        // `open_output_with_writer`, alive until `free_custom_io` removed this
+        // context; libav calls back synchronously on the thread driving the
+        // muxer, so there is no aliasing `&mut`. `buf` holds `len` bytes.
+        let (writer, data) = unsafe {
+            (
+                &mut *opaque.cast::<PacketWriter>(),
+                std::slice::from_raw_parts(buf, len),
+            )
+        };
+        let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer(data)));
+        if matches!(wrote, Ok(true)) {
+            size
+        } else {
+            ffi::AVERROR(libc::EIO)
+        }
+    }
+
+    pub(super) fn open_output_with_writer(
+        format_name: &str,
+        packet_size: usize,
+        writer: &mut Box<PacketWriter>,
+    ) -> Result<ffmpeg::format::context::Output> {
+        let invalid = || FfmpegError::Mux(ffmpeg::Error::InvalidData);
+        let c_fmt = CString::new(format_name).map_err(|_| invalid())?;
+        let size = c_int::try_from(packet_size).map_err(|_| invalid())?;
+        let mut ctx: *mut ffi::AVFormatContext = ptr::null_mut();
+        // SAFETY: allocates an owned context into `ctx`; `c_fmt` outlives the call.
+        let r = unsafe {
+            ffi::avformat_alloc_output_context2(
+                &raw mut ctx,
+                ptr::null_mut(),
+                c_fmt.as_ptr(),
+                ptr::null(),
+            )
+        };
+        if r < 0 || ctx.is_null() {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(r.min(-1))));
+        }
+        // SAFETY: `av_malloc` returns an owned buffer or null; ownership passes
+        // to the AVIO context below, or is freed on its failure.
+        let buffer = unsafe { ffi::av_malloc(packet_size) }.cast::<u8>();
+        let opaque = ptr::from_mut::<PacketWriter>(writer.as_mut()).cast::<c_void>();
+        // SAFETY: `buffer` holds `size` bytes; `opaque` is a stable heap address
+        // that the `Muxer` keeps alive until `free_custom_io` runs.
+        let pb = if buffer.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { ffi::avio_alloc_context(buffer, size, 1, opaque, None, Some(write_cb), None) }
+        };
+        if pb.is_null() {
+            // SAFETY: both are ours; `av_free` accepts null.
+            unsafe {
+                ffi::av_free(buffer.cast::<c_void>());
+                ffi::avformat_free_context(ctx);
+            }
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(ffi::AVERROR(
+                libc::ENOMEM,
+            ))));
+        }
+        // SAFETY: `ctx` and `pb` are valid. `max_packet_size` makes libav flush
+        // whole `packet_size` chunks; CUSTOM_IO stops libav closing `pb`. The
+        // `Output` wrapper's own destructor would `avio_close` it, which is why
+        // `free_custom_io` must null `pb` first.
+        unsafe {
+            (*pb).max_packet_size = size;
+            (*ctx).pb = pb;
+            (*ctx).flags |= ffi::AVFMT_FLAG_CUSTOM_IO;
+            Ok(ffmpeg::format::context::Output::wrap(ctx))
+        }
+    }
+
+    /// Free a custom `AVIOContext` and clear `pb`, so the `Output` destructor's
+    /// `avio_close` (which assumes a `URLContext` opaque) sees null.
+    pub(super) fn free_custom_io(output: &mut ffmpeg::format::context::Output) {
+        // SAFETY: `output` owns the context; `pb` is the context allocated in
+        // `open_output_with_writer`, whose buffer libav may have reallocated, so
+        // it is read back from `pb`. Both are freed exactly once, then cleared.
+        unsafe {
+            let ctx = output.as_mut_ptr();
+            let mut pb = (*ctx).pb;
+            if !pb.is_null() {
+                ffi::av_freep((&raw mut (*pb).buffer).cast::<c_void>());
+                ffi::avio_context_free(&raw mut pb);
+                (*ctx).pb = ptr::null_mut();
+            }
+        }
+    }
 
     /// `extern "C"` interrupt callback: `1` aborts the blocked libav call.
     extern "C" fn interrupt_cb(opaque: *mut c_void) -> c_int {

@@ -2,7 +2,12 @@
 //! operator requirement FFmpeg's libsrt protocol cannot meet. Peers are the
 //! `ffmpeg` CLI's own libsrt caller, so the handshake is independent of this
 //! crate. Skips only when libsrt or the CLI is genuinely absent.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::print_stderr)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr
+)]
 
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +18,15 @@ use multiview_srt_sys::{ListenerOptions, SrtLib, SrtListener};
 
 fn send_ts_from(caller_host: &str, port: u16) -> std::process::Child {
     Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
         .arg("testsrc=size=160x120:rate=30:duration=4")
         .args(["-c:v", "mpeg2video", "-f", "mpegts"])
         .arg(format!("srt://{caller_host}:{port}?mode=caller"))

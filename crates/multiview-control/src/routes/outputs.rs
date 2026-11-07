@@ -334,9 +334,18 @@ pub(crate) async fn get_output_link(
         kind: OUTPUT_KIND,
         id: id.clone(),
     };
+    let versioned = accepted_output(&state, &id)?;
     let snapshot = state.engine.state.latest().ok_or_else(not_found)?;
-    let link = output_link_from_snapshot(&snapshot, &id).ok_or_else(not_found)?;
+    let runtime_id = runtime_output_id(&versioned.resource.body, &id);
+    let link = output_link_from_snapshot(&snapshot, &runtime_id).ok_or_else(not_found)?;
     Ok((StatusCode::OK, Json(link)).into_response())
+}
+
+/// The id the running pipeline knows this output by. An output with no authored
+/// id is `output-N` here but keyed by its derived label at run time.
+fn runtime_output_id(body: &serde_json::Value, resource_id: &str) -> String {
+    serde_json::from_value::<multiview_config::Output>(body.clone())
+        .map_or_else(|_| resource_id.to_owned(), |output| output.id())
 }
 
 /// `outputs.<id>.link` from the conflated snapshot, if present.
@@ -355,8 +364,21 @@ fn output_link_from_snapshot(
 #[cfg(test)]
 mod link_tests {
     #![allow(clippy::unwrap_used)]
-    use super::output_link_from_snapshot;
+    use super::{output_link_from_snapshot, runtime_output_id};
     use serde_json::json;
+
+    #[test]
+    fn resource_ids_resolve_to_the_runtime_key() {
+        let idless = json!({"kind": "srt", "url": "srt://[::]:9000", "codec": "h264"});
+        assert_eq!(
+            runtime_output_id(&idless, "output-0"),
+            "srt srt://[::]:9000"
+        );
+        let authored =
+            json!({"kind": "srt", "id": "main", "url": "srt://[::]:9000", "codec": "h264"});
+        assert_eq!(runtime_output_id(&authored, "main"), "main");
+        assert_eq!(runtime_output_id(&json!({"kind": "?"}), "x"), "x");
+    }
 
     #[test]
     fn projects_the_link_or_none() {

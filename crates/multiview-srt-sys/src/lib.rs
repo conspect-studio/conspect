@@ -95,6 +95,11 @@ pub enum SrtError {
     /// The peer closed the connection.
     #[error("connection closed by peer")]
     Closed,
+    /// A listener URL carries an option this binding does not apply. Failing
+    /// closed beats silently ignoring e.g. an encryption setting. Names the key
+    /// only, never its value.
+    #[error("unsupported SRT listener option {0:?}")]
+    UnsupportedOption(String),
     /// An argument was invalid (e.g. a passphrase with an interior NUL).
     #[error("invalid argument: {0}")]
     Invalid(&'static str),
@@ -338,6 +343,123 @@ impl ListenerOptions {
     }
 }
 
+/// A listener's bind address and socket options, parsed from its URL.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ListenerSpec {
+    /// Where to bind.
+    pub addr: SocketAddr,
+    /// The socket options.
+    pub options: ListenerOptions,
+}
+
+/// Decode a query value the way libav's `ff_urldecode` does (`%XX`, `+` = space).
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let hex = (b == b'%')
+            .then(|| value.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        if let Some(decoded) = hex {
+            out.push(decoded);
+            i += 3;
+        } else {
+            out.push(if b == b'+' { b' ' } else { b });
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse an `srt://host:port?mode=listener&…` URL into a [`ListenerSpec`].
+///
+/// Query values keep the libav units the URL lowering emits (`latency` is in
+/// **microseconds**). `sender` selects output vs input. An empty host binds the
+/// dual-stack wildcard. Options with no effect on a listener are accepted; any
+/// other key fails closed with [`SrtError::UnsupportedOption`].
+///
+/// # Errors
+/// [`SrtError::Invalid`] for a malformed URL or value;
+/// [`SrtError::UnsupportedOption`] as above.
+pub fn parse_listener_url(url: &str, sender: bool) -> Result<ListenerSpec> {
+    use std::net::ToSocketAddrs;
+
+    let (authority, query) = url.split_once('?').unwrap_or((url, ""));
+    let host_port = authority
+        .strip_prefix("srt://")
+        .ok_or(SrtError::Invalid("scheme is not srt"))?;
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or(SrtError::Invalid("port is missing"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| SrtError::Invalid("port is invalid"))?;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let bare = if bare.is_empty() { "::" } else { bare };
+    let addr = (bare, port)
+        .to_socket_addrs()
+        .map_err(|_| SrtError::Invalid("host does not resolve"))?
+        .next()
+        .ok_or(SrtError::Invalid("host does not resolve"))?;
+
+    let mut options = ListenerOptions {
+        sender,
+        ..ListenerOptions::default()
+    };
+    let mut passphrase = None;
+    let mut key_len = None;
+    for pair in query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "latency" => {
+                let micros = value
+                    .parse::<u64>()
+                    .map_err(|_| SrtError::Invalid("latency"))?;
+                let ms = u32::try_from(micros / 1000).map_err(|_| SrtError::Invalid("latency"))?;
+                options.latency_ms = Some(ms);
+            }
+            "passphrase" => passphrase = Some(url_decode(value)),
+            "pbkeylen" => {
+                key_len = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| SrtError::Invalid("pbkeylen"))?,
+                );
+            }
+            "oheadbw" => {
+                options.oheadbw_pct = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| SrtError::Invalid("oheadbw"))?,
+                );
+            }
+            "maxbw" => {
+                options.maxbw = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| SrtError::Invalid("maxbw"))?,
+                );
+            }
+            "transtype" if value == "live" => {}
+            // No effect on a listener: the mode is implied, a stream id is the
+            // caller's, and accept waits are owned by the stop predicate.
+            "mode" | "streamid" | "connect_timeout" | "timeout" | "listen_timeout" | "pkt_size"
+            | "payload_size" => {}
+            other => return Err(SrtError::UnsupportedOption(other.to_owned())),
+        }
+    }
+    if let Some(passphrase) = passphrase {
+        options.encryption = Some((key_len.unwrap_or(16), passphrase));
+    }
+    Ok(ListenerSpec { addr, options })
+}
+
 /// A bound, listening SRT socket. Closed on drop.
 #[derive(Debug)]
 pub struct SrtListener {
@@ -502,7 +624,10 @@ impl SrtListener {
     ///
     /// # Errors
     /// [`SrtError::Interrupted`] on stop; [`SrtError::Call`] on a libsrt failure.
-    pub fn accept(&self, should_stop: &dyn Fn() -> bool) -> Result<(SrtSocket, Option<SocketAddr>)> {
+    pub fn accept(
+        &self,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<(SrtSocket, Option<SocketAddr>)> {
         loop {
             if should_stop() {
                 return Err(SrtError::Interrupted);
@@ -522,7 +647,11 @@ impl SrtListener {
                 c_int::try_from(std::mem::size_of::<libc::sockaddr_storage>()).unwrap_or(128);
             // SAFETY: `storage` has `len` bytes for libsrt to write the peer.
             let sock = unsafe {
-                (self.lib.accept)(self.sock, std::ptr::from_mut(&mut storage).cast(), &raw mut len)
+                (self.lib.accept)(
+                    self.sock,
+                    std::ptr::from_mut(&mut storage).cast(),
+                    &raw mut len,
+                )
             };
             if sock == SRT_ERROR {
                 // A spurious wake (no pending caller) is retried.
@@ -592,12 +721,18 @@ impl SrtSocket {
     }
 
     /// Send `data` as live-mode messages of at most [`LIVE_PAYLOAD`] bytes.
-    /// Each message is retried on a send timeout until `deadline` elapses.
+    /// Each message is retried on a send timeout until `deadline` elapses or
+    /// `should_stop()` is true.
     ///
     /// # Errors
-    /// [`SrtError::TimedOut`] past `deadline`; [`SrtError::Call`] when the
-    /// connection is broken.
-    pub fn send(&self, data: &[u8], deadline: Duration) -> Result<()> {
+    /// [`SrtError::TimedOut`] past `deadline`; [`SrtError::Interrupted`] on
+    /// stop; [`SrtError::Call`] when the connection is broken.
+    pub fn send(
+        &self,
+        data: &[u8],
+        deadline: Duration,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let started = Instant::now();
         for chunk in data.chunks(LIVE_PAYLOAD) {
             let len = c_int::try_from(chunk.len()).map_err(|_| SrtError::Invalid("chunk"))?;
@@ -609,6 +744,9 @@ impl SrtSocket {
                 }
                 if !self.lib.last_error_is_again() {
                     return Err(self.lib.call_error("srt_sendmsg"));
+                }
+                if should_stop() {
+                    return Err(SrtError::Interrupted);
                 }
                 if started.elapsed() >= deadline {
                     return Err(SrtError::TimedOut);
@@ -653,6 +791,34 @@ impl Drop for SrtSocket {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn listener_url_parses_units_secrets_and_fails_closed() {
+        let spec = parse_listener_url(
+            "srt://[::]:9000?mode=listener&latency=200000&pbkeylen=32&passphrase=a%26b+c&maxbw=7",
+            true,
+        )
+        .unwrap();
+        assert_eq!(spec.addr, "[::]:9000".parse().unwrap());
+        assert_eq!(spec.options.latency_ms, Some(200));
+        assert_eq!(spec.options.encryption, Some((32, "a&b c".to_owned())));
+        assert_eq!(spec.options.maxbw, Some(7));
+        assert!(spec.options.sender);
+        // An empty host is the dual-stack wildcard.
+        let spec = parse_listener_url("srt://:9000?mode=listener", false).unwrap();
+        assert_eq!(spec.addr, "[::]:9000".parse().unwrap());
+        // A specific address stays specific.
+        let spec = parse_listener_url("srt://[2001:db8::10]:9000", false).unwrap();
+        assert_eq!(spec.addr, "[2001:db8::10]:9000".parse().unwrap());
+        // Unknown keys are refused by name, and the value is not echoed.
+        let err = parse_listener_url("srt://[::]:9000?enforced_encryption=hunter2", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("enforced_encryption") && !err.contains("hunter2"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn v4_binds_as_mapped_v6() {

@@ -10,13 +10,14 @@
 //!   (a listener waiting for a caller, a caller reconnecting) the packet is
 //!   **dropped and counted** — it never blocks, so the consumer's fan-out queue
 //!   never fills and the sink is never marked wedged.
-//! * **link thread** — opens the transport through [`Muxer::create_push`],
-//!   whose `AVIOInterruptCB` makes the blocking connect / `srt_accept`
-//!   abortable. On failure it backs off (0.5 s → 5 s, jittered) and retries.
-//!   *Caller* mode keeps one session and reconnects when it ends. *Listener*
-//!   mode (SRT `mode=listener`) hands each accepted caller to its own writer
-//!   and immediately listens again, so a dropped caller can reconnect and
-//!   several callers can be attached at once (one encode, N connections).
+//! * **link thread** — *caller* mode opens the transport through
+//!   [`Muxer::create_push`], whose `AVIOInterruptCB` makes the blocking connect
+//!   abortable, keeps one session, and reconnects with back-off (0.5 s → 5 s,
+//!   jittered) when it ends. *Listener* mode (SRT `mode=listener`) holds **one**
+//!   native socket from `multiview-srt-sys` for the whole run, because FFmpeg's
+//!   libsrt can neither bind dual-stack `[::]` nor keep listening after an
+//!   accept. Each caller gets its own writer while the socket keeps accepting,
+//!   so there is no re-listen gap and N callers share one encode.
 //! * **writer** — one per session: writes a fresh container header, then
 //!   muxes packets from its queue. The distributor gates every new (or
 //!   overflowed) session on the next **video keyframe**, so a decoder always
@@ -37,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use multiview_core::time::Rational;
 use multiview_ffmpeg::{EncodedPacket, Muxer, StreamCodecParameters, StreamKind};
+use multiview_srt_sys::{parse_listener_url, SrtError, SrtListener, SrtSocket, LIVE_PAYLOAD};
 
 use super::{
     add_track_streams, apply_mux_metadata, ff, route_packet, AudioSelection, MuxStream,
@@ -44,7 +46,7 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::metadata::{DisplayMatrix, MuxMetadata};
-use crate::push_link::{Backoff, PushLinkState, PushLinkStatus};
+use crate::push_link::{redact_target, Backoff, PushLinkState, PushLinkStatus};
 
 /// Per-session queue depth (packets). ~3–6 s of a typical A/V program; a peer
 /// slower than real time overflows it, is re-gated to the next keyframe and
@@ -57,8 +59,10 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// How long writers may flush their trailer at end-of-program before the stop
 /// flag aborts their I/O. Well inside the pipeline's 2 s sink-wedge grace.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(800);
-/// Simultaneous callers a listener accepts before it pauses re-listening.
+/// Simultaneous callers a listener serves; further callers are refused.
 const MAX_LISTENER_CLIENTS: usize = 16;
+/// Handshakes libsrt may queue between accepts.
+const LISTEN_BACKLOG: u16 = 16;
 /// A caller session at least this long resets the reconnect back-off.
 const STABLE_SESSION: Duration = Duration::from_secs(5);
 /// Poll step for interruptible sleeps / joins.
@@ -83,8 +87,10 @@ pub fn is_srt_listener_url(url: &str) -> bool {
     if !url.starts_with("srt://") {
         return false;
     }
-    url.split_once('?')
-        .is_some_and(|(_, q)| q.split('&').any(|p| p.eq_ignore_ascii_case("mode=listener")))
+    url.split_once('?').is_some_and(|(_, q)| {
+        q.split('&')
+            .any(|p| p.eq_ignore_ascii_case("mode=listener"))
+    })
 }
 
 /// Owned stream layout + per-output mux metadata a writer needs (cloned per
@@ -190,7 +196,13 @@ impl PacketMuxSink {
             let url = url.to_owned();
             std::thread::Builder::new()
                 .name("multiview-push-link".to_owned())
-                .spawn(move || link_main(&shared, &url, muxer_name, listener, &spec))
+                .spawn(move || {
+                    if listener {
+                        listener_main(&shared, &url, muxer_name, &spec);
+                    } else {
+                        caller_main(&shared, &url, muxer_name, &spec);
+                    }
+                })
                 .map_err(|e| Error::Output(format!("spawn push link thread: {e}")))?
         };
 
@@ -286,79 +298,140 @@ fn sleep_unless_stopped(shared: &Shared, total: Duration) {
     }
 }
 
-/// The link thread: (re)connect or (re)listen until stopped.
-fn link_main(shared: &Shared, url: &str, muxer_name: &'static str, listener: bool, spec: &WriterSpec) {
-    let seed = u64::from(std::process::id())
-        ^ u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        )
-        .unwrap_or(0);
-    let mut backoff = Backoff::standard(seed);
+fn backoff_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    u64::from(std::process::id()) ^ u64::try_from(nanos & u128::from(u64::MAX)).unwrap_or(0)
+}
+
+/// Report a link failure and wait out the next back-off step.
+fn back_off(shared: &Shared, backoff: &mut Backoff, url: &str, error: &str) {
+    let delay = backoff.next_delay();
+    tracing::warn!(
+        url = %redact_target(url),
+        error,
+        retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        "push link failed; retrying"
+    );
+    shared.link.set_error(error);
+    shared.link.set_state(PushLinkState::Reconnecting);
+    sleep_unless_stopped(shared, delay);
+}
+
+/// Caller mode: one session at a time, reconnecting until stopped.
+fn caller_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &WriterSpec) {
+    let mut backoff = Backoff::standard(backoff_seed());
     while !shared.stopped() {
-        if listener && shared.clients().len() >= MAX_LISTENER_CLIENTS {
-            sleep_unless_stopped(shared, Duration::from_millis(250));
-            continue;
-        }
-        shared.link.set_state(if listener {
-            PushLinkState::Listening
-        } else {
-            PushLinkState::Connecting
-        });
-        let open_timeout = if listener { None } else { Some(CONNECT_DEADLINE) };
-        match Muxer::create_push(url, muxer_name, Arc::clone(&shared.stop), open_timeout) {
-            Ok(muxer) => {
-                if shared.stopped() {
-                    break;
-                }
-                let peer = (!listener).then(|| redacted_target(url));
-                let started = Instant::now();
-                let Some(writer) = start_session(shared, muxer, spec, peer) else {
-                    sleep_unless_stopped(shared, backoff.next_delay());
-                    continue;
-                };
-                if listener {
-                    // Hand off and go straight back to listening.
-                    backoff.reset();
-                    shared.writers().push(writer);
-                    reap_finished(shared);
-                    continue;
-                }
-                // Caller mode: one session; wait for it to end, then retry.
-                while !shared.stopped() && !writer.is_finished() {
-                    std::thread::sleep(POLL);
-                }
-                shared.writers().push(writer);
-                reap_finished(shared);
-                if shared.stopped() {
-                    break;
-                }
-                // Only a session that actually lived resets the schedule: a
-                // peer that accepts then fails the header must not hot-loop.
-                if started.elapsed() >= STABLE_SESSION {
-                    backoff.reset();
-                }
-                shared.link.set_state(PushLinkState::Reconnecting);
-                sleep_unless_stopped(shared, backoff.next_delay());
-            }
+        shared.link.set_state(PushLinkState::Connecting);
+        let opened = Muxer::create_push(
+            url,
+            muxer_name,
+            Arc::clone(&shared.stop),
+            Some(CONNECT_DEADLINE),
+        );
+        let muxer = match opened {
+            Ok(muxer) => muxer,
             Err(e) => {
-                if shared.stopped() {
-                    break;
+                if !shared.stopped() {
+                    back_off(shared, &mut backoff, url, &e.to_string());
                 }
-                let delay = backoff.next_delay();
-                tracing::warn!(
-                    url = %redacted_target(url),
-                    error = %e,
-                    retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                    "push link open failed; retrying"
-                );
-                shared.link.set_error(e.to_string());
-                shared.link.set_state(PushLinkState::Reconnecting);
-                sleep_unless_stopped(shared, delay);
+                continue;
             }
+        };
+        let started = Instant::now();
+        let Some(writer) = start_session(shared, muxer, spec, Some(redact_target(url))) else {
+            sleep_unless_stopped(shared, backoff.next_delay());
+            continue;
+        };
+        while !shared.stopped() && !writer.is_finished() {
+            std::thread::sleep(POLL);
+        }
+        shared.writers().push(writer);
+        reap_finished(shared);
+        if shared.stopped() {
+            break;
+        }
+        // Only a session that actually lived resets the schedule: a peer that
+        // accepts then fails the header must not hot-loop.
+        if started.elapsed() >= STABLE_SESSION {
+            backoff.reset();
+        }
+        shared.link.set_state(PushLinkState::Reconnecting);
+        sleep_unless_stopped(shared, backoff.next_delay());
+    }
+}
+
+/// Listener mode: hold one socket, give each caller its own writer. A bind or
+/// socket failure rebinds with back-off; a bad URL keeps reporting its error.
+fn listener_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &WriterSpec) {
+    let mut backoff = Backoff::standard(backoff_seed());
+    while !shared.stopped() {
+        let bound = parse_listener_url(url, true)
+            .and_then(|listen| SrtListener::bind(listen.addr, &listen.options, LISTEN_BACKLOG));
+        let listener = match bound {
+            Ok(listener) => listener,
+            Err(e) => {
+                back_off(shared, &mut backoff, url, &e.to_string());
+                continue;
+            }
+        };
+        backoff.reset();
+        shared.link.set_state(PushLinkState::Listening);
+        tracing::info!(addr = %listener.local_addr(), "srt listener ready");
+        let failure = accept_callers(shared, &listener, muxer_name, spec);
+        drop(listener);
+        if let Some(e) = failure {
+            back_off(shared, &mut backoff, url, &e.to_string());
         }
     }
+}
+
+/// Accept until stopped (`None`) or the socket fails (`Some`).
+fn accept_callers(
+    shared: &Shared,
+    listener: &SrtListener,
+    muxer_name: &'static str,
+    spec: &WriterSpec,
+) -> Option<SrtError> {
+    loop {
+        let stop = Arc::clone(&shared.stop);
+        let accepted = listener.accept(&move || stop.load(Ordering::Acquire));
+        let (socket, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(SrtError::Interrupted) => return None,
+            Err(e) => return Some(e),
+        };
+        reap_finished(shared);
+        if shared.link.clients() >= MAX_LISTENER_CLIENTS {
+            tracing::warn!(
+                limit = MAX_LISTENER_CLIENTS,
+                "srt listener full; refusing caller"
+            );
+            continue;
+        }
+        let writer = socket_writer(socket, Arc::clone(&shared.stop));
+        match Muxer::create_with_writer(muxer_name, LIVE_PAYLOAD, writer) {
+            Ok(muxer) => {
+                if let Some(handle) =
+                    start_session(shared, muxer, spec, peer.map(|p| p.to_string()))
+                {
+                    shared.writers().push(handle);
+                }
+            }
+            Err(e) => shared.link.set_error(e.to_string()),
+        }
+    }
+}
+
+/// The muxer byte sink for one accepted caller. The socket closes with the muxer.
+fn socket_writer(socket: SrtSocket, stop: Arc<AtomicBool>) -> multiview_ffmpeg::PacketWriter {
+    Box::new(move |data: &[u8]| {
+        let stop = &stop;
+        socket
+            .send(data, WRITE_DEADLINE, &|| stop.load(Ordering::Acquire))
+            .is_ok()
+    })
 }
 
 /// Join and drop writer handles that already finished (bounded bookkeeping).
@@ -386,10 +459,11 @@ fn start_session(
     let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(CLIENT_QUEUE_CAP);
     let spec = spec.clone();
     let link = Arc::clone(&shared.link);
-    link.client_attached(peer);
+    link.client_attached(peer.clone());
+    let writer_peer = peer.clone();
     let spawned = std::thread::Builder::new()
         .name("multiview-push-writer".to_owned())
-        .spawn(move || writer_main(muxer, &rx, &spec, &link));
+        .spawn(move || writer_main(muxer, &rx, &spec, &link, writer_peer.as_deref()));
     match spawned {
         Ok(handle) => {
             shared.clients().push(Client { tx, gated: true });
@@ -397,7 +471,7 @@ fn start_session(
             Some(handle)
         }
         Err(e) => {
-            shared.link.client_detached();
+            shared.link.client_detached(peer.as_deref());
             shared.link.set_error(format!("spawn push writer: {e}"));
             None
         }
@@ -411,6 +485,7 @@ fn writer_main(
     rx: &Receiver<EncodedPacket>,
     spec: &WriterSpec,
     link: &PushLinkStatus,
+    peer: Option<&str>,
 ) {
     let result = write_session(&mut muxer, rx, spec, link);
     // Best-effort trailer under a short deadline; the peer may be gone.
@@ -418,7 +493,7 @@ fn writer_main(
     match muxer.finish() {
         Ok(()) | Err(_) => {}
     }
-    link.client_detached();
+    link.client_detached(peer);
     if let Err(e) = result {
         tracing::warn!(error = %e, "push peer session ended");
         link.set_error(e.to_string());
@@ -468,11 +543,6 @@ fn write_session(
     Ok(())
 }
 
-/// The target without its query (no passphrase/stream id in logs/status).
-fn redacted_target(url: &str) -> String {
-    url.split_once('?').map_or(url, |(base, _)| base).to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::is_srt_listener_url;
@@ -480,7 +550,9 @@ mod tests {
     #[test]
     fn listener_detection() {
         assert!(is_srt_listener_url("srt://0.0.0.0:9000?mode=listener"));
-        assert!(is_srt_listener_url("srt://0.0.0.0:9000?latency=1&mode=listener"));
+        assert!(is_srt_listener_url(
+            "srt://0.0.0.0:9000?latency=1&mode=listener"
+        ));
         assert!(!is_srt_listener_url("srt://[::1]:9000?mode=caller"));
         assert!(!is_srt_listener_url("srt://[::1]:9000"));
         assert!(!is_srt_listener_url("rtmp://x/app?mode=listener"));

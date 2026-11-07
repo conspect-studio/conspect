@@ -314,7 +314,7 @@ pub use hwframe::{
 };
 
 #[cfg(feature = "ffmpeg")]
-pub use mux::Muxer;
+pub use mux::{Muxer, PacketWriter};
 
 #[cfg(feature = "ffmpeg")]
 pub use opus::{

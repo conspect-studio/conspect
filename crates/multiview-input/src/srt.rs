@@ -722,11 +722,11 @@ impl SrtConfig {
     }
 }
 
-/// The IPv4 wildcard an SRT **listener** binds when asked for "any address".
-pub const SRT_LISTENER_WILDCARD: &str = "0.0.0.0";
+/// The canonical dual-stack wildcard host of an SRT **listener**.
+pub const SRT_LISTENER_WILDCARD: &str = "[::]";
 
-/// Whether `host` names the unspecified ("any") address: empty, `::`, `[::]`,
-/// or `0.0.0.0`.
+/// Whether `host` spells the IPv6 wildcard: empty, `::`, or `[::]`. `0.0.0.0`
+/// is deliberately **not** a wildcard here: it is an explicit IPv4-only bind.
 #[must_use]
 pub fn is_wildcard_host(host: &str) -> bool {
     let bare = host
@@ -735,22 +735,17 @@ pub fn is_wildcard_host(host: &str) -> bool {
         .unwrap_or(host);
     bare.is_empty()
         || bare
-            .parse::<std::net::IpAddr>()
+            .parse::<std::net::Ipv6Addr>()
             .is_ok_and(|ip| ip.is_unspecified())
 }
 
-/// The bind host an SRT listener actually uses for `host`.
+/// The bind host an SRT listener uses for `host`: every wildcard spelling
+/// becomes [`SRT_LISTENER_WILDCARD`]; a specific address is unchanged.
 ///
-/// **Why `[::]` is lowered (production finding, FFmpeg 8.1 + libsrt 1.5.4):**
-/// libsrt 1.5 refuses `srt_bind` on the IPv6 wildcard unless `SRTO_IPV6ONLY`
-/// was set explicitly on the socket ("Operation not supported: Bad
-/// parameters"), and FFmpeg's `libsrt.c` exposes no `ipv6only` `AVOption` nor
-/// any hook to set it on the socket it creates. So a dual-stack `[::]` SRT
-/// listener is impossible through the FFmpeg URL API; the closest working bind
-/// is the IPv4 wildcard. Every wildcard spelling (empty, `::`, `[::]`) is
-/// therefore lowered to [`SRT_LISTENER_WILDCARD`]. A **specific** address
-/// (IPv4 or IPv6, e.g. `[2001:db8::10]`) is passed through unchanged — that is
-/// how an operator gets an IPv6 SRT listener.
+/// libsrt refuses to bind `[::]` unless `SRTO_IPV6ONLY` is set explicitly and
+/// `FFmpeg`'s `libsrt.c` exposes no way to set it, so a listener URL is **not**
+/// opened through libav: `multiview-srt-sys` binds one `AF_INET6` socket with
+/// `SRTO_IPV6ONLY = 0`, which serves IPv6 and IPv4 callers on the same port.
 #[must_use]
 pub fn listener_bind_host(host: &str) -> &str {
     if is_wildcard_host(host) {
@@ -760,12 +755,9 @@ pub fn listener_bind_host(host: &str) -> &str {
     }
 }
 
-/// Rewrite an opaque `srt://host:port?…` URL so a **listener** on a wildcard
-/// host binds [`SRT_LISTENER_WILDCARD`] (see [`listener_bind_host`]).
-///
-/// A URL is a listener when its query carries `mode=listener`. Caller /
-/// rendezvous URLs, specific hosts, and anything that does not parse as
-/// `srt://host:port` are returned unchanged.
+/// Normalise an opaque `srt://host:port?…` **listener** URL's wildcard host to
+/// `[::]` (see [`listener_bind_host`]). Caller / rendezvous URLs, specific
+/// hosts, and anything that does not parse are returned unchanged.
 #[must_use]
 pub fn lower_listener_url(url: &str) -> String {
     let (authority, query) = match url.split_once('?') {

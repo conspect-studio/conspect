@@ -16,7 +16,7 @@
 //! jitter, reset on a successful connect. Pure Rust, always compiled.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use multiview_framestore::SwapCell;
@@ -97,9 +97,11 @@ pub struct PushLinkStatus {
     resync: AtomicBool,
     /// The most recent connect/listen/write error (cleared on connect).
     last_error: SwapCell<Option<Arc<String>>>,
-    /// The attached peer's address when known (caller mode: the configured
-    /// target; FFmpeg's libsrt does not expose an accepted caller's address).
-    peer: SwapCell<Option<Arc<String>>>,
+    /// Attached peer addresses, published for lock-free reads by the snapshot.
+    peers: SwapCell<Arc<Vec<String>>>,
+    /// Serialises the sink-side threads' read-modify-write of `peers`. Never
+    /// taken by the consumer or the snapshot.
+    peers_edit: Mutex<Vec<String>>,
 }
 
 /// A point-in-time copy of a [`PushLinkStatus`] for the status API.
@@ -124,8 +126,8 @@ pub struct PushLinkSnapshot {
     pub written: u64,
     /// Last error, if any since the last successful connect.
     pub last_error: Option<String>,
-    /// Peer address when known.
-    pub peer: Option<String>,
+    /// Attached peer addresses (an SRT listener's callers; a caller's target).
+    pub peers: Vec<String>,
 }
 
 impl PushLinkStatus {
@@ -143,7 +145,8 @@ impl PushLinkStatus {
             written: AtomicU64::new(0),
             resync: AtomicBool::new(false),
             last_error: SwapCell::new(None),
-            peer: SwapCell::new(None),
+            peers: SwapCell::new(Arc::new(Vec::new())),
+            peers_edit: Mutex::new(Vec::new()),
         }
     }
 
@@ -168,11 +171,29 @@ impl PushLinkStatus {
         self.clients.fetch_add(1, Ordering::AcqRel);
         self.sessions.fetch_add(1, Ordering::AcqRel);
         self.last_error.store(None);
-        self.peer.store(peer.map(Arc::new));
+        if let Some(peer) = peer {
+            self.edit_peers(|peers| peers.push(peer));
+        }
+    }
+
+    fn edit_peers(&self, edit: impl FnOnce(&mut Vec<String>)) {
+        let mut peers = self
+            .peers_edit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        edit(&mut peers);
+        self.peers.store(Arc::new(peers.clone()));
     }
 
     /// A peer detached.
-    pub fn client_detached(&self) {
+    pub fn client_detached(&self, peer: Option<&str>) {
+        if let Some(peer) = peer {
+            self.edit_peers(|peers| {
+                if let Some(at) = peers.iter().position(|p| p == peer) {
+                    peers.swap_remove(at);
+                }
+            });
+        }
         let mut current = self.clients.load(Ordering::Acquire);
         while current > 0 {
             match self.clients.compare_exchange_weak(
@@ -241,12 +262,31 @@ impl PushLinkStatus {
             dropped: self.dropped(),
             written: self.written.load(Ordering::Relaxed),
             last_error: self.last_error.load().map(|e| e.as_ref().clone()),
-            peer: if clients > 0 {
-                self.peer.load().map(|p| p.as_ref().clone())
-            } else {
-                None
-            },
+            peers: self.peers.load().as_ref().clone(),
         }
+    }
+}
+
+/// A display-safe form of a push URL: no query (passphrase, stream id), no
+/// userinfo, and for RTMP no stream key (the final path segment).
+#[must_use]
+pub fn redact_target(url: &str) -> String {
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return "***".to_owned();
+    };
+    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if !scheme.starts_with("rtmp") || path.is_empty() {
+        return if path.is_empty() {
+            format!("{scheme}://{host}")
+        } else {
+            format!("{scheme}://{host}/{path}")
+        };
+    }
+    match path.rsplit_once('/') {
+        Some((app, _key)) => format!("{scheme}://{host}/{app}/***"),
+        None => format!("{scheme}://{host}/{path}"),
     }
 }
 
@@ -318,6 +358,31 @@ mod tests {
     }
 
     #[test]
+    fn redaction_removes_every_credential_shape() {
+        for (url, want) in [
+            (
+                "rtmp://live.example/app/sk_secret",
+                "rtmp://live.example/app/***",
+            ),
+            (
+                "rtmps://u:pw@live.example:443/a/b/sk?x=1",
+                "rtmps://live.example:443/a/b/***",
+            ),
+            (
+                "srt://[::]:9000?mode=listener&passphrase=***",
+                "srt://[::]:9000",
+            ),
+            (
+                "rist://u:pw@[2001:db8::1]:8000?secret=x",
+                "rist://[2001:db8::1]:8000",
+            ),
+            ("not a url with secret", "***"),
+        ] {
+            assert_eq!(redact_target(url), want);
+        }
+    }
+
+    #[test]
     fn status_derives_connected_and_clears_error_on_attach() {
         let s = PushLinkStatus::new("srt", true, "srt://0.0.0.0:9000?mode=listener");
         s.set_state(PushLinkState::Listening);
@@ -326,13 +391,15 @@ mod tests {
         assert_eq!(snap.state, PushLinkState::Listening);
         assert_eq!(snap.mode, "listener");
         assert_eq!(snap.last_error.as_deref(), Some("Input/output error"));
-        s.client_attached(None);
+        s.client_attached(Some("[::1]:5000".to_owned()));
         let snap = s.snapshot();
         assert_eq!(snap.state, PushLinkState::Connected);
         assert_eq!((snap.clients, snap.sessions), (1, 1));
         assert_eq!(snap.last_error, None);
-        s.client_detached();
-        s.client_detached(); // saturates, never underflows
+        assert_eq!(snap.peers, vec!["[::1]:5000".to_owned()]);
+        s.client_detached(Some("[::1]:5000"));
+        s.client_detached(None); // saturates, never underflows
+        assert!(s.snapshot().peers.is_empty());
         assert_eq!(s.snapshot().state, PushLinkState::Listening);
         s.add_dropped(3);
         assert_eq!(s.snapshot().dropped, 3);

@@ -143,9 +143,13 @@ fn wait_for(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
 
 /// A real SRT caller that decodes `frames` video frames, then disconnects.
 fn caller(port: u16, frames: u32) -> Child {
+    caller_over("127.0.0.1", port, frames)
+}
+
+fn caller_over(host: &str, port: u16, frames: u32) -> Child {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(format!("srt://127.0.0.1:{port}?mode=caller"))
+        .arg(format!("srt://{host}:{port}?mode=caller"))
         .args(["-frames:v", &frames.to_string(), "-f", "null", "-"])
         .stdin(Stdio::null())
         .spawn()
@@ -170,7 +174,11 @@ fn assert_decoded(mut child: Child, who: &str) {
 #[test]
 fn listener_serves_two_sequential_callers() {
     let port = port();
-    let run = start(format!("srt://127.0.0.1:{port}?mode=listener"), true, paced());
+    let run = start(
+        format!("srt://127.0.0.1:{port}?mode=listener"),
+        true,
+        paced(),
+    );
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -186,10 +194,77 @@ fn listener_serves_two_sequential_callers() {
     run.handle.join().unwrap();
 }
 
+/// The operator requirement: `[::]` serves IPv6 and IPv4 callers at once, and
+/// the status reports both real peer addresses.
+#[test]
+fn wildcard_listener_is_dual_stack_and_reports_real_peers() {
+    let port = port();
+    let run = start(format!("srt://[::]:{port}?mode=listener"), true, paced());
+    wait_for("listening", Duration::from_secs(5), || {
+        run.link.snapshot().state == PushLinkState::Listening
+    });
+    assert!(run.link.snapshot().last_error.is_none());
+    let v6 = caller_over("[::1]", port, 120);
+    let v4 = caller_over("127.0.0.1", port, 120);
+    wait_for("both attached", Duration::from_secs(10), || {
+        run.link.clients() == 2
+    });
+    let peers = run.link.snapshot().peers;
+    assert!(peers.iter().any(|p| p.starts_with("[::1]:")), "{peers:?}");
+    assert!(
+        peers.iter().any(|p| p.starts_with("127.0.0.1:")),
+        "{peers:?}"
+    );
+    assert_decoded(v6, "ipv6 caller");
+    assert_decoded(v4, "ipv4 caller");
+    run.stop.store(true, Ordering::Release);
+    run.handle.join().unwrap();
+}
+
+/// Chaos (R3, invariants #1/#10): callers connecting and vanishing without a
+/// clean close must never slow the producer, and every session must be released.
+#[test]
+fn caller_churn_never_slows_the_producer() {
+    let port = port();
+    let run = start(format!("srt://[::]:{port}?mode=listener"), true, paced());
+    wait_for("listening", Duration::from_secs(5), || {
+        run.link.snapshot().state == PushLinkState::Listening
+    });
+    let started = Instant::now();
+    let mut sessions = 0;
+    for round in 0..6_u64 {
+        let mut child = caller_over("[::1]", port, 100_000);
+        wait_for("attach", Duration::from_secs(10), || {
+            run.link.snapshot().sessions > round
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        child.kill().expect("kill caller"); // no SRT shutdown handshake
+        child.wait().expect("reap caller");
+        sessions += 1;
+    }
+    let elapsed = started.elapsed();
+    let snap = run.link.snapshot();
+    assert_eq!(snap.sessions, sessions, "{snap:?}");
+    run.stop.store(true, Ordering::Release);
+    let report = run.handle.join().unwrap();
+    // A 33 ms pace yields ~30 packets/s; a stalled producer would fall far short.
+    let expected = u64::try_from(elapsed.as_millis()).unwrap() / 33;
+    assert!(
+        report.received * 10 >= expected * 7,
+        "producer stalled: {} packets in {elapsed:?} (expected ~{expected})",
+        report.received
+    );
+    assert_eq!(run.link.clients(), 0, "every killed session is released");
+}
+
 #[test]
 fn listener_serves_two_simultaneous_callers() {
     let port = port();
-    let run = start(format!("srt://127.0.0.1:{port}?mode=listener"), true, paced());
+    let run = start(
+        format!("srt://127.0.0.1:{port}?mode=listener"),
+        true,
+        paced(),
+    );
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });
@@ -220,10 +295,16 @@ fn caller_reconnects_after_the_peer_goes_away() {
             .expect("spawn ffmpeg listener peer")
     };
     // The push starts with NO peer: it must retry rather than die.
-    let run = start(format!("srt://127.0.0.1:{port}?mode=caller"), false, paced());
+    let run = start(
+        format!("srt://127.0.0.1:{port}?mode=caller"),
+        false,
+        paced(),
+    );
     std::thread::sleep(Duration::from_millis(700));
     assert_decoded(peer(20), "first peer");
-    wait_for("detach", Duration::from_secs(15), || run.link.clients() == 0);
+    wait_for("detach", Duration::from_secs(15), || {
+        run.link.clients() == 0
+    });
     assert_decoded(peer(20), "second peer");
     assert!(run.link.snapshot().sessions >= 2);
     run.stop.store(true, Ordering::Release);
@@ -247,7 +328,11 @@ fn no_peer_never_blocks_the_producer_and_counts_drops() {
 #[test]
 fn teardown_is_bounded_while_waiting_for_a_caller() {
     let port = port();
-    let run = start(format!("srt://127.0.0.1:{port}?mode=listener"), true, paced());
+    let run = start(
+        format!("srt://127.0.0.1:{port}?mode=listener"),
+        true,
+        paced(),
+    );
     wait_for("listening", Duration::from_secs(5), || {
         run.link.snapshot().state == PushLinkState::Listening
     });

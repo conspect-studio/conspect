@@ -8982,9 +8982,9 @@ fn srt_resolved_url(
     srt: Option<&SrtOptions>,
     redact: bool,
 ) -> Result<String, SrtError> {
-    // A wildcard listener (`[::]`, `::`, empty host) cannot bind through
-    // FFmpeg's libsrt: lower it to the IPv4 wildcard (see
-    // `multiview_input::srt::listener_bind_host`). Specific hosts pass through.
+    // Every wildcard listener spelling normalises to dual-stack `[::]`, which
+    // `multiview-srt-sys` binds natively (FFmpeg's libsrt cannot). Specific
+    // hosts pass through.
     let Some(opts) = srt else {
         let lowered = multiview_input::srt::lower_listener_url(base_url);
         return Ok(if redact {
@@ -9033,8 +9033,8 @@ fn srt_resolved_url(
     } else {
         (KeyLength::None, None)
     };
-    // Lower a wildcard listener host BEFORE validation so an empty host
-    // (`srt://:9000`) is accepted and bound as the IPv4 wildcard.
+    // Normalise a wildcard listener host BEFORE validation so an empty host
+    // (`srt://:9000`) is accepted and bound dual-stack.
     let host = if mode == SrtMode::Listener {
         multiview_input::srt::listener_bind_host(host)
     } else {
@@ -9284,7 +9284,8 @@ fn build_hls_output(
 }
 
 /// A fresh link-status record for a push sink: listener mode is read from the
-/// sink's real (lowered) URL; only the redacted URL is stored for display.
+/// sink's real (lowered) URL; only [`redact_target`](multiview_output::push_link::redact_target)'s
+/// credential-free form is stored, because the link is served to read-role users.
 fn push_link_for(
     label: &'static str,
     sink: &PacketMuxSink,
@@ -9294,7 +9295,9 @@ fn push_link_for(
         .push_target()
         .is_some_and(|(url, _)| multiview_output::sink::is_srt_listener_url(url));
     Arc::new(multiview_output::push_link::PushLinkStatus::new(
-        label, listener, redacted,
+        label,
+        listener,
+        multiview_output::push_link::redact_target(redacted),
     ))
 }
 
@@ -9418,8 +9421,8 @@ fn build_outputs(
                 })?;
                 tracing::info!(transport = "srt", url = %redacted, "wiring srt push output");
                 let (meta, matrix) = output_mux_meta(output);
-                let sink =
-                    PacketMuxSink::push(PushProtocol::Srt, lowered).with_output_metadata(meta, matrix);
+                let sink = PacketMuxSink::push(PushProtocol::Srt, lowered)
+                    .with_output_metadata(meta, matrix);
                 runnable.push(RunnableOutput::Push {
                     id: output.id(),
                     link: push_link_for("srt", &sink, &redacted),
@@ -16714,42 +16717,61 @@ mod srt_wiring_tests {
     }
 
     #[test]
-    fn srt_wildcard_listener_lowers_to_ipv4_wildcard_specific_hosts_pass_through() {
-        // Legacy opaque URL (no typed block).
-        assert_eq!(
-            srt_resolved_url("srt://[::]:9000?mode=listener", None, false).unwrap(),
-            "srt://0.0.0.0:9000?mode=listener"
-        );
-        // Typed listener mode on the IPv6 wildcard.
+    fn srt_wildcard_listener_stays_dual_stack_specific_hosts_pass_through() {
         let listener = serde_json::from_value(serde_json::json!({"mode": "listener"})).unwrap();
-        assert_eq!(
-            srt_resolved_url("srt://[::]:9000", Some(&listener), false).unwrap(),
-            "srt://0.0.0.0:9000?mode=listener"
-        );
         let legacy = serde_json::from_value(serde_json::json!({"listener": true})).unwrap();
+        for (base, opts, want) in [
+            (
+                "srt://[::]:9000?mode=listener",
+                None,
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://:9000?mode=listener",
+                None,
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://[::]:9000",
+                Some(&listener),
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://:9000",
+                Some(&listener),
+                "srt://[::]:9000?mode=listener",
+            ),
+            (
+                "srt://[::]:9000?latency=1000",
+                Some(&legacy),
+                "srt://[::]:9000?mode=listener&latency=1000",
+            ),
+            (
+                "srt://[2001:db8::10]:9000",
+                Some(&listener),
+                "srt://[2001:db8::10]:9000?mode=listener",
+            ),
+            (
+                "srt://0.0.0.0:9000",
+                Some(&listener),
+                "srt://0.0.0.0:9000?mode=listener",
+            ),
+            (
+                "srt://[::1]:9000?mode=caller",
+                None,
+                "srt://[::1]:9000?mode=caller",
+            ),
+        ] {
+            assert_eq!(srt_resolved_url(base, opts, false).unwrap(), want, "{base}");
+        }
         assert_eq!(
-            srt_resolved_url("srt://[::]:9000?latency=1000", Some(&legacy), false).unwrap(),
-            "srt://0.0.0.0:9000?mode=listener&latency=1000"
-        );
-        // An empty host binds the wildcard too (typed and legacy paths).
-        assert_eq!(
-            srt_resolved_url("srt://:9000", Some(&listener), false).unwrap(),
-            "srt://0.0.0.0:9000?mode=listener"
-        );
-        // A specific IPv6 listener and a caller to [::] are untouched.
-        assert_eq!(
-            srt_resolved_url("srt://[2001:db8::10]:9000", Some(&listener), false).unwrap(),
-            "srt://[2001:db8::10]:9000?mode=listener"
-        );
-        assert_eq!(
-            srt_resolved_url("srt://[::1]:9000?mode=caller", None, false).unwrap(),
-            "srt://[::1]:9000?mode=caller"
-        );
-        // Redacted diagnostics carry the same bind host.
-        assert_eq!(
-            srt_resolved_url("srt://[::]:9000?mode=listener&passphrase=abcdefghijk", None, true)
-                .unwrap(),
-            "srt://0.0.0.0:9000?mode=listener&passphrase=***"
+            srt_resolved_url(
+                "srt://:9000?mode=listener&passphrase=abcdefghijk",
+                None,
+                true
+            )
+            .unwrap(),
+            "srt://[::]:9000?mode=listener&passphrase=***"
         );
     }
 
@@ -20144,9 +20166,16 @@ mod push_send_policy_tests {
             "never waits: {:?}",
             started.elapsed()
         );
-        assert_eq!(live, vec![true], "a full push queue never marks the sink dead");
+        assert_eq!(
+            live,
+            vec![true],
+            "a full push queue never marks the sink dead"
+        );
         assert_eq!(link.dropped(), 100);
-        assert!(link.take_resync(), "the sink is asked to resync on a keyframe");
+        assert!(
+            link.take_resync(),
+            "the sink is asked to resync on a keyframe"
+        );
         // Draining the queue lets later packets through again.
         while rx.try_recv().is_ok() {}
         drop(rx);

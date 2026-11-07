@@ -3277,6 +3277,7 @@ dependencies = [
  "multiview-input",
  "multiview-ndi-sys",
  "multiview-rist-sys",
+ "multiview-srt-sys",
  "multiview-telemetry",
  "proptest",
  "rustix",

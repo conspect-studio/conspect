@@ -2213,7 +2213,6 @@ pub struct OutputLinkDoc {
     /// The last connect/listen/write error since the last successful connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    /// The attached peer's address, when known (caller mode).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<String>,
+    /// Attached peer addresses: an SRT listener's callers, or a caller's target.
+    pub peers: Vec<String>,
 }

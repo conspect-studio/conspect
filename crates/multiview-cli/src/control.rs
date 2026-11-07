@@ -936,11 +936,14 @@ pub fn insert_input_fragment(
 
 /// Serialise the live push-output link records into the `outputs` snapshot
 /// fragment: `{ "<id>": { "link": { state, mode, transport, url, clients,
-/// sessions, dropped, written, last_error?, peer? } } }`, or `None` when the
+/// sessions, dropped, written, peers, last_error? } } }`, or `None` when the
 /// run has no push outputs. Reads atomics + lock-free cells only (inv #10).
 #[must_use]
 pub fn push_links_fragment(
-    links: &[(String, std::sync::Arc<multiview_output::push_link::PushLinkStatus>)],
+    links: &[(
+        String,
+        std::sync::Arc<multiview_output::push_link::PushLinkStatus>,
+    )],
 ) -> Option<serde_json::Value> {
     if links.is_empty() {
         return None;
@@ -957,13 +960,11 @@ pub fn push_links_fragment(
             "sessions": snap.sessions,
             "dropped": snap.dropped,
             "written": snap.written,
+            "peers": snap.peers,
         });
         if let Some(map) = obj.as_object_mut() {
             if let Some(err) = snap.last_error {
                 map.insert("last_error".to_owned(), serde_json::Value::String(err));
-            }
-            if let Some(peer) = snap.peer {
-                map.insert("peer".to_owned(), serde_json::Value::String(peer));
             }
         }
         outputs.insert(id.clone(), serde_json::json!({ "link": obj }));
