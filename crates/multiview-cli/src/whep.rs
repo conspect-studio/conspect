@@ -539,7 +539,11 @@ impl CliWhepProvider {
         program_audio: Option<crate::preview::ProgramAudioSlot>,
     ) -> Self {
         let state = Arc::new(Mutex::new(DriverState::default()));
-        spawn_encode_pump(Arc::clone(&state), program_audio.clone(), Arc::clone(&egress));
+        spawn_encode_pump(
+            Arc::clone(&state),
+            program_audio.clone(),
+            Arc::clone(&egress),
+        );
         Self {
             egress,
             state,
@@ -700,11 +704,15 @@ fn spawn_encode_pump(
                         .filter(|id| {
                             egress
                                 .session_state(&SessionId::new(id.as_str()))
-                                .is_none_or(|s| s == multiview_preview::whep::transport::SessionState::Closed)
+                                .is_none_or(|s| {
+                                    s == multiview_preview::whep::transport::SessionState::Closed
+                                })
                         })
                         .cloned()
                         .collect();
-                    dead.iter().filter_map(|id| state.sessions.remove(id)).collect()
+                    dead.iter()
+                        .filter_map(|id| state.sessions.remove(id))
+                        .collect()
                 },
             );
             drop(reaped);

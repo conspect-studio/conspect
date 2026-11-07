@@ -252,7 +252,8 @@ input_id = "msnow"
 channels = { kind = "stereo" }
 include_in_program_bus = true
 "#;
-        let extra = "[[sources]]\nid = \"msnow\"\nkind = \"hls\"\nurl = \"https://example.test/m.m3u8\"";
+        let extra =
+            "[[sources]]\nid = \"msnow\"\nkind = \"hls\"\nurl = \"https://example.test/m.m3u8\"";
         let demand = demand(&config(extra, tail));
         assert_eq!(demand["msnow"].rails, Rails::AUDIO);
         assert!(!demand.contains_key("unused"));
@@ -410,7 +411,12 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
             return None;
         }
         let tag = ConsumerTag::new(ConsumerClass::Preview, label);
-        Some(Box::new(HeldLease(self.manager.acquire(id, Rails::VIDEO, tag, None))))
+        Some(Box::new(HeldLease(self.manager.acquire(
+            id,
+            Rails::VIDEO,
+            tag,
+            None,
+        ))))
     }
 
     fn touch_preview(&self, id: &str) -> Option<multiview_control::SourceDemandPhase> {
@@ -420,23 +426,27 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
         let tag = ConsumerTag::new(ConsumerClass::Preview, "jpeg");
         self.manager
             .touch(id, Rails::VIDEO, tag, PREVIEW_POLL_LEASE)
-            .map(|phase| view_of(&multiview_engine::DemandStatus {
-                id: id.to_owned(),
-                phase,
-                wanted: Rails::VIDEO,
-                running: Rails::NONE,
-                consumers: Vec::new(),
-                detail: None,
+            .map(|phase| {
+                view_of(&multiview_engine::DemandStatus {
+                    id: id.to_owned(),
+                    phase,
+                    wanted: Rails::VIDEO,
+                    running: Rails::NONE,
+                    consumers: Vec::new(),
+                    detail: None,
+                })
+                .phase
             })
-            .phase)
     }
 }
 
 /// The control-plane demand provider of the current run, installed by the
 /// binary before it serves. Process-wide: one run per process.
-fn control_demand_slot() -> &'static std::sync::Mutex<Option<multiview_control::SharedSourceDemand>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<multiview_control::SharedSourceDemand>>> =
-        std::sync::OnceLock::new();
+fn control_demand_slot() -> &'static std::sync::Mutex<Option<multiview_control::SharedSourceDemand>>
+{
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<Option<multiview_control::SharedSourceDemand>>,
+    > = std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 

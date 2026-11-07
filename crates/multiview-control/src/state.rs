@@ -1296,7 +1296,10 @@ impl AppState {
 
     /// Attach the source demand provider.
     #[must_use]
-    pub fn with_source_demand(mut self, provider: crate::source_demand::SharedSourceDemand) -> Self {
+    pub fn with_source_demand(
+        mut self,
+        provider: crate::source_demand::SharedSourceDemand,
+    ) -> Self {
         self.source_demand = Some(provider);
         self
     }

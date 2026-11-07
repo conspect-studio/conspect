@@ -1103,26 +1103,25 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // Prefer the video's fetched copy (one fetch per source: audio and video
         // read the same segments). Fall back to opening the origin when video is
         // not on the fetcher.
-        let shared =
-            if plan.live
-                && is_hls
-                && !plan.audio_only
-                && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none()
-            {
-                let slot = crate::pipeline::live_anchor_slot(&plan.id);
-                await_shared_url(
-                    || crate::hls_fetch::shared_url(&plan.id, plan.lifecycle),
-                    || {
-                        slot.load()
-                            .filter(|a| a.raw_pts0_ns.is_some() && a.generation > plan.anchor_floor)
-                            .map(|a| a.generation)
-                    },
-                    stop,
-                    SharedUrlWait::DEFAULT,
-                )
-            } else {
-                None
-            };
+        let shared = if plan.live
+            && is_hls
+            && !plan.audio_only
+            && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none()
+        {
+            let slot = crate::pipeline::live_anchor_slot(&plan.id);
+            await_shared_url(
+                || crate::hls_fetch::shared_url(&plan.id, plan.lifecycle),
+                || {
+                    slot.load()
+                        .filter(|a| a.raw_pts0_ns.is_some() && a.generation > plan.anchor_floor)
+                        .map(|a| a.generation)
+                },
+                stop,
+                SharedUrlWait::DEFAULT,
+            )
+        } else {
+            None
+        };
         let shared_fetch = shared.is_some();
         let pinned = if shared.is_some() {
             shared

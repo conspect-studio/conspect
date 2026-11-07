@@ -609,11 +609,11 @@ impl IptvService {
         self.note_guide_request(now_unix());
         let cold = {
             let feeds = self.feeds.lock().unwrap_or_else(PoisonError::into_inner);
-            publication
-                .feeds
-                .keys()
-                .take(MAX_FEEDS)
-                .any(|url| feeds.get(url).is_none_or(|c| c.status.last_attempt.is_none()))
+            publication.feeds.keys().take(MAX_FEEDS).any(|url| {
+                feeds
+                    .get(url)
+                    .is_none_or(|c| c.status.last_attempt.is_none())
+            })
         };
         if cold {
             let _ = tokio::time::timeout(wait, refreshed).await;
@@ -1298,12 +1298,18 @@ mod tests {
         let policy = Arc::new(DialPolicy::allow_lan());
         for pass in 0..5 {
             let now = NOW + pass * REFRESH_SECS * 2;
-            assert_eq!(service.refresh_if_wanted(&publication, &policy, now).await, 0);
+            assert_eq!(
+                service.refresh_if_wanted(&publication, &policy, now).await,
+                0
+            );
         }
         assert!(fake.calls.lock().unwrap().is_empty());
 
         service.note_guide_request(NOW);
-        assert_eq!(service.refresh_if_wanted(&publication, &policy, NOW).await, 1);
+        assert_eq!(
+            service.refresh_if_wanted(&publication, &policy, NOW).await,
+            1
+        );
         assert_eq!(fake.calls.lock().unwrap().len(), 1, "one shared feed");
     }
 
@@ -1317,9 +1323,17 @@ mod tests {
         service.note_guide_request(NOW);
         assert!(service.guide_wanted(&publication.config, NOW + 3_600));
         assert!(!service.guide_wanted(&publication.config, NOW + 3_601));
-        assert_eq!(service.refresh_if_wanted(&publication, &policy, NOW).await, 1);
+        assert_eq!(
+            service.refresh_if_wanted(&publication, &policy, NOW).await,
+            1
+        );
         let later = NOW + REFRESH_SECS + REFRESH_JITTER_SECS + 3_600;
-        assert_eq!(service.refresh_if_wanted(&publication, &policy, later).await, 0);
+        assert_eq!(
+            service
+                .refresh_if_wanted(&publication, &policy, later)
+                .await,
+            0
+        );
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
     }
 
@@ -1331,7 +1345,10 @@ mod tests {
         service
             .request_guide(&publication, Duration::from_millis(50))
             .await;
-        assert!(started.elapsed() < Duration::from_secs(2), "request blocked");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "request blocked"
+        );
         let snapshot = service.current_snapshot(&publication).unwrap();
         let text = String::from_utf8(snapshot.plain.to_vec()).unwrap();
         assert!(text.contains(r#"<channel id="s0">"#), "{text:.200}");
@@ -1353,10 +1370,15 @@ mod tests {
         service
             .request_guide(&publication, Duration::from_secs(30))
             .await;
-        assert!(started.elapsed() < Duration::from_secs(5), "warm cache waited");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "warm cache waited"
+        );
         let later = NOW + REFRESH_SECS + REFRESH_JITTER_SECS;
         service.note_guide_request(later);
-        service.refresh_if_wanted(&publication, &policy, later).await;
+        service
+            .refresh_if_wanted(&publication, &policy, later)
+            .await;
         assert_eq!(service.snapshot().unwrap().plain, good.plain);
     }
 

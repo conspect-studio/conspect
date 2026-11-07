@@ -82,9 +82,10 @@ pub fn catalogue_upsert(catalogue: &Catalogue, source: &Source) -> Arc<TileStore
     let mut store = None;
     catalogue.rcu(|current| {
         let mut next = current.as_ref().clone();
-        let kept = next
-            .get(&source.id)
-            .map_or_else(|| empty_store(&source.id), |entry| Arc::clone(entry.store()));
+        let kept = next.get(&source.id).map_or_else(
+            || empty_store(&source.id),
+            |entry| Arc::clone(entry.store()),
+        );
         store = Some(Arc::clone(&kept));
         next.insert(
             source.id.clone(),
@@ -180,7 +181,8 @@ pub trait RailSpawner: Send + Sync + 'static {
     ///
     /// # Errors
     /// An operator-safe reason.
-    fn start_audio(&self, source: &Source, audio_only: bool) -> Result<Vec<JoinHandle<()>>, String>;
+    fn start_audio(&self, source: &Source, audio_only: bool)
+        -> Result<Vec<JoinHandle<()>>, String>;
 
     /// Detach `source`'s audio from the program bus (its rail stopped).
     fn audio_stopped(&self, id: &str);
@@ -264,7 +266,8 @@ impl RailDriver<Nv12Image> for SourceRails {
         };
         let kind = &entry.source().kind;
         let audio = asked.audio && kind_has_audio(kind) && self.spawner.audio_available();
-        let video = (asked.video || (audio && kind_audio_rides_video(kind))) && kind_has_video(kind);
+        let video =
+            (asked.video || (audio && kind_audio_rides_video(kind))) && kind_has_video(kind);
         Rails {
             video,
             audio: audio && (video || !kind_audio_rides_video(kind)),

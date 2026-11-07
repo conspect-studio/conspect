@@ -82,9 +82,7 @@ pub use graphics::{
     DataKind, DataProviderKind, GraphicsBus, GraphicsChannel, GraphicsConfig, GraphicsDataSource,
     GraphicsItem, GraphicsStyle, TemplateSpec, Transition, TransitionKind,
 };
-pub use iptv::{
-    IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_IDLE_SECS, MAX_IPTV_ENTRIES,
-};
+pub use iptv::{IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_IDLE_SECS, MAX_IPTV_ENTRIES};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,

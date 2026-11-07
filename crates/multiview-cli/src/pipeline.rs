@@ -2278,7 +2278,10 @@ impl Pipeline {
         // consumer leases it: no probe, no plan, no thread, no connection.
         let boot_demand = crate::source_demand::startup_demand(
             config,
-            layout.cells.iter().filter_map(|cell| cell.source.as_deref()),
+            layout
+                .cells
+                .iter()
+                .filter_map(|cell| cell.source.as_deref()),
         );
         let wants = |id: &str| boot_demand.get(id).map_or(Rails::NONE, |d| d.rails);
 
@@ -2459,7 +2462,8 @@ impl Pipeline {
             // colour-bars companion), so it contributes a real audio store on the
             // bus rather than silence. Its pure tone store is pulled by the bake
             // consumer, without a producer thread. Other synthetic sources stay silent.
-            if let Some(_tone_plan) = tone_ingest_plan_for(source, cadence).filter(|_| rails.audio) {
+            if let Some(_tone_plan) = tone_ingest_plan_for(source, cadence).filter(|_| rails.audio)
+            {
                 audio_stores
                     .entry(source.id.clone())
                     .or_insert_with(crate::audio::new_tone_store);
@@ -2929,7 +2933,9 @@ impl Pipeline {
             .collect();
         // Media players and other boot-only stores ride along.
         for (id, store) in &self.stores {
-            stores.entry(id.clone()).or_insert_with(|| Arc::clone(store));
+            stores
+                .entry(id.clone())
+                .or_insert_with(|| Arc::clone(store));
         }
         stores
     }
@@ -2990,10 +2996,8 @@ impl Pipeline {
         let (layout, _) = self.demand_sets.clone()?;
         Some(crate::source_demand::DrainDemand {
             layout,
-            subtitles: manager.consumer_set(
-                multiview_engine::ConsumerClass::SubtitleRoute,
-                Rails::VIDEO,
-            ),
+            subtitles: manager
+                .consumer_set(multiview_engine::ConsumerClass::SubtitleRoute, Rails::VIDEO),
             manager,
             catalogue: Arc::clone(&self.catalogue),
         })
@@ -3766,10 +3770,7 @@ impl Pipeline {
         // The demand manager: built now if the binary did not build it, started
         // once the audio bus (if any) exists so audio rails have somewhere to go.
         let demand = self.demand();
-        let route_demand = self
-            .demand_sets
-            .as_ref()
-            .map(|(_, audio)| audio.clone());
+        let route_demand = self.demand_sets.as_ref().map(|(_, audio)| audio.clone());
         let audio_bus = self.encode_cfg.audio.as_ref().map(|cfg| {
             let mut bus = program_audio_bus(cfg, self.cadence);
             // Route every per-source store onto the program bus at unity gain. The
@@ -7192,7 +7193,10 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
             return false;
         };
         crate::source_rails::catalogue_upsert_with(catalogue, &spawn.source, &spawn.store);
-        manager.set_pins(&spawn.source.id, crate::source_demand::standing_pins(&spawn.source));
+        manager.set_pins(
+            &spawn.source.id,
+            crate::source_demand::standing_pins(&spawn.source),
+        );
         manager.restart(&spawn.source.id);
         true
     }
@@ -7479,7 +7483,11 @@ impl crate::source_rails::RailSpawner for DemandSpawner {
         Ok(vec![produced.handle])
     }
 
-    fn start_audio(&self, source: &Source, audio_only: bool) -> Result<Vec<JoinHandle<()>>, String> {
+    fn start_audio(
+        &self,
+        source: &Source,
+        audio_only: bool,
+    ) -> Result<Vec<JoinHandle<()>>, String> {
         let Some(route) = self.live.audio_route.load() else {
             return Err("this run carries no program audio".to_owned());
         };
@@ -7555,7 +7563,10 @@ impl DemandSpawner {
         let lifecycle = begin_live_lifecycle(&id);
         let stop = crate::source_rails::register(&self.registry, &id);
         let thread_store = Arc::clone(store);
-        let (width, height) = (self.live.layout.canvas.width, self.live.layout.canvas.height);
+        let (width, height) = (
+            self.live.layout.canvas.width,
+            self.live.layout.canvas.height,
+        );
         let canvas = self.live.canvas_color;
         let cadence = self.live.cadence;
         let thread_id = id.clone();
@@ -14367,14 +14378,17 @@ pub type LiveAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveAnch
 
 /// The audio stores each running audio rail publishes into, for the demand
 /// manager's progress check. Written when a rail starts or stops, read wait-free.
-fn audio_progress_slots(
-) -> &'static multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>>> {
+fn audio_progress_slots() -> &'static multiview_framestore::SwapCell<
+    Arc<std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>>,
+> {
     static SLOTS: std::sync::OnceLock<
         multiview_framestore::SwapCell<
             Arc<std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>>,
         >,
     > = std::sync::OnceLock::new();
-    SLOTS.get_or_init(|| multiview_framestore::SwapCell::from_pointee(std::collections::HashMap::new()))
+    SLOTS.get_or_init(|| {
+        multiview_framestore::SwapCell::from_pointee(std::collections::HashMap::new())
+    })
 }
 
 /// Record (or with `None` forget) the store `id`'s audio rail publishes into.
@@ -15041,9 +15055,9 @@ mod overlay_clock_tests {
 mod fault_detector_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use multiview_core::layout::Cell;
     use crate::overlays::TileFault;
     use multiview_audio::{AudioBlock, AudioFormat, ChannelLayout};
+    use multiview_core::layout::Cell;
 
     /// A 25/1 fps cadence (40 ms per tick), so the dwell windows below convert to
     /// a small, deterministic number of ticks.
