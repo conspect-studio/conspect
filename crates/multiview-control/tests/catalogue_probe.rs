@@ -166,6 +166,7 @@ fn req(url: String) -> ProbeRequest {
         user_agent: None,
         referrer: None,
         quality: None,
+        channel_country: None,
     }
 }
 

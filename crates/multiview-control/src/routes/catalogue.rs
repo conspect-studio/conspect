@@ -34,6 +34,21 @@ const OBJECT_ID: &str = "iptv-org";
 /// Offline bundles may be large; cap the request body.
 pub(crate) const IMPORT_BODY_LIMIT: usize = 192 * 1024 * 1024;
 
+/// The iptv-org country of a linked source's channel (ISO alpha-2), for the
+/// network report's geo-block hint. `None` when the source is not linked or the
+/// channel is not in the current snapshot.
+fn source_channel_country(state: &AppState, source: &multiview_config::Source) -> Option<String> {
+    let channel = source.origin.as_ref()?.channel.clone()?;
+    state
+        .catalogue
+        .as_ref()?
+        .snapshot()?
+        .rows
+        .iter()
+        .find(|r| r.ch.as_deref() == Some(channel.as_str()))
+        .and_then(|r| r.country.clone())
+}
+
 fn catalogue(state: &AppState) -> ControlResult<&std::sync::Arc<crate::catalogue::Catalogue>> {
     state.catalogue.as_ref().ok_or_else(|| {
         ControlError::Conflict("the IPTV-ORG catalogue is not configured on this node".to_owned())
@@ -424,6 +439,7 @@ pub(crate) async fn get_links(
                 user_agent: alt.user_agent.clone(),
                 referrer: alt.referrer.clone(),
                 quality: None,
+                channel_country: None,
             })?
             .verdict
     };
@@ -509,6 +525,7 @@ pub(crate) async fn post_probe(
                     user_agent: row.ua.clone(),
                     referrer: row.referrer.clone(),
                     quality: row.q.clone(),
+                    channel_country: row.country.clone(),
                 },
             });
         }
@@ -527,6 +544,7 @@ pub(crate) async fn post_probe(
             ControlError::Validation(format!("source {id:?} has no probeable URL"))
         })?;
         let (user_agent, referrer) = links::source_headers(&source);
+        let channel_country = source_channel_country(&state, &source);
         targets.push(JobTarget {
             k: None,
             source_id: Some(id.clone()),
@@ -535,6 +553,7 @@ pub(crate) async fn post_probe(
                 user_agent,
                 referrer,
                 quality: None,
+                channel_country,
             },
         });
     }
@@ -640,19 +659,7 @@ pub(crate) async fn post_source_network(
         .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
         .ok_or_else(|| ControlError::Validation("the source has no http(s) URL".to_owned()))?;
     let (user_agent, referrer) = links::source_headers(&source);
-    let channel = serde_json::to_value(&source)
-        .ok()
-        .and_then(|v| v.pointer("/origin/channel")?.as_str().map(str::to_owned));
-    let country = channel.and_then(|ch| {
-        state
-            .catalogue
-            .as_ref()?
-            .snapshot()?
-            .rows
-            .iter()
-            .find(|r| r.ch.as_deref() == Some(ch.as_str()))
-            .and_then(|r| r.country.clone())
-    });
+    let country = source_channel_country(&state, &source);
     // The same permit pool as the probes: the diagnostics obey the probe bounds.
     let _permit = svc.acquire_for_diagnostics(&principal.key_id).await?;
     let report = collector
@@ -662,6 +669,7 @@ pub(crate) async fn post_source_network(
                 user_agent,
                 referrer,
                 quality: None,
+                channel_country: None,
             },
             country,
         )

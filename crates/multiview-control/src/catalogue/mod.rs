@@ -193,6 +193,7 @@ pub fn probe_linked_round(state: &AppState) -> usize {
             user_agent,
             referrer,
             quality: None,
+            channel_country: None,
         };
         if svc.submit("system:catalogue-probe", req).is_err() {
             break;

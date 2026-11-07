@@ -118,6 +118,7 @@ fn req(url: String) -> ProbeRequest {
         user_agent: Some("UA/9".into()),
         referrer: Some("https://ref.example/p?secret=REFSECRET".into()),
         quality: None,
+        channel_country: None,
     }
 }
 

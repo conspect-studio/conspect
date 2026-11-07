@@ -175,6 +175,9 @@ pub struct ProbeRequest {
     pub referrer: Option<String>,
     /// Advertised quality (`720p`), used to pick the variant and judge degradation.
     pub quality: Option<String>,
+    /// The channel's country (ISO alpha-2), when known; feeds the network
+    /// report's geo-block hint. Not part of the cache key.
+    pub channel_country: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +728,8 @@ impl ProbeService {
             };
             if let Some(c) = &me.collector {
                 // Own 15 s budget inside the collector; still under this permit.
-                result.network = Some(c.collect(net_req, None).await);
+                let country = net_req.channel_country.clone();
+                result.network = Some(c.collect(net_req, country).await);
             }
             result.id.clone_from(&id);
             result.state = "done";
@@ -1171,7 +1175,39 @@ mod tests {
             user_agent: Some("UA".into()),
             referrer: None,
             quality: quality.map(str::to_owned),
+            channel_country: None,
         }
+    }
+
+    /// Records the country each network collection was asked about.
+    struct CountryCollector(std::sync::Mutex<Vec<Option<String>>>);
+    impl super::super::netdiag::NetworkCollector for CountryCollector {
+        fn collect(
+            &self,
+            _: ProbeRequest,
+            channel_country: Option<String>,
+        ) -> super::super::sync::BoxFuture<'_, super::super::netdiag::NetworkReport> {
+            self.0.lock().unwrap().push(channel_country);
+            Box::pin(async { super::super::netdiag::NetworkReport::default() })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_probe_network_report_is_told_the_channel_country() {
+        // Without the country the geo-block hint ("listed for DE, this server is
+        // in US") can never fire for a probe.
+        let seen = Arc::new(CountryCollector(std::sync::Mutex::new(Vec::new())));
+        let svc = ProbeService::with_network(Arc::new(Instant0), "h".into(), seen.clone());
+        let mut r = req(None);
+        r.channel_country = Some("DE".into());
+        svc.submit("p", r).unwrap();
+        for _ in 0..200 {
+            if !seen.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(*seen.0.lock().unwrap(), vec![Some("DE".to_owned())]);
     }
 
     #[tokio::test]
