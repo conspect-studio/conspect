@@ -311,8 +311,6 @@ struct Entry<T> {
     in_flight: bool,
     /// A stop-then-start was requested (the source was edited).
     restart: bool,
-    /// Consumers exist, but none of their rails can run on this source.
-    unstartable: bool,
     /// When the running rails last exceeded what is wanted.
     surplus_since: Option<Instant>,
     phase: DemandPhase,
@@ -332,7 +330,6 @@ impl<T> Entry<T> {
             running: Rails::NONE,
             in_flight: false,
             restart: false,
-            unstartable: false,
             surplus_since: None,
             phase: DemandPhase::Starting,
             detail: None,
@@ -749,7 +746,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 consumers: Vec::new(),
                 detail: None,
             },
-            |entry| report(id, entry),
+            |entry| report(self.inner.driver.as_ref(), id, entry),
         )
     }
 
@@ -760,7 +757,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         let mut out: Vec<DemandStatus> = book
             .entries
             .iter()
-            .map(|(id, entry)| report(id, entry))
+            .map(|(id, entry)| report(self.inner.driver.as_ref(), id, entry))
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
@@ -779,8 +776,9 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     }
 }
 
-fn report<T>(id: &str, entry: &Entry<T>) -> DemandStatus {
+fn report<T: 'static>(driver: &dyn RailDriver<T>, id: &str, entry: &Entry<T>) -> DemandStatus {
     let wanted = entry.wanted();
+    let unstartable = !wanted.is_empty() && driver.resolve(id, wanted).is_empty();
     let mut consumers: Vec<ConsumerTag> = entry
         .leases
         .values()
@@ -793,7 +791,7 @@ fn report<T>(id: &str, entry: &Entry<T>) -> DemandStatus {
         // A lingering source is still running, so it stays truthful about what
         // the host is paying for. Nothing running and nothing startable (an
         // audio consumer on a run with no bus) is idle, never a fault.
-        phase: if entry.running.is_empty() && entry.unstartable {
+        phase: if entry.running.is_empty() && unstartable {
             DemandPhase::Idle
         } else {
             entry.phase
@@ -920,7 +918,6 @@ impl<T: Send + Sync + 'static> Inner<T> {
             for (id, entry) in &mut book.entries {
                 let asked = entry.wanted();
                 let wanted = self.driver.resolve(id, asked);
-                entry.unstartable = !asked.is_empty() && wanted.is_empty();
                 if !entry.running.is_empty() && !entry.in_flight {
                     self.check_health(id, entry, now);
                     sooner(now + config.health_period);
