@@ -870,6 +870,54 @@ fn url_fetch_normalises_ipv4_notations_before_screening() {
     }
 }
 
+/// A `url_fetch` URL is stored in the parser's **canonical** form, not the
+/// operator's spelling: the fill carries exactly what the WHATWG parser
+/// interpreted, and that canonical form re-parses to itself, so
+/// serialize → deserialize is stable.
+#[test]
+fn url_fetch_stores_the_canonical_parsed_form() {
+    let cfg = doc_with_fill(&url_fill("https://Example.COM/a"));
+    cfg.validate().expect("a normal https URL validates");
+    assert_eq!(
+        cfg.media_fills[0].kind,
+        MediaFillKind::UrlFetch {
+            url: "https://example.com/a".to_owned()
+        },
+        "the stored URL must be the parser's canonical rendering"
+    );
+
+    // serialize → deserialize is stable: a reloaded document is identical to
+    // the one that was serialized (a canonical URL re-parses to itself).
+    for text in [
+        cfg.to_json().expect("serialize JSON"),
+        cfg.to_toml().expect("serialize TOML"),
+    ] {
+        let back = if text.trim_start().starts_with('{') {
+            MultiviewConfig::load_from_json(&text).expect("reparse JSON")
+        } else {
+            MultiviewConfig::load_from_toml(&text).expect("reparse TOML")
+        };
+        assert_eq!(back, cfg, "round trip changed the document");
+    }
+}
+
+/// The trailing-root-dot IPv4 notations are normalised by the parser to the
+/// `127.0.0.1` they denote, stored as that canonical literal, and then refused
+/// by the SSRF screen — the dot must not smuggle loopback past the guard.
+#[test]
+fn url_fetch_rejects_trailing_dot_ipv4_notations() {
+    for url in [
+        "https://127.0.0.1./",
+        "https://2130706433./",
+        "https://0x7f.1./",
+    ] {
+        let cfg = doc_with_fill(&url_fill(url));
+        let err = validation_error(&cfg);
+        assert!(err.contains("SSRF guard"), "{url}: {err}");
+        assert!(err.contains("127.0.0.1"), "{url}: {err}");
+    }
+}
+
 #[test]
 fn url_fetch_rejects_local_and_special_use_hosts() {
     for url in [
@@ -943,7 +991,7 @@ fn one_param(key: &str, value: serde_json::Value) -> serde_json::Value {
 }
 
 /// A fill whose view carries `params`.
-fn fill_with_params(params: serde_json::Value) -> MultiviewConfig {
+fn fill_with_params(params: &serde_json::Value) -> MultiviewConfig {
     doc_with_fill(&with_view(
         web_fill(),
         &serde_json::json!({ "width": 1920, "height": 1080, "params": params }),
@@ -1021,30 +1069,30 @@ fn param_maps_are_bounded_shaped_and_control_free() {
     for index in 0..33 {
         many.insert(format!("p{index}"), serde_json::json!(index));
     }
-    let err = validation_error(&fill_with_params(serde_json::Value::Object(many)));
+    let err = validation_error(&fill_with_params(&serde_json::Value::Object(many)));
     assert!(err.contains("exceeds the bound"), "{err}");
 
     // Keys are 1..=64 characters of [a-z0-9_].
     let long_key = "k".repeat(65);
     for key in ["", "Zoom", "has space", "dash-key", long_key.as_str()] {
-        let err = validation_error(&fill_with_params(one_param(key, serde_json::json!(1))));
+        let err = validation_error(&fill_with_params(&one_param(key, serde_json::json!(1))));
         assert!(err.contains("template parameter key"), "{key:?}: {err}");
     }
 
     // String values: at most 1024 characters, no control characters.
-    let err = validation_error(&fill_with_params(one_param(
+    let err = validation_error(&fill_with_params(&one_param(
         "note",
         serde_json::json!("x".repeat(1025)),
     )));
     assert!(err.contains("1024"), "{err}");
-    let err = validation_error(&fill_with_params(one_param(
+    let err = validation_error(&fill_with_params(&one_param(
         "note",
         serde_json::json!("a\u{7}b"),
     )));
     assert!(err.contains("control character"), "{err}");
 
     // Valid shapes: bool, integer, float, a bounded string and every key class.
-    fill_with_params(serde_json::json!({
+    fill_with_params(&serde_json::json!({
         "hide_ui": true, "zoom": 10, "lat": -33.946, "note_2": "x".repeat(1024)
     }))
     .validate()

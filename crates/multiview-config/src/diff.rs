@@ -11,9 +11,16 @@
 //! silently dropped. [`ConfigDiff::changed_sections`] is the per-section
 //! **reporting** surface, not a restart verdict: the apply layer decides
 //! live-follow vs restart per section — the management-plane sections
-//! (`graphics`, `weather`, `iptv`) and `media_fills` (a fill edit is job
-//! intent, ADR-0100 Decision 1) take effect without an engine restart, while
+//! (`graphics`, `weather`, `iptv`) take effect without an engine restart, while
 //! the remaining sections are restart-pending today.
+//!
+//! `media_fills` is kept **separate from `media`** (a fill edit is job intent,
+//! ADR-0100 Decision 1) so the control plane CAN apply a fill edit live once a
+//! fill store exists. Until that store lands (ADR-0100 delivery step 1, the
+//! job-runner slice) nothing follows a fill edit from the file:
+//! `multiview-control`'s file watcher puts every changed section except
+//! `overlays` into its restart set, so a fill edit is still reported as
+//! restart-pending.
 //!
 //! Pure and total: no I/O, no clocks, no allocation beyond the reported
 //! changes. Comparison is over the typed schema (`PartialEq`), so semantic
@@ -147,8 +154,10 @@ pub struct ConfigDiff {
     /// This is the per-section **reporting** surface, not a restart verdict:
     /// the apply layer classifies each name. In particular `media` holds only
     /// the restart-class media library / player set, while a fill edit is
-    /// reported separately as `media_fills` — live-applicable job intent
-    /// (ADR-0100 Decision 1) that never triggers a media restart.
+    /// reported separately as `media_fills` — job intent (ADR-0100 Decision 1)
+    /// that never joins the media restart class, and that the control plane CAN
+    /// apply live once the fill store lands. Until it does, a fill edit is
+    /// still counted restart-pending by the file watcher (see the module docs).
     pub changed_sections: BTreeSet<&'static str>,
 }
 
@@ -248,12 +257,15 @@ impl ConfigDiff {
         //
         // The declarative VT clip fills bound to those players (ADR-0100
         // Decision 1) are deliberately NOT in `media`: a fill edit is
-        // job-intent, not an engine-topology change — it must not be
-        // restart-class. It is surfaced as its own live-applicable
-        // `media_fills` section (the same shape the other management-plane
-        // sections below use): the change is reported so a file edit is never
-        // silently dropped, and the fill store / job runner follow the new
-        // definition without an engine restart.
+        // job-intent, not an engine-topology change, so it is kept separate so
+        // the control plane CAN apply it live without touching the media
+        // library/player restart class. It is surfaced as its own `media_fills`
+        // section (the same shape the other management-plane sections below
+        // use) so a file edit is never silently dropped. Until the fill store
+        // lands (ADR-0100 delivery step 1, the job-runner slice) no consumer
+        // follows the file, and `multiview-control`'s file watcher — which puts
+        // every changed section except `overlays` into its restart set — still
+        // reports a fill edit as restart-pending.
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
@@ -300,11 +312,12 @@ impl ConfigDiff {
             // as a changed section (controlled reset) rather than claiming hot-apply.
             ("system", running_system != next_system),
             ("media", media_changed),
-            // A fill edit is job intent (ADR-0100 Decision 1), NOT restart-class:
-            // it is reported as its own live-applicable section so the fill
-            // store / runner follow the file without an engine restart. Kept
-            // SEPARATE from `media` so a fill edit never reports (or triggers) a
-            // media restart, while a library/player edit still does.
+            // A fill edit is job intent (ADR-0100 Decision 1), never part of
+            // the media restart class: it is reported as its own `media_fills`
+            // section so the control plane CAN pick a fill edit up live once the
+            // fill store lands, while a library/player edit still reports
+            // `media`. Until the store lands the watcher still counts a fill
+            // edit restart-pending, because no consumer follows the file yet.
             ("media_fills", running_media_fills != next_media_fills),
             // Weather locations are management-plane data (the poller re-reads
             // them); no engine restart is needed, but the change is surfaced.
