@@ -40,6 +40,10 @@ libc = { version = "0.2", optional = true }
 name = "tile_scale_cost"
 required-features = ["ffmpeg"]
 
+# Emitted-line count + suppressor cost for an HLS reconnect log flood.
+[[example]]
+name = "log_flood"
+
 [features]
 "default" = []
 "ffmpeg" = ["dep:ffmpeg-next", "dep:libc"]
