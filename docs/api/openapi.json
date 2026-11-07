@@ -968,6 +968,422 @@
         }
       }
     },
+    "/api/v1/catalogues/iptv-org/import": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/import` — offline bundle import (administer).",
+        "operationId": "post_import",
+        "requestBody": {
+          "description": "A JSON object keyed by upstream file name (`streams`, `channels`, `feeds`, `logos`, `cities`, `countries`, `subdivisions`, `regions`, `blocklist`, `categories`, `languages`), optionally gzip'd. Replaces the named files; the rest stay as persisted.",
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`{outcome, changed[]}`.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "Requires administer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Bundle is malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/index": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/index` — the joined stream index.",
+        "operationId": "get_index",
+        "responses": {
+          "200": {
+            "description": "`{etag, synced_at, count, rows: IndexRow[]}`; gzip when accepted; `already_added` flagged per caller.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched (and the caller has no linked sources)."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No snapshot yet; refresh or import first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/links": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/links` — per-source link status (caller-scoped).",
+        "operationId": "get_links",
+        "responses": {
+          "200": {
+            "description": "`{links: LinkInfo[]}` — status, change diff and ranked alternatives, only for sources the caller may see.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Catalogue not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/logos/{k}": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/logos/{k}` — bounded server-side logo cache.",
+        "operationId": "get_logo",
+        "parameters": [
+          {
+            "name": "k",
+            "in": "path",
+            "description": "Logo key `l:<hex>` from an index row.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, fetched server-side.",
+            "content": {
+              "image/*": {}
+            }
+          },
+          "404": {
+            "description": "Unknown logo key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream logo unavailable or not an image.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/places": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/places` — the gazetteer with stream counts.",
+        "operationId": "get_places",
+        "responses": {
+          "200": {
+            "description": "`{etag, countries[], subdivisions[], cities[] (lat/lon), regions[]}` with stream counts.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No snapshot yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/probes": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/probes` — start a deep probe (operate).",
+        "operationId": "post_probe",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The probe job (`state: queued|running|done`; a 15-minute cache hit returns `done` + `cached: true`). Poll `GET probes/{id}`.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "Requires operate (write).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Neither/invalid `k`/`url`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-principal rate (60/min) or the global queue (64) is exhausted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No probe service on this node.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/probes/{id}": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/probes/{id}` — a probe job.",
+        "operationId": "get_probe",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Probe job id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The probe job and, when `done`, verdict, stages, facts, events.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/refresh": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/refresh` — sync now (administer).",
+        "operationId": "post_refresh",
+        "responses": {
+          "200": {
+            "description": "`{outcome: unchanged|updated, changed[]}`; a failed sync keeps the previous snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "Requires administer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Disabled / not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream sync failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/catalogues/iptv-org/status": {
+      "get": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`GET /api/v1/catalogues/iptv-org/status`.",
+        "operationId": "get_status",
+        "responses": {
+          "200": {
+            "description": "Sync state, counts, ETags, last error and the caller-scoped link-status tally.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Catalogue not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/commands/apply-layout": {
       "post": {
         "tags": [
@@ -15483,6 +15899,47 @@
           }
         }
       },
+      "ProbeBody": {
+        "type": "object",
+        "description": "Request body of `POST .../probes`.",
+        "properties": {
+          "k": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Index row key (`s:<hex>`) — the server resolves URL + headers + quality."
+          },
+          "quality": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Advertised quality (explicit-URL form only)."
+          },
+          "referrer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`Referer` to replay (explicit-URL form only)."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Or an explicit URL (e.g. a linked source); headers/quality optional."
+          },
+          "user_agent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`User-Agent` to replay (explicit-URL form only)."
+          }
+        }
+      },
       "ProbeBodyDoc": {
         "allOf": [
           {
@@ -18974,7 +19431,8 @@
         "description": "`OpenAPI` mirror of [`multiview_events::WarningCode`] (SA-0 catalog).\n\nSerde-equivalent: a unit enum rendered as its `kebab-case` variant name.",
         "enum": [
           "gpu-present-no-vulkan-adapter",
-          "container-no-host-networking"
+          "container-no-host-networking",
+          "catalogue-link-attention"
         ]
       },
       "WarningSeverityDoc": {
@@ -19320,6 +19778,10 @@
     {
       "name": "telemetry",
       "description": "Telemetry pipe (Conspect): the opt-in daily-pipe consent (off by default, last-writer-wins), the published schema (sent + never-sent), and the §4.2 diagnostics snapshot (logs + engine state, never media). DISTINCT from the licensing heartbeat (under /licensing) — the two pipes are never co-mingled. Consent gates no local route; control-plane only."
+    },
+    {
+      "name": "catalogue",
+      "description": "IPTV-ORG source browser (ADR-M015): synced catalogue index + place gazetteer, offline import, deep stream probe, and per-source link tracking. Control plane only; probes are bounded (4 concurrent, queue 64, 20 s, 16 MiB, 60/min/principal) and every dial is SSRF-screened."
     },
     {
       "name": "salvos",

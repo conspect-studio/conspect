@@ -174,6 +174,16 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ], optional = true }
 
+# IPTV-ORG source browser (ADR-M015): gzip for the cached index + persisted
+# snapshot. Pure-Rust `miniz_oxide` backend, MIT/Apache-2.0, always compiled (the
+# store/sync/index/routes are pure; only network I/O is behind `catalogue`).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Pure-Rust HLS/SCTE parsers reused by the deep probe (no native deps, no new
+# third-party crates; feature-free so it never links libav).
+multiview-input = { workspace = true }
+# Safe libav wrappers for the probe's media stage (only with `catalogue-ffmpeg`).
+multiview-ffmpeg = { workspace = true, optional = true }
+
 # The WHATWG URL parser — the SAME one reqwest resolves hosts through — so the
 # `zowietek` transport's SSRF screen (SEC-02, CWE-918) canonicalizes a device
 # URL's host to the exact `IpAddr` reqwest will dial (incl. alt-encoded IPv4
@@ -329,6 +339,16 @@ tokio-rustls = "0.26"
 # (`ReqwestTransport`) needs this feature, so the default build stays
 # pure-Rust/socket-free and CI-green.
 "zowietek" = ["dep:reqwest", "dep:url"]
+# Off-by-default IPTV-ORG source browser network I/O (ADR-M015, docs/io/iptv-org.md):
+# the catalogue sync HTTP client (fixed iptv-org host) and the deep probe's guarded
+# client + HLS/SCTE parsing. The model/join/index/store/link-tracker/routes are
+# pure Rust and ALWAYS compiled (so the OpenAPI document lists them in every build
+# and `xtask` needs no TLS stack); without this feature refresh/probe answer an
+# honest 503. Pure Rust (reqwest + rustls, no native lib).
+"catalogue" = ["dep:reqwest", "dep:url"]
+# The probe's stage-4 media check (demux + decode via the safe `multiview-ffmpeg`
+# wrappers). Without it the probe honestly reports stage 4 as `skipped`.
+"catalogue-ffmpeg" = ["catalogue", "dep:multiview-ffmpeg", "multiview-ffmpeg/ffmpeg"]
 # Off-by-default live CASTV2 wire layer for the `cast` managed-device driver
 # (DEV-D2, ADR-M011). The protocol payloads + media-URL rules + session actor
 # + registry wiring are ALWAYS compiled and tested socket-free over the
@@ -374,3 +394,8 @@ required-features = ["tls"]
 
 [lints]
 workspace = true
+
+[[test]]
+# Catalogue routes/sync run against a local fixture server over reqwest.
+name = "catalogue_routes"
+required-features = ["catalogue"]

@@ -233,6 +233,10 @@ pub mod decode_stream;
 #[cfg(feature = "ffmpeg")]
 pub mod demux;
 
+/// Bounded demux+decode sample probe for the IPTV-ORG deep probe.
+#[cfg(feature = "ffmpeg")]
+pub mod media_probe;
+
 #[cfg(feature = "ffmpeg")]
 pub mod encode;
 

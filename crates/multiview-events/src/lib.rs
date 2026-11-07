@@ -42,10 +42,11 @@ pub use envelope::{Envelope, FrameKind, SchemaVersion};
 pub use error::{Error, Result};
 pub use event::{
     AchievedSync, AddressFamily, AlarmTransition, Alert, AlertSeverity, AudioLoudness, AudioMeter,
-    AuthzScope, CastSessionRemoved, CastSessionStarted, ClockQuality, ClockSource, DeviceAdopted,
-    DeviceCapabilities, DeviceDiscovered, DeviceError, DeviceMode, DeviceRemoved, DeviceState,
-    DeviceStatus, DeviceStreamRole, DeviceStreamStatus, DeviceSync, DeviceSyncSummary, Event,
-    FailureStage, GpuMetrics, GpuVendor, GraphicsChannelEvent, HealthWarning, ImpactClass,
+    AuthzScope, CastSessionRemoved, CastSessionStarted, CatalogueLinkStatus, ClockQuality,
+    ClockSource, DeviceAdopted, DeviceCapabilities, DeviceDiscovered, DeviceError, DeviceMode,
+    DeviceRemoved, DeviceState, DeviceStatus, DeviceStreamRole, DeviceStreamStatus, DeviceSync,
+    DeviceSyncSummary, Event, FailureStage, GpuMetrics, GpuVendor, GraphicsChannelEvent,
+    HealthWarning, ImpactClass,
     InputConnection, InputStreams, JobProgress, LifecycleState, MediaPlayerEvent, MediaPlayerState,
     ModePhase, OutputRunState, OutputStatus, RistLinkRole, RistLinkStats, SalvoEvent, SalvoPhase,
     ShedLoad, ShedReason, ShedScope, SyncCapability, SyncChange, SyncGroupSkew, SystemMetrics,

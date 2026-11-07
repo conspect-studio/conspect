@@ -77,6 +77,11 @@ pub enum ControlError {
     #[error("desired-state commit status is indeterminate: {0}")]
     CommitIndeterminate(String),
 
+    /// A bounded control-plane queue or per-principal rate is exhausted (the deep
+    /// probe's queue/rate limit); the request is shed with `429`, never blocked.
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+
     /// A persistence/repository fault.
     #[error("repository error: {0}")]
     Repository(String),
@@ -127,6 +132,9 @@ impl ControlError {
             .with_detail(format!(
                 "{msg}; read the current resource and its ETag before a retry"
             )),
+            Self::TooManyRequests(msg) => {
+                Problem::new(429, "too-many-requests", "Too many requests").with_detail(msg)
+            }
             Self::Repository(msg) => {
                 Problem::new(500, "repository", "Internal repository error").with_detail(msg)
             }

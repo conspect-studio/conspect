@@ -586,6 +586,8 @@ pub enum WarningCodeDoc {
     GpuPresentNoVulkanAdapter,
     /// Multicast is configured inside a container without host networking.
     ContainerNoHostNetworking,
+    /// Sources linked to an IPTV-ORG catalogue entry need attention.
+    CatalogueLinkAttention,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).

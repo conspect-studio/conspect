@@ -337,6 +337,8 @@ where
     // The Boot/Loaded/Running model (ADR-W024): installed for a config-file
     // run so the boot-model/revert/promote routes are live; absent ⇒ those
     // routes honestly report `modeled: false`.
+    #[cfg(feature = "catalogue")]
+    let catalogue_boot_path = boot_model.as_ref().map(|m| m.boot_path().to_path_buf());
     if let Some(boot_model) = boot_model {
         state = state.with_boot_model(boot_model);
     }
@@ -363,6 +365,22 @@ where
     if let Some(whep_output) = whep_output {
         state = state.with_whep_output(whep_output);
     }
+
+    // IPTV-ORG source browser (ADR-M015): catalogue sync, link tracker and the
+    // bounded deep probe, all on the control plane (invariants #1/#10). Wired only
+    // when the `catalogue` feature is built; `[catalogues.iptv_org] enabled = false`
+    // keeps the routes (answering "disabled") but spawns no sync task.
+    #[cfg(feature = "catalogue")]
+    let state = multiview_control::catalogue::install(
+        state,
+        &config
+            .catalogues
+            .as_ref()
+            .and_then(|c| c.iptv_org.clone())
+            .unwrap_or_default(),
+        catalogue_boot_path.as_deref(),
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "this-server".to_owned()),
+    );
 
     // Install the real mDNS browser when the `discovery` feature is built, so
     // `POST /api/v1/discovery/devices/scan` browses the LAN for Cast / NDI /
