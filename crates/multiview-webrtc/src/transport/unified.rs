@@ -133,6 +133,23 @@ struct RunProbe {
     /// pure unused instrumentation state in a release build.
     #[cfg(test)]
     handoff_services: std::sync::atomic::AtomicU64,
+    /// Times a readable wake drained the socket to `WouldBlock` (or failed)
+    /// instead of exhausting its budget — a NATURAL yield point, after which
+    /// the next `readable()` can return `Pending`. `cfg(test)`-only (review
+    /// PR193-06): the flood test uses it to prove the socket stayed
+    /// continuously readable across each fairness interval it measures, so a
+    /// natural drain-to-empty cannot stand in for the production `yield_now`.
+    #[cfg(test)]
+    drained_dry: std::sync::atomic::AtomicU64,
+    /// Consecutive exhausted budgets since the last dry drain (reset to 0 by
+    /// one), and the longest such run seen. During a dry-free run the receive
+    /// arm never returns `Pending`, so the ONLY way another task on the
+    /// runtime can be scheduled inside it is the production `yield_now`
+    /// (review PR193-06). `cfg(test)`-only.
+    #[cfg(test)]
+    dry_free_run: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    max_dry_free_run: std::sync::atomic::AtomicU64,
 }
 
 /// The single-socket WebRTC endpoint: ONE bound dual-stack UDP socket and ONE
@@ -452,6 +469,11 @@ impl UnifiedEndpoint {
                         probe
                             .recv_budgets_exhausted
                             .fetch_add(1, Ordering::Relaxed);
+                        #[cfg(test)]
+                        {
+                            let run = probe.dry_free_run.fetch_add(1, Ordering::Relaxed) + 1;
+                            probe.max_dry_free_run.fetch_max(run, Ordering::Relaxed);
+                        }
                         tokio::task::yield_now().await;
                         Self::service_timers_and_gc(
                             &socket, &mut turn,
@@ -461,6 +483,11 @@ impl UnifiedEndpoint {
                             ServiceOrigin::ExhaustionHandoff,
                         ).await;
                     } else {
+                        #[cfg(test)]
+                        {
+                            probe.drained_dry.fetch_add(1, Ordering::Relaxed);
+                            probe.dry_free_run.store(0, Ordering::Relaxed);
+                        }
                         // The socket drained within budget: just pump outbound
                         // (the full tick servicing runs on the idle tick arm). No
                         // re-arm is needed — tokio cleared readiness.
@@ -895,22 +922,36 @@ mod tests {
         // stop the driver. Above 1 so the test exercises a *sustained*
         // saturating flood (many consecutive budget->handoff cycles).
         const TARGET_EXHAUSTIONS: u64 = 8;
-        // How many FURTHER exhaustions the fairness window below measures
-        // after saturation — the max observed "gap" (consecutive exhaustions
-        // with no observer-poll increment in between) must stay small across
-        // this many iterations for the result to be meaningful.
+        // The fairness window is bounded by COUNTS, not time (review
+        // PR193-06): it measures at least this many further exhaustions AND
+        // must contain one dry-free run of `REQUIRED_DRY_FREE_RUN` exhaustions
+        // (see below); `FAIRNESS_EXHAUSTION_CAP` ends a window that never
+        // finds one, which then fails the saturation precondition.
         const FAIRNESS_WINDOW_EXHAUSTIONS: u64 = 300;
-        // The largest tolerated gap between observer-poll increments,
-        // measured in exhaustions. With the production `yield_now` firing on
-        // every exhausted budget, the single-threaded runtime schedules the
-        // observer within a handful of exhaustions (empirically ~3 on this
-        // host); removing `yield_now` leaves the observer parked until the
-        // ~10ms idle-tick `Pending` happens to fall due, which — because the
-        // flood keeps re-arming the readable arm immediately — lets dozens of
-        // exhaustions run back-to-back first (empirically 50-85 on this
-        // host). A generous ceiling keeps this non-flaky while still failing
-        // hard on a removed `yield_now` (review PR193-03).
+        const FAIRNESS_EXHAUSTION_CAP: u64 = 50_000;
+        // Saturation proof (review PR193-06): within the measured window the
+        // socket must stay continuously readable for this many consecutive
+        // exhausted budgets — no drain reached `WouldBlock`, so the receive
+        // arm never returned `Pending`. Inside such a run the ONLY way the
+        // observer can be scheduled is the production `yield_now` (the driver
+        // runs `unconstrained`, so Tokio's coop budget cannot do it either);
+        // without it the observer's gap is at least this run's length, which
+        // is over three times `MAX_TOLERATED_GAP`. This turns the no-yield
+        // detection from a throughput assumption into a checked precondition.
+        const REQUIRED_DRY_FREE_RUN: u64 = 64;
+        // The largest tolerated number of exhaustions between two consecutive
+        // observer polls, as recorded by the observer itself. With the
+        // production `yield_now` on every exhausted budget the observer polls
+        // after every one or two (measured: 2); without it, the gap spans the
+        // whole dry-free run (measured: 52-84, and >= REQUIRED_DRY_FREE_RUN by
+        // construction).
         const MAX_TOLERATED_GAP: u64 = 20;
+        // Hang guard ONLY, never the pass/fail bound: every phase ends on a
+        // count. The flooder itself stops sending at this deadline (it runs on
+        // an OS thread, so this works even if a regression never lets the
+        // runtime poll its own timers); the socket then drains, the driver
+        // returns `Pending`, and the Tokio timeouts below can fire.
+        const SAFETY_TIMEOUT: Duration = Duration::from_secs(120);
 
         let cfg = crate::config::EndpointConfig {
             udp_port: 0,
@@ -960,7 +1001,8 @@ mod tests {
                 let target =
                     SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, bound.port(), 0, 0));
                 let junk = [0u8; 64];
-                while !flood_stop.load(Ordering::Relaxed) {
+                let deadline = Instant::now() + SAFETY_TIMEOUT;
+                while !flood_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
                     for _ in 0..1024 {
                         let _ = s.send_to(&junk, target);
                     }
@@ -1038,7 +1080,7 @@ mod tests {
         // precondition holds regardless of how little CPU a contended runner
         // gave the flooder. The outer timeout only bounds a wedged regression
         // that can never reach the target (it would otherwise spin forever).
-        let saturated = tokio::time::timeout(Duration::from_secs(60), async {
+        let saturated = tokio::time::timeout(SAFETY_TIMEOUT, async {
             loop {
                 if probe.recv_budgets_exhausted.load(Ordering::Relaxed) >= TARGET_EXHAUSTIONS {
                     return;
@@ -1050,7 +1092,7 @@ mod tests {
 
         // The ring must end (the Release command was serviced) within the same
         // bound, despite the permanent flood — the real-effect check (PR193-02).
-        let serviced = tokio::time::timeout(Duration::from_secs(30), async {
+        let serviced = tokio::time::timeout(SAFETY_TIMEOUT, async {
             loop {
                 if ring.is_ended() {
                     return true;
@@ -1060,23 +1102,33 @@ mod tests {
         })
         .await;
 
-        // Keep the flood saturating for `FAIRNESS_WINDOW_EXHAUSTIONS` further
-        // budgets while the observer measures; this loop only decides WHEN to
-        // stop, it computes nothing (the statistic lives in the observer).
+        // Keep the flood saturating while the observer measures, until the
+        // window holds `FAIRNESS_WINDOW_EXHAUSTIONS` further exhaustions AND a
+        // proven dry-free run of `REQUIRED_DRY_FREE_RUN` (or the count cap is
+        // hit). This loop only decides WHEN to stop, by counts; it computes
+        // nothing (the statistic lives in the observer). The window's dry-free
+        // record starts fresh here so only a run inside the window counts.
         let exh_start = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
-        let window = tokio::time::timeout(Duration::from_secs(60), async {
-            while probe.recv_budgets_exhausted.load(Ordering::Relaxed)
-                < exh_start + FAIRNESS_WINDOW_EXHAUSTIONS
-            {
+        probe.max_dry_free_run.store(0, Ordering::Relaxed);
+        let window = tokio::time::timeout(SAFETY_TIMEOUT, async {
+            loop {
+                let done = probe.recv_budgets_exhausted.load(Ordering::Relaxed) - exh_start;
+                let run = probe.max_dry_free_run.load(Ordering::Relaxed);
+                if (done >= FAIRNESS_WINDOW_EXHAUSTIONS && run >= REQUIRED_DRY_FREE_RUN)
+                    || done >= FAIRNESS_EXHAUSTION_CAP
+                {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await;
+        let window_run = probe.max_dry_free_run.load(Ordering::Relaxed);
 
         stop.store(true, Ordering::Release);
-        let stopped = tokio::time::timeout(Duration::from_secs(30), driver).await;
+        let stopped = tokio::time::timeout(SAFETY_TIMEOUT, driver).await;
         // Hang guard only: the observer returns once it sees the driver stop.
-        let (max_gap, observer_polls) = tokio::time::timeout(Duration::from_secs(30), observer)
+        let (max_gap, observer_polls) = tokio::time::timeout(SAFETY_TIMEOUT, observer)
             .await
             .expect("the observer finishes once the driver has stopped")
             .expect("the observer task completes");
@@ -1117,8 +1169,16 @@ mod tests {
         );
         assert!(
             window.is_ok(),
-            "the flood must keep driving further exhaustions within the bound \
-             while the observer measures them"
+            "hang guard: the fairness window did not reach its exhaustion \
+             counts within {SAFETY_TIMEOUT:?}"
+        );
+        assert!(
+            window_run >= REQUIRED_DRY_FREE_RUN,
+            "saturation precondition (review PR193-06): the measured window must \
+             contain {REQUIRED_DRY_FREE_RUN} consecutive exhausted budgets with \
+             no drain reaching WouldBlock, but the longest was {window_run} — \
+             the flood was not continuously readable, so a natural yield could \
+             mask a missing production `yield_now`"
         );
         assert!(
             observer_polls > 1,
