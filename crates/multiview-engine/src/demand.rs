@@ -331,6 +331,9 @@ pub const MAX_PENDING_RESTARTS: usize = 64;
 /// Upper bound on concurrent timed leases, so polling cannot pin unbounded
 /// sources.
 pub const MAX_TIMED_LEASES: usize = 64;
+/// How long [`DemandManager::stop_all`] waits for in-flight transitions before
+/// it leaves them to tear themselves down when they return.
+pub const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 /// Upper bound on remembered generations of retired source records.
 pub const MAX_RETIRED_GENERATIONS: usize = 4096;
 
@@ -646,6 +649,9 @@ struct Inner<T> {
     restarts: SwapCell<Arc<Vec<Arc<str>>>>,
     /// Transition threads spawned so far, for tests and diagnostics.
     transitions: AtomicU64,
+    /// Transition threads still running, drained (bounded) by
+    /// [`DemandManager::stop_all`].
+    pending: AtomicU64,
     /// Worker passes so far, for idle-wakeup measurement.
     passes: AtomicU64,
     /// Where [`TransitionEvent`]s go.
@@ -794,6 +800,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 sets: Mutex::new(Vec::new()),
                 restarts: SwapCell::from_pointee(Vec::new()),
                 transitions: AtomicU64::new(0),
+                pending: AtomicU64::new(0),
                 passes: AtomicU64::new(0),
                 sink: OnceLock::new(),
                 activity: SwapCell::from_pointee(HashMap::new()),
@@ -847,13 +854,22 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     /// Stop the worker, then every running rail's producers
     /// ([`RailDriver::teardown`]). For run teardown, off the output clock.
     /// Blocking, bounded by the driver's own grace periods.
+    ///
+    /// A transition still in flight is fenced (review DMD-08): it is waited
+    /// for up to [`SHUTDOWN_DRAIN`], and whenever it returns after the
+    /// worker stopped it tears down whatever it started itself.
     pub fn stop_all(&self) {
         self.shutdown();
+        let drain_until = Instant::now() + SHUTDOWN_DRAIN.min(self.inner.config.start_timeout);
+        while self.inner.pending.load(Ordering::Acquire) > 0 && Instant::now() < drain_until {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let running: Vec<(Arc<str>, Rails)> = {
             let book = lock(&self.inner.book);
             book.entries
                 .iter()
-                .filter(|(_, entry)| !entry.running.is_empty())
+                // An in-flight source is torn down by its own thread on return.
+                .filter(|(_, entry)| !entry.running.is_empty() && !entry.in_flight)
                 .map(|(id, entry)| (Arc::clone(id), entry.running))
                 .collect()
         };
@@ -1587,6 +1603,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
         } = launch;
         let id = &id;
         self.transitions.fetch_add(1, Ordering::Relaxed);
+        self.pending.fetch_add(1, Ordering::AcqRel);
         let inner = Arc::clone(self);
         let thread_id = Arc::clone(id);
         let spawned = std::thread::Builder::new()
@@ -1618,6 +1635,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                     })
                 });
                 inner.finish(&thread_id, from, to, baseline, outcome);
+                inner.pending.fetch_sub(1, Ordering::AcqRel);
             });
         if let Err(error) = spawned {
             tracing::warn!(source = %id, %error, "could not spawn a rail transition; retrying");
@@ -1626,6 +1644,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 reason: "could not start a worker thread".to_owned(),
             };
             self.finish(id, from, to, baseline, Err(failure));
+            self.pending.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -1647,10 +1666,21 @@ impl<T: Send + Sync + 'static> Inner<T> {
             .flatten();
         let mut surplus = None;
         let mut events = Notes::default();
+        let mut orphaned = Rails::NONE;
         {
             let mut book = lock(&self.book);
             let now = Instant::now();
-            if let Some(entry) = book.entries.get_mut(id) {
+            // The worker is gone: nothing would ever stop these rails, so this
+            // thread does (checked under the lock `stop_all` snapshots under).
+            if self.stopping.load(Ordering::Acquire) {
+                if let Some(entry) = book.entries.get_mut(id) {
+                    entry.in_flight = false;
+                    entry.open_deadline = None;
+                    entry.running = Rails::NONE;
+                    surplus = entry.handle.take();
+                }
+                orphaned = running;
+            } else if let Some(entry) = book.entries.get_mut(id) {
                 entry.in_flight = false;
                 entry.open_deadline = None;
                 let late = std::mem::take(&mut entry.timed_out);
@@ -1709,6 +1739,10 @@ impl<T: Send + Sync + 'static> Inner<T> {
             }
         }
         drop(surplus);
+        if !orphaned.is_empty() {
+            self.driver.teardown(id, orphaned);
+            return;
+        }
         self.emit(&events);
         self.wake();
     }
@@ -2681,6 +2715,31 @@ mod tests {
         );
         drop((healthy, healthy_again));
         manager.shutdown();
+    }
+
+    /// Review DMD-08: a start still in flight at teardown is fenced: when it
+    /// finally returns, what it started is torn down, not left running.
+    #[test]
+    fn stop_all_fences_a_start_that_completes_after_teardown() {
+        let fake = Arc::new(Fake::default());
+        lock(&fake.wedged).insert("slow".to_owned());
+        let manager = manager(&fake, 10);
+        let lease = manager.acquire("slow", Rails::VIDEO, tag("x"), None);
+        wait("opening", || {
+            manager.status("slow").starting == Some(StartingPhase::Opening)
+        });
+        let started = Instant::now();
+        manager.stop_all();
+        assert!(started.elapsed() < Duration::from_secs(6), "bounded");
+        lock(&fake.wedged).clear();
+        wait("the late start is stopped", || {
+            fake.video_starts.load(Ordering::SeqCst) == 1
+                && lock(&fake.running).get("slow") == Some(&Rails::NONE)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(lock(&fake.running).get("slow"), Some(&Rails::NONE));
+        assert_eq!(manager.status("slow").running, Rails::NONE);
+        drop(lease);
     }
 
     /// Lease churn on a ready source. `DEMAND_LEASE_CYCLES` sets the count so
