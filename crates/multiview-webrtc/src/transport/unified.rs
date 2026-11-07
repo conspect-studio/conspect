@@ -89,6 +89,20 @@ enum ServiceOrigin {
     /// The explicit bounded handoff run immediately after a receive budget
     /// was exhausted (invariant #10, round-2 BLOCKER).
     ExhaustionHandoff,
+    /// The outbound-only pump after a wake that drained the socket to
+    /// `WouldBlock` (not a full servicing pass; tags sends only).
+    DrainedDry,
+}
+
+/// Most STUN Binding Requests [`RunProbe::sent_checks`] retains, so the
+/// test-only send log stays bounded however long a run lasts.
+#[cfg(test)]
+const SENT_CHECK_LOG_CAP: usize = 256;
+
+/// Whether `payload` is a STUN Binding Request (type 0x0001 + magic cookie).
+#[cfg(test)]
+fn is_stun_binding_request(payload: &[u8]) -> bool {
+    payload.len() >= 20 && payload[..2] == [0x00, 0x01] && payload[4..8] == [0x21, 0x12, 0xA4, 0x42]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +164,29 @@ struct RunProbe {
     dry_free_run: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     max_dry_free_run: std::sync::atomic::AtomicU64,
+    /// Every STUN Binding Request the driver sent, recorded at the actual
+    /// send site with the servicing path that sent it, its destination and
+    /// its exact bytes (bounded by [`SENT_CHECK_LOG_CAP`]). The flood test
+    /// matches a datagram the peer received against this log, so the pump
+    /// effect is attributed at its source rather than inferred from a time
+    /// window (review PR193-07). `cfg(test)`-only.
+    #[cfg(test)]
+    sent_checks: std::sync::Mutex<Vec<(ServiceOrigin, SocketAddr, Vec<u8>)>>,
+}
+
+#[cfg(test)]
+impl RunProbe {
+    /// Record one sent datagram if it is a STUN Binding Request.
+    fn record_send(&self, origin: ServiceOrigin, dst: SocketAddr, payload: &[u8]) {
+        if !is_stun_binding_request(payload) {
+            return;
+        }
+        if let Ok(mut log) = self.sent_checks.lock() {
+            if log.len() < SENT_CHECK_LOG_CAP {
+                log.push((origin, dst, payload.to_vec()));
+            }
+        }
+    }
 }
 
 /// The single-socket WebRTC endpoint: ONE bound dual-stack UDP socket and ONE
@@ -502,6 +539,10 @@ impl UnifiedEndpoint {
                             &socket, &mut turn,
                             ingest.as_mut(), serve.as_mut(), preview.as_ref(), &mut push,
                             local_addr, now,
+                            #[cfg(test)]
+                            probe,
+                            #[cfg(test)]
+                            ServiceOrigin::DrainedDry,
                         ).await;
                     }
                 }
@@ -550,6 +591,10 @@ impl UnifiedEndpoint {
             push,
             local_addr,
             now,
+            #[cfg(test)]
+            probe,
+            #[cfg(test)]
+            origin,
         )
         .await;
         // GC dead sessions per lane.
@@ -745,6 +790,8 @@ impl UnifiedEndpoint {
         push: &mut [PushLane],
         local_addr: SocketAddr,
         now: Instant,
+        #[cfg(test)] probe: &RunProbe,
+        #[cfg(test)] origin: ServiceOrigin,
     ) {
         // Drive the shared TURN driver first so a fresh relay is published before
         // the roles gather candidates for the next negotiation.
@@ -763,7 +810,15 @@ impl UnifiedEndpoint {
         }
 
         if let Some(lane) = ingest {
-            WhipEndpoint::pump_outbound(socket, &mut lane.sessions, turn, now).await;
+            WhipEndpoint::pump_outbound(
+                socket,
+                &mut lane.sessions,
+                turn,
+                now,
+                #[cfg(test)]
+                &mut |dst, payload| probe.record_send(origin, dst, payload),
+            )
+            .await;
         }
         if let Some(lane) = serve {
             WhepServeEndpoint::pump_outbound(socket, &mut lane.viewers, turn, now).await;
@@ -916,9 +971,9 @@ mod tests {
     ///    path. Every command is queued only after saturation and a completed
     ///    handoff. Then: a mid-flood Register + the session's ICE timer must
     ///    put a STUN check on the wire to a peer (command drain + timer); a
-    ///    check must arrive while no drained-dry wake ran (the handoff's own
-    ///    outbound pump); a mid-flood Release must close the RTP ring (command
-    ///    drain); and the dead session must be closed in the session table,
+    ///    check the peer received must be one the handoff's own outbound pump
+    ///    sent, attributed at the send site (review PR193-07); a mid-flood
+    ///    Release must close the RTP ring (command drain); and the dead session must be closed in the session table,
     ///    which only reap/GC does.
     /// 3. **Independent fairness** (review PR193-03-R2): a separate task on the
     ///    same current-thread runtime records, at each of ITS polls, how many
@@ -1151,33 +1206,51 @@ mod tests {
 
         // TIMER + PUMP effect. Any STUN check at the peer proves the session
         // was registered (command drain) and its ICE timer fired (nothing else
-        // makes str0m queue a check: the junk flood is never accepted). A
-        // check that arrives while NO drained-dry wake ran proves the
-        // HANDOFF's pump sent it — the dry branch is the only other pump, and
-        // the idle tick no longer fires. "Clean" = the peer socket was empty
-        // at the previous sample and `drained_dry` has not moved since.
+        // makes str0m queue a check: the junk flood is never accepted). Which
+        // servicing path SENT a received check is attributed at the source
+        // (review PR193-07), not inferred from a time window: the driver logs
+        // every Binding Request at its actual send site, tagged with the
+        // servicing origin, destination and exact bytes. Each check the peer
+        // receives is matched, in send order, to its own log entry; it counts
+        // as the handoff's pump effect only if that entry is tagged
+        // `ExhaustionHandoff` and addressed to the peer. Each queued datagram
+        // is popped and sent exactly once, by exactly one path, so a match
+        // has no other servicing path in between, and an unrelated dry drain
+        // elsewhere can no longer discard it.
         let mut stun_seen = 0u64;
-        let mut armed_dry: Option<u64> = None;
-        let mut clean_stun = false;
+        let mut handoff_stun = 0u64;
+        let mut other_stun = 0u64;
+        // Received checks not yet matched (the send log is read after the
+        // peer, so a check may briefly lead its own entry).
+        let mut unmatched: Vec<Vec<u8>> = Vec::new();
+        let mut consumed = vec![false; SENT_CHECK_LOG_CAP];
         let mut datagram = [0u8; 1500];
         let pumped = within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
-            let dry_now = probe.drained_dry.load(Ordering::Relaxed);
-            let clean_window = armed_dry == Some(dry_now);
             while let Ok((len, _)) = peer.recv_from(&mut datagram) {
-                // STUN Binding Request: type 0x0001 + magic cookie.
-                let is_check = len >= 8
-                    && datagram[..2] == [0x00, 0x01]
-                    && datagram[4..8] == [0x21, 0x12, 0xA4, 0x42];
-                if is_check {
+                if is_stun_binding_request(&datagram[..len]) {
                     stun_seen += 1;
-                    clean_stun |= clean_window;
+                    unmatched.push(datagram[..len].to_vec());
                 }
             }
-            if clean_stun {
-                return true;
-            }
-            armed_dry = Some(dry_now);
-            false
+            let log = probe.sent_checks.lock().expect("send log lock");
+            unmatched.retain(|bytes| {
+                let entry = log.iter().enumerate().find(|(i, (_, dst, sent))| {
+                    !consumed[*i] && *dst == peer_addr && sent == bytes
+                });
+                match entry {
+                    Some((i, (origin, _, _))) => {
+                        consumed[i] = true;
+                        if *origin == ServiceOrigin::ExhaustionHandoff {
+                            handoff_stun += 1;
+                        } else {
+                            other_stun += 1;
+                        }
+                        false
+                    }
+                    None => true,
+                }
+            });
+            handoff_stun > 0
         })
         .await;
         assert!(
@@ -1188,10 +1261,12 @@ mod tests {
         );
         assert!(
             pumped,
-            "{stun_seen} STUN checks arrived but none while only the exhaustion \
-             handoff could have pumped them, within {SERVICE_EXHAUSTION_CAP} \
-             exhausted budgets (handoff outbound pump starved or deleted, \
-             PR193-02-R2)"
+            "{stun_seen} STUN checks reached the peer but none was sent by the \
+             exhaustion handoff's own outbound pump ({other_stun} attributed to \
+             another servicing path, {} unattributed) within \
+             {SERVICE_EXHAUSTION_CAP} exhausted budgets (handoff outbound pump \
+             starved or deleted, PR193-02-R2 / PR193-07)",
+            unmatched.len()
         );
 
         // COMMAND-DRAIN effect: a mid-flood Release closes the ring only when
