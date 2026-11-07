@@ -1528,33 +1528,7 @@ impl Source {
                 target,
                 on_target,
                 ..
-            } => {
-                // The target's `at` must parse and any IANA `timezone` must be a
-                // known id (typed error, never a panic — ADR-0047 §5.2).
-                target.validate().map_err(|e| {
-                    ConfigError::Validation(format!("source {:?}: {e}", self.id))
-                })?;
-                // `recur` is only meaningful for a recurring time-of-day target;
-                // reject it on a `date_time` or a non-recurring time-of-day so the
-                // configuration is unambiguous (it would otherwise silently
-                // degrade to `hold`).
-                if matches!(on_target, crate::timer::TimerOnTarget::Recur) {
-                    let recurs = matches!(
-                        target,
-                        crate::timer::TimerTarget::TimeOfDay {
-                            recur_daily: true,
-                            ..
-                        }
-                    );
-                    if !recurs {
-                        return Err(ConfigError::Validation(format!(
-                            "source {:?}: on_target = \"recur\" requires a time_of_day target \
-                             with recur_daily = true",
-                            self.id
-                        )));
-                    }
-                }
-            }
+            } => validate_timer_source(&self.id, target, *on_target)?,
             // RIST (ADR-0095): the typed options validate structurally here — a
             // non-empty bonding list is rejected on the Tier-0 build (FFmpeg's
             // protocol is single-peer; honest capability reporting, never a
@@ -1968,6 +1942,36 @@ fn validate_display_output(
                  exact rational (e.g. \"60000/1001\"), got {refresh:?}"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Timer-source structural checks (ADR-0047 §5.2): the target must parse and
+/// `recur` is only valid on a recurring time-of-day target.
+fn validate_timer_source(
+    id: &str,
+    target: &crate::timer::TimerTarget,
+    on_target: crate::timer::TimerOnTarget,
+) -> Result<(), ConfigError> {
+    target
+        .validate()
+        .map_err(|e| ConfigError::Validation(format!("source {id:?}: {e}")))?;
+    // `recur` is only meaningful for a recurring time-of-day target; reject it
+    // on a `date_time` or a non-recurring time-of-day so the configuration is
+    // unambiguous (it would otherwise silently degrade to `hold`).
+    if matches!(on_target, crate::timer::TimerOnTarget::Recur)
+        && !matches!(
+            target,
+            crate::timer::TimerTarget::TimeOfDay {
+                recur_daily: true,
+                ..
+            }
+        )
+    {
+        return Err(ConfigError::Validation(format!(
+            "source {id:?}: on_target = \"recur\" requires a time_of_day target \
+             with recur_daily = true"
+        )));
     }
     Ok(())
 }
