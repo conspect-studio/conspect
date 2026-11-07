@@ -13,9 +13,12 @@
 //!   tokio runtime handle. Never on the output clock or a data-plane thread.
 //! - A start that misses its deadline is cancelled (its future dropped) and
 //!   the source reads `failed`.
-//! - On a successful start the owner's [`ResourceScope`] is registered in the
-//!   [`ScopeRegistry`] under `{source_id, generation, kind}`. It is removed
-//!   only after the owner confirms the stop. A stop that does not confirm
+//! - A [`ScopeKind::Pending`] scope is registered under `{source_id,
+//!   generation}` *before* the owner's start runs, and becomes the owner's
+//!   kind on success. It is removed only after the owner confirms the stop (or
+//!   reports a clean start failure). A start that times out is stopped; if
+//!   that stop and its kill fail, the scope stays, the rails read as still
+//!   running and failed, and no new start runs until teardown is confirmed. A stop that does not confirm
 //!   within its bound goes to [`SourceOwner::kill`]; if that fails too the
 //!   scope stays registered and the source reads `failed`.
 //! - The generation fences late work: [`ScopeRegistry::is_current`] is false
@@ -44,6 +47,9 @@ pub enum ScopeKind {
     Cgroup,
     /// Threads inside this process.
     Threads,
+    /// A start is in progress (or timed out without confirmed teardown): what
+    /// it allocated is not known yet, so it is accounted before it can exist.
+    Pending,
 }
 
 /// One registered resource scope.
@@ -271,6 +277,13 @@ impl<O: SourceOwner, T: Send + Sync + 'static> RailDriver<T> for OwnerRails<O, T
                 reason: "source is not configured".to_owned(),
             });
         }
+        // Account for the attempt before it can allocate anything.
+        self.scopes.register(ResourceScope {
+            source_id: id.to_owned(),
+            generation,
+            kind: ScopeKind::Pending,
+        });
+        lock(&self.started).insert(id.to_owned(), generation);
         let budget = deadline.saturating_duration_since(Instant::now());
         let started = self.runtime.block_on(async {
             tokio::time::timeout(budget, self.owner.start(id, generation, deadline)).await
@@ -285,18 +298,30 @@ impl<O: SourceOwner, T: Send + Sync + 'static> RailDriver<T> for OwnerRails<O, T
                 lock(&self.started).insert(id.to_owned(), generation);
                 Ok(to)
             }
-            Ok(Err(reason)) => Err(RailFailure {
-                running: Rails::NONE,
-                reason,
-            }),
-            Err(_) => {
-                // The start future was dropped at the deadline. Make sure the
-                // owner has nothing left over before reporting.
-                let _ = self.stop_owner(id, generation);
+            Ok(Err(reason)) => {
+                // The owner reported a clean failure: nothing was left over.
+                self.scopes.remove(id, generation);
+                lock(&self.started).remove(id);
                 Err(RailFailure {
                     running: Rails::NONE,
-                    reason: "start timeout".to_owned(),
+                    reason,
                 })
+            }
+            Err(_) => {
+                // The start future was dropped at the deadline. Make sure the
+                // owner has nothing left over before reporting; if that is not
+                // confirmed, the attempt's scope stays and its rails count as
+                // running, so the manager stops it again before any new start.
+                match self.stop_owner(id, generation) {
+                    Ok(()) => Err(RailFailure {
+                        running: Rails::NONE,
+                        reason: "start timeout".to_owned(),
+                    }),
+                    Err(cleanup) => Err(RailFailure {
+                        running: to,
+                        reason: format!("start timeout; teardown not confirmed: {cleanup}"),
+                    }),
+                }
             }
         }
     }
@@ -315,6 +340,10 @@ impl<O: SourceOwner, T: Send + Sync + 'static> RailDriver<T> for OwnerRails<O, T
 
     fn bounds(&self, _id: &str) -> KindBounds {
         self.owner.bounds()
+    }
+
+    fn unconfirmed(&self, id: &str) -> bool {
+        self.scopes.get(id).is_some()
     }
 }
 
@@ -451,6 +480,13 @@ mod tests {
         }
     }
 
+    /// The owner confirmed its start (the scope is no longer pending).
+    fn started(scopes: &ScopeRegistry) -> bool {
+        scopes
+            .get("web")
+            .is_some_and(|scope| scope.kind != ScopeKind::Pending)
+    }
+
     fn viewer() -> ConsumerTag {
         ConsumerTag::new(ConsumerClass::Preview, "viewer")
     }
@@ -459,7 +495,7 @@ mod tests {
     fn a_lease_starts_the_owner_registers_its_scope_and_close_after_stops_it() {
         let h = harness();
         let lease = h.manager.acquire("web", Rails::VIDEO, viewer(), None);
-        wait("started", || h.scopes.get("web").is_some());
+        wait("started", || started(&h.scopes));
         let scope = h.scopes.get("web").unwrap();
         assert_eq!(scope.kind, ScopeKind::ProcessTree);
         assert_eq!(scope.generation, 1);
@@ -484,13 +520,13 @@ mod tests {
     fn a_callback_from_before_an_idle_cycle_is_not_current() {
         let h = harness();
         let lease = h.manager.acquire("web", Rails::VIDEO, viewer(), None);
-        wait("started", || h.scopes.get("web").is_some());
+        wait("started", || started(&h.scopes));
         drop(lease);
         wait("idle", || {
             h.manager.active_len() == 0 && h.scopes.is_empty()
         });
         let lease = h.manager.acquire("web", Rails::VIDEO, viewer(), None);
-        wait("restarted", || h.scopes.get("web").is_some());
+        wait("restarted", || started(&h.scopes));
         assert_eq!(h.scopes.get("web").unwrap().generation, 2);
         assert!(
             !h.scopes.is_current("web", 1),
@@ -525,11 +561,51 @@ mod tests {
         h.manager.shutdown();
     }
 
+    /// Review DMD-06: a start that times out and whose stop and kill both fail
+    /// keeps its scope, reads failed, and no further start runs on top of the
+    /// leaked resources until teardown is confirmed.
+    #[test]
+    fn a_timed_out_start_with_failed_cleanup_keeps_its_scope_and_blocks_retries() {
+        let h = harness();
+        h.owner.hang_start.store(true, Ordering::SeqCst);
+        h.owner.hang_stop.store(true, Ordering::SeqCst);
+        h.owner.kill_fails.store(true, Ordering::SeqCst);
+        h.manager.start_source("web");
+        wait("timed out and kill tried", || {
+            h.owner.kills.load(Ordering::SeqCst) >= 1
+                && h.manager.status("web").phase == DemandPhase::Failed
+        });
+        let scope = h
+            .scopes
+            .get("web")
+            .expect("the attempted scope stays registered");
+        assert_eq!(scope.generation, 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            h.owner.starts.load(Ordering::SeqCst),
+            1,
+            "no start piles onto unconfirmed resources"
+        );
+        assert_eq!(h.manager.status("web").phase, DemandPhase::Failed);
+        // Teardown recovers: the scope goes, and only then a new start runs.
+        h.owner.hang_start.store(false, Ordering::SeqCst);
+        h.owner.hang_stop.store(false, Ordering::SeqCst);
+        h.owner.kill_fails.store(false, Ordering::SeqCst);
+        wait("teardown confirmed", || h.scopes.is_empty());
+        // The kind's retry cap may have been reached meanwhile: Start retries.
+        h.manager.start_source("web");
+        wait("restarted after confirmed teardown", || {
+            h.owner.starts.load(Ordering::SeqCst) == 2
+                && h.scopes.get("web").is_some_and(|s| s.generation > 1)
+        });
+        h.manager.shutdown();
+    }
+
     #[test]
     fn a_wedged_stop_goes_to_kill_and_a_failed_kill_keeps_the_scope_and_reads_failed() {
         let h = harness();
         let lease = h.manager.acquire("web", Rails::VIDEO, viewer(), None);
-        wait("started", || h.scopes.get("web").is_some());
+        wait("started", || started(&h.scopes));
         h.owner.hang_stop.store(true, Ordering::SeqCst);
         h.owner.kill_fails.store(true, Ordering::SeqCst);
         drop(lease);

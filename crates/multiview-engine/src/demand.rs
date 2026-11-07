@@ -429,6 +429,15 @@ pub trait RailDriver<T>: Send + Sync + 'static {
         false
     }
 
+    /// After a failed start: whether rails it reported running hold resources
+    /// whose teardown is not confirmed, so they must be stopped before any new
+    /// start (review DMD-06). Called off the manager's lock. The default is
+    /// `false`: a failed native start's rails stay usable.
+    fn unconfirmed(&self, id: &str) -> bool {
+        let _ = id;
+        false
+    }
+
     /// Lifecycle bounds for `id`'s kind. Runs under the manager's lock: must be
     /// a wait-free read. The default defers to the manager's config.
     fn bounds(&self, id: &str) -> KindBounds {
@@ -1664,6 +1673,10 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let handle = started_video
             .then(|| self.registry_handle(id, None))
             .flatten();
+        let unconfirmed = outcome.is_err()
+            && !from.covers(to)
+            && !running.is_empty()
+            && self.driver.unconfirmed(id);
         let mut surplus = None;
         let mut events = Notes::default();
         let mut orphaned = Rails::NONE;
@@ -1689,7 +1702,11 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 }
                 if to.is_empty() {
                     entry.restart = false;
+                }
+                if running.is_empty() {
                     entry.stale = false;
+                } else if unconfirmed {
+                    entry.stale = true;
                 }
                 entry.running = running;
                 if !running.video {
