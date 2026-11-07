@@ -357,6 +357,7 @@ fn event_dto(
         lifecycle: projection.lifecycle,
         label: OverlayLabel::Uncertain,
         timer: None,
+        descriptor: event.descriptor().cloned(),
     };
     let mut row = dto(overlay.as_ref().unwrap_or(&fallback));
     if overlay.is_none() {
@@ -416,6 +417,9 @@ fn dto(overlay: &EventOverlay) -> SourceEventDto {
         }),
         asset_id: None,
         correlation_id: None,
+        marker_name: overlay.descriptor.as_ref().map(|d| d.name.clone()),
+        marker_type_id: overlay.descriptor.as_ref().and_then(|d| d.type_id.clone()),
+        marker_detail: overlay.descriptor.as_ref().and_then(|d| d.detail.clone()),
     }
 }
 
@@ -511,6 +515,10 @@ impl NativeEvents {
             return;
         };
         while self.id3_published < self.id3.len() {
+            let descriptor = self
+                .id3
+                .get(self.id3_published)
+                .and_then(multiview_input::id3::marker_descriptor);
             let observation = SourceEventObservation {
                 key: SourceEventKey {
                     source_id: self.source.clone(),
@@ -522,6 +530,7 @@ impl NativeEvents {
                 boundary: EventBoundary::MarkerObserved,
                 asset_id: None,
                 correlation_id: None,
+                descriptor,
             };
             let _ = producer.try_observe(observation);
             self.id3_published += 1;
@@ -560,6 +569,21 @@ impl NativeEvents {
         while self.untimed_scte_published < self.untimed_scte.len() {
             // Section occurrence namespace is independent of trusted insert/seg IDs.
             // One evidence row per validated section, never an invented break instance.
+            let descriptor = self
+                .untimed_scte
+                .get(self.untimed_scte_published)
+                .and_then(|cues| cues.first())
+                .and_then(|cue| {
+                    cue.segmentation.as_ref().and_then(|d| {
+                        let type_id = d.segmentation_type_id?;
+                        let name = multiview_input::scte::segmentation_type_name(type_id)?;
+                        Some(multiview_core::source_event::MarkerDescriptor {
+                            name: name.to_owned(),
+                            type_id: Some(format!("0x{type_id:02X}")),
+                            detail: None,
+                        })
+                    })
+                });
             let observation = SourceEventObservation {
                 key: SourceEventKey {
                     source_id: self.source.clone(),
@@ -571,6 +595,7 @@ impl NativeEvents {
                 boundary: EventBoundary::MarkerObserved,
                 asset_id: None,
                 correlation_id: None,
+                descriptor,
             };
             let _ = producer.try_observe(observation);
             self.untimed_scte_published += 1;
@@ -933,6 +958,7 @@ mod tests {
                 boundary,
                 asset_id: Some("asset".into()),
                 correlation_id: Some("correlation".into()),
+                descriptor: None,
             });
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1008,6 +1034,7 @@ mod tests {
                 },
                 asset_id: None,
                 correlation_id: None,
+                descriptor: None,
             });
         }
         let clock = PresentationClock::Fresh {

@@ -17373,6 +17373,7 @@ mod live_overlay_bake_tests {
             },
             asset_id: None,
             correlation_id: None,
+            descriptor: None,
         });
         let reader = runtime.reader();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

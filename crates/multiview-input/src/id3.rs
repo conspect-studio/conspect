@@ -158,6 +158,69 @@ pub fn parse(bytes: &[u8]) -> Result<Id3Tag, Id3Error> {
     Ok(Id3Tag { version, frames })
 }
 
+/// Build the bounded marker identity text for a tag, off-clock at ingest
+/// time. Picks the first frame; a tag normally carries exactly one. The
+/// Apple transport-timestamp `PRIV` owner is a recognised clock marker
+/// ("Timestamp (ID3)"); every other frame is named by its raw frame id and,
+/// when printable, the owner (`PRIV`) or description (`TXXX`) text — never
+/// claiming more semantic meaning than the frame actually carries.
+#[must_use]
+pub fn marker_descriptor(tag: &Id3Tag) -> Option<multiview_core::source_event::MarkerDescriptor> {
+    use multiview_core::source_event::MarkerDescriptor;
+    let frame = tag.frames.first()?;
+    let frame_id = std::str::from_utf8(&frame.id).ok()?;
+    if frame_id == "PRIV" && frame.transport_timestamp_90khz.is_some() {
+        return Some(MarkerDescriptor {
+            name: "Timestamp (ID3)".to_owned(),
+            type_id: Some("PRIV".to_owned()),
+            detail: owner_text(&frame.payload),
+        });
+    }
+    let detail = match frame_id {
+        "PRIV" => owner_text(&frame.payload),
+        "TXXX" => description_text(&frame.payload),
+        _ => None,
+    };
+    let mut name = format!("ID3 {frame_id}");
+    name.truncate(48);
+    Some(MarkerDescriptor {
+        name,
+        type_id: Some(frame_id.to_owned()),
+        detail,
+    })
+}
+
+/// Null-terminated owner string ahead of a `PRIV` frame's binary payload,
+/// when printable ASCII; bounded to 48 bytes.
+fn owner_text(payload: &[u8]) -> Option<String> {
+    let end = payload.iter().position(|&b| b == 0)?;
+    let bytes = payload.get(..end)?;
+    if bytes.is_empty() || !bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return None;
+    }
+    let mut text = String::from_utf8(bytes.to_vec()).ok()?;
+    text.truncate(48);
+    Some(text)
+}
+
+/// `TXXX` description: one encoding byte, then a (possibly multi-byte)
+/// null-terminated description. Only the common Latin-1/UTF-8 encoding is
+/// decoded as text; other encodings return [`None`] rather than mis-decode.
+fn description_text(payload: &[u8]) -> Option<String> {
+    let (&encoding, rest) = payload.split_first()?;
+    if encoding != 0 && encoding != 3 {
+        return None;
+    }
+    let end = rest.iter().position(|&b| b == 0)?;
+    let bytes = rest.get(..end)?;
+    if bytes.is_empty() || !bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return None;
+    }
+    let mut text = String::from_utf8(bytes.to_vec()).ok()?;
+    text.truncate(48);
+    Some(text)
+}
+
 fn private_timestamp(payload: &[u8]) -> Result<Option<u64>, Id3Error> {
     let owner_end = payload
         .iter()

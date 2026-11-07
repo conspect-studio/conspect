@@ -145,6 +145,12 @@ pub struct SegmentationDescriptor {
     pub duration_90k: Option<u64>,
     /// Absent on cancellation.
     pub upid: Option<SegmentationUpid>,
+    /// 1-based ordinal of this segment within a multi-part sequence (e.g. a
+    /// chapter), absent on cancellation.
+    pub segment_num: Option<u8>,
+    /// Total expected segments in the sequence `segment_num` belongs to,
+    /// absent on cancellation.
+    pub segments_expected: Option<u8>,
 }
 
 /// Rich projection retaining segmentation identity alongside the legacy cue.
@@ -667,6 +673,8 @@ fn parse_segmentation(bytes: &[u8]) -> Result<SegmentationDescriptor, ScteError>
         segmentation_type_id: None,
         duration_90k: None,
         upid: None,
+        segment_num: None,
+        segments_expected: None,
     };
     if !cancel {
         let program = reader.flag()?;
@@ -692,7 +700,8 @@ fn parse_segmentation(bytes: &[u8]) -> Result<SegmentationDescriptor, ScteError>
         descriptor.upid = Some(SegmentationUpid { upid_type, value });
         let kind = read_byte(&mut reader)?;
         descriptor.segmentation_type_id = Some(kind);
-        reader.skip(16)?; // segment_num + segments_expected
+        descriptor.segment_num = Some(read_byte(&mut reader)?);
+        descriptor.segments_expected = Some(read_byte(&mut reader)?);
         if matches!(kind, 0x34 | 0x36 | 0x38 | 0x3a) {
             reader.skip(16)?; // sub_segment_num + sub_segments_expected
         }

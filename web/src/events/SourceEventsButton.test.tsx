@@ -149,6 +149,19 @@ describe('read-only source events', () => {
     await open('observing');
     expect(await screen.findByText(/a badge\/countdown overlay will appear automatically/)).toBeInTheDocument();
   });
+
+  it('shows the server-computed marker name/type/detail, falling back to the event id', async () => {
+    server.use(http.get(endpoint, () => HttpResponse.json(snapshot([
+      row({ event_id: 'named', marker_name: 'Break Start', marker_type_id: '0x22', marker_detail: '2/4' }),
+      row({ event_id: 'unnamed-cue' }),
+    ]))));
+    await open();
+    expect(await screen.findByText('Break Start')).toBeInTheDocument();
+    expect(screen.getByText(/0x22/)).toBeInTheDocument();
+    expect(screen.getByText(/2\/4/)).toBeInTheDocument();
+    expect(screen.queryByText('named')).not.toBeInTheDocument();
+    expect(screen.getByText('unnamed-cue')).toBeInTheDocument();
+  });
 });
 
 describe('test-injection aid (admin only, clearly labelled)', () => {

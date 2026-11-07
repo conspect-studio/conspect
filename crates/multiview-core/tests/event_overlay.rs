@@ -19,6 +19,7 @@ fn event(boundaries: Vec<EventBoundary>) -> SourceEvent {
             boundary,
             correlation_id: None,
             asset_id: None,
+            descriptor: None,
         });
     }
     match tracker.get(&key()) {

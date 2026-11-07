@@ -1,7 +1,7 @@
 // Fixture construction deliberately fails loudly on impossible fixture sizes.
 #![allow(clippy::expect_used)]
 
-use multiview_input::id3::{parse, Id3Error};
+use multiview_input::id3::{marker_descriptor, parse, Id3Error};
 
 fn sync(n: u32) -> [u8; 4] {
     [21, 14, 7, 0].map(|shift| u8::try_from((n >> shift) & 127).expect("masked seven bits"))
@@ -151,4 +151,47 @@ fn bounded_frames_payloads_and_zero_padding() {
     let many = frame(4, b"ABCD", b"x").repeat(257);
     assert_eq!(parse(&tag(4, &many)), Err(Id3Error::TooLarge));
     assert_eq!(parse(&tag(4, &vec![0; 65_537])), Err(Id3Error::TooLarge));
+}
+
+#[test]
+fn apple_transport_timestamp_priv_is_named_a_clock_marker() {
+    let mut payload = b"com.apple.streaming.transportStreamTimestamp\0".to_vec();
+    payload.extend(1_000_u64.to_be_bytes());
+    let parsed = parse(&tag(4, &frame(4, b"PRIV", &payload))).unwrap();
+    let d = marker_descriptor(&parsed).expect("descriptor");
+    assert_eq!(d.name, "Timestamp (ID3)");
+    assert_eq!(d.type_id.as_deref(), Some("PRIV"));
+    assert_eq!(
+        d.detail.as_deref(),
+        Some("com.apple.streaming.transportStreamTimestamp")
+    );
+}
+
+#[test]
+fn unrecognized_priv_owner_is_named_by_frame_id_and_owner_text() {
+    let payload = b"com.example.vendor\0opaque-bytes";
+    let parsed = parse(&tag(4, &frame(4, b"PRIV", payload))).unwrap();
+    let d = marker_descriptor(&parsed).expect("descriptor");
+    assert_eq!(d.name, "ID3 PRIV");
+    assert_eq!(d.type_id.as_deref(), Some("PRIV"));
+    assert_eq!(d.detail.as_deref(), Some("com.example.vendor"));
+}
+
+#[test]
+fn txxx_description_names_the_frame_with_its_description() {
+    // encoding byte 3 (UTF-8), description "ad-marker", null, value.
+    let parsed = parse(&tag(4, &frame(4, b"TXXX", b"\x03ad-marker\0value"))).unwrap();
+    let d = marker_descriptor(&parsed).expect("descriptor");
+    assert_eq!(d.name, "ID3 TXXX");
+    assert_eq!(d.type_id.as_deref(), Some("TXXX"));
+    assert_eq!(d.detail.as_deref(), Some("ad-marker"));
+}
+
+#[test]
+fn unknown_frame_id_is_named_without_claiming_more_than_the_evidence() {
+    let parsed = parse(&tag(4, &frame(4, b"X123", b"opaque"))).unwrap();
+    let d = marker_descriptor(&parsed).expect("descriptor");
+    assert_eq!(d.name, "ID3 X123");
+    assert_eq!(d.type_id.as_deref(), Some("X123"));
+    assert_eq!(d.detail, None);
 }

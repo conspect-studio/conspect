@@ -1206,38 +1206,112 @@ impl OverlayBaker {
     }
 }
 
-/// Format exact decimal nanoseconds without float conversion or wall-clock time.
-fn event_badge_text(event: &multiview_core::event_overlay::EventOverlay) -> String {
-    use multiview_core::event_overlay::{OverlayLabel, OverlayTimerKind};
-    let label = match event.label {
-        OverlayLabel::Upcoming => "Event upcoming",
-        OverlayLabel::Active => "Event active",
-        OverlayLabel::Ended => "Event ended",
-        OverlayLabel::Uncertain => "Event timing uncertain",
-        OverlayLabel::Overrun => "End unconfirmed",
-        OverlayLabel::Observed => "Marker observed",
+/// Combine a precomputed marker descriptor's name and detail into one short
+/// string. A detail containing `/` is a segment ordinal ("2/4") and reads
+/// naturally as a plain suffix ("Chapter Start 2/4"); any other detail (a
+/// duration, a UPID suffix) reads naturally parenthesised ("Ad break (60s)").
+fn marker_descriptor_text(descriptor: &multiview_core::source_event::MarkerDescriptor) -> String {
+    match &descriptor.detail {
+        None => descriptor.name.clone(),
+        Some(detail) if detail.contains('/') => format!("{} {detail}", descriptor.name),
+        Some(detail) => format!("{} ({detail})", descriptor.name),
+    }
+}
+
+/// Whether a wire timer value is a valid decimal `u64` (never floating-point
+/// seconds): bounded digit-string, successfully parsed.
+fn valid_timer_ns(nanoseconds: &str) -> bool {
+    !nanoseconds.is_empty()
+        && nanoseconds.len() <= 20
+        && nanoseconds.bytes().all(|byte| byte.is_ascii_digit())
+        && nanoseconds.parse::<u64>().is_ok()
+}
+
+/// Exact decimal nanoseconds as `mm:ss`, or `--:--` when the wire value is
+/// malformed. Malformed input stays explicitly unknown rather than looking
+/// like a zero countdown.
+fn timer_clock(nanoseconds: &str) -> String {
+    let Ok(ns) = nanoseconds.parse::<u64>() else {
+        return "--:--".to_owned();
     };
-    let Some(timer) = &event.timer else {
-        return label.to_owned();
-    };
-    // Wire data is decimal u64, not floating-point seconds. Malformed input
-    // remains explicitly unknown instead of looking like a zero countdown.
-    let ns = (!timer.nanoseconds.is_empty()
-        && timer.nanoseconds.len() <= 20
-        && timer.nanoseconds.bytes().all(|byte| byte.is_ascii_digit()))
-    .then(|| timer.nanoseconds.parse::<u64>().ok())
-    .flatten();
-    let Some(ns) = ns else {
-        return format!("{label} --:--");
-    };
+    if !valid_timer_ns(nanoseconds) {
+        return "--:--".to_owned();
+    }
     let seconds = ns / 1_000_000_000;
-    let meaning = match timer.kind {
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn timer_meaning(kind: multiview_core::event_overlay::OverlayTimerKind) -> &'static str {
+    use multiview_core::event_overlay::OverlayTimerKind;
+    match kind {
         OverlayTimerKind::UntilStart => "in",
         OverlayTimerKind::Remaining => "remaining",
         OverlayTimerKind::Elapsed => "elapsed",
         OverlayTimerKind::Overrun => "overrun",
+    }
+}
+
+/// Compact badge text: the marker's own name/detail when evidence named it
+/// (SCTE-35 segmentation type, splice_insert direction, HLS asset, ID3 frame),
+/// e.g. `"Provider Ad Start · 01:23 remaining"`, `"Program End"`,
+/// `"Chapter Start 2/4"`, `"Ad break (60s) · 00:42 remaining"`,
+/// `"Return from break"`. The lifecycle is kept as a prefix/suffix only where
+/// it adds meaning on top of the name (e.g. `"Upcoming: Break Start in
+/// 00:10"`). The fully generic wording (`"Event active remaining 01:01"`
+/// style) is reserved for a marker with no identifying evidence at all.
+fn event_badge_text(event: &multiview_core::event_overlay::EventOverlay) -> String {
+    use multiview_core::event_overlay::OverlayLabel;
+    let marker = event.descriptor.as_ref().map(marker_descriptor_text);
+    let Some(marker) = marker else {
+        // No identifying evidence: the unchanged generic wording.
+        let label = match event.label {
+            OverlayLabel::Upcoming => "Event upcoming",
+            OverlayLabel::Active => "Event active",
+            OverlayLabel::Ended => "Event ended",
+            OverlayLabel::Uncertain => "Event timing uncertain",
+            OverlayLabel::Overrun => "End unconfirmed",
+            OverlayLabel::Observed => "Marker observed",
+        };
+        return event.timer.as_ref().map_or_else(
+            || label.to_owned(),
+            |timer| {
+                if valid_timer_ns(&timer.nanoseconds) {
+                    format!(
+                        "{label} {} {}",
+                        timer_meaning(timer.kind),
+                        timer_clock(&timer.nanoseconds)
+                    )
+                } else {
+                    format!("{label} --:--")
+                }
+            },
+        );
     };
-    format!("{label} {meaning} {:02}:{:02}", seconds / 60, seconds % 60)
+    let with_timer = |marker: &str| {
+        event.timer.as_ref().map_or_else(
+            || marker.to_owned(),
+            |timer| {
+                format!(
+                    "{marker} · {} {}",
+                    timer_clock(&timer.nanoseconds),
+                    timer_meaning(timer.kind)
+                )
+            },
+        )
+    };
+    match event.label {
+        // "Upcoming: <name> in <mm:ss>" keeps the lifecycle prefix readable
+        // as a sentence rather than the "· <clock> <meaning>" badge used once
+        // the marker is already active/overrun.
+        OverlayLabel::Upcoming => event.timer.as_ref().map_or_else(
+            || format!("Upcoming: {marker}"),
+            |timer| format!("Upcoming: {marker} in {}", timer_clock(&timer.nanoseconds)),
+        ),
+        OverlayLabel::Active | OverlayLabel::Observed => with_timer(&marker),
+        OverlayLabel::Ended => marker,
+        OverlayLabel::Uncertain => format!("{marker} (uncertain)"),
+        OverlayLabel::Overrun => format!("{} (end unconfirmed)", with_timer(&marker)),
+    }
 }
 
 /// Intersect a glyph's pixel coverage with its clip rectangle. Crop the source
@@ -1695,6 +1769,7 @@ mod tests {
                 kind: OverlayTimerKind::Remaining,
                 nanoseconds: "61000000001".into(),
             }),
+            descriptor: None,
         }
     }
 
@@ -1719,6 +1794,76 @@ mod tests {
         assert_eq!(event_badge_text(&event), "Marker observed");
         event.key.origin = multiview_core::source_event::EventOrigin::TimedId3;
         assert_eq!(event_badge_text(&event), "Marker observed");
+    }
+
+    #[test]
+    fn event_badge_uses_marker_name_and_detail_when_evidence_names_it() {
+        use multiview_core::event_overlay::{OverlayLabel, OverlayTimer, OverlayTimerKind};
+        use multiview_core::source_event::MarkerDescriptor;
+        let mut event = event_fixture();
+        // "Provider Ad Start · 01:23 remaining" — named marker with a timer.
+        event.descriptor = Some(MarkerDescriptor {
+            name: "Provider Advertisement Start".into(),
+            type_id: Some("0x30".into()),
+            detail: None,
+        });
+        event.timer = Some(OverlayTimer {
+            kind: OverlayTimerKind::Remaining,
+            nanoseconds: "83000000000".into(),
+        });
+        assert_eq!(
+            event_badge_text(&event),
+            "Provider Advertisement Start · 01:23 remaining"
+        );
+        // "Program End" — named marker, no timer.
+        event.descriptor = Some(MarkerDescriptor {
+            name: "Program End".into(),
+            type_id: Some("0x11".into()),
+            detail: None,
+        });
+        event.timer = None;
+        event.label = OverlayLabel::Ended;
+        assert_eq!(event_badge_text(&event), "Program End");
+        // "Chapter Start 2/4" — ordinal detail reads as a plain suffix.
+        event.descriptor = Some(MarkerDescriptor {
+            name: "Chapter Start".into(),
+            type_id: Some("0x20".into()),
+            detail: Some("2/4".into()),
+        });
+        event.label = OverlayLabel::Active;
+        assert_eq!(event_badge_text(&event), "Chapter Start 2/4");
+        // "Ad break (60s) · 00:42 remaining" — duration detail is parenthesised.
+        event.descriptor = Some(MarkerDescriptor {
+            name: "Ad break".into(),
+            type_id: Some("splice_insert".into()),
+            detail: Some("60s".into()),
+        });
+        event.timer = Some(OverlayTimer {
+            kind: OverlayTimerKind::Remaining,
+            nanoseconds: "42000000000".into(),
+        });
+        assert_eq!(event_badge_text(&event), "Ad break (60s) · 00:42 remaining");
+        // "Return from break" — named marker, ended, no timer.
+        event.descriptor = Some(MarkerDescriptor {
+            name: "Return from break".into(),
+            type_id: Some("splice_insert".into()),
+            detail: None,
+        });
+        event.timer = None;
+        event.label = OverlayLabel::Ended;
+        assert_eq!(event_badge_text(&event), "Return from break");
+        // Upcoming prefix keeps the lifecycle meaning on top of the name.
+        event.descriptor = Some(MarkerDescriptor {
+            name: "Break Start".into(),
+            type_id: Some("0x22".into()),
+            detail: None,
+        });
+        event.timer = Some(OverlayTimer {
+            kind: OverlayTimerKind::UntilStart,
+            nanoseconds: "10000000000".into(),
+        });
+        event.label = OverlayLabel::Upcoming;
+        assert_eq!(event_badge_text(&event), "Upcoming: Break Start in 00:10");
     }
 
     #[test]

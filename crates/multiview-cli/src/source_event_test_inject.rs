@@ -51,6 +51,7 @@ impl TestBoundary {
             boundary,
             correlation_id: None,
             asset_id: None,
+            descriptor: None,
         }
     }
 }

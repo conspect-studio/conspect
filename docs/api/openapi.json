@@ -14971,6 +14971,30 @@
             "$ref": "#/components/schemas/SourceEventLifecycle",
             "description": "Observational lifecycle, not an automation command."
           },
+          "marker_detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short additional detail (segment ordinal, break duration, UPID\nsuffix), consistent with `marker_name`.",
+            "maxLength": 48
+          },
+          "marker_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Short human-readable marker name (e.g. \"Program Start\", \"Ad break\"),\nwhen the evidence carried enough identity to name it. Absent means\nthis marker is honestly unidentified, not that it was omitted.",
+            "maxLength": 48
+          },
+          "marker_type_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Raw wire type token the name was derived from (e.g. `\"0x22\"`,\n`\"splice_insert\"`, `\"PRIV\"`, `\"asset\"`).",
+            "maxLength": 32
+          },
           "origin": {
             "$ref": "#/components/schemas/SourceEventOrigin",
             "description": "Evidence origin; vendor markers never imply a splice boundary."

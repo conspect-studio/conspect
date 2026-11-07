@@ -537,6 +537,7 @@ mod tests {
             },
             correlation_id: None,
             asset_id: None,
+            descriptor: None,
         }
     }
     // Pause after the worker's final active check, exercising the actual stale
@@ -657,6 +658,7 @@ mod source_event_stress {
             },
             correlation_id: None,
             asset_id: Some("stress-asset".into()),
+            descriptor: None,
         }
     }
 
