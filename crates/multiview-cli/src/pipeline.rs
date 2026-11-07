@@ -1898,6 +1898,9 @@ struct IngestPlan {
     id: String,
     /// Where the media lives.
     location: SourceLocation,
+    /// Operator-set HLS request headers (`user_agent` / `referrer`, IPTV-ORG
+    /// slice A). Empty for every other kind.
+    http_headers: HttpHeaders,
     /// When `Some`, this source is a **media-player channel** (ADR-0057 /
     /// ADR-0097): [`open_and_stream`] runs the transport-driven decode loop
     /// ([`stream_player`]) instead of the plain pace-and-publish pump — it
@@ -10197,7 +10200,7 @@ fn ingest_plan_for(
         }
         SourceKind::File { path } => (SourceLocation::Path(PathBuf::from(path)), false),
         SourceKind::Rtsp { url, .. }
-        | SourceKind::Hls { url }
+        | SourceKind::Hls { url, .. }
         | SourceKind::Ts { url }
         | SourceKind::Rtmp { url } => (SourceLocation::Url(url.clone()), true),
         SourceKind::Srt { url, srt } => {
@@ -10308,6 +10311,7 @@ fn ingest_plan_for(
         source_events: None,
         id: source.id.clone(),
         location,
+        http_headers: http_headers_for(&source.kind),
         // Not a media-player channel (those are built from `config.media_players`).
         player: None,
         tile_w,
@@ -10515,6 +10519,7 @@ fn build_media_player_boot(
             source_events: None,
             id: player.id.clone(),
             location: SourceLocation::Path(path),
+            http_headers: HttpHeaders::default(),
             player: Some(handle),
             tile_w,
             tile_h,
@@ -10582,7 +10587,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         | SourceKind::GraphicsChannel { .. } => return None,
         SourceKind::File { path } => (path.clone(), false),
         SourceKind::Rtsp { url, .. }
-        | SourceKind::Hls { url }
+        | SourceKind::Hls { url, .. }
         | SourceKind::Ts { url }
         | SourceKind::Rtmp { url } => (url.clone(), true),
         SourceKind::Srt { url, srt } => match srt_resolved_url(url, srt.as_ref(), false) {
@@ -10614,6 +10619,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         live,
         lifecycle: 0,
         anchor_floor: 0,
+        http_headers: http_headers_for(&source.kind).to_ffmpeg(),
     })
 }
 
@@ -10890,6 +10896,56 @@ fn resolve_incontainer_sub_route(
         },
         store,
     ))
+}
+
+/// Operator-set HTTP request headers for an HLS source (libav `user_agent` /
+/// `referer` `AVOption`s). Not secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HttpHeaders {
+    user_agent: Option<String>,
+    referer: Option<String>,
+}
+
+impl HttpHeaders {
+    fn is_empty(&self) -> bool {
+        self.user_agent.is_none() && self.referer.is_none()
+    }
+
+    /// The same headers for the in-process fetchers (loopback segment fetcher,
+    /// variant-pin master fetch); control characters are dropped there.
+    fn request_headers(&self) -> crate::hls_fetch::RequestHeaders {
+        crate::hls_fetch::RequestHeaders::new(self.user_agent.as_deref(), self.referer.as_deref())
+    }
+
+    /// The same headers as the libav-level value the audio rail opens with.
+    fn to_ffmpeg(&self) -> multiview_ffmpeg::HttpHeaders {
+        multiview_ffmpeg::HttpHeaders::new(self.user_agent.as_deref(), self.referer.as_deref())
+    }
+
+    /// Set the headers as libav open options on `opts`.
+    fn apply(&self, opts: &mut ffmpeg::Dictionary<'_>) {
+        if let Some(ua) = &self.user_agent {
+            opts.set("user_agent", ua);
+        }
+        if let Some(r) = &self.referer {
+            opts.set("referer", r);
+        }
+    }
+}
+
+/// The headers an HLS source carries (empty for every other kind).
+fn http_headers_for(kind: &SourceKind) -> HttpHeaders {
+    match kind {
+        SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } => HttpHeaders {
+            user_agent: user_agent.clone(),
+            referer: referrer.clone(),
+        },
+        _ => HttpHeaders::default(),
+    }
 }
 
 /// Where a source's media lives.
@@ -11180,11 +11236,27 @@ pub(crate) fn resolve_hls_variant_url(
 /// outran real time and starved the audio (~40-60 % audible). A pinned media
 /// playlist also carries no `WebVTT` rendition (ADR-T011). Best-effort: `None`
 /// opens the original URL.
-pub(crate) fn resolve_hls_audio_url(master_url: &str) -> Option<String> {
-    resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher)
+///
+/// The master fetch carries the source's operator `User-Agent`/`Referer`
+/// (a source with none uses the libav fetcher).
+pub(crate) fn resolve_hls_audio_url_with_headers(
+    master_url: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
+) -> Option<String> {
+    if headers.is_empty() {
+        return resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher);
+    }
+    tracing::debug!("audio pin: master fetch carries operator request headers");
+    resolve_hls_audio_url_with(
+        master_url,
+        &HeaderPlaylistFetcher(crate::hls_fetch::RequestHeaders::new(
+            headers.user_agent(),
+            headers.referer(),
+        )),
+    )
 }
 
-/// [`resolve_hls_audio_url`] with an injectable fetcher (offline tests).
+/// [`resolve_hls_audio_url_with_headers`] with an injectable fetcher (offline tests).
 fn resolve_hls_audio_url_with(
     master_url: &str,
     fetcher: &dyn crate::captions::PlaylistFetcher,
@@ -11256,11 +11328,36 @@ fn resolve_hls_variant_url_with(
 /// original `url` is returned unchanged. Best-effort: this never fails the open
 /// (invariants #1/#10) — a fall-through to the original URL still has the post-open
 /// discard + reconnect bracket as guards.
-fn main_demuxer_open_url(url: &str, location: &SourceLocation, tile_h: u32) -> String {
+fn main_demuxer_open_url(
+    url: &str,
+    location: &SourceLocation,
+    tile_h: u32,
+    headers: &HttpHeaders,
+) -> String {
     if !is_hls_location(location) {
         return url.to_owned();
     }
-    resolve_hls_variant_url(url, Some(tile_h)).unwrap_or_else(|| url.to_owned())
+    let resolved = if headers.is_empty() {
+        resolve_hls_variant_url(url, Some(tile_h))
+    } else {
+        resolve_hls_variant_url_with(
+            url,
+            Some(tile_h),
+            &HeaderPlaylistFetcher(headers.request_headers()),
+        )
+    };
+    resolved.unwrap_or_else(|| url.to_owned())
+}
+
+/// Master-playlist fetcher for the variant pin that carries the source's
+/// operator `User-Agent`/`Referer` (control/IO plane, bounded, best-effort).
+pub(crate) struct HeaderPlaylistFetcher(pub(crate) crate::hls_fetch::RequestHeaders);
+
+impl crate::captions::PlaylistFetcher for HeaderPlaylistFetcher {
+    fn fetch(&self, url: &str) -> Result<crate::captions::FetchedPlaylist, String> {
+        crate::hls_fetch::fetch_text(&self.0, url, 8 * 1024 * 1024)
+            .map(|(url, body)| crate::captions::FetchedPlaylist { url, body })
+    }
 }
 
 /// The per-source streaming-ingest loop, run on a dedicated thread (BUG-2 fix).
@@ -12404,7 +12501,8 @@ fn open_and_stream(
 
     // Network sources open with an `rw_timeout` so a dead live source fails fast
     // instead of hanging this decode thread on open or a blocking read (#45).
-    let opts = ingest_open_options(&plan.location);
+    let mut opts = ingest_open_options(&plan.location);
+    plan.http_headers.apply(&mut opts);
     // Kept alive for this connection: the loopback server libav reads from.
     let mut hls_fetcher: Option<crate::hls_fetch::HlsFetcher> = None;
     let mut hls_event_bridge = None;
@@ -12422,7 +12520,10 @@ fn open_and_stream(
             // best-effort — a fetch/parse miss falls back to the original URL with
             // the post-open discard + reconnect bracket as the remaining guards
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
-            let open_url = main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h);
+            // Operator `user_agent`/`referrer` headers ride the variant-pin
+            // request and the loopback fetcher (and libav's own opts).
+            let open_url =
+                main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h, &plan.http_headers);
             // A live HLS media playlist is fetched by our parallel-range segment
             // fetcher and read by libav from loopback memory (see `hls_fetch`);
             // anything it cannot serve (VOD, encrypted, fMP4) opens directly.
@@ -12442,16 +12543,24 @@ fn open_and_stream(
                 } else {
                     (None, None)
                 };
+                let fetch_headers = plan.http_headers.request_headers();
                 let start_result = if observer.is_some() {
                     crate::hls_fetch::HlsFetcher::start_with_observer(
                         &plan.id,
                         &open_url,
+                        &fetch_headers,
                         stop,
                         plan.lifecycle,
                         observer,
                     )
                 } else {
-                    crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop, plan.lifecycle)
+                    crate::hls_fetch::HlsFetcher::start(
+                        &plan.id,
+                        &open_url,
+                        &fetch_headers,
+                        stop,
+                        plan.lifecycle,
+                    )
                 };
                 match start_result {
                     Ok(fetcher) => {
@@ -12481,7 +12590,8 @@ fn open_and_stream(
             let Some(url) = resolved_youtube_url.as_deref() else {
                 return Err("youtube source did not resolve a manifest url".to_owned());
             };
-            let open_url = main_demuxer_open_url(url, &plan.location, plan.tile_h);
+            let open_url =
+                main_demuxer_open_url(url, &plan.location, plan.tile_h, &plan.http_headers);
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
@@ -17184,6 +17294,7 @@ input_id = "net1"
     #[test]
     fn caption_reader_registers_a_prefixed_stop_flag() {
         let plan = crate::captions::CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
             id: "net1".to_owned(),
             rendition_url: "http://[::1]:1/never/subs.m3u8".to_owned(),
             store: Arc::new(crate::captions::CueStore::new()),
@@ -18035,6 +18146,7 @@ mod media_player_loop_tests {
             source_events: None,
             id: "player-test".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
+            http_headers: super::HttpHeaders::default(),
             player: Some(handle),
             tile_w,
             tile_h,
@@ -18203,6 +18315,7 @@ mod media_player_loop_tests {
             source_events: None,
             id: "vt-bad".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
+            http_headers: super::HttpHeaders::default(),
             player: Some(handle),
             tile_w: 160,
             tile_h: 120,
@@ -18315,6 +18428,7 @@ mod media_player_loop_tests {
             source_events: None,
             id: "vt-bframe".to_owned(),
             location: super::SourceLocation::Path(clip.clone()),
+            http_headers: super::HttpHeaders::default(),
             player: Some(handle),
             tile_w,
             tile_h,
@@ -19977,5 +20091,99 @@ mod packet_reader_tests {
             wait_until(Duration::from_secs(2), || done.load(Ordering::SeqCst)),
             "reader thread (and the Input it owns) must be released"
         );
+    }
+}
+
+#[cfg(test)]
+mod http_headers_tests {
+    use super::{
+        audio_ingest_plan_for, ffmpeg, http_headers_for, resolve_hls_audio_url_with_headers,
+        SourceKind,
+    };
+    use multiview_config::Source;
+
+    #[test]
+    fn audio_plan_carries_hls_headers_and_other_kinds_carry_none() {
+        let mut hls: Source = serde_json::from_value(serde_json::json!({
+            "id": "a", "kind": "hls", "url": "https://o.test/m.m3u8",
+            "user_agent": "UA/1", "referrer": "https://r.test/",
+        }))
+        .expect("hls");
+        let plan = audio_ingest_plan_for(&hls).expect("hls audio plan");
+        assert_eq!(plan.http_headers.user_agent(), Some("UA/1"));
+        assert_eq!(plan.http_headers.referer(), Some("https://r.test/"));
+        let opts = plan.http_headers.open_options();
+        assert_eq!(opts[0], ("user_agent", "UA/1".to_owned()));
+        assert_eq!(opts[1], ("referer", "https://r.test/".to_owned()));
+        let ts: Source = serde_json::from_value(serde_json::json!({
+            "id": "t", "kind": "ts", "url": "udp://[::1]:1234",
+        }))
+        .expect("ts");
+        assert!(audio_ingest_plan_for(&ts)
+            .expect("ts plan")
+            .http_headers
+            .is_empty());
+        if let SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } = &mut hls.kind
+        {
+            *user_agent = Some("bad\r\nX: 1".to_owned());
+            *referrer = None;
+        }
+        assert!(audio_ingest_plan_for(&hls)
+            .expect("plan")
+            .http_headers
+            .is_empty());
+    }
+
+    #[test]
+    fn audio_master_pin_fetch_sends_the_operator_headers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0_u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1.4d401f,mp4a.40.2\"\nv/a.m3u8\n";
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let headers =
+            multiview_ffmpeg::HttpHeaders::new(Some("Opera/Test 9"), Some("https://ref.example/"));
+        let url = format!("http://{addr}/master.m3u8");
+        let pinned = resolve_hls_audio_url_with_headers(&url, &headers);
+        let head = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request seen")
+            .to_ascii_lowercase();
+        assert!(head.contains("user-agent: opera/test 9"), "{head}");
+        assert!(head.contains("referer: https://ref.example/"), "{head}");
+        assert!(pinned.is_some_and(|u| u.ends_with("/v/a.m3u8")));
+    }
+
+    #[test]
+    fn hls_headers_become_libav_user_agent_and_referer_options() {
+        let kind = SourceKind::Hls {
+            url: "https://h/x.m3u8".to_owned(),
+            user_agent: Some("UA/1".to_owned()),
+            referrer: Some("https://r/".to_owned()),
+        };
+        let headers = http_headers_for(&kind);
+        assert!(!headers.is_empty());
+        let mut opts = ffmpeg::Dictionary::new();
+        headers.apply(&mut opts);
+        assert_eq!(opts.get("user_agent"), Some("UA/1"));
+        assert_eq!(opts.get("referer"), Some("https://r/"));
+        let none = http_headers_for(&SourceKind::Bars);
+        assert!(none.is_empty());
     }
 }

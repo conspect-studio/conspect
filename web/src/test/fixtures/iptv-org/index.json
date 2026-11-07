@@ -1,0 +1,1179 @@
+{
+ "schema": 1,
+ "generated_at": "2026-11-07T05:00:00Z",
+ "categories": [
+  {
+   "id": "classic",
+   "name": "Classic"
+  },
+  {
+   "id": "documentary",
+   "name": "Documentary"
+  },
+  {
+   "id": "education",
+   "name": "Education"
+  },
+  {
+   "id": "entertainment",
+   "name": "Entertainment"
+  },
+  {
+   "id": "general",
+   "name": "General"
+  },
+  {
+   "id": "movies",
+   "name": "Movies"
+  },
+  {
+   "id": "news",
+   "name": "News"
+  },
+  {
+   "id": "series",
+   "name": "Series"
+  },
+  {
+   "id": "sports",
+   "name": "Sports"
+  },
+  {
+   "id": "weather",
+   "name": "Weather"
+  }
+ ],
+ "languages": [
+  {
+   "code": "deu",
+   "name": "German"
+  },
+  {
+   "code": "eng",
+   "name": "English"
+  },
+  {
+   "code": "spa",
+   "name": "Spanish"
+  },
+  {
+   "code": "srp",
+   "name": "Serbian"
+  },
+  {
+   "code": "swe",
+   "name": "Swedish"
+  },
+  {
+   "code": "ukr",
+   "name": "Ukrainian"
+  },
+  {
+   "code": "zho",
+   "name": "Chinese"
+  }
+ ],
+ "streams": [
+  {
+   "k": "s:b89326a9f52c",
+   "url": "https://2-fss-2.streamhoster.com/pl_120/amlst:203530-1426406/playlist.m3u8",
+   "title": "WPS TV",
+   "ch": "WPSTV.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "WPS-TV",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "education"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USICT"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USICT"
+    ]
+   },
+   "q": "360p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.usd259.org/Page/1254",
+   "logo_url": "https://i.imgur.com/zwzmwse.jpg",
+   "guide": null
+  },
+  {
+   "k": "s:d7d98a9eecbd",
+   "url": "https://cdn-uw2-prod.tsv2.amagi.tv/linear/amg02104-imagicommcommun-kokibreaking-ono/playlist.m3u8",
+   "title": "KOKI-DT1",
+   "ch": "Roar.us",
+   "feed": "KOKITV",
+   "feed_name": "KOKI-TV",
+   "name": "Roar",
+   "alt": [
+    "TBD"
+   ],
+   "net": "Roar",
+   "cats": [
+    "entertainment"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USTUL"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USTUL"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://watchroar.com/",
+   "logo_url": "https://iili.io/FxYNwOB.md.png",
+   "guide": null
+  },
+  {
+   "k": "s:b20414866a98",
+   "url": "https://2-fss-1.streamhoster.com/pl_154/amlst:205432-2055980/playlist.m3u8",
+   "title": "KCKS-LD 25.3",
+   "ch": "AceTV.us",
+   "feed": "KCKSLD",
+   "feed_name": "KCKS-LD",
+   "name": "Ace TV",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "entertainment"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USKCK"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USKCK"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "http://www.acetelevisionnetwork.com/",
+   "logo_url": "https://i.imgur.com/KtXQeeZ.png",
+   "guide": null
+  },
+  {
+   "k": "s:d4e9ec8986d2",
+   "url": "https://content.uplynk.com/channel/50d0fa1b042945a3a4f550f9b8412c83.m3u8",
+   "title": "KSHB 41 (Kansas City MO)",
+   "ch": "NBC.us",
+   "feed": "KSHBTV",
+   "feed_name": "KSHB-TV",
+   "name": "NBC",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USMKC"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USMKC"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "http://www.nbc.com/",
+   "logo_url": "https://i.imgur.com/B1qVjQN.png",
+   "guide": null
+  },
+  {
+   "k": "s:e9ba39520b97",
+   "url": "https://hls-kmosdt.lls.cdn.pbs.org/hls/live/index.m3u8",
+   "title": "PBS Sedalia British Columbia MO (KMOS)",
+   "ch": "PBS.us",
+   "feed": "KMOSTV",
+   "feed_name": "KMOS-TV",
+   "name": "PBS",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "education"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USDMO"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USDMO"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [
+    "geo_blocked"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.pbs.org/",
+   "logo_url": "https://i.imgur.com/O1zzAvh.png",
+   "guide": null
+  },
+  {
+   "k": "s:811bb8090ad9",
+   "url": "https://fuel-streaming-prod01.fuelmedia.io/v1/sem/e48409e7-672d-42f2-b5e0-ebb6744b0425.m3u8",
+   "title": "CBS 9 Oklahoma City OK (KWTV-DT1)",
+   "ch": "CBS.us",
+   "feed": "KWTVDT",
+   "feed_name": "KWTV-DT",
+   "name": "CBS",
+   "alt": [],
+   "net": "CBS Entertainment",
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USOKC"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USOKC"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [
+    "not_24_7"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.cbs.com/",
+   "logo_url": "https://upload.wikimedia.org/wikipedia/en/6/6b/KYES-TV_2017_Logo.png",
+   "guide": null
+  },
+  {
+   "k": "s:3b188ff41d60",
+   "url": "https://linear-705.frequency.stream/dist/stirr/705/hls/master/playlist.m3u8",
+   "title": "FOX 25 Oklahoma City OK (KOKH)",
+   "ch": "Fox.us",
+   "feed": "KOKHTV",
+   "feed_name": "KOKH-TV",
+   "name": "Fox",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USOKC"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USOKC"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.fox.com/",
+   "logo_url": "https://static.wikia.nocookie.net/tvstations/images/8/8e/KBSIO6.png",
+   "guide": null
+  },
+  {
+   "k": "s:7e560e575c4d",
+   "url": "https://cdn-ue1-prod.tsv2.amagi.tv/linear/amg00327-coxmediagroup-wsocbreaking-ono/playlist.m3u8",
+   "title": "WSOC-DT1",
+   "ch": "ABC.us",
+   "feed": "WSOCTV",
+   "feed_name": "WSOC-TV",
+   "name": "ABC",
+   "alt": [],
+   "net": "ABC",
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USCLT"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USCLT"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://abc.com/",
+   "logo_url": "https://upload.wikimedia.org/wikipedia/commons/f/f8/KTVX2022LOGO.svg",
+   "guide": null
+  },
+  {
+   "k": "s:ae887a24f7ef",
+   "url": "https://d1q60ra9vxbqm1.cloudfront.net/playlist.m3u8",
+   "title": "WSOC Charlotte",
+   "ch": "ABC.us",
+   "feed": "WSOCTV",
+   "feed_name": "WSOC-TV",
+   "name": "ABC",
+   "alt": [],
+   "net": "ABC",
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USCLT"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USCLT"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [
+    "geo_blocked"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://abc.com/",
+   "logo_url": "https://upload.wikimedia.org/wikipedia/commons/f/f8/KTVX2022LOGO.svg",
+   "guide": null
+  },
+  {
+   "k": "s:d50a9aba7b59",
+   "url": "https://aegis-cloudfront-1.tubi.video/d864a20b-85bb-41bc-8fbe-6c9d8a88a32d/playlist.m3u8",
+   "title": "ABC 9 Charlotte NC (WSOC)",
+   "ch": "ABC.us",
+   "feed": "WSOCTV",
+   "feed_name": "WSOC-TV",
+   "name": "ABC",
+   "alt": [],
+   "net": "ABC",
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "ct/USCLT"
+   ],
+   "geo": {
+    "lvl": "city",
+    "places": [
+     "USCLT"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://abc.com/",
+   "logo_url": "https://upload.wikimedia.org/wikipedia/commons/f/f8/KTVX2022LOGO.svg",
+   "guide": null
+  },
+  {
+   "k": "s:5df43ae89acd",
+   "url": "https://30a-tv.com/gh.m3u8",
+   "title": "30A Georgia Hollywood Review TV",
+   "ch": "30AGeorgiaHollywoodReview.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "30A Georgia Hollywood Review",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "entertainment",
+    "news"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "c/US"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "US"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://30a-tv.com/30a/georgia-hollywood-review-tv/",
+   "logo_url": "https://images.axios.com/JiG3RuYBwpU_WZFeU6HHjt03FAU=/111x0:1191x1080/320x320/2023/11/09/1699558891265.jpg",
+   "guide": null
+  },
+  {
+   "k": "s:f1a1fa415a9a",
+   "url": "https://30a-tv.com/ln.m3u8",
+   "title": "30A Lionel Nation TV",
+   "ch": "30ALionelNation.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "30A Lionel Nation",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "news"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "c/US"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "US"
+    ]
+   },
+   "q": null,
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://30a-tv.com/30a/lionel-nation-tv/",
+   "logo_url": "https://m.media-amazon.com/images/I/71dgsQwVcNL.png",
+   "guide": null
+  },
+  {
+   "k": "s:f3f42ad2e4de",
+   "url": "https://30a-tv.com/loomer.m3u8",
+   "title": "30A Loomered TV",
+   "ch": "30ALoomeredTV.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "30A Loomered TV",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "news",
+    "documentary"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "c/US"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "US"
+    ]
+   },
+   "q": null,
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://30a-tv.com/m3u8-channels/",
+   "logo_url": "https://cbs12.com/resources/media/0c1ecad8-fb09-4bb2-beaa-fc561dfe624a-small21x9_LoomerStill.jpg?1603419052801",
+   "guide": null
+  },
+  {
+   "k": "s:d912daa42321",
+   "url": "https://cdn-ue1-prod.tsv2.amagi.tv/linear/amg00684-accuweather-accuweather-plex/playlist.m3u8",
+   "title": "AccuWeather Now",
+   "ch": "AccuWeatherNOW.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "AccuWeather NOW",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "weather"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "c/US"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "US"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://watch.plex.tv/live-tv/channel/accuweather-now-2",
+   "logo_url": "https://i.imgur.com/M8wbVYK.png",
+   "guide": null
+  },
+  {
+   "k": "s:87f475afd80e",
+   "url": "https://amg00684-accuweather-accuweather-rokuus-0endj.amagi.tv/playlist.m3u8",
+   "title": "AccuWeather Now",
+   "ch": "AccuWeatherNOW.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "AccuWeather NOW",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "weather"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "c/US"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "US"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [
+    "geo_blocked"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://watch.plex.tv/live-tv/channel/accuweather-now-2",
+   "logo_url": "https://i.imgur.com/M8wbVYK.png",
+   "guide": null
+  },
+  {
+   "k": "s:d0e6c0e0b47f",
+   "url": "https://reflect-tampa-bay-community.cablecast.tv/live-16/live/live.m3u8",
+   "title": "Tampa Bay Communnity Network TBCN (Tampa Bay FL)",
+   "ch": "TBCN.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "TBCN",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "s/US-FL"
+   ],
+   "geo": {
+    "lvl": "subdivision",
+    "places": [
+     "US-FL"
+    ]
+   },
+   "q": "480p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://reflect-tampa-bay-community.cablecast.tv/CablecastPublicSite/watch/1?channel=1",
+   "logo_url": "https://i.imgur.com/nNxl3F4.png",
+   "guide": null
+  },
+  {
+   "k": "s:810db3a54350",
+   "url": "https://tgn.bozztv.com/watc57/watc57-theloop/watc57-theloop/index.m3u8",
+   "title": "The Loop",
+   "ch": "TheLoop.us",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "The Loop",
+   "alt": [
+    "Lovers of Old Programs"
+   ],
+   "net": null,
+   "cats": [
+    "classic",
+    "series"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "s/US-GA"
+   ],
+   "geo": {
+    "lvl": "subdivision",
+    "places": [
+     "US-GA"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://watc.tv/theloop/",
+   "logo_url": "https://i.imgur.com/iyYLuJj.png",
+   "guide": null
+  },
+  {
+   "k": "s:d2715787eaf1",
+   "url": "https://origin.dpsgo.com/ssai/event/BBp0VeP6QtOOlH8nu3bWTg/master.m3u8",
+   "title": "13 Entretención",
+   "ch": "13E.cl",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "13E",
+   "alt": [
+    "13 Entretención"
+   ],
+   "net": null,
+   "cats": [
+    "entertainment"
+   ],
+   "langs": [
+    "spa"
+   ],
+   "country": "CL",
+   "area": [
+    "c/CL"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "CL"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [
+    "closed"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": "2024-08-15",
+   "replaced_by": null,
+   "website": "https://www.13.cl/13e",
+   "logo_url": "https://i.imgur.com/utI1tJV.png",
+   "guide": null
+  },
+  {
+   "k": "s:9026d9713afc",
+   "url": "mmsh://212.200.255.151/rtv1",
+   "title": "RTV 1",
+   "ch": "RTV1.rs",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "RTV 1",
+   "alt": [
+    "РТВ 1"
+   ],
+   "net": null,
+   "cats": [],
+   "langs": [
+    "srp",
+    "swe"
+   ],
+   "country": "RS",
+   "area": [
+    "c/RS"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "RS"
+    ]
+   },
+   "q": "576p",
+   "proto": "mmsh",
+   "flags": [
+    "not_24_7",
+    "unsupported"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.rtv.rs/",
+   "logo_url": "https://i.imgur.com/CG44YT3.png",
+   "guide": null
+  },
+  {
+   "k": "s:a26cd41fe5b0",
+   "url": "rtmp://59.124.75.138:1935/sat/tv111",
+   "title": "CTS (HUA-CHI CTS)",
+   "ch": "CTS.tw",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "CTS",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "zho"
+   ],
+   "country": "TW",
+   "area": [
+    "c/TW"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "TW"
+    ]
+   },
+   "q": "1080p",
+   "proto": "rtmp",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.cts.com.tw/",
+   "logo_url": "https://upload.wikimedia.org/wikipedia/zh/8/8a/CTS_Logo.png",
+   "guide": null
+  },
+  {
+   "k": "s:eabfbe8c6f88",
+   "url": "https://wowzasrv.chaco.gov.ar/Streamtv/chacotv/playlist.m3u8",
+   "title": "Chaco TV",
+   "ch": null,
+   "feed": null,
+   "feed_name": null,
+   "name": null,
+   "alt": [],
+   "net": null,
+   "cats": [],
+   "langs": [],
+   "country": null,
+   "area": [],
+   "geo": {
+    "lvl": "none",
+    "places": []
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [
+    "not_24_7",
+    "no_metadata"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": null,
+   "logo_url": null,
+   "guide": null
+  },
+  {
+   "k": "s:ed365f9f2b2e",
+   "url": "http://playcom.trapemn.tv:1935/transcoderip/tvpublica.stream/playlist.m3u8",
+   "title": "TV Publica",
+   "ch": null,
+   "feed": null,
+   "feed_name": null,
+   "name": null,
+   "alt": [],
+   "net": null,
+   "cats": [],
+   "langs": [],
+   "country": null,
+   "area": [],
+   "geo": {
+    "lvl": "none",
+    "places": []
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [
+    "http_only",
+    "no_metadata"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": null,
+   "logo_url": null,
+   "guide": null
+  },
+  {
+   "k": "s:8a2283bef1b1",
+   "url": "https://dash2.antik.sk/live/test_one_plus_one_int_tizen/playlist.m3u8",
+   "title": "1+1 International HD",
+   "ch": "1Plus1International.ua",
+   "feed": "HD",
+   "feed_name": "HD",
+   "name": "1+1 International",
+   "alt": [
+    "1+1 Інтернешнл"
+   ],
+   "net": null,
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "ukr"
+   ],
+   "country": "UA",
+   "area": [
+    "r/EU"
+   ],
+   "geo": {
+    "lvl": "region",
+    "places": [
+     "EU"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://1plus1.international/",
+   "logo_url": "https://i.imgur.com/LOY0rtp.png",
+   "guide": null
+  },
+  {
+   "k": "s:46245d24c7b7",
+   "url": "https://dash4.antik.sk/live/test_drei_sat_tizen/playlist.m3u8",
+   "title": "3sat",
+   "ch": "3sat.de",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "3sat",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "deu"
+   ],
+   "country": "DE",
+   "area": [
+    "c/DE",
+    "c/AT",
+    "c/CH"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "DE",
+     "AT",
+     "CH"
+    ]
+   },
+   "q": null,
+   "proto": "hls",
+   "flags": [],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.3sat.de/",
+   "logo_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/3sat_2019.svg/960px-3sat_2019.svg.png",
+   "guide": {
+    "site": "neo.io",
+    "site_id": "3sat",
+    "lang": "de"
+   }
+  },
+  {
+   "k": "s:9780defc39a8",
+   "url": "https://zdf-hls-18.akamaized.net/hls/live/2016501/dach/high/master.m3u8",
+   "title": "3sat",
+   "ch": "3sat.de",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "3sat",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "general"
+   ],
+   "langs": [
+    "deu"
+   ],
+   "country": "DE",
+   "area": [
+    "c/DE",
+    "c/AT",
+    "c/CH"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "DE",
+     "AT",
+     "CH"
+    ]
+   },
+   "q": "720p",
+   "proto": "hls",
+   "flags": [
+    "geo_blocked"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.3sat.de/",
+   "logo_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/3sat_2019.svg/960px-3sat_2019.svg.png",
+   "guide": {
+    "site": "neo.io",
+    "site_id": "3sat",
+    "lang": "de"
+   }
+  },
+  {
+   "k": "s:89e7f0b86e02",
+   "url": "http://45.153.96.44:8001",
+   "title": "BBC News UK HD",
+   "ch": "BBCNews.uk",
+   "feed": "UKHD",
+   "feed_name": "UK HD",
+   "name": "BBC News",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "news"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "UK",
+   "area": [
+    "c/UK"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "UK"
+    ]
+   },
+   "q": "1080p",
+   "proto": "hls",
+   "flags": [
+    "http_only"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.bbc.co.uk/tv/bbcnews",
+   "logo_url": "https://dtil.tmsimg.com/assets/s158142_ld_h15_aa.png?lock=720x540",
+   "guide": null
+  },
+  {
+   "k": "s:620f88cf386d",
+   "url": "https://saruman1.tharen1.cfd/axyblack/usergenrxi6s93hs2.m3u8",
+   "title": "AXN Black Romania",
+   "ch": "AXNBlack.us",
+   "feed": "Romania",
+   "feed_name": "Romania",
+   "name": "AXN Black",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "movies"
+   ],
+   "langs": [
+    "eng"
+   ],
+   "country": "US",
+   "area": [
+    "c/RO"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "RO"
+    ]
+   },
+   "q": null,
+   "proto": "hls",
+   "flags": [
+    "needs_headers"
+   ],
+   "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 VLC/3.0.18 LibVLC/3.0.18",
+   "ref": "https://cool-tv.net/",
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://www.axnblack.com/",
+   "logo_url": "https://i.imgur.com/Peo1QiZ.png",
+   "guide": null
+  },
+  {
+   "k": "s:ac1c47d53673",
+   "url": "https://example.test/360bundesliga.m3u8",
+   "title": "360 Bundesliga",
+   "ch": "360Bundesliga.vn",
+   "feed": "SD",
+   "feed_name": "SD",
+   "name": "360 Bundesliga",
+   "alt": [],
+   "net": null,
+   "cats": [
+    "sports"
+   ],
+   "langs": [],
+   "country": "VN",
+   "area": [
+    "c/VN"
+   ],
+   "geo": {
+    "lvl": "country",
+    "places": [
+     "VN"
+    ]
+   },
+   "q": null,
+   "proto": "hls",
+   "flags": [
+    "blocklisted"
+   ],
+   "ua": null,
+   "ref": null,
+   "logo": null,
+   "closed": null,
+   "replaced_by": null,
+   "website": "https://m.tv360.vn/page/bundesliga",
+   "logo_url": "https://i.ibb.co/Z1YC0ZRv/IMG-2880.png",
+   "guide": null
+  }
+ ]
+}

@@ -7,7 +7,9 @@
 // hook mirrors into the Query cache; a source outside the running engine shows
 // "—" with an explanation, because honesty beats a fabricated state.
 import { M3uImportButton } from './M3uImportDialog';
+import { useState } from 'react';
 import type { JSX } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { Trans, useLingui } from '@lingui/react/macro';
 import type { ColumnDef } from '@tanstack/react-table';
 
@@ -63,9 +65,14 @@ import {
   SelectField,
 } from '../resources/FormControls';
 import { whipPublishUrl } from '../resources/api';
+import type { CrudSeed } from '../resources/CrudPage';
 import { SourceFromDeviceSection } from '../devices/FromDevice';
 import { tileForSource, useLiveTiles } from '../resources/useLiveTiles';
 import type { LiveTile } from '../realtime/useEngineEvents';
+import { Button } from '../components/ui/button';
+import { useCatalogueLinks } from '../api/catalogueQueries';
+import { LinkActions, LinkCell, OriginPanel, SourceNetworkAction } from '../iptv/SourceLinks';
+import type { SourceFormState as SeedForm } from '../resources/forms';
 import { HelpLink } from '../components/HelpLink';
 import { TileStateBadge } from '../components/TileStateBadge';
 
@@ -655,6 +662,29 @@ function SourceAdvancedFields({
   };
   return (
     <AdvancedSection summary={t`Advanced`}>
+      {form.kind === 'hls' ? (
+        <>
+          <FormField
+            id="source-user-agent"
+            label={t`User-Agent header (optional)`}
+            value={form.userAgent}
+            error={errors.userAgent}
+            hint={<Trans>Sent on every HLS request. Not a secret; exported with the config.</Trans>}
+            onChange={(next): void => {
+              setForm({ ...form, userAgent: next });
+            }}
+          />
+          <FormField
+            id="source-referrer"
+            label={t`Referer header (optional)`}
+            value={form.referrer}
+            error={errors.referrer}
+            onChange={(next): void => {
+              setForm({ ...form, referrer: next });
+            }}
+          />
+        </>
+      ) : null}
       <SelectField<CaptionsMode>
         label={t`Captions`}
         value={form.captionsMode}
@@ -926,11 +956,42 @@ function epgModeLabel(mode: EpgModeChoice): JSX.Element {
   }
 }
 
+function isSourceFormState(value: unknown): value is SeedForm {
+  return typeof value === 'object' && value !== null && 'kind' in value && 'extra' in value;
+}
+
+/** Read the “Add as source” seed the IPTV-ORG browser leaves in router state. */
+function readIptvSeed(state: unknown): { ts: number; form: SeedForm } | undefined {
+  if (typeof state !== 'object' || state === null || !('iptvSeed' in state)) {
+    return undefined;
+  }
+  const seed = state.iptvSeed;
+  if (typeof seed !== 'object' || seed === null || !('ts' in seed) || !('form' in seed)) {
+    return undefined;
+  }
+  // The seed is produced by our own browser page (toSourceForm) in router state.
+  return typeof seed.ts === 'number' && isSourceFormState(seed.form)
+    ? { ts: seed.ts, form: seed.form }
+    : undefined;
+}
+
 /** Sources management (ingest). */
 export function SourcesPage(): JSX.Element {
   const { t } = useLingui();
   const sources = useSources();
   const tiles = useLiveTiles();
+  const links = useCatalogueLinks();
+  const linkBySource = new Map((links.data?.links ?? []).map((l) => [l.source_id, l]));
+  // "Add as source" from /sources/iptv-org arrives as router state; each distinct
+  // timestamp opens the create dialog once, prefilled (nothing is saved yet).
+  const location = useLocation();
+  const [seed, setSeed] = useState<CrudSeed<SeedForm> | undefined>(undefined);
+  const [seenTs, setSeenTs] = useState<number | undefined>(undefined);
+  const incoming = readIptvSeed(location.state);
+  if (incoming !== undefined && incoming.ts !== seenTs) {
+    setSeenTs(incoming.ts);
+    setSeed({ key: incoming.ts, creating: true, form: incoming.form });
+  }
 
   const columns = (
     onEdit: (row: SourceView) => void,
@@ -969,6 +1030,22 @@ export function SourcesPage(): JSX.Element {
       ),
       cell: (ctx): JSX.Element => (
         <SourceStatusCell tile={tileForSource(tiles, ctx.row.original.id)} />
+      ),
+    },
+    {
+      id: 'link',
+      header: t`Link`,
+      cell: (ctx): JSX.Element => (
+        <div className="flex flex-col gap-1">
+          <LinkCell link={linkBySource.get(ctx.row.original.id)} />
+          <LinkActions
+            sourceId={ctx.row.original.id}
+            sourceName={ctx.row.original.name}
+            locator={ctx.row.original.locator}
+            link={linkBySource.get(ctx.row.original.id)}
+          />
+          <SourceNetworkAction sourceId={ctx.row.original.id} sourceName={ctx.row.original.name} />
+        </div>
       ),
     },
     {
@@ -1026,9 +1103,15 @@ export function SourcesPage(): JSX.Element {
       emptyMessage={<Trans>No sources configured.</Trans>}
       loadingMessage={<Trans>Loading sources…</Trans>}
       errorPrefix={<Trans>Could not load sources:</Trans>}
+      seed={seed}
       headerExtras={
         <>
           <M3uImportButton />
+          <Button asChild variant="outline">
+            <Link to="/sources/iptv-org">
+              <Trans>Browse IPTV-ORG</Trans>
+            </Link>
+          </Button>
           <ExportConfigButton compact />
         </>
       }
@@ -1112,6 +1195,7 @@ export function SourcesPage(): JSX.Element {
             }}
           />
           <SourceKindFields form={form} setForm={setForm} errors={errors} />
+          <OriginPanel form={form} setForm={setForm} />
           <SourceAdvancedFields form={form} setForm={setForm} errors={errors} />
         </>
       )}

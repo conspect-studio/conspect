@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use multiview_audio::store::{audio_decode_loop, AudioStore};
+use multiview_audio::store::AudioStore;
 use multiview_audio::{AudioFormat, ChannelLayout, ToneGenerator};
 use multiview_core::time::Rational;
 
@@ -947,6 +947,10 @@ pub(crate) struct AudioIngestPlan {
     pub(crate) lifecycle: u64,
     /// Startup audio is not gated by a live-edit replacement marker.
     pub(crate) anchor_floor: u64,
+    /// Operator HLS `user_agent`/`referrer`, sent on every request this rail
+    /// makes (master fetch for the audio pin and libav's own opens). Empty for
+    /// every other source kind.
+    pub(crate) http_headers: multiview_ffmpeg::HttpHeaders,
 }
 
 /// How long [`await_shared_url`] waits for the video's fetcher.
@@ -1015,6 +1019,7 @@ fn await_shared_url(
 /// pace nor stall the output clock (invariant #1) nor back-pressure the engine
 /// (invariant #10); a wedged libav network call is bounded by the supervisor's
 /// detach-on-grace teardown, exactly as for video.
+#[allow(clippy::too_many_lines)] // one supervised reconnect loop; splitting hides the order
 pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop: &AtomicBool) {
     // Name this source on every line the audio thread emits: our own (the span)
     // and libav's synchronous lines (the thread-local resource context the log
@@ -1072,14 +1077,22 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         let pinned = if shared.is_some() {
             shared
         } else if plan.live && is_hls {
-            crate::pipeline::resolve_hls_audio_url(&plan.location)
+            crate::pipeline::resolve_hls_audio_url_with_headers(&plan.location, &plan.http_headers)
         } else {
             None
+        };
+        // The shared copy is served from loopback memory: no origin request, so
+        // no origin headers. Otherwise libav opens the origin and carries them.
+        let open_headers = if shared_fetch {
+            multiview_ffmpeg::HttpHeaders::default()
+        } else {
+            plan.http_headers.clone()
         };
         tracing::info!(
             source = %plan.id,
             location = %pinned.as_deref().unwrap_or(&plan.location),
             shared_fetch,
+            request_headers_set = !open_headers.is_empty(),
             "live audio: opening"
         );
         let location = std::path::Path::new(pinned.as_deref().unwrap_or(&plan.location));
@@ -1107,9 +1120,16 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
                 },
                 Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
                 &plan.id,
+                &open_headers,
             );
         } else {
-            audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
+            multiview_audio::store::audio_decode_loop_with_headers(
+                location,
+                ChannelLayout::Stereo,
+                store,
+                stop,
+                &open_headers,
+            );
         }
         let ran_for = started.elapsed();
         if !plan.live || stop.load(Ordering::Acquire) {

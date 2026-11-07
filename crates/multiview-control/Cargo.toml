@@ -174,6 +174,12 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ], optional = true }
 
+# Pure-Rust HLS/SCTE parsers reused by the deep probe (no native deps, no new
+# third-party crates; feature-free so it never links libav).
+multiview-input = { workspace = true }
+# Safe libav wrappers for the probe's media stage (only with `catalogue-ffmpeg`).
+multiview-ffmpeg = { workspace = true, optional = true }
+
 # The WHATWG URL parser — the SAME one reqwest resolves hosts through — so the
 # `zowietek` transport's SSRF screen (SEC-02, CWE-918) canonicalizes a device
 # URL's host to the exact `IpAddr` reqwest will dial (incl. alt-encoded IPv4
@@ -181,6 +187,18 @@ reqwest = { version = "0.12", default-features = false, features = [
 # off-by-default (behind `zowietek`) so it stays out of the scanned default
 # graph (`deny.toml [graph] all-features = false`).
 url = { version = "2", optional = true }
+
+# Certificate facts (subject / issuer / expiry) for the network-path diagnostics
+# (docs/io/iptv-org.md §3a). Pure Rust, already in the lock via rcgen; only built
+# with the `catalogue` feature.
+x509-parser = { version = "0.18", optional = true }
+
+# Real DNS facts (CNAME chain, A/AAAA with TTL, the resolver used) for the
+# network-path diagnostics. Plain UDP/TCP stub resolver on the system
+# configuration: default features minus nothing but TLS/DoH/DNSSEC are NOT
+# enabled, so no OpenSSL and no native library. Only built with `catalogue`.
+# MIT OR Apache-2.0.
+hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"], optional = true }
 
 # The live CASTV2 wire layer for the `cast` managed-device driver: OFF by
 # default (`cast` / `devices-net`). The typed protocol payloads, the media-URL
@@ -329,6 +347,16 @@ tokio-rustls = "0.26"
 # (`ReqwestTransport`) needs this feature, so the default build stays
 # pure-Rust/socket-free and CI-green.
 "zowietek" = ["dep:reqwest", "dep:url"]
+# Off-by-default IPTV-ORG source browser network I/O (ADR-M015, docs/io/iptv-org.md):
+# the catalogue sync HTTP client (fixed iptv-org host) and the deep probe's guarded
+# client + HLS/SCTE parsing. The model/join/index/store/link-tracker/routes are
+# pure Rust and ALWAYS compiled (so the OpenAPI document lists them in every build
+# and `xtask` needs no TLS stack); without this feature refresh/probe answer an
+# honest 503. Pure Rust (reqwest + rustls, no native lib).
+"catalogue" = ["iptv-net", "dep:reqwest", "dep:url", "dep:x509-parser", "dep:hickory-resolver", "dep:tokio-rustls"]
+# The probe's stage-4 media check (demux + decode via the safe `multiview-ffmpeg`
+# wrappers). Without it the probe honestly reports stage 4 as `skipped`.
+"catalogue-ffmpeg" = ["catalogue", "dep:multiview-ffmpeg", "multiview-ffmpeg/ffmpeg"]
 # Off-by-default live CASTV2 wire layer for the `cast` managed-device driver
 # (DEV-D2, ADR-M011). The protocol payloads + media-URL rules + session actor
 # + registry wiring are ALWAYS compiled and tested socket-free over the
@@ -374,3 +402,28 @@ required-features = ["tls"]
 
 [lints]
 workspace = true
+
+[[test]]
+# Catalogue routes/sync run against a local fixture server over reqwest.
+name = "catalogue_routes"
+required-features = ["catalogue"]
+
+[[test]]
+# Deep-probe tests: local ::1 fixture server + the test-only dial-guard seam.
+name = "catalogue_probe"
+required-features = ["catalogue"]
+
+[[test]]
+# Hostile-fixture chaos tests proving the probe bounds hold.
+name = "catalogue_chaos"
+required-features = ["catalogue"]
+
+[[test]]
+# Link tracker end-to-end (events, health warning, follow=auto write path).
+name = "catalogue_links"
+required-features = ["catalogue"]
+
+[[test]]
+# Network-path diagnostics (§3a) against the [::1] fixture server.
+name = "catalogue_netdiag"
+required-features = ["catalogue"]

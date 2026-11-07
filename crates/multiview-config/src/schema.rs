@@ -737,6 +737,14 @@ pub enum SourceKind {
     Hls {
         /// Playlist URL.
         url: String,
+        /// Optional `User-Agent` request header (printable, no CR/LF, <= 1 KiB).
+        /// Passed to libav as the `user_agent` `AVOption`. Not a secret.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
+        /// Optional `Referer` request header (printable, no CR/LF, <= 1 KiB).
+        /// Passed to libav as the `referer` `AVOption`. Not a secret.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        referrer: Option<String>,
     },
     /// `YouTube` live, bound by a watch/live/channel URL (ADR-0015).
     ///
@@ -1058,6 +1066,10 @@ pub struct Source {
     /// ingest, or decode path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playlist_metadata: Option<PlaylistMetadata>,
+    /// Optional provenance: the external catalogue entry this source was linked
+    /// from (IPTV-ORG, ADR-M015). Purely informational to the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SourceOrigin>,
 }
 
 /// Per-source event observation configuration (ADR-0183).
@@ -1475,6 +1487,45 @@ fn validate_http_url(
         )));
     }
     Ok(())
+}
+
+/// How a linked source follows upstream catalogue changes (ADR-M015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginFollow {
+    /// Never act on upstream changes.
+    Manual,
+    /// Notify the operator (default).
+    #[default]
+    Notify,
+    /// Automatically apply same-channel URL/header updates.
+    Auto,
+}
+
+/// Provenance block recording the catalogue entry a source was linked from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SourceOrigin {
+    /// Catalogue provider id (e.g. `iptv-org`).
+    pub provider: String,
+    /// Channel id (`NBC.us`); absent for streams without metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Feed id (`KSHBTV`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<String>,
+    /// The stream URL as linked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_url: Option<String>,
+    /// Catalogue labels at link time (e.g. `Geo-blocked`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// RFC 3339 link timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_at: Option<String>,
+    /// How to follow upstream changes.
+    #[serde(default)]
+    pub follow: OriginFollow,
 }
 
 /// Per-source wall-clock configuration (ADR-0038, SYNC-0): the operator's

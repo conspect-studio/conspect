@@ -625,6 +625,11 @@ pub struct AppState {
     /// derived and the cast-session routes refuse with an honest `409`.
     /// Read-only control-plane state (invariant #10).
     pub cast_delivery: Option<Arc<CastDelivery>>,
+    /// The IPTV-ORG source-browser catalogue (ADR-M015): sync state, joined index,
+    /// link tracker. `None` when not wired (routes answer an honest `503`).
+    pub catalogue: Option<Arc<crate::catalogue::Catalogue>>,
+    /// The IPTV-ORG deep-probe service (bounded; control plane only).
+    pub catalogue_probe: Option<Arc<crate::catalogue::probe::ProbeService>>,
     /// The outbound-dial SSRF policy (SEC-02/SEC-04, CWE-918) the managed-device
     /// poller and Cast session actor screen each resolved dial IP against. The
     /// non-breaking default
@@ -973,6 +978,8 @@ impl AppState {
             device_drivers: Arc::new(DeviceDriverRegistry::new()),
             device_pollers: Arc::new(DevicePollerRegistry::new()),
             cast_delivery: None,
+            catalogue: None,
+            catalogue_probe: None,
             // Non-breaking default: LAN devices (private/ULA/carrier) stay
             // dialable, never-legitimate ranges stay blocked. An operator
             // `control.device_dial_allow` allowlist tightens it (SEC-02/SEC-04).
@@ -1731,6 +1738,18 @@ impl AppState {
         policy: Arc<multiview_config::device::net_guard::DialPolicy>,
     ) -> Self {
         self.dial_policy = policy;
+        self
+    }
+
+    /// Install the IPTV-ORG catalogue and deep-probe services (ADR-M015).
+    #[must_use]
+    pub fn with_catalogue(
+        mut self,
+        catalogue: Arc<crate::catalogue::Catalogue>,
+        probe: Arc<crate::catalogue::probe::ProbeService>,
+    ) -> Self {
+        self.catalogue = Some(catalogue);
+        self.catalogue_probe = Some(probe);
         self
     }
 

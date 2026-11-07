@@ -411,6 +411,10 @@ pub enum WarningCode {
     RistLinkLoss,
     /// A container is configured for multicast without host networking. Latched at startup.
     ContainerNoHostNetworking,
+    /// One or more sources linked to an IPTV-ORG catalogue entry need attention
+    /// (stream removed, channel closed, blocklisted, updated, or edited). Aggregate
+    /// warning (one coalescing key); cleared when every link is back in sync.
+    CatalogueLinkAttention,
 }
 
 /// Which end of a RIST link a [`RistLinkStats`] sample describes.
@@ -543,6 +547,7 @@ impl WarningCode {
             Self::ConfigFileApplyIncomplete => "config-file-apply-incomplete",
             Self::RistLinkLoss => "rist-link-loss",
             Self::ContainerNoHostNetworking => "container-no-host-networking",
+            Self::CatalogueLinkAttention => "catalogue-link-attention",
         }
     }
 }
@@ -851,6 +856,33 @@ impl MediaPlayerEvent {
         self.asset = Some(asset.into());
         self
     }
+}
+
+/// A linked source's catalogue link status changed (IPTV-ORG, ADR-M015 slice D).
+///
+/// Lossless low-rate lifecycle fact on topic `inputs`, scoped by the **source id**
+/// (the object axis, so a cam1-scoped principal never sees another source's link
+/// state). Carries only identifiers and the status token — the diff/alternatives
+/// are read from `GET /api/v1/catalogues/iptv-org/links`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogueLinkStatus {
+    /// The linked source's id (the authorization object).
+    pub source_id: String,
+    /// New status (`in_sync`, `updated`, `stream_removed`, `channel_closed`,
+    /// `blocklisted`, `unlinked`, `edited`).
+    pub status: String,
+    /// Previous status, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// Linked channel id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Linked feed id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<String>,
+    /// Replacement channel (for `channel_closed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
 }
 
 // ---- Devices realtime surface (ADR-RT007, managed-devices.md §2.1/§7) ----
@@ -1721,6 +1753,13 @@ pub enum Event {
     #[serde(rename = "graphics.channel_state")]
     GraphicsChannelState(GraphicsChannelEvent),
 
+    // ---- Catalogue link tracker (topic `inputs`, IPTV-ORG slice D) ----
+    /// A source linked to an external catalogue entry changed link status
+    /// (topic `inputs`, envelope `id` = source id). Lossless; see
+    /// [`CatalogueLinkStatus`].
+    #[serde(rename = "catalogue.link_status")]
+    CatalogueLinkStatus(CatalogueLinkStatus),
+
     // ---- Devices realtime surface (topic `devices`, ADR-RT007) ----
     /// Conflated latest-wins per-device runtime snapshot (envelope `id` =
     /// device id). Excluded from the lossless replay ring per event type
@@ -1805,6 +1844,7 @@ impl Event {
             Self::SalvoCancelled(_) => "salvo.cancelled",
             Self::MediaPlayerState(_) => "media.player_state",
             Self::GraphicsChannelState(_) => "graphics.channel_state",
+            Self::CatalogueLinkStatus(_) => "catalogue.link_status",
             Self::DeviceStatus(_) => "device.status",
             Self::DeviceAdopted(_) => "device.adopted",
             Self::DeviceRemoved(_) => "device.removed",
@@ -1891,6 +1931,9 @@ impl Event {
             // leak class to a cam1-scoped principal.
             Self::InputStreams(e) => AuthzScope::Object(&e.input_id),
             Self::InputConnection(e) => AuthzScope::Object(&e.input_id),
+            // A catalogue link status is per linked source: the same object axis as
+            // the source's `GET /sources/{id}` (BOLA, ADR-W026).
+            Self::CatalogueLinkStatus(e) => AuthzScope::Object(&e.source_id),
 
             // ---- Object+output-scoped salvo lane (ADR-W026) ----
             // The REST twin gates BOTH axes when a head is addressed

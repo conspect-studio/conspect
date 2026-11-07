@@ -27,6 +27,7 @@ pub mod alarms;
 pub mod audio;
 pub mod audit;
 pub mod cast_sessions;
+pub(crate) mod catalogue;
 pub mod config;
 pub mod devices;
 pub mod discovery;
@@ -1065,6 +1066,22 @@ fn resource_router() -> Router<AppState> {
                 .put(update_layout)
                 .delete(delete_layout),
         )
+        // IPTV-ORG source browser (ADR-M015): status/index/places/links/logos/probes
+        // (read), probes POST (write), refresh/import (administer). All per-caller
+        // scoped; control plane only.
+        .route("/catalogues/iptv-org/status", get(catalogue::get_status))
+        .route("/catalogues/iptv-org/index", get(catalogue::get_index))
+        .route("/catalogues/iptv-org/places", get(catalogue::get_places))
+        .route("/catalogues/iptv-org/links", get(catalogue::get_links))
+        .route("/catalogues/iptv-org/logos/{k}", get(catalogue::get_logo))
+        .route("/catalogues/iptv-org/refresh", post(catalogue::post_refresh))
+        .route(
+            "/catalogues/iptv-org/import",
+            post(catalogue::post_import)
+                .layer(axum::extract::DefaultBodyLimit::max(catalogue::IMPORT_BODY_LIMIT)),
+        )
+        .route("/catalogues/iptv-org/probes", post(catalogue::post_probe))
+        .route("/catalogues/iptv-org/probes/{id}", get(catalogue::get_probe))
         // Sources resource CRUD (managed inputs), mirroring layouts.
         .route("/sources", get(sources::list_sources))
         .route("/sources/import/m3u", post(iptv::import_m3u))
@@ -1076,6 +1093,7 @@ fn resource_router() -> Router<AppState> {
                 .put(sources::update_source)
                 .delete(sources::delete_source),
         )
+        .route("/sources/{id}/network", post(catalogue::post_source_network))
         // Graphics (CG): data sources, templates, items, playout channels.
         .route("/graphics/data-sources", get(graphics::list_data_sources))
         .route(

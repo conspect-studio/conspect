@@ -69,3 +69,54 @@ fn valid_outputs_pass_validation() {
         .validate()
         .expect("valid ndi (no codec field exists)");
 }
+
+#[test]
+fn hls_headers_and_origin_round_trip_and_validate() {
+    let s = source(serde_json::json!({
+        "id": "k", "kind": "hls", "url": "https://h/x.m3u8",
+        "user_agent": "Mozilla/5.0", "referrer": "https://h/",
+        "origin": { "provider": "iptv-org", "channel": "KAKE.us", "feed": "SD",
+                    "stream_url": "https://h/x.m3u8", "labels": ["Geo-blocked"],
+                    "linked_at": "2026-11-07T05:00:00Z" }
+    }));
+    s.validate().expect("valid");
+    let origin = s.origin.as_ref().expect("origin");
+    assert_eq!(origin.follow, multiview_config::OriginFollow::Notify);
+    let toml = toml::to_string(&s).expect("toml");
+    assert!(
+        toml.contains("[origin]") && toml.contains("user_agent"),
+        "{toml}"
+    );
+    let back: Source = toml::from_str(&toml).expect("round trip");
+    assert_eq!(back, s);
+}
+
+#[test]
+fn source_without_origin_serializes_no_origin_block() {
+    let s = source(serde_json::json!({ "id": "k", "kind": "hls", "url": "https://h/x" }));
+    let toml = toml::to_string(&s).expect("toml");
+    assert!(
+        !toml.contains("origin") && !toml.contains("user_agent"),
+        "{toml}"
+    );
+}
+
+#[test]
+fn hls_header_with_crlf_or_oversize_fails_validation() {
+    for (field, value) in [
+        ("user_agent", "bad\r\nX-Evil: 1".to_owned()),
+        ("referrer", "bad\nvalue".to_owned()),
+        ("user_agent", "a".repeat(1025)),
+        ("user_agent", String::new()),
+    ] {
+        let s = source(serde_json::json!({
+            "id": "k", "kind": "hls", "url": "https://h/x", field: value
+        }));
+        let err = s.validate().expect_err("must fail");
+        assert!(err.to_string().contains(field), "{err}");
+    }
+    let ok = source(serde_json::json!({
+        "id": "k", "kind": "hls", "url": "https://h/x", "user_agent": "a".repeat(1024)
+    }));
+    ok.validate().expect("1 KiB is allowed");
+}
