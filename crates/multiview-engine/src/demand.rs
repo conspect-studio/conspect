@@ -2444,7 +2444,7 @@ mod tests {
     }
 
     /// Lease churn on a ready source. `DEMAND_LEASE_CYCLES` sets the count so
-    /// an external malloc counter (LD_PRELOAD) can difference two runs for
+    /// an external malloc counter (`LD_PRELOAD`) can difference two runs for
     /// the per-lease allocation figure; it defaults to a small smoke count.
     #[test]
     fn lease_cycles_on_a_ready_source_leave_nothing_behind() {
