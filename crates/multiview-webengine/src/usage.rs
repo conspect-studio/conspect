@@ -19,7 +19,7 @@ use crate::fsroot::FsRoot;
 use crate::job::JobPhase;
 use crate::process_tree::{
     ratio_to_f32, sample_process_tree, ticks_to_seconds, PreviousSweep, ProcessTreeSample,
-    TypeAccountingArray, TypeSecondsArray, TYPE_COUNT,
+    TreeSample, TypeAccountingArray, TypeSecondsArray, TYPE_COUNT,
 };
 use crate::scope::{Generation, ScopeOwner, ScopeRegistry};
 
@@ -289,6 +289,15 @@ impl Sampler {
     /// whose counter dropped is not booked as exited — so a per-type breakdown
     /// stays truthful while the cumulative figure stays monotonic.
     ///
+    /// The **root's** identity is tracked the same way, from the first sample on
+    /// ([`PreviousSweep::root`]): a sweep whose root pid now carries a different
+    /// `starttime` returns [`TreeSample::RootGone`], and the sampler keeps no
+    /// state from it — the scope is over and the caller retires it and registers
+    /// a new generation rather than charging the impostor to the old owner.
+    /// Keeping the retained state (rather than resetting it to the impostor)
+    /// means a root that is still the wrong process keeps reporting `RootGone`
+    /// until the caller acts.
+    ///
     /// # Errors
     ///
     /// [`crate::error::Error::Io`] or [`crate::error::Error::Parse`] when the
@@ -297,10 +306,12 @@ impl Sampler {
         &mut self,
         fs: &F,
         root: crate::fsroot::Pid,
-    ) -> Result<ProcessTreeSample> {
+    ) -> Result<TreeSample> {
         let sample = sample_process_tree(fs, root, self.previous_sweep.as_ref())?;
-        // Keep only the compact per-pid state, never a clone of the sample.
-        self.previous_sweep = Some(PreviousSweep::from_sample(&sample));
+        if let TreeSample::Sampled(reading) = &sample {
+            // Keep only the compact per-pid state, never a clone of the sample.
+            self.previous_sweep = Some(PreviousSweep::from_sample(reading));
+        }
         Ok(sample)
     }
 

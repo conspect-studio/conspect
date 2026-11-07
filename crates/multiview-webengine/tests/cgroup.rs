@@ -23,9 +23,9 @@ use std::fs;
 
 use common::{FakeRoot, RecordingRoot};
 use multiview_webengine::{
-    delegation_status, plan_leaf_move, probe_child_name, probe_child_path, read_cgroup_usage,
-    ControllerSet, DelegationReport, FailureAction, LeafMoveStep, NotDelegated,
-    DELEGATION_PROBE_PREFIX, REQUIRED_CONTROLLERS,
+    delegation_status, plan_leaf_move, plan_with_rollback, probe_child_name, probe_child_path,
+    read_cgroup_usage, rollback_for, ControllerSet, DelegationReport, FailureAction, LeafMoveStep,
+    NotDelegated, DELEGATION_PROBE_PREFIX, REQUIRED_CONTROLLERS,
 };
 
 /// A tempdir standing in for a delegated service cgroup.
@@ -189,6 +189,60 @@ fn an_eexist_create_is_retried_once_with_a_fresh_name() {
 }
 
 #[test]
+fn a_probe_directory_it_did_not_create_is_left_alone() {
+    // LOW: the failure path after the second failed create did an unconditional
+    // `rmdir`, which could delete a directory this call never made (another
+    // caller's, or a concurrent probe's). Only remove what THIS call created.
+    //
+    // The fake models a hierarchy where the probe cannot create anything, so
+    // both attempts fail and the pre-existing directory must survive.
+    let root = RecordingRoot::new(FakeRoot {
+        allow_create: false,
+        allow_remove: false,
+        ..FakeRoot::permissive().with_file(
+            "sys/fs/cgroup/conspect.service/cgroup.controllers",
+            "cpu memory pids\n",
+        )
+    });
+    let report = delegation_status(&root, "sys/fs/cgroup/conspect.service").expect("a probe");
+    assert_eq!(report.reason(), Some(NotDelegated::CannotCreateChild));
+    let writes = root.writes();
+    assert!(
+        writes.iter().all(|write| write.starts_with("create ")),
+        "no rmdir may be attempted for a directory this call did not create: {writes:?}"
+    );
+    assert!(
+        !writes.iter().any(|write| write.starts_with("remove ")),
+        "the pre-existing probe directory survives: {writes:?}"
+    );
+}
+
+#[test]
+fn a_second_failed_create_does_not_remove_the_directory_that_held_the_name() {
+    // The EEXIST retry path: the FIRST create failed because a stale probe holds
+    // the name, the retry fails for a real reason. The stale directory is not
+    // ours, so it must not be removed — even though this call did try to create
+    // it once.
+    let root = RecordingRoot::new(FakeRoot {
+        eexist_creates: 1,
+        allow_create: false,
+        allow_remove: true,
+        ..FakeRoot::permissive().with_file(
+            "sys/fs/cgroup/conspect.service/cgroup.controllers",
+            "cpu memory pids\n",
+        )
+    });
+    let report = delegation_status(&root, "sys/fs/cgroup/conspect.service").expect("a probe");
+    assert_eq!(report.reason(), Some(NotDelegated::CannotCreateChild));
+    let writes = root.writes();
+    assert_eq!(writes.len(), 2, "one EEXIST attempt, one retry: {writes:?}");
+    assert!(
+        writes.iter().all(|write| write.starts_with("create ")),
+        "neither failed create authorises a removal: {writes:?}"
+    );
+}
+
+#[test]
 fn a_failing_probe_makes_a_best_effort_removal() {
     // The probe created its directory, then could not remove it: it must not
     // simply walk away, so a second best-effort `rmdir` is attempted.
@@ -219,25 +273,183 @@ fn a_failing_probe_makes_a_best_effort_removal() {
 }
 
 #[test]
-fn a_failed_verify_step_aborts_and_enables_no_controller() {
-    let steps = plan_leaf_move("/sys/fs/cgroup/conspect.service", 4242);
-    let verify = steps
+fn a_failed_verify_step_rolls_back_and_enables_no_controller() {
+    let steps = plan_with_rollback("/sys/fs/cgroup/conspect.service", 4242);
+    let verify_index = steps
         .iter()
-        .find(|step| matches!(step, LeafMoveStep::VerifyParentEmpty { .. }))
+        .position(|step| matches!(step, LeafMoveStep::VerifyParentEmpty { .. }))
         .expect("a verify_parent_empty step");
     assert_eq!(
-        verify.on_failure(),
-        FailureAction::AbortAndStay,
-        "a failed verify aborts and stays: no controller is enabled"
+        steps.get(verify_index).map(LeafMoveStep::on_failure),
+        Some(FailureAction::AbortAfterRollback),
+        "a failed verify rolls back and stays: no controller is enabled"
     );
-    // Every step aborts: a failure anywhere leaves the process where it was.
+    // Every step rolls back before aborting: a failure anywhere leaves the
+    // process where it was *before the plan*, not merely stopped in place.
     for step in &steps {
-        assert_eq!(step.on_failure(), FailureAction::AbortAndStay, "{step:?}");
+        assert_eq!(
+            step.on_failure(),
+            FailureAction::AbortAfterRollback,
+            "{step:?}"
+        );
     }
-    // And the abort is meaningful: the controller enables follow the verify.
+    // The undo of the move precedes the verify that may require it: "abort and
+    // stay" cannot undo a move that has already happened.
     let labels: Vec<&str> = steps.iter().map(LeafMoveStep::label).collect();
     let index_of = |label: &str| labels.iter().position(|l| *l == label).expect("a step");
+    assert!(
+        index_of("move_self") < index_of("move_self_back"),
+        "the move's undo is in the plan"
+    );
+    assert!(
+        index_of("move_self_back") < index_of("verify_parent_empty"),
+        "the undo of the move runs before the verify that may fail"
+    );
     assert!(index_of("verify_parent_empty") < index_of("enable_controller"));
+    assert!(
+        index_of("remove_leaf") < index_of("enable_controller"),
+        "the leaf's undo is in the plan too"
+    );
+}
+
+#[test]
+fn a_failure_at_each_step_rolls_back_exactly_the_steps_that_ran() {
+    // MEDIUM: MoveSelf precedes VerifyParentEmpty, so the plan must model the
+    // rollback explicitly. For each step, the rollback sequence is exactly the
+    // undo steps before it; nothing after the failure may run.
+    let parent = "/sys/fs/cgroup/conspect.service";
+    let plan = plan_with_rollback(parent, 4242);
+
+    // (1) create_leaf fails: nothing was changed, so there is nothing to undo.
+    assert!(rollback_for(&plan, 0).is_empty(), "create_leaf");
+    // (2) move_self fails: the move did not complete, so no move_self_back.
+    assert!(rollback_for(&plan, 1).is_empty(), "move_self");
+    // (3) move_self_back itself fails (already rolling back): stop, do not loop.
+    assert!(
+        rollback_for(&plan, 2).is_empty(),
+        "a rollback step has nothing further to undo"
+    );
+    // (4) verify_parent_empty fails AFTER the move completed: undo the move.
+    let rollback = rollback_for(&plan, 3);
+    assert_eq!(
+        rollback,
+        vec![LeafMoveStep::MoveSelfBack {
+            pid: 4242,
+            to: std::path::PathBuf::from(format!("{parent}/cgroup.procs")),
+        }],
+        "a verify failure after MoveSelf puts us back in the parent"
+    );
+    // (5) verify_delegation_in_place fails: same undo (the move is still the
+    // only completed mutation that needs one).
+    assert_eq!(
+        rollback_for(&plan, 4),
+        rollback,
+        "verify_delegation_in_place"
+    );
+    // (6) remove_leaf itself fails: only the move (which already completed, at
+    // index 1) needs undoing. A rollback step never re-runs itself.
+    assert_eq!(
+        rollback_for(&plan, 5)
+            .iter()
+            .map(LeafMoveStep::label)
+            .collect::<Vec<_>>(),
+        vec!["move_self_back"],
+        "a failing rollback step does not re-run itself"
+    );
+    // (7) the first enable_controller fails: the leaf was created (index 0) and
+    // the move completed (index 1), so both undos run — and the move comes out
+    // first, because a cgroup holding a process cannot be removed.
+    let rollback = rollback_for(&plan, 6);
+    assert_eq!(
+        rollback.iter().map(LeafMoveStep::label).collect::<Vec<_>>(),
+        vec!["move_self_back", "remove_leaf"],
+        "an enable failure also removes the leaf that was created"
+    );
+    assert_eq!(
+        rollback.first(),
+        Some(&LeafMoveStep::MoveSelfBack {
+            pid: 4242,
+            to: std::path::PathBuf::from(format!("{parent}/cgroup.procs")),
+        }),
+    );
+    // (8) a later enable fails exactly like the first.
+    assert_eq!(
+        rollback_for(&plan, plan.len() - 1)
+            .iter()
+            .map(LeafMoveStep::label)
+            .collect::<Vec<_>>(),
+        vec!["move_self_back", "remove_leaf"],
+        "the last enable rolls back the same way"
+    );
+    // Running every step means both undos are available; past the end there is
+    // nothing left to undo, and neither case panics.
+    assert_eq!(
+        rollback_for(&plan, plan.len())
+            .iter()
+            .map(LeafMoveStep::label)
+            .collect::<Vec<_>>(),
+        vec!["move_self_back", "remove_leaf"],
+        "a plan that ran to the end has both undos"
+    );
+    assert_eq!(
+        rollback_for(&plan, plan.len().saturating_add(5)),
+        Vec::new()
+    );
+}
+
+#[test]
+fn a_rolled_back_plan_never_enables_a_controller() {
+    // The rollback steps must all precede every controller enable, so a failure
+    // can never leave a controller on while the process is back in the parent.
+    let plan = plan_with_rollback("/sys/fs/cgroup/conspect.service", 4242);
+    let labels: Vec<&str> = plan.iter().map(LeafMoveStep::label).collect();
+    let first_enable = labels
+        .iter()
+        .position(|label| *label == "enable_controller")
+        .expect("an enable step");
+    for rollback in ["move_self_back", "remove_leaf"] {
+        let index = labels
+            .iter()
+            .position(|label| *label == rollback)
+            .expect("a rollback step");
+        assert!(
+            index < first_enable,
+            "{rollback} at {index} must precede the first enable at {first_enable}"
+        );
+    }
+    // And the forward view carries no rollback steps: `plan_leaf_move` is the
+    // plain ordered decision, `plan_with_rollback` is what an executor runs.
+    assert!(plan_leaf_move("/sys/fs/cgroup/conspect.service", 4242)
+        .iter()
+        .all(|step| !step.is_rollback()));
+    assert!(plan.iter().any(LeafMoveStep::is_rollback));
+}
+
+#[test]
+fn the_plan_runs_before_any_thread_or_child_exists() {
+    // ADR-0099 decision 8: the whole plan runs in `main`, before any thread or
+    // child exists. That is what makes the rollback safe and what makes
+    // `verify_parent_empty` normally pass: the only process the move could have
+    // put in the parent is this one, and the plan takes it back out before the
+    // verify runs.
+    let plan = plan_with_rollback("/sys/fs/cgroup/conspect.service", 4242);
+    let labels: Vec<&str> = plan.iter().map(LeafMoveStep::label).collect();
+    let index_of = |label: &str| labels.iter().position(|l| *l == label).expect("a step");
+    assert_eq!(
+        index_of("move_self_back") + 1,
+        index_of("verify_parent_empty"),
+        "the move is undone immediately before the parent is checked"
+    );
+    // Nothing in the plan waits on, or names, another process: the only pid it
+    // moves is the caller's own.
+    for step in &plan {
+        match step {
+            LeafMoveStep::MoveSelf { pid, .. } | LeafMoveStep::MoveSelfBack { pid, .. } => {
+                assert_eq!(*pid, 4242, "the plan only ever moves the caller's own pid");
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]

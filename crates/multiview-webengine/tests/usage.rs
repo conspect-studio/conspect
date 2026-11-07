@@ -235,7 +235,9 @@ fn the_per_type_cpu_split_names_the_gpu_process() {
     let mut sampler = Sampler::new(Accounting::Estimated);
     let sample = sampler
         .sample_tree(tree.root(), Pid::new(600))
-        .expect("a walk");
+        .expect("a walk")
+        .into_sample()
+        .expect("a live root");
     let seconds = type_cpu_seconds(&sample.by_type);
 
     assert_eq!(

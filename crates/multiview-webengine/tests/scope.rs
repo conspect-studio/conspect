@@ -71,29 +71,61 @@ fn a_registry_snapshots_every_owner_with_its_kind() {
 }
 
 #[test]
-fn a_pool_scope_is_exact_and_never_a_process_tree() {
-    // ADR-0099 decision 11: a pool's own figures are exact, only the per-member
-    // split is estimated.
+fn a_pool_scope_is_exact_only_when_backed_by_a_cgroup() {
+    // ADR-0099 decision 11 says pool figures are exact; that reads as "exact
+    // when the pool has its own cgroup". Pooled is not by itself a claim of
+    // exactness, so the variant carries its backing and `is_exact` follows it.
     let mut registry = ScopeRegistry::new();
-    let pool = owner("pool-1");
-    let generation = registry.next_generation(&pool);
+
+    // (a) A pool with its own delegated cgroup: exact.
+    let exact = owner("pool-1");
+    let generation = registry.next_generation(&exact);
     registry
         .register(ResourceScope::new(
-            pool.clone(),
+            exact.clone(),
             generation,
-            ScopeKind::Pool {
-                id: "sydney".to_owned(),
-            },
+            ScopeKind::exact_pool(
+                "sydney",
+                PathBuf::from("/sys/fs/cgroup/engine/pools/sydney"),
+            ),
         ))
         .expect("registered");
-    let scope = registry.get(&pool).expect("the pool scope");
-    assert!(scope.kind.is_exact());
+    let scope = registry.get(&exact).expect("the exact pool scope");
+    assert!(
+        scope.kind.is_exact(),
+        "a pool with its own cgroup has kernel-exact figures"
+    );
     assert_eq!(
         scope.kind,
         ScopeKind::Pool {
-            id: "sydney".to_owned()
+            id: "sydney".to_owned(),
+            backing: Box::new(ScopeKind::Cgroup(PathBuf::from(
+                "/sys/fs/cgroup/engine/pools/sydney"
+            ))),
         }
     );
+
+    // (b) The same pool name with no cgroup of its own: estimated.
+    let walked = owner("pool-2");
+    let generation = registry.next_generation(&walked);
+    registry
+        .register(ResourceScope::new(
+            walked.clone(),
+            generation,
+            ScopeKind::estimated_pool("sydney", Pid::new(4242)),
+        ))
+        .expect("registered");
+    let scope = registry.get(&walked).expect("the estimated pool scope");
+    assert!(
+        !scope.kind.is_exact(),
+        "a pool with no cgroup of its own is an estimate, however many sources share it"
+    );
+
+    // The two are told apart by their backing alone: same pool id, different
+    // answer.
+    let exact_kind = registry.get(&exact).map(|scope| scope.kind.clone());
+    let walked_kind = registry.get(&walked).map(|scope| scope.kind.clone());
+    assert_ne!(exact_kind, walked_kind, "the backing is the difference");
 }
 
 #[test]
