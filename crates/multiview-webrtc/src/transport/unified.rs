@@ -74,6 +74,14 @@ const MAX_DRAIN_TIME: Duration = Duration::from_millis(2);
 /// the function (rather than an increment the caller bolts on afterwards)
 /// means a regression that stops *calling* the handoff pass can never still
 /// satisfy the handoff counter: there is no second place to fake it.
+///
+/// `cfg(test)`-only (review PR193-04): this origin tag, the parameter that
+/// threads it, and the [`RunProbe::handoff_services`] counter it gates exist
+/// solely so a soak test can assert the handoff fires once per exhausted
+/// budget. None of it is needed for the production servicing pass itself
+/// (which always runs the same work regardless of why it was invoked), so it
+/// must not cost a release build an extra enum/branch/atomic.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceOrigin {
     /// The periodic idle-tick arm (`tick.tick()`).
@@ -118,6 +126,11 @@ struct RunProbe {
     /// assert the handoff itself keeps pace with exhaustions — an idle tick
     /// that happens to also run a service cannot inflate this counter and mask
     /// a regression that drops the explicit handoff.
+    /// `cfg(test)`-only (review PR193-04): nothing in production distinguishes
+    /// the handoff pass from an idle-tick pass (both run identical work), so
+    /// this counter — and the [`ServiceOrigin`] tag that feeds it — would be
+    /// pure unused instrumentation state in a release build.
+    #[cfg(test)]
     handoff_services: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     wake_gate: Option<Arc<tokio::sync::Semaphore>>,
@@ -393,7 +406,9 @@ impl UnifiedEndpoint {
                     Self::service_timers_and_gc(
                         &socket, &mut turn,
                         &mut ingest, &mut serve, preview.as_ref(), &mut push,
-                        local_addr, now, probe, ServiceOrigin::IdleTick,
+                        local_addr, now, probe,
+                        #[cfg(test)]
+                        ServiceOrigin::IdleTick,
                     ).await;
                 }
                 ready = socket.readable() => {
@@ -443,7 +458,9 @@ impl UnifiedEndpoint {
                         Self::service_timers_and_gc(
                             &socket, &mut turn,
                             &mut ingest, &mut serve, preview.as_ref(), &mut push,
-                            local_addr, now, probe, ServiceOrigin::ExhaustionHandoff,
+                            local_addr, now, probe,
+                            #[cfg(test)]
+                            ServiceOrigin::ExhaustionHandoff,
                         ).await;
                         #[cfg(test)]
                         if let Some(gate) = &probe.wake_gate {
@@ -486,16 +503,19 @@ impl UnifiedEndpoint {
         local_addr: SocketAddr,
         now: Instant,
         probe: &RunProbe,
-        origin: ServiceOrigin,
+        #[cfg(test)] origin: ServiceOrigin,
     ) {
         probe.driver_services.fetch_add(1, Ordering::Relaxed);
+        // `cfg(test)`-only (review PR193-04): bumped from INSIDE the servicing
+        // pass itself, gated on the origin the caller threaded through — not by
+        // the caller incrementing a separate counter after the call returns. A
+        // regression that stops invoking this function on the exhaustion path
+        // (or invokes it with the wrong origin) cannot still satisfy this
+        // counter, because there is no other place that increments it (round-2
+        // review finding). Production runs identical work regardless of
+        // origin, so neither the tag nor this counter exists outside tests.
+        #[cfg(test)]
         if origin == ServiceOrigin::ExhaustionHandoff {
-            // Bumped from INSIDE the servicing pass itself, gated on the origin
-            // the caller threaded through — not by the caller incrementing a
-            // separate counter after the call returns. A regression that stops
-            // invoking this function on the exhaustion path (or invokes it with
-            // the wrong origin) cannot still satisfy this counter, because there
-            // is no other place that increments it (round-2 review finding).
             probe.handoff_services.fetch_add(1, Ordering::Relaxed);
         }
         // Drain pending register/release commands for each lane.
