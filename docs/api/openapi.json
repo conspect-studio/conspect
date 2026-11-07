@@ -10781,6 +10781,51 @@
           "unlicensed-build"
         ]
       },
+      "EpgModeDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::EpgMode` (epg-playlist).",
+        "enum": [
+          "automatic",
+          "manual",
+          "disabled"
+        ]
+      },
+      "EpgSourceDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::EpgSource` (epg-playlist):\na source's optional per-source EPG (XMLTV) acquisition block.",
+        "properties": {
+          "allow_private_network": {
+            "type": "boolean",
+            "description": "Whether the feed may resolve to a private/link-local network address."
+          },
+          "channel_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional exact provider channel id (as it appears in the XMLTV feed)."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/EpgModeDoc",
+            "description": "How the guide is obtained. Defaults to `automatic`."
+          },
+          "secret_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional secret-manager reference for the feed's credentials."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional HTTP(S) XMLTV feed URL (credential-free)."
+          }
+        },
+        "additionalProperties": false
+      },
       "FiredBody": {
         "type": "object",
         "description": "The `202` body of a successful salvo fire.",
@@ -12662,6 +12707,41 @@
           "encode"
         ]
       },
+      "PlaylistMetadataDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):\noptional IPTV playlist presentation metadata for a source.",
+        "properties": {
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `group-title`: the playlist section this entry appears under."
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-name`: the channel name an IPTV playlist displays."
+          },
+          "tvg_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional `tvg-id`: the EPG channel id this entry presents."
+          }
+        },
+        "additionalProperties": false
+      },
       "PreviewCapabilities": {
         "type": "object",
         "description": "The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview\ntransports this build can serve, so the SPA picks WHEP vs the JPEG ladder\n(ADR-W020) **before** issuing an offer.",
@@ -13872,6 +13952,17 @@
                 ],
                 "description": "Human-friendly display name."
               },
+              "epg": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EpgSourceDoc",
+                    "description": "Optional per-source EPG (XMLTV) acquisition block (epg-playlist)."
+                  }
+                ]
+              },
               "gpu_pin": {
                 "oneOf": [
                   {
@@ -13889,6 +13980,17 @@
                   "null"
                 ],
                 "description": "Stable input id; may be omitted (the path id is injected)."
+              },
+              "playlist_metadata": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PlaylistMetadataDoc",
+                    "description": "Optional IPTV playlist presentation metadata (epg-playlist)."
+                  }
+                ]
               },
               "wallclock": {
                 "oneOf": [

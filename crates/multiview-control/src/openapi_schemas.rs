@@ -1024,6 +1024,63 @@ pub struct SourceWallClockDoc {
     pub use_: WallClockUseDoc,
 }
 
+/// `OpenAPI` mirror of `multiview_config::EpgMode` (epg-playlist).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EpgModeDoc {
+    /// Resolve the guide automatically. The default.
+    #[default]
+    Automatic,
+    /// Use the explicitly authored `url` and `channel_id`.
+    Manual,
+    /// Do not fetch a guide for this source (retains any configured url/id).
+    Disabled,
+}
+
+/// `OpenAPI` mirror of `multiview_config::EpgSource` (epg-playlist):
+/// a source's optional per-source EPG (XMLTV) acquisition block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct EpgSourceDoc {
+    /// How the guide is obtained. Defaults to `automatic`.
+    #[serde(default)]
+    pub mode: EpgModeDoc,
+    /// Optional HTTP(S) XMLTV feed URL (credential-free).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional exact provider channel id (as it appears in the XMLTV feed).
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// Optional secret-manager reference for the feed's credentials.
+    #[serde(default)]
+    pub secret_ref: Option<String>,
+    /// Whether the feed may resolve to a private/link-local network address.
+    #[serde(default)]
+    pub allow_private_network: bool,
+}
+
+/// `OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):
+/// optional IPTV playlist presentation metadata for a source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct PlaylistMetadataDoc {
+    /// Optional `tvg-id`: the EPG channel id this entry presents.
+    #[serde(default)]
+    pub tvg_id: Option<String>,
+    /// Optional `tvg-name`: the channel name an IPTV playlist displays.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image.
+    #[serde(default)]
+    pub logo: Option<String>,
+    /// Optional `group-title`: the playlist section this entry appears under.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
 /// `OpenAPI` mirror of `multiview_config::Source` — the body accepted by
 /// `POST`/`PUT /api/v1/sources/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1053,6 +1110,12 @@ pub struct SourceBodyDoc {
     /// Wall-clock Use/Discard verb.
     #[serde(default)]
     pub wallclock: Option<SourceWallClockDoc>,
+    /// Optional per-source EPG (XMLTV) acquisition block (epg-playlist).
+    #[serde(default)]
+    pub epg: Option<EpgSourceDoc>,
+    /// Optional IPTV playlist presentation metadata (epg-playlist).
+    #[serde(default)]
+    pub playlist_metadata: Option<PlaylistMetadataDoc>,
 }
 
 /// `OpenAPI` mirror of `multiview_config::audio::OutputAudioMode`.

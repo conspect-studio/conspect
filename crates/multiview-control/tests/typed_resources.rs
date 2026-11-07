@@ -263,6 +263,20 @@ fn openapi_mirrors_accept_what_the_config_types_accept() {
             "gpu_pin": { "vendor": "nvidia", "stable_id": "GPU-uuid" },
             "wallclock": { "use": "discard" }
         }),
+        json!({
+            "id": "s", "kind": "hls", "url": "https://cdn.example.net/live.m3u8",
+            "epg": {
+                "mode": "manual",
+                "url": "https://guide.example.net/xmltv.xml",
+                "channel_id": "bbc1.uk"
+            },
+            "playlist_metadata": {
+                "tvg_id": "bbc1.uk",
+                "name": "BBC One",
+                "logo": "https://logos.example.net/bbc1.png",
+                "group": "UK Terrestrial"
+            }
+        }),
     ];
     for doc in &sources {
         let real: Result<multiview_config::Source, _> = serde_json::from_value(doc.clone());
@@ -425,6 +439,8 @@ fn openapi_mirrors_reject_what_the_config_types_reject() {
     let bad_sources = [
         json!({ "id": "s", "kind": "clock", "face": null }),
         json!({ "id": "s", "kind": "rtsp", "url": "rtsp://h/x", "wallclock": { "use": "maybe" } }),
+        json!({ "id": "s", "kind": "bars", "epg": { "mode": "sometimes" } }),
+        json!({ "id": "s", "kind": "bars", "epg": { "urls": "https://x/y.xml" } }),
     ];
     for doc in &bad_sources {
         assert!(
@@ -923,5 +939,114 @@ async fn rist_applies_live_when_the_engine_build_carries_the_rist_feature() {
             multiview_control::Command::UpsertSource { source, .. } if source.id == "rist1"
         )),
         "RIST with the rist feature must enqueue UpsertSource, got {drained:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// epg-playlist: EPG/playlist-metadata-only edits apply LIVE even on a kind
+// that otherwise only applies on restart (routes::sources::guide_only_change).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn epg_only_edit_applies_live_on_an_otherwise_restart_only_kind() {
+    let mut h = harness();
+    // rtsp is a restart-only kind on the default (no live-network) run — any
+    // OTHER field change on it reports "restart" (proven by the bars->rtsp
+    // kind-change test above). An EPG-only edit must still report "live" and
+    // must NOT enqueue any engine command (no decoder restart).
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            &json!({
+                "name": "Cam 1",
+                "body": { "id": "cam1", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam1" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let _ = h.commands.try_drain();
+
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({
+                "name": "Cam 1",
+                "body": {
+                    "id": "cam1",
+                    "kind": "rtsp",
+                    "url": "rtsp://[2001:db8::1]/cam1",
+                    "epg": {
+                        "mode": "manual",
+                        "url": "https://guide.example.net/xmltv.xml",
+                        "channel_id": "cam1.hd"
+                    },
+                    "playlist_metadata": { "tvg_id": "cam1.hd", "name": "Studio Cam" }
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        apply_header(&resp),
+        "live",
+        "an EPG/playlist-metadata-only edit must never trigger a decoder restart"
+    );
+    let drained = h.commands.try_drain();
+    assert!(
+        drained.is_empty(),
+        "a guide-only edit must enqueue no engine command, got {drained:?}"
+    );
+}
+
+#[tokio::test]
+async fn epg_edit_combined_with_a_media_change_still_requires_restart() {
+    let mut h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            &json!({
+                "name": "Cam 1",
+                "body": { "id": "cam1", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam1" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let _ = h.commands.try_drain();
+
+    // The URL (a media-identity field) changes ALONGSIDE the epg block: this
+    // must take the canonical (restart) path, not the guide-only exemption.
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({
+                "name": "Cam 1",
+                "body": {
+                    "id": "cam1",
+                    "kind": "rtsp",
+                    "url": "rtsp://[2001:db8::2]/cam1",
+                    "epg": { "mode": "manual", "url": "https://guide.example.net/x.xml", "channel_id": "c" }
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        apply_header(&resp),
+        "restart",
+        "a media-identity change must not be masked by an accompanying epg edit"
     );
 }

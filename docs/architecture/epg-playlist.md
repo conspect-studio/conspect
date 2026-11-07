@@ -40,6 +40,12 @@ Measure idle overhead with the feature disabled, repeated catalogue reads with n
 
 Before deployment: independent cross-vendor review, targeted tests, full CI, production-preserving omnibus merge, state capture and rollback artifact. After deployment: verify the public URL, authenticated playlist and XMLTV, an actual player, metadata correspondence, and unchanged active layout/source/audio state.
 
+## Implementation status (this slice)
+
+Shipped and tested: the `Source.epg` (`EpgSource`: mode automatic/manual/disabled, url, channel_id, secret_ref, allow_private_network) and `Source.playlist_metadata` (`PlaylistMetadata`: tvg_id, name, logo, group) config blocks, their structural validation, OpenAPI mirrors, and the web source editor's "Upstream EPG" / "IPTV playlist presentation" fields. `routes::sources::guide_only_change` (present before this slice) already exempts edits to these two keys from the canonical restart-apply path — this slice adds direct integration-test coverage (`epg_only_edit_applies_live_on_an_otherwise_restart_only_kind`, `epg_edit_combined_with_a_media_change_still_requires_restart`) proving a guide-only `PUT` reports `X-Multiview-Apply: live` with **no** engine command enqueued, even on an otherwise restart-only kind (rtsp), and that a concurrent media-identity change is never masked by an accompanying EPG edit.
+
+Deferred to a follow-up slice (not started): the bounded M3U import API/UI (§ "Fetch and resource bounds"), the managed playlist-publication config section and `GET /iptv/playlist.m3u8`, the XMLTV passthrough `GET /iptv/guide.xml` with its background refresher, and the auth decision for those two public endpoints. Operators can author EPG/playlist metadata per source today; nothing yet serves a combined playlist or filtered guide.
+
 ## Review status
 
 The installed model catalogue is stale: its designated Anthropic architecture-review route is unavailable in this session. Reserved design review remains pending; parser and configuration work can proceed independently. Do not represent this document as an approved independent review.

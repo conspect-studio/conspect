@@ -3452,6 +3452,27 @@ export interface components {
          * @enum {string}
          */
         EnforcementLevelDoc: "active" | "warning" | "config-locked" | "watermark" | "block-new-instance" | "unlicensed-build";
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::EpgMode` (epg-playlist).
+         * @enum {string}
+         */
+        EpgModeDoc: "automatic" | "manual" | "disabled";
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::EpgSource` (epg-playlist):
+         *     a source's optional per-source EPG (XMLTV) acquisition block.
+         */
+        EpgSourceDoc: {
+            /** @description Whether the feed may resolve to a private/link-local network address. */
+            allow_private_network?: boolean;
+            /** @description Optional exact provider channel id (as it appears in the XMLTV feed). */
+            channel_id?: string | null;
+            /** @description How the guide is obtained. Defaults to `automatic`. */
+            mode?: components["schemas"]["EpgModeDoc"];
+            /** @description Optional secret-manager reference for the feed's credentials. */
+            secret_ref?: string | null;
+            /** @description Optional HTTP(S) XMLTV feed URL (credential-free). */
+            url?: string | null;
+        };
         /** @description The `202` body of a successful salvo fire. */
         FiredBody: {
             /** @description The queued action id (also the pending-action + audit correlation id). */
@@ -4280,6 +4301,20 @@ export interface components {
          */
         PipelineStage: "decode" | "composite" | "encode";
         /**
+         * @description `OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):
+         *     optional IPTV playlist presentation metadata for a source.
+         */
+        PlaylistMetadataDoc: {
+            /** @description Optional `group-title`: the playlist section this entry appears under. */
+            group?: string | null;
+            /** @description Optional `tvg-logo`: a credential-free HTTP(S) URL to a logo image. */
+            logo?: string | null;
+            /** @description Optional `tvg-name`: the channel name an IPTV playlist displays. */
+            name?: string | null;
+            /** @description Optional `tvg-id`: the EPG channel id this entry presents. */
+            tvg_id?: string | null;
+        };
+        /**
          * @description The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
          *     transports this build can serve, so the SPA picks WHEP vs the JPEG ladder
          *     (ADR-W020) **before** issuing an offer.
@@ -4917,9 +4952,11 @@ export interface components {
             color_override?: null | components["schemas"]["ColorOverrideDoc"];
             /** @description Human-friendly display name. */
             display_name?: string | null;
+            epg?: null | components["schemas"]["EpgSourceDoc"];
             gpu_pin?: null | components["schemas"]["DevicePinDoc"];
             /** @description Stable input id; may be omitted (the path id is injected). */
             id?: string | null;
+            playlist_metadata?: null | components["schemas"]["PlaylistMetadataDoc"];
             wallclock?: null | components["schemas"]["SourceWallClockDoc"];
         };
         /**
