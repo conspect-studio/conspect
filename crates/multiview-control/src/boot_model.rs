@@ -218,10 +218,13 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
     let json = serde_json::to_string(&desired)
         .map_err(|e| ControlError::Repository(format!("serializing desired state: {e}")))?;
     let model = Arc::clone(model);
-    tokio::task::spawn_blocking(move || {
-        let _serial = model.lock_writes();
-        create_state_dir(&model.state_dir()).map_err(AtomicWriteError::BeforeRename)?;
-        write_atomic_commit(&model.state_dir().join(DESIRED_FILE), &json)
+    let result = tokio::task::spawn_blocking({
+        let model = Arc::clone(&model);
+        move || {
+            let _serial = model.lock_writes();
+            create_state_dir(&model.state_dir()).map_err(AtomicWriteError::BeforeRename)?;
+            write_atomic_commit(&model.state_dir().join(DESIRED_FILE), &json)
+        }
     })
     .await
     .map_err(|e| ControlError::Repository(format!("desired-state write task failed: {e}")))?
@@ -232,7 +235,17 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
         AtomicWriteError::AfterRename(e) => ControlError::CommitIndeterminate(format!(
             "desired-state rename is visible but directory sync failed: {e}"
         )),
-    })
+    });
+    // Review R3-03: the rename is visible on disk in BOTH outcomes below (a
+    // plain success, or the indeterminate "renamed but directory sync
+    // failed" case every caller already treats as committed) — swap the
+    // in-memory snapshot to match what a fresh `load_desired` would now
+    // return, under the SAME `lock_config_mutation` every commit serializes
+    // under, so a concurrent reader's lazy load can never race this.
+    if matches!(result, Ok(()) | Err(ControlError::CommitIndeterminate(_))) {
+        model.set_accepted(desired);
+    }
+    result
 }
 
 /// Read the accepted config. Before the first commit (migration of an existing
@@ -246,9 +259,10 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
 /// An invalid record or a failed store composition returns an error.
 pub fn current_desired_config(state: &AppState) -> ControlResult<serde_json::Value> {
     if let Some(model) = &state.boot_model {
-        let config = load_desired(model.boot_path())
+        let config = model
+            .accepted()
             .map_err(ControlError::Repository)?
-            .map_or_else(|| model.adopted_config(), |desired| desired.config);
+            .map_or_else(|| model.adopted_config(), |desired| desired.config.clone());
         return serde_json::to_value(config)
             .map_err(|e| ControlError::Repository(format!("serializing accepted config: {e}")));
     }
@@ -270,8 +284,8 @@ pub fn selected_layout_id(
         .boot_model
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
-        return Ok(desired.selected_layout_id);
+    if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
+        return Ok(desired.selected_layout_id.clone());
     }
     if let Some(selected) = model.selected_layout_id() {
         return Ok(selected);
@@ -423,14 +437,14 @@ pub async fn commit_resource(
             .boot_model
             .as_ref()
             .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-        let prior = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+        let prior = model.accepted().map_err(ControlError::Repository)?;
         let ids = prior.map_or_else(
             || {
                 (0..entries.len())
                     .map(|index| format!("output-{index}"))
                     .collect::<Vec<_>>()
             },
-            |desired| desired.output_ids,
+            |desired| desired.output_ids.clone(),
         );
         if let Some(index) = ids.iter().position(|existing| existing == id) {
             if let Some(body) = replacement.clone() {
@@ -480,14 +494,14 @@ pub async fn commit_resource(
         .boot_model
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+    let previous = model.accepted().map_err(ControlError::Repository)?;
     let mut output_ids = previous.map_or_else(
         || {
             (0..state.outputs.list().map_or(0, |items| items.len()))
                 .map(|index| format!("output-{index}"))
                 .collect::<Vec<_>>()
         },
-        |desired| desired.output_ids,
+        |desired| desired.output_ids.clone(),
     );
     if key == "outputs" {
         if !output_ids.iter().any(|existing| existing == id) {
@@ -562,7 +576,7 @@ async fn commit_desired_document_named(
         .boot_model
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+    let previous = model.accepted().map_err(ControlError::Repository)?;
     if previous.is_none() && !layouts.iter().any(|layout| layout.id == selected_layout_id) {
         layouts.push(crate::repository::Layout {
             id: selected_layout_id.clone(),
@@ -1066,7 +1080,7 @@ pub fn accepted_resources(
     let Some(model) = &state.boot_model else {
         return Ok(None);
     };
-    let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? else {
+    let Some(desired) = model.accepted().map_err(ControlError::Repository)? else {
         return Ok(None);
     };
     let bodies = resource_bodies(&desired.config, &desired.output_ids, key)?;
@@ -1131,7 +1145,8 @@ pub fn accepted_item(
 /// Whether a modeled run has an authoritative envelope to serve from.
 fn has_envelope(state: &AppState) -> ControlResult<bool> {
     match &state.boot_model {
-        Some(model) => Ok(load_desired(model.boot_path())
+        Some(model) => Ok(model
+            .accepted()
             .map_err(ControlError::Repository)?
             .is_some()),
         None => Ok(false),
@@ -1205,7 +1220,7 @@ fn accepted_version(desired: &DesiredState, key: &str, id: &str) -> crate::concu
 /// A corrupt accepted record or a store fault fails closed.
 pub fn accepted_salvos(state: &AppState) -> ControlResult<Vec<crate::salvo_store::VersionedSalvo>> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
             let mut out: Vec<_> = desired
                 .config
                 .salvos
@@ -1286,7 +1301,7 @@ pub fn accepted_profiles(
     state: &AppState,
 ) -> ControlResult<Vec<crate::tally_state::VersionedProfile>> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
             let mut out: Vec<_> = desired
                 .config
                 .tally_profiles
@@ -1371,7 +1386,7 @@ pub fn accepted_audio(
     crate::concurrency::Version,
 )> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
             let version = desired
                 .resource_versions
                 .get("audio")
@@ -1379,7 +1394,7 @@ pub fn accepted_audio(
                 .copied()
                 .unwrap_or(1);
             return Ok((
-                desired.config.audio,
+                desired.config.audio.clone(),
                 crate::concurrency::Version::new(version),
             ));
         }
@@ -1400,7 +1415,7 @@ pub fn output_ids_for_config(
     let prior = state
         .boot_model
         .as_ref()
-        .map(|model| load_desired(model.boot_path()))
+        .map(|model| model.accepted())
         .transpose()
         .map_err(ControlError::Repository)?
         .flatten();
@@ -1476,8 +1491,8 @@ pub fn output_ids_for_config(
 /// A corrupt desired record or failed repository read returns an error.
 pub fn layout_library(state: &AppState) -> ControlResult<Vec<crate::repository::Layout>> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
-            return Ok(desired.layouts);
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
+            return Ok(desired.layouts.clone());
         }
     }
     Ok(state
@@ -1534,6 +1549,30 @@ pub struct BootModel {
     /// interior mutability (the async lock provides the ordering, not this).
     last_adopted: std::sync::Mutex<MultiviewConfig>,
     selected_layout: std::sync::Mutex<Option<String>>,
+    /// Review R3-03: the accepted envelope, held as one immutable `Arc`
+    /// snapshot instead of being re-read, re-parsed and re-validated from
+    /// `desired.json` on every GET/list/item/precondition. Lazily loaded from
+    /// disk on the FIRST call to [`Self::accepted`] (not at construction, so
+    /// `Self::new` stays infallible and a corrupt record still surfaces
+    /// through the same caller that would have seen it under the old
+    /// always-read behavior) and then swapped atomically by
+    /// [`write_desired`] immediately after each successful durable commit —
+    /// always under [`crate::AppState::lock_config_mutation`] (the same lock
+    /// that serializes every commit), so a reader never observes a partially
+    /// updated snapshot. A restart still loads straight from disk: this
+    /// cache holds nothing durable itself.
+    accepted_cache: std::sync::RwLock<AcceptedCache>,
+}
+
+/// [`BootModel::accepted_cache`]'s three states: not yet loaded from disk,
+/// loaded and confirmed absent (no envelope), or loaded and present.
+/// Distinguishing "not yet loaded" from "loaded, absent" is why this is not
+/// simply `Option<Arc<DesiredState>>`.
+#[derive(Debug, Clone)]
+enum AcceptedCache {
+    Unloaded,
+    Empty,
+    Loaded(Arc<DesiredState>),
 }
 
 impl BootModel {
@@ -1564,6 +1603,7 @@ impl BootModel {
             write_tickets: AtomicU64::new(0),
             last_adopted: std::sync::Mutex::new(running),
             selected_layout: std::sync::Mutex::new(None),
+            accepted_cache: std::sync::RwLock::new(AcceptedCache::Unloaded),
         }
     }
 
@@ -1571,6 +1611,67 @@ impl BootModel {
     #[must_use]
     pub fn boot_path(&self) -> &Path {
         &self.boot_path
+    }
+
+    /// The accepted envelope (review R3-03): an `Arc` clone of the in-memory
+    /// snapshot, lazily loaded from disk on first use and thereafter served
+    /// with NO filesystem read, no re-parse and no re-validation. `Ok(None)`
+    /// means no envelope exists yet (store-only run, or before the first
+    /// commit) — exactly [`load_desired`]'s meaning.
+    ///
+    /// # Errors
+    /// A corrupt on-disk record fails closed on the first (lazy) load; once
+    /// loaded, this never fails again until the next [`Self::set_accepted`].
+    pub fn accepted(&self) -> Result<Option<Arc<DesiredState>>, String> {
+        // Each read/write guard below is bound to its own statement and
+        // dropped at the end of that statement (NOT kept alive by an
+        // `if let`'s temporary-lifetime extension) — a held read guard must
+        // never still be live when a later statement in this function takes
+        // the write lock, or the write would deadlock against its own
+        // reader.
+        let is_unloaded = matches!(
+            *self
+                .accepted_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            AcceptedCache::Unloaded
+        );
+        if is_unloaded {
+            // Load outside any lock (disk I/O), then settle the race: only
+            // the first writer's load wins, matching `load_desired`'s result
+            // either way (both re-read the identical file).
+            let loaded = load_desired(&self.boot_path)?;
+            let mut cache = self
+                .accepted_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(*cache, AcceptedCache::Unloaded) {
+                *cache = loaded.map_or(AcceptedCache::Empty, |desired| {
+                    AcceptedCache::Loaded(Arc::new(desired))
+                });
+            }
+        }
+        let snapshot = match &*self
+            .accepted_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            AcceptedCache::Loaded(desired) => Some(Arc::clone(desired)),
+            AcceptedCache::Empty | AcceptedCache::Unloaded => None,
+        };
+        Ok(snapshot)
+    }
+
+    /// Swap the in-memory accepted snapshot right after a durable commit
+    /// (review R3-03). Call ONLY under [`crate::AppState::lock_config_mutation`]
+    /// — the same lock [`write_desired`] is always called under — so this can
+    /// never race a concurrent commit or lazy load.
+    fn set_accepted(&self, desired: DesiredState) {
+        *self
+            .accepted_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            AcceptedCache::Loaded(Arc::new(desired));
     }
 
     /// The immutable Loaded snapshot (the revert-to-start target).
@@ -1723,8 +1824,8 @@ impl BootModel {
     /// # Errors
     /// A corrupt or unreadable desired record prevents startup selection.
     pub fn restore_desired_layout_id(&self) -> Result<(), String> {
-        if let Some(desired) = load_desired(&self.boot_path)? {
-            self.select_layout(desired.selected_layout_id);
+        if let Some(desired) = self.accepted()? {
+            self.select_layout(desired.selected_layout_id.clone());
         }
         Ok(())
     }

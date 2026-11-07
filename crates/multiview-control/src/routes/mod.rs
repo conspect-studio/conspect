@@ -128,13 +128,15 @@ fn layout_response(status: StatusCode, versioned: &VersionedLayout) -> Response 
 }
 
 /// Read the accepted layout library, not its replaceable SQLite projection.
+/// Review R3-03: the in-memory accepted snapshot, not a fresh
+/// `desired.json` read-parse-validate on every layout list/GET.
 fn authoritative_layouts(
     state: &AppState,
-) -> ControlResult<Option<crate::boot_model::DesiredState>> {
+) -> ControlResult<Option<std::sync::Arc<crate::boot_model::DesiredState>>> {
     let Some(model) = &state.boot_model else {
         return Ok(None);
     };
-    crate::boot_model::load_desired(model.boot_path()).map_err(ControlError::Repository)
+    model.accepted().map_err(ControlError::Repository)
 }
 
 /// Return a layout with the envelope-owned version. Older envelopes without
@@ -183,7 +185,7 @@ async fn list_layouts(
     // carries no embedded device_ref, so the row filter alone is complete; it is
     // a no-op for an unscoped principal.
     let mut layouts = if let Some(desired) = authoritative_layouts(&state)? {
-        desired.layouts
+        desired.layouts.clone()
     } else {
         state
             .repository

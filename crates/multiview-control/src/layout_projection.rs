@@ -247,9 +247,7 @@ fn reconcile(state: &AppState) -> ControlResult<()> {
     let Some(model) = &state.boot_model else {
         return Ok(());
     };
-    let Some(desired) =
-        crate::boot_model::load_desired(model.boot_path()).map_err(ControlError::Repository)?
-    else {
+    let Some(desired) = model.accepted().map_err(ControlError::Repository)? else {
         return Ok(());
     };
     for entry in state.repository.list_layouts()? {
