@@ -44,7 +44,11 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
 3. **Activation is the operator's choice.** Add and bulk add from the browser require an explicit
    **Always on** or **On demand** choice, with no silent default. Show the selected count and a warning
    for large selections (a 500-source always-on add opens 500 connections). The `activation` field
-   comes from `feat/rc-demand-driven-sources` and is not merged yet; do not depend on it until it is.
+   (`always_on` | `on_demand`, default `always_on`) comes from `feat/rc-demand-driven-sources` and is
+   not merged yet. **Follow-up once it lands on rc3:** the single "Add as source" seed and the bulk add
+   dialog get the same explicit radio choice the M3U import dialog uses (no preselected value, the add
+   button disabled until one is chosen, and the M3U dialog's large-selection warning), writing
+   `activation` through the shared `sourceFormToBody` path.
 4. **Build.** Production builds `--features nvidia,web`. The `nvidia` preset enables
    `catalogue-ffmpeg`, which enables `catalogue`; the PR shows the resolved feature check.
 5. **Headers on every rail.** HLS `user_agent`/`referrer` go through the shared loopback fetcher and
