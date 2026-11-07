@@ -23,13 +23,18 @@ vi.mock('./MapView', () => ({
   ),
 }));
 
+const AXN = index.streams.find((x) => x.ch === 'AXNBlack.us');
+if (AXN === undefined) {
+  throw new Error('fixture');
+}
+
 let created: { id: string; payload: unknown }[] = [];
 let probeBodies: unknown[] = [];
 
 const server = setupServer(
   http.get('*/api/v1/catalogues/iptv-org/status', () =>
     HttpResponse.json({
-      state: 'idle', etag: null, synced_at: null, counts: { streams: 22, channels: 20 }, errors: [],
+      state: 'idle', etag: null, synced_at: null, counts: { streams: 28, channels: 24 }, errors: [],
       server: { name: 'Dallas', lat: 32.78, lon: -96.8 },
     }),
   ),
@@ -37,7 +42,7 @@ const server = setupServer(
   http.get('*/api/v1/catalogues/iptv-org/places', () => HttpResponse.json(places)),
   http.get('*/api/v1/sources', () =>
     HttpResponse.json([
-      { id: 'ksn', name: 'KSN', body: { id: 'ksn', kind: 'hls', url: 'https://example.test/ksn/index.m3u8' } },
+      { id: 'wps', name: 'WPS TV', body: { id: 'wps', kind: 'hls', url: 'https://2-fss-2.streamhoster.com/pl_120/amlst:203530-1426406/playlist.m3u8' } },
     ]),
   ),
   http.get('*/api/v1/catalogues/iptv-org/links', () => HttpResponse.json({ links: [] })),
@@ -47,7 +52,7 @@ const server = setupServer(
       id: 'p1', state: 'done', error: null,
       results: [
         {
-          k: 's:kake000001', source_id: null, verdict: 'live', probed_from: 'dallas-1',
+          k: 's:d4e9ec8986d2', source_id: null, verdict: 'live', probed_from: 'dallas-1',
           probed_at: '2026-11-07T05:00:00Z', detail: null,
           facts: { width: 1280, height: 720, fps: 29.97, video_codec: 'h264', audio_codec: 'aac', bitrate_kbps: 2800, advertised_kbps: 3000, audio_languages: ['eng'], captions: [], thumbnail: null },
           events: [{ kind: 'cue_out', at: '12s', detail: 'duration 30' }],
@@ -100,7 +105,7 @@ describe('IptvOrgPage', () => {
     await ready();
     await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'accuwether');
     await waitFor(() => { expect(screen.getByTestId('iptv-results')).toHaveTextContent('AccuWeather'); });
-    expect(screen.getByTestId('iptv-results')).not.toHaveTextContent('KAKE');
+    expect(screen.getByTestId('iptv-results')).not.toHaveTextContent('KSHB');
   });
 
   it('facet filtering shows counts and narrows the list', async () => {
@@ -109,19 +114,19 @@ describe('IptvOrgPage', () => {
     const geo = await screen.findByRole('checkbox', { name: 'Geo-blocked' });
     expect(geo.closest('li')).toHaveTextContent(/\d+/);
     await userEvent.click(geo);
-    await waitFor(() => { expect(screen.getByTestId('iptv-results')).toHaveTextContent('KSN'); });
+    await waitFor(() => { expect(screen.getByTestId('iptv-results')).toHaveTextContent('PBS Sedalia'); });
     expect(screen.getByTestId('iptv-results')).not.toHaveTextContent('BBC News');
     // The flag renders as text, not colour alone.
     expect(within(screen.getByTestId('iptv-results')).getAllByText('Geo-blocked').length).toBeGreaterThan(0);
   });
 
-  it('place search ranks Wichita first and lists local streams in the city tier', async () => {
+  it('place search ranks Kansas City, MO first; the row leads with the station, not the network', async () => {
     renderPage();
     await ready();
-    await userEvent.type(screen.getByRole('searchbox', { name: /where is it happening/i }), 'wichta');
+    await userEvent.type(screen.getByRole('searchbox', { name: /where is it happening/i }), 'kansas citty, MO');
     const hits = await screen.findByRole('list', { name: /matching places/i });
     const buttons = within(hits).getAllByRole('button');
-    expect(buttons[0]).toHaveTextContent('Wichita, Kansas, United States');
+    expect(buttons[0]).toHaveTextContent('Kansas City, Missouri, United States');
     const top = buttons[0];
     if (top === undefined) {
       throw new Error('no place hit');
@@ -129,11 +134,48 @@ describe('IptvOrgPage', () => {
     await userEvent.click(top);
     const results = await screen.findByTestId('iptv-results');
     await waitFor(() => { expect(results).toHaveTextContent('Local (this city)'); });
-    expect(results).toHaveTextContent('KAKE');
+    expect(results).toHaveTextContent('KSHB 41 (Kansas City MO)');
+    expect(results).toHaveTextContent('KSHB-TV');
+    expect(results).toHaveTextContent('on NBC');
+    expect(results).toHaveTextContent('KCKS-LD 25.3');
     expect(results).not.toHaveTextContent('BBC News');
-    expect(screen.getByText(/Near Wichita/)).toBeInTheDocument();
-    // State-wide + national tiers follow (national content is in a tier row too).
-    expect(results).toHaveTextContent('State / province');
+    expect(screen.getByText(/Near Kansas City/)).toBeInTheDocument();
+    // Later tiers follow: Missouri has no other state-level row here, national does.
+    expect(results).toHaveTextContent('Nearby (within 150 km)');
+    expect(results).toHaveTextContent('National');
+  });
+
+  it('says plainly that iptv-org lists few local streams, and still shows state and national tiers', async () => {
+    renderPage();
+    await ready();
+    await userEvent.type(screen.getByRole('searchbox', { name: /where is it happening/i }), 'tampa');
+    const hits = await screen.findByRole('list', { name: /matching places/i });
+    const top = within(hits).getAllByRole('button')[0];
+    if (top === undefined) {
+      throw new Error('no place hit');
+    }
+    await userEvent.click(top);
+    const sparse = await screen.findByTestId('iptv-sparse');
+    expect(sparse).toHaveTextContent(/iptv-org lists few local streams here/);
+    expect(sparse).toHaveTextContent(/none in this city/);
+    const results = screen.getByTestId('iptv-results');
+    await waitFor(() => { expect(results).toHaveTextContent('State / province'); });
+    expect(results).toHaveTextContent('Tampa Bay Communnity Network');
+    expect(results).toHaveTextContent('National');
+  });
+
+  it('Wichita (one real local stream) also gets the honest notice', async () => {
+    renderPage();
+    await ready();
+    await userEvent.type(screen.getByRole('searchbox', { name: /where is it happening/i }), 'wichita');
+    const hits = await screen.findByRole('list', { name: /matching places/i });
+    const top = within(hits).getAllByRole('button')[0];
+    if (top === undefined) {
+      throw new Error('no place hit');
+    }
+    await userEvent.click(top);
+    expect(await screen.findByTestId('iptv-sparse')).toHaveTextContent(/1 in this city/);
+    expect(screen.getByTestId('iptv-results')).toHaveTextContent('WPS TV');
   });
 
   it('map click selects a subdivision through the same path; near-server is offered', async () => {
@@ -141,50 +183,51 @@ describe('IptvOrgPage', () => {
     await ready();
     expect(await screen.findByRole('button', { name: /near this server/i })).toBeInTheDocument();
     await userEvent.click(screen.getByTestId('map-stub'));
-    await waitFor(() => { expect(screen.getByTestId('iptv-results')).toHaveTextContent('Kansas Statewide'); });
+    await waitFor(() => { expect(screen.getByTestId('iptv-results')).toHaveTextContent('WPS TV'); });
   });
 
   it('probe flow shows verdict, facts and events', async () => {
     renderPage();
     await ready();
-    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'kake');
-    await userEvent.click(await screen.findByRole('button', { name: /show streams of kake/i }));
-    await userEvent.click(await screen.findByRole('button', { name: /^probe kake 10 news$/i }));
-    await userEvent.click(await screen.findByRole('button', { name: /details for kake/i }));
+    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'kshb');
+    await userEvent.click(await screen.findByRole('button', { name: /show streams of kshb 41/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /^probe kshb 41 \(kansas city mo\)$/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /details for kshb 41/i }));
     const detail = await screen.findByTestId('iptv-detail');
     expect(await within(detail).findByText('Live')).toBeInTheDocument();
     expect(within(detail).getByText(/1280×720/)).toBeInTheDocument();
     expect(within(detail).getByText('cue_out')).toBeInTheDocument();
-    expect(probeBodies[0]).toEqual({ keys: ['s:kake000001'] });
+    expect(probeBodies[0]).toEqual({ keys: ['s:d4e9ec8986d2'] });
   });
 
   it('marks already-added streams', async () => {
     renderPage();
     await ready();
-    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'ksn');
-    await userEvent.click(await screen.findByRole('button', { name: /show streams of ksn/i }));
+    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'wps tv');
+    await userEvent.click(await screen.findByRole('button', { name: /show streams of wps tv/i }));
     expect((await screen.findAllByText('Already added')).length).toBeGreaterThan(0);
-    expect(screen.getByRole('button', { name: /add ksn 3 as source/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /add wps tv as source/i })).toBeDisabled();
   });
 
   it('Add as source opens the Sources create dialog prefilled with url/UA/referer/origin', async () => {
     renderPage();
     await ready();
-    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'kake');
-    await userEvent.click(await screen.findByRole('button', { name: /show streams of kake/i }));
-    await userEvent.click(await screen.findByRole('button', { name: /add kake 10 news as source/i }));
+    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'axn black');
+    await userEvent.click(await screen.findByRole('button', { name: /show streams of axn black/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /add axn black romania as source/i }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByDisplayValue('https://example.test/kake/index.m3u8')).toBeInTheDocument();
+    expect(within(dialog).getByDisplayValue(AXN.url)).toBeInTheDocument();
     expect(within(dialog).getByText(/linked to iptv-org/i)).toBeInTheDocument();
     await userEvent.click(within(dialog).getByRole('button', { name: /^create$/i }));
     await waitFor(() => { expect(created).toHaveLength(1); });
     expect(created[0]?.payload).toMatchObject({
       body: {
         kind: 'hls',
-        url: 'https://example.test/kake/index.m3u8',
-        user_agent: 'Mozilla/5.0 Test',
-        referrer: 'https://example.test/',
-        origin: { provider: 'iptv-org', channel: 'KAKE.us', follow: 'notify' },
+        url: AXN.url,
+        user_agent: AXN.ua,
+        referrer: AXN.ref,
+        playlist_metadata: { tvg_id: 'AXNBlack.us@Romania', name: 'AXN Black Romania' },
+        origin: { provider: 'iptv-org', channel: 'AXNBlack.us', follow: 'notify' },
       },
     });
   });
@@ -192,14 +235,17 @@ describe('IptvOrgPage', () => {
   it('bulk add reports per-item results including a partial failure', async () => {
     renderPage();
     await ready();
-    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'news');
-    await userEvent.click(await screen.findByRole('checkbox', { name: /select kake for bulk add/i }));
-    await userEvent.click(await screen.findByRole('checkbox', { name: /select bbc news for bulk add/i }));
+    const box = screen.getByRole('searchbox', { name: /search channels/i });
+    await userEvent.type(box, 'kshb');
+    await userEvent.click(await screen.findByRole('checkbox', { name: /select kshb 41 .* for bulk add/i }));
+    await userEvent.clear(box);
+    await userEvent.type(box, 'bbc news');
+    await userEvent.click(await screen.findByRole('checkbox', { name: /select bbc news uk hd for bulk add/i }));
     await userEvent.click(screen.getByRole('button', { name: /add selected \(2\)/i }));
     const dialog = await screen.findByRole('dialog');
     await userEvent.click(within(dialog).getByRole('button', { name: /add 2 sources/i }));
     await waitFor(() => { expect(within(dialog).getAllByText(/created|failed/i).length).toBeGreaterThanOrEqual(2); });
-    expect(created.map((c) => c.id)).toEqual(['kake-us-sd']);
+    expect(created.map((c) => c.id)).toEqual(['nbc-us-kshbtv']);
     expect(within(dialog).getByText(/Failed: Conflict/)).toBeInTheDocument();
   });
 });

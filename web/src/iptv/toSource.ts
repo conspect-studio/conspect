@@ -1,6 +1,7 @@
 // Map an IPTV-ORG stream onto the ordinary source form (ONE code path for
 // “Add as source” and “Bulk add”): the same SourceFormState → sourceFormToBody.
 import type { IndexStream } from '../api/catalogue';
+import { logoUrl } from '../api/catalogue';
 import { emptySourceForm } from '../resources/forms';
 import type { OriginFollow, SourceFormKind, SourceFormState } from '../resources/forms';
 
@@ -73,16 +74,23 @@ export function toSourceForm(
   taken: ReadonlySet<string>,
   follow: OriginFollow = 'notify',
   now: Date = new Date(),
+  catNames: ReadonlyMap<string, string> = new Map(),
 ): SourceFormState {
   const kind = sourceKindFor(s) ?? 'hls';
   return {
     ...emptySourceForm(),
     id: uniqueId(slugId(s), taken),
-    name: s.name ?? s.title,
+    // Lead with the station (stream title), not the network channel name.
+    name: s.title,
     kind,
     url: s.url,
     userAgent: kind === 'hls' ? (s.ua ?? '') : '',
     referrer: kind === 'hls' ? (s.ref ?? '') : '',
+    // rc3 `playlist_metadata` (epg-playlist): tvg_id = channel@feed, name, logo, group.
+    metaTvgId: s.ch !== null ? `${s.ch}@${s.feed ?? ''}`.replace(/@$/, '') : '',
+    metaName: s.title,
+    metaLogo: s.logo !== null && typeof window !== 'undefined' ? `${window.location.origin}${logoUrl(s.logo)}` : '',
+    metaGroup: s.cats[0] !== undefined ? (catNames.get(s.cats[0]) ?? s.cats[0]) : '',
     origin: {
       provider: 'iptv-org',
       ...(s.ch !== null ? { channel: s.ch } : {}),

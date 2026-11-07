@@ -64,6 +64,12 @@ const ALL_FLAGS: readonly StreamFlag[] = [
 const RADII = ['25', '50', '150', '300', '500'] as const;
 type Radius = (typeof RADII)[number];
 const PROBE_CAP = 50;
+/** At or below this many local (city + radius) streams, say so plainly. */
+const SPARSE_LOCAL = 3;
+
+function isLocalTier(tier: Tier | null): boolean {
+  return tier === 'city' || tier === 'nearby';
+}
 
 type Row =
   | { readonly t: 'tier'; readonly tier: Tier; readonly count: number; readonly open: boolean }
@@ -143,6 +149,7 @@ export function IptvOrgPage(): JSX.Element {
     [facetFiltered, place, radiusKm, placeIndex],
   );
   const groups = useMemo(() => groupEntries(tiered), [tiered]);
+  const localCount = useMemo(() => tiered.filter((x) => isLocalTier(x.tier)).length, [tiered]);
 
   const inScope = useMemo(
     () =>
@@ -243,7 +250,11 @@ export function IptvOrgPage(): JSX.Element {
       return;
     }
     setPlace(p);
-    setOpenTiers(new Set<Tier>(['city', 'nearby', 'subdivision']));
+    // With no local streams, open the national tier too instead of an empty view.
+    const local = facetFiltered.filter((e) => isLocalTier(tierOf(e, p, radiusKm, placeIndex))).length;
+    setOpenTiers(
+      new Set<Tier>(local === 0 ? ['city', 'nearby', 'subdivision', 'country'] : ['city', 'nearby', 'subdivision']),
+    );
     setFocus({
       id: p.id,
       kind: p.kind,
@@ -299,7 +310,7 @@ export function IptvOrgPage(): JSX.Element {
     // One code path: the same form the source dialog edits; the Sources page
     // opens its create dialog prefilled (nothing is saved until confirmed).
     void navigate('/sources', {
-      state: { iptvSeed: { ts: Date.now(), form: toSourceForm(s, takenIds) } },
+      state: { iptvSeed: { ts: Date.now(), form: toSourceForm(s, takenIds, 'notify', new Date(), catName) } },
     });
   };
 
@@ -522,6 +533,24 @@ export function IptvOrgPage(): JSX.Element {
               ) : null}
             </p>
 
+            {place !== null && localCount <= SPARSE_LOCAL ? (
+              <p role="status" data-testid="iptv-sparse" className="rounded-md border border-dashed p-3 text-sm">
+                {localCount === 0 ? (
+                  <Trans>
+                    iptv-org lists few local streams here: none in this city or within {radius} km.
+                    Showing the state and national streams instead; many real stations are not in
+                    the catalogue.
+                  </Trans>
+                ) : (
+                  <Trans>
+                    iptv-org lists few local streams here: {localCount} in this city or within{' '}
+                    {radius} km. State and national streams are shown below, and a larger radius
+                    may find more.
+                  </Trans>
+                )}
+              </p>
+            ) : null}
+
             {probeError !== null ? (
               <p role="alert" className="text-sm text-destructive">
                 <Trans>Probe failed:</Trans> {probeError}
@@ -659,6 +688,7 @@ export function IptvOrgPage(): JSX.Element {
         open={bulkOpen}
         streams={selectedStreams}
         takenIds={takenIds}
+        catNames={catName}
         onClose={(): void => {
           setBulkOpen(false);
         }}
@@ -733,6 +763,16 @@ function GroupRow({
             ) : null}
             {name}
           </span>
+          {g.feedName !== null && g.feedName !== name ? (
+            <span className="text-xs text-muted-foreground" lang="" dir="auto">
+              {g.feedName}
+            </span>
+          ) : null}
+          {g.channelName !== null ? (
+            <span className="text-xs text-muted-foreground" lang="" dir="auto">
+              <Trans>on {g.channelName}</Trans>
+            </span>
+          ) : null}
           {first?.net != null ? (
             <span className="text-xs text-muted-foreground" lang="" dir="auto">
               {first.net}

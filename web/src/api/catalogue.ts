@@ -31,9 +31,11 @@ export interface IndexStream {
   readonly k: string;
   readonly url: string;
   readonly title: string;
-  /** `channel` id (`KAKE.us`) or null for a no-metadata stream. */
+  /** `channel` id (`NBC.us`) or null for a no-metadata stream. */
   readonly ch: string | null;
   readonly feed: string | null;
+  /** Feed display name (`KSHB-TV`); local stations are feeds of network channels. */
+  readonly feed_name: string | null;
   readonly name: string | null;
   readonly alt: readonly string[];
   readonly net: string | null;

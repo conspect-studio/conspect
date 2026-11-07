@@ -47,12 +47,14 @@ export function BulkAddDialog({
   open,
   streams,
   takenIds,
+  catNames,
   onClose,
   onDone,
 }: {
   readonly open: boolean;
   readonly streams: readonly IndexStream[];
   readonly takenIds: ReadonlySet<string>;
+  readonly catNames?: ReadonlyMap<string, string>;
   readonly onClose: () => void;
   readonly onDone: (okKeys: readonly string[]) => void;
 }): JSX.Element {
@@ -68,7 +70,7 @@ export function BulkAddDialog({
     const taken = new Set(takenIds);
     const out: ItemResult[] = [];
     for (const s of streams) {
-      const form = toSourceForm(s, taken, follow);
+      const form = toSourceForm(s, taken, follow, new Date(), catNames);
       taken.add(form.id);
       const invalid = Object.keys(validateSourceForm(form, true)).length > 0;
       if (invalid) {
@@ -128,7 +130,7 @@ export function BulkAddDialog({
             <ul className="max-h-60 space-y-1 overflow-y-auto text-sm">
               {streams.map((s) => (
                 <li key={s.k} lang="" dir="auto">
-                  {s.name ?? s.title}
+                  {s.title}
                   {s.q !== null ? ` · ${s.q}` : ''}
                 </li>
               ))}

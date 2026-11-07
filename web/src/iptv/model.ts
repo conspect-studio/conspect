@@ -207,7 +207,9 @@ export function tierOf(
           }
         }
       }
-      if (place.subdivision !== null && e.subAreaIds.includes(`s/${place.subdivision}`)) {
+      // State tier: state-wide streams AND local streams of other cities in the
+      // same state (iptv-org coverage is thin; the state is the honest fallback).
+      if (place.subdivision !== null && e.allSubs.includes(place.subdivision)) {
         return 'subdivision';
       }
       if (place.country !== null && e.countryAreaIds.includes(`c/${place.country}`)) {
@@ -376,11 +378,12 @@ export function buildTextIndex(streams: readonly IndexStream[]): MiniSearch<{
   alt: string;
   net: string;
   title: string;
+  feed: string;
 }> {
-  const ms = new MiniSearch<{ k: string; name: string; alt: string; net: string; title: string }>({
-    fields: ['name', 'alt', 'net', 'title'],
+  const ms = new MiniSearch<{ k: string; name: string; alt: string; net: string; title: string; feed: string }>({
+    fields: ['name', 'alt', 'net', 'title', 'feed'],
     idField: 'k',
-    searchOptions: { boost: { name: 3, alt: 2 }, fuzzy: 0.2, prefix: true, combineWith: 'AND' },
+    searchOptions: { boost: { title: 3, feed: 3, name: 2, alt: 2 }, fuzzy: 0.2, prefix: true, combineWith: 'AND' },
     processTerm: (term) =>
       term
         .normalize('NFD')
@@ -394,6 +397,7 @@ export function buildTextIndex(streams: readonly IndexStream[]): MiniSearch<{
       alt: s.alt.join(' '),
       net: s.net ?? '',
       title: s.title,
+      feed: [s.feed_name ?? '', s.feed ?? ''].join(' '),
     })),
   );
   return ms;
@@ -403,31 +407,38 @@ export function buildTextIndex(streams: readonly IndexStream[]): MiniSearch<{
 export interface Group {
   readonly key: string;
   readonly tier: Tier | null;
+  /** Leading label: the best stream's title (local stations are feeds of networks). */
   readonly name: string;
+  /** Channel name (e.g. the network “NBC”), when it differs from the lead. */
+  readonly channelName: string | null;
+  /** Feed name (e.g. “KSHB-TV”), when present. */
+  readonly feedName: string | null;
   readonly streams: readonly Entry[];
 }
 
-/** Group matching entries by channel inside their best tier. */
+/** Group matching entries by channel feed (one local station) inside their best tier. */
 export function groupEntries(
   list: readonly { readonly e: Entry; readonly tier: Tier | null }[],
 ): Group[] {
-  const groups = new Map<string, { tier: Tier | null; name: string; streams: Entry[] }>();
+  const groups = new Map<string, { tier: Tier | null; streams: Entry[] }>();
   for (const { e, tier } of list) {
-    const key = `${tier ?? '-'}|${e.s.ch ?? e.s.k}`;
+    const id = e.s.ch === null ? e.s.k : `${e.s.ch}@${e.s.feed ?? ''}`;
+    const key = `${tier ?? '-'}|${id}`;
     const g = groups.get(key);
     if (g === undefined) {
-      groups.set(key, { tier, name: e.s.name ?? e.s.title, streams: [e] });
+      groups.set(key, { tier, streams: [e] });
     } else {
       g.streams.push(e);
     }
   }
   return [...groups.entries()]
-    .map(([key, g]) => ({
-      key,
-      tier: g.tier,
-      name: g.name,
-      streams: g.streams.sort((a, b) => qualityRank(b.s.q) - qualityRank(a.s.q)),
-    }))
+    .map(([key, g]) => {
+      const streams = g.streams.sort((a, b) => qualityRank(b.s.q) - qualityRank(a.s.q));
+      const lead = streams[0]?.s;
+      const name = lead?.title ?? '';
+      const channelName = lead?.name != null && lead.name !== name ? lead.name : null;
+      return { key, tier: g.tier, name, channelName, feedName: lead?.feed_name ?? null, streams };
+    })
     .sort((a, b) => {
       const ta = a.tier === null ? 0 : TIERS.indexOf(a.tier);
       const tb = b.tier === null ? 0 : TIERS.indexOf(b.tier);
