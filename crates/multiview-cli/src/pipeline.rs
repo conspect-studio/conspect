@@ -20364,7 +20364,7 @@ mod push_send_policy_tests {
         // The distributor drains the backlog, old keyframe included.
         let drained: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(
-            drained.iter().map(|p| p.pts()).collect::<Vec<_>>(),
+            drained.iter().map(EncodedPacket::pts).collect::<Vec<_>>(),
             [Some(1), Some(2)]
         );
         // Post-loss: P4 and its audio must not get through; K5 resyncs.

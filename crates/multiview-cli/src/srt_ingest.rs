@@ -535,7 +535,7 @@ mod tests {
             let mut opts = ffmpeg_next::Dictionary::new();
             opts.set("rw_timeout", "10000000");
             let video_packets = ffmpeg_next::format::input_with_dictionary(&reader.url(), opts)
-                .map(|mut input| {
+                .map_or(0, |mut input| {
                     let index = input
                         .streams()
                         .best(ffmpeg_next::media::Type::Video)
@@ -545,8 +545,7 @@ mod tests {
                         .take(200)
                         .filter(|(stream, _)| Some(stream.index()) == index)
                         .count()
-                })
-                .unwrap_or(0);
+                });
             caller.kill().expect("kill caller");
             caller.wait().expect("reap caller");
             assert!(video_packets >= 15, "{video_packets} packets over {host}");
