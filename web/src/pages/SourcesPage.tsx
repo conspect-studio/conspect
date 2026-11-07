@@ -872,7 +872,13 @@ export function SourcesPage(): JSX.Element {
     {
       id: 'events',
       header: t`Events`,
-      cell: (ctx): JSX.Element => <SourceEventsButton id={ctx.row.original.id} name={ctx.row.original.name} />,
+      cell: (ctx): JSX.Element => (
+        <SourceEventsButton
+          id={ctx.row.original.id}
+          name={ctx.row.original.name}
+          eventObservation={ctx.row.original.eventObservation}
+        />
+      ),
     },
     {
       id: 'actions',

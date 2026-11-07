@@ -75,6 +75,13 @@ struct Shared {
     slots: SwapCell<Arc<BTreeMap<String, Arc<Generation>>>>,
     stopped: AtomicBool,
     finished: AtomicBool,
+    /// Shared with [`RegistrationController`]/[`SourceEventProducer`] so a
+    /// registry reader can submit an administrator-injected test observation
+    /// (ADR-0183 operator test aid) through the SAME bounded worker queue and
+    /// per-generation epoch check as ordinary evidence, without handing out a
+    /// full [`SourceEventProducer`] capability.
+    test_tx: SyncSender<(Arc<Generation>, SourceEventObservation)>,
+    max_string_bytes: usize,
     #[cfg(test)]
     publication_hook: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
@@ -138,6 +145,51 @@ impl SourceEventRegistry {
     #[must_use]
     pub fn worker_finished(&self) -> bool {
         self.0.finished.load(Ordering::Acquire)
+    }
+    /// Operator test aid (ADR-0183 item 5): submit a synthetic observation
+    /// against this source's CURRENT active generation and epoch, through the
+    /// SAME bounded worker queue and validation [`SourceEventProducer::try_observe`]
+    /// uses, so a test event clears/overlays/automates exactly like real
+    /// evidence and never bypasses capacity or payload bounds. Requires an
+    /// already-active (live or previously connected) generation — this never
+    /// allocates a new source identity or epoch, so it cannot be used to probe
+    /// unknown source ids.
+    ///
+    /// # Errors
+    /// `None` when the source has no active generation (unknown or retired).
+    #[must_use]
+    pub fn inject_test_observation(
+        &self,
+        source: &str,
+        boundary: crate::source_event_test_inject::TestBoundary,
+    ) -> Option<SubmitOutcome> {
+        let slots = self.0.slots.load();
+        let generation = slots.get(source)?;
+        if !generation.active.load(Ordering::Acquire) || self.is_stopped() {
+            return None;
+        }
+        let epoch = generation.epoch;
+        let observation = boundary.into_observation(source.to_owned(), epoch);
+        if observation.key.event_id.is_empty()
+            || observation.key.event_id.len() > self.0.max_string_bytes
+        {
+            generation.degraded.store(true, Ordering::Release);
+            return Some(SubmitOutcome::Invalid);
+        }
+        Some(
+            match self
+                .0
+                .test_tx
+                .try_send((Arc::clone(generation), observation))
+            {
+                Ok(()) => SubmitOutcome::Queued,
+                Err(TrySendError::Full(_)) => {
+                    generation.degraded.store(true, Ordering::Release);
+                    SubmitOutcome::Overflow
+                }
+                Err(TrySendError::Disconnected(_)) => SubmitOutcome::Retired,
+            },
+        )
     }
 }
 /// Nonblocking submission result. Queued is not proof of accepted evidence.
@@ -287,14 +339,16 @@ impl SourceEventService {
     /// # Errors
     /// Returns the OS thread creation error if the worker cannot start.
     pub fn new(limits: ServiceLimits) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(limits.queue_capacity);
         let shared = Arc::new(Shared {
             slots: SwapCell::new(Arc::new(BTreeMap::new())),
             stopped: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            test_tx: tx.clone(),
+            max_string_bytes: limits.tracker.max_string_bytes,
             #[cfg(test)]
             publication_hook: Mutex::new(None),
         });
-        let (tx, rx) = mpsc::sync_channel(limits.queue_capacity);
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("source-events".into())

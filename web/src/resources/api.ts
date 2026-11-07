@@ -351,7 +351,27 @@ export function toSourceView(record: ResourceRecord): SourceView {
     rawKind: raw ?? kind,
     editable: parseSourceFormKind(raw) !== undefined,
     locator,
+    eventObservation: eventObservationFor(kind, record.body),
   };
+}
+
+/**
+ * Compute the effective source-event observation status (ADR-0183) THE SAME
+ * WAY the engine gates it (`source_events_enabled` in
+ * `multiview-cli/src/pipeline.rs`): only `hls`/`youtube` ever observe, and for
+ * those the `events.observe` boolean defaults `true` when the `events` table
+ * is absent or present without the key.
+ */
+function eventObservationFor(
+  kind: SourceKind,
+  body: Record<string, unknown>,
+): SourceView['eventObservation'] {
+  if (kind !== 'hls' && kind !== 'youtube') return 'not_supported';
+  const events = body.events;
+  if (events !== null && typeof events === 'object' && 'observe' in events && events.observe === false) {
+    return 'disabled';
+  }
+  return 'observing';
 }
 
 /** Project an output record's opaque body into the {@link OutputView}. */

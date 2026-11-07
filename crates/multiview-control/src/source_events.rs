@@ -23,6 +23,41 @@ pub trait SourceEventProvider: Send + Sync {
 /// Shared optional runtime adapter handle.
 pub type SharedSourceEvents = Arc<dyn SourceEventProvider>;
 
+/// Operator test-injection kind (ADR-0183 item 5): a caller-selected synthetic
+/// lifecycle boundary, independent of the CLI's internal representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestEventBoundary {
+    /// Announce/confirm a synthetic break start.
+    Start {
+        /// Declared duration in nanoseconds, if supplied.
+        duration_ns: Option<i64>,
+    },
+    /// Confirm a synthetic break end for the most recent injected start.
+    End,
+}
+
+/// Outcome of a test-injection submission, independent of CLI internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestEventOutcome {
+    /// Accepted into the bounded worker queue.
+    Queued,
+    /// Queue full; this source's evidence is now permanently degraded.
+    Overflow,
+    /// Source has no active generation (never ingested, or retired).
+    Unknown,
+}
+
+/// Optional adapter for the operator test-injection route. Implemented ONLY by
+/// the runtime binary over its real `SourceEventRegistry`; never exposed to an
+/// unauthenticated request body and never a general evidence-submission API —
+/// this can only affect a source that already has an active generation.
+pub trait SourceEventTestInjector: Send + Sync {
+    /// Submit a synthetic observation against the source's current generation.
+    fn inject_test_event(&self, id: &str, boundary: TestEventBoundary) -> TestEventOutcome;
+}
+/// Shared optional runtime test-injection handle.
+pub type SharedSourceEventTestInjector = Arc<dyn SourceEventTestInjector>;
+
 /// Availability of the latched presentation clock, not ingest health.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]

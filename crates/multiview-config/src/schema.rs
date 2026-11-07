@@ -987,6 +987,38 @@ pub struct Source {
     /// trust *tier* is measured at runtime, never authored. See [`SourceWallClock`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallclock: Option<SourceWallClock>,
+    /// Per-source event observation opt-in (ADR-0183).
+    ///
+    /// Absent means the default posture: observation runs for HLS sources
+    /// (`observe` defaults `true`) because the HLS cue/DATERANGE/SCTE-35/ID3
+    /// watcher is read-only metadata parsing already present on the existing
+    /// fetch/demux path — it adds no extra network or disk IO and a bounded,
+    /// off-clock parse cost (see [`SourceEventsConfig::observe`]). Non-HLS
+    /// kinds never observe regardless of this field (there is no cue carriage
+    /// to watch). Automation remains disarmed independently of this flag; see
+    /// `multiview_control::event_automation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<SourceEventsConfig>,
+}
+
+/// Per-source event observation configuration (ADR-0183).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceEventsConfig {
+    /// Whether HLS cue/DATERANGE/SCTE-35/ID3 observation runs for this source.
+    /// Defaults to `true`: for an HLS source, observation is read-only parsing
+    /// of metadata the fetch/demux path already receives (no extra network
+    /// request, no extra disk write), so the default is ON. Set `false` to
+    /// opt out explicitly. This flag never arms automation.
+    #[serde(default = "default_observe")]
+    pub observe: bool,
+}
+impl Default for SourceEventsConfig {
+    fn default() -> Self {
+        Self { observe: true }
+    }
+}
+fn default_observe() -> bool {
+    true
 }
 
 /// Per-source wall-clock configuration (ADR-0038, SYNC-0): the operator's

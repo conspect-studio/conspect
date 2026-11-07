@@ -2546,6 +2546,87 @@
         ]
       }
     },
+    "/api/v1/inputs/{id}/events/test": {
+      "post": {
+        "tags": [
+          "inputs"
+        ],
+        "summary": "`POST /api/v1/inputs/{id}/events/test` — inject a clearly-labelled synthetic\nevent for operator/automation testing (ADR-0183 item 5; role: administer).",
+        "description": "This can only affect a source that already has an ACTIVE event-tracking\ngeneration (a source the running engine has ingested, live or previously\nconnected) — it never allocates a new source identity or epoch, and the\ninjected evidence is tagged `origin: \"external\"` with a `test:` event id\nprefix so it is unmistakably distinguishable from real evidence in the\nAPI/UI. It never bypasses the bounded worker queue or payload limits real\nevidence uses.",
+        "operationId": "post_source_event_test",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity; no suffix normalization",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Synthetic observation accepted into the bounded worker queue."
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope, or insufficient role",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or never-active source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Source event test-injection adapter unavailable, or the queue is full",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/inputs/{id}/streams": {
       "get": {
         "tags": [
@@ -15403,6 +15484,35 @@
             "description": "The schema version (stable across machine + portal)."
           }
         }
+      },
+      "TestEventRequest": {
+        "type": "object",
+        "description": "Request body for the operator test-injection aid.",
+        "required": [
+          "boundary"
+        ],
+        "properties": {
+          "boundary": {
+            "$ref": "#/components/schemas/TestEventRequestBoundary",
+            "description": "`\"start\"` or `\"end\"` — see [`TestEventBoundary`]."
+          },
+          "duration_ns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Declared break duration in nanoseconds (only meaningful for `\"start\"`)."
+          }
+        }
+      },
+      "TestEventRequestBoundary": {
+        "type": "string",
+        "description": "Wire boundary selector, internally tagged (never untagged).",
+        "enum": [
+          "start",
+          "end"
+        ]
       },
       "Ticket": {
         "type": "object",

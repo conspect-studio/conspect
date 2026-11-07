@@ -5,8 +5,8 @@ use crate::source_event_service::{
 };
 use multiview_control::source_events::{
     SourceEventAvailability, SourceEventDto, SourceEventLabel, SourceEventLifecycle,
-    SourceEventOrigin, SourceEventProvider, SourceEventTimer, SourceEventTimerKind,
-    SourceEventsDto,
+    SourceEventOrigin, SourceEventProvider, SourceEventTestInjector, SourceEventTimer,
+    SourceEventTimerKind, SourceEventsDto, TestEventBoundary, TestEventOutcome,
 };
 use multiview_core::{
     event_overlay::{
@@ -252,6 +252,24 @@ impl SourceEventProvider for RuntimeReader {
             read.as_ref().is_some_and(|read| read.degraded),
             rows,
         ))
+    }
+}
+impl SourceEventTestInjector for RuntimeReader {
+    fn inject_test_event(&self, id: &str, boundary: TestEventBoundary) -> TestEventOutcome {
+        let boundary = match boundary {
+            TestEventBoundary::Start { duration_ns } => {
+                crate::source_event_test_inject::TestBoundary::Start { duration_ns }
+            }
+            TestEventBoundary::End => crate::source_event_test_inject::TestBoundary::End,
+        };
+        match self.registry.inject_test_observation(id, boundary) {
+            None => TestEventOutcome::Unknown,
+            Some(
+                crate::source_event_service::SubmitOutcome::Queued
+                | crate::source_event_service::SubmitOutcome::Invalid,
+            ) => TestEventOutcome::Queued,
+            Some(_) => TestEventOutcome::Overflow,
+        }
     }
 }
 fn event_priority(
