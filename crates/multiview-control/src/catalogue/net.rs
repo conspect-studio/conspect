@@ -114,7 +114,7 @@ mod tests {
         file.rewind().unwrap();
         shared::FetchOutcome::Body {
             file,
-            len: bytes.len() as u64,
+            len: u64::try_from(bytes.len()).unwrap(),
             etag: Some("\"e1\"".into()),
             last_modified: None,
             content_type: None,

@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::state::AppState;
 
 const MAX_LOGO_BYTES: usize = 512 * 1024;
+const MAX_LOGO_BYTES_U64: u64 = 512 * 1024;
 const MAX_ENTRIES: usize = 1024;
 const MAX_TOTAL_BYTES: usize = 48 * 1024 * 1024;
 const ALLOWED: &[&str] = &[
@@ -70,7 +71,7 @@ pub async fn fetch_with(
     }
     let request = crate::iptv::fetch::FetchRequest {
         url: url.to_owned(),
-        max_bytes: MAX_LOGO_BYTES as u64,
+        max_bytes: MAX_LOGO_BYTES_U64,
         timeout: Duration::from_secs(10),
         etag: None,
         last_modified: None,
@@ -93,7 +94,7 @@ pub async fn fetch_with(
     }
     let mut body = Vec::new();
     file.by_ref()
-        .take(MAX_LOGO_BYTES as u64 + 1)
+        .take(MAX_LOGO_BYTES_U64 + 1)
         .read_to_end(&mut body)
         .map_err(|e| e.to_string())?;
     if body.len() > MAX_LOGO_BYTES {
@@ -134,7 +135,7 @@ mod tests {
             file.rewind().unwrap();
             let out = FetchOutcome::Body {
                 file,
-                len: self.0.len() as u64,
+                len: u64::try_from(self.0.len()).unwrap(),
                 etag: None,
                 last_modified: None,
                 content_type: self.1.map(str::to_owned),
