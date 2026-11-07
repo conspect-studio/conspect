@@ -195,6 +195,8 @@ impl ConfigDiff {
             audio: running_audio,
             routing: running_routing,
             discovery: running_discovery,
+            catalogues: running_catalogues,
+            network_diagnostics: running_network_diagnostics,
             timing: running_timing,
             webrtc: running_webrtc,
             system: running_system,
@@ -226,6 +228,8 @@ impl ConfigDiff {
             audio: next_audio,
             routing: next_routing,
             discovery: next_discovery,
+            catalogues: next_catalogues,
+            network_diagnostics: next_network_diagnostics,
             timing: next_timing,
             webrtc: next_webrtc,
             system: next_system,
@@ -271,7 +275,7 @@ impl ConfigDiff {
         let media_changed = running_media_library != next_media_library
             || running_media_players != next_media_players;
         let mut changed_sections = BTreeSet::new();
-        let sectioned: [(&'static str, bool); 24] = [
+        let sectioned: [(&'static str, bool); 26] = [
             (
                 "schema_version",
                 running_schema_version != next_schema_version,
@@ -306,6 +310,14 @@ impl ConfigDiff {
             ("sync_groups", running_sync_groups != next_sync_groups),
             ("routing", running_routing != next_routing),
             ("discovery", running_discovery != next_discovery),
+            // Catalogue sync/probe settings are control-plane only; a change is a
+            // restart-class section (the sync task is spawned once at boot).
+            ("catalogues", running_catalogues != next_catalogues),
+            // The diagnostics collector is built once at boot.
+            (
+                "network_diagnostics",
+                running_network_diagnostics != next_network_diagnostics,
+            ),
             ("timing", running_timing != next_timing),
             ("webrtc", running_webrtc != next_webrtc),
             // A change to `[system.ndi]` license acceptance is restart-class: full

@@ -126,6 +126,16 @@
         "summary": "An ad-hoc cast session was started (cast.session.started on topic `devices`; lossless lifecycle lane).",
         "title": "Ephemeral cast session started"
       },
+      "CatalogueLinkStatus": {
+        "contentType": "application/json",
+        "description": "Emitted on topic `inputs` with envelope `id` = source id, after each catalogue sync. LOSSLESS lifecycle fact. Carries identifiers and the status token only; the change diff and ranked alternatives are served by `GET /api/v1/catalogues/iptv-org/links`. Authorized per source id (BOLA).",
+        "name": "CatalogueLinkStatus",
+        "payload": {
+          "$ref": "#/components/schemas/CatalogueLinkStatus"
+        },
+        "summary": "A source linked to an IPTV-ORG catalogue entry changed link status (catalogue.link_status on topic `inputs`).",
+        "title": "Catalogue link status changed"
+      },
       "DeviceAdopted": {
         "contentType": "application/json",
         "name": "DeviceAdopted",
@@ -252,6 +262,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/GraphicsChannelEvent"
+                },
+                {
+                  "$ref": "#/components/schemas/CatalogueLinkStatus"
                 },
                 {
                   "$ref": "#/components/schemas/DeviceStatus"
@@ -760,6 +773,46 @@
           "session_id",
           "address",
           "output"
+        ],
+        "type": "object"
+      },
+      "CatalogueLinkStatus": {
+        "description": "Data body of `catalogue.link_status` (IPTV-ORG, ADR-M015): a linked source's catalogue link status changed. Envelope `id` = source id.",
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "feed": {
+            "type": "string"
+          },
+          "previous": {
+            "description": "Previous status, when known.",
+            "type": "string"
+          },
+          "replaced_by": {
+            "description": "Replacement channel id (channel_closed).",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "The linked source id.",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "in_sync",
+              "updated",
+              "stream_removed",
+              "channel_closed",
+              "blocklisted",
+              "unlinked",
+              "edited"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "status"
         ],
         "type": "object"
       },
@@ -2340,7 +2393,8 @@
           "config-file-invalid",
           "config-file-requires-restart",
           "config-file-apply-incomplete",
-          "container-no-host-networking"
+          "container-no-host-networking",
+          "catalogue-link-attention"
         ],
         "type": "string"
       },

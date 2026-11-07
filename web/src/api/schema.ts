@@ -251,6 +251,176 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/catalogues/iptv-org/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/catalogues/iptv-org/import` — offline bundle import (administer). */
+        post: operations["import_catalogue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/index": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/catalogues/iptv-org/index` — the joined stream index. */
+        get: operations["get_catalogue_index"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/catalogues/iptv-org/links` — per-source link status (caller-scoped). */
+        get: operations["list_catalogue_links"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/logos/{k}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/catalogues/iptv-org/logos/{k}` — persistent server-side logo cache. */
+        get: operations["get_catalogue_logo"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/places": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/catalogues/iptv-org/places` — the gazetteer with stream counts. */
+        get: operations["get_catalogue_places"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/probes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/catalogues/iptv-org/probes` — start a probe job (operate). */
+        post: operations["create_catalogue_probe"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/probes/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/catalogues/iptv-org/probes/{id}` — a probe job. */
+        get: operations["get_catalogue_probe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/catalogues/iptv-org/refresh` — sync now (administer). */
+        post: operations["refresh_catalogue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/catalogues/iptv-org/sources` — bulk-create sources (write). */
+        post: operations["create_catalogue_sources"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalogues/iptv-org/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /api/v1/catalogues/iptv-org/status`. */
+        get: operations["get_catalogue_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/commands/apply-layout": {
         parameters: {
             query?: never;
@@ -2254,6 +2424,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{id}/network": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/sources/{id}/network` — the §3a network-path report for any
+         *     existing source (operate; per-object authorization).
+         */
+        post: operations["create_source_network_report"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{id}/start": {
         parameters: {
             query?: never;
@@ -3478,6 +3668,41 @@ export interface components {
              *     closure (no `nonfree` Cargo feature exists).
              */
             redistributable: boolean;
+        };
+        /** @description Request body of `POST /catalogues/iptv-org/sources`. */
+        BulkAddBody: {
+            /** @description 1..=8 sources to create. */
+            sources: components["schemas"]["BulkAddEntry"][];
+        };
+        /**
+         * @description One entry of a bulk add: the same `{name, body}` a single create takes, plus
+         *     the source id (the `{id}` of `POST /sources/{id}`).
+         */
+        BulkAddEntry: {
+            /** @description The source document (`multiview_config::Source`). */
+            body: unknown;
+            /** @description Source id. */
+            id: string;
+            /** @description Human-friendly name. */
+            name?: string;
+        };
+        /** @description One per-item result of a bulk add. */
+        BulkAddItem: {
+            /** @description How the create takes effect: `live` or `restart`. */
+            apply?: string | null;
+            /** @description Why the item failed. */
+            error?: string | null;
+            /** @description `ETag` of the created source. */
+            etag?: string | null;
+            /** @description Source id. */
+            id: string;
+            /** @description `created`, `failed` or `skipped` (not attempted after an earlier failure). */
+            status: string;
+        };
+        /** @description Response of `POST /catalogues/iptv-org/sources`. */
+        BulkAddResponse: {
+            /** @description One result per requested source, in request order. */
+            results: components["schemas"]["BulkAddItem"][];
         };
         /**
          * @description One composed support bundle: the echoed request, the redacted/diagnostic
@@ -5129,6 +5354,11 @@ export interface components {
          * @enum {string}
          */
         OrientationModeDoc: "auto" | "tag" | "pixels";
+        /**
+         * @description `OpenAPI` mirror of `multiview_config::OriginFollow`.
+         * @enum {string}
+         */
+        OriginFollowDoc: "manual" | "notify" | "auto";
         /** @description `OpenAPI` mirror of `multiview_config::audio::OutputAudio`. */
         OutputAudioDoc: {
             /**
@@ -5569,6 +5799,18 @@ export interface components {
              *     wired). `false` on a pure / negotiation-only build.
              */
             webrtc: boolean;
+        };
+        /**
+         * @description Request body of `POST .../probes` (the web contract's `ProbeRequest`).
+         *
+         *     The browser never supplies a URL: it names index rows (`keys`) and/or linked
+         *     sources (`source_ids`); the server resolves URL, headers and quality.
+         */
+        ProbeBody: {
+            /** @description Index row keys (`s:<hex>`). */
+            keys?: string[];
+            /** @description Linked source ids (per-object authorised). */
+            source_ids?: string[];
         };
         /**
          * @description `OpenAPI` mirror of `multiview_config::Probe` — the body accepted by
@@ -6250,6 +6492,7 @@ export interface components {
             gpu_pin?: null | components["schemas"]["DevicePinDoc"];
             /** @description Stable input id; may be omitted (the path id is injected). */
             id?: string | null;
+            origin?: null | components["schemas"]["SourceOriginDoc"];
             playlist_metadata?: null | components["schemas"]["PlaylistMetadataDoc"];
             wallclock?: null | components["schemas"]["SourceWallClockDoc"];
         };
@@ -6504,8 +6747,12 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "hls";
+            /** @description Optional `Referer` header (printable, no CR/LF, <= 1 KiB). */
+            referrer?: string | null;
             /** @description Playlist URL. */
             url: string;
+            /** @description Optional `User-Agent` header (printable, no CR/LF, <= 1 KiB). */
+            user_agent?: string | null;
         } | {
             /** @enum {string} */
             kind: "youtube";
@@ -6596,6 +6843,23 @@ export interface components {
             uncertainty_ms?: number | null;
             /** @description Decoded UPID with its type name. */
             upid?: string | null;
+        };
+        /** @description `OpenAPI` mirror of `multiview_config::SourceOrigin`. */
+        SourceOriginDoc: {
+            /** @description Channel id; absent for no-metadata streams. */
+            channel?: string | null;
+            /** @description Feed id. */
+            feed?: string | null;
+            /** @description Follow mode. */
+            follow?: components["schemas"]["OriginFollowDoc"];
+            /** @description Catalogue labels at link time. */
+            labels?: string[];
+            /** @description RFC 3339 link timestamp. */
+            linked_at?: string | null;
+            /** @description Catalogue provider id (e.g. `iptv-org`). */
+            provider: string;
+            /** @description Stream URL as linked. */
+            stream_url?: string | null;
         };
         /** @description `OpenAPI` mirror of [`multiview_config::SourceRecall`]. */
         SourceRecallDoc: {
@@ -7258,7 +7522,7 @@ export interface components {
          *     Serde-equivalent: a unit enum rendered as its `kebab-case` variant name.
          * @enum {string}
          */
-        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking";
+        WarningCodeDoc: "gpu-present-no-vulkan-adapter" | "container-no-host-networking" | "catalogue-link-attention";
         /**
          * @description `OpenAPI` mirror of [`multiview_events::WarningSeverity`] (SA-0).
          *
@@ -8142,6 +8406,460 @@ export interface operations {
             };
             /** @description level_percent is out of range (0–100). */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    import_catalogue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description A JSON object keyed by upstream file name (`streams`, `channels`, `feeds`, `logos`, `cities`, `countries`, `subdivisions`, `regions`, `blocklist`, `categories`, `languages`), optionally gzip'd. Replaces the named files; the rest stay as persisted. */
+        requestBody: {
+            content: {
+                "application/json": unknown;
+            };
+        };
+        responses: {
+            /** @description `{outcome, changed[]}`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Requires administer. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Bundle is malformed. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_catalogue_index: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; identical for every caller (`already_added` is computed by the web). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description If-None-Match matched . */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No snapshot yet; refresh or import first. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    list_catalogue_links: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `{links: [{source_id, status, checked_at, upstream, replaced_by, alternatives}]}` — status, upstream target and ranked alternatives (with cached probe verdict), only for sources the caller may see. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Catalogue not configured. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_catalogue_logo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Logo key `l:<hex>` from an index row. */
+                k: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, cached on disk for 30 days. `Cache-Control: private, max-age=2592000, immutable` and a strong `ETag`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "image/*": unknown;
+                };
+            };
+            /** @description No logo: unknown key, upstream missing/failing, oversized or not an image (`Cache-Control: private, max-age=86400`), or the upstream fetch queue was busy (`Cache-Control: no-store`; retry later). Never an error status. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `If-None-Match` matched the logo's `ETag`. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalogue not configured. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_catalogue_places: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `{schema, places[{id, kind, name, alt, country, subdivision, lat, lon, flag, members, streams, streams_within}]}`; `id` is prefixed like a row's `area`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description If-None-Match matched. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No snapshot yet. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_catalogue_probe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProbeBody"];
+            };
+        };
+        responses: {
+            /** @description The probe job `{id, state: queued|running|done|failed, results[], error}`; poll `GET probes/{id}`. A 15-minute cache hit completes immediately. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Requires operate (write), or a `source_ids` entry the caller may not use. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown key or source id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description `keys` + `source_ids` must hold 1..=50 entries. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Per-principal rate (60/min) or the global queue (64) is exhausted. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No probe service on this node. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_catalogue_probe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Probe job id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The probe job and its finished results (verdict, facts, events). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Unknown job. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    refresh_catalogue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `{outcome: unchanged|updated, changed[]}`; a failed sync keeps the previous snapshot. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Requires administer. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Disabled / not configured. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Upstream sync failed. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_catalogue_sources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkAddBody"];
+            };
+        };
+        responses: {
+            /** @description Every source was created; per-item results in request order. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkAddResponse"];
+                };
+            };
+            /** @description A durable write failed part-way: earlier items are created, the failed item and the rest are reported. */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkAddResponse"];
+                };
+            };
+            /** @description Requires write, or an id is outside the caller's scope. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description At most 8 sources per bulk add (each starts always on until activation lands); or an entry is invalid or duplicated. Nothing was created. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_catalogue_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sync state, counts, ETags, last error and the caller-scoped link-status tally. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Catalogue not configured. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -14350,6 +15068,74 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_source_network_report: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Source id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `NetworkReport {egress, hosts, hops, request_headers, assessment, curl}`; userinfo and query strings are redacted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Requires operate (write), or the source is outside the caller's scope. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Diagnostics are not available on this node. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The source has no http(s) URL. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description The probe queue is full. */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

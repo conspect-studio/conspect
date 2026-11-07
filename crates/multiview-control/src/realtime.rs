@@ -1303,6 +1303,8 @@ pub fn event_scope_id(event: &Event) -> Option<String> {
         // the `ids` filter narrows the coarse `switcher` topic to one player.
         Event::MediaPlayerState(e) => Some(e.player.clone()),
         Event::GraphicsChannelState(e) => Some(e.channel.clone()),
+        // A catalogue link status scopes by the linked source id.
+        Event::CatalogueLinkStatus(e) => Some(e.source_id.clone()),
         // A discovery row has no registry id yet (untrusted inventory): it is
         // correlated to its scan operation via `corr`, never a fabricated id.
         _ => None,
@@ -1381,9 +1383,10 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // Both input connection state AND elementary-stream inventory deltas ride
         // the existing `inputs` lane (RT-3: `input.streams` is a delta on
         // re-probe / PMT-version bump, not a new topic).
-        Event::InputConnection(_) | Event::InputStreams(_) | Event::InputLifecycle(_) => {
-            Topic::Inputs
-        }
+        Event::InputConnection(_)
+        | Event::InputStreams(_)
+        | Event::InputLifecycle(_)
+        | Event::CatalogueLinkStatus(_) => Topic::Inputs,
         Event::JobProgress(_) => Topic::Jobs,
         // Broadcast monitoring/control events ride their own topics so a client
         // can subscribe to the alarm or tally firehose independently.

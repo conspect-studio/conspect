@@ -56,7 +56,7 @@ fn open_with_interrupt_aborts_a_black_holed_socket_within_the_timeout() {
     let opts = DemuxOptions::new().with_rw_timeout(Duration::from_millis(500));
 
     let start = Instant::now();
-    let result = Demuxer::open_with_interrupt(Path::new(&url), opts);
+    let result = Demuxer::open_with_interrupt(Path::new(&url), &opts);
     let elapsed = start.elapsed();
 
     // The open must FAIL (the stream never delivers a header) and, crucially, it
@@ -101,7 +101,7 @@ fn open_with_interrupt_still_opens_a_healthy_local_file() {
     assert!(status.success(), "ffmpeg CLI must generate the clip");
 
     let opts = DemuxOptions::new().with_rw_timeout(Duration::from_secs(5));
-    let demux = Demuxer::open_with_interrupt(&clip, opts).expect("open healthy local file");
+    let demux = Demuxer::open_with_interrupt(&clip, &opts).expect("open healthy local file");
     let streams = demux.streams();
     assert!(
         !streams.is_empty(),
@@ -136,7 +136,7 @@ fn read_packet_on_a_healthy_file_returns_packets_under_the_interrupt_path() {
     assert!(status.success());
 
     let opts = DemuxOptions::new().with_rw_timeout(Duration::from_secs(5));
-    let mut demux = Demuxer::open_with_interrupt(&clip, opts).expect("open");
+    let mut demux = Demuxer::open_with_interrupt(&clip, &opts).expect("open");
     let first = demux
         .read_packet()
         .expect("read without error")

@@ -230,6 +230,15 @@ mod guide_change_tests {
         let mut moved = combined.clone();
         moved["url"] = json!("https://example.com/other");
         assert!(!guide_only_change(&combined, &moved), "a url edit is media");
+        let mut origin = source.clone();
+        origin["origin"] = json!({"provider":"iptv-org","channel":"A.us","follow":"notify"});
+        assert!(guide_only_change(&source, &origin), "origin is metadata");
+        let mut ua = source.clone();
+        ua["user_agent"] = json!("UA/9");
+        assert!(!guide_only_change(&source, &ua), "user_agent is media");
+        let mut rf = source.clone();
+        rf["referrer"] = json!("https://r/");
+        assert!(!guide_only_change(&source, &rf), "referrer is media");
         let mut observe = source.clone();
         observe["events"] = json!({"observe": false});
         assert!(
@@ -363,6 +372,39 @@ fn live_apply_remove(state: &AppState, id: &str) -> ApplyMode {
     } else {
         ApplyMode::Restart
     }
+}
+
+/// The parsed sources the caller may see (per-object BOLA filter) — the catalogue
+/// routes use it for `already_added` and link status so neither can reveal a source
+/// the caller could not `GET`.
+pub(crate) fn visible_sources(
+    state: &AppState,
+    principal: &Principal,
+) -> ControlResult<Vec<multiview_config::Source>> {
+    Ok(accepted_sources(state)?
+        .into_iter()
+        .filter(|v| crate::auth::authorize_object(principal, &v.resource.id).is_ok())
+        .filter_map(|v| parse_stored_source(&v.resource.body))
+        .collect())
+}
+
+/// Every accepted source, parsed (system view for server-side bookkeeping).
+pub(crate) fn accepted_sources_system(state: &AppState) -> Vec<multiview_config::Source> {
+    accepted_sources(state)
+        .map(|all| {
+            all.into_iter()
+                .filter_map(|v| parse_stored_source(&v.resource.body))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One accepted source with its version (system view).
+pub(crate) fn accepted_sources_system_versioned(
+    state: &AppState,
+    id: &str,
+) -> Option<VersionedResource> {
+    accepted_source(state, id).ok()
 }
 
 /// Read accepted intent rather than a lagging, fallible SQLite projection.
@@ -502,14 +544,36 @@ pub(crate) async fn create_source(
     // store-write → submit → adopt-snapshot sequence, so the persister (which
     // takes the same lock) can never compose mid-mutation and the adopted
     // snapshot advances atomically with the engine submit.
-    let _mutation = state.lock_config_mutation().await;
-    if accepted_sources(&state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
+    let mutation = state.lock_config_mutation().await;
+    let (versioned, mode) =
+        create_source_locked(&state, &mutation, &principal.key_id, &id, input).await?;
+    Ok(with_apply(
+        mode,
+        source_response(StatusCode::CREATED, &versioned),
+    ))
+}
+
+/// The canonical durable source create: capacity and duplicate checks,
+/// `commit_resource`, store projection, audit and live apply.
+///
+/// The caller must hold `lock_config_mutation` — the `_mutation` guard is the
+/// proof — and must already have authorised `id` and validated `input.body`
+/// (see [`validated_body`]). Shared by `POST /sources/{id}` and the catalogue
+/// bulk add so both go through one path.
+pub(crate) async fn create_source_locked(
+    state: &AppState,
+    _mutation: &tokio::sync::OwnedMutexGuard<()>,
+    actor: &str,
+    id: &str,
+    input: ResourceInput,
+) -> ControlResult<(VersionedResource, ApplyMode)> {
+    if accepted_sources(state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
         return Err(crate::error::ControlError::Validation(format!(
             "sources exceeds the live source capacity of {}",
             multiview_config::MAX_ADMITTED_SOURCES
         )));
     }
-    if accepted_sources(&state)?
+    if accepted_sources(state)?
         .iter()
         .any(|entry| entry.resource.id == id)
     {
@@ -518,36 +582,49 @@ pub(crate) async fn create_source(
         )));
     }
     crate::boot_model::commit_resource(
-        &state,
+        state,
         "sources",
-        &id,
+        id,
         Some(input.body.clone()),
         Some(input.name.clone()),
     )
     .await?;
-    if let Err(error) = state.sources.create(&id, input) {
+    if let Err(error) = state.sources.create(id, input) {
         if state.boot_model.is_none() {
             return Err(error);
         }
         tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
     }
-    let versioned = accepted_source(&state, &id).map_err(|error| {
+    let versioned = accepted_source(state, id).map_err(|error| {
         crate::error::ControlError::CommitIndeterminate(format!(
             "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
         ))
     })?;
     state.audit(
-        &principal.key_id,
+        actor,
         AuditAction::Create,
         SOURCE_KIND,
-        &id,
+        id,
         Some(versioned.resource.body.clone()),
     );
-    let mode = live_apply_upsert(&state, parse_stored_source(&versioned.resource.body), None);
-    Ok(with_apply(
-        mode,
-        source_response(StatusCode::CREATED, &versioned),
-    ))
+    let mode = live_apply_upsert(state, parse_stored_source(&versioned.resource.body), None);
+    Ok((versioned, mode))
+}
+
+/// The number of accepted sources and their ids (for bulk pre-validation).
+pub(crate) fn accepted_source_ids(state: &AppState) -> ControlResult<Vec<String>> {
+    Ok(accepted_sources(state)?
+        .into_iter()
+        .map(|entry| entry.resource.id)
+        .collect())
+}
+
+/// Validate a source body for create (public wrapper for the bulk path).
+pub(crate) fn validate_source_body(
+    id: &str,
+    body: &serde_json::Value,
+) -> ControlResult<serde_json::Value> {
+    validated_body(TypedCollection::Sources, id, body)
 }
 
 /// `PUT /api/v1/sources/{id}` — replace a source (role: write; If-Match → 412).
@@ -581,41 +658,84 @@ pub(crate) async fn update_source(
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // precondition → store-write → submit → adopt-snapshot sequence.
     let _mutation = state.lock_config_mutation().await;
+    // Review R3-01: a written automation rule's targets and cells are
+    // authorized against the caller. The catalogue's system auto-follow never
+    // changes `events.automation`, so it shares `apply_source_update` without
+    // this check.
+    if let Ok(current) = accepted_source(&state, &id) {
+        authorize_written_automation(&principal, Some(&current.resource.body), &input.body)?;
+    }
+    let (mode, versioned) =
+        apply_source_update(&state, &principal.key_id, &id, Some(&if_match), input)
+            .await?
+            .into_applied();
+    Ok(with_apply(
+        mode,
+        source_response(StatusCode::OK, &versioned),
+    ))
+}
+
+/// The result of a source update (kept as a struct so callers destructure it).
+pub(crate) struct AppliedUpdate {
+    mode: ApplyMode,
+    versioned: VersionedResource,
+}
+
+impl AppliedUpdate {
+    fn into_applied(self) -> (ApplyMode, VersionedResource) {
+        (self.mode, self.versioned)
+    }
+}
+
+/// The shared update sequence behind `PUT /sources/{id}` and the catalogue's
+/// `follow = auto` apply: precondition (`If-Match` when `Some`, the current version
+/// when `None` for system callers who just read it under the same lock) →
+/// typed validation → durable commit → store write → audit → live apply.
+///
+/// The caller MUST hold `state.lock_config_mutation()`.
+pub(crate) async fn apply_source_update(
+    state: &AppState,
+    actor: &str,
+    id: &str,
+    if_match: Option<&IfMatch>,
+    input: ResourceInput,
+) -> ControlResult<AppliedUpdate> {
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
-    let current = accepted_source(&state, &id)?;
-    if_match.require(SOURCE_KIND, &id, current.version)?;
+    let current = accepted_source(state, id)?;
+    if let Some(m) = if_match {
+        m.require(SOURCE_KIND, id, current.version)?;
+    }
     let input = ResourceInput {
         name: input.name,
-        body: validated_body(TypedCollection::Sources, &id, &input.body)?,
+        body: validated_body(TypedCollection::Sources, id, &input.body)?,
     };
-    authorize_written_automation(&principal, Some(&current.resource.body), &input.body)?;
     let previous = parse_stored_source(&current.resource.body);
     crate::boot_model::commit_resource(
-        &state,
+        state,
         "sources",
-        &id,
+        id,
         Some(input.body.clone()),
         Some(input.name.clone()),
     )
     .await?;
-    if let Err(error) = state.sources.update(&id, input) {
+    if let Err(error) = state.sources.update(id, input) {
         if state.boot_model.is_none() {
             return Err(error);
         }
         tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
     }
-    let versioned = accepted_source(&state, &id).map_err(|error| {
+    let versioned = accepted_source(state, id).map_err(|error| {
         crate::error::ControlError::CommitIndeterminate(format!(
             "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
         ))
     })?;
     state.audit(
-        &principal.key_id,
+        actor,
         AuditAction::Update,
         SOURCE_KIND,
-        &id,
+        id,
         Some(versioned.resource.body.clone()),
     );
     let next = parse_stored_source(&versioned.resource.body);
@@ -636,12 +756,9 @@ pub(crate) async fn update_source(
             ApplyMode::Live
         }
     } else {
-        live_apply_upsert(&state, next, previous.as_ref())
+        live_apply_upsert(state, next, previous.as_ref())
     };
-    Ok(with_apply(
-        mode,
-        source_response(StatusCode::OK, &versioned),
-    ))
+    Ok(AppliedUpdate { mode, versioned })
 }
 
 /// `DELETE /api/v1/sources/{id}` — delete a source (role: administer; If-Match).

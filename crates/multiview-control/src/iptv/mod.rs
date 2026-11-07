@@ -169,7 +169,7 @@ pub fn strip_userinfo(url: &str) -> String {
 fn source_url(kind: &SourceKind) -> Option<&str> {
     match kind {
         SourceKind::Rtsp { url }
-        | SourceKind::Hls { url }
+        | SourceKind::Hls { url, .. }
         | SourceKind::Youtube { url }
         | SourceKind::Ts { url }
         | SourceKind::Rtmp { url }
@@ -1104,6 +1104,7 @@ mod tests {
                     len: u64::try_from(body.len()).unwrap(),
                     etag: None,
                     last_modified: None,
+                    content_type: None,
                 })
             })
         }

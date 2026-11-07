@@ -372,6 +372,12 @@ discovery = ["multiview-control/discovery"]
 # CI-green; forwards `multiview-control/devices-net` (= `zowietek` + `cast`).
 devices-net = ["multiview-control/devices-net"]
 
+# IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe on
+# the control plane. Pure-Rust (reqwest + rustls). `catalogue-ffmpeg` adds the
+# probe's decode stage (needs libav, so it rides the `ffmpeg` presets only).
+catalogue = ["multiview-control/catalogue"]
+catalogue-ffmpeg = ["catalogue", "multiview-control/catalogue-ffmpeg"]
+
 # Overlay rasterization: bakes the configured overlays (clock/labels, dB
 # meters, safe-area graticules, tally borders, burned-in SRT/VTT subtitles) into
 # the composited program before encode, via multiview-compositor's pure-Rust
@@ -590,6 +596,9 @@ nvidia = [
     # deploy image's SRT listeners would fail closed with a clear "requires
     # srt-libsrt" error instead of serving the production dual-stack listener.
     "srt-libsrt",
+    # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe
+    # (decode stage via the safe libav wrappers). Pure-Rust network I/O, LGPL-clean.
+    "catalogue-ffmpeg",
     # Native overlay / caption burn-in. The native HLS-WebVTT caption ingest +
     # per-tile burn-in path (the `#47` fix) is entirely `#[cfg(feature =
     # "overlay")]`-gated (`prefetch_caption_plans` / `wire_source_captions` / the
@@ -657,6 +666,9 @@ apple = [
     "tls",
     "sqlite",
     "ffmpeg",
+    # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe
+    # (decode stage via the safe libav wrappers). Pure-Rust network I/O, LGPL-clean.
+    "catalogue-ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped Apple deploy image
     # would silently render no native captions/overlays.
@@ -688,6 +700,9 @@ linux-vaapi = [
     "tls",
     "sqlite",
     "ffmpeg",
+    # IPTV-ORG source browser (ADR-M015): catalogue sync + link tracker + deep probe
+    # (decode stage via the safe libav wrappers). Pure-Rust network I/O, LGPL-clean.
+    "catalogue-ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped VAAPI deploy image
     # would silently render no native captions/overlays.
@@ -756,6 +771,9 @@ full = [
     # HTTP backend. LGPL-clean (reqwest + rustls, no native lib), so it belongs
     # in the non-GPL `full` build.
     "devices-net",
+    # IPTV-ORG source browser: catalogue sync, link tracker, deep probe (with the
+    # libav decode stage). Pure-Rust network I/O + the safe ffmpeg wrappers.
+    "catalogue-ffmpeg",
     # RIST ingest + egress (ADR-0095): comes transitively via the presets above;
     # named explicitly so the everything-non-GPL build keeps it on a refactor.
     # LGPL-clean (librist BSD-2-Clause).

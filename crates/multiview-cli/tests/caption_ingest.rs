@@ -161,6 +161,7 @@ fn bipbop_english_webvtt_cue_decodes_into_the_store() {
 /// `CaptionPlan` has public fields, so a test constructs it directly.
 fn plan_for(rendition_url: String, live: bool) -> CaptionPlan {
     CaptionPlan {
+        http_headers: multiview_ffmpeg::HttpHeaders::default(),
         id: "cam".to_owned(),
         rendition_url,
         store: Arc::new(CueStore::new()),

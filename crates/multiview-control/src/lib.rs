@@ -46,6 +46,7 @@ pub mod audit;
 pub mod auth;
 pub mod automation;
 pub mod boot_model;
+pub mod catalogue;
 pub mod command;
 pub mod concurrency;
 pub mod config_lock;

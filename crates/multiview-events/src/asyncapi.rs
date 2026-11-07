@@ -244,6 +244,19 @@ fn build_messages() -> Value {
     map.insert("InputLifecycle".to_owned(), input_lifecycle_message());
     // Switcher realtime surface messages (ADR-RT008).
     map.extend(build_messages_switcher_events());
+    map.insert("CatalogueLinkStatus".to_owned(), json!({
+        "name": "CatalogueLinkStatus",
+        "title": "Catalogue link status changed",
+        "summary": "A source linked to an IPTV-ORG catalogue entry changed link status (catalogue.link_status on topic `inputs`).",
+        "description": concat!(
+            "Emitted on topic `inputs` with envelope `id` = source id, after each ",
+            "catalogue sync. LOSSLESS lifecycle fact. Carries identifiers and the status ",
+            "token only; the change diff and ranked alternatives are served by ",
+            "`GET /api/v1/catalogues/iptv-org/links`. Authorized per source id (BOLA).",
+        ),
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/CatalogueLinkStatus" }
+    }));
     // Devices realtime surface messages (ADR-RT007).
     map.extend(build_messages_device_events());
     // Control frame messages.
@@ -714,6 +727,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/SalvoEvent" },
         { "$ref": "#/components/schemas/MediaPlayerEvent" },
         { "$ref": "#/components/schemas/GraphicsChannelEvent" },
+        { "$ref": "#/components/schemas/CatalogueLinkStatus" },
         { "$ref": "#/components/schemas/DeviceStatus" },
         { "$ref": "#/components/schemas/DeviceAdopted" },
         { "$ref": "#/components/schemas/DeviceRemoved" },
@@ -1211,7 +1225,7 @@ fn warning_code_schema() -> Value {
             "`#[non_exhaustive]`: the catalog grows over time, so a client must ",
             "treat an unknown code as a forward-compatible warning, not an error.",
         ),
-        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking"]
+        "enum": ["gpu-present-no-vulkan-adapter", "config-file-invalid", "config-file-requires-restart", "config-file-apply-incomplete", "container-no-host-networking", "catalogue-link-attention"]
     })
 }
 
@@ -1536,7 +1550,8 @@ fn switcher_event_schemas() -> Value {
     json!({
         "MediaPlayerState": media_player_state_schema(),
         "MediaPlayerEvent": media_player_event_schema(),
-        "GraphicsChannelEvent": graphics_channel_event_schema()
+        "GraphicsChannelEvent": graphics_channel_event_schema(),
+        "CatalogueLinkStatus": catalogue_link_status_schema()
     })
 }
 
@@ -1618,6 +1633,28 @@ fn media_player_state_schema() -> Value {
                 "description": "Reached end-of-file with no loop/vamp engaged."
             }
         ]
+    })
+}
+
+fn catalogue_link_status_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": concat!(
+            "Data body of `catalogue.link_status` (IPTV-ORG, ADR-M015): a linked ",
+            "source's catalogue link status changed. Envelope `id` = source id.",
+        ),
+        "required": ["source_id", "status"],
+        "properties": {
+            "source_id": { "type": "string", "description": "The linked source id." },
+            "status": {
+                "type": "string",
+                "enum": ["in_sync", "updated", "stream_removed", "channel_closed", "blocklisted", "unlinked", "edited"]
+            },
+            "previous": { "type": "string", "description": "Previous status, when known." },
+            "channel": { "type": "string" },
+            "feed": { "type": "string" },
+            "replaced_by": { "type": "string", "description": "Replacement channel id (channel_closed)." }
+        }
     })
 }
 

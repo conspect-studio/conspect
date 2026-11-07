@@ -91,6 +91,19 @@ export interface CastSessionStarted {
   readonly session_id: string;
 }
 
+/** Data body of `catalogue.link_status` (IPTV-ORG, ADR-M015): a linked source's catalogue link status changed. Envelope `id` = source id. */
+export interface CatalogueLinkStatus {
+  readonly channel?: string;
+  readonly feed?: string;
+  /** Previous status, when known. */
+  readonly previous?: string;
+  /** Replacement channel id (channel_closed). */
+  readonly replaced_by?: string;
+  /** The linked source id. */
+  readonly source_id: string;
+  readonly status: "in_sync" | "updated" | "stream_removed" | "channel_closed" | "blocklisted" | "unlinked" | "edited";
+}
+
 /** Data body of `device.adopted`: a device was adopted into the registry. */
 export interface DeviceAdopted {
   /** The registry device id. */
@@ -647,7 +660,7 @@ export interface WallClockRef {
 }
 
 /** Stable catalog code of a health warning (kebab-case). `#[non_exhaustive]`: the catalog grows over time, so a client must treat an unknown code as a forward-compatible warning, not an error. */
-export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking";
+export type WarningCode = "gpu-present-no-vulkan-adapter" | "config-file-invalid" | "config-file-requires-restart" | "config-file-apply-incomplete" | "container-no-host-networking" | "catalogue-link-attention";
 
 /** Severity of a health warning (sibling of AlertSeverity). */
 export type WarningSeverity = "info" | "warning" | "critical";

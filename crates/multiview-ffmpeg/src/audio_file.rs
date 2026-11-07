@@ -38,7 +38,7 @@ use multiview_core::time::MediaTime;
 
 use crate::convert::MediaKind;
 use crate::decode_stream::StreamAudioDecoder;
-use crate::demux::{DemuxOptions, Demuxer};
+use crate::demux::{DemuxOptions, Demuxer, HttpHeaders};
 use crate::error::{FfmpegError, Result};
 use crate::resample::{ResampleSpec, Resampler};
 
@@ -159,12 +159,28 @@ impl AudioFileDecoder {
     /// # Errors
     /// As [`open`](Self::open), plus [`FfmpegError::ReadTimeout`].
     pub fn open_live(path: &Path, target_rate: u32, target_channels: u16) -> Result<Self> {
+        Self::open_live_with_headers(path, target_rate, target_channels, &HttpHeaders::default())
+    }
+
+    /// [`open_live`](Self::open_live) sending operator HTTP `headers` on every
+    /// request libav makes for the input.
+    ///
+    /// # Errors
+    /// As [`open_live`](Self::open_live).
+    pub fn open_live_with_headers(
+        path: &Path,
+        target_rate: u32,
+        target_channels: u16,
+        headers: &HttpHeaders,
+    ) -> Result<Self> {
         let is_hls = path
             .to_string_lossy()
             .split(['?', '#'])
             .next()
             .is_some_and(|base| base.to_ascii_lowercase().ends_with(".m3u8"));
-        let mut options = DemuxOptions::new().with_rw_timeout(LIVE_READ_TIMEOUT);
+        let mut options = DemuxOptions::new()
+            .with_rw_timeout(LIVE_READ_TIMEOUT)
+            .with_http_headers(headers.clone());
         if is_hls {
             options = options.with_options(&[
                 ("strict", "normal"),
@@ -173,7 +189,7 @@ impl AudioFileDecoder {
             ]);
         }
         let mut decoder = Self::from_demuxer(
-            Demuxer::open_with_interrupt(path, options)?,
+            Demuxer::open_with_interrupt(path, &options)?,
             target_rate,
             target_channels,
         )?;

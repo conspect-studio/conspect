@@ -602,10 +602,11 @@ impl HlsFetcher {
     pub(crate) fn start(
         source_id: &str,
         playlist_url: &str,
+        headers: &RequestHeaders,
         stop: &AtomicBool,
         generation: u64,
     ) -> Result<Self, String> {
-        Self::start_with_observer(source_id, playlist_url, stop, generation, None)
+        Self::start_with_observer(source_id, playlist_url, headers, stop, generation, None)
     }
 
     /// Inject a bounded observer owned solely by this fetch coordinator.
@@ -613,6 +614,7 @@ impl HlsFetcher {
     pub(crate) fn start_with_observer(
         source_id: &str,
         playlist_url: &str,
+        headers: &RequestHeaders,
         stop: &AtomicBool,
         generation: u64,
         observer: Option<crate::hls_event_observer::HlsEventObserver>,
@@ -637,7 +639,7 @@ impl HlsFetcher {
             return Err("bypassed after the fetcher gave up on this origin".to_owned());
         }
         let base = url::Url::parse(playlist_url).map_err(|e| format!("playlist url: {e}"))?;
-        let agent = agent();
+        let agent = agent_with(headers);
         // Probe the playlist once synchronously so an unsupported one falls back
         // before any thread starts.
         let (first, final_url) = fetch_playlist(&agent, base.as_str(), &st.throttle)?;
@@ -714,8 +716,55 @@ impl HlsFetcher {
     }
 }
 
+/// Operator-set request headers (`user_agent` / `referrer`) for one source.
+///
+/// Only these two are ever sent; values containing CR, LF or any other control
+/// character are dropped (header-injection guard, mirroring the config
+/// validator). There is no origin policy: as with libav before the fetcher
+/// existed, the headers go on every request of the source (playlist, segments,
+/// redirect hops and segment hosts).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RequestHeaders {
+    user_agent: Option<String>,
+    referer: Option<String>,
+}
+
+impl RequestHeaders {
+    pub(crate) fn new(user_agent: Option<&str>, referer: Option<&str>) -> Self {
+        let clean = |v: Option<&str>| {
+            v.filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        Self {
+            user_agent: clean(user_agent),
+            referer: clean(referer),
+        }
+    }
+}
+
+#[cfg(test)]
 fn agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
+    agent_with(&RequestHeaders::default())
+}
+
+fn agent_with(headers: &RequestHeaders) -> ureq::Agent {
+    let mut builder = ureq::Agent::config_builder();
+    if let Some(ua) = &headers.user_agent {
+        builder = builder.user_agent(ua.as_str());
+    }
+    if let Some(referer) = headers.referer.clone() {
+        builder = builder.middleware(
+            move |mut req: ureq::http::Request<ureq::SendBody<'_>>,
+                  next: ureq::middleware::MiddlewareNext<'_>|
+                  -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+                if let Ok(v) = ureq::http::HeaderValue::from_str(&referer) {
+                    req.headers_mut().insert(ureq::http::header::REFERER, v);
+                }
+                next.handle(req)
+            },
+        );
+    }
+    let config = builder
         .http_status_as_error(false)
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(CALL_TIMEOUT))
@@ -770,6 +819,31 @@ fn fetch_playlist(
         }
     }
     Err(last)
+}
+
+/// Fetch a small text resource (an HLS master playlist) carrying `headers`;
+/// returns the body with its effective (post-redirect) URL. Control/IO plane.
+pub(crate) fn fetch_text(
+    headers: &RequestHeaders,
+    url: &str,
+    max_bytes: u64,
+) -> Result<(String, String), String> {
+    use ureq::ResponseExt as _;
+    let resp = agent_with(headers)
+        .get(url)
+        .call()
+        .map_err(|e| e.to_string())?;
+    if resp.status().as_u16() != 200 {
+        return Err(format!("status {}", resp.status().as_u16()));
+    }
+    let final_url = resp.get_uri().to_string();
+    let body = resp
+        .into_body()
+        .with_config()
+        .limit(max_bytes)
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    Ok((final_url, body))
 }
 
 fn header_retry_after(resp: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
@@ -2591,5 +2665,106 @@ mod tests {
         .expect("evicted");
         assert_eq!(s, 404, "evicted segments are gone");
         shared.stop.store(true, Ordering::Release);
+    }
+
+    /// Serve a live playlist + one segment on loopback, recording every
+    /// request's lower-cased header block keyed by path.
+    #[allow(clippy::type_complexity)] // test helper: (port, recorded (path, headers))
+    fn recording_origin() -> (u16, Arc<Mutex<Vec<(String, String)>>>) {
+        let listener = TcpListener::bind("[::1]:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    let Ok(mut out) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut input = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        if input.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let path = line.split(' ').nth(1).unwrap_or("").to_owned();
+                        let mut headers = String::new();
+                        loop {
+                            let mut h = String::new();
+                            if input.read_line(&mut h).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if h.trim_end().is_empty() {
+                                break;
+                            }
+                            headers.push_str(&h.to_ascii_lowercase());
+                        }
+                        log.lock().expect("log").push((path.clone(), headers));
+                        let is_playlist = std::path::Path::new(&path)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"));
+                        let resp = if is_playlist {
+                            reply(
+                                "HTTP/1.1 200 OK",
+                                b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:5.6,\nseg5.ts\n",
+                            )
+                        } else {
+                            reply("HTTP/1.1 200 OK", &[0x47; 188])
+                        };
+                        if out.write_all(&resp).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    #[test]
+    fn operator_user_agent_and_referer_ride_playlist_segment_and_master_requests() {
+        let (port, seen) = recording_origin();
+        let headers = RequestHeaders::new(Some("Opera/Test 9"), Some("https://ref.example/"));
+        // The variant-pin master fetch.
+        let (_, body) = fetch_text(
+            &headers,
+            &format!("http://[::1]:{port}/master.m3u8"),
+            1 << 20,
+        )
+        .expect("master");
+        assert!(body.starts_with("#EXTM3U"));
+        // The loopback fetcher: playlist probe, reloads and the segment.
+        let id = "hls-headers-test";
+        let generation = begin_generation(id);
+        let stop = AtomicBool::new(false);
+        let fetcher = HlsFetcher::start(
+            id,
+            &format!("http://[::1]:{port}/live.m3u8"),
+            &headers,
+            &stop,
+            generation,
+        )
+        .expect("fetcher");
+        drop(fetcher);
+        let log = seen.lock().expect("log");
+        for want in ["/master.m3u8", "/live.m3u8", "/seg5.ts"] {
+            let (_, h) = log
+                .iter()
+                .find(|(p, _)| p == want)
+                .unwrap_or_else(|| panic!("no request for {want}"));
+            assert!(h.contains("user-agent: opera/test 9\r\n"), "{want}: {h}");
+            assert!(
+                h.contains("referer: https://ref.example/\r\n"),
+                "{want}: {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_headers_drop_control_characters() {
+        let h = RequestHeaders::new(Some("ok\r\nX-Evil: 1"), Some("https://r/\n"));
+        assert_eq!(h, RequestHeaders::default());
+        assert!(RequestHeaders::new(Some("UA"), None).user_agent.is_some());
     }
 }

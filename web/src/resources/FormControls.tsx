@@ -118,6 +118,13 @@ export function FieldErrorMessage({ code }: { readonly code: FormErrorCode }): J
       return <Trans>Add at least one member device to the group.</Trans>;
     case 'duplicate-member':
       return <Trans>This device is already a member of the group.</Trans>;
+    case 'header-invalid':
+      return (
+        <Trans>
+          A header value must be printable, with no line breaks, and at most
+          1024 characters.
+        </Trans>
+      );
   }
 }
 

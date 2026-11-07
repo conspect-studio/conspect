@@ -44,6 +44,27 @@ async fn create_source_with_unknown_kind_is_422_with_field_detail() {
 }
 
 #[tokio::test]
+async fn create_hls_source_with_crlf_header_is_422() {
+    let h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/news",
+            OPERATOR_TOKEN,
+            &json!({
+                "name": "News",
+                "body": { "id": "news", "kind": "hls", "url": "https://example.com/x.m3u8",
+                          "user_agent": "bad\r\nX-Evil: 1" }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let problem = body_json(resp).await;
+    assert_eq!(problem["type"], "/problems/validation");
+}
+
+#[tokio::test]
 async fn create_source_missing_required_field_is_422() {
     let h = harness();
     // An rtsp source without its `url` must be rejected.
@@ -247,6 +268,11 @@ fn openapi_mirrors_accept_what_the_config_types_accept() {
                 "timezone": "UTC", "format": "d_hh_mm_ss" }),
         json!({ "id": "s", "kind": "rtsp", "url": "rtsp://[2001:db8::1]/cam" }),
         json!({ "id": "s", "kind": "hls", "url": "https://example.com/x.m3u8" }),
+        json!({ "id": "s", "kind": "hls", "url": "https://example.com/x.m3u8",
+                "user_agent": "Mozilla/5.0", "referrer": "https://example.com/",
+                "origin": { "provider": "iptv-org", "channel": "KAKE.us", "feed": "SD",
+                            "stream_url": "https://example.com/x.m3u8", "labels": ["Geo-blocked"],
+                            "linked_at": "2026-11-07T05:00:00Z", "follow": "auto" } }),
         json!({ "id": "s", "kind": "youtube", "url": "https://www.youtube.com/watch?v=abc" }),
         json!({ "id": "s", "kind": "ts", "url": "udp://[ff3e::1]:5000" }),
         json!({ "id": "s", "kind": "srt", "url": "srt://[2001:db8::2]:9000" }),

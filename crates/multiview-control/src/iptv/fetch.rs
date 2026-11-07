@@ -51,6 +51,8 @@ pub enum FetchOutcome {
         etag: Option<String>,
         /// Response `Last-Modified`, if any.
         last_modified: Option<String>,
+        /// Response media type (parameters dropped, lower-cased), if any.
+        content_type: Option<String>,
     },
     /// `304 Not Modified` for a conditional request.
     NotModified,
@@ -186,6 +188,19 @@ mod net {
         }
     }
 
+    /// The error plus its `source()` chain, so callers can tell a DNS failure
+    /// ("dns error: …") from a timeout or a refused connection.
+    fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut out = e.to_string();
+        let mut cur = e.source();
+        while let Some(c) = cur {
+            out.push_str(": ");
+            out.push_str(&c.to_string());
+            cur = c.source();
+        }
+        out
+    }
+
     fn screen_literal(url: &url::Url, policy: &DialPolicy) -> Result<(), String> {
         let ip = match url.host() {
             Some(url::Host::Ipv4(v4)) => IpAddr::V4(v4),
@@ -235,7 +250,11 @@ mod net {
                 }
                 attempt.follow()
             }))
-            .user_agent(concat!("multiview-iptv/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                "Conspect-iptv/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/conspect-studio/conspect; catalogue and logo fetcher)"
+            ))
             .build()
             .map_err(|e| format!("http client: {e}"))?;
         let mut builder = client
@@ -250,7 +269,7 @@ mod net {
         let mut response = builder
             .send()
             .await
-            .map_err(|e| format!("{shown}: {}", e.without_url()))?;
+            .map_err(|e| format!("{shown}: {}", error_chain(&e.without_url())))?;
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(FetchOutcome::NotModified);
         }
@@ -273,6 +292,13 @@ mod net {
         };
         let etag = header("etag");
         let last_modified = header("last-modified");
+        let content_type = header("content-type").map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        });
         let mut file = tempfile::tempfile().map_err(|e| format!("spool: {e}"))?;
         let mut len: u64 = 0;
         while let Some(chunk) = response
@@ -293,6 +319,7 @@ mod net {
             len,
             etag,
             last_modified,
+            content_type,
         })
     }
 }

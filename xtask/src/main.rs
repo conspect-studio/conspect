@@ -23,6 +23,9 @@ const ASYNCAPI_OUT: &str = "docs/api/asyncapi.json";
 /// Relative path (from the workspace root, gitignored) of the emitted iptv soak
 /// source manifest. `.multiview-build/` is the transient build working dir and
 /// is never committed — the resolved real stream URLs MUST NOT enter git.
+/// Relative path of the committed IPTV-ORG city gazetteer (embedded by multiview-control).
+const GAZETTEER_OUT: &str = "crates/multiview-control/assets/iptv-org-gazetteer.tsv";
+
 const IPTV_SOAK_OUT: &str = ".multiview-build/iptv-soak-sources.json";
 
 fn main() -> ExitCode {
@@ -37,6 +40,8 @@ fn main() -> ExitCode {
             );
             println!("                 test sources → {IPTV_SOAK_OUT} (needs network; build with");
             println!("                 `--features net`). Aliases: iptv-sources.");
+            println!("  iptv-gazetteer build the CC0 city-coordinate gazetteer from Wikidata P625");
+            println!("                 → {GAZETTEER_OUT} (needs network; `--features net`)");
             println!("  soak-report    render the DEV-C4 acceptance-soak verdict from a captured");
             println!("                 metrics series: cargo xtask soak-report <capture.json>");
             println!("  check-release-features  assert no shipped release preset (nvidia/apple/");
@@ -76,6 +81,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        "iptv-gazetteer" => iptv_gazetteer(),
         "soak-report" => {
             let Some(capture) = std::env::args().nth(2) else {
                 eprintln!("soak-report: missing <capture.json> argument");
@@ -208,6 +214,43 @@ impl std::error::Error for IptvSoakError {
             Self::Selection(source) => Some(source),
         }
     }
+}
+
+/// `iptv-gazetteer [cities.json]`: regenerate the committed city-coordinate file.
+#[cfg(feature = "net")]
+fn iptv_gazetteer() -> ExitCode {
+    let cities = std::env::args().nth(2);
+    match xtask::gazetteer::generate(cities.as_deref()) {
+        Ok(tsv) => {
+            let out = workspace_root().join(GAZETTEER_OUT);
+            if let Some(dir) = out.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match std::fs::write(&out, tsv) {
+                Ok(()) => {
+                    println!("wrote {}", out.display());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("iptv-gazetteer failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("iptv-gazetteer failed: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The `net`-disabled stub.
+#[cfg(not(feature = "net"))]
+fn iptv_gazetteer() -> ExitCode {
+    eprintln!(
+        "iptv-gazetteer needs the network: run `cargo run -p xtask --features net -- iptv-gazetteer`"
+    );
+    ExitCode::from(2)
 }
 
 /// Serialize `multiview-control`'s utoipa [`OpenApi`] document to pretty JSON and

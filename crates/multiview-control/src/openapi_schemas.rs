@@ -586,6 +586,8 @@ pub enum WarningCodeDoc {
     GpuPresentNoVulkanAdapter,
     /// Multicast is configured inside a container without host networking.
     ContainerNoHostNetworking,
+    /// Sources linked to an IPTV-ORG catalogue entry need attention.
+    CatalogueLinkAttention,
 }
 
 /// `OpenAPI` mirror of [`multiview_events::HealthWarning`] (SA-0).
@@ -1002,6 +1004,12 @@ pub enum SourceKindDoc {
     Hls {
         /// Playlist URL.
         url: String,
+        /// Optional `User-Agent` header (printable, no CR/LF, <= 1 KiB).
+        #[serde(default)]
+        user_agent: Option<String>,
+        /// Optional `Referer` header (printable, no CR/LF, <= 1 KiB).
+        #[serde(default)]
+        referrer: Option<String>,
     },
     /// `YouTube` live, resolved to HLS at runtime.
     Youtube {
@@ -1233,6 +1241,49 @@ pub struct SourceBodyDoc {
     /// `on_demand` (idle until something consumes it).
     #[serde(default)]
     pub activation: Option<crate::source_demand::SourceActivationView>,
+    /// Catalogue provenance (IPTV-ORG link).
+    #[serde(default)]
+    pub origin: Option<SourceOriginDoc>,
+}
+
+/// `OpenAPI` mirror of `multiview_config::OriginFollow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OriginFollowDoc {
+    /// Never act on upstream changes.
+    Manual,
+    /// Notify the operator (default).
+    #[default]
+    Notify,
+    /// Auto-apply same-channel URL/header updates.
+    Auto,
+}
+
+/// `OpenAPI` mirror of `multiview_config::SourceOrigin`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct SourceOriginDoc {
+    /// Catalogue provider id (e.g. `iptv-org`).
+    pub provider: String,
+    /// Channel id; absent for no-metadata streams.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Feed id.
+    #[serde(default)]
+    pub feed: Option<String>,
+    /// Stream URL as linked.
+    #[serde(default)]
+    pub stream_url: Option<String>,
+    /// Catalogue labels at link time.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// RFC 3339 link timestamp.
+    #[serde(default)]
+    pub linked_at: Option<String>,
+    /// Follow mode.
+    #[serde(default)]
+    pub follow: OriginFollowDoc,
 }
 
 /// `OpenAPI` mirror of `multiview_config::audio::OutputAudioMode`.
