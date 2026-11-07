@@ -12523,9 +12523,27 @@ fn open_and_stream(
     // the tile keeps running (invariants #1/#2).
     let nvdec_env = std::env::var(multiview_ffmpeg::NVDEC_DISABLE_ENV).ok();
     let (want_hw, cuda_ordinal) = decoder_open_args(&plan.decode_placement, nvdec_env.as_deref());
-    let (decoder, used_hw) =
-        StreamVideoDecoder::new_preferring_hw(params, time_base, want_hw, cuda_ordinal)
-            .map_err(|e| e.to_string())?;
+    // Inv #6 (decode near display size): on NVDEC, ask the ASIC to emit at the
+    // tile size (`*_cuvid -resize`) so the host download and the CPU tile scale
+    // shrink from the source to the tile. A pure downscale only; the tile size is
+    // fixed for this plan (a layout change respawns the producer, which reopens).
+    let display_resize = {
+        let (src_w, src_h) = StreamVideoDecoder::coded_size(&params);
+        let resize_env = std::env::var(multiview_ffmpeg::NVDEC_RESIZE_DISABLE_ENV).ok();
+        multiview_ffmpeg::nvdec_resize_target(
+            multiview_ffmpeg::TileSize::new(src_w, src_h),
+            multiview_ffmpeg::TileSize::new(plan.tile_w, plan.tile_h),
+            resize_env.as_deref(),
+        )
+    };
+    let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
+        params,
+        time_base,
+        want_hw,
+        cuda_ordinal,
+        display_resize,
+    )
+    .map_err(|e| e.to_string())?;
     // Feed the declared cadence so the decoder's genpts fallback advances at the
     // source's true rate (PAL 25, film 24, …) rather than an NTSC-shaped guess;
     // an unusable rate is ignored inside `with_declared_fps` (invariant #3).
@@ -12534,6 +12552,7 @@ fn open_and_stream(
         source = %plan.id,
         hardware = used_hw,
         decoder = decoder.hw_decoder_name().unwrap_or("software"),
+        nvdec_resize = ?decoder.hw_resize(),
         "opened video decoder"
     );
     let mut to_tile = TileScaler::new(plan.tile_w, plan.tile_h);

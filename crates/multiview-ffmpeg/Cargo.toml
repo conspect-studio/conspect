@@ -34,6 +34,12 @@ ffmpeg-next = { version = "8.1", optional = true }
 # native/license surface. MIT OR Apache-2.0.
 libc = { version = "0.2", optional = true }
 
+# Host-side cost of the source-size decode + swscale tile path vs the NVDEC
+# fused-resize identity path (perf evidence for decode-at-display-size).
+[[example]]
+name = "tile_scale_cost"
+required-features = ["ffmpeg"]
+
 [features]
 "default" = []
 "ffmpeg" = ["dep:ffmpeg-next", "dep:libc"]

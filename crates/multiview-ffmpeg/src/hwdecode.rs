@@ -411,6 +411,55 @@ pub fn plan_decode_resize(inputs: ResizeInputs) -> HwDecodePlan {
     }
 }
 
+/// The environment variable that disables the NVDEC fused decode-time resize
+/// (`*_cuvid -resize`) at run time while keeping NVDEC decode itself — a
+/// per-deploy A/B / rollback switch. Same truthiness as [`nvdec_disabled`].
+pub const NVDEC_RESIZE_DISABLE_ENV: &str = "MULTIVIEW_DISABLE_NVDEC_RESIZE";
+
+/// The NVDEC fused-resize target for one decode, or [`None`] to decode at the
+/// source size (inv #6: "sources are decoded near display size").
+///
+/// `source` is the stream's coded size from the demuxer; `display` is the
+/// largest tile the decode feeds (the ingest plan's tile). A resize is planned
+/// only when it is a genuine **downscale on both axes** that still lands on an
+/// even, non-degenerate NV12 geometry:
+///
+/// * an unknown source size (`0`) or degenerate display → `None`;
+/// * a display equal to the source → `None` (nothing to save);
+/// * a display larger than the source on either axis → `None` (NVDEC never
+///   upscales here; the existing host scaler handles that tile exactly as
+///   before);
+/// * the opt-out `env_value` ([`NVDEC_RESIZE_DISABLE_ENV`]) engaged → `None`.
+///
+/// The decoded picture then arrives already at the tile size, so the host
+/// download shrinks by `source/display` and the CPU swscale becomes the
+/// identity pack. Pure and total; GPU-free unit-tested.
+#[must_use]
+pub fn nvdec_resize_target(
+    source: TileSize,
+    display: TileSize,
+    env_value: Option<&str>,
+) -> Option<TileSize> {
+    if nvdec_disabled(env_value) {
+        return None;
+    }
+    let even = |v: u32| v & !1;
+    let target = TileSize::new(even(display.width), even(display.height));
+    if source.width == 0 || source.height == 0 || target.width < 2 || target.height < 2 {
+        return None;
+    }
+    if target.width > source.width || target.height > source.height || target == source {
+        return None;
+    }
+    Some(target)
+}
+
+/// The `*_cuvid` `resize` `AVOption` value (`"<width>x<height>"`) for `target`.
+#[must_use]
+pub fn cuvid_resize_option(target: TileSize) -> String {
+    format!("{}x{}", target.width, target.height)
+}
+
 /// The sample bit-depth a hardware surface pool is sized for (inv #5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -517,6 +566,68 @@ pub fn decode_surface_pool(inputs: PoolInputs) -> DecodeSurfacePool {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn nvdec_resize_targets_a_real_downscale_to_the_even_tile() {
+        let src = TileSize::new(1920, 1080);
+        assert_eq!(
+            nvdec_resize_target(src, TileSize::new(640, 360), None),
+            Some(TileSize::new(640, 360))
+        );
+        // Odd display extents round down to even NV12 geometry.
+        assert_eq!(
+            nvdec_resize_target(src, TileSize::new(641, 361), None),
+            Some(TileSize::new(640, 360))
+        );
+        // A single-axis shrink (still no upscale) is a valid resize.
+        assert_eq!(
+            nvdec_resize_target(src, TileSize::new(1920, 540), None),
+            Some(TileSize::new(1920, 540))
+        );
+        assert_eq!(cuvid_resize_option(TileSize::new(640, 360)), "640x360");
+    }
+
+    #[test]
+    fn nvdec_resize_never_upscales_or_no_ops() {
+        let src = TileSize::new(1280, 720);
+        // Equal: nothing to save.
+        assert_eq!(nvdec_resize_target(src, src, None), None);
+        // Larger on either axis: decode at source, host scaler as before.
+        assert_eq!(
+            nvdec_resize_target(src, TileSize::new(1920, 1080), None),
+            None
+        );
+        assert_eq!(
+            nvdec_resize_target(src, TileSize::new(1440, 360), None),
+            None
+        );
+        assert_eq!(
+            nvdec_resize_target(src, TileSize::new(640, 800), None),
+            None
+        );
+        // Unknown source size or degenerate tile.
+        assert_eq!(
+            nvdec_resize_target(TileSize::new(0, 0), TileSize::new(640, 360), None),
+            None
+        );
+        assert_eq!(nvdec_resize_target(src, TileSize::new(1, 1), None), None);
+    }
+
+    #[test]
+    fn nvdec_resize_honours_the_runtime_opt_out() {
+        let src = TileSize::new(1920, 1080);
+        let tile = TileSize::new(640, 360);
+        assert_eq!(NVDEC_RESIZE_DISABLE_ENV, "MULTIVIEW_DISABLE_NVDEC_RESIZE");
+        assert_eq!(nvdec_resize_target(src, tile, Some("1")), None);
+        assert_eq!(
+            nvdec_resize_target(src, tile, Some("0")),
+            Some(TileSize::new(640, 360))
+        );
+        assert_eq!(
+            nvdec_resize_target(src, tile, Some("")),
+            Some(TileSize::new(640, 360))
+        );
+    }
 
     #[test]
     fn software_has_no_libav_device_name_and_is_not_resident() {
