@@ -35,6 +35,7 @@ use multiview_core::color::ColorInfo;
 
 use crate::blend::{over, LinearRgba, PremulRgba};
 use crate::error::{Error, Result};
+use crate::overlay::color_memo::{decode_table, with_encode_cache, EncodeCache};
 use crate::overlay::text::{RasterizedGlyph, RasterizedRun};
 use crate::pipeline::{
     canvas_linear_to_output_yuv, tile_yuv_to_canvas_linear, CanvasColor, Nv12Image,
@@ -1394,7 +1395,13 @@ fn apply_overlays_with_limit(
 
 /// Below this many pixels a rect's thread-spawn overhead outweighs the win, so
 /// it bakes on the calling thread (also covers tiny/test rects).
-const PARALLEL_RECT_PIXEL_THRESHOLD: u64 = 64 * 64;
+///
+/// Measured with the exact colour memos (`color_memo`): per-pixel work is then
+/// a few table lookups, so scoped-thread spawn + join dominates for meter-lane
+/// and caption-sized rects (8×444, 684×74). On `matched_bake`, 64×64 cost
+/// ~14 ms/bake vs ~7.5 ms at 256×256; 512×512 measured the same as 256×256.
+/// Large cards (≥ 256×256) still fan out across bands.
+const PARALLEL_RECT_PIXEL_THRESHOLD: u64 = 256 * 256;
 
 /// The number of worker threads to fan a large dirty rect's bands across: the
 /// machine's available parallelism minus 2 (reserve headroom for the encoder
@@ -1606,12 +1613,20 @@ fn bake_rect_band_into(
         y1: band_y1,
     };
     let mut buffer = LinearCanvasBuffer::region(band);
+    // Exact decode memo: every table entry is the oracle's own output for that
+    // (y8, cb8, cr8), so a lookup equals the call below bit for bit. `None`
+    // (table still building in the background, or another colour pair) means
+    // the oracle runs directly — never a wait.
+    let table = decode_table(color, canvas);
     for y in band.y0..band.y1 {
         for x in band.x0..band.x1 {
             let Some((y8, cb8, cr8)) = image.sample(x, y) else {
                 continue;
             };
-            let lin = tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?;
+            let lin = match table.and_then(|t| t.get(y8, cb8, cr8)) {
+                Some(lin) => lin,
+                None => tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?,
+            };
             if let Some(idx) = buffer.index(x, y) {
                 if let Some(slot) = buffer.pixels.get_mut(idx) {
                     *slot = [lin[0], lin[1], lin[2], 1.0];
@@ -1632,6 +1647,34 @@ fn bake_rect_band_into(
     // the caller handed us (full-canvas planes in the serial path: the offset
     // is simply `band_y0` itself, which is correct since there the slice IS the
     // full plane). This matches `composite_band`'s py_start rebasing.
+    // Exact encode memo keyed by the input's f32 bit patterns (persistent
+    // across frames, bounded; see `color_memo`). Slot hint: the band's
+    // row-pair offset in its rect, so concurrent bands usually start on
+    // distinct pool slots (a busy slot is skipped with `try_lock`, never
+    // waited on).
+    let hint = usize::try_from(band_y0.saturating_sub(rect.y0) / 2).unwrap_or(0);
+    with_encode_cache(hint, canvas, |cache| {
+        encode_band(
+            &buffer, band, band_y0, members, canvas, w, out_y, out_uv, cache,
+        )
+    })
+}
+
+/// Re-encode `band`'s member-covered 2×2 blocks of `buffer` into `out_y` /
+/// `out_uv` (rows rebased to `band_y0`), through the exact encode memo when
+/// one is available, otherwise the oracle.
+#[allow(clippy::too_many_arguments)]
+fn encode_band(
+    buffer: &LinearCanvasBuffer,
+    band: DirtyRect,
+    band_y0: u32,
+    members: &[DirtyRect],
+    canvas: CanvasColor,
+    w: usize,
+    out_y: &mut [u8],
+    out_uv: &mut [u8],
+    mut cache: Option<&mut EncodeCache>,
+) -> Result<()> {
     for y in (band.y0..band.y1).step_by(2) {
         let local_y = y.saturating_sub(band_y0);
         for x in (band.x0..band.x1).step_by(2) {
@@ -1652,8 +1695,11 @@ fn bake_rect_band_into(
                     .pixel(px, global_py)
                     .unwrap_or(PremulRgba::TRANSPARENT);
                 let straight = premul.unpremultiplied();
-                let out =
-                    canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
+                let lin = [straight.r, straight.g, straight.b];
+                let out = match cache.as_deref_mut() {
+                    Some(cache) => cache.encode(lin, canvas)?,
+                    None => canvas_linear_to_output_yuv(lin, canvas)?,
+                };
                 write_nv12_pixel(out_y, out_uv, w, px, local_py, out);
             }
         }
