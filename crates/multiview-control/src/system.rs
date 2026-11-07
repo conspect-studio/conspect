@@ -242,6 +242,57 @@ pub struct SystemCapabilities {
     /// The mandatory NDI attribution — present iff `ndi` is compiled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ndi_attribution: Option<NdiAttribution>,
+    /// Whether this build can resolve a `youtube` source (ADR-0015): the
+    /// `youtube` Cargo feature compiled in AND a `yt-dlp` binary found +
+    /// probed at startup. `None` on a build without the `youtube` feature at
+    /// all (the capability does not exist, as opposed to existing-but-
+    /// unavailable) — mirrors how [`ndi_attribution`](Self::ndi_attribution)
+    /// distinguishes "not compiled" from "compiled but inert".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub youtube: Option<YoutubeCapability>,
+}
+
+/// The `youtube` source kind's resolve capability (ADR-0015): whether this
+/// build can actually resolve a live `YouTube` URL right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct YoutubeCapability {
+    /// Whether the `youtube` Cargo feature is compiled into this binary. A
+    /// `false` here means the build simply cannot run the resolver at all,
+    /// regardless of whether `yt-dlp` is installed.
+    pub compiled: bool,
+    /// Whether a `yt-dlp` binary was found and successfully probed
+    /// (`yt-dlp --version`) at startup. Always `false` when
+    /// [`compiled`](Self::compiled) is `false`.
+    pub available: bool,
+    /// The probed `yt-dlp --version` output — present only when
+    /// [`available`](Self::available) is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl YoutubeCapability {
+    /// The honest "feature not compiled" report: `compiled: false`,
+    /// `available: false`, no version.
+    #[must_use]
+    pub const fn not_compiled() -> Self {
+        Self {
+            compiled: false,
+            available: false,
+            version: None,
+        }
+    }
+
+    /// The report for a compiled build whose `yt-dlp` probe resolved to
+    /// `version` on success, or `None` on a failed/absent probe.
+    #[must_use]
+    pub fn compiled_with_probe(version: Option<String>) -> Self {
+        Self {
+            compiled: true,
+            available: version.is_some(),
+            version,
+        }
+    }
 }
 
 impl Default for SystemCapabilities {
@@ -271,6 +322,7 @@ impl Default for SystemCapabilities {
             },
             build: BuildInfo::resolve(false, false, vec!["software".to_owned()]),
             ndi_attribution: None,
+            youtube: None,
         }
     }
 }

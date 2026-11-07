@@ -15,6 +15,7 @@ import type {
   BackendCapability,
   CompositorCapability,
   BuildInfo,
+  YoutubeCapability,
 } from '../api/systemQueries';
 import { PageHeader } from '../components/PageHeader';
 import { Badge } from '../components/ui/badge';
@@ -225,6 +226,55 @@ function BuildPanel(props: {
   );
 }
 
+/** The `youtube` source kind's resolve capability (ADR-0015): whether this
+ * build can compile the resolver and whether `yt-dlp` was found at startup. */
+function YoutubePanel({
+  youtube,
+}: {
+  readonly youtube: YoutubeCapability | undefined;
+}): JSX.Element {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>
+          <Trans>YouTube live ingest</Trans>
+        </CardTitle>
+        <CardDescription>
+          <Trans>
+            Whether this server can resolve a live YouTube source
+            (ADR-0015): the build feature plus the `yt-dlp` resolver found at
+            startup.
+          </Trans>
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-muted-foreground">
+            <Trans>Build feature compiled</Trans>
+          </span>
+          <Badge variant={youtube?.compiled === true ? 'secondary' : 'outline'}>
+            {youtube?.compiled === true ? <Trans>Yes</Trans> : <Trans>No</Trans>}
+          </Badge>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-muted-foreground">
+            <Trans>yt-dlp resolver found</Trans>
+          </span>
+          <Badge variant={youtube?.available === true ? 'live' : 'stale'}>
+            {youtube?.available === true ? <Trans>Yes</Trans> : <Trans>No</Trans>}
+          </Badge>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-muted-foreground">
+            <Trans>yt-dlp version</Trans>
+          </span>
+          <span className="font-medium">{youtube?.version ?? '—'}</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 /** The Capabilities screen. */
 export function CapabilitiesPage(): JSX.Element {
   const query = useSystemCapabilities();
@@ -258,6 +308,9 @@ export function CapabilitiesPage(): JSX.Element {
             build={query.data.build}
             ndiAttribution={query.data.ndi_attribution ?? undefined}
           />
+          {query.data.youtube !== null && query.data.youtube !== undefined ? (
+            <YoutubePanel youtube={query.data.youtube} />
+          ) : null}
         </div>
       )}
     </div>

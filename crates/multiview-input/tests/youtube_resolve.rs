@@ -175,6 +175,48 @@ async fn capability_probe_reports_unavailable_when_binary_absent() {
     );
 }
 
+/// `operator_message` maps each `NotLive` classification to the exact
+/// "not a live stream (status: …)" wording the brief specifies, naming the
+/// yt-dlp wire token, not a Rust `Debug` dump.
+#[test]
+fn operator_message_names_every_not_live_status() {
+    for (status, label) in [
+        (LiveStatus::WasLive, "was_live"),
+        (LiveStatus::NotLive, "not_live"),
+        (LiveStatus::Upcoming, "upcoming"),
+        (LiveStatus::PostLive, "post_live"),
+    ] {
+        let err = YoutubeError::NotLive(status);
+        assert_eq!(
+            err.operator_message(),
+            format!("not a live stream (status: {label})")
+        );
+    }
+}
+
+/// `operator_message` reports the honest "yt-dlp not found on the server" for
+/// `Unavailable`, never a raw spawn-error dump.
+#[test]
+fn operator_message_names_yt_dlp_unavailable() {
+    let err = YoutubeError::Unavailable("No such file or directory (os error 2)".to_owned());
+    assert_eq!(err.operator_message(), "yt-dlp not found on the server");
+}
+
+/// Every other error variant falls back to the resolver's own `Display` text
+/// (already a plain-English sentence) — `operator_message` never panics and
+/// never produces an empty string.
+#[test]
+fn operator_message_falls_back_to_display_for_other_variants() {
+    let no_hls = YoutubeError::NoHlsMaster;
+    assert_eq!(no_hls.operator_message(), no_hls.to_string());
+
+    let resolve_failed = YoutubeError::Resolve("n-sig rotated".to_owned());
+    assert_eq!(
+        resolve_failed.operator_message(),
+        resolve_failed.to_string()
+    );
+}
+
 /// Property: the pure parser never panics on arbitrary bytes — any input either
 /// resolves or returns a typed [`YoutubeError`] (ADR-0015 robustness).
 mod prop {

@@ -45,6 +45,25 @@ impl LiveStatus {
             _ => Self::Unknown,
         }
     }
+
+    /// The stable, lower-case wire label for this status — the exact yt-dlp
+    /// `live_status` token (`was_live` / `not_live` / `upcoming` / `post_live`),
+    /// or `live`/`unknown` for the remaining variants. Used to build the
+    /// operator-facing "not a live stream" message
+    /// ([`YoutubeError::operator_message`](super::YoutubeError::operator_message))
+    /// so the surfaced reason names the exact classification, not a Rust
+    /// `Debug` dump.
+    #[must_use]
+    pub const fn wire_label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Upcoming => "upcoming",
+            Self::PostLive => "post_live",
+            Self::WasLive => "was_live",
+            Self::NotLive => "not_live",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// A resolved live `YouTube` source: the HLS master URL libav will open, its

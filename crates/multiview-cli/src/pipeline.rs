@@ -2035,6 +2035,12 @@ struct IngestPlan {
     /// [`IngestSupervisor::start`].
     #[cfg(feature = "youtube")]
     youtube_url_slot: Option<Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>>,
+    /// An explicit `yt-dlp` binary path for this run (ADR-0015 §6), stamped
+    /// from the `MULTIVIEW_YOUTUBE_YT_DLP_PATH` environment variable or else
+    /// `[system.youtube] yt_dlp_path` after build (like `ndi_accept_license`).
+    /// `None` ⇒ `yt-dlp` is resolved on `PATH` (the resolver's default).
+    #[cfg(feature = "youtube")]
+    youtube_yt_dlp_path: Option<String>,
 }
 
 /// Everything one AES67 / ST 2110-30 audio source needs to be received on its own
@@ -2380,6 +2386,18 @@ impl Pipeline {
                     accepted_by: ndi.accepted_by.clone().unwrap_or_default(),
                     accepted_at: ndi.accepted_at.clone().unwrap_or_default(),
                 };
+            }
+
+            // Stamp this source's explicit `yt-dlp` path (ADR-0015 §6), like
+            // `ndi_accept_license` above: the service user's `PATH` may not
+            // include where an operator installed it (e.g. `~/.local/bin`), so
+            // an explicit override is read from `MULTIVIEW_YOUTUBE_YT_DLP_PATH`
+            // (takes precedence, matching the existing `MULTIVIEW_*` override
+            // pattern) or else `[system.youtube] yt_dlp_path`. `None` ⇒ resolve
+            // on `PATH` (the resolver's own default).
+            #[cfg(feature = "youtube")]
+            {
+                plan.youtube_yt_dlp_path = crate::youtube_resolver_path(config);
             }
 
             // Wire this source's native captions (HLS WebVTT rendition thread +/or
@@ -6641,6 +6659,7 @@ impl IngestSupervisor {
                 if let Some(slot) = plan.youtube_url_slot.clone() {
                     let id = plan.id.clone();
                     let watch_url = watch_url.clone();
+                    let yt_dlp_path = plan.youtube_yt_dlp_path.clone();
                     let rr_stop = Arc::new(AtomicBool::new(false));
                     let rr_exited = crate::live_sources::register_stop(
                         registry,
@@ -6657,7 +6676,12 @@ impl IngestSupervisor {
                         std::thread::Builder::new().name(format!("multiview-yt-reresolve-{id}"));
                     match rr_builder.spawn(move || {
                         let _exit = rr_exit_guard;
-                        youtube_reresolve_thread(&watch_url, &slot, &rr_thread_stop);
+                        youtube_reresolve_thread(
+                            &watch_url,
+                            yt_dlp_path.as_deref(),
+                            &slot,
+                            &rr_thread_stop,
+                        );
                     }) {
                         Ok(handle) => producers.push((rr_stop, handle)),
                         Err(e) => {
@@ -10443,6 +10467,8 @@ fn ingest_plan_for(
         },
         #[cfg(feature = "youtube")]
         youtube_url_slot,
+        #[cfg(feature = "youtube")]
+        youtube_yt_dlp_path: None,
     })
 }
 
@@ -10643,6 +10669,8 @@ fn build_media_player_boot(
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         });
         tracing::info!(
             player = %player.id, asset = %asset_id,
@@ -12320,12 +12348,31 @@ fn timeline_pts(
     normalizer.normalize(raw_pts, 0).unwrap_or(fallback)
 }
 
+/// Build the [`ResolverConfig`](multiview_input::youtube::ResolverConfig) this
+/// run's `yt-dlp` invocations use: an explicit `yt_dlp_path` (from
+/// [`IngestPlan::youtube_yt_dlp_path`], itself stamped from the
+/// `MULTIVIEW_YOUTUBE_YT_DLP_PATH` environment variable or else `[system.youtube]
+/// yt_dlp_path`, ADR-0015 §6) when configured, else the default (`"yt-dlp"` on
+/// `PATH`) — because the service user's `PATH` may not include where an operator
+/// installed it (e.g. `~/.local/bin`).
+#[cfg(feature = "youtube")]
+fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtube::ResolverConfig {
+    match yt_dlp_path {
+        Some(path) if !path.is_empty() => multiview_input::youtube::ResolverConfig::new(
+            path,
+            multiview_input::youtube::ResolverConfig::default().timeout,
+        ),
+        _ => multiview_input::youtube::ResolverConfig::default(),
+    }
+}
+
 /// Resolve a `YouTube` **watch** URL to a fresh live HLS master URL (ADR-0015),
 /// for opening by the standard HLS ingest path.
 ///
 /// This is the CLI's wiring seam onto [`multiview_input::youtube`]: it spawns the
-/// runtime-discovered `yt-dlp` resolver under its hard timeout and returns the
-/// resolved `*.googlevideo.com` manifest URL ([`ingest_url`](multiview_input::youtube::reresolve::ingest_url)).
+/// runtime-discovered `yt-dlp` resolver (at `yt_dlp_path`, see
+/// [`youtube_resolver_config`]) under its hard timeout and returns the resolved
+/// `*.googlevideo.com` manifest URL ([`ingest_url`](multiview_input::youtube::reresolve::ingest_url)).
 /// It runs on the calling **ingest thread** (a `std::thread`, the control/IO
 /// plane), so it spins up a small current-thread Tokio runtime to drive the async
 /// resolver; the output data plane is never involved (invariants #1/#10). A
@@ -12333,20 +12380,21 @@ fn timeline_pts(
 /// live) is returned as a `String` error — the caller's reconnect bracket backs
 /// off and retries while the tile degrades; it is never a panic.
 #[cfg(feature = "youtube")]
-fn resolve_youtube_master(watch_url: &str) -> Result<String, String> {
+fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<String, String> {
     use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
-    // timeout (ResolverConfig::default) bounds the await, so this never blocks the
-    // ingest thread indefinitely; the reconnect backoff bounds retry frequency.
+    // timeout (within `youtube_resolver_config`) bounds the await, so this never
+    // blocks the ingest thread indefinitely; the reconnect backoff bounds retry
+    // frequency.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("youtube resolver runtime: {e}"))?;
-    let process = ProcessResolver::default();
+    let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let master = runtime
         .block_on(process.resolve(watch_url))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.operator_message())?;
     Ok(ingest_url(&master).to_owned())
 }
 
@@ -12406,6 +12454,7 @@ where
 #[cfg(feature = "youtube")]
 fn youtube_reresolve_thread(
     watch_url: &str,
+    yt_dlp_path: Option<&str>,
     slot: &Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
     stop: &AtomicBool,
 ) {
@@ -12432,7 +12481,7 @@ fn youtube_reresolve_thread(
         }
     };
 
-    let resolver = ProcessResolver::default();
+    let resolver = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let clock = SystemUnixClock;
     let swap_slot = Arc::clone(slot);
     let outcome = runtime.block_on(run_reresolve_loop(
@@ -12492,9 +12541,11 @@ fn open_and_stream(
     #[cfg(feature = "youtube")]
     let resolved_youtube_url = match &plan.location {
         SourceLocation::Youtube { watch_url } => {
-            Some(youtube_open_url(plan.youtube_url_slot.as_deref(), || {
-                resolve_youtube_master(watch_url)
-            })?)
+            let resolved = youtube_open_url(plan.youtube_url_slot.as_deref(), || {
+                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref())
+            });
+            crate::youtube_status::record(&plan.id, resolved.as_ref().err().map(String::as_str));
+            Some(resolved?)
         }
         _ => None,
     };
@@ -16431,13 +16482,18 @@ mod youtube_tests {
     }
 
     impl multiview_input::youtube::reresolve::Resolver for FakeResolver {
-        async fn resolve(&self, _url: &str) -> Result<ResolvedHls, YoutubeError> {
+        fn resolve(
+            &self,
+            _url: &str,
+        ) -> impl std::future::Future<Output = Result<ResolvedHls, YoutubeError>> + Send {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.results
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned())))
+            std::future::ready(
+                self.results
+                    .lock()
+                    .expect("lock")
+                    .pop_front()
+                    .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned()))),
+            )
         }
     }
 
@@ -18243,6 +18299,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // A recorder thread snapshots the published tile's (stamp, fingerprint)
@@ -18412,6 +18470,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // Drive the player WITHOUT ever setting `stop`: the fail-safe must end the
@@ -18525,6 +18585,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // Capture every distinct published frame fingerprint across the run.

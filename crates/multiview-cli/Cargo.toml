@@ -607,6 +607,13 @@ nvidia = [
     # shipped deploy image takes/delivers `rist://` feeds (the deployed FFmpeg is
     # built `--enable-librist`). LGPL-clean (librist is BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): the shipped deploy image can resolve + ride
+    # a `youtube` source via the runtime-discovered `yt-dlp` resolver. The build
+    # still stays LGPL-clean (yt-dlp runs out-of-process; see the standalone
+    # `youtube` feature docs above for the full rationale) — before this, the web
+    # UI advertised a `youtube` source kind that no shipped build could actually
+    # run (every shipped build must carry whatever the UI advertises).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6): the shipped deploy image
     # runs the real mDNS announce/browse loop.
     "mesh-mdns",
@@ -638,6 +645,8 @@ apple = [
     "webrtc-native",
     # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): LGPL-clean (yt-dlp runs out-of-process).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6).
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
@@ -679,6 +688,8 @@ linux-vaapi = [
     "webrtc-native",
     # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): LGPL-clean (yt-dlp runs out-of-process).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6).
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
@@ -722,6 +733,10 @@ full = [
     # named explicitly so the everything-non-GPL build keeps it on a refactor.
     # LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): comes transitively via the presets above;
+    # named explicitly so the everything-non-GPL build keeps it on a refactor.
+    # LGPL-clean (yt-dlp runs out-of-process, never vendored/linked).
+    "youtube",
     # Control-plane HTTPS (TLS-0, ADR-W029): comes transitively via `nvidia` +
     # `linux-vaapi`; named explicitly so `full` keeps it on a preset refactor.
     "tls",
