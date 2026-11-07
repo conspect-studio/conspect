@@ -279,7 +279,10 @@ async fn a_push_only_config_is_runnable_now_that_push_is_wired() {
 
 /// Production finding: with no caller for longer than `SINK_WEDGE_GRACE` (2 s)
 /// the consumer marked the sink dead and the listener vanished. The whole real
-/// pipeline must keep the listener alive and then serve a late caller.
+/// pipeline must keep the listener alive and then serve a late caller. Needs
+/// `srt-libsrt` (ADR-0039 decision 10, amended): `FFmpeg`'s libsrt cannot bind
+/// `[::]`, so without the native leaf this listener URL is rejected at build.
+#[cfg(feature = "srt-libsrt")]
 #[tokio::test]
 async fn srt_listener_with_no_caller_past_the_wedge_grace_still_serves_a_late_caller() {
     const TICKS: u64 = 500; // 20 s @ 25 fps, paced in real time.
@@ -313,6 +316,9 @@ async fn srt_listener_with_no_caller_past_the_wedge_grace_still_serves_a_late_ca
 /// The real ingest path, not just the relay: a caller over IPv4 pushes to a
 /// `[::]` listener SOURCE and its picture reaches the program output. White
 /// video makes the assertion unambiguous against the dark no-signal card.
+/// Needs `srt-libsrt` (ADR-0039 decision 10, amended): without the native leaf
+/// a `[::]` listener source fails closed at ingest-plan build time.
+#[cfg(feature = "srt-libsrt")]
 #[tokio::test]
 async fn srt_listener_source_on_the_wildcard_reaches_the_program() {
     const TICKS: u64 = 375; // 15 s @ 25 fps.

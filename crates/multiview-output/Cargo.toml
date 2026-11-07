@@ -123,6 +123,8 @@ multiview-ffmpeg = { workspace = true, optional = true }
 # Dual-stack SRT listener (`sink::push`): FFmpeg's libsrt cannot bind `[::]`.
 # All raw FFI lives in this runtime-loaded leaf, so this crate stays
 # `forbid(unsafe_code)`. libsrt is dlopen-resolved, never linked or vendored.
+# Pulled in ONLY by the off-by-default `srt-libsrt` feature (ADR-0039 decision
+# 10, amended) — NOT by plain `ffmpeg`.
 multiview-srt-sys = { workspace = true, optional = true }
 
 # Opt-in alongside `multiview-ffmpeg`, used ONLY to name `ffmpeg-next`'s safe value
@@ -175,13 +177,25 @@ multiview-input = { workspace = true }
     "dep:multiview-ffmpeg",
     "multiview-ffmpeg/ffmpeg",
     "dep:ffmpeg-next",
-    "dep:multiview-srt-sys",
 ]
 # License-escalating: forwards multiview-ffmpeg's `gpl-codecs` so a sink may target
 # the GPL software encoders (libx264/libx265). Enabling this makes the whole
 # build GPL; it is NEVER pulled in by `ffmpeg` alone and never enters the default
 # (LGPL-clean) build. Implies `ffmpeg` (the sinks need the real encode path).
 "gpl-codecs" = ["ffmpeg", "multiview-ffmpeg/gpl-codecs"]
+# Dual-stack SRT **listener** leaf (ADR-0039 decision 10, amended 2026-11-07):
+# the owned `multiview-srt-sys` libsrt FFI binding (`dlopen`-resolved, never
+# linked/vendored) that binds one `AF_INET6` socket with `SRTO_IPV6ONLY = 0` for
+# the push listener role (`sink::push`) — the only way to serve a dual-stack
+# `[::]` SRT listener, which `FFmpeg`'s `libsrt` protocol cannot bind and whose
+# listener additionally blocks its calling thread in `srt_accept` (unworkable
+# for the never-await-a-client push sink, invariant #10). Off by default and
+# NOT implied by plain `ffmpeg` (a caller/rendezvous SRT push stays on
+# `FFmpeg`'s own `srt://`); without it a listener-mode SRT push URL fails
+# closed with a clear "requires srt-libsrt" error instead of being attempted
+# through `FFmpeg`'s libsrt (which would surface its own "Bad parameters").
+# Implies `ffmpeg` (the muxer the listener feeds).
+"srt-libsrt" = ["ffmpeg", "dep:multiview-srt-sys"]
 # NVENC hardware-encoder selection (compile-only here; no native crate). Forwards
 # multiview-ffmpeg's `cuda` so the codec selector may consider h264_nvenc/hevc_nvenc.
 # Implies `ffmpeg` (selection's run-time probe needs libav).

@@ -1,10 +1,15 @@
-//! Resilient push over a **real** libsrt loopback (the `ffmpeg` feature).
+//! Resilient push over a **real** libsrt loopback (the `ffmpeg` + `srt-libsrt`
+//! features; ADR-0039 decision 10, amended).
 //!
 //! Drives [`PacketMuxSink::run_push_resilient`] with a paced live encoder and
 //! real `ffmpeg` CLI SRT peers, proving: sequential callers on one listener,
 //! simultaneous callers, caller-mode reconnect, the never-block drop policy with
-//! no peer attached, and bounded teardown while waiting in `srt_accept`.
-#![cfg(feature = "ffmpeg")]
+//! no peer attached, and bounded teardown while waiting in `srt_accept`. The SRT
+//! **listener** role needs the native `multiview-srt-sys` leaf (`FFmpeg`'s
+//! `libsrt` protocol cannot bind `[::]` nor keep accepting after one caller), so
+//! this whole file requires the off-by-default `srt-libsrt` feature on top of
+//! `ffmpeg`.
+#![cfg(all(feature = "ffmpeg", feature = "srt-libsrt"))]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

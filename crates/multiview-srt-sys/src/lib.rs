@@ -193,8 +193,17 @@ impl SrtLib {
     }
 
     fn load() -> Result<Self> {
+        Self::load_from(&SONAMES)
+    }
+
+    /// `dlopen` the first SONAME in `names` that resolves. Factored out of
+    /// [`load`](Self::load) so a test can inject a deliberately-missing list
+    /// and exercise the "libsrt unavailable" path without depending on the
+    /// host's real install (and without touching the process-wide
+    /// [`shared`](Self::shared) cache).
+    fn load_from(names: &[&str]) -> Result<Self> {
         let mut last = String::from("no SONAME tried");
-        for name in SONAMES {
+        for &name in names {
             // SAFETY: `dlopen` of a well-known system library; its initialisers
             // are libsrt's own (no Rust code). A failure is just reported.
             match unsafe { Library::new(name) } {
@@ -829,6 +838,28 @@ mod tests {
             Ipv6Addr::from(sa.sin6_addr.s6_addr).to_ipv4_mapped(),
             Some("127.0.0.1".parse().unwrap())
         );
+    }
+
+    /// Missing-library path (ADR-0039 §3): an injected SONAME list that cannot
+    /// possibly resolve on any host proves `SrtLib::load_from` fails closed
+    /// with a clear [`SrtError::Unavailable`] message — never a panic — and
+    /// that [`SrtListener::bind`] (which calls through the SAME `dlopen` path
+    /// via [`SrtLib::shared`]) surfaces that same clear error rather than
+    /// crashing, so a caller's retry loop (the push listener / ingest bridge)
+    /// keeps the rest of the program running.
+    #[test]
+    fn missing_library_fails_closed_with_a_clear_error_never_a_panic() {
+        let err = SrtLib::load_from(&["libsrt-definitely-not-installed.so.999"]).unwrap_err();
+        let SrtError::Unavailable(message) = &err else {
+            panic!("expected Unavailable, got {err:?}");
+        };
+        assert!(
+            message.contains("libsrt-definitely-not-installed.so.999"),
+            "{message}"
+        );
+        // The same shape surfaces through the public error Display without
+        // panicking (mirrors what a listener's retry loop logs).
+        assert!(err.to_string().contains("libsrt unavailable"));
     }
 
     #[test]

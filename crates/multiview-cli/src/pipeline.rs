@@ -8986,8 +8986,15 @@ fn srt_resolved_url(
 ) -> Result<String, SrtError> {
     // Every wildcard listener spelling normalises to dual-stack `[::]`, which
     // `multiview-srt-sys` binds natively (FFmpeg's libsrt cannot). Specific
-    // hosts pass through.
+    // hosts pass through. Without `srt-libsrt` (ADR-0039 decision 10, amended)
+    // NO listener role is runnable — not just the wildcard — so fail closed
+    // before ever handing libav a URL it would reject with an opaque "Bad
+    // parameters" (or, for a specific-host listener, silently never re-accept
+    // after one caller).
     let Some(opts) = srt else {
+        if !cfg!(feature = "srt-libsrt") && multiview_output::sink::is_srt_listener_url(base_url) {
+            return Err(SrtError::ListenerRequiresNativeLeaf);
+        }
         let lowered = multiview_input::srt::lower_listener_url(base_url);
         return Ok(if redact {
             redact_srt_url(&lowered)
@@ -9024,6 +9031,13 @@ fn srt_resolved_url(
         .is_some_and(|listener| (mode == SrtMode::Listener) != listener)
     {
         return Err(SrtError::Parameter("listener and mode conflict"));
+    }
+    // Listener mode needs the native leaf regardless of host (ADR-0039
+    // decision 10, amended): FFmpeg's libsrt listener always blocks its
+    // calling thread in `srt_accept`, which is unworkable even for a specific
+    // (non-wildcard) bind.
+    if !cfg!(feature = "srt-libsrt") && mode == SrtMode::Listener {
+        return Err(SrtError::ListenerRequiresNativeLeaf);
     }
     let (key_length, passphrase) = if let Some(enc) = &opts.encryption {
         let reference = enc
@@ -11463,6 +11477,10 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
     }
     // Hold an SRT listener across reconnects so its port never closes between
     // attempts; `open_and_stream` reports a bad URL through the retry bracket.
+    // Without `srt-libsrt` no `plan.location` can be a listener URL —
+    // `ingest_plan_for`'s `srt_resolved_url` already failed the build closed
+    // for one (ADR-0039 decision 10, amended) — so this is unreachable there.
+    #[cfg(feature = "srt-libsrt")]
     let _srt_listener = match &plan.location {
         SourceLocation::Url(url) if multiview_output::sink::is_srt_listener_url(url) => {
             crate::srt_ingest::acquire(url).ok()
@@ -12548,6 +12566,11 @@ fn open_and_stream(
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
             let open_url = main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h);
             // libav cannot bind a dual-stack SRT listener: read its local relay.
+            // Without `srt-libsrt` a listener URL never reaches here —
+            // `ingest_plan_for`'s `srt_resolved_url` already failed the build
+            // closed for one (ADR-0039 decision 10, amended) — so this branch
+            // is unreachable in that build and compiled out.
+            #[cfg(feature = "srt-libsrt")]
             let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
                 crate::srt_ingest::acquire(&open_url)?
                     .local_url()
@@ -16708,9 +16731,11 @@ buffer_ms = 700
 
 #[cfg(test)]
 mod srt_wiring_tests {
+    #[cfg(feature = "srt-libsrt")]
+    use super::audio_ingest_plan_for;
     use super::{
-        audio_ingest_plan_for, build_outputs, ingest_plan_for, srt_resolved_url, PipelineError,
-        RunnableOutput, SourceLocation,
+        build_outputs, ingest_plan_for, srt_resolved_url, PipelineError, RunnableOutput,
+        SourceLocation,
     };
     use multiview_compositor::pipeline::CanvasColor;
     use multiview_config::{Output, Source};
@@ -16730,10 +16755,23 @@ mod srt_wiring_tests {
             "oheadbw_pct": 25, "maxbw": 0, "conn_timeout_ms": 3000,
         }))
         .unwrap();
+        // Listener-mode lowering needs the native leaf (ADR-0039 decision 10,
+        // amended): without `srt-libsrt` this specific-host (`[::1]`) listener
+        // still fails closed, covered by `unsupported_srt_backend_and_peer_timeout_fail_closed`'s
+        // sibling assertions and the dedicated feature-gated test below.
+        #[cfg(not(feature = "srt-libsrt"))]
+        assert!(matches!(
+            srt_resolved_url(base, Some(&opts), false).unwrap_err(),
+            SrtError::ListenerRequiresNativeLeaf
+        ));
+        #[cfg(feature = "srt-libsrt")]
         assert_eq!(srt_resolved_url(base, Some(&opts), false).unwrap(),
             "srt://[::1]:9000?mode=listener&latency=200000&streamid=%23%21%3A%3Ar%3Dlive&oheadbw=25&maxbw=0&connect_timeout=3000&transtype=live");
     }
 
+    /// Listener resolution — including the dual-stack normalisation and the
+    /// redaction path — needs the native leaf (ADR-0039 decision 10, amended).
+    #[cfg(feature = "srt-libsrt")]
     #[test]
     fn srt_wildcard_listener_stays_dual_stack_specific_hosts_pass_through() {
         let listener = serde_json::from_value(serde_json::json!({"mode": "listener"})).unwrap();
@@ -16793,6 +16831,9 @@ mod srt_wiring_tests {
         );
     }
 
+    /// Needs `srt-libsrt`: listener-mode lowering fails closed without it
+    /// (ADR-0039 decision 10, amended), covered separately below.
+    #[cfg(feature = "srt-libsrt")]
     #[test]
     fn srt_audio_plan_uses_the_same_lowered_url_as_video() {
         let source: Source = serde_json::from_value(serde_json::json!({
@@ -16909,6 +16950,76 @@ mod srt_wiring_tests {
             ),
             Err(PipelineError::Ingest { .. })
         ));
+    }
+
+    /// Without `srt-libsrt` (ADR-0039 decision 10, amended) EVERY SRT listener
+    /// URL — wildcard or a specific host — fails closed with a clear,
+    /// actionable error, never libav's opaque "Bad parameters": both the
+    /// legacy opaque-URL path (`srt` absent) and the typed `SrtOptions` path,
+    /// for both an ingest source and a push output.
+    #[cfg(not(feature = "srt-libsrt"))]
+    #[test]
+    fn srt_listener_fails_closed_without_the_native_leaf() {
+        for base in [
+            "srt://[::]:9000?mode=listener",
+            "srt://[::1]:9000?mode=listener",
+        ] {
+            assert!(matches!(
+                srt_resolved_url(base, None, false).unwrap_err(),
+                SrtError::ListenerRequiresNativeLeaf
+            ));
+        }
+        let typed = serde_json::from_value(serde_json::json!({"mode": "listener"})).unwrap();
+        assert!(matches!(
+            srt_resolved_url("srt://[::1]:9000", Some(&typed), false).unwrap_err(),
+            SrtError::ListenerRequiresNativeLeaf
+        ));
+        let source: Source = serde_json::from_value(serde_json::json!({
+            "id": "srt-in", "kind": "srt", "url": "srt://[::]:9000?mode=listener"
+        }))
+        .unwrap();
+        let store = Arc::new(TileStore::new(
+            source.id.clone(),
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let result = ingest_plan_for(
+            &source,
+            320,
+            180,
+            store,
+            CanvasColor::default(),
+            Rational::new(30, 1),
+        );
+        match result {
+            Err(err @ PipelineError::Ingest { .. }) => {
+                assert!(err.to_string().contains("srt-libsrt"), "{err}");
+            }
+            Ok(_) => panic!("expected an Ingest error naming srt-libsrt, got Ok"),
+            Err(other) => panic!("expected an Ingest error naming srt-libsrt, got {other:?}"),
+        }
+        let output: Output = serde_json::from_value(serde_json::json!({
+            "kind": "srt", "id": "srt-out", "url": "srt://[::]:9000?mode=listener", "codec": "mpeg2video"
+        }))
+        .unwrap();
+        let epoch = multiview_output::SharedEpoch::default();
+        #[cfg(feature = "webrtc-native")]
+        let sinks = std::collections::HashMap::new();
+        let result = build_outputs(
+            &[output],
+            &epoch,
+            #[cfg(feature = "webrtc-native")]
+            &sinks,
+            None,
+            Rational::new(30, 1),
+        );
+        match result {
+            Err(err @ PipelineError::Output { .. }) => {
+                assert!(err.to_string().contains("srt-libsrt"), "{err}");
+            }
+            Ok(_) => panic!("expected an Output error naming srt-libsrt, got Ok"),
+            Err(other) => panic!("expected an Output error naming srt-libsrt, got {other:?}"),
+        }
     }
 }
 

@@ -202,8 +202,11 @@ pub mod pipeline;
 #[cfg(feature = "ffmpeg")]
 pub mod hls_fetch;
 /// Dual-stack SRT listener input: one native socket per listener URL, relayed
-/// to libav over loopback. Behind the `ffmpeg` feature.
-#[cfg(feature = "ffmpeg")]
+/// to libav over loopback. Behind the off-by-default `srt-libsrt` feature
+/// (ADR-0039 decision 10, amended): the native `multiview-srt-sys` leaf is a
+/// separate opt-in from plain `ffmpeg`, since only a `[::]`/wildcard listener
+/// URL needs it (caller/rendezvous SRT stays on `FFmpeg`'s own `srt://`).
+#[cfg(feature = "srt-libsrt")]
 pub mod srt_ingest;
 
 /// Per-source **runtime audio ingest** (AUD-2): the audio peer of the video

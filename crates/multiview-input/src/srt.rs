@@ -68,6 +68,22 @@ pub enum SrtError {
     /// pair, or an unknown `t=`/`m=` token is rejected outright.
     #[error("srt stream id is not a parseable Access-Control grammar: {0}")]
     StreamIdUnparseable(String),
+
+    /// An SRT **listener** URL (`mode=listener`, including the dual-stack
+    /// `[::]`/wildcard bind), but this build was compiled without the
+    /// `srt-libsrt` feature (ADR-0039 decision 10, amended): `FFmpeg`'s
+    /// `libsrt` protocol cannot bind the IPv6 wildcard at all (it has no
+    /// option to set `SRTO_IPV6ONLY`, so the bind fails with an opaque "Bad
+    /// parameters") and, for every listener bind, blocks its calling thread in
+    /// `srt_accept` after one caller — unworkable for a never-await-a-client
+    /// sink (invariant #10). Only the native `multiview-srt-sys` leaf serves
+    /// the listener role; without it a listener URL fails closed here.
+    #[error(
+        "SRT listener mode requires the srt-libsrt feature (off by default): FFmpeg's libsrt \
+         protocol cannot bind a dual-stack listener nor keep accepting after one caller \
+         (rebuild with --features srt-libsrt, or use mode=caller)"
+    )]
+    ListenerRequiresNativeLeaf,
 }
 
 impl SrtError {

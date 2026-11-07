@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use multiview_core::time::Rational;
 use multiview_ffmpeg::{EncodedPacket, Muxer, StreamCodecParameters, StreamKind};
+#[cfg(feature = "srt-libsrt")]
 use multiview_srt_sys::{parse_listener_url, SrtError, SrtListener, SrtSocket, LIVE_PAYLOAD};
 
 use super::{
@@ -60,8 +61,10 @@ const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// flag aborts their I/O. Well inside the pipeline's 2 s sink-wedge grace.
 const TEARDOWN_GRACE: Duration = Duration::from_millis(800);
 /// Simultaneous callers a listener serves; further callers are refused.
+#[cfg(feature = "srt-libsrt")]
 const MAX_LISTENER_CLIENTS: usize = 16;
 /// Handshakes libsrt may queue between accepts.
+#[cfg(feature = "srt-libsrt")]
 const LISTEN_BACKLOG: u16 = 16;
 /// A caller session at least this long resets the reconnect back-off.
 const STABLE_SESSION: Duration = Duration::from_secs(5);
@@ -152,9 +155,15 @@ impl PacketMuxSink {
     /// into `link`.
     ///
     /// # Errors
-    /// [`Error::Output`] only when this sink is not a push sink, or the
-    /// `source` itself fails. Network failures are never errors here — they are
-    /// retried and reported through `link`.
+    /// [`Error::Output`] when this sink is not a push sink, the `source`
+    /// itself fails, or `url` is an SRT **listener** URL (`mode=listener`) and
+    /// this build lacks the `srt-libsrt` feature (ADR-0039 decision 10,
+    /// amended): `FFmpeg`'s `libsrt` protocol cannot bind a dual-stack `[::]`
+    /// listener nor keep accepting after one caller, so without the native
+    /// leaf such a URL fails closed here with a clear, actionable message
+    /// rather than being attempted through libsrt's own opaque "Bad
+    /// parameters". Network failures (once running) are never errors here —
+    /// they are retried and reported through `link`.
     pub fn run_push_resilient<P: PacketSource>(
         &self,
         source: &mut P,
@@ -168,6 +177,16 @@ impl PacketMuxSink {
                 "run_push_resilient called on a non-push sink".to_owned(),
             ));
         };
+        #[cfg(not(feature = "srt-libsrt"))]
+        if is_srt_listener_url(url) {
+            return Err(Error::Output(format!(
+                "SRT listener push ({}) requires the srt-libsrt feature (off by default): \
+                 FFmpeg's libsrt protocol cannot bind a dual-stack [::] listener nor keep \
+                 accepting after one caller (rebuild with --features srt-libsrt, or use \
+                 mode=caller)",
+                redact_target(url)
+            )));
+        }
         let audio = if self.audio_selection.program {
             audio
         } else {
@@ -190,6 +209,9 @@ impl PacketMuxSink {
             stop: Arc::new(AtomicBool::new(false)),
             link: Arc::clone(link),
         });
+        // Without `srt-libsrt` the early return above already rejected any
+        // listener URL, so every URL reaching here is a caller/rendezvous URL.
+        #[cfg(feature = "srt-libsrt")]
         let listener = is_srt_listener_url(url);
         let link_thread = {
             let shared = Arc::clone(&shared);
@@ -197,11 +219,12 @@ impl PacketMuxSink {
             std::thread::Builder::new()
                 .name("multiview-push-link".to_owned())
                 .spawn(move || {
+                    #[cfg(feature = "srt-libsrt")]
                     if listener {
                         listener_main(&shared, &url, muxer_name, &spec);
-                    } else {
-                        caller_main(&shared, &url, muxer_name, &spec);
+                        return;
                     }
+                    caller_main(&shared, &url, muxer_name, &spec);
                 })
                 .map_err(|e| Error::Output(format!("spawn push link thread: {e}")))?
         };
@@ -365,6 +388,7 @@ fn caller_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &Writ
 
 /// Listener mode: hold one socket, give each caller its own writer. A bind or
 /// socket failure rebinds with back-off; a bad URL keeps reporting its error.
+#[cfg(feature = "srt-libsrt")]
 fn listener_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &WriterSpec) {
     let mut backoff = Backoff::standard(backoff_seed());
     while !shared.stopped() {
@@ -389,6 +413,7 @@ fn listener_main(shared: &Shared, url: &str, muxer_name: &'static str, spec: &Wr
 }
 
 /// Accept until stopped (`None`) or the socket fails (`Some`).
+#[cfg(feature = "srt-libsrt")]
 fn accept_callers(
     shared: &Shared,
     listener: &SrtListener,
@@ -425,6 +450,7 @@ fn accept_callers(
 }
 
 /// The muxer byte sink for one accepted caller. The socket closes with the muxer.
+#[cfg(feature = "srt-libsrt")]
 fn socket_writer(socket: SrtSocket, stop: Arc<AtomicBool>) -> multiview_ffmpeg::PacketWriter {
     Box::new(move |data: &[u8]| {
         let stop = &stop;
