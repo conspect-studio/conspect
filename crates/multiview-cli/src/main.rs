@@ -645,6 +645,15 @@ async fn run_pipeline_until_ctrl_c(
         // before the hub and drain so live edits catalogue instead of spawning,
         // and every consumer below takes leases from the same manager.
         let demand = pipeline.demand();
+        // Every source lifecycle transition rides the existing event path as
+        // `input.lifecycle` (topic `inputs`). The publisher is a bounded
+        // drop-oldest ring, so a slow subscriber never stalls the manager.
+        {
+            let events = Arc::clone(&publisher);
+            demand.set_transition_sink(Arc::new(move |event| {
+                events.publish_event(multiview_cli::source_demand::lifecycle_event(event));
+            }));
+        }
         multiview_cli::source_demand::install_control_demand(Some(Arc::new(
             multiview_cli::source_demand::ControlDemand::new(demand, pipeline.catalogue()),
         )));

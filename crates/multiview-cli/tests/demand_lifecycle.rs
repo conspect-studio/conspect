@@ -1,6 +1,6 @@
 //! Demand lifecycle in a real run (`docs/architecture/demand-driven-sources.md`):
-//! a cell re-pointed to an idle source starts it off-clock (`NO_SIGNAL` until its
-//! first frame), re-pointing away stops it after the linger, a shared source
+//! a cell re-pointed to an idle `on_demand` source starts it off-clock (`NO_SIGNAL` until its
+//! first frame), re-pointing away stops it `close after` later, a shared source
 //! never restarts across a swap, and lease churn during live output never
 //! slips the output clock.
 #![cfg(feature = "ffmpeg")]
@@ -28,7 +28,7 @@ use multiview_engine::{
 };
 use multiview_events::Event;
 
-fn config(playlist: &Path, linger_secs: u32) -> MultiviewConfig {
+fn config(playlist: &Path, close_after_secs: u32) -> MultiviewConfig {
     let doc = format!(
         r##"schema_version = 1
 [canvas]
@@ -52,10 +52,12 @@ color = "#404040"
 id = "dark"
 kind = "solid"
 color = "#101010"
+activation = "on_demand"
 [[sources]]
 id = "bright"
 kind = "solid"
 color = "#f0f0f0"
+activation = "on_demand"
 [[cells]]
 id = "cell_a"
 area = "a"
@@ -67,7 +69,7 @@ area = "b"
 [cells.source]
 input_id = "dark"
 [system.demand]
-linger_secs = {linger_secs}
+close_after_secs = {close_after_secs}
 [[outputs]]
 kind = "hls"
 path = "{}"
@@ -111,9 +113,9 @@ async fn eventually(what: &str, within: Duration, mut done: impl FnMut() -> bool
 }
 
 /// Re-point `cell_b` dark -> bright -> dark. `bright` starts on demand, `dark`
-/// lingers then stops, `shared` (bound throughout) never restarts.
+/// runs `close after`, then stops, `shared` (bound throughout) never restarts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linger() {
+async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_close_after() {
     let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let config = config(&dir.path().join("p.m3u8"), 3);
@@ -144,8 +146,8 @@ async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linge
     let relay_stop = stop.clone();
     let relay = tokio::spawn(async move {
         let _guard = StopOnDrop(relay_stop.clone());
-        eventually("shared is live", Duration::from_secs(30), || {
-            watcher.status("shared").phase == DemandPhase::Live
+        eventually("shared is ready", Duration::from_secs(30), || {
+            watcher.status("shared").phase == DemandPhase::Ready
         })
         .await;
         let shared_transitions = watcher.transitions();
@@ -153,7 +155,7 @@ async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linge
 
         commands.try_submit(route("cell_b", "bright")).unwrap();
         eventually("bright starts on demand", Duration::from_secs(10), || {
-            watcher.status("bright").phase == DemandPhase::Live
+            watcher.status("bright").phase == DemandPhase::Ready
         })
         .await;
         let bright = watcher.status("bright");
@@ -162,15 +164,15 @@ async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linge
             .iter()
             .any(|c| c.class == ConsumerClass::LayoutCell));
 
-        // dark lost its only consumer: it lingers, then stops.
+        // dark lost its only consumer: it runs for `close after`, then stops.
         let dark = watcher.status("dark");
         assert!(dark.consumers.is_empty(), "dark has no consumer: {dark:?}");
         assert!(
             dark.running.video,
-            "dark lingers (3 s), it does not stop at once"
+            "dark keeps running for close after (3 s), it does not stop at once"
         );
         eventually(
-            "dark stops after the linger",
+            "dark stops after close after",
             Duration::from_secs(10),
             || watcher.status("dark").phase == DemandPhase::Idle,
         )
@@ -178,11 +180,11 @@ async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linge
 
         commands.try_submit(route("cell_b", "dark")).unwrap();
         eventually("dark restarts", Duration::from_secs(10), || {
-            watcher.status("dark").phase == DemandPhase::Live
+            watcher.status("dark").phase == DemandPhase::Ready
         })
         .await;
         let shared = watcher.status("shared");
-        assert_eq!(shared.phase, DemandPhase::Live, "shared never stopped");
+        assert_eq!(shared.phase, DemandPhase::Ready, "shared never stopped");
         assert!(watcher.transitions() > shared_transitions);
         relay_stop.stop();
     });

@@ -125,10 +125,11 @@ pub use clock::{ManualTimeSource, MonotonicTimeSource, OutputClock, Tick, TimeSo
 pub use cycle::{FreezeTile, RoundRobin};
 pub use degrade::{ControlLoop, ControlStep};
 pub use demand::{
-    ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig, DemandLease, DemandManager, DemandPhase,
-    DemandStatus, KindBounds, RailDriver, RailFailure, Rails, SetItem, StartingPhase,
-    TransitionEvent, TransitionSink, DEFAULT_CLOSE_AFTER, DEFAULT_MAX_CONCURRENT_STARTS,
-    DEFAULT_START_TIMEOUT, MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
+    ActivityMap, ActivityReader, ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig,
+    DemandLease, DemandManager, DemandPhase, DemandStatus, KindBounds, RailDriver, RailFailure,
+    Rails, SetItem, SourceActivity, StartingPhase, TransitionEvent, TransitionSink,
+    DEFAULT_CLOSE_AFTER, DEFAULT_MAX_CONCURRENT_STARTS, DEFAULT_START_TIMEOUT,
+    MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
 };
 pub use drive::{CompositedFrame, CompositorDrive};
 pub use epoch::{

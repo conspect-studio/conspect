@@ -1,5 +1,6 @@
-//! Demand-driven sources (`docs/architecture/demand-driven-sources.md`): a
-//! configured source costs nothing until a consumer needs it.
+//! Demand-driven sources (`docs/architecture/demand-driven-sources.md`): every
+//! source starts at boot by default (`activation = "always_on"`), exactly as
+//! before; a source set `on_demand` costs nothing until a consumer needs it.
 //!
 //! Every network source here points at one loopback listener that counts the
 //! connections it accepts, so "zero outbound connections" is measured, not
@@ -76,8 +77,8 @@ fn thread_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One bound `bars` source plus `idle` HLS sources (half with captions, every
-/// third with an armed-looking-but-disarmed rule and EPG), all on `origin`.
+/// One bound `bars` source plus `idle` `on_demand` HLS sources (half with
+/// captions), all on `origin`.
 fn config(origin_port: u16, idle: usize, playlist: &Path, extra: &str) -> MultiviewConfig {
     let mut doc = String::from(
         r##"schema_version = 1
@@ -102,7 +103,7 @@ kind = "bars"
     for i in 0..idle {
         let _ = write!(
             doc,
-            "[[sources]]\nid = \"idle{i}\"\nkind = \"hls\"\nurl = \"http://[::1]:{origin_port}/idle{i}/index.m3u8\"\n"
+            "[[sources]]\nid = \"idle{i}\"\nkind = \"hls\"\nurl = \"http://[::1]:{origin_port}/idle{i}/index.m3u8\"\nactivation = \"on_demand\"\n"
         );
         if i % 2 == 0 {
             doc.push_str("captions = { mode = \"auto\" }\n");
@@ -128,7 +129,7 @@ segment_ms = 1000
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn five_hundred_unconsumed_sources_cost_no_connection_probe_or_thread() {
+async fn five_hundred_on_demand_sources_cost_no_connection_probe_or_thread() {
     let origin = CountingOrigin::start();
     let dir = tempfile::tempdir().unwrap();
     let playlist = dir.path().join("p.m3u8");
@@ -227,17 +228,21 @@ include_in_program_bus = true
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn always_on_is_the_explicit_opt_out() {
+async fn a_source_with_no_activation_starts_at_boot_and_the_legacy_alias_loads() {
     let origin = CountingOrigin::start();
     let dir = tempfile::tempdir().unwrap();
     let playlist = dir.path().join("p.m3u8");
     let extra = format!(
-        "[[sources]]\nid = \"pinned\"\nkind = \"hls\"\nurl = \"http://[::1]:{}/p.m3u8\"\ndemand = {{ always_on = true }}\n",
+        "[[sources]]\nid = \"plain\"\nkind = \"hls\"\nurl = \"http://[::1]:{0}/a.m3u8\"\n\
+         [[sources]]\nid = \"pinned\"\nkind = \"hls\"\nurl = \"http://[::1]:{0}/p.m3u8\"\ndemand = {{ always_on = true }}\n\
+         [[sources]]\nid = \"lazy\"\nkind = \"hls\"\nurl = \"http://[::1]:{0}/l.m3u8\"\ndemand = {{ always_on = false }}\n",
         origin.port
     );
     let config = config(origin.port, 2, &playlist, &extra);
     let pipeline = Pipeline::build(&config).expect("builds");
+    assert_eq!(pipeline.boot_rails().get("plain"), Some(&Rails::ALL));
     assert_eq!(pipeline.boot_rails().get("pinned"), Some(&Rails::ALL));
+    assert!(!pipeline.boot_rails().contains_key("lazy"));
 }
 
 #[test]

@@ -4456,6 +4456,10 @@ impl Pipeline {
             canvas_width: self.layout.canvas.width,
             canvas_height: self.layout.canvas.height,
             overlay_apply: Some(Arc::clone(&self.overlay_apply)),
+            activity: self
+                .demand
+                .as_ref()
+                .map(|manager| (manager.activity_reader(), Arc::clone(&self.catalogue))),
         }
     }
 
@@ -4514,6 +4518,15 @@ struct BakeContext {
     /// live seam (the boot-derived overlay set stands for the whole run).
     #[cfg(feature = "overlay")]
     overlay_apply: Option<crate::live_overlays::OverlayApplySlot>,
+    /// Source lifecycle for the tile status chip (IDLE / STARTING / FAILED).
+    /// One wait-free load per frame; the map changes only on a transition.
+    /// Only catalogued (lifecycle-managed) sources can read idle; a media
+    /// player or other unmanaged tile keeps its signal state.
+    #[cfg(feature = "overlay")]
+    activity: Option<(
+        multiview_engine::ActivityReader,
+        crate::source_rails::Catalogue,
+    )>,
 }
 
 impl BakeContext {
@@ -4545,6 +4558,37 @@ impl BakeContext {
         } else {
             Some(cue.lines.clone())
         }
+    }
+}
+
+/// The chip lifecycle for `id`. Absent from the map is idle when a demand
+/// manager is wired; with no manager every tile is ready (signal state only).
+#[cfg(feature = "overlay")]
+fn tile_activity(
+    managed: Option<(
+        &multiview_engine::ActivityMap,
+        &std::collections::HashMap<String, Arc<crate::source_rails::CatalogEntry>>,
+    )>,
+    id: &str,
+) -> crate::overlays::TileActivity {
+    use crate::overlays::{StartPhase, TileActivity};
+    use multiview_engine::{DemandPhase, StartingPhase};
+    let Some((map, catalogue)) = managed else {
+        return TileActivity::Ready;
+    };
+    match map.get(id) {
+        None if catalogue.contains_key(id) => TileActivity::Idle,
+        None => TileActivity::Ready,
+        Some(activity) => match activity.phase {
+            DemandPhase::Idle => TileActivity::Idle,
+            DemandPhase::Ready => TileActivity::Ready,
+            DemandPhase::Failed => TileActivity::Failed,
+            DemandPhase::Starting => TileActivity::Starting(match activity.starting {
+                Some(StartingPhase::Opening) => StartPhase::Opening,
+                Some(StartingPhase::AwaitingMedia) => StartPhase::AwaitingMedia,
+                Some(StartingPhase::Queued) | None => StartPhase::Queued,
+            }),
+        },
     }
 }
 
@@ -4677,7 +4721,18 @@ impl StreamBaker {
         // a small live window); the in-memory sidecar track has no eviction, so it
         // is sampled here at `pts`. Native wins on overlap.
         let mut captions: std::collections::HashMap<String, Vec<String>> = item.captions.clone();
+        let activity = self
+            .meter
+            .activity
+            .as_ref()
+            .and_then(|(reader, catalogue)| Some((reader.load()?, catalogue.load())));
         for spec in self.baker.tiles() {
+            let activity = tile_activity(
+                activity
+                    .as_ref()
+                    .map(|(map, catalogue)| (map.as_ref(), catalogue.as_ref())),
+                &spec.source_id,
+            );
             let state = item
                 .source_states
                 .get(&spec.source_id)
@@ -4710,6 +4765,7 @@ impl StreamBaker {
                         .unwrap_or(crate::overlays::MeterChannels::EMPTY),
                     state,
                     fault,
+                    activity,
                 },
             );
             if !captions.contains_key(&spec.source_id) {
@@ -7412,14 +7468,16 @@ impl LiveIngestSpawner {
         // follower's size (layout supremum, or the small unbound size).
         let (tile_w, tile_h) = size
             .filter(|size| size.width >= 2 && size.height >= 2)
-            .map(|size| (size.width & !1, size.height & !1))
-            .unwrap_or_else(|| {
-                if decode_follows_layout(&source.kind) {
-                    self.display.size_for(&source.id)
-                } else {
-                    self.display.fixed_size_for(&source.id)
-                }
-            });
+            .map_or_else(
+                || {
+                    if decode_follows_layout(&source.kind) {
+                        self.display.size_for(&source.id)
+                    } else {
+                        self.display.fixed_size_for(&source.id)
+                    }
+                },
+                |size| (size.width & !1, size.height & !1),
+            );
         let mut plan = match ingest_plan_for(
             &source,
             tile_w,
@@ -18090,6 +18148,7 @@ mod live_overlay_bake_tests {
             canvas_width: 320,
             canvas_height: 180,
             overlay_apply: Some(Arc::clone(slot)),
+            activity: None,
         }
     }
 

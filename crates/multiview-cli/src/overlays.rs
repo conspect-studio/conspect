@@ -91,6 +91,10 @@ const WHITE: OverlayColor = OverlayColor::opaque(0.92, 0.92, 0.92);
 const AMBER: OverlayColor = OverlayColor::opaque(0.95, 0.6, 0.05);
 const GREEN: OverlayColor = OverlayColor::opaque(0.1, 0.85, 0.2);
 const RED: OverlayColor = OverlayColor::opaque(0.9, 0.12, 0.12);
+/// Neutral grey for an IDLE source: not a fault, never red.
+const IDLE_GREY: OverlayColor = OverlayColor::opaque(0.7, 0.72, 0.75);
+/// A neutral blue for STARTING, distinct from LIVE green and fault red.
+const STARTING_BLUE: OverlayColor = OverlayColor::opaque(0.35, 0.6, 0.95);
 const SAFE: OverlayColor = OverlayColor::new(0.9, 0.9, 0.9, 0.7);
 /// A translucent dark backing for the per-tile label / flag chrome so the text
 /// reads over any underlying picture (the meaning is the *text*, not the colour).
@@ -215,6 +219,38 @@ pub struct TileDynamics {
     /// The tile's detected content fault sampled this tick (distinct from
     /// `state`). [`TileFault::None`] ⇒ no fault badge.
     pub fault: TileFault,
+    /// The source's lifecycle state (idle / starting / ready / failed), a
+    /// separate axis from `state`. Anything but [`TileActivity::Ready`]
+    /// replaces the signal text in the status chip.
+    pub activity: TileActivity,
+}
+
+/// A source's lifecycle as the tile status chip shows it
+/// (`docs/architecture/demand-driven-sources.md`). Separate from the signal
+/// state: an idle source has no signal by design, so it must never read as
+/// `NO SIGNAL` in red.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TileActivity {
+    /// Started (or not lifecycle-managed): the chip shows the signal state.
+    #[default]
+    Ready,
+    /// Not started; costs nothing. Neutral, never red.
+    Idle,
+    /// Starting, with where it is.
+    Starting(StartPhase),
+    /// Wanted but not producing. Red.
+    Failed,
+}
+
+/// Where a starting source is, for the chip text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartPhase {
+    /// Waiting for a start slot.
+    Queued,
+    /// Opening (connect, launch).
+    Opening,
+    /// Waiting for first media.
+    AwaitingMedia,
 }
 
 /// The per-tile peak-hold meter + conflator state, kept across frames so the
@@ -501,6 +537,7 @@ impl OverlayBaker {
                 channels: MeterChannels::EMPTY,
                 state: SourceState::NoSignal,
                 fault: TileFault::None,
+                activity: TileActivity::Ready,
             });
 
             // Advance this tile's meter from its own audio (conflated ~30 Hz).
@@ -545,7 +582,16 @@ impl OverlayBaker {
                 .map(|m| (m.bars, m.count, m.clip_until_ns));
 
             self.draw_tile(
-                &mut list, &label, rect, dyn_.state, dyn_.fault, bars, now_ns,
+                &mut list,
+                &label,
+                rect,
+                ChipState {
+                    signal: dyn_.state,
+                    activity: dyn_.activity,
+                },
+                dyn_.fault,
+                bars,
+                now_ns,
             )?;
 
             // Burn this source's active caption (if any) into THIS tile's cell
@@ -800,7 +846,7 @@ impl OverlayBaker {
         list: &mut OverlayDrawList,
         label: &str,
         rect: PixelRect,
-        state: SourceState,
+        state: ChipState,
         fault: TileFault,
         bars: Option<(
             [MeterBar; MAX_METER_CHANNELS],
@@ -963,8 +1009,7 @@ impl OverlayBaker {
 
         // The state / fault flag: a top-left badge whose TEXT names the state, on
         // a translucent backing (meaning is the text, not the colour — A11y).
-        let flag_text = state_flag_text(state);
-        let flag_color = state_flag_color(state);
+        let (flag_text, flag_color) = state.chip();
         let flag_h = geom.chip_height();
         let flag_w = geom
             .flag_width(self.text_ink_width(flag_text, FontFamily::Sans, geom.chip_text_px())?)
@@ -1561,6 +1606,30 @@ impl TileGeometry {
     }
 }
 
+/// The two axes the status chip reads: signal state and source lifecycle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ChipState {
+    signal: SourceState,
+    activity: TileActivity,
+}
+
+impl ChipState {
+    /// The chip text and tint. Lifecycle wins while the source is not ready;
+    /// IDLE and STARTING are neutral (never red), FAILED is red.
+    fn chip(self) -> (&'static str, OverlayColor) {
+        match self.activity {
+            TileActivity::Ready => (state_flag_text(self.signal), state_flag_color(self.signal)),
+            TileActivity::Idle => ("IDLE", IDLE_GREY),
+            TileActivity::Starting(StartPhase::Queued) => ("STARTING: QUEUED", STARTING_BLUE),
+            TileActivity::Starting(StartPhase::Opening) => ("STARTING: OPENING", STARTING_BLUE),
+            TileActivity::Starting(StartPhase::AwaitingMedia) => {
+                ("STARTING: WAITING", STARTING_BLUE)
+            }
+            TileActivity::Failed => ("FAILED", RED),
+        }
+    }
+}
+
 /// The short, all-text flag label for a tile's lifecycle state. Conveys meaning
 /// as text (not colour alone) per the accessibility requirement.
 fn state_flag_text(state: SourceState) -> &'static str {
@@ -1750,6 +1819,42 @@ mod tests {
     use crate::wallclock::{WallClock, WallClockSource};
 
     use super::*;
+
+    #[test]
+    fn an_idle_source_never_reads_no_signal_in_red() {
+        let idle = ChipState {
+            signal: SourceState::NoSignal,
+            activity: TileActivity::Idle,
+        };
+        let (text, color) = idle.chip();
+        assert_eq!(text, "IDLE");
+        assert_ne!(color, RED, "idle is not a fault");
+        let starting = ChipState {
+            signal: SourceState::NoSignal,
+            activity: TileActivity::Starting(StartPhase::Opening),
+        };
+        let (text, color) = starting.chip();
+        assert_eq!(text, "STARTING: OPENING");
+        assert_ne!(color, RED);
+        assert_ne!(color, GREEN);
+        let failed = ChipState {
+            signal: SourceState::NoSignal,
+            activity: TileActivity::Failed,
+        };
+        assert_eq!(failed.chip(), ("FAILED", RED));
+        // A ready source shows its signal state exactly as before.
+        for (signal, text, color) in [
+            (SourceState::Live, "LIVE", GREEN),
+            (SourceState::Stale, "STALE", AMBER),
+            (SourceState::NoSignal, "NO SIGNAL", RED),
+        ] {
+            let ready = ChipState {
+                signal,
+                activity: TileActivity::Ready,
+            };
+            assert_eq!(ready.chip(), (text, color));
+        }
+    }
 
     fn event_fixture() -> multiview_core::event_overlay::EventOverlay {
         use multiview_core::event_overlay::{
@@ -2132,6 +2237,7 @@ mod tests {
                             .unwrap_or(-120.0)]),
                         state: *state,
                         fault: TileFault::None,
+                        activity: TileActivity::Ready,
                     },
                 )
             })
@@ -2156,6 +2262,7 @@ mod tests {
                             .unwrap_or(-120.0)]),
                         state: *state,
                         fault: *fault,
+                        activity: TileActivity::Ready,
                     },
                 )
             })
@@ -2269,6 +2376,7 @@ mod tests {
                 channels: MeterChannels::from_db(&[-3.0]),
                 state: SourceState::Live,
                 fault: TileFault::Silent,
+                activity: TileActivity::Ready,
             },
         );
         dynamics.insert(
@@ -2278,6 +2386,7 @@ mod tests {
                 channels: MeterChannels::from_db(&[-9.0]),
                 state: SourceState::Live,
                 fault: TileFault::None,
+                activity: TileActivity::Ready,
             },
         );
         let list = baker
@@ -2743,6 +2852,7 @@ mod tests {
                 channels: MeterChannels::from_db(&[0.0, -120.0]),
                 state: SourceState::Live,
                 fault: TileFault::None,
+                activity: TileActivity::Ready,
             },
         )]);
         let first = baker
@@ -2838,6 +2948,7 @@ mod tests {
                 channels: data,
                 state: SourceState::Live,
                 fault: TileFault::None,
+                activity: TileActivity::Ready,
             },
         )]);
         let list = baker
@@ -2883,6 +2994,7 @@ mod tests {
                 channels: MeterChannels::from_db(&[-3.0]),
                 state: SourceState::Live,
                 fault: TileFault::Silent,
+                activity: TileActivity::Ready,
             },
         )]);
         let list = baker
@@ -2996,6 +3108,7 @@ mod tests {
                     channels: MeterChannels::from_db(&[-3.0, -120.0]),
                     state: SourceState::Live,
                     fault: TileFault::Silent,
+                    activity: TileActivity::Ready,
                 },
             )]);
             let list = baker
@@ -3108,6 +3221,7 @@ mod tests {
                     channels: MeterChannels::from_db(&[-3.0]),
                     state: SourceState::Live,
                     fault: TileFault::Silent,
+                    activity: TileActivity::Ready,
                 },
             )]);
             let list = baker

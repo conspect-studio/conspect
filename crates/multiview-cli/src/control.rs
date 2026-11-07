@@ -1431,7 +1431,7 @@ pub fn command_drain_with_live_sources_and_demand(
 /// [`command_drain_with_audio_and_players`] plus the demand seam (the
 /// non-overlay production run path).
 #[cfg(feature = "ffmpeg")]
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn command_drain_with_audio_players_and_demand(
     commands: CommandReceiver,
     config: MultiviewConfig,

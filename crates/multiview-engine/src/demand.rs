@@ -246,6 +246,20 @@ impl DemandStatus {
     }
 }
 
+/// What a tile's status chip shows for a source: its lifecycle phase and,
+/// while starting, where it is. Absent from [`DemandManager::activity`] means
+/// idle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SourceActivity {
+    /// The lifecycle phase.
+    pub phase: DemandPhase,
+    /// While starting: where it is.
+    pub starting: Option<StartingPhase>,
+}
+
+/// The non-idle sources' [`SourceActivity`], republished only when one changes.
+pub type ActivityMap = HashMap<Arc<str>, SourceActivity>;
+
 /// One lifecycle transition, reported on the event path.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TransitionEvent {
@@ -456,12 +470,17 @@ struct Entry<T> {
     generation: u64,
     /// The phase last reported as a [`TransitionEvent`].
     reported: DemandPhase,
+    /// The starting sub-phase last published to the activity map.
+    reported_starting: Option<StartingPhase>,
     /// Why the phase last changed (for the transition event).
     reason: String,
     /// An operator Stop: skip `close after` once nothing wants the rails.
     close_now: bool,
     /// The kind's retry cap was reached: no more automatic starts.
     gave_up: bool,
+    /// Started by boot (adopted), not by this manager: it never held a start
+    /// slot, so it must not occupy one while awaiting its first media.
+    booted: bool,
 }
 
 impl<T> Entry<T> {
@@ -481,9 +500,11 @@ impl<T> Entry<T> {
             handle: None,
             generation: 0,
             reported: DemandPhase::Idle,
+            reported_starting: None,
             reason: String::new(),
             close_now: false,
             gave_up: false,
+            booted: false,
         }
     }
 
@@ -509,7 +530,8 @@ impl<T> Entry<T> {
     /// Occupies a start slot: a transition in flight, or a rail awaiting its
     /// first frame.
     fn holds_start_slot(&self) -> bool {
-        self.in_flight || (self.phase == DemandPhase::Starting && !self.running.is_empty())
+        self.in_flight
+            || (!self.booted && self.phase == DemandPhase::Starting && !self.running.is_empty())
     }
 }
 
@@ -564,6 +586,8 @@ struct Inner<T> {
     passes: AtomicU64,
     /// Where [`TransitionEvent`]s go.
     sink: OnceLock<TransitionSink>,
+    /// The tile-chip view, republished on change only.
+    activity: SwapCell<Arc<ActivityMap>>,
 }
 
 /// The source demand manager. Cheap to clone.
@@ -706,6 +730,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 transitions: AtomicU64::new(0),
                 passes: AtomicU64::new(0),
                 sink: OnceLock::new(),
+                activity: SwapCell::from_pointee(HashMap::new()),
             }),
         }
     }
@@ -883,6 +908,15 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
 
     /// Record rails the run started itself before the worker existed.
     pub fn adopt(&self, id: &str, rails: Rails) {
+        // Only rails the kind can run: a clock asked for "all" has no audio.
+        let possible = self.inner.driver.resolve(id, rails);
+        let rails = Rails {
+            video: rails.video && possible.video,
+            audio: rails.audio && possible.audio,
+        };
+        if rails.is_empty() {
+            return;
+        }
         let handle = rails.video.then(|| self.inner.registry_handle(id, None));
         let mut book = lock(&self.inner.book);
         let now = Instant::now();
@@ -892,6 +926,9 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
             .entry(Arc::from(id))
             .or_insert_with(|| Entry::new(now));
         entry.running = entry.running.union(rails);
+        entry.booted = true;
+        // Boot started it: this is its first generation.
+        entry.generation = entry.generation.max(1);
         entry.progress = progress;
         entry.progress_at = now;
         if let Some(handle) = handle.flatten() {
@@ -970,6 +1007,23 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         self.inner.transitions.load(Ordering::Relaxed)
     }
 
+    /// The non-idle sources' activity for tile status chips. A wait-free load;
+    /// the map is replaced only when a phase or starting sub-phase changes, so
+    /// a per-frame reader allocates nothing.
+    #[must_use]
+    pub fn activity(&self) -> Arc<ActivityMap> {
+        self.inner.activity.load()
+    }
+
+    /// A cheap handle that reads [`activity`](Self::activity) without holding
+    /// the manager alive.
+    #[must_use]
+    pub fn activity_reader(&self) -> ActivityReader {
+        let weak: std::sync::Weak<Inner<T>> = Arc::downgrade(&self.inner);
+        let weak: std::sync::Weak<dyn ActivitySource> = weak;
+        ActivityReader(weak)
+    }
+
     /// Worker passes so far. Constant while every source is idle.
     #[must_use]
     pub fn worker_passes(&self) -> u64 {
@@ -1021,6 +1075,35 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         drop(previous);
         self.inner.wake();
         Ok(())
+    }
+}
+
+/// Something that holds an [`ActivityMap`].
+trait ActivitySource: Send + Sync {
+    fn load_activity(&self) -> Arc<ActivityMap>;
+}
+
+impl<T: Send + Sync + 'static> ActivitySource for Inner<T> {
+    fn load_activity(&self) -> Arc<ActivityMap> {
+        self.activity.load()
+    }
+}
+
+/// Reads a manager's [`ActivityMap`]; empty once the manager is gone.
+#[derive(Clone)]
+pub struct ActivityReader(std::sync::Weak<dyn ActivitySource>);
+
+impl std::fmt::Debug for ActivityReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivityReader").finish_non_exhaustive()
+    }
+}
+
+impl ActivityReader {
+    /// The current map (wait-free), or `None` once the manager is dropped.
+    #[must_use]
+    pub fn load(&self) -> Option<Arc<ActivityMap>> {
+        self.0.upgrade().map(|source| source.load_activity())
     }
 }
 
@@ -1108,8 +1191,18 @@ impl<T: Send + Sync + 'static> Inner<T> {
 
     /// The transition events for `entry` since it was last reported, marking
     /// it reported. Book lock held; the caller emits after releasing it.
-    fn note(&self, id: &str, entry: &mut Entry<T>, out: &mut Vec<TransitionEvent>) {
+    fn note(&self, id: &str, entry: &mut Entry<T>, out: &mut Notes) {
         let phase = effective_phase(self.driver.as_ref(), id, entry);
+        let starting = if phase == DemandPhase::Starting {
+            entry.starting_phase()
+        } else {
+            None
+        };
+        if phase != entry.reported || starting != entry.reported_starting {
+            entry.reported_starting = starting;
+            out.activity
+                .push((Arc::from(id), SourceActivity { phase, starting }));
+        }
         if phase == entry.reported {
             return;
         }
@@ -1119,7 +1212,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
             } else {
                 std::mem::take(&mut entry.reason)
             };
-            out.push(TransitionEvent {
+            out.events.push(TransitionEvent {
                 source_id: id.to_owned(),
                 generation: entry.generation,
                 from: entry.reported,
@@ -1133,9 +1226,22 @@ impl<T: Send + Sync + 'static> Inner<T> {
         entry.reported = phase;
     }
 
-    fn emit(&self, events: &[TransitionEvent]) {
+    fn emit(&self, notes: &Notes) {
+        if !notes.activity.is_empty() {
+            self.activity.rcu(|current| {
+                let mut next = current.as_ref().clone();
+                for (id, activity) in &notes.activity {
+                    if activity.phase == DemandPhase::Idle {
+                        next.remove(id);
+                    } else {
+                        next.insert(Arc::clone(id), *activity);
+                    }
+                }
+                next
+            });
+        }
         if let Some(sink) = self.sink.get() {
-            for event in events {
+            for event in &notes.events {
                 sink(event);
             }
         }
@@ -1234,7 +1340,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
         };
         let mut launches: Vec<(Arc<str>, Rails, Rails, bool, u64)> = Vec::new();
         let mut released = Vec::new();
-        let mut events = Vec::new();
+        let mut events = Notes::default();
         {
             let mut book = lock(&self.book);
             let mut slots_used = book
@@ -1295,6 +1401,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 }
                 in_flight += 1;
                 entry.in_flight = true;
+                entry.booted = false;
                 launches.push((
                     Arc::clone(id),
                     entry.running,
@@ -1433,7 +1540,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
             .flatten();
         let progress = self.driver.progress(id, running);
         let mut surplus = None;
-        let mut events = Vec::new();
+        let mut events = Notes::default();
         {
             let mut book = lock(&self.book);
             let now = Instant::now();
@@ -1562,6 +1669,13 @@ fn desired_rails<T>(
 fn backoff(base: Duration, max: Duration, failures: u32) -> Duration {
     let exponent = failures.saturating_sub(1).min(16);
     base.saturating_mul(1_u32 << exponent).min(max)
+}
+
+/// What one pass learned, emitted after the book lock is released.
+#[derive(Default)]
+struct Notes {
+    events: Vec<TransitionEvent>,
+    activity: Vec<(Arc<str>, SourceActivity)>,
 }
 
 fn default_reason(phase: DemandPhase) -> String {
@@ -2303,6 +2417,29 @@ mod tests {
         let before = manager.worker_passes();
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(manager.worker_passes(), before, "idle wakeups");
+        manager.shutdown();
+    }
+
+    #[test]
+    fn boot_started_sources_do_not_hold_start_slots() {
+        let fake = Arc::new(Fake::default());
+        let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(&fake);
+        let manager = DemandManager::new(SourceRegistry::new(), driver, config(10));
+        // Ten boot-started sources, none producing yet; four start slots.
+        for i in 0..10 {
+            manager.set_pins(
+                &format!("boot{i}"),
+                vec![(format!("boot{i}"), Rails::VIDEO, tag("always_on"))],
+            );
+            manager.adopt(&format!("boot{i}"), Rails::VIDEO);
+        }
+        manager.start();
+        let lease = manager.acquire("lazy", Rails::VIDEO, tag("viewer"), None);
+        wait("on-demand start not blocked by boot", || {
+            fake.video_starts.load(Ordering::SeqCst) == 1
+        });
+        assert_eq!(manager.status("boot0").generation, 1);
+        drop(lease);
         manager.shutdown();
     }
 }

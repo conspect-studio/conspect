@@ -2,8 +2,11 @@
 //! (`docs/architecture/demand-driven-sources.md`).
 //!
 //! Pure policy with no I/O: it decides what starts at boot and which standing
-//! leases a source's own settings imply. Everything that appears at runtime (a
-//! layout flip, a route, a preview) takes its lease where it happens.
+//! leases a source's own settings imply. `activation = "always_on"` (the
+//! default) is a standing lease, so every source starts at boot as it always
+//! has; only `on_demand` sources wait for a consumer. Everything that appears
+//! at runtime (a layout flip, a route, a preview) takes its lease where it
+//! happens.
 
 use std::collections::BTreeMap;
 
@@ -23,8 +26,11 @@ pub struct StartupDemand {
 pub fn demand_config(config: &MultiviewConfig) -> DemandConfig {
     let mut tuned = DemandConfig::default();
     if let Some(settings) = config.system.as_ref().and_then(|s| s.demand) {
-        if let Some(linger) = settings.linger_secs {
-            tuned.linger = std::time::Duration::from_secs(u64::from(linger));
+        if let Some(close_after) = settings.close_after_secs {
+            tuned.close_after = std::time::Duration::from_secs(u64::from(close_after));
+        }
+        if let Some(timeout) = settings.start_timeout_secs {
+            tuned.start_timeout = std::time::Duration::from_secs(u64::from(timeout.max(1)));
         }
         if let Some(starts) = settings.max_concurrent_starts {
             tuned.max_concurrent_starts = usize::try_from(starts).unwrap_or(usize::MAX).max(1);
@@ -33,20 +39,25 @@ pub fn demand_config(config: &MultiviewConfig) -> DemandConfig {
     tuned
 }
 
-/// The standing leases `source`'s own settings imply: `always_on`, explicitly
-/// enabled journaling, and armed automation (the watched source plus its
+/// The standing leases `source`'s own settings imply: `always_on` activation
+/// (the default) and armed automation (the watched source plus its
 /// replacement, so a take has a picture at once).
+///
+/// There is no separate journaling pin: event observation rides the video
+/// rail, so it runs whenever the source is ready. An `always_on` source is
+/// always ready, which keeps its event history.
 #[must_use]
 pub fn standing_pins(source: &Source) -> Vec<(String, Rails, ConsumerTag)> {
     let mut pins = Vec::new();
-    let policy = source.demand.unwrap_or_default();
-    if policy.always_on {
+    if matches!(source.kind, multiview_config::SourceKind::Aes67 { .. }) {
+        // AES67 is a local multicast join outside demand; it always runs.
+        return pins;
+    }
+    if !source.is_on_demand() {
+        // Exactly today's boot set: the picture of every source, and its audio
+        // only where boot built audio before (audio-bearing kinds).
         let tag = ConsumerTag::new(ConsumerClass::AlwaysOn, "always_on");
         pins.push((source.id.clone(), Rails::ALL, tag));
-    }
-    if policy.journal_events {
-        let tag = ConsumerTag::new(ConsumerClass::EventJournal, "journal");
-        pins.push((source.id.clone(), Rails::VIDEO, tag));
     }
     let rule = source
         .events
@@ -199,7 +210,7 @@ pub fn view_of(status: &multiview_engine::DemandStatus) -> multiview_control::So
         phase: match status.phase {
             D::Idle => P::Idle,
             D::Starting => P::Starting,
-            D::Live => P::Live,
+            D::Ready => P::Ready,
             D::Failed => P::Failed,
         },
         video_wanted: status.wanted.video,
@@ -215,11 +226,82 @@ pub fn view_of(status: &multiview_engine::DemandStatus) -> multiview_control::So
             })
             .collect(),
         detail: status.detail.clone(),
+        starting_phase: status.starting.map(|phase| match phase {
+            multiview_engine::StartingPhase::Queued => {
+                multiview_control::SourceStartingPhase::Queued
+            }
+            multiview_engine::StartingPhase::Opening => {
+                multiview_control::SourceStartingPhase::Opening
+            }
+            multiview_engine::StartingPhase::AwaitingMedia => {
+                multiview_control::SourceStartingPhase::AwaitingMedia
+            }
+        }),
+        deadline_in_ms: status
+            .deadline_in
+            .map(|left| u64::try_from(left.as_millis()).unwrap_or(u64::MAX)),
+        // Filled by the API from the accepted document.
+        activation: multiview_control::SourceActivationView::AlwaysOn,
     }
+}
+
+/// The `input.lifecycle` event for an engine transition.
+#[must_use]
+pub fn lifecycle_event(event: &multiview_engine::TransitionEvent) -> multiview_events::Event {
+    use multiview_engine::DemandPhase as D;
+    use multiview_events::SourceLifecycle as L;
+    let state = |phase: D| match phase {
+        D::Idle => L::Idle,
+        D::Starting => L::Starting,
+        D::Ready => L::Ready,
+        D::Failed => L::Failed,
+    };
+    let at_ms = event
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    multiview_events::Event::InputLifecycle(multiview_events::InputLifecycle::new(
+        event.source_id.clone(),
+        event.generation,
+        state(event.from),
+        state(event.to),
+        event.reason.clone(),
+        at_ms,
+        event
+            .lease_holders
+            .iter()
+            .map(|tag| multiview_events::LeaseHolder {
+                kind: tag.class.as_str().to_owned(),
+                label: tag.label.to_string(),
+            })
+            .collect(),
+    ))
 }
 
 #[cfg(feature = "ffmpeg")]
 impl multiview_control::SourceDemandProvider for ControlDemand {
+    fn start_source(&self, id: &str) -> bool {
+        if !self.catalogue.load().contains_key(id) {
+            return false;
+        }
+        self.manager.start_source(id);
+        true
+    }
+
+    fn stop_source(&self, id: &str) -> Result<(), multiview_control::StopRefusal> {
+        self.manager.stop_source(id).map_err(|holders| {
+            multiview_control::StopRefusal::InUse(
+                holders
+                    .iter()
+                    .map(|tag| multiview_control::SourceConsumerView {
+                        kind: tag.class.as_str().to_owned(),
+                        label: tag.label.to_string(),
+                    })
+                    .collect(),
+            )
+        })
+    }
+
     fn status(&self, id: &str) -> multiview_control::SourceDemandView {
         view_of(&self.manager.status(id))
     }
@@ -271,12 +353,8 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
             .touch(id, Rails::VIDEO, tag, PREVIEW_POLL_LEASE)
             .map(|phase| {
                 view_of(&multiview_engine::DemandStatus {
-                    id: id.to_owned(),
                     phase,
-                    wanted: Rails::VIDEO,
-                    running: Rails::NONE,
-                    consumers: Vec::new(),
-                    detail: None,
+                    ..multiview_engine::DemandStatus::idle(id)
                 })
                 .phase
             })
@@ -353,10 +431,17 @@ input_id = "bound"
     }
 
     #[test]
-    fn an_unconsumed_source_has_no_demand_and_a_bound_one_gets_both_rails() {
+    fn an_existing_source_starts_at_boot_whether_or_not_it_is_consumed() {
         let demand = demand(&config("", ""));
         assert_eq!(demand["bound"].rails, Rails::ALL);
-        assert!(!demand.contains_key("unused"));
+        assert_eq!(demand["unused"].rails, Rails::ALL, "default is always on");
+    }
+
+    #[test]
+    fn an_unconsumed_on_demand_source_has_no_demand() {
+        let extra = "[[sources]]\nid = \"lazy\"\nkind = \"hls\"\nurl = \"https://example.test/z.m3u8\"\nactivation = \"on_demand\"";
+        let demand = demand(&config(extra, ""));
+        assert!(!demand.contains_key("lazy"));
     }
 
     #[test]
@@ -370,27 +455,29 @@ channels = { kind = "stereo" }
 include_in_program_bus = true
 "#;
         let extra =
-            "[[sources]]\nid = \"msnow\"\nkind = \"hls\"\nurl = \"https://example.test/m.m3u8\"";
+            "[[sources]]\nid = \"msnow\"\nkind = \"hls\"\nurl = \"https://example.test/m.m3u8\"\nactivation = \"on_demand\"";
         let demand = demand(&config(extra, tail));
         assert_eq!(demand["msnow"].rails, Rails::AUDIO);
-        assert!(!demand.contains_key("unused"));
     }
 
     #[test]
-    fn always_on_and_journaling_are_explicit_consumers() {
+    fn the_legacy_demand_alias_still_selects_activation() {
         let extra = r#"[[sources]]
 id = "pinned"
 kind = "hls"
 url = "https://example.test/p.m3u8"
 demand = { always_on = true }
 [[sources]]
-id = "logged"
+id = "lazy"
 kind = "hls"
 url = "https://example.test/l.m3u8"
-demand = { journal_events = true }"#;
+demand = { always_on = false, journal_events = true }"#;
         let demand = demand(&config(extra, ""));
         assert_eq!(demand["pinned"].rails, Rails::ALL);
-        assert_eq!(demand["logged"].rails, Rails::VIDEO);
+        assert!(
+            !demand.contains_key("lazy"),
+            "journal_events is no longer a pin"
+        );
     }
 
     #[test]
@@ -399,6 +486,7 @@ demand = { journal_events = true }"#;
 id = "watched"
 kind = "hls"
 url = "https://example.test/w.m3u8"
+activation = "on_demand"
 events = { observe = true }"#;
         assert!(!demand(&config(observed, "")).contains_key("watched"));
         let armed = |armed: bool| {
@@ -407,10 +495,12 @@ events = { observe = true }"#;
 id = "slate"
 kind = "hls"
 url = "https://example.test/s.m3u8"
+activation = "on_demand"
 [[sources]]
 id = "watched"
 kind = "hls"
 url = "https://example.test/w.m3u8"
+activation = "on_demand"
 [sources.events.automation]
 armed = {armed}
 restore_on_end = true
@@ -429,15 +519,19 @@ target = "slate""#
     }
 
     #[test]
-    fn linger_and_start_concurrency_come_from_system_demand() {
+    fn close_after_start_timeout_and_concurrency_come_from_system_demand() {
         let tuned = demand_config(&config(
             "",
-            "[system.demand]\nlinger_secs = 5\nmax_concurrent_starts = 2\n",
+            "[system.demand]\nclose_after_secs = 5\nstart_timeout_secs = 7\nmax_concurrent_starts = 2\n",
         ));
-        assert_eq!(tuned.linger, std::time::Duration::from_secs(5));
+        assert_eq!(tuned.close_after, std::time::Duration::from_secs(5));
+        assert_eq!(tuned.start_timeout, std::time::Duration::from_secs(7));
         assert_eq!(tuned.max_concurrent_starts, 2);
+        // The old name still loads.
+        let legacy = demand_config(&config("", "[system.demand]\nlinger_secs = 9\n"));
+        assert_eq!(legacy.close_after, std::time::Duration::from_secs(9));
         let default = demand_config(&config("", ""));
-        assert_eq!(default.linger, multiview_engine::DEFAULT_LINGER);
+        assert_eq!(default.close_after, multiview_engine::DEFAULT_CLOSE_AFTER);
     }
 
     #[test]
