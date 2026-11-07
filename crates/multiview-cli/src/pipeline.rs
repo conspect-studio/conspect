@@ -13908,17 +13908,22 @@ pub type LiveAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveAnch
 /// Takes a mutex only to find/create the entry (plan build, control plane);
 /// never on a per-frame path.
 pub fn live_anchor_slot(id: &str) -> LiveAnchorSlot {
-    static SLOTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>>,
-    > = std::sync::OnceLock::new();
-    let map = SLOTS.get_or_init(Default::default);
-    let mut map = map
+    let mut map = anchor_slots()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(
         map.entry(id.to_owned())
             .or_insert_with(|| Arc::new(multiview_framestore::SwapCell::empty())),
     )
+}
+
+/// The process-wide anchor slots, keyed by live source id. A removed source's
+/// entry is dropped (review R2-04), so the map tracks live sources only.
+fn anchor_slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>> {
+    static SLOTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>>,
+    > = std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
 }
 
 /// A detached writer and a replacement synchronize publication under one lock.
@@ -13946,10 +13951,15 @@ pub(crate) fn begin_live_lifecycle(id: &str) -> u64 {
 
 #[allow(clippy::expect_used)] // 2^64 lifecycle replacements cannot safely reuse a token; fail closed before ABA.
 fn advance_live_lifecycle(id: &str, tokens: &mut std::collections::HashMap<String, u64>) -> u64 {
+    // Review R2-04: tokens come from one process-wide counter, so no id ever
+    // sees a token twice. A removed id can then drop its entry: a stale worker
+    // holds a token that no later lifecycle of any id can equal. Allocated
+    // under the lifecycle lock, so per-id tokens stay strictly increasing.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(next != u64::MAX, "source lifecycle epoch exhausted");
     let token = tokens.entry(id.to_owned()).or_default();
-    *token = token
-        .checked_add(1)
-        .expect("source lifecycle epoch exhausted");
+    *token = next;
     let slot = live_anchor_slot(id);
     let generation = slot
         .load()
@@ -13965,12 +13975,43 @@ fn advance_live_lifecycle(id: &str, tokens: &mut std::collections::HashMap<Strin
     *token
 }
 
-/// End a removed source's lifecycle and release its fetch registration. The
-/// token stays in place: a re-add must continue it so stale workers stay fenced.
+/// End a removed source's lifecycle and release every per-id registry entry:
+/// the lifecycle token, the anchor slot and the fetch registration (review
+/// R2-04). Tokens are globally unique, so dropping the entry cannot unfence a
+/// stale worker: its token never matches an absent entry (read as `0`) or any
+/// later lifecycle. A detached worker keeps its own `Arc` of the old slot; a
+/// re-add gets a fresh slot that the old worker cannot reach.
 pub(crate) fn remove_live_lifecycle(id: &str) -> u64 {
-    let lifecycle = begin_live_lifecycle(id);
+    let mut tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lifecycle = advance_live_lifecycle(id, &mut tokens);
     crate::hls_fetch::forget_source(id, lifecycle);
+    tokens.remove(id);
+    anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(id);
     lifecycle
+}
+
+/// Live entries retained by the lifecycle and anchor registries whose id
+/// starts with `prefix` (churn-bound tests).
+#[cfg(test)]
+pub(crate) fn retained_lifecycle_ids(prefix: &str) -> (usize, usize) {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .count();
+    let slots = anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .count();
+    (tokens, slots)
 }
 
 /// Invalidate an ending run only if its startup producer still owns this id.

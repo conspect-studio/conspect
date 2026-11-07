@@ -1545,6 +1545,12 @@ mod tests {
             crate::pipeline::remove_live_lifecycle(&id);
         }
         assert_eq!(retained(prefix), 0, "removed ids must not be retained");
+        // Review R2-04: every source-identity registry, not just the fetch map.
+        assert_eq!(
+            crate::pipeline::retained_lifecycle_ids(prefix),
+            (0, 0),
+            "removed ids must not be retained by the lifecycle or anchor registries"
+        );
     }
 
     #[test]
