@@ -59,14 +59,16 @@ fn bound_client(
     store: Arc<LeaseStore>,
 ) -> HeartbeatClient<FakeLicenceServer> {
     let pinned = server.pinned_root();
-    HeartbeatClient::with_device_signer(
+    let now_ms = server.kit().now_ms();
+    HeartbeatClient::with_clock(
         server,
         store,
         pinned,
         lifecycle_config(),
         bound_identity(),
-        Arc::new(pop_test_signer()),
+        Arc::new(move || now_ms),
     )
+    .with_signer(Arc::new(pop_test_signer()))
 }
 
 #[tokio::test]
