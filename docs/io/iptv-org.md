@@ -50,7 +50,11 @@ The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
    button disabled until one is chosen, and the M3U dialog's large-selection warning), writing
    `activation` through the shared `sourceFormToBody` path.
    **Until then** (agreed with the rc3 owner, 2026-11-07): a single bulk add creates at most
-   `BULK_ADD_MAX = 8` sources, and the dialog states that each new source starts always on and opens
+   `BULK_ADD_MAX = 8` sources. **The server enforces this:** `POST /api/v1/catalogues/iptv-org/sources`
+   (Write role, body `{"sources":[{id,name,body}]}`) refuses more than 8 entries, and any invalid or
+   duplicate entry, with `422` before creating anything; it then creates the entries in order through
+   the canonical `create_source` path (`lock_config_mutation`, `commit_resource`, audit, live apply) with
+   per-object authorization on every id. The web constant only mirrors it for the UI. The dialog states that each new source starts always on and opens
    a connection and decoder at boot. The cap is lifted by the activation follow-up.
 4. **Build.** Production builds `--features nvidia,web`. The `nvidia` preset enables
    `catalogue-ffmpeg`, which enables `catalogue`; the PR shows the resolved feature check.

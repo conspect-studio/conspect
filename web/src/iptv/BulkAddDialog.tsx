@@ -7,7 +7,10 @@ import type { JSX } from 'react';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { CircleCheck, CircleX } from 'lucide-react';
 
-import type { IndexStream } from '../api/catalogue';
+import { useQueryClient } from '@tanstack/react-query';
+
+import { bulkAddSources } from '../api/catalogue';
+import type { BulkAddEntry, IndexStream } from '../api/catalogue';
 import { Button } from '../components/ui/button';
 import {
   Dialog,
@@ -20,7 +23,7 @@ import {
 import { ORIGIN_FOLLOWS, sourceFormToBody, validateSourceForm } from '../resources/forms';
 import type { OriginFollow } from '../resources/forms';
 import { SelectField } from '../resources/FormControls';
-import { useSaveResource } from '../resources/queries';
+import { resourceKeys } from '../resources/queries';
 import { toSourceForm } from './toSource';
 
 interface ItemResult {
@@ -67,7 +70,7 @@ export function BulkAddDialog({
   readonly onDone: (okKeys: readonly string[]) => void;
 }): JSX.Element {
   const { t } = useLingui();
-  const save = useSaveResource('sources', {});
+  const queryClient = useQueryClient();
   const followLabel = useFollowLabel();
   const [follow, setFollow] = useState<OriginFollow>('notify');
   const [results, setResults] = useState<readonly ItemResult[] | null>(null);
@@ -82,6 +85,8 @@ export function BulkAddDialog({
     setRunning(true);
     const taken = new Set(takenIds);
     const out: ItemResult[] = [];
+    const entries: BulkAddEntry[] = [];
+    const sent: { key: string; title: string; id: string }[] = [];
     for (const s of streams) {
       const form = toSourceForm(s, taken, follow, new Date(), catNames);
       taken.add(form.id);
@@ -90,22 +95,29 @@ export function BulkAddDialog({
         out.push({ key: s.k, title: s.title, id: form.id, ok: false, message: t`Invalid source` });
         continue;
       }
+      entries.push({ id: form.id, name: form.name.trim(), body: sourceFormToBody(form) });
+      sent.push({ key: s.k, title: s.title, id: form.id });
+    }
+    if (entries.length > 0) {
+      // One server call: the server enforces the cap and validates every entry
+      // before it creates any (all-or-nothing on a bad request).
       try {
-        await save.mutateAsync({
-          id: form.id,
-          create: true,
-          input: { name: form.name.trim(), body: sourceFormToBody(form) },
-        });
-        out.push({ key: s.k, title: s.title, id: form.id, ok: true, message: t`Created` });
+        const response = await bulkAddSources(entries);
+        for (const item of sent) {
+          const r = response.results.find((x) => x.id === item.id);
+          out.push({
+            ...item,
+            ok: r?.status === 'created',
+            message: r?.status === 'created' ? t`Created` : (r?.error ?? t`Not created`),
+          });
+        }
       } catch (error) {
-        out.push({
-          key: s.k,
-          title: s.title,
-          id: form.id,
-          ok: false,
-          message: error instanceof Error ? error.message : String(error),
-        });
+        const message = error instanceof Error ? error.message : String(error);
+        for (const item of sent) {
+          out.push({ ...item, ok: false, message });
+        }
       }
+      void queryClient.invalidateQueries({ queryKey: resourceKeys.list('sources') });
     }
     setResults(out);
     setRunning(false);

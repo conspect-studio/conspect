@@ -387,6 +387,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/catalogues/iptv-org/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /api/v1/catalogues/iptv-org/sources` — bulk-create sources (write). */
+        post: operations["create_catalogue_sources"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/catalogues/iptv-org/status": {
         parameters: {
             query?: never;
@@ -3496,6 +3513,41 @@ export interface components {
              *     closure (no `nonfree` Cargo feature exists).
              */
             redistributable: boolean;
+        };
+        /** @description Request body of `POST /catalogues/iptv-org/sources`. */
+        BulkAddBody: {
+            /** @description 1..=8 sources to create. */
+            sources: components["schemas"]["BulkAddEntry"][];
+        };
+        /**
+         * @description One entry of a bulk add: the same `{name, body}` a single create takes, plus
+         *     the source id (the `{id}` of `POST /sources/{id}`).
+         */
+        BulkAddEntry: {
+            /** @description The source document (`multiview_config::Source`). */
+            body: unknown;
+            /** @description Source id. */
+            id: string;
+            /** @description Human-friendly name. */
+            name?: string;
+        };
+        /** @description One per-item result of a bulk add. */
+        BulkAddItem: {
+            /** @description How the create takes effect: `live` or `restart`. */
+            apply?: string | null;
+            /** @description Why the item failed. */
+            error?: string | null;
+            /** @description `ETag` of the created source. */
+            etag?: string | null;
+            /** @description Source id. */
+            id: string;
+            /** @description `created`, `failed` or `skipped` (not attempted after an earlier failure). */
+            status: string;
+        };
+        /** @description Response of `POST /catalogues/iptv-org/sources`. */
+        BulkAddResponse: {
+            /** @description One result per requested source, in request order. */
+            results: components["schemas"]["BulkAddItem"][];
         };
         /**
          * @description One composed support bundle: the echoed request, the redacted/diagnostic
@@ -8261,6 +8313,57 @@ export interface operations {
             };
             /** @description Upstream sync failed. */
             502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    create_catalogue_sources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkAddBody"];
+            };
+        };
+        responses: {
+            /** @description Every source was created; per-item results in request order. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkAddResponse"];
+                };
+            };
+            /** @description A durable write failed part-way: earlier items are created, the failed item and the rest are reported. */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkAddResponse"];
+                };
+            };
+            /** @description Requires write, or an id is outside the caller's scope. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description At most 8 sources per bulk add (each starts always on until activation lands); or an entry is invalid or duplicated. Nothing was created. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

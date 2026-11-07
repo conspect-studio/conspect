@@ -1351,6 +1351,67 @@
         }
       }
     },
+    "/api/v1/catalogues/iptv-org/sources": {
+      "post": {
+        "tags": [
+          "catalogue"
+        ],
+        "summary": "`POST /api/v1/catalogues/iptv-org/sources` — bulk-create sources (write).",
+        "operationId": "create_catalogue_sources",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkAddBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Every source was created; per-item results in request order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkAddResponse"
+                }
+              }
+            }
+          },
+          "207": {
+            "description": "A durable write failed part-way: earlier items are created, the failed item and the rest are reported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkAddResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Requires write, or an id is outside the caller's scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "At most 8 sources per bulk add (each starts always on until activation lands); or an entry is invalid or duplicated. Nothing was created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/catalogues/iptv-org/status": {
       "get": {
         "tags": [
@@ -12135,6 +12196,98 @@
           "redistributable": {
             "type": "boolean",
             "description": "Whether the artifact is redistributable. `true` for every shippable\nMultiview build: the default is LGPL-clean, `gpl-codecs` is GPL\n(redistributable under copyleft), and NDI is runtime-loaded (never\nvendored/linked) — there is no non-redistributable `--enable-nonfree`\nclosure (no `nonfree` Cargo feature exists)."
+          }
+        }
+      },
+      "BulkAddBody": {
+        "type": "object",
+        "description": "Request body of `POST /catalogues/iptv-org/sources`.",
+        "required": [
+          "sources"
+        ],
+        "properties": {
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkAddEntry"
+            },
+            "description": "1..=8 sources to create."
+          }
+        }
+      },
+      "BulkAddEntry": {
+        "type": "object",
+        "description": "One entry of a bulk add: the same `{name, body}` a single create takes, plus\nthe source id (the `{id}` of `POST /sources/{id}`).",
+        "required": [
+          "id",
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "description": "The source document (`multiview_config::Source`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Source id."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-friendly name."
+          }
+        }
+      },
+      "BulkAddItem": {
+        "type": "object",
+        "description": "One per-item result of a bulk add.",
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "apply": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the create takes effect: `live` or `restart`."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the item failed."
+          },
+          "etag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ETag` of the created source."
+          },
+          "id": {
+            "type": "string",
+            "description": "Source id."
+          },
+          "status": {
+            "type": "string",
+            "description": "`created`, `failed` or `skipped` (not attempted after an earlier failure)."
+          }
+        }
+      },
+      "BulkAddResponse": {
+        "type": "object",
+        "description": "Response of `POST /catalogues/iptv-org/sources`.",
+        "required": [
+          "results"
+        ],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BulkAddItem"
+            },
+            "description": "One result per requested source, in request order."
           }
         }
       },

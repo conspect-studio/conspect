@@ -447,14 +447,36 @@ pub(crate) async fn create_source(
     // store-write → submit → adopt-snapshot sequence, so the persister (which
     // takes the same lock) can never compose mid-mutation and the adopted
     // snapshot advances atomically with the engine submit.
-    let _mutation = state.lock_config_mutation().await;
-    if accepted_sources(&state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
+    let mutation = state.lock_config_mutation().await;
+    let (versioned, mode) =
+        create_source_locked(&state, &mutation, &principal.key_id, &id, input).await?;
+    Ok(with_apply(
+        mode,
+        source_response(StatusCode::CREATED, &versioned),
+    ))
+}
+
+/// The canonical durable source create: capacity and duplicate checks,
+/// `commit_resource`, store projection, audit and live apply.
+///
+/// The caller must hold `lock_config_mutation` — the `_mutation` guard is the
+/// proof — and must already have authorised `id` and validated `input.body`
+/// (see [`validated_body`]). Shared by `POST /sources/{id}` and the catalogue
+/// bulk add so both go through one path.
+pub(crate) async fn create_source_locked(
+    state: &AppState,
+    _mutation: &tokio::sync::OwnedMutexGuard<()>,
+    actor: &str,
+    id: &str,
+    input: ResourceInput,
+) -> ControlResult<(VersionedResource, ApplyMode)> {
+    if accepted_sources(state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
         return Err(crate::error::ControlError::Validation(format!(
             "sources exceeds the live source capacity of {}",
             multiview_config::MAX_ADMITTED_SOURCES
         )));
     }
-    if accepted_sources(&state)?
+    if accepted_sources(state)?
         .iter()
         .any(|entry| entry.resource.id == id)
     {
@@ -463,36 +485,49 @@ pub(crate) async fn create_source(
         )));
     }
     crate::boot_model::commit_resource(
-        &state,
+        state,
         "sources",
-        &id,
+        id,
         Some(input.body.clone()),
         Some(input.name.clone()),
     )
     .await?;
-    if let Err(error) = state.sources.create(&id, input) {
+    if let Err(error) = state.sources.create(id, input) {
         if state.boot_model.is_none() {
             return Err(error);
         }
         tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
     }
-    let versioned = accepted_source(&state, &id).map_err(|error| {
+    let versioned = accepted_source(state, id).map_err(|error| {
         crate::error::ControlError::CommitIndeterminate(format!(
             "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
         ))
     })?;
     state.audit(
-        &principal.key_id,
+        actor,
         AuditAction::Create,
         SOURCE_KIND,
-        &id,
+        id,
         Some(versioned.resource.body.clone()),
     );
-    let mode = live_apply_upsert(&state, parse_stored_source(&versioned.resource.body), None);
-    Ok(with_apply(
-        mode,
-        source_response(StatusCode::CREATED, &versioned),
-    ))
+    let mode = live_apply_upsert(state, parse_stored_source(&versioned.resource.body), None);
+    Ok((versioned, mode))
+}
+
+/// The number of accepted sources and their ids (for bulk pre-validation).
+pub(crate) fn accepted_source_ids(state: &AppState) -> ControlResult<Vec<String>> {
+    Ok(accepted_sources(state)?
+        .into_iter()
+        .map(|entry| entry.resource.id)
+        .collect())
+}
+
+/// Validate a source body for create (public wrapper for the bulk path).
+pub(crate) fn validate_source_body(
+    id: &str,
+    body: &serde_json::Value,
+) -> ControlResult<serde_json::Value> {
+    validated_body(TypedCollection::Sources, id, body)
 }
 
 /// `PUT /api/v1/sources/{id}` — replace a source (role: write; If-Match → 412).

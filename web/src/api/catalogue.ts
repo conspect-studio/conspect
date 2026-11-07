@@ -419,6 +419,34 @@ export function startProbe(
 export function fetchProbe(id: string, o: CatalogueRequestOptions = {}): Promise<ProbeJob> {
   return request<ProbeJob>(`/probes/${encodeURIComponent(id)}`, o);
 }
+/** One source of a bulk add. */
+export interface BulkAddEntry {
+  readonly id: string;
+  readonly name: string;
+  readonly body: unknown;
+}
+/** Per-item result of a bulk add. */
+export interface BulkAddItem {
+  readonly id: string;
+  readonly status: 'created' | 'failed' | 'skipped';
+  readonly etag?: string;
+  readonly apply?: 'live' | 'restart';
+  readonly error?: string;
+}
+/** `POST /sources` response. */
+export interface BulkAddResponse {
+  readonly results: readonly BulkAddItem[];
+}
+/**
+ * `POST /sources` (bulk create; write role). The server refuses more than 8
+ * entries, and any invalid/duplicate entry, with 422 before creating anything.
+ */
+export function bulkAddSources(
+  sources: readonly BulkAddEntry[],
+  o: CatalogueRequestOptions = {},
+): Promise<BulkAddResponse> {
+  return request<BulkAddResponse>('/sources', o, { method: 'POST', body: { sources } });
+}
 /** Logo URL for a cache key (§5: served same-origin by the control plane). */
 export function logoUrl(key: string): string {
   return `${BASE}/logos/${encodeURIComponent(key)}`;

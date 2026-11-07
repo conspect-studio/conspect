@@ -22,9 +22,16 @@ const streams = (n: number): IndexStream[] =>
 
 const created: string[] = [];
 const server = setupServer(
-  http.post('*/api/v1/sources/:id', ({ params }) => {
-    created.push(String(params.id));
-    return HttpResponse.json({ id: params.id, name: 'x', body: {} }, { status: 201 });
+  http.post('*/api/v1/catalogues/iptv-org/sources', async ({ request }) => {
+    const { sources } = (await request.json()) as { sources: { id: string }[] };
+    if (sources.length > BULK_ADD_MAX) {
+      return HttpResponse.json({ title: 'at most 8 sources per bulk add' }, { status: 422 });
+    }
+    created.push(...sources.map((x) => x.id));
+    return HttpResponse.json(
+      { results: sources.map((x) => ({ id: x.id, status: 'created' })) },
+      { status: 201 },
+    );
   }),
 );
 beforeAll(() => { server.listen(); });
@@ -45,6 +52,19 @@ describe('BulkAddDialog cap (sources start always on until activation lands)', (
     await userEvent.click(within(dialog).getByRole('button', { name: new RegExp(`add ${String(BULK_ADD_MAX)} sources`, 'i') }));
     await within(dialog).findAllByText(/created/i);
     expect(created).toHaveLength(BULK_ADD_MAX);
+  });
+
+  it('reports a server-side refusal (422) as failed for every item', async () => {
+    server.use(
+      http.post('*/api/v1/catalogues/iptv-org/sources', () =>
+        HttpResponse.json({ title: 'at most 8 sources per bulk add' }, { status: 422 }),
+      ),
+    );
+    open(2);
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: /add 2 sources/i }));
+    expect(await within(dialog).findAllByText(/at most 8 sources per bulk add/i)).toHaveLength(2);
+    expect(created).toHaveLength(0);
   });
 
   it('refuses a bulk add over the cap, says why, and creates nothing', async () => {

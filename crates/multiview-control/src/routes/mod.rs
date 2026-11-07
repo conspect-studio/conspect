@@ -1033,6 +1033,10 @@ fn resource_router() -> Router<AppState> {
         )
         .route("/catalogues/iptv-org/probes", post(catalogue::post_probe))
         .route("/catalogues/iptv-org/probes/{id}", get(catalogue::get_probe))
+        .route(
+            "/catalogues/iptv-org/sources",
+            post(catalogue::post_bulk_sources),
+        )
         // Sources resource CRUD (managed inputs), mirroring layouts.
         .route("/sources", get(sources::list_sources))
         .route("/sources/import/m3u", post(iptv::import_m3u))

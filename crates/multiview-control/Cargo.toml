@@ -432,3 +432,8 @@ required-features = ["catalogue"]
 # Catalogue egress is public-only (PR192-01): private/CGNAT/ULA/redirect refusals.
 name = "catalogue_egress"
 required-features = ["catalogue"]
+
+[[test]]
+# Server-enforced bulk-add cap (PR192-02).
+name = "catalogue_bulk"
+required-features = ["catalogue"]

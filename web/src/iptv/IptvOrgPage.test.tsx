@@ -61,6 +61,21 @@ const server = setupServer(
       ],
     });
   }),
+  http.post('*/api/v1/catalogues/iptv-org/sources', async ({ request }) => {
+    const { sources } = (await request.json()) as { sources: { id: string }[] };
+    const results = [];
+    let failed = false;
+    for (const s of sources) {
+      if (s.id.startsWith('bbc')) {
+        failed = true;
+        results.push({ id: s.id, status: 'failed', error: 'Conflict' });
+      } else {
+        created.push({ id: s.id, payload: s });
+        results.push({ id: s.id, status: failed ? 'skipped' : 'created' });
+      }
+    }
+    return HttpResponse.json({ results }, { status: failed ? 207 : 201 });
+  }),
   http.post('*/api/v1/sources/:id', async ({ request, params }) => {
     const id = String(params.id);
     if (id.startsWith('bbc')) {

@@ -676,3 +676,177 @@ pub(crate) async fn post_source_network(
         .await;
     Ok(Json(report))
 }
+
+/// The most sources one bulk add may create. The web dialog uses the same
+/// number (`BULK_ADD_MAX` in `web/src/iptv/BulkAddDialog.tsx`); this is the
+/// server-side enforcement. Lifted by the activation follow-up
+/// (`docs/io/iptv-org.md`, Integration rules, item 3).
+pub(crate) const BULK_ADD_MAX: usize = 8;
+
+/// One entry of a bulk add: the same `{name, body}` a single create takes, plus
+/// the source id (the `{id}` of `POST /sources/{id}`).
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct BulkAddEntry {
+    /// Source id.
+    pub id: String,
+    /// Human-friendly name.
+    #[serde(default)]
+    pub name: String,
+    /// The source document (`multiview_config::Source`).
+    pub body: serde_json::Value,
+}
+
+/// Request body of `POST /catalogues/iptv-org/sources`.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct BulkAddBody {
+    /// 1..=8 sources to create.
+    pub sources: Vec<BulkAddEntry>,
+}
+
+/// One per-item result of a bulk add.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct BulkAddItem {
+    /// Source id.
+    pub id: String,
+    /// `created`, `failed` or `skipped` (not attempted after an earlier failure).
+    pub status: &'static str,
+    /// `ETag` of the created source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// How the create takes effect: `live` or `restart`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply: Option<&'static str>,
+    /// Why the item failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response of `POST /catalogues/iptv-org/sources`.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub(crate) struct BulkAddResponse {
+    /// One result per requested source, in request order.
+    pub results: Vec<BulkAddItem>,
+}
+
+/// `POST /api/v1/catalogues/iptv-org/sources` — bulk-create sources (write).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/catalogues/iptv-org/sources",
+        operation_id = "create_catalogue_sources",
+        tag = "catalogue",
+        request_body = BulkAddBody,
+        responses(
+            (status = 201, description = "Every source was created; per-item results in request order.", body = BulkAddResponse),
+            (status = 207, description = "A durable write failed part-way: earlier items are created, the failed item and the rest are reported.", body = BulkAddResponse),
+            (status = 403, description = "Requires write, or an id is outside the caller's scope.", body = crate::problem::Problem),
+            (status = 422, description = "At most 8 sources per bulk add (each starts always on until activation lands); or an entry is invalid or duplicated. Nothing was created.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn post_bulk_sources(
+    State(state): State<AppState>,
+    principal: Principal,
+    Json(body): Json<BulkAddBody>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    let n = body.sources.len();
+    if n == 0 || n > BULK_ADD_MAX {
+        return Err(ControlError::Validation(format!(
+            "at most {BULK_ADD_MAX} sources per bulk add; each starts always on until activation lands (got {n})"
+        )));
+    }
+    // BOLA: authorise every id before revealing anything about any of them.
+    for e in &body.sources {
+        crate::auth::authorize_object(&principal, &e.id)?;
+    }
+    // Validate everything first; reject the whole request on any problem.
+    let mut seen = HashSet::new();
+    let mut inputs = Vec::with_capacity(n);
+    for e in &body.sources {
+        if !seen.insert(e.id.as_str()) {
+            return Err(ControlError::Validation(format!(
+                "source {:?} appears more than once in the request",
+                e.id
+            )));
+        }
+        let validated = super::sources::validate_source_body(&e.id, &e.body)?;
+        inputs.push(crate::resource_store::ResourceInput {
+            name: e.name.clone(),
+            body: validated,
+        });
+    }
+    // One lock hold across the pre-checks and every create, so the checked
+    // state cannot change underneath the batch.
+    let mutation = state.lock_config_mutation().await;
+    let existing = super::sources::accepted_source_ids(&state)?;
+    if existing.len() + n > multiview_config::MAX_ADMITTED_SOURCES {
+        return Err(ControlError::Validation(format!(
+            "sources exceeds the live source capacity of {}",
+            multiview_config::MAX_ADMITTED_SOURCES
+        )));
+    }
+    for e in &body.sources {
+        if existing.iter().any(|x| x == &e.id) {
+            return Err(ControlError::Validation(format!(
+                "source {:?} already exists",
+                e.id
+            )));
+        }
+    }
+    let mut results = Vec::with_capacity(n);
+    let mut failed = false;
+    for (e, input) in body.sources.iter().zip(inputs) {
+        if failed {
+            results.push(BulkAddItem {
+                id: e.id.clone(),
+                status: "skipped",
+                etag: None,
+                apply: None,
+                error: None,
+            });
+            continue;
+        }
+        match super::sources::create_source_locked(
+            &state,
+            &mutation,
+            &principal.key_id,
+            &e.id,
+            input,
+        )
+        .await
+        {
+            Ok((versioned, mode)) => results.push(BulkAddItem {
+                id: e.id.clone(),
+                status: "created",
+                etag: Some(versioned.version.to_etag()),
+                apply: Some(match mode {
+                    crate::typed_resources::ApplyMode::Live => "live",
+                    crate::typed_resources::ApplyMode::Restart => "restart",
+                }),
+                error: None,
+            }),
+            Err(error) => {
+                failed = true;
+                results.push(BulkAddItem {
+                    id: e.id.clone(),
+                    status: "failed",
+                    etag: None,
+                    apply: None,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+    let status = if failed {
+        StatusCode::MULTI_STATUS
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(BulkAddResponse { results })).into_response())
+}
