@@ -79,40 +79,113 @@ pub fn accepted_source_docs(state: &AppState) -> Vec<multiview_config::Source> {
     crate::routes::sources::accepted_sources_system(state)
 }
 
-/// Apply a link [`links::Change`] to `source_id` through the normal If-Match write
-/// path (the current version is read under the same config-mutation lock), audited
-/// as `actor`.
+/// An unattended `follow = auto` decision: the change that was evaluated for a
+/// source, and the accepted version of the source it was evaluated against.
+/// It is only a *proposal*: [`apply_auto_decision`] re-checks it under the
+/// config-mutation lock and drops it if the operator has moved on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoDecision {
+    /// The source the decision is about.
+    pub source_id: String,
+    /// The accepted version the decision was evaluated against.
+    pub version: crate::concurrency::Version,
+    /// The change that was decided.
+    pub change: links::Change,
+}
+
+/// Evaluate the `follow = auto` decisions for `infos` against the current accepted
+/// sources, recording the version each was evaluated against. (First half of an
+/// auto-follow; the second half is [`apply_auto_decision`].)
+#[must_use]
+pub fn plan_auto(state: &AppState, infos: &[links::LinkInfo]) -> Vec<AutoDecision> {
+    infos
+        .iter()
+        .filter_map(|info| {
+            let change = links::auto_applicable(info)?.clone();
+            let current =
+                crate::routes::sources::accepted_sources_system_versioned(state, &info.source_id)?;
+            Some(AutoDecision {
+                source_id: info.source_id.clone(),
+                version: current.version,
+                change,
+            })
+        })
+        .collect()
+}
+
+/// Apply an [`AutoDecision`] through the normal If-Match write path, audited as
+/// `actor`.
+///
+/// Under `lock_config_mutation` the decision is re-validated against the CURRENT
+/// accepted source and the CURRENT catalogue snapshot: the source must still carry
+/// `origin.provider == iptv-org`, `follow == auto` and status `Updated`, its
+/// version must equal the one the decision was evaluated against, and the freshly
+/// computed change must equal the decided one. Otherwise nothing is written
+/// (`Ok(false)`): a newer operator decision (follow switched off, unlink, URL
+/// edit, delete-recreate) always wins over stale automatic intent.
 ///
 /// # Errors
 ///
-/// A message when the source vanished, the change does not validate, or the write
-/// is rejected.
-pub async fn apply_source_change(
+/// A message when the change does not validate or the write is rejected.
+pub async fn apply_auto_decision(
     state: &AppState,
-    source_id: &str,
-    change: &links::Change,
+    cat: &Catalogue,
+    decision: &AutoDecision,
     actor: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let _guard = state.lock_config_mutation().await;
-    let current = crate::routes::sources::accepted_sources_system_versioned(state, source_id)
-        .ok_or_else(|| format!("source {source_id:?} not found"))?;
+    let skip = |why: &str| {
+        tracing::debug!(source = %decision.source_id, why, "catalogue auto-follow skipped a stale decision");
+        Ok(false)
+    };
+    let Some(current) =
+        crate::routes::sources::accepted_sources_system_versioned(state, &decision.source_id)
+    else {
+        return skip("source gone");
+    };
+    if current.version != decision.version {
+        return skip("source changed since evaluation");
+    }
     let source: multiview_config::Source =
         serde_json::from_value(current.resource.body.clone()).map_err(|e| e.to_string())?;
-    let next = links::apply_change(&source, change, &store::now_rfc3339())?;
+    if source
+        .origin
+        .as_ref()
+        .is_none_or(|o| o.provider != links::PROVIDER)
+    {
+        return skip("source no longer linked to iptv-org");
+    }
+    let Some(snapshot) = cat.snapshot() else {
+        return skip("no catalogue snapshot");
+    };
+    let Some(info) = links::evaluate(&source, &snapshot) else {
+        return skip("source no longer evaluates as linked");
+    };
+    // `auto_applicable` requires follow == auto and status == Updated.
+    match links::auto_applicable(&info) {
+        Some(fresh) if *fresh == decision.change => {}
+        _ => return skip("fresh evaluation differs from the decision"),
+    }
+    let next = links::apply_change(&source, &decision.change, &store::now_rfc3339())?;
     let body = serde_json::to_value(&next).map_err(|e| e.to_string())?;
     let input = crate::resource_store::ResourceInput {
         name: current.resource.name.clone(),
         body,
     };
-    let version = current.version;
     let if_match = crate::concurrency::IfMatch {
-        expected: Some(version),
-        raw: Some(version.to_etag()),
+        expected: Some(current.version),
+        raw: Some(current.version.to_etag()),
     };
-    crate::routes::sources::apply_source_update(state, actor, source_id, Some(&if_match), input)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    crate::routes::sources::apply_source_update(
+        state,
+        actor,
+        &decision.source_id,
+        Some(&if_match),
+        input,
+    )
+    .await
+    .map(|_| true)
+    .map_err(|e| e.to_string())
 }
 
 /// Wire the catalogue + probe services into `state` and spawn the sync loop

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use multiview_events::{CatalogueLinkStatus, Event, HealthWarning, WarningCode, WarningSeverity};
 
-use super::links::{self, LinkStatus, Transition};
+use super::links::{LinkStatus, Transition};
 use super::Catalogue;
 use crate::state::AppState;
 
@@ -78,17 +78,16 @@ pub async fn recompute_and_publish(state: &AppState, cat: &Arc<Catalogue>) {
 /// `unsupported`) through the normal source write path.
 async fn apply_auto(state: &AppState, cat: &Arc<Catalogue>, _snapshot: &super::index::Snapshot) {
     let infos = cat.links.all();
-    for info in infos {
-        let Some(change) = links::auto_applicable(&info).cloned() else {
-            continue;
-        };
-        let Ok(()) =
-            super::apply_source_change(state, &info.source_id, &change, SYSTEM_ACTOR).await
-        else {
-            tracing::warn!(source = %info.source_id, "catalogue auto-follow could not apply the change");
-            continue;
-        };
-        tracing::info!(source = %info.source_id, "catalogue auto-follow applied an upstream update");
+    for decision in super::plan_auto(state, &infos) {
+        match super::apply_auto_decision(state, cat, &decision, SYSTEM_ACTOR).await {
+            Ok(true) => {
+                tracing::info!(source = %decision.source_id, "catalogue auto-follow applied an upstream update");
+            }
+            Ok(false) => {}
+            Err(_) => {
+                tracing::warn!(source = %decision.source_id, "catalogue auto-follow could not apply the change");
+            }
+        }
     }
     // Re-evaluate so applied updates settle to `in_sync` immediately.
     if let Some(snapshot) = cat.snapshot() {

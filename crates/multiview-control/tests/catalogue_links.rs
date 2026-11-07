@@ -396,3 +396,128 @@ async fn probe_linked_round_probes_only_linked_sources_through_the_probe_service
 fn link_runtime_probe_round(state: &multiview_control::AppState) -> usize {
     multiview_control::catalogue::probe_linked_round(state)
 }
+
+/// PR192-03: an operator decision committed between evaluating an auto-follow and
+/// applying it must survive; the stale automatic update is dropped.
+mod stale_auto_follow {
+    use super::*;
+    use multiview_control::catalogue::{apply_auto_decision, links, plan_auto};
+
+    struct Rig {
+        h: support::Harness,
+        state: multiview_control::AppState,
+        cat: Arc<Catalogue>,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = Catalogue::new(
+            dir.path().join("cat"),
+            &multiview_config::IptvOrgConfig::default(),
+            Arc::new(NoNet),
+        );
+        let cat2 = Arc::clone(&cat);
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let c2 = Arc::clone(&captured);
+        let h = harness_with(move |s| {
+            let s = s.with_catalogue(cat2, probe::ProbeService::new(Arc::new(Never), "h".into()));
+            *c2.lock().unwrap() = Some(s.clone());
+            s
+        });
+        let state = captured.lock().unwrap().take().unwrap();
+        cat.import_bundle(serde_json::to_vec(&bundle("https://a/1.m3u8", None, false)).unwrap())
+            .await
+            .unwrap();
+        put_source(
+            &h,
+            "auto-src",
+            &link("auto-src", "https://a/1.m3u8", "A.us", "auto"),
+        )
+        .await;
+        Rig {
+            h,
+            state,
+            cat,
+            _dir: dir,
+        }
+    }
+
+    /// Upstream now wants a UA; evaluate (without applying) like the sync does.
+    async fn decide(r: &Rig) -> multiview_control::catalogue::AutoDecision {
+        r.cat
+            .import_bundle(
+                serde_json::to_vec(&bundle("https://a/1.m3u8", Some("UA/2"), false)).unwrap(),
+            )
+            .await
+            .unwrap();
+        let src = multiview_control::catalogue::accepted_source_docs(&r.state)
+            .into_iter()
+            .find(|s| s.id == "auto-src")
+            .unwrap();
+        let info = links::evaluate(&src, &r.cat.snapshot().unwrap()).unwrap();
+        let mut plan = plan_auto(&r.state, &[info]);
+        assert_eq!(plan.len(), 1, "follow=auto + updated is planned");
+        plan.remove(0)
+    }
+
+    async fn operator_put(r: &Rig, body: &Value) {
+        let g = send(&r.h.router, get("/api/v1/sources/auto-src", ADMIN_TOKEN)).await;
+        let tag = support::etag(&g).unwrap();
+        let resp = send(
+            &r.h.router,
+            support::put_json("/api/v1/sources/auto-src", ADMIN_TOKEN, Some(&tag), body),
+        )
+        .await;
+        assert!(resp.status().is_success(), "{}", resp.status());
+    }
+
+    async fn current(r: &Rig) -> Value {
+        body_json(send(&r.h.router, get("/api/v1/sources/auto-src", ADMIN_TOKEN)).await).await
+    }
+
+    #[tokio::test]
+    async fn unmodified_source_still_gets_the_auto_update() {
+        let r = rig().await;
+        let d = decide(&r).await;
+        let applied = apply_auto_decision(&r.state, &r.cat, &d, "system:catalogue")
+            .await
+            .unwrap();
+        assert!(applied);
+        assert_eq!(current(&r).await["body"]["user_agent"], "UA/2");
+    }
+
+    #[tokio::test]
+    async fn operator_switching_follow_off_between_evaluation_and_apply_wins() {
+        let r = rig().await;
+        let d = decide(&r).await;
+        operator_put(&r, &link("auto-src", "https://a/1.m3u8", "A.us", "manual")).await;
+        let before = current(&r).await;
+        let applied = apply_auto_decision(&r.state, &r.cat, &d, "system:catalogue")
+            .await
+            .unwrap();
+        assert!(!applied, "stale auto decision must be dropped");
+        let after = current(&r).await;
+        assert_eq!(after, before, "no auto update was written");
+        assert_eq!(after["body"]["origin"]["follow"], "manual");
+        assert!(after["body"].get("user_agent").is_none() || after["body"]["user_agent"].is_null());
+    }
+
+    #[tokio::test]
+    async fn operator_url_edit_between_evaluation_and_apply_wins() {
+        let r = rig().await;
+        let d = decide(&r).await;
+        // Same follow=auto, but the operator pointed the stream elsewhere.
+        let mut edited = link("auto-src", "https://a/1.m3u8", "A.us", "auto");
+        edited["body"]["url"] = json!("https://operator.example/own.m3u8");
+        operator_put(&r, &edited).await;
+        let before = current(&r).await;
+        let applied = apply_auto_decision(&r.state, &r.cat, &d, "system:catalogue")
+            .await
+            .unwrap();
+        assert!(!applied);
+        let after = current(&r).await;
+        assert_eq!(after, before);
+        assert_eq!(after["body"]["url"], "https://operator.example/own.m3u8");
+    }
+}
