@@ -301,3 +301,72 @@ pub(crate) async fn delete_output(
     );
     Ok(with_apply_restart(StatusCode::NO_CONTENT.into_response()))
 }
+
+/// `GET /api/v1/outputs/{id}/link` — the live link state of a push output
+/// (role: read; per-object authz).
+///
+/// Projects `outputs.<id>.link` out of the cached off-engine snapshot (inv
+/// #10: never touches the engine). `404` when the output has no live push link
+/// (not a push output, or the program is not running).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/outputs/{id}/link",
+        tag = "outputs",
+        params(("id" = String, Path, description = "Output id.")),
+        responses(
+            (status = 200, description = "The output's live push-link state.", body = crate::openapi_schemas::OutputLinkDoc),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to read this output.", body = crate::problem::Problem),
+            (status = 404, description = "No live push link for this output.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn get_output_link(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Read)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let not_found = || crate::error::ControlError::NotFound {
+        kind: OUTPUT_KIND,
+        id: id.clone(),
+    };
+    let snapshot = state.engine.state.latest().ok_or_else(not_found)?;
+    let link = output_link_from_snapshot(&snapshot, &id).ok_or_else(not_found)?;
+    Ok((StatusCode::OK, Json(link)).into_response())
+}
+
+/// `outputs.<id>.link` from the conflated snapshot, if present.
+fn output_link_from_snapshot(
+    snapshot: &crate::state::EngineStateSnapshot,
+    id: &str,
+) -> Option<serde_json::Value> {
+    snapshot
+        .get("outputs")
+        .and_then(|outputs| outputs.get(id))
+        .and_then(|output| output.get("link"))
+        .filter(|link| link.is_object())
+        .cloned()
+}
+
+#[cfg(test)]
+mod link_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::output_link_from_snapshot;
+    use serde_json::json;
+
+    #[test]
+    fn projects_the_link_or_none() {
+        let snap = json!({
+            "v": 1,
+            "outputs": { "srt-out": { "link": { "state": "listening", "clients": 0 } } }
+        });
+        let link = output_link_from_snapshot(&snap, "srt-out").unwrap();
+        assert_eq!(link["state"], "listening");
+        assert!(output_link_from_snapshot(&snap, "other").is_none());
+        assert!(output_link_from_snapshot(&json!({"v": 1}), "srt-out").is_none());
+    }
+}

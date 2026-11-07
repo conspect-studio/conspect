@@ -2189,3 +2189,31 @@ pub struct LogRecordDoc {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub repeated: Option<u64>,
 }
+
+/// Live link state of a push output (SRT / RTMP / RIST / UDP) — the body of
+/// `GET /api/v1/outputs/{id}/link`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OutputLinkDoc {
+    /// `idle` / `connecting` / `listening` / `connected` / `reconnecting`.
+    pub state: String,
+    /// `caller` or `listener`.
+    pub mode: String,
+    /// `srt` / `rtmp` / `rist` / `udp`.
+    pub transport: String,
+    /// The (redacted) destination or bind URL.
+    pub url: String,
+    /// Peers attached right now.
+    pub clients: u64,
+    /// Peer sessions established this run.
+    pub sessions: u64,
+    /// Packets dropped for this output (no peer attached / slow peer).
+    pub dropped: u64,
+    /// Packets written to peers.
+    pub written: u64,
+    /// The last connect/listen/write error since the last successful connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// The attached peer's address, when known (caller mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+}

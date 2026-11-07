@@ -1092,6 +1092,9 @@ fn resource_router() -> Router<AppState> {
                 .put(outputs::update_output)
                 .delete(outputs::delete_output),
         )
+        // Live push-link state (listening / connected / reconnecting / drops),
+        // projected from the off-engine snapshot (inv #10).
+        .route("/outputs/{id}/link", get(outputs::get_output_link))
         // The audio-routing singleton document (program-bus + discrete tracks).
         .route(
             "/audio-routing",
