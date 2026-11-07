@@ -181,6 +181,15 @@ serde_json = { workspace = true }
 # and output-anchored stamp monotonicity across loop laps. Matches the
 # workspace proptest pin used by multiview-core/config/etc.
 proptest = "1.5.0"
+# Test-only zlib/DEFLATE for the in-process PNG artifact the full-timer-readout
+# overlay test writes (crates/multiview-cli/src/synth.rs). The `overlay`
+# feature-gated clippy/test leg runs on a bare runner with NO `ffmpeg` binary
+# (docs: .github/workflows/ci.yml "feature-gated clippy" matrix), so the test
+# must encode its PNG itself rather than shelling out to `ffmpeg`. `flate2` is
+# already allowlisted (MIT/Apache-2.0, deny.toml) and already in the workspace
+# graph transitively via `xtask`'s `ureq`; pulling it here as a direct dev-dep
+# adds no new license/advisory surface.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).

@@ -1758,8 +1758,6 @@ segment_ms = 1000
     #[cfg(feature = "overlay")]
     #[test]
     fn full_timer_readout_is_visible_in_rendered_pixels_and_png() {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
         let (width, height) = (320, 120);
         let kind = timer_kind(TimerFormat::HhMmSs, TimerOnTarget::Hold);
         let seconds = 12 * 3600 + 18 * 60 + 30;
@@ -1792,40 +1790,161 @@ segment_ms = 1000
                 "rendered timer readout has no ink in {left}..{right}"
             );
         }
+        // Encode the Y plane as an in-process grayscale PNG artifact (no
+        // external `ffmpeg`/`convert` binary): the "feature-gated clippy
+        // (multiview-cli, overlay)" CI leg intentionally runs on a bare
+        // runner with no FFmpeg CLI installed (.github/workflows/ci.yml), so
+        // a prior version of this test that shelled out to `ffmpeg` failed
+        // there with `NotFound`. The pixel-visibility assertions above
+        // already prove the readout renders; this just also proves the Y
+        // plane survives a real PNG round-trip with visible ink.
         let dir = tempfile::tempdir().expect("image directory");
         let path = dir.path().join("timer-full-readout.png");
-        let mut encoder = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "nv12",
-                "-s",
-                "320x120",
-                "-i",
-                "pipe:0",
-                "-frames:v",
-                "1",
-            ])
-            .arg(&path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("png encoder");
-        {
-            let stdin = encoder.stdin.as_mut().expect("encoder stdin");
-            stdin.write_all(image.y_plane()).expect("Y plane");
-            stdin.write_all(image.uv_plane()).expect("UV plane");
-        }
-        assert!(encoder.wait().expect("encoder completion").success());
+        write_grayscale_png(&path, width, height, y).expect("write PNG");
         let metadata = std::fs::metadata(&path).expect("PNG artifact");
         assert!(
             metadata.len() > 1_000,
             "full readout PNG must contain visible pixels"
         );
+        let decoded = read_grayscale_png(&path).expect("read back PNG");
+        assert_eq!(decoded, y, "PNG round-trip must preserve the Y plane");
+    }
+
+    /// Write `pixels` (one `u8` luma sample per pixel, row-major) as a minimal
+    /// valid 8-bit grayscale PNG at `path`. Pure Rust (`flate2`'s zlib
+    /// deflate), no external encoder process — the "feature-gated clippy
+    /// (multiview-cli, overlay)" CI leg runs on a bare runner with no
+    /// `ffmpeg`/`convert` binary installed.
+    #[cfg(feature = "overlay")]
+    fn write_grayscale_png(
+        path: &std::path::Path,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> std::io::Result<()> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let width_usize = usize::try_from(width).expect("width fits usize");
+        let height_usize = usize::try_from(height).expect("height fits usize");
+        assert_eq!(pixels.len(), width_usize * height_usize);
+
+        // Scanlines, each prefixed with filter-type byte 0 (None).
+        let mut raw = Vec::with_capacity(pixels.len() + height_usize);
+        for row in 0..height_usize {
+            raw.push(0u8);
+            let start = row * width_usize;
+            raw.extend_from_slice(&pixels[start..start + width_usize]);
+        }
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::fast());
+        zlib.write_all(&raw)?;
+        let idat = zlib.finish()?;
+
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]); // bit depth 8, grayscale, defaults
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])?;
+        write_png_chunk(&mut file, *b"IHDR", &ihdr)?;
+        write_png_chunk(&mut file, *b"IDAT", &idat)?;
+        write_png_chunk(&mut file, *b"IEND", &[])?;
+        Ok(())
+    }
+
+    /// Read back a grayscale PNG written by [`write_grayscale_png`] and
+    /// return its pixel bytes, row-major. Minimal reader matching the exact
+    /// writer above (no filter other than `None`, no interlace); proves the
+    /// written file is a genuine, decodable PNG rather than asserting on
+    /// byte length alone.
+    #[cfg(feature = "overlay")]
+    fn read_grayscale_png(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+
+        let bytes = std::fs::read(path)?;
+        assert_eq!(
+            &bytes[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        let mut pos = 8;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut idat = Vec::new();
+        while pos < bytes.len() {
+            let len = usize::try_from(u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()))
+                .expect("chunk length fits usize");
+            let kind = &bytes[pos + 4..pos + 8];
+            let data = &bytes[pos + 8..pos + 8 + len];
+            match kind {
+                b"IHDR" => {
+                    width = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                    height = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                }
+                b"IDAT" => idat.extend_from_slice(data),
+                b"IEND" => break,
+                _ => {}
+            }
+            pos += 8 + len + 4; // length + kind + data + crc
+        }
+        let mut decoder = ZlibDecoder::new(idat.as_slice());
+        let mut raw = Vec::new();
+        decoder.read_to_end(&mut raw)?;
+        let width_usize = usize::try_from(width).expect("width fits usize");
+        let height_usize = usize::try_from(height).expect("height fits usize");
+        let mut pixels = Vec::with_capacity(width_usize * height_usize);
+        let stride = width_usize + 1;
+        for row in 0..height_usize {
+            let start = row * stride;
+            pixels.extend_from_slice(&raw[start + 1..start + stride]);
+        }
+        Ok(pixels)
+    }
+
+    /// Append one length-prefixed, CRC32-checked PNG chunk to `out`.
+    #[cfg(feature = "overlay")]
+    fn write_png_chunk(
+        out: &mut impl std::io::Write,
+        kind: [u8; 4],
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let len = u32::try_from(data.len()).expect("PNG chunk length fits u32");
+        out.write_all(&len.to_be_bytes())?;
+        out.write_all(&kind)?;
+        out.write_all(data)?;
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(&kind);
+        crc_input.extend_from_slice(data);
+        out.write_all(&crc32(&crc_input).to_be_bytes())?;
+        Ok(())
+    }
+
+    /// Standard IEEE CRC-32 (the PNG chunk checksum), computed without a
+    /// dependency: a fresh table built from the fixed polynomial every call is
+    /// cheap at the tiny chunk sizes this test writes.
+    #[cfg(feature = "overlay")]
+    fn crc32(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (n, slot) in table.iter_mut().enumerate() {
+            let mut c = u32::try_from(n).expect("table index fits u32");
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            *slot = c;
+        }
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            let idx =
+                usize::try_from((crc ^ u32::from(byte)) & 0xFF).expect("byte index fits usize");
+            crc = table[idx] ^ (crc >> 8);
+        }
+        crc ^ 0xFFFF_FFFF
     }
 
     #[cfg(feature = "overlay")]

@@ -2119,7 +2119,7 @@ mod resync_tests {
     #[test]
     fn finite_file_pacer_bounds_unread_lead_while_consumer_is_delayed() {
         use std::sync::atomic::AtomicBool;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
         const BLOCK: usize = 1_920;
         let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
         let store = AudioStore::finite_file(format, 96_000);
@@ -2151,9 +2151,17 @@ mod resync_tests {
             // Delay the consumer while the off-clock writer reaches its bounded lead.
             std::thread::sleep(Duration::from_millis(700));
             let start = std::time::Instant::now();
+            let tick_duration = Duration::from_millis(40);
             let mut last = 0.0_f32;
-            let mut audible_ticks = 0;
-            while start.elapsed() < Duration::from_secs(8) && audible_ticks < 100 {
+            let mut audible_ticks: u32 = 0;
+            // A generous wall-clock budget (not the original 8 s): on a loaded CI
+            // runner (observed: `macos-latest`, many tests scheduled
+            // concurrently) a *relative* `sleep(40ms)` after every one of ~98
+            // reads compounds scheduler overshoot across the whole loop, so a
+            // fixed tight budget like 8 s is itself timing-fragile, not the
+            // ordering/completion behaviour the assertions below verify.
+            let budget = Duration::from_secs(25);
+            while start.elapsed() < budget && audible_ticks < 100 {
                 let block = store.read(BLOCK);
                 let level = block.interleaved().first().copied().unwrap_or(0.0);
                 if level == 0.0 {
@@ -2166,7 +2174,18 @@ mod resync_tests {
                 );
                 last = level;
                 audible_ticks += 1;
-                std::thread::sleep(Duration::from_millis(40));
+                // Pace the next read against an ABSOLUTE per-tick deadline from
+                // `start`, not a fixed relative sleep each iteration: a relative
+                // sleep's overshoot compounds linearly over ~100 iterations under
+                // CI load, while scheduling against `start + tick_duration *
+                // audible_ticks` lets a late consumer catch back up instead
+                // (same pattern as `a_slow_segment_fetch_does_not_gap_the_paced_audio`
+                // above, which schedules its reads the same way).
+                if let Some(d) =
+                    (start + tick_duration * audible_ticks).checked_duration_since(Instant::now())
+                {
+                    std::thread::sleep(d);
+                }
             }
             stop.store(true, Ordering::Release);
             assert!(
