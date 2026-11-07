@@ -64,6 +64,25 @@ pub enum EventBoundary {
     MarkerAbsent,
 }
 
+/// Bounded, precomputed marker identity text. Adapters compute this once, off
+/// the output clock, from parsed wire evidence (never per-frame in the bake).
+/// Each field is deliberately short so a caller can embed it directly in a
+/// fixed-width badge without per-frame truncation logic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkerDescriptor {
+    /// Short human-readable name, e.g. "Program Start", "Ad break".
+    /// At most 48 UTF-8 bytes.
+    pub name: String,
+    /// Raw wire type token the name was derived from, e.g. `"0x22"` (SCTE-35
+    /// `segmentation_type_id`), `"splice_insert"`, `"asset"`, `"priv"`. At
+    /// most 32 UTF-8 bytes. Absent when no raw type applies (e.g. test
+    /// injection).
+    pub type_id: Option<String>,
+    /// Short additional detail, e.g. a segment ordinal ("2/4"), a break
+    /// duration ("60s"), or a readable UPID suffix. At most 48 UTF-8 bytes.
+    pub detail: Option<String>,
+}
+
 /// One bounded observation supplied by an ingest/control adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceEventObservation {
@@ -77,6 +96,9 @@ pub struct SourceEventObservation {
     pub correlation_id: Option<String>,
     /// Optional reusable asset identity, independent of the occurrence key.
     pub asset_id: Option<String>,
+    /// Optional precomputed marker identity text; absent means the adapter
+    /// had no richer evidence than the boundary/lifecycle itself.
+    pub descriptor: Option<MarkerDescriptor>,
 }
 
 /// Caller-injected presentation position; freshness is the caller's decision.
@@ -155,6 +177,19 @@ impl SourceEvent {
     /// Latest evidence per boundary, in start/end/cancel/present/absent order.
     pub fn observations(&self) -> impl Iterator<Item = &SourceEventObservation> {
         self.boundaries.values()
+    }
+
+    /// The marker identity text an overlay/panel should display, preferring
+    /// the `Start`/`MarkerObserved` boundary (where the descriptive evidence
+    /// is attached), falling back to any other boundary that carries one.
+    #[must_use]
+    pub fn descriptor(&self) -> Option<&MarkerDescriptor> {
+        self.boundaries
+            .get(&0)
+            .or_else(|| self.boundaries.get(&1))
+            .or_else(|| self.boundaries.get(&3))
+            .and_then(|o| o.descriptor.as_ref())
+            .or_else(|| self.boundaries.values().find_map(|o| o.descriptor.as_ref()))
     }
 
     /// Project without mutating history or sampling any clock.

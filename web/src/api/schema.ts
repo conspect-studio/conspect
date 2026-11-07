@@ -5816,6 +5816,22 @@ export interface components {
             label?: null | components["schemas"]["SourceEventLabel"];
             /** @description Observational lifecycle, not an automation command. */
             lifecycle: components["schemas"]["SourceEventLifecycle"];
+            /**
+             * @description Short additional detail (segment ordinal, break duration, UPID
+             *     suffix), consistent with `marker_name`.
+             */
+            marker_detail?: string | null;
+            /**
+             * @description Short human-readable marker name (e.g. "Program Start", "Ad break"),
+             *     when the evidence carried enough identity to name it. Absent means
+             *     this marker is honestly unidentified, not that it was omitted.
+             */
+            marker_name?: string | null;
+            /**
+             * @description Raw wire type token the name was derived from (e.g. `"0x22"`,
+             *     `"splice_insert"`, `"PRIV"`, `"asset"`).
+             */
+            marker_type_id?: string | null;
             /** @description Evidence origin; vendor markers never imply a splice boundary. */
             origin: components["schemas"]["SourceEventOrigin"];
             timer?: null | components["schemas"]["SourceEventTimer"];

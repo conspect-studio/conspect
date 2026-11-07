@@ -95,6 +95,19 @@ pub struct SourceEventDto {
     pub correlation_id: Option<String>,
     /// Optional semantic display label consistent with lifecycle and timer.
     pub label: Option<SourceEventLabel>,
+    /// Short human-readable marker name (e.g. "Program Start", "Ad break"),
+    /// when the evidence carried enough identity to name it. Absent means
+    /// this marker is honestly unidentified, not that it was omitted.
+    #[cfg_attr(feature = "openapi", schema(max_length = 48))]
+    pub marker_name: Option<String>,
+    /// Raw wire type token the name was derived from (e.g. `"0x22"`,
+    /// `"splice_insert"`, `"PRIV"`, `"asset"`).
+    #[cfg_attr(feature = "openapi", schema(max_length = 32))]
+    pub marker_type_id: Option<String>,
+    /// Short additional detail (segment ordinal, break duration, UPID
+    /// suffix), consistent with `marker_name`.
+    #[cfg_attr(feature = "openapi", schema(max_length = 48))]
+    pub marker_detail: Option<String>,
 }
 
 /// Exact timer value projected by the server against the selected source frame.
@@ -194,6 +207,9 @@ fn valid_event(event: &SourceEventDto, availability: SourceEventAvailability) ->
             .into_iter()
             .flatten()
             .any(|value| value.len() > MAX_SOURCE_EVENT_ID_BYTES)
+        || event.marker_name.as_ref().is_some_and(|v| v.len() > 48)
+        || event.marker_type_id.as_ref().is_some_and(|v| v.len() > 32)
+        || event.marker_detail.as_ref().is_some_and(|v| v.len() > 48)
     {
         return false;
     }

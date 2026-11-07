@@ -17,6 +17,7 @@ fn observation(source: &str, epoch: u64) -> SourceEventObservation {
         },
         correlation_id: None,
         asset_id: None,
+        descriptor: None,
     }
 }
 fn wait(mut predicate: impl FnMut() -> bool) {

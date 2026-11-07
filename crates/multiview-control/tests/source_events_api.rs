@@ -45,6 +45,9 @@ fn snapshot_bounds_rows_and_preserves_exact_event_epochs() {
         asset_id: None,
         correlation_id: None,
         label: None,
+        marker_name: None,
+        marker_type_id: None,
+        marker_detail: None,
     };
     let dto = SourceEventsDto::new(
         "cam",
@@ -88,6 +91,9 @@ fn timed_event() -> multiview_control::source_events::SourceEventDto {
         asset_id: Some("asset".into()),
         correlation_id: Some("correlation".into()),
         label: Some(SourceEventLabel::Overrun),
+        marker_name: Some("Break Start".into()),
+        marker_type_id: Some("0x22".into()),
+        marker_detail: Some("2/4".into()),
     }
 }
 

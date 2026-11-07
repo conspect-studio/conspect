@@ -27,13 +27,20 @@ function EventRow({ event, timingAvailable }: { readonly event: SourceEvent; rea
   const showTimer = !['cancelled', 'ended', 'superseded'].includes(event.lifecycle)
     && (event.lifecycle !== 'uncertain' || event.timer?.kind === 'overrun');
   const isTest = event.event_id.startsWith('test:');
+  // Marker name/detail are server-computed free text (SCTE-35 segmentation
+  // names, splice_insert direction, HLS asset labels, ID3 frame names) — they
+  // cannot be run through the i18n macro as a static literal. Only the
+  // surrounding field labels are translated; an absent marker_name means the
+  // evidence was honestly unidentified, not that the server omitted it.
   return <li className="space-y-1 rounded border p-3">
     <p className="break-all font-medium">
-      {event.event_id}
+      {event.marker_name ?? event.event_id}
       {isTest ? <span className="ml-2 rounded bg-amber-200 px-1.5 py-0.5 text-xs font-semibold uppercase text-amber-900"><Trans>Test</Trans></span> : null}
     </p>
     <p>{states[event.lifecycle]}</p>
     <p><Trans>Provenance</Trans>: {origins[event.origin]}{event.vendor ? <> — {event.vendor}</> : null}</p>
+    {event.marker_type_id ? <p className="break-all text-xs text-muted-foreground"><Trans>Marker type</Trans>: {event.marker_type_id}</p> : null}
+    {event.marker_detail ? <p className="break-all text-xs text-muted-foreground"><Trans>Detail</Trans>: {event.marker_detail}</p> : null}
     <p><Trans>Epoch</Trans>: {event.epoch}</p>
     {event.asset_id ? <p className="break-all"><Trans>Asset</Trans>: {event.asset_id}</p> : null}
     {event.correlation_id ? <p className="break-all"><Trans>Correlation</Trans>: {event.correlation_id}</p> : null}

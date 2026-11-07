@@ -9,7 +9,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::source_event::{
-    EventBoundary, EventLifecycle, EventOrigin, PresentationClock, SourceEvent, SourceEventKey,
+    EventBoundary, EventLifecycle, EventOrigin, MarkerDescriptor, PresentationClock, SourceEvent,
+    SourceEventKey,
 };
 
 /// Saved selection, independent of a tile/strip renderer or generated event.
@@ -123,6 +124,8 @@ pub struct EventOverlay {
     pub label: OverlayLabel,
     /// Absent whenever source timing cannot support a timer.
     pub timer: Option<OverlayTimer>,
+    /// Precomputed marker identity text, when the evidence carried one.
+    pub descriptor: Option<MarkerDescriptor>,
 }
 
 fn timer(kind: OverlayTimerKind, a: i64, b: i64) -> OverlayTimer {
@@ -247,5 +250,6 @@ pub fn project_event_overlay(
         lifecycle: projection.lifecycle,
         label,
         timer: readout,
+        descriptor: event.descriptor().cloned(),
     })
 }

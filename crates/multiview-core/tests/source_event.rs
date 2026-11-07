@@ -15,6 +15,7 @@ fn obs(boundary: EventBoundary, revision: u64) -> SourceEventObservation {
         boundary,
         correlation_id: None,
         asset_id: None,
+        descriptor: None,
     }
 }
 fn clock(position_ns: i64) -> PresentationClock {

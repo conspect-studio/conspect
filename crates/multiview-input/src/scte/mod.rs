@@ -124,3 +124,88 @@ fn ticks_90k_to_ns(ticks: u64) -> Option<i64> {
     let ns = u128::from(ticks).checked_mul(100_000)?.checked_div(9)?;
     i64::try_from(ns).ok()
 }
+
+/// The standard SCTE-35 2023r1 Table 23 `segmentation_type_id` name, or
+/// [`None`] for a reserved/unassigned id. Names match the ANSI/SCTE 35 table
+/// verbatim so an operator can cross-reference the spec directly.
+#[must_use]
+pub fn segmentation_type_name(type_id: u8) -> Option<&'static str> {
+    Some(match type_id {
+        0x10 => "Program Start",
+        0x11 => "Program End",
+        0x12 => "Program Early Termination",
+        0x13 => "Program Breakaway",
+        0x14 => "Program Resumption",
+        0x17 => "Program Overlap Start",
+        0x19 => "Program Blackout Override",
+        0x20 => "Chapter Start",
+        0x21 => "Chapter End",
+        0x22 => "Break Start",
+        0x23 => "Break End",
+        0x24 => "Opening Credit Start",
+        0x25 => "Opening Credit End",
+        0x26 => "Closing Credit Start",
+        0x27 => "Closing Credit End",
+        0x30 => "Provider Advertisement Start",
+        0x31 => "Provider Advertisement End",
+        0x32 => "Distributor Advertisement Start",
+        0x33 => "Distributor Advertisement End",
+        0x34 => "Provider Placement Opportunity Start",
+        0x35 => "Provider Placement Opportunity End",
+        0x36 => "Distributor Placement Opportunity Start",
+        0x37 => "Distributor Placement Opportunity End",
+        0x38 => "Provider Overlay Placement Opportunity Start",
+        0x39 => "Provider Overlay Placement Opportunity End",
+        0x3A => "Distributor Overlay Placement Opportunity Start",
+        0x3B => "Distributor Overlay Placement Opportunity End",
+        0x3C => "Provider Promo Start",
+        0x3D => "Provider Promo End",
+        0x3E => "Distributor Promo Start",
+        0x3F => "Distributor Promo End",
+        0x40 => "Unscheduled Event Start",
+        0x41 => "Unscheduled Event End",
+        0x42 => "Alternate Content Opportunity Start",
+        0x43 => "Alternate Content Opportunity End",
+        0x44 => "Provider Ad Block Start",
+        0x45 => "Provider Ad Block End",
+        0x46 => "Distributor Ad Block Start",
+        0x47 => "Distributor Ad Block End",
+        0x50 => "Network Start",
+        0x51 => "Network End",
+        _ => return None,
+    })
+}
+
+/// The standard SCTE-35 2023r1 Table 22 `segmentation_upid_type` name, for the
+/// readable-identity types this adapter surfaces as a short label suffix.
+/// Returns [`None`] for a type that is not a human-readable identity (e.g.
+/// binary EIDR, UUID) or is unassigned.
+#[must_use]
+fn segmentation_upid_type_name(upid_type: u8) -> Option<&'static str> {
+    Some(match upid_type {
+        0x03 => "Ad-ID",
+        0x08 => "TI",
+        0x09 => "ADI",
+        0x0C => "MPU",
+        0x0E => "ADS",
+        0x0F => "URI",
+        _ => return None,
+    })
+}
+
+/// A short, printable suffix derived from a readable `segmentation_upid`
+/// (ADI, URI, TI, ADS/MPU, `AiringID`), bounded to 48 bytes including the type
+/// prefix. Returns [`None`] when the UPID type is not human-readable or the
+/// bytes are not printable text (binary identities stay internal, never
+/// mis-rendered as text).
+#[must_use]
+pub fn segmentation_upid_label(upid: &splice35::SegmentationUpid) -> Option<String> {
+    let kind = segmentation_upid_type_name(upid.upid_type)?;
+    if upid.value.is_empty() || !upid.value.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return None;
+    }
+    let text = std::str::from_utf8(&upid.value).ok()?;
+    let mut label = format!("{kind}:{text}");
+    label.truncate(48);
+    Some(label)
+}

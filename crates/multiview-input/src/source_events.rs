@@ -15,7 +15,9 @@ use crate::{
     scte::{CueKind, ScteError, SpliceInfoSection},
 };
 use multiview_core::{
-    source_event::{EventBoundary, EventOrigin, SourceEventKey, SourceEventObservation},
+    source_event::{
+        EventBoundary, EventOrigin, MarkerDescriptor, SourceEventKey, SourceEventObservation,
+    },
     time::Rational,
 };
 use std::collections::BTreeMap;
@@ -57,6 +59,7 @@ struct Semantic {
     pts: Option<u64>,
     duration: Option<i64>,
     asset: Option<String>,
+    descriptor: Option<MarkerDescriptor>,
 }
 #[derive(Debug)]
 struct Slot {
@@ -139,6 +142,7 @@ impl ScteSourceEventAdapter {
                 .as_ref()
                 .and_then(|d| d.upid.as_ref())
                 .map(asset_identity);
+            let descriptor = marker_descriptor(&event, edge);
             let semantic = Semantic {
                 edge,
                 pts: if edge == 2 { None } else { cue.pts_time_90k },
@@ -148,6 +152,7 @@ impl ScteSourceEventAdapter {
                     None
                 },
                 asset,
+                descriptor,
             };
             let slot_key = (id.clone(), edge);
             if let Some(old) = self.slots.get(&slot_key) {
@@ -182,6 +187,7 @@ impl ScteSourceEventAdapter {
                 boundary: boundary(&semantic, pts),
                 correlation_id: None,
                 asset_id: semantic.asset.clone(),
+                descriptor: semantic.descriptor.clone(),
             };
             let cancelled = self.slots.contains_key(&(id.clone(), 2)) || edge == 2;
             let pending = semantic.pts.is_some() && pts.is_none() && !cancelled;
@@ -241,6 +247,63 @@ fn component_only(section: &SpliceInfoSection) -> bool {
         section.command,
         crate::scte::splice35::SpliceCommand::Insert(insert) if !insert.program_splice
     )
+}
+
+/// Build the bounded marker identity text off-clock, at ingest time, so the
+/// bake/overlay path never reparses wire evidence per frame. `edge` is the
+/// already-classified semantic edge (0 start, 1 end, 2 cancel); cancellation
+/// carries no descriptor (there is nothing new to name).
+fn marker_descriptor(
+    event: &crate::scte::splice35::NormalizedCueEvent,
+    edge: u8,
+) -> Option<MarkerDescriptor> {
+    if edge == 2 {
+        return None;
+    }
+    if let Some(d) = &event.segmentation {
+        let type_id = d.segmentation_type_id?;
+        let name = crate::scte::segmentation_type_name(type_id)?.to_owned();
+        let mut detail_parts: Vec<String> = Vec::new();
+        if let (Some(num), Some(expected)) = (d.segment_num, d.segments_expected) {
+            if num > 0 && expected > 0 {
+                detail_parts.push(format!("{num}/{expected}"));
+            }
+        }
+        if let Some(upid) = &d.upid {
+            if let Some(label) = crate::scte::segmentation_upid_label(upid) {
+                detail_parts.push(label);
+            }
+        }
+        let detail = (!detail_parts.is_empty()).then(|| {
+            // Cap at 48 chars on a char boundary: UPID text may be non-ASCII.
+            detail_parts.join(" ").chars().take(48).collect::<String>()
+        });
+        Some(MarkerDescriptor {
+            name,
+            type_id: Some(format!("0x{type_id:02X}")),
+            detail,
+        })
+    } else {
+        // A bare splice_insert without segmentation: out_of_network tells us
+        // ad-break direction; time_signal with no segmentation carries no
+        // naming evidence beyond the generic lifecycle label.
+        match event.cue.kind {
+            CueKind::SpliceOut => Some(MarkerDescriptor {
+                name: "Ad break".to_owned(),
+                type_id: Some("splice_insert".to_owned()),
+                detail: event
+                    .cue
+                    .break_duration_ns()
+                    .map(|ns| format!("{}s", ns / 1_000_000_000)),
+            }),
+            CueKind::SpliceIn => Some(MarkerDescriptor {
+                name: "Return from break".to_owned(),
+                type_id: Some("splice_insert".to_owned()),
+                detail: None,
+            }),
+            CueKind::TimeSignal => None,
+        }
+    }
 }
 fn asset_identity(u: &crate::scte::splice35::SegmentationUpid) -> String {
     use std::fmt::Write;
