@@ -934,6 +934,54 @@ pub fn insert_input_fragment(
     obj.insert("inputs".to_owned(), fragment.clone());
 }
 
+/// Serialise the live push-output link records into the `outputs` snapshot
+/// fragment: `{ "<id>": { "link": { state, mode, transport, url, clients,
+/// sessions, dropped, written, last_error?, peer? } } }`, or `None` when the
+/// run has no push outputs. Reads atomics + lock-free cells only (inv #10).
+#[must_use]
+pub fn push_links_fragment(
+    links: &[(String, std::sync::Arc<multiview_output::push_link::PushLinkStatus>)],
+) -> Option<serde_json::Value> {
+    if links.is_empty() {
+        return None;
+    }
+    let mut outputs = serde_json::Map::with_capacity(links.len());
+    for (id, link) in links {
+        let snap = link.snapshot();
+        let mut obj = serde_json::json!({
+            "state": snap.state.as_str(),
+            "mode": snap.mode,
+            "transport": snap.transport,
+            "url": snap.url,
+            "clients": snap.clients,
+            "sessions": snap.sessions,
+            "dropped": snap.dropped,
+            "written": snap.written,
+        });
+        if let Some(map) = obj.as_object_mut() {
+            if let Some(err) = snap.last_error {
+                map.insert("last_error".to_owned(), serde_json::Value::String(err));
+            }
+            if let Some(peer) = snap.peer {
+                map.insert("peer".to_owned(), serde_json::Value::String(peer));
+            }
+        }
+        outputs.insert(id.clone(), serde_json::json!({ "link": obj }));
+    }
+    Some(serde_json::Value::Object(outputs))
+}
+
+/// Insert a pre-built [`push_links_fragment`] under `outputs` (no-op on `None`).
+pub fn insert_output_fragment(
+    snapshot: &mut EngineStateSnapshot,
+    fragment: Option<&serde_json::Value>,
+) {
+    let (Some(fragment), Some(obj)) = (fragment, snapshot.as_object_mut()) else {
+        return;
+    };
+    obj.insert("outputs".to_owned(), fragment.clone());
+}
+
 /// Fold each source's current lifecycle state into the conflated engine-state
 /// snapshot blob as `tiles: [{ "id", "state" }, …]`, sorted by id, using the
 /// SAME [`multiview_events::LifecycleState`] wire strings the `tile.state`

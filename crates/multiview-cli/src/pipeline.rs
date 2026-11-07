@@ -220,14 +220,26 @@ fn shed_load_event(
     }))
 }
 
+/// The live push-output link records of the current run, keyed by output id.
+type PushLinkRegistry = Arc<
+    multiview_framestore::SwapCell<
+        Arc<Vec<(String, Arc<multiview_output::push_link::PushLinkStatus>)>>,
+    >,
+>;
+
+/// Refresh the push-link snapshot fragment every this many ticks (≈0.5 s at
+/// 30 fps): the per-tick projection then only clones a cached value.
+const PUSH_LINK_REFRESH_TICKS: u64 = 15;
+
 /// The egress plan for one [`Pipeline::drive_streaming`] call: the send
 /// policy, the per-sink runners, and an optional hot-loop tick observer (test
 /// only). Bundled so the streaming core keeps a small argument list.
 struct StreamPlan {
     /// How the hot loop hands ticks to the consumer (block vs drop-on-overload).
     policy: SendPolicy,
-    /// One runner per output sink, each driving its sink to completion off-hot.
-    runners: Vec<SinkRunner>,
+    /// One runner per output sink, each driving its sink to completion off-hot,
+    /// paired with how the consumer sends to it (bounded wait vs drop-when-full).
+    runners: Vec<(SinkRunner, SinkSendPolicy)>,
     /// Incremented once per emitted tick on the hot loop when present, so a test
     /// can prove a frame was encoded while the engine was still ticking. `None`
     /// on the production paths.
@@ -1447,6 +1459,9 @@ enum RunnableOutput {
         label: &'static str,
         /// The destination URL (for the run report + logs).
         url: String,
+        /// Live link state (listening / connected / reconnecting / drops) shared
+        /// with the consumer's never-block fan-out and the status snapshot.
+        link: Arc<multiview_output::push_link::PushLinkStatus>,
     },
     /// A WebRTC program output (`webrtc` WHEP-serve / `whip_push`): a **mux-free**
     /// sink that re-stamps each coded [`EncodedPacket`] into an
@@ -1617,6 +1632,10 @@ pub struct Pipeline {
     /// Frame-boundary tile geometry and bindings for the off-clock bake consumer.
     #[cfg(feature = "overlay")]
     tile_spec_apply: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    /// The current run's push-output link records (id → status), published by
+    /// [`Pipeline::build_sink_runners`] and projected into the engine-state
+    /// snapshot under `outputs.<id>.link` (read lock-free on the hot loop).
+    push_links: PushLinkRegistry,
     /// Source-kind audio applicability, refreshed at frame-boundary live edits.
     /// Missing PCM from a decoded source is unknown, not proof of no audio.
     #[cfg(feature = "overlay")]
@@ -2644,6 +2663,7 @@ impl Pipeline {
             tile_labels,
             #[cfg(feature = "overlay")]
             tile_spec_apply,
+            push_links: Arc::new(multiview_framestore::SwapCell::new(Arc::new(Vec::new()))),
             #[cfg(feature = "overlay")]
             audio_free_sources,
             #[cfg(feature = "overlay")]
@@ -3182,16 +3202,29 @@ impl Pipeline {
     /// container), a live run (`true`) suppresses it so the run never writes an
     /// ever-growing `program.ts` (HLS-2, ADR-0032) — the rolling HLS window is the
     /// bounded on-disk artifact instead.
-    fn build_sink_runners(&mut self, live: bool) -> Vec<SinkRunner> {
+    fn build_sink_runners(&mut self, live: bool) -> Vec<(SinkRunner, SinkSendPolicy)> {
         let outputs = maybe_prepend_program_ts(std::mem::take(&mut self.outputs), live);
-        outputs
+        let mut links = Vec::new();
+        let runners = outputs
             .into_iter()
-            .map(|output| -> SinkRunner {
-                Box::new(move |rx, params, time_base, audio, tracks| {
+            .map(|output| -> (SinkRunner, SinkSendPolicy) {
+                let policy = match &output {
+                    RunnableOutput::Push { id, link, .. } => {
+                        links.push((id.clone(), Arc::clone(link)));
+                        SinkSendPolicy::DropWhenFull(Arc::clone(link))
+                    }
+                    _ => SinkSendPolicy::Bounded,
+                };
+                let runner: SinkRunner = Box::new(move |rx, params, time_base, audio, tracks| {
                     run_one_output(output, rx, &params, time_base, audio.as_ref(), &tracks)
-                })
+                });
+                (runner, policy)
             })
-            .collect()
+            .collect();
+        // Publish this run's push links to the status registry (read lock-free
+        // by the per-tick snapshot projection; replaced wholesale per run).
+        self.push_links.store(Arc::new(links));
+        runners
     }
 
     /// **Test seam** (ADR-0025): drive the streaming bake→encode→fan-out path
@@ -3226,7 +3259,7 @@ impl Pipeline {
             runners,
             hot_tick_observer,
         } = params;
-        let runners: Vec<SinkRunner> = runners
+        let runners: Vec<(SinkRunner, SinkSendPolicy)> = runners
             .into_iter()
             .map(|r| -> SinkRunner {
                 // The fake sink consumes the coded-packet fan-out channel; it does
@@ -3241,6 +3274,7 @@ impl Pipeline {
                     })
                 })
             })
+            .map(|runner| (runner, SinkSendPolicy::Bounded))
             .collect();
         let capacity = policy.queue_cap();
         let plan = StreamPlan {
@@ -3821,6 +3855,11 @@ impl Pipeline {
             publisher.publish_event(event);
         }
         let input_fragment = crate::control::input_inventories_fragment(&self.inventories);
+        // Push-output link states (listening / connected / reconnecting /
+        // drops), re-serialised every `PUSH_LINK_REFRESH_TICKS` from atomics +
+        // a lock-free load and otherwise cloned (a handful of small objects).
+        let push_links = Arc::clone(&self.push_links);
+        let mut push_fragment: Option<serde_json::Value> = None;
         // (The DRM/KMS display heads — and their DEV-B4 audio sinks — were
         // started above, before the egress spawn, so the bake consumer received
         // the audio publishers; `display_publishers` feeds the video mailboxes
@@ -3951,6 +3990,10 @@ impl Pipeline {
             // seeded with the CURRENT tile states (the `tiles` `$snapshot`)
             // instead of waiting for the next sparse `tile.state` delta.
             crate::control::fold_tile_states(&mut snapshot, &frame.source_states);
+            if push_fragment.is_none() || frame.tick.index % PUSH_LINK_REFRESH_TICKS == 0 {
+                push_fragment = crate::control::push_links_fragment(&push_links.load());
+            }
+            crate::control::insert_output_fragment(&mut snapshot, push_fragment.as_ref());
             snapshot
         };
         // Sparse tile-state events: emit at most one `tile.state` change per tick
@@ -4650,7 +4693,7 @@ impl StreamEgress {
     #[allow(clippy::too_many_arguments)] // reason: the bake consumer threads the encode, the audio bus + loudnorm + loudness meter, and the publisher — each a distinct, irreducible owned input to the off-hot-path consumer.
     fn spawn(
         ctx: BakeContext,
-        runners: Vec<SinkRunner>,
+        runners: Vec<(SinkRunner, SinkSendPolicy)>,
         policy: SendPolicy,
         encoder: ProgramEncoder,
         audio_bus: Option<multiview_audio::program::ProgramBus>,
@@ -4691,10 +4734,12 @@ impl StreamEgress {
         // `StreamingPacketSource` — muxing the SAME packets the single encoder
         // produced, never re-encoding (encode-once-mux-many).
         let mut sink_txs: Vec<SyncSender<EncodedPacket>> = Vec::with_capacity(runners.len());
+        let mut send_policies: Vec<SinkSendPolicy> = Vec::with_capacity(runners.len());
         let mut sinks = Vec::with_capacity(runners.len());
-        for (i, runner) in runners.into_iter().enumerate() {
+        for (i, (runner, send_policy)) in runners.into_iter().enumerate() {
             let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(SINK_QUEUE_CAP);
             sink_txs.push(tx);
+            send_policies.push(send_policy);
             let builder = std::thread::Builder::new().name(format!("multiview-sink-{i}"));
             let params = params.clone();
             let audio = audio.clone();
@@ -4706,6 +4751,7 @@ impl StreamEgress {
                     // produce its artifact); drop its sender so nothing wedges, and
                     // record a thread that immediately returns the spawn error.
                     sink_txs.pop();
+                    send_policies.pop();
                     let reason = e.to_string();
                     sinks.push(spawn_failed_sink(reason));
                 }
@@ -4725,6 +4771,7 @@ impl StreamEgress {
                     ctx,
                     &hot_rx,
                     sink_txs,
+                    &send_policies,
                     encoder,
                     audio_bus,
                     audio_route,
@@ -5002,6 +5049,7 @@ fn consumer_main(
     ctx: BakeContext,
     hot_rx: &Receiver<StreamItem>,
     sink_txs: Vec<SyncSender<EncodedPacket>>,
+    policies: &[SinkSendPolicy],
     mut encoder: ProgramEncoder,
     mut audio_bus: Option<multiview_audio::program::ProgramBus>,
     audio_route: Option<Arc<crate::audio::AudioControlHandle>>,
@@ -5088,7 +5136,7 @@ fn consumer_main(
                 kind: "encode",
                 reason: e.to_string(),
             })?;
-        fan_packets(&sink_txs, &mut live, packets);
+        fan_packets(&sink_txs, &mut live, &policies, packets);
         // Program audio (AUD-4 + RT-8b), OFF the engine hot loop: when the bus is
         // present, mix program audio up to THIS frame's output tick index — catching
         // up the samples for any ticks `DropOnOverload` shed since the last surviving
@@ -5215,7 +5263,7 @@ fn consumer_main(
                     kind: "encode-audio",
                     reason: e.to_string(),
                 })?;
-            fan_packets(&sink_txs, &mut live, audio_packets);
+            fan_packets(&sink_txs, &mut live, &policies, audio_packets);
             // #152: discrete tracks, same tick, same sample budget (inv #3).
             if !selected_tracks.is_empty() {
                 #[cfg(feature = "overlay")]
@@ -5230,7 +5278,7 @@ fn consumer_main(
                     &selected_tracks,
                     block.frame_count(),
                 )?;
-                fan_packets(&sink_txs, &mut live, packets);
+                fan_packets(&sink_txs, &mut live, &policies, packets);
             }
         } else if let Some(bus) = display_audio.dedicated_bus.as_mut() {
             // A video-only run with audio-enabled display heads: drive the
@@ -5250,7 +5298,7 @@ fn consumer_main(
         kind: "encode",
         reason: e.to_string(),
     })?;
-    fan_packets(&sink_txs, &mut live, tail);
+    fan_packets(&sink_txs, &mut live, &policies, tail);
     drop(sink_txs);
     Ok(())
 }
@@ -5300,11 +5348,24 @@ fn encode_discrete_tracks(
 fn fan_packets(
     sink_txs: &[SyncSender<EncodedPacket>],
     live: &mut [bool],
+    policies: &[SinkSendPolicy],
     packets: Vec<EncodedPacket>,
 ) {
     for packet in packets {
         for (i, tx) in sink_txs.iter().enumerate() {
             if !live.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Some(SinkSendPolicy::DropWhenFull(link)) = policies.get(i) {
+                // A resilient push sink drains its queue itself and never
+                // blocks; if the queue is full anyway, shed + count and ask the
+                // sink to resync on the next keyframe. Never wait, never mark
+                // dead (only a hung-up receiver ends it) — invariant #10.
+                if !send_or_drop(tx, packet.clone(), link) {
+                    if let Some(flag) = live.get_mut(i) {
+                        *flag = false;
+                    }
+                }
                 continue;
             }
             // Bounded send: a healthy sink drains within the grace, so this
@@ -5320,6 +5381,35 @@ fn fan_packets(
                 }
             }
         }
+    }
+}
+
+/// How the consumer hands packets to one sink's bounded queue.
+#[derive(Clone)]
+enum SinkSendPolicy {
+    /// Bounded wait ([`send_bounded`]): a file/HLS sink must not lose a packet,
+    /// so a full queue paces the consumer up to [`SINK_WEDGE_GRACE`].
+    Bounded,
+    /// Never wait ([`send_or_drop`]): a resilient live push drops + counts on
+    /// a full queue (its link status records the drop).
+    DropWhenFull(Arc<multiview_output::push_link::PushLinkStatus>),
+}
+
+/// Non-blocking send for a resilient push sink: `try_send` once; a full queue
+/// drops the packet into `link`'s counter and requests a keyframe resync.
+/// Returns `false` only when the receiver hung up (the sink ended).
+fn send_or_drop(
+    tx: &SyncSender<EncodedPacket>,
+    packet: EncodedPacket,
+    link: &multiview_output::push_link::PushLinkStatus,
+) -> bool {
+    match tx.try_send(packet) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            link.shed_upstream();
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -5472,10 +5562,12 @@ fn run_one_output(
             sink,
             label,
             url,
+            link,
         } => Ok(run_push_output(
             &sink,
             label,
             &url,
+            &link,
             rx,
             multiview_output::MuxStream::new(params, time_base),
             (audio, &track_mux),
@@ -5821,23 +5913,21 @@ where
     }
 }
 
-/// Run a live push sink (RTMP / SRT) over its fan-out channel, tolerating an
-/// unreachable peer. **Infallible** by design (returns a [`SinkRunOutcome`], never
-/// an error): a push that cannot be delivered must not fail the program.
+/// Run a live push sink (SRT / RTMP / RIST / UDP) over its fan-out channel.
+/// **Infallible** by design (returns a [`SinkRunOutcome`], never an error).
 ///
-/// [`PushSink::run`] connects when it opens the muxer; with a reachable peer it
-/// streams the encoded program (the same encode-once-mux-many drive loop the file
-/// sink uses) and reports the packet/keyframe counts. A connect failure (no peer)
-/// is **logged and the sink dropped** — never an error that fails the run: the
-/// caller drops the [`Receiver`] when this returns, so the bake consumer's next
-/// fan-out send to this sink fails and it marks the sink dead for the rest of the
-/// run, while the program's file/HLS outputs keep producing (invariants #1/#10). A
-/// push that connected and then errored mid-stream is reported the same tolerant
-/// way.
+/// Drives [`PacketMuxSink::run_push_resilient`]: the sink thread drains its
+/// fan-out queue as fast as packets arrive and never blocks on the network — a
+/// listener waiting for a caller or a caller reconnecting drops (and counts)
+/// packets instead of filling the queue, so the consumer never marks this sink
+/// wedged (invariants #1/#10). Connect / listen / write failures are retried
+/// with back-off for the whole run; an SRT listener accepts multiple callers
+/// and re-listens after each disconnect. State is published through `link`.
 fn run_push_output(
     sink: &PacketMuxSink,
     label: &'static str,
     url: &str,
+    link: &Arc<multiview_output::push_link::PushLinkStatus>,
     rx: Receiver<EncodedPacket>,
     video: multiview_output::MuxStream<'_>,
     (audio, tracks): (
@@ -5847,26 +5937,21 @@ fn run_push_output(
 ) -> SinkRunOutcome {
     let mut source = StreamingPacketSource::new(rx);
     let audio_mux = audio.map(|(p, tb)| multiview_output::MuxStream::new(p, *tb));
-    match sink.run_av_tracks(&mut source, video, audio_mux, tracks) {
-        Ok(outcome) => {
-            let (packets, keyframes) = match &outcome {
-                PacketMuxOutcome::Single(s) => (s.packets, s.keyframes),
-                PacketMuxOutcome::Segment(s) => (s.stats.packets, s.stats.keyframes),
-            };
-            SinkRunOutcome {
-                line: format!("{label} push {url}: {packets} packet(s), {keyframes} keyframe(s)"),
-                playlist: None,
-                frames: source.delivered,
-            }
-        }
+    match sink.run_push_resilient(&mut source, video, audio_mux, tracks, link) {
+        Ok(report) => SinkRunOutcome {
+            line: format!(
+                "{label} push {url}: {} session(s), {} packet(s) received, {} dropped",
+                report.sessions, report.received, report.dropped
+            ),
+            playlist: None,
+            frames: source.delivered,
+        },
         Err(e) => {
-            // A push peer that is unreachable / drops must never fail the program.
             tracing::warn!(
                 transport = label,
                 url,
                 error = %e,
-                "live push could not be delivered (peer unreachable or dropped); \
-                 the program's other outputs are unaffected"
+                "live push ended with an error; the program's other outputs are unaffected"
             );
             SinkRunOutcome {
                 line: format!("{label} push {url}: not delivered ({e})"),
@@ -8948,6 +9033,13 @@ fn srt_resolved_url(
     } else {
         (KeyLength::None, None)
     };
+    // Lower a wildcard listener host BEFORE validation so an empty host
+    // (`srt://:9000`) is accepted and bound as the IPv4 wildcard.
+    let host = if mode == SrtMode::Listener {
+        multiview_input::srt::listener_bind_host(host)
+    } else {
+        host
+    };
     let config = SrtConfig {
         mode,
         host: host.to_owned(),
@@ -9055,9 +9147,11 @@ fn build_rist_push(
     // OUTMETA: RIST carries MPEG-TS, so the SDT/PMT metadata applies (no
     // rotation tag — pixels-only orientation is the compositor's concern).
     let (meta, matrix) = output_mux_meta(output);
+    let sink = PacketMuxSink::push(PushProtocol::Rist, lowered).with_output_metadata(meta, matrix);
     Ok(RunnableOutput::Push {
         id: output.id(),
-        sink: PacketMuxSink::push(PushProtocol::Rist, lowered).with_output_metadata(meta, matrix),
+        link: push_link_for("rist", &sink, &redacted),
+        sink,
         label: "rist",
         url: redacted,
     })
@@ -9189,6 +9283,21 @@ fn build_hls_output(
     })
 }
 
+/// A fresh link-status record for a push sink: listener mode is read from the
+/// sink's real (lowered) URL; only the redacted URL is stored for display.
+fn push_link_for(
+    label: &'static str,
+    sink: &PacketMuxSink,
+    redacted: &str,
+) -> Arc<multiview_output::push_link::PushLinkStatus> {
+    let listener = sink
+        .push_target()
+        .is_some_and(|(url, _)| multiview_output::sink::is_srt_listener_url(url));
+    Arc::new(multiview_output::push_link::PushLinkStatus::new(
+        label, listener, redacted,
+    ))
+}
+
 /// Build a live push sink ([`RunnableOutput::Push`]) for an RTMP/SRT output: the
 /// muxer targeting `url` over `protocol`, carrying the output's declarative
 /// metadata (ADR-0088), fed the SAME encode-once packets as every other transport
@@ -9200,9 +9309,11 @@ fn build_push_output(
     label: &'static str,
 ) -> RunnableOutput {
     let (meta, matrix) = output_mux_meta(output);
+    let sink = PacketMuxSink::push(protocol, url.to_owned()).with_output_metadata(meta, matrix);
     RunnableOutput::Push {
         id: output.id(),
-        sink: PacketMuxSink::push(protocol, url.to_owned()).with_output_metadata(meta, matrix),
+        link: push_link_for(label, &sink, url),
+        sink,
         label,
         url: url.to_owned(),
     }
@@ -9307,10 +9418,12 @@ fn build_outputs(
                 })?;
                 tracing::info!(transport = "srt", url = %redacted, "wiring srt push output");
                 let (meta, matrix) = output_mux_meta(output);
+                let sink =
+                    PacketMuxSink::push(PushProtocol::Srt, lowered).with_output_metadata(meta, matrix);
                 runnable.push(RunnableOutput::Push {
                     id: output.id(),
-                    sink: PacketMuxSink::push(PushProtocol::Srt, lowered)
-                        .with_output_metadata(meta, matrix),
+                    link: push_link_for("srt", &sink, &redacted),
+                    sink,
                     label: "srt",
                     url: redacted,
                 });
@@ -16618,6 +16731,11 @@ mod srt_wiring_tests {
             srt_resolved_url("srt://[::]:9000?latency=1000", Some(&legacy), false).unwrap(),
             "srt://0.0.0.0:9000?mode=listener&latency=1000"
         );
+        // An empty host binds the wildcard too (typed and legacy paths).
+        assert_eq!(
+            srt_resolved_url("srt://:9000", Some(&listener), false).unwrap(),
+            "srt://0.0.0.0:9000?mode=listener"
+        );
         // A specific IPv6 listener and a caller to [::] are untouched.
         assert_eq!(
             srt_resolved_url("srt://[2001:db8::10]:9000", Some(&listener), false).unwrap(),
@@ -19990,5 +20108,75 @@ mod packet_reader_tests {
             wait_until(Duration::from_secs(2), || done.load(Ordering::SeqCst)),
             "reader thread (and the Input it owns) must be released"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod push_send_policy_tests {
+    //! The consumer's per-sink send policy: a resilient push sink whose queue is
+    //! full (e.g. its peer is down) must be dropped-and-counted immediately —
+    //! never waited on for `SINK_WEDGE_GRACE` and never marked dead — while a
+    //! file/HLS sink keeps the bounded-wait contract.
+    use super::{fan_packets, SinkSendPolicy, SINK_QUEUE_CAP};
+    use multiview_ffmpeg::EncodedPacket;
+    use multiview_output::push_link::PushLinkStatus;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn packets(n: usize) -> Vec<EncodedPacket> {
+        (0..n)
+            .map(|_| EncodedPacket::from_packet(ffmpeg_next::codec::packet::Packet::new(16)))
+            .collect()
+    }
+
+    #[test]
+    fn full_push_queue_drops_without_blocking_or_killing_the_sink() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(SINK_QUEUE_CAP);
+        let link = Arc::new(PushLinkStatus::new("srt", true, "srt://0.0.0.0:9000"));
+        let policies = [SinkSendPolicy::DropWhenFull(Arc::clone(&link))];
+        let mut live = vec![true];
+        // Nobody drains `rx`: the first SINK_QUEUE_CAP fill it, the rest drop.
+        let started = Instant::now();
+        fan_packets(&[tx], &mut live, &policies, packets(SINK_QUEUE_CAP + 100));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "never waits: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(live, vec![true], "a full push queue never marks the sink dead");
+        assert_eq!(link.dropped(), 100);
+        assert!(link.take_resync(), "the sink is asked to resync on a keyframe");
+        // Draining the queue lets later packets through again.
+        while rx.try_recv().is_ok() {}
+        drop(rx);
+    }
+
+    #[test]
+    fn hung_up_push_receiver_is_marked_dead() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(SINK_QUEUE_CAP);
+        drop(rx);
+        let link = Arc::new(PushLinkStatus::new("rtmp", false, "rtmp://x/app"));
+        let policies = [SinkSendPolicy::DropWhenFull(link)];
+        let mut live = vec![true];
+        fan_packets(&[tx], &mut live, &policies, packets(1));
+        assert_eq!(live, vec![false]);
+    }
+
+    #[test]
+    fn bounded_policy_still_waits_for_a_file_sink() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(1);
+        let drain = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut n = 0;
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {
+                n += 1;
+            }
+            n
+        });
+        let mut live = vec![true];
+        fan_packets(&[tx], &mut live, &[SinkSendPolicy::Bounded], packets(5));
+        assert_eq!(live, vec![true]);
+        assert_eq!(drain.join().unwrap(), 5, "bounded wait loses nothing");
     }
 }
