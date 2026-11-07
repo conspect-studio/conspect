@@ -174,10 +174,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ], optional = true }
 
-# IPTV-ORG source browser (ADR-M015): gzip for the cached index + persisted
-# snapshot. Pure-Rust `miniz_oxide` backend, MIT/Apache-2.0, always compiled (the
-# store/sync/index/routes are pure; only network I/O is behind `catalogue`).
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Pure-Rust HLS/SCTE parsers reused by the deep probe (no native deps, no new
 # third-party crates; feature-free so it never links libav).
 multiview-input = { workspace = true }
