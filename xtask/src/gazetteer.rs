@@ -1,0 +1,268 @@
+//! `cargo xtask iptv-gazetteer` — build the compact CC0 city-coordinate file the
+//! IPTV-ORG source browser embeds (`crates/multiview-control/assets/iptv-org-gazetteer.tsv`).
+//!
+//! The runtime never queries Wikidata. This task reads iptv-org's `cities.json`
+//! (each city has a `code` and a `wikidata_id`), asks the Wikidata SPARQL endpoint
+//! for the `P625` (coordinate location) of those ids in batches of
+//! [`BATCH`], and writes one `code<TAB>lat<TAB>lon` line per resolved city,
+//! sorted by code (only cities referenced by a feed's `broadcast_area`), three decimals (~100 m — ample for "near this place"). Wikidata
+//! data is CC0.
+//!
+//! The pure parts (query building, WKT parsing, rendering) are always compiled and
+//! unit-tested; only the HTTP calls need the off-by-default `net` feature.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+/// Wikidata ids per SPARQL query.
+pub const BATCH: usize = 400;
+
+/// One city to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct City {
+    /// iptv-org city code (`USICT`).
+    pub code: String,
+    /// Wikidata item id (`Q49266`).
+    pub wikidata_id: String,
+}
+
+/// Parse `cities.json` into the cities that carry a well-formed Wikidata id.
+///
+/// # Errors
+/// A JSON parse error message.
+pub fn parse_cities(json: &str) -> Result<Vec<City>, String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let code = row.get("code").and_then(|v| v.as_str());
+        let qid = row.get("wikidata_id").and_then(|v| v.as_str());
+        if let (Some(code), Some(qid)) = (code, qid) {
+            if is_qid(qid) {
+                out.push(City {
+                    code: code.to_owned(),
+                    wikidata_id: qid.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The city codes (`ct/XXXXX` entries of `broadcast_area`) referenced by `feeds.json`.
+///
+/// # Errors
+/// A JSON parse error message.
+pub fn feed_city_codes(feeds_json: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(feeds_json).map_err(|e| e.to_string())?;
+    let mut out = std::collections::BTreeSet::new();
+    for row in rows {
+        if let Some(areas) = row.get("broadcast_area").and_then(|a| a.as_array()) {
+            for a in areas.iter().filter_map(|a| a.as_str()) {
+                if let Some(code) = a.strip_prefix("ct/") {
+                    out.insert(code.to_owned());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn is_qid(s: &str) -> bool {
+    s.len() > 1 && s.starts_with('Q') && s[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The SPARQL query for one batch of Wikidata ids.
+#[must_use]
+pub fn build_query(qids: &[&str]) -> String {
+    let values: Vec<String> = qids.iter().map(|q| format!("wd:{q}")).collect();
+    format!(
+        "SELECT ?c ?coord WHERE {{ VALUES ?c {{ {} }} ?c wdt:P625 ?coord }}",
+        values.join(" ")
+    )
+}
+
+/// Parse a WKT `Point(lon lat)` literal into `(lat, lon)`.
+#[must_use]
+pub fn parse_wkt_point(wkt: &str) -> Option<(f64, f64)> {
+    let inner = wkt.trim().strip_prefix("Point(")?.strip_suffix(')')?;
+    let mut it = inner.split_whitespace();
+    let lon: f64 = it.next()?.parse().ok()?;
+    let lat: f64 = it.next()?.parse().ok()?;
+    if it.next().is_some() || !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    Some((lat, lon))
+}
+
+/// Parse a SPARQL JSON result into `qid -> (lat, lon)` (first coordinate wins).
+///
+/// # Errors
+/// A JSON parse error message.
+pub fn parse_results(json: &str) -> Result<BTreeMap<String, (f64, f64)>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut out = BTreeMap::new();
+    let bindings = v
+        .pointer("/results/bindings")
+        .and_then(|b| b.as_array())
+        .ok_or_else(|| "missing results.bindings".to_owned())?;
+    for b in bindings {
+        let uri = b.pointer("/c/value").and_then(|x| x.as_str());
+        let wkt = b.pointer("/coord/value").and_then(|x| x.as_str());
+        if let (Some(uri), Some(wkt)) = (uri, wkt) {
+            let qid = uri.rsplit('/').next().unwrap_or(uri);
+            if let Some(p) = parse_wkt_point(wkt) {
+                out.entry(qid.to_owned()).or_insert(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Render the TSV (sorted by city code, three decimals).
+#[must_use]
+pub fn render(cities: &[City], coords: &BTreeMap<String, (f64, f64)>) -> String {
+    let mut rows: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+    for c in cities {
+        if let Some(p) = coords.get(&c.wikidata_id) {
+            rows.insert(c.code.as_str(), *p);
+        }
+    }
+    let mut out = String::from("# iptv-org city code, latitude, longitude (WGS84). Source: Wikidata P625 (CC0). Generated by `cargo xtask iptv-gazetteer`.\n");
+    for (code, (lat, lon)) in rows {
+        let _ = writeln!(out, "{code}\t{lat:.3}\t{lon:.3}");
+    }
+    out
+}
+
+/// Live generation (needs the network): fetch `cities.json` (or read `cities_path`),
+/// query Wikidata in batches, and return the rendered TSV.
+///
+/// # Errors
+/// A human-readable failure message.
+#[cfg(feature = "net")]
+pub fn generate(cities_path: Option<&str>) -> Result<String, String> {
+    use std::time::Duration;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(120)))
+        .build()
+        .into();
+    let cities_json = if let Some(p) = cities_path {
+        std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?
+    } else {
+        agent
+            .get("https://iptv-org.github.io/api/cities.json")
+            .call()
+            .map_err(|e| e.to_string())?
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_string()
+            .map_err(|e| e.to_string())?
+    };
+    let feeds_json = agent
+        .get("https://iptv-org.github.io/api/feeds.json")
+        .call()
+        .map_err(|e| e.to_string())?
+        .body_mut()
+        .with_config()
+        .limit(64 * 1024 * 1024)
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    let referenced = feed_city_codes(&feeds_json)?;
+    let cities: Vec<City> = parse_cities(&cities_json)?
+        .into_iter()
+        .filter(|c| referenced.contains(&c.code))
+        .collect();
+    let mut qids: Vec<&str> = cities.iter().map(|c| c.wikidata_id.as_str()).collect();
+    qids.sort_unstable();
+    qids.dedup();
+    let mut coords = BTreeMap::new();
+    for batch in qids.chunks(BATCH) {
+        let query = build_query(batch);
+        let mut last = String::new();
+        let mut done = false;
+        for attempt in 0..4u64 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(5 * attempt));
+            }
+            let resp = agent
+                .post("https://query.wikidata.org/sparql")
+                .header(
+                    "User-Agent",
+                    "Conspect-gazetteer/0.1 (https://github.com/aperim/conspect; xtask iptv-gazetteer)",
+                )
+                .header("Accept", "application/sparql-results+json")
+                .send_form([("query", query.as_str())]);
+            match resp {
+                Ok(mut r) => {
+                    let body = r
+                        .body_mut()
+                        .with_config()
+                        .limit(32 * 1024 * 1024)
+                        .read_to_string()
+                        .map_err(|e| e.to_string())?;
+                    coords.extend(parse_results(&body)?);
+                    done = true;
+                    break;
+                }
+                Err(e) => last = e.to_string(),
+            }
+        }
+        if !done {
+            return Err(format!("wikidata batch failed: {last}"));
+        }
+        eprintln!("resolved {} / {} ids", coords.len(), qids.len());
+    }
+    Ok(render(&cities, &coords))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_batches_and_wkt() {
+        assert_eq!(
+            build_query(&["Q1", "Q2"]),
+            "SELECT ?c ?coord WHERE { VALUES ?c { wd:Q1 wd:Q2 } ?c wdt:P625 ?coord }"
+        );
+        assert_eq!(
+            parse_wkt_point("Point(-97.34 37.69)"),
+            Some((37.69, -97.34))
+        );
+        assert_eq!(parse_wkt_point("Point(1 200)"), None);
+        assert_eq!(parse_wkt_point("nonsense"), None);
+    }
+
+    #[test]
+    fn feed_cities_are_extracted() {
+        let codes = feed_city_codes(
+            r#"[{"broadcast_area":["c/US","ct/USICT"]},{"broadcast_area":["ct/DEBER","ct/USICT"]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codes.into_iter().collect::<Vec<_>>(),
+            vec!["DEBER", "USICT"]
+        );
+    }
+
+    #[test]
+    fn results_and_render_are_sorted_and_compact() {
+        let json = r#"{"results":{"bindings":[
+          {"c":{"value":"http://www.wikidata.org/entity/Q49266"},"coord":{"value":"Point(-97.3375 37.6922)"}},
+          {"c":{"value":"http://www.wikidata.org/entity/Q64"},"coord":{"value":"Point(13.38 52.5166)"}}]}}"#;
+        let coords = parse_results(json).unwrap();
+        let cities = parse_cities(
+            r#"[{"code":"USICT","wikidata_id":"Q49266"},{"code":"DEBER","wikidata_id":"Q64"},{"code":"XX","wikidata_id":null}]"#,
+        )
+        .unwrap();
+        assert_eq!(cities.len(), 2);
+        let out = render(&cities, &coords);
+        let lines: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            lines,
+            vec!["DEBER\t52.517\t13.380", "USICT\t37.692\t-97.338"]
+        );
+    }
+}
