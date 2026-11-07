@@ -1,7 +1,7 @@
 //! The published accounting record and the sampler that produces it.
 //!
 //! [`ResourceUsage`] is the wire shape ADR-0099 decision 8 specifies: owner,
-//! generation, phase, CPU fraction, cumulative CPU and GPU seconds, memory and
+//! generation, phase, CPU cores, cumulative CPU and GPU seconds, memory and
 //! peak memory, plus GPU utilisation and VRAM. GPU fields are `Option` because a
 //! missing value reports **unknown**, never zero — the same rule the GPU-load
 //! probe already follows.
@@ -13,21 +13,30 @@
 //! a test can drive a whole soak's worth of samples deterministically — and the
 //! later 1 Hz task owns the actual cadence off the data plane.
 
-use std::collections::BTreeMap;
-
 use crate::cgroup::CgroupUsage;
 use crate::error::Result;
 use crate::fsroot::FsRoot;
 use crate::job::JobPhase;
 use crate::process_tree::{
-    frac_to_f32, retain_exited, sample_process_tree, ticks_to_seconds, ChromiumProcessType,
-    ProcessTreeSample, TypeAccounting,
+    ratio_to_f32, sample_process_tree, ticks_to_seconds, PreviousSweep, ProcessTreeSample,
+    TypeAccountingArray, TypeSecondsArray, TYPE_COUNT,
 };
 use crate::scope::{Generation, ScopeOwner, ScopeRegistry};
 
+/// The cap a reported CPU figure saturates at, in cores.
+///
+/// The kernel lets a scope use as many cores as a host has; this crate bounds
+/// the wire value so a garbled counter cannot produce an absurd number, and the
+/// bound is high enough that no host this runs on reaches it.
+pub const CPU_CORES_CAP: f32 = 64.0;
+
 /// Whether a figure is kernel-exact or estimated.
+///
+/// `#[non_exhaustive]`: an `Unknown`/`mixed` accounting state is plausible as
+/// the GPU slices land, so consumers carry a wildcard.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Accounting {
     /// Kernel-enforced cgroup accounting: nothing can be missed.
     Exact,
@@ -43,7 +52,7 @@ pub enum Accounting {
 
 /// One published resource sample.
 ///
-/// Every field is either measured or honestly absent. `cpu_frac` is `None`
+/// Every field is either measured or honestly absent. `cpu_cores` is `None`
 /// until two readings a known time apart exist, and the GPU fields are `None`
 /// when the value is unknown.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -54,8 +63,10 @@ pub struct ResourceUsage {
     pub generation: Generation,
     /// The named phase the scope is in.
     pub phase: JobPhase,
-    /// CPU as a fraction of one core (`1.0` = one saturated core), when known.
-    pub cpu_frac: Option<f32>,
+    /// CPU in **cores** (`1.0` = one core fully used, `2.0` = two), when known.
+    ///
+    /// Saturates at [`CPU_CORES_CAP`].
+    pub cpu_cores: Option<f32>,
     /// Cumulative CPU seconds charged to the scope (monotonic within a
     /// generation).
     pub cpu_seconds_total: f64,
@@ -89,7 +100,7 @@ impl ResourceUsage {
             owner,
             generation,
             phase,
-            cpu_frac: None,
+            cpu_cores: None,
             cpu_seconds_total: 0.0,
             mem_bytes: None,
             mem_peak_bytes: None,
@@ -107,8 +118,11 @@ impl ResourceUsage {
     }
 }
 
-/// CPU as a fraction of one core from two cumulative readings a known time
-/// apart.
+/// CPU in **cores** from two cumulative readings a known time apart.
+///
+/// `1.0` means one core fully used; two CPU-seconds burned in one wall-clock
+/// second is `2.0`, which is exactly what a multi-process browser tree can
+/// produce and what a `0.0..=1.0` fraction hid.
 ///
 /// This is the pure core of the sampler, and it is total by construction: it is
 /// `pub` so a caller can unit-test the arithmetic without a `Sampler`.
@@ -119,14 +133,11 @@ impl ResourceUsage {
 ///   reported less CPU than before, which can only be a reset (or a wrapped
 ///   kernel counter), and reporting the drop as a negative share would be worse
 ///   than reporting no work in the interval.
-/// * The result is saturated to `0.0..=1.0` rather than panicking on an
-///   over-range ratio.
+/// * The result is saturated at [`CPU_CORES_CAP`] rather than panicking on an
+///   over-range ratio (an infinite ratio saturates too, rather than reporting a
+///   number the wire cannot carry).
 #[must_use]
-pub fn cpu_fraction(
-    previous_seconds: f64,
-    current_seconds: f64,
-    elapsed_seconds: f64,
-) -> Option<f32> {
+pub fn cpu_cores(previous_seconds: f64, current_seconds: f64, elapsed_seconds: f64) -> Option<f32> {
     if elapsed_seconds.is_nan() || elapsed_seconds <= 0.0 {
         return None;
     }
@@ -140,11 +151,8 @@ pub fn cpu_fraction(
     if ratio.is_nan() || ratio <= 0.0 {
         return Some(0.0);
     }
-    // An infinite ratio is a saturated core, not an unknown: clamp it.
-    if !ratio.is_finite() {
-        return Some(1.0);
-    }
-    Some(frac_to_f32(ratio))
+    // An infinite ratio is a saturated scope, not an unknown: clamp it.
+    Some(ratio_to_f32(ratio, CPU_CORES_CAP))
 }
 
 /// The monotonic value of `current`, given the `previous` reading.
@@ -153,9 +161,9 @@ pub fn cpu_fraction(
 /// counter reset, or a sample taken across a scope replacement — so a reported
 /// cumulative total never goes backwards.
 ///
-/// The *total* is what must be monotonic; the CPU *fraction* for the interval is
-/// computed separately, by [`cpu_fraction`], from the un-clamped readings, so a
-/// reset does not suppress the next interval's measurement.
+/// The *total* is what must be monotonic; the CPU *cores* figure for the
+/// interval is computed separately, by [`cpu_cores`], from the un-clamped
+/// readings, so a reset does not suppress the next interval's measurement.
 #[must_use]
 pub fn monotonic_total(previous: f64, current: f64) -> f64 {
     if current >= previous {
@@ -188,9 +196,10 @@ struct Reading {
 #[derive(Clone, Debug, Default)]
 pub struct Sampler {
     previous: Option<Reading>,
-    /// The last process-tree walk, kept so the next one can retain exited
-    /// children's CPU time.
-    previous_tree: Option<ProcessTreeSample>,
+    /// The per-pid map and running totals from the last tree walk. Only this
+    /// compact state is kept, never the whole previous [`ProcessTreeSample`],
+    /// so a sweep does not clone every record it just produced.
+    previous_sweep: Option<PreviousSweep>,
     accounting: Accounting,
 }
 
@@ -204,7 +213,7 @@ impl Sampler {
         }
     }
 
-    /// Record one reading at monotonic `now_seconds`, returning the CPU fraction
+    /// Record one reading at monotonic `now_seconds`, returning the CPU cores
     /// for the interval since the previous reading.
     ///
     /// `None` until a second reading exists, and for a non-advancing clock. The
@@ -212,8 +221,8 @@ impl Sampler {
     /// [`cpu_seconds_total`](Self::cpu_seconds_total)), so a kernel counter reset
     /// is absorbed once and growth continues from the reset value.
     pub fn record(&mut self, now_seconds: f64, cpu_seconds_total: f64) -> Option<f32> {
-        let fraction = self.previous.as_ref().and_then(|previous| {
-            cpu_fraction(
+        let cores = self.previous.as_ref().and_then(|previous| {
+            cpu_cores(
                 previous.counter,
                 cpu_seconds_total,
                 now_seconds - previous.at,
@@ -227,7 +236,7 @@ impl Sampler {
             counter: cpu_seconds_total,
             held: monotonic_total(held, cpu_seconds_total),
         });
-        fraction
+        cores
     }
 
     /// The monotonic cumulative CPU seconds last published.
@@ -251,7 +260,7 @@ impl Sampler {
         owner: ScopeOwner,
         generation: Generation,
         phase: JobPhase,
-        cpu_frac: Option<f32>,
+        cpu_cores: Option<f32>,
         mem_bytes: Option<u64>,
         mem_peak_bytes: Option<u64>,
     ) -> ResourceUsage {
@@ -259,7 +268,7 @@ impl Sampler {
             owner,
             generation,
             phase,
-            cpu_frac,
+            cpu_cores,
             cpu_seconds_total: self.cpu_seconds_total(),
             mem_bytes,
             mem_peak_bytes,
@@ -274,9 +283,11 @@ impl Sampler {
 
     /// Sample a process tree rooted at `root` through `fs` and return the walk.
     ///
-    /// The returned sample's `exited_cpu_ticks` carries the CPU time of children
-    /// that exited since the previous walk, so a per-type breakdown stays
-    /// truthful while the cumulative figure stays monotonic.
+    /// The returned sample's `exited_cpu_ticks` carries the CPU time of
+    /// processes that exited since the previous walk — identified by
+    /// `(pid, starttime)`, so a reused pid is a new process and a live process
+    /// whose counter dropped is not booked as exited — so a per-type breakdown
+    /// stays truthful while the cumulative figure stays monotonic.
     ///
     /// # Errors
     ///
@@ -287,19 +298,9 @@ impl Sampler {
         fs: &F,
         root: crate::fsroot::Pid,
     ) -> Result<ProcessTreeSample> {
-        let mut sample = sample_process_tree(fs, root, self.previous_tree.as_ref())?;
-        if let Some(previous) = self.previous_tree.as_ref() {
-            // A child that exited since the previous walk keeps its CPU time
-            // charged to the scope, so the cumulative figure is monotonic even
-            // though the live total dropped.
-            sample.exited_cpu_ticks = retain_exited(previous, &sample);
-            sample.cpu_ticks = previous.cpu_ticks.max(
-                sample
-                    .exited_cpu_ticks
-                    .saturating_add(sample.live_cpu_ticks),
-            );
-        }
-        self.previous_tree = Some(sample.clone());
+        let sample = sample_process_tree(fs, root, self.previous_sweep.as_ref())?;
+        // Keep only the compact per-pid state, never a clone of the sample.
+        self.previous_sweep = Some(PreviousSweep::from_sample(&sample));
         Ok(sample)
     }
 
@@ -326,11 +327,11 @@ pub fn usage_from_cgroup(
     owner: ScopeOwner,
     generation: Generation,
     phase: JobPhase,
-    cpu_frac: Option<f32>,
+    cpu_cores: Option<f32>,
     usage: &CgroupUsage,
 ) -> ResourceUsage {
     let mut record = ResourceUsage::unknown_gpu(owner, generation, phase, Accounting::Exact);
-    record.cpu_frac = cpu_frac;
+    record.cpu_cores = cpu_cores;
     record.cpu_seconds_total = usage.cpu_seconds_total();
     record.mem_bytes = usage.memory_current_bytes;
     record.mem_peak_bytes = usage.memory_peak_bytes;
@@ -341,15 +342,17 @@ pub fn usage_from_cgroup(
 ///
 /// This is the diagnostics view ADR-0099's measured bug needs: it shows the GPU
 /// process carrying the bulk of the CPU, so a regression to "one process" is
-/// visible without a second data structure.
+/// visible without a second data structure. The result is a fixed array indexed
+/// by [`ChromiumProcessType::index`], so no map is allocated per sweep.
 #[must_use]
-pub fn type_cpu_seconds(
-    by_type: &BTreeMap<ChromiumProcessType, TypeAccounting>,
-) -> BTreeMap<ChromiumProcessType, f64> {
-    by_type
-        .iter()
-        .map(|(kind, entry)| (*kind, ticks_to_seconds(entry.cpu_ticks)))
-        .collect()
+pub fn type_cpu_seconds(by_type: &TypeAccountingArray) -> TypeSecondsArray {
+    let mut seconds: TypeSecondsArray = [0.0; TYPE_COUNT];
+    for (index, entry) in by_type.iter().enumerate() {
+        if let Some(slot) = seconds.get_mut(index) {
+            *slot = ticks_to_seconds(entry.cpu_ticks);
+        }
+    }
+    seconds
 }
 
 /// Attribute a sampler's reading to `{owner, generation}`, dropping it when the
@@ -372,26 +375,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_fraction_needs_a_positive_interval() {
-        assert_eq!(cpu_fraction(0.0, 1.0, 0.0), None);
-        assert_eq!(cpu_fraction(0.0, 1.0, -1.0), None);
-        assert_eq!(cpu_fraction(0.0, 1.0, f64::NAN), None);
+    fn cpu_cores_needs_a_positive_interval() {
+        assert_eq!(cpu_cores(0.0, 1.0, 0.0), None);
+        assert_eq!(cpu_cores(0.0, 1.0, -1.0), None);
+        assert_eq!(cpu_cores(0.0, 1.0, f64::NAN), None);
     }
 
     #[test]
-    fn cpu_fraction_saturates_instead_of_panicking() {
-        // Two cores fully busy for one second against a one-second interval:
-        // the fraction saturates at 1.0 rather than reporting 2.0 or panicking.
-        assert_eq!(cpu_fraction(0.0, 2.0, 1.0), Some(1.0_f32));
-        // A finite but absurd ratio still saturates.
-        assert_eq!(cpu_fraction(0.0, 1.0e300, 1.0e-300), Some(1.0_f32));
+    fn cpu_cores_reports_cores_not_a_unit_fraction() {
+        // Two CPU-seconds burned in one wall-clock second is TWO cores, not a
+        // saturating 1.0 fraction.
+        assert_eq!(cpu_cores(0.0, 2.0, 1.0), Some(2.0_f32));
+        // Half a core is still 0.5.
+        assert_eq!(cpu_cores(0.0, 1.0, 2.0), Some(0.5_f32));
     }
 
     #[test]
-    fn cpu_fraction_reports_zero_on_a_counter_reset() {
+    fn cpu_cores_saturates_at_the_documented_cap_instead_of_panicking() {
+        assert_eq!(cpu_cores(0.0, 65.0, 1.0), Some(CPU_CORES_CAP));
+        // A finite but absurd ratio, and an infinite one, both saturate.
+        assert_eq!(cpu_cores(0.0, 1.0e300, 1.0e-300), Some(CPU_CORES_CAP));
+        assert_eq!(cpu_cores(0.0, f64::INFINITY, 1.0), Some(CPU_CORES_CAP));
+        assert!(cpu_cores(0.0, 1.0e9, 1.0).is_some_and(|cores| cores <= CPU_CORES_CAP));
+    }
+
+    #[test]
+    fn cpu_cores_reports_zero_on_a_counter_reset() {
         // The scope reports LESS CPU than the previous reading: a reset, not
         // negative work.
-        assert_eq!(cpu_fraction(100.0, 50.0, 1.0), Some(0.0_f32));
+        assert_eq!(cpu_cores(100.0, 50.0, 1.0), Some(0.0_f32));
     }
 
     #[test]

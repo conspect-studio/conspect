@@ -113,8 +113,12 @@ impl std::fmt::Display for JobPhase {
 }
 
 /// A job's lifecycle state.
+///
+/// `#[non_exhaustive]`: ADR-0100 decision 4's vocabulary can grow (a `paused`
+/// state is the likely next addition), so a consumer must carry a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum JobState {
     /// Accepted, waiting for a runner slot.
     Queued,
@@ -186,8 +190,10 @@ pub struct Job {
     pub id: JobId,
     /// The fill this job fills.
     pub fill: FillId,
-    /// Where the job is in its lifecycle.
-    pub state: JobState,
+    /// Where the job is in its lifecycle. Private so that
+    /// [`transition`](Self::transition) is the only write path; read it with
+    /// [`state`](Self::state).
+    state: JobState,
     /// The named phase within the job kind.
     pub phase: JobPhase,
     /// Completion percentage, when the phase can estimate one.
@@ -207,10 +213,20 @@ impl Job {
         }
     }
 
+    /// The job's lifecycle state.
+    ///
+    /// The field is private and this is the only reader, so the state can only
+    /// change through [`transition`](Self::transition) and the lifecycle guard
+    /// cannot be bypassed.
+    #[must_use]
+    pub const fn state(&self) -> JobState {
+        self.state
+    }
+
     /// Move the job to `next`, rejecting an illegal move.
     ///
-    /// This is the only way to change [`Job::state`]: a state transition cannot
-    /// be written by a caller that has not gone through the guard.
+    /// This is the only way to change the job's state: a transition cannot be
+    /// written by a caller that has not gone through the guard.
     ///
     /// # Errors
     ///
@@ -292,6 +308,10 @@ impl Trigger {
 /// so the structure cannot grow without limit; `max_concurrent` bounds how many
 /// may be running at once, which is the same statement as
 /// `media_jobs.concurrency` (default 1).
+///
+/// A cancelled job is removed immediately, so it never occupies a slot. A
+/// trigger that coalesces into a **running** job is not lost: it is remembered
+/// as one pending rerun for that fill, and [`finish`](Self::finish) queues it.
 #[derive(Clone, Debug)]
 pub struct JobQueue {
     capacity: usize,
@@ -301,8 +321,14 @@ pub struct JobQueue {
     /// key. One entry per fill with a job queued **or** running, so a repeat
     /// trigger can be answered with the job it coalesced onto.
     in_flight: HashMap<FillId, JobId>,
-    /// The currently running job ids, oldest first.
-    running: Vec<JobId>,
+    /// The currently running job records, oldest first. The queue owns them so
+    /// [`finish`](Self::finish) and [`cancel`](Self::cancel) move them through
+    /// [`Job::transition`], the single guarded write path.
+    running: Vec<Job>,
+    /// At most one rerun request per fill, set when a trigger coalesces into a
+    /// **running** job and consumed by [`finish`](Self::finish). Bounded by
+    /// construction: the key is the fill, so a repeat overwrites.
+    pending_rerun: HashMap<FillId, JobId>,
 }
 
 impl JobQueue {
@@ -318,6 +344,7 @@ impl JobQueue {
             pending: VecDeque::new(),
             in_flight: HashMap::new(),
             running: Vec::new(),
+            pending_rerun: HashMap::new(),
         }
     }
 
@@ -357,19 +384,53 @@ impl JobQueue {
         self.tracked_len() < self.capacity
     }
 
+    /// Whether `id` is already in use: queued, running, or held as a rerun.
+    ///
+    /// The pending-rerun ids count because each one becomes a real job at the
+    /// next [`finish`](Self::finish); admitting it for another fill now would
+    /// create two tracked jobs with one id.
+    #[must_use]
+    fn id_in_use(&self, id: &JobId) -> bool {
+        self.pending.iter().any(|job| &job.id == id)
+            || self.running.iter().any(|job| &job.id == id)
+            || self.pending_rerun.values().any(|rerun| rerun == id)
+    }
+
     /// Trigger a run for `fill`.
     ///
     /// A trigger for a fill that already has a job queued or running coalesces
-    /// onto that job and creates nothing. Otherwise a new job with `id` is
-    /// queued, or the trigger is refused when the queue is at its bound.
+    /// onto that job and creates nothing. When that job is **running**, the
+    /// trigger also records one pending rerun for the fill, so the operator's
+    /// second press runs again after this job rather than being dropped.
+    /// Otherwise a new job with `id` is queued, or the trigger is refused when
+    /// the queue is at its bound.
     ///
     /// # Errors
     ///
-    /// [`Error::QueueFull`] when `fill` has no job in flight and the queue is at
-    /// capacity.
+    /// [`Error::DuplicateJob`] when a new job would reuse an id the queue
+    /// already tracks; [`Error::QueueFull`] when `fill` has no job in flight and
+    /// the queue is at capacity.
     pub fn trigger(&mut self, fill: FillId, id: JobId) -> Result<Trigger> {
-        if let Some(existing) = self.in_flight.get(&fill) {
-            return Ok(Trigger::Coalesced(existing.clone()));
+        if let Some(existing) = self.in_flight.get(&fill).cloned() {
+            if self.running.iter().any(|job| job.id == existing) {
+                // The id will become a real job at the next `finish`, so it must
+                // be unique now. Re-requesting with the id already held for this
+                // fill is idempotent rather than a duplicate.
+                if self.pending_rerun.get(&fill) != Some(&id) && self.id_in_use(&id) {
+                    return Err(Error::DuplicateJob {
+                        job: id.as_str().to_owned(),
+                    });
+                }
+                // One pending rerun per fill: a repeat trigger overwrites, so
+                // the flag is bounded.
+                self.pending_rerun.insert(fill, id);
+            }
+            return Ok(Trigger::Coalesced(existing));
+        }
+        if self.id_in_use(&id) {
+            return Err(Error::DuplicateJob {
+                job: id.as_str().to_owned(),
+            });
         }
         if !self.could_accept() {
             return Err(Error::QueueFull {
@@ -383,7 +444,8 @@ impl JobQueue {
 
     /// Start the next pending job, if a runner slot is free.
     ///
-    /// A job that was cancelled while waiting is dropped rather than started.
+    /// A cancelled job is removed from the pending set by
+    /// [`cancel`](Self::cancel), so nothing that reaches the runner is terminal.
     ///
     /// # Errors
     ///
@@ -395,18 +457,24 @@ impl JobQueue {
             });
         }
         while let Some(mut job) = self.pending.pop_front() {
-            if job.state != JobState::Queued {
-                // Cancelled while it waited (see `cancel`): nothing to run.
+            if job.state() != JobState::Queued {
+                // Defensive: `cancel` removes rather than parks a cancelled job.
                 continue;
             }
             job.transition(JobState::Running)?;
-            self.running.push(job.id.clone());
-            return Ok(Some(job));
+            let started = job.clone();
+            self.running.push(job);
+            return Ok(Some(started));
         }
         Ok(None)
     }
 
     /// Finish `id` in `terminal` (`succeeded`, `failed` or `cancelled`).
+    ///
+    /// The queue's own record is moved through [`Job::transition`], so an
+    /// illegal terminal is refused and the job stays running. When a rerun was
+    /// requested while this job ran, exactly one new job for the fill is queued
+    /// (the finished job has freed its slot).
     ///
     /// # Errors
     ///
@@ -414,43 +482,50 @@ impl JobQueue {
     /// [`Error::IllegalTransition`] when `terminal` is not a legal successor of
     /// the running state (only reachable by passing a non-terminal state).
     pub fn finish(&mut self, id: &JobId, terminal: JobState) -> Result<JobState> {
-        if terminal != JobState::Succeeded
-            && terminal != JobState::Failed
-            && terminal != JobState::Cancelled
-        {
-            return Err(Error::IllegalTransition {
-                job: id.as_str().to_owned(),
-                from: JobState::Running.as_str(),
-                to: terminal.as_str(),
-            });
-        }
-        if !self.running.iter().any(|running| running == id) {
+        let Some(index) = self.running.iter().position(|job| &job.id == id) else {
             return Err(Error::UnknownJob {
                 job: id.as_str().to_owned(),
             });
+        };
+        if let Some(job) = self.running.get_mut(index) {
+            job.transition(terminal)?;
         }
-        self.running.retain(|running| running != id);
+        let finished = self.running.remove(index);
         self.in_flight.retain(|_, in_flight| in_flight != id);
+        if let Some(rerun) = self.pending_rerun.remove(&finished.fill) {
+            self.in_flight.insert(finished.fill.clone(), rerun.clone());
+            self.pending.push_back(Job::queued(rerun, finished.fill));
+        }
         Ok(terminal)
     }
 
     /// Cancel a job, whether it is waiting or running.
     ///
-    /// A job that has not been discovered in either set was already cancelled or
-    /// finished.
+    /// A cancelled job is removed from its set, so it never occupies capacity
+    /// and can never be started. A pending rerun for the same fill is discarded
+    /// (the operator cancelled, so the fill must not run again by itself).
     ///
     /// # Errors
     ///
     /// [`Error::UnknownJob`] when `id` is not tracked.
     pub fn cancel(&mut self, id: &JobId) -> Result<JobState> {
-        if let Some(job) = self.pending.iter_mut().find(|job| &job.id == id) {
-            job.transition(JobState::Cancelled)?;
-            self.in_flight.retain(|_, in_flight| in_flight != id);
+        if let Some(index) = self.pending.iter().position(|job| &job.id == id) {
+            if let Some(job) = self.pending.get_mut(index) {
+                job.transition(JobState::Cancelled)?;
+            }
+            if let Some(cancelled) = self.pending.remove(index) {
+                self.in_flight.retain(|_, in_flight| in_flight != id);
+                self.pending_rerun.remove(&cancelled.fill);
+            }
             return Ok(JobState::Cancelled);
         }
-        if self.running.iter().any(|running| running == id) {
-            self.running.retain(|running| running != id);
+        if let Some(index) = self.running.iter().position(|job| &job.id == id) {
+            if let Some(job) = self.running.get_mut(index) {
+                job.transition(JobState::Cancelled)?;
+            }
+            let cancelled = self.running.remove(index);
             self.in_flight.retain(|_, in_flight| in_flight != id);
+            self.pending_rerun.remove(&cancelled.fill);
             return Ok(JobState::Cancelled);
         }
         Err(Error::UnknownJob {
@@ -466,8 +541,16 @@ impl JobQueue {
 
     /// The ids of the jobs currently running, oldest first.
     #[must_use]
-    pub fn running_ids(&self) -> &[JobId] {
-        &self.running
+    pub fn running_ids(&self) -> Vec<JobId> {
+        self.running.iter().map(|job| job.id.clone()).collect()
+    }
+
+    /// The rerun requested while `fill`'s job was running, if any.
+    ///
+    /// At most one per fill; consumed by [`finish`](Self::finish).
+    #[must_use]
+    pub fn pending_rerun_for(&self, fill: &FillId) -> Option<&JobId> {
+        self.pending_rerun.get(fill)
     }
 
     /// Whether `fill` has a job queued or running.
@@ -498,7 +581,7 @@ mod tests {
     #[test]
     fn legal_transitions_are_accepted() {
         let mut job = Job::queued(job_id("j1"), fill("f1"));
-        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.state(), JobState::Queued);
         assert_eq!(
             job.transition(JobState::Running)
                 .expect("queued -> running"),
@@ -543,7 +626,7 @@ mod tests {
         let mut job = Job::queued(job_id("j1"), fill("f1"));
         assert!(job.transition(JobState::Succeeded).is_err());
         assert_eq!(
-            job.state,
+            job.state(),
             JobState::Queued,
             "a refused move must not change state"
         );
@@ -606,12 +689,18 @@ mod tests {
         let other = queue.trigger(fill("wind"), job_id("j4")).expect("room");
         assert_eq!(other, Trigger::Queued(job_id("j4")));
 
-        // Once the first job finishes, the fill can be triggered again.
+        // The trigger that coalesced into the RUNNING j1 becomes exactly one
+        // pending rerun, queued when j1 finishes.
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), Some(&job_id("j3")));
         queue
             .finish(&job_id("j1"), JobState::Succeeded)
             .expect("finish");
-        let again = queue.trigger(fill("radar"), job_id("j5")).expect("room");
-        assert_eq!(again, Trigger::Queued(job_id("j5")));
+        assert_eq!(queue.in_flight_for(&fill("radar")), Some(&job_id("j3")));
+        // A further trigger now coalesces onto the rerun instead of adding one.
+        let again = queue
+            .trigger(fill("radar"), job_id("j5"))
+            .expect("coalesces");
+        assert_eq!(again, Trigger::Coalesced(job_id("j3")));
     }
 
     #[test]
@@ -691,5 +780,135 @@ mod tests {
         assert_eq!(queue.capacity(), 1);
         assert_eq!(queue.max_concurrent(), 1);
         assert!(queue.trigger(fill("a"), job_id("j1")).is_ok());
+    }
+
+    #[test]
+    fn a_trigger_that_coalesces_into_a_running_job_reruns_after_finish() {
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("radar"), job_id("j1")).expect("room");
+        queue.start_next().expect("slot").expect("a job");
+
+        // The operator presses run while j1 is running: coalesced, and exactly
+        // one rerun is remembered.
+        let repeat = queue
+            .trigger(fill("radar"), job_id("j2"))
+            .expect("coalesces");
+        assert_eq!(repeat, Trigger::Coalesced(job_id("j1")));
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), Some(&job_id("j2")));
+        assert_eq!(queue.pending_len(), 0, "nothing is queued yet");
+
+        queue
+            .finish(&job_id("j1"), JobState::Succeeded)
+            .expect("finish");
+        assert_eq!(
+            queue.in_flight_for(&fill("radar")),
+            Some(&job_id("j2")),
+            "the fill runs again"
+        );
+        assert_eq!(queue.pending_len(), 1, "exactly one rerun");
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), None);
+    }
+
+    #[test]
+    fn a_repeat_trigger_while_running_keeps_at_most_one_rerun() {
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("radar"), job_id("j1")).expect("room");
+        queue.start_next().expect("slot").expect("a job");
+        for name in ["j2", "j3", "j4"] {
+            assert_eq!(
+                queue
+                    .trigger(fill("radar"), job_id(name))
+                    .expect("coalesces"),
+                Trigger::Coalesced(job_id("j1"))
+            );
+        }
+        queue
+            .finish(&job_id("j1"), JobState::Failed)
+            .expect("finish");
+        assert_eq!(
+            queue.pending_len(),
+            1,
+            "three repeat triggers still queue one rerun"
+        );
+        assert_eq!(queue.in_flight_for(&fill("radar")), Some(&job_id("j4")));
+    }
+
+    #[test]
+    fn a_coalesced_trigger_for_a_queued_job_requests_no_rerun() {
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("radar"), job_id("j1")).expect("room");
+        // j1 is still queued, so the repeat has nothing to rerun after.
+        queue
+            .trigger(fill("radar"), job_id("j2"))
+            .expect("coalesces");
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), None);
+        queue.start_next().expect("slot").expect("a job");
+        queue
+            .finish(&job_id("j1"), JobState::Succeeded)
+            .expect("finish");
+        assert_eq!(queue.pending_len(), 0);
+    }
+
+    #[test]
+    fn a_cancelled_job_frees_its_capacity_slot() {
+        let mut queue = JobQueue::new(2, 1);
+        queue.trigger(fill("a"), job_id("j1")).expect("room");
+        queue.trigger(fill("b"), job_id("j2")).expect("room");
+        assert!(!queue.could_accept(), "two tracked jobs at a bound of two");
+
+        assert_eq!(
+            queue.cancel(&job_id("j1")).expect("cancel"),
+            JobState::Cancelled
+        );
+        assert_eq!(queue.tracked_len(), 1, "the cancelled entry is gone");
+        assert!(
+            queue.could_accept(),
+            "a cancelled job must not occupy capacity"
+        );
+        assert!(queue.trigger(fill("c"), job_id("j3")).is_ok());
+        assert_eq!(queue.pending_len(), 2);
+    }
+
+    #[test]
+    fn a_duplicate_job_id_is_refused() {
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("a"), job_id("j1")).expect("room");
+        let error = queue
+            .trigger(fill("b"), job_id("j1"))
+            .expect_err("the id is already tracked");
+        assert!(
+            error.to_string().contains("j1"),
+            "the job is named: {error}"
+        );
+        assert_eq!(queue.pending_len(), 1, "the duplicate added nothing");
+
+        // Still refused once the job is running.
+        queue.start_next().expect("slot").expect("a job");
+        assert!(queue.trigger(fill("b"), job_id("j1")).is_err());
+    }
+
+    #[test]
+    fn a_rerun_requested_id_cannot_be_reused_for_another_fill() {
+        let mut queue = JobQueue::new(4, 1);
+        queue.trigger(fill("radar"), job_id("j1")).expect("room");
+        queue.start_next().expect("slot").expect("a job");
+        queue
+            .trigger(fill("radar"), job_id("j2"))
+            .expect("coalesces");
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), Some(&job_id("j2")));
+
+        // j2 becomes a real job at the next finish, so it is already in use.
+        assert!(queue.trigger(fill("wind"), job_id("j2")).is_err());
+        // Re-requesting the same fill with the same id is idempotent.
+        assert_eq!(
+            queue
+                .trigger(fill("radar"), job_id("j2"))
+                .expect("coalesces"),
+            Trigger::Coalesced(job_id("j1"))
+        );
+        queue
+            .finish(&job_id("j1"), JobState::Succeeded)
+            .expect("finish");
+        assert_eq!(queue.pending_len(), 1);
     }
 }

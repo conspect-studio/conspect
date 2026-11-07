@@ -23,8 +23,9 @@ use std::fs;
 
 use common::{FakeRoot, RecordingRoot};
 use multiview_webengine::{
-    delegation_status, plan_leaf_move, probe_child_path, read_cgroup_usage, ControllerSet,
-    DelegationReport, LeafMoveStep, NotDelegated, REQUIRED_CONTROLLERS,
+    delegation_status, plan_leaf_move, probe_child_name, probe_child_path, read_cgroup_usage,
+    ControllerSet, DelegationReport, FailureAction, LeafMoveStep, NotDelegated,
+    DELEGATION_PROBE_PREFIX, REQUIRED_CONTROLLERS,
 };
 
 /// A tempdir standing in for a delegated service cgroup.
@@ -136,18 +137,107 @@ fn unreadable_controllers_are_reported_rather_than_assumed_absent() {
 }
 
 #[test]
-fn the_probe_child_name_never_collides_with_a_generation_scope() {
-    // The probe is a reserved name, so a probe can never be mistaken for, or
-    // interfere with, a running scope's cgroup.
-    assert_eq!(
-        probe_child_path("sys/fs/cgroup/conspect.service"),
-        "sys/fs/cgroup/conspect.service/conspect-delegation-probe"
+fn the_probe_child_name_never_collides_with_a_generation_scope_or_another_probe() {
+    // The probe uses a reserved prefix, so it can never be mistaken for, or
+    // interfere with, a running scope's cgroup; and each call gets a fresh name,
+    // so two probes never contend for one directory.
+    let first = probe_child_name();
+    let second = probe_child_name();
+    assert!(first.starts_with(DELEGATION_PROBE_PREFIX), "{first}");
+    assert_ne!(first, second, "each probe gets a unique name");
+    assert!(
+        first.contains(&std::process::id().to_string()),
+        "the pid separates processes: {first}"
     );
-    // And the probe path is exactly one child of the root it was given.
+    // The probe path is exactly one child of the root it was given.
     assert_eq!(
-        probe_child_path("sys/fs/cgroup/conspect.service/"),
-        "sys/fs/cgroup/conspect.service/conspect-delegation-probe"
+        probe_child_path("sys/fs/cgroup/conspect.service", &first),
+        format!("sys/fs/cgroup/conspect.service/{first}")
     );
+    assert_eq!(
+        probe_child_path("sys/fs/cgroup/conspect.service/", &first),
+        format!("sys/fs/cgroup/conspect.service/{first}")
+    );
+}
+
+#[test]
+fn an_eexist_create_is_retried_once_with_a_fresh_name() {
+    // A stale probe directory from a crashed run makes `mkdir` fail with
+    // EEXIST. That is not "not delegated": the probe retries with a new name.
+    let root = FakeRoot {
+        eexist_creates: 1,
+        ..FakeRoot::permissive().with_file(
+            "sys/fs/cgroup/conspect.service/cgroup.controllers",
+            "cpu memory pids\n",
+        )
+    };
+    let report = delegation_status(&root, "sys/fs/cgroup/conspect.service").expect("a probe");
+    assert_eq!(report, DelegationReport::Delegated);
+    let attempts = root.create_paths.borrow();
+    assert_eq!(attempts.len(), 2, "one retry, not a give-up");
+    assert_ne!(
+        attempts.first(),
+        attempts.get(1),
+        "the retry used a new name"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|path| path.contains(DELEGATION_PROBE_PREFIX)),
+        "{attempts:?}"
+    );
+}
+
+#[test]
+fn a_failing_probe_makes_a_best_effort_removal() {
+    // The probe created its directory, then could not remove it: it must not
+    // simply walk away, so a second best-effort `rmdir` is attempted.
+    let root = RecordingRoot::new(FakeRoot {
+        allow_remove: false,
+        ..FakeRoot::permissive().with_file(
+            "sys/fs/cgroup/conspect.service/cgroup.controllers",
+            "cpu memory pids\n",
+        )
+    });
+    let report = delegation_status(&root, "sys/fs/cgroup/conspect.service").expect("a probe");
+    assert_eq!(report.reason(), Some(NotDelegated::CannotRemoveChild));
+    let writes = root.writes();
+    assert_eq!(
+        writes.len(),
+        3,
+        "create, remove, best-effort remove: {writes:?}"
+    );
+    assert!(writes.first().is_some_and(|w| w.starts_with("create ")));
+    assert!(
+        writes.get(1).is_some_and(|w| w.starts_with("remove ")),
+        "{writes:?}"
+    );
+    assert!(
+        writes.get(2).is_some_and(|w| w.starts_with("remove ")),
+        "the failure path retries the removal: {writes:?}"
+    );
+}
+
+#[test]
+fn a_failed_verify_step_aborts_and_enables_no_controller() {
+    let steps = plan_leaf_move("/sys/fs/cgroup/conspect.service", 4242);
+    let verify = steps
+        .iter()
+        .find(|step| matches!(step, LeafMoveStep::VerifyParentEmpty { .. }))
+        .expect("a verify_parent_empty step");
+    assert_eq!(
+        verify.on_failure(),
+        FailureAction::AbortAndStay,
+        "a failed verify aborts and stays: no controller is enabled"
+    );
+    // Every step aborts: a failure anywhere leaves the process where it was.
+    for step in &steps {
+        assert_eq!(step.on_failure(), FailureAction::AbortAndStay, "{step:?}");
+    }
+    // And the abort is meaningful: the controller enables follow the verify.
+    let labels: Vec<&str> = steps.iter().map(LeafMoveStep::label).collect();
+    let index_of = |label: &str| labels.iter().position(|l| *l == label).expect("a step");
+    assert!(index_of("verify_parent_empty") < index_of("enable_controller"));
 }
 
 #[test]
@@ -204,16 +294,17 @@ fn reading_usage_writes_nothing_at_all() {
         root.writes()
     );
 
-    // The probe itself only creates and removes its own reserved child.
+    // The probe itself only creates and removes its own uniquely named child.
     let report = delegation_status(&root, "cgroup").expect("a probe");
     assert!(report.is_delegated());
-    assert_eq!(
-        root.writes(),
-        vec![
-            "create cgroup/conspect-delegation-probe".to_owned(),
-            "remove cgroup/conspect-delegation-probe".to_owned(),
-        ]
-    );
+    let writes = root.writes();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    let created = writes
+        .first()
+        .and_then(|write| write.strip_prefix("create cgroup/"))
+        .expect("a create of the probe child");
+    assert!(created.starts_with(DELEGATION_PROBE_PREFIX), "{created}");
+    assert_eq!(writes.get(1), Some(&format!("remove cgroup/{created}")));
 }
 
 #[test]

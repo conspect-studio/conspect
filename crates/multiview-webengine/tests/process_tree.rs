@@ -5,22 +5,31 @@
 //! while ~95% of the CPU sat in the GPU process. Every test here therefore
 //! asserts on the *whole tree*, and the six-type case asserts the per-type split
 //! so a regression to "one process" fails loudly.
+//!
+//! One test deliberately reads the host's real `/proc/self/stat`: parsing a
+//! genuine kernel line is the only way to prove the fixtures are not the thing
+//! being tested. It reads, never writes.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
     clippy::as_conversions,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::print_stderr
 )]
 
 mod common;
 
-use common::{normalise, FakeRoot, ProcSpec, ProcTree};
+use std::path::Path;
+use std::time::Instant;
+
+use common::{kernel_stat_line, normalise, CountingRoot, FakeRoot, ProcSpec, ProcTree};
 
 use multiview_webengine::{
-    parse_stat_comm, read_cgroup_usage, sample_process_tree, ChromiumProcessType, MemorySource,
-    Pid, ProcRecord, Sampler, CHROMIUM_PROCESS_TYPES,
+    parse_stat_comm, parse_stat_cpu_ticks, parse_stat_ppid, parse_stat_starttime,
+    read_cgroup_usage, sample_process_tree, ChromiumProcessType, FsRoot, MemorySource, Pid,
+    ProcRecord, Sampler, CHROMIUM_PROCESS_TYPES,
 };
 
 /// The six-type Chromium tree used by the regression test.
@@ -61,6 +70,29 @@ fn chromium_tree() -> ProcTree {
             .with_type("ppapi")
             .with_pss_kib(256),
     ])
+}
+
+/// A width-`size` tree: root 1 with children `2..=size`.
+///
+/// With `with_children` every process gets a `children` strand (empty for the
+/// leaves), so the walk never needs the `/proc` ppid scan. Without it, every
+/// node falls back to the scan, which must still happen at most once per sweep.
+fn wide_tree(size: u32, with_children: bool) -> ProcTree {
+    let children: Vec<u32> = (2..=size).collect();
+    let root = if with_children {
+        ProcSpec::new(1, "chrome", 1, 1).with_children(&children)
+    } else {
+        ProcSpec::new(1, "chrome", 1, 1)
+    };
+    let mut specs = vec![root];
+    for pid in 2..=size {
+        let mut spec = ProcSpec::new(pid, "chrome", 1, 1).with_parent(1);
+        if with_children {
+            spec = spec.with_children(&[]);
+        }
+        specs.push(spec);
+    }
+    ProcTree::build(specs)
 }
 
 /// The measured CPU of every tree member: root plus each `utime + stime`.
@@ -153,7 +185,7 @@ fn the_whole_tree_sums_every_chromium_process_type() {
 }
 
 #[test]
-fn a_process_tree_produces_a_cpu_fraction_from_two_readings() {
+fn a_process_tree_produces_a_cpu_cores_reading_from_two_readings() {
     // The end-to-end shape of one sample tick: walk the tree, hand the walk's
     // cumulative seconds to the sampler, and let the injected clock supply the
     // interval. No wall clock is read anywhere.
@@ -173,12 +205,12 @@ fn a_process_tree_produces_a_cpu_fraction_from_two_readings() {
     // Ten seconds later the tree has burned another 30 ticks (0.3 CPU-seconds).
     first.live_cpu_ticks += 30;
     first.cpu_ticks += 30;
-    let fraction = sampler
+    let cores = sampler
         .record(10.0, Sampler::tree_cpu_seconds(&first))
         .expect("a positive interval");
     assert!(
-        (fraction - 0.03).abs() < 1e-4,
-        "0.3 CPU-s / 10 s, got {fraction}"
+        (cores - 0.03).abs() < 1e-4,
+        "0.3 CPU-s / 10 s is 0.03 cores, got {cores}"
     );
 }
 
@@ -187,14 +219,14 @@ fn exited_child_time_is_retained_so_totals_never_go_backwards() {
     let tree = chromium_tree();
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
 
-    // Sample A: the full tree, 125 ticks.
+    // Sample A: the full tree, 135 ticks.
     let first = sampler
         .sample_tree(tree.root(), Pid::new(100))
         .expect("first walk");
     assert_eq!(first.cpu_ticks, expected_ticks());
     assert_eq!(first.exited_cpu_ticks, 0);
 
-    // The renderer (25 ticks) exits before the next walk.
+    // The renderer (30 ticks) exits before the next walk.
     tree.remove(101);
     let second = sampler
         .sample_tree(tree.root(), Pid::new(100))
@@ -226,11 +258,119 @@ fn exited_child_time_is_retained_so_totals_never_go_backwards() {
 }
 
 #[test]
+fn a_grandchild_exit_in_the_same_interval_is_retained() {
+    // root 300 -> child 301 -> grandchild 302. The grandchild is two levels
+    // down, so the retention map must cover the whole walk, not just the root's
+    // immediate children.
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(300, "chrome", 5, 5).with_children(&[301]),
+        ProcSpec::new(301, "chrome", 3, 3)
+            .with_parent(300)
+            .with_children(&[302]),
+        ProcSpec::new(302, "chrome", 7, 2).with_parent(301),
+    ]);
+    let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
+
+    let first = sampler
+        .sample_tree(tree.root(), Pid::new(300))
+        .expect("first walk");
+    assert_eq!(first.process_count(), 2, "child and grandchild");
+    assert_eq!(first.cpu_ticks, 10 + 6 + 9);
+
+    tree.remove(302);
+    let second = sampler
+        .sample_tree(tree.root(), Pid::new(300))
+        .expect("second walk");
+    assert_eq!(
+        second.exited_cpu_ticks, 9,
+        "the departed grandchild's CPU time is retained"
+    );
+    assert_eq!(second.live_cpu_ticks, 10 + 6);
+    assert_eq!(second.cpu_ticks, 25, "the total is unchanged");
+}
+
+#[test]
+fn a_reused_pid_is_a_new_process_and_its_predecessors_time_is_retained() {
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(100, "chrome", 12, 8).with_children(&[101]),
+        ProcSpec::new(101, "chrome", 20, 10)
+            .with_parent(100)
+            .with_starttime(500),
+    ]);
+    let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
+    let first = sampler
+        .sample_tree(tree.root(), Pid::new(100))
+        .expect("first walk");
+    assert_eq!(first.cpu_ticks, 20 + 30);
+    assert_eq!(record_for(&first, 101).starttime, 500);
+
+    // The kernel reuses pid 101 for a NEW process: a different `starttime` and
+    // its own small tick count.
+    tree.update_stat(
+        &ProcSpec::new(101, "chrome", 3, 2)
+            .with_parent(100)
+            .with_starttime(999),
+    );
+    let second = sampler
+        .sample_tree(tree.root(), Pid::new(100))
+        .expect("second walk");
+
+    assert_eq!(
+        record_for(&second, 101).starttime,
+        999,
+        "the pid now names a different process"
+    );
+    assert_eq!(
+        second.exited_cpu_ticks, 30,
+        "the replaced process's CPU time is retained"
+    );
+    assert_eq!(
+        second.live_cpu_ticks,
+        20 + 5,
+        "the root plus the new process, not the old ticks"
+    );
+    assert_eq!(
+        second.cpu_ticks, 55,
+        "old time plus new time, counted once each"
+    );
+}
+
+#[test]
+fn a_live_process_whose_ticks_went_down_is_not_booked_as_exited() {
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(100, "chrome", 12, 8).with_children(&[101]),
+        ProcSpec::new(101, "chrome", 20, 10).with_parent(100),
+    ]);
+    let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
+    let first = sampler
+        .sample_tree(tree.root(), Pid::new(100))
+        .expect("first walk");
+    assert_eq!(first.cpu_ticks, 20 + 30);
+
+    // The same process, same starttime, reporting LESS CPU than before: a
+    // counter reset, not an exit.
+    tree.update_stat(&ProcSpec::new(101, "chrome", 1, 1).with_parent(100));
+    let second = sampler
+        .sample_tree(tree.root(), Pid::new(100))
+        .expect("second walk");
+
+    assert_eq!(
+        second.exited_cpu_ticks, 0,
+        "a still-live process is never booked as exited"
+    );
+    assert_eq!(second.live_cpu_ticks, 20 + 2);
+    assert!(
+        second.cpu_ticks >= first.cpu_ticks,
+        "the monotonic total still holds the earlier peak"
+    );
+}
+
+#[test]
 fn a_comm_containing_parens_and_spaces_parses_from_the_last_paren() {
     // A static file fixture (not a tempdir) for the field-offset corner case:
     // field 2 may itself contain `)`, so everything is counted after the LAST
     // `)`.
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let body = std::fs::read_to_string(fixture.join("proc/302/stat")).expect("the fixture");
     assert_eq!(parse_stat_comm(&body).as_deref(), Some("odd )( comm"));
 
@@ -250,6 +390,59 @@ fn a_comm_containing_parens_and_spaces_parses_from_the_last_paren() {
     // Everything is read through the fixture root: no real /proc is consulted,
     // so a pid that cannot exist on the host still resolves here.
     assert!(!fixture.join("proc/999999").exists());
+}
+
+#[test]
+fn every_static_stat_fixture_is_a_real_kernel_line() {
+    // A fixture that is a field short, or whose activity fields are all zero,
+    // would let an off-by-one parser pass. This pins the shape: 50 fields after
+    // the comm (fields 3..52), distinct nonzero minflt/cminflt/majflt/cmajflt.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for relative in ["proc/301/stat", "proc/302/stat"] {
+        let body = std::fs::read_to_string(fixture.join(relative)).expect("a fixture");
+        let tail = body.rsplit_once(')').expect("a comm paren").1;
+        let fields: Vec<&str> = tail.split_whitespace().collect();
+        assert_eq!(fields.len(), 50, "{relative} must carry fields 3..52");
+        let activity: Vec<u64> = (7..11)
+            .map(|index| {
+                fields[index]
+                    .parse::<u64>()
+                    .expect("a numeric activity field")
+            })
+            .collect();
+        assert!(
+            activity.iter().all(|value| *value != 0),
+            "{relative}: minflt/cminflt/majflt/cmajflt must be nonzero: {activity:?}"
+        );
+        let distinct: std::collections::BTreeSet<u64> = activity.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "{relative}: the four activity fields must differ: {activity:?}"
+        );
+        assert!(
+            parse_stat_starttime(&body).is_some(),
+            "{relative}: field 22 (starttime) must parse"
+        );
+    }
+}
+
+#[test]
+fn the_real_proc_self_stat_line_parses_through_a_root_of_slash() {
+    // The one deliberate read of the host's real /proc: a fixture can drift from
+    // the kernel's line, and this is what catches it. Read-only, and no value
+    // assertion beyond "it parsed".
+    let root = Path::new("/");
+    let body = root
+        .read_to_string("proc/self/stat")
+        .expect("the real /proc/self/stat");
+    assert!(
+        parse_stat_cpu_ticks(&body).is_some(),
+        "utime/stime must parse from a real kernel line: {body}"
+    );
+    assert!(parse_stat_ppid(&body).is_some());
+    assert!(parse_stat_starttime(&body).is_some());
+    assert!(parse_stat_comm(&body).is_some());
 }
 
 #[test]
@@ -303,8 +496,21 @@ fn memory_is_unavailable_not_zero_when_smaps_rollup_is_absent() {
     assert_eq!(child.memory_source, MemorySource::Unavailable);
     assert_eq!(
         sample.memory_source,
-        MemorySource::Rss,
-        "the tree sum is not all-Pss"
+        MemorySource::Unavailable,
+        "every record was unmeasurable: unknown, never Rss"
+    );
+}
+
+#[test]
+fn an_empty_tree_reports_memory_unavailable_rather_than_a_source() {
+    let tree = ProcTree::build(vec![ProcSpec::new(700, "chrome", 4, 4)]);
+    let sample = sample_process_tree(tree.root(), Pid::new(700), None).expect("a walk");
+    assert_eq!(sample.process_count(), 0);
+    assert_eq!(sample.memory_bytes, 0);
+    assert_eq!(
+        sample.memory_source,
+        MemorySource::Unavailable,
+        "an empty tree measured nothing; it is not Pss or Rss"
     );
 }
 
@@ -315,12 +521,12 @@ fn every_documented_separator_and_source_is_read_through_a_root() {
     let root = FakeRoot::default()
         .with_file(
             "proc/500/stat",
-            "500 (chrome) S 1 500 500 0 -1 0 0 0 0 0 20 10 0 0 20 0 1 0 9 0 0\n",
+            &kernel_stat_line(500, "chrome", 1, 20, 10, 900),
         )
         .with_file("proc/500/task/500/children", "501\n")
         .with_file(
             "proc/501/stat",
-            "501 (chrome) S 500 501 501 0 -1 0 0 0 0 0 4 1 0 0 20 0 1 0 9 0 0\n",
+            &kernel_stat_line(501, "chrome", 500, 4, 1, 950),
         )
         .with_file("proc/501/cmdline", "/opt/chrome\0--type=gpu-process\0")
         .with_file("proc/501/smaps_rollup", "Pss: 1 kB\n");
@@ -337,4 +543,108 @@ fn every_documented_separator_and_source_is_read_through_a_root() {
     // error, never a fabricated zero.
     assert!(read_cgroup_usage(&root, "sys/fs/cgroup/x").is_err());
     assert_eq!(normalise("/proc/500/stat"), "proc/500/stat");
+}
+
+#[test]
+fn an_existing_but_empty_children_file_means_no_children_and_no_scan() {
+    // The kernel wrote a `children` file and it is empty: authoritative "no
+    // children". A node with a missing strand falls back, so with an EMPTY
+    // strand present the ppid scan must not run -- the counting root proves it.
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(800, "chrome", 1, 1).with_children(&[]),
+        // 801 really is a child of 800 by ppid, but 800's empty strand wins.
+        ProcSpec::new(801, "chrome", 1, 1).with_parent(800),
+    ]);
+    let root = CountingRoot::new(tree.root());
+    let sample = sample_process_tree(&root, Pid::new(800), None).expect("a walk");
+    assert_eq!(
+        sample.process_count(),
+        0,
+        "the empty strand is authoritative"
+    );
+    assert_eq!(
+        root.stat_reads(),
+        1,
+        "only the root's own stat: no ppid scan"
+    );
+    assert_eq!(root.children_reads(), 1);
+}
+
+#[test]
+fn a_missing_children_file_falls_back_per_node_not_only_when_the_union_is_empty() {
+    // The root has a real strand naming 901. 901 has NO strand, so 901's own
+    // children must be found by the ppid fallback -- the union of the walk is
+    // not empty, which is exactly the case the old fallback missed.
+    let tree = ProcTree::build(vec![
+        ProcSpec::new(900, "chrome", 5, 5).with_children(&[901]),
+        ProcSpec::new(901, "chrome", 3, 3).with_parent(900),
+        ProcSpec::new(902, "chrome", 7, 2).with_parent(901),
+    ]);
+    let sample = sample_process_tree(tree.root(), Pid::new(900), None).expect("a walk");
+    assert_eq!(
+        sample.process_count(),
+        2,
+        "the grandchild is discovered through the per-node fallback"
+    );
+    assert_eq!(
+        record_for(&sample, 902).cpu_ticks,
+        9,
+        "and it is classified and summed"
+    );
+}
+
+#[test]
+fn a_two_hundred_process_sweep_reads_stat_once_per_process_and_scans_proc_once() {
+    const SIZE: u32 = 200;
+    const DESCENDANTS: usize = (SIZE - 1) as usize;
+
+    // (a) No `children` files at all: every node needs the fallback, but the
+    // `/proc` ppid scan is built once for the whole sweep.
+    let bare = wide_tree(SIZE, false);
+    let bare_root = CountingRoot::new(bare.root());
+    let started = Instant::now();
+    let bare_sample = sample_process_tree(&bare_root, Pid::new(1), None).expect("a walk");
+    let bare_elapsed = started.elapsed();
+    assert_eq!(bare_sample.process_count(), DESCENDANTS);
+    assert_eq!(
+        bare_root.stat_reads(),
+        1 + SIZE as usize + DESCENDANTS,
+        "root + one ppid scan over all {SIZE} pids + one stat per record"
+    );
+    assert_eq!(
+        bare_root.children_reads(),
+        1 + DESCENDANTS,
+        "one children read attempt per node"
+    );
+    // A per-node scan would read SIZE stats per node; assert the whole sweep
+    // stays linear rather than merely equal to the expected number.
+    assert!(
+        bare_root.stat_reads() < 3 * SIZE as usize,
+        "a sweep must be O(processes), not O(processes x pids): {} stat reads",
+        bare_root.stat_reads()
+    );
+
+    // (b) Every process has a `children` strand (empty for the leaves): no scan.
+    let full = wide_tree(SIZE, true);
+    let full_root = CountingRoot::new(full.root());
+    let started = Instant::now();
+    let full_sample = sample_process_tree(&full_root, Pid::new(1), None).expect("a walk");
+    let full_elapsed = started.elapsed();
+    assert_eq!(full_sample.process_count(), DESCENDANTS);
+    assert_eq!(
+        full_root.stat_reads(),
+        SIZE as usize,
+        "root + one stat per record, with no ppid scan"
+    );
+    assert_eq!(full_root.children_reads(), SIZE as usize);
+
+    eprintln!(
+        "200-process sweep: {bare_stat} stat reads / {bare_children} children reads in {bare_elapsed:?} \
+         (no children files); {full_stat} stat reads / {full_children} children reads in {full_elapsed:?} \
+         (children files present)",
+        bare_stat = bare_root.stat_reads(),
+        bare_children = bare_root.children_reads(),
+        full_stat = full_root.stat_reads(),
+        full_children = full_root.children_reads(),
+    );
 }
