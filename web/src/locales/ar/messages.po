@@ -8739,7 +8739,7 @@ msgstr ""
 msgid "The management API, its conventions, the realtime event streams, and where to find the live, interactive reference."
 msgstr ""
 
-#: src/iptv/MapView.tsx:433
+#: src/iptv/MapView.tsx:439
 msgid "The map could not start on this device. Use the place search and the list instead — they offer everything the map does."
 msgstr ""
 
