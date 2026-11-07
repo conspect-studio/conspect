@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use multiview_cli::pipeline::Pipeline;
+use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::MultiviewConfig;
 use multiview_engine::Rails;
 
@@ -267,4 +268,54 @@ fn the_idle_cost_of_500_sources_is_a_catalogue_entry_each() {
         "{per_build_kb} kB per 500-source build"
     );
     drop(pipelines);
+}
+
+/// Idle sources raise no alarm: the only tile-state and fault surfaces are the
+/// cells the output composites, so an unconsumed source never reaches them. A
+/// whole run with 50 idle sources (pointed at a dead origin) emits no event
+/// naming any of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_sources_raise_no_tile_state_or_alarm_events() {
+    use multiview_control::EngineStateSnapshot;
+    use multiview_engine::{CompositorDrive, EnginePublisher, StopSignal};
+    use multiview_events::Event;
+
+    let origin = CountingOrigin::start();
+    let dir = tempfile::tempdir().unwrap();
+    let playlist = dir.path().join("p.m3u8");
+    let config = config(origin.port, 50, &playlist, "");
+    let mut pipeline = Pipeline::build(&config).expect("builds");
+    let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(4096));
+    let mut events = publisher.subscribe();
+    let slot = multiview_cli::preview::program_slot();
+    let stop = StopSignal::new();
+    let stopper = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        stopper.stop();
+    });
+    Box::pin(pipeline.run_until_serving(
+        &stop,
+        publisher.as_ref(),
+        &slot,
+        |_drive: &mut CompositorDrive<Nv12Image>| {},
+    ))
+    .await
+    .expect("run");
+
+    let mut named_idle = Vec::new();
+    while let Ok(seq) = events.try_recv() {
+        let event = seq.event.as_ref();
+        let text = format!("{event:?}");
+        let idle = (0..50).any(|i| text.contains(&format!("\"idle{i}\"")));
+        let alarm_or_tile = matches!(
+            event,
+            Event::TileState(_) | Event::AlarmRaised(_) | Event::AlarmUpdated(_)
+        );
+        if idle && alarm_or_tile {
+            named_idle.push(text);
+        }
+    }
+    assert!(named_idle.is_empty(), "idle sources raised: {named_idle:?}");
+    assert_eq!(origin.accepted(), 0);
 }

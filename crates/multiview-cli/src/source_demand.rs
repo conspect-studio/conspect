@@ -11,10 +11,7 @@ use std::sync::Arc;
 
 use multiview_config::{MultiviewConfig, Source};
 use multiview_core::layout::{Cell, Layout};
-use multiview_engine::{
-    ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig, DemandManager, Rails, RequestedSize,
-    SetItem,
-};
+use multiview_engine::{ConsumerClass, ConsumerTag, DemandConfig, Rails, RequestedSize, SetItem};
 
 /// What one source must run at boot.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -137,14 +134,15 @@ pub fn layout_items_for(layout: &Layout) -> Vec<SetItem> {
 
 /// The command drain's demand seam: it republishes the layout consumers when
 /// the active layout's bindings change. Every call is wait-free.
+#[cfg(feature = "ffmpeg")]
 #[derive(Clone, Debug)]
 pub struct DrainDemand<T> {
     /// The active layout's consumers.
-    pub layout: ConsumerSet<T>,
+    pub layout: multiview_engine::ConsumerSet<T>,
     /// The subtitle routes' consumers.
-    pub subtitles: ConsumerSet<T>,
+    pub subtitles: multiview_engine::ConsumerSet<T>,
     /// The manager, for restarting an edited source.
-    pub manager: DemandManager<T>,
+    pub manager: multiview_engine::DemandManager<T>,
     /// The configured-source catalogue the rails read.
     pub catalogue: crate::source_rails::Catalogue,
 }
