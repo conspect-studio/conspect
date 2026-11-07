@@ -67,9 +67,7 @@ pub(crate) async fn list_sync_groups(
     // by its OWN id (`get_sync_group` 403s an out-of-scope id), so the list must
     // drop rows outside the allowlist. THEN redact an out-of-scope member device
     // id on a surviving in-scope row. Both are no-ops for an unscoped principal.
-    let groups = state
-        .sync_groups
-        .list()?
+    let groups = crate::boot_model::accepted_family(&state, "sync_groups", &state.sync_groups)?
         .into_iter()
         .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
         .map(|v| {
@@ -104,7 +102,8 @@ pub(crate) async fn get_sync_group(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let mut versioned = state.sync_groups.get(&id)?;
+    let mut versioned =
+        crate::boot_model::accepted_item(&state, "sync_groups", &state.sync_groups, &id)?;
     // Redact out-of-scope member device ids (BOLA visibility, ADR-W005/ADR-W025):
     // the group itself is in scope (authorized above), but its members must not
     // leak device ids the principal could not `GET`. No-op when unscoped.
@@ -146,7 +145,11 @@ pub(crate) async fn create_sync_group(
     };
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    crate::boot_model::require_absent(state.sync_groups.get(&id), SYNC_GROUP_KIND, &id)?;
+    crate::boot_model::require_absent(
+        crate::boot_model::accepted_item(&state, "sync_groups", &state.sync_groups, &id),
+        SYNC_GROUP_KIND,
+        &id,
+    )?;
     crate::boot_model::commit_resource(
         &state,
         "sync_groups",
@@ -155,10 +158,10 @@ pub(crate) async fn create_sync_group(
         Some(input.name.clone()),
     )
     .await?;
-    let versioned = state
-        .sync_groups
-        .create(&id, input)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "sync_groups", &state.sync_groups, &id, || {
+            state.sync_groups.create(&id, input)
+        })?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -203,7 +206,7 @@ pub(crate) async fn update_sync_group(
     // Preconditions before content (RFC 9110 §13.2.2).
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.sync_groups.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "sync_groups", &state.sync_groups, &id)?;
     if_match.require(SYNC_GROUP_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
@@ -217,10 +220,10 @@ pub(crate) async fn update_sync_group(
         Some(input.name.clone()),
     )
     .await?;
-    let versioned = state
-        .sync_groups
-        .update(&id, input)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "sync_groups", &state.sync_groups, &id, || {
+            state.sync_groups.update(&id, input)
+        })?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -261,13 +264,10 @@ pub(crate) async fn delete_sync_group(
     crate::auth::authorize_object(&principal, &id)?;
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.sync_groups.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "sync_groups", &state.sync_groups, &id)?;
     if_match.require(SYNC_GROUP_KIND, &id, current.version)?;
     crate::boot_model::commit_resource(&state, "sync_groups", &id, None, None).await?;
-    state
-        .sync_groups
-        .delete(&id)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    crate::boot_model::project_delete(&state, "sync_groups", &state.sync_groups, &id)?;
     state.audit(
         &principal.key_id,
         AuditAction::Delete,
@@ -309,13 +309,12 @@ pub(crate) async fn measure_sync_group(
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
     // Fail fast on an unknown group before reserving an idempotency key.
-    state
-        .sync_groups
-        .get(&id)
-        .map_err(|_| ControlError::NotFound {
+    crate::boot_model::accepted_item(&state, "sync_groups", &state.sync_groups, &id).map_err(
+        |_| ControlError::NotFound {
             kind: SYNC_GROUP_KIND,
             id: id.clone(),
-        })?;
+        },
+    )?;
     let op = match state.idempotency.reserve(idem.0.as_deref()) {
         Reservation::Fresh(op) | Reservation::Replay(op) => op,
     };

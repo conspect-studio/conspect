@@ -382,7 +382,7 @@ pub fn require_absent<T>(lookup: ControlResult<T>, kind: &str, id: &str) -> Cont
 /// error stands.
 #[must_use]
 pub fn after_commit(state: &AppState, error: ControlError) -> ControlError {
-    if state.boot_model.is_none() {
+    if state.boot_model.is_none() || matches!(error, ControlError::CommitIndeterminate(_)) {
         return error;
     }
     ControlError::CommitIndeterminate(format!(
@@ -1089,6 +1089,274 @@ pub fn accepted_resources(
             })
             .collect(),
     ))
+}
+
+/// Accepted resources of a store-served family (review R2-01): the envelope
+/// once it exists, else the legacy store. Reads, existence checks and
+/// `If-Match` preconditions of every modeled family use this, so a store
+/// projection that failed after a commit can never authorize a stale tag.
+///
+/// # Errors
+/// A corrupt accepted record or a store fault fails closed.
+pub fn accepted_family(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+) -> ControlResult<Vec<crate::resource_store::VersionedResource>> {
+    accepted_resources(state, key)?.map_or_else(|| store.list(), Ok)
+}
+
+/// One accepted resource of a store-served family; see [`accepted_family`].
+///
+/// # Errors
+/// An absent id is `NotFound`; a corrupt record or store fault propagates.
+pub fn accepted_item(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+    id: &str,
+) -> ControlResult<crate::resource_store::VersionedResource> {
+    match accepted_resources(state, key)? {
+        Some(entries) => entries
+            .into_iter()
+            .find(|entry| entry.resource.id == id)
+            .ok_or_else(|| ControlError::NotFound {
+                kind: store.kind(),
+                id: id.to_owned(),
+            }),
+        None => store.get(id),
+    }
+}
+
+/// Whether a modeled run has an authoritative envelope to serve from.
+fn has_envelope(state: &AppState) -> ControlResult<bool> {
+    match &state.boot_model {
+        Some(model) => Ok(load_desired(model.boot_path())
+            .map_err(ControlError::Repository)?
+            .is_some()),
+        None => Ok(false),
+    }
+}
+
+/// Project a just-committed upsert into its store at the exact durable
+/// version (review R2-01/R2-02) and return the accepted entry. A recreated
+/// identity therefore keeps its tombstoned counter, and a failed store write
+/// is logged only: every read already answers from the envelope, and the next
+/// boot rebuilds the store from it. Without an envelope (a store-only run) the
+/// legacy `write` runs and its result stands.
+///
+/// # Errors
+/// A legacy store fault, or an accepted entry that cannot be reread.
+pub fn project_upsert(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+    id: &str,
+    write: impl FnOnce() -> ControlResult<crate::resource_store::VersionedResource>,
+) -> ControlResult<crate::resource_store::VersionedResource> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return write();
+    }
+    let accepted = accepted_item(state, key, store, id).map_err(|e| after_commit(state, e))?;
+    if let Err(error) = store.put_versioned(accepted.clone()) {
+        tracing::warn!(key, id, %error, "accepted change committed; store projection failed");
+    }
+    Ok(accepted)
+}
+
+/// Project a just-committed delete into its store; see [`project_upsert`].
+///
+/// # Errors
+/// A legacy store fault.
+pub fn project_delete(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+    id: &str,
+) -> ControlResult<()> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return store.delete(id);
+    }
+    match store.delete(id) {
+        Ok(()) | Err(ControlError::NotFound { .. }) => {}
+        Err(error) => {
+            tracing::warn!(key, id, %error, "accepted delete committed; store projection failed");
+        }
+    }
+    Ok(())
+}
+
+fn accepted_version(desired: &DesiredState, key: &str, id: &str) -> crate::concurrency::Version {
+    crate::concurrency::Version::new(
+        desired
+            .resource_versions
+            .get(key)
+            .and_then(|map| map.get(id))
+            .copied()
+            .unwrap_or(1)
+            .max(1),
+    )
+}
+
+/// Accepted salvo definitions with durable versions; the store before the first
+/// envelope exists (review R2-01).
+///
+/// # Errors
+/// A corrupt accepted record or a store fault fails closed.
+pub fn accepted_salvos(state: &AppState) -> ControlResult<Vec<crate::salvo_store::VersionedSalvo>> {
+    if let Some(model) = &state.boot_model {
+        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+            let mut out: Vec<_> = desired
+                .config
+                .salvos
+                .iter()
+                .map(|salvo| crate::salvo_store::VersionedSalvo {
+                    version: accepted_version(&desired, "salvos", &salvo.id),
+                    salvo: salvo.clone(),
+                })
+                .collect();
+            out.sort_by(|a, b| a.salvo.id.cmp(&b.salvo.id));
+            return Ok(out);
+        }
+    }
+    state.salvos.list()
+}
+
+/// One accepted salvo; see [`accepted_salvos`].
+///
+/// # Errors
+/// An absent id is `NotFound`.
+pub fn accepted_salvo(
+    state: &AppState,
+    id: &str,
+) -> ControlResult<crate::salvo_store::VersionedSalvo> {
+    if !has_envelope(state)? {
+        return state.salvos.get(id);
+    }
+    accepted_salvos(state)?
+        .into_iter()
+        .find(|entry| entry.salvo.id == id)
+        .ok_or_else(|| ControlError::NotFound {
+            kind: crate::salvo_store::SALVO_KIND,
+            id: id.to_owned(),
+        })
+}
+
+/// Project a committed salvo upsert at its durable version; see [`project_upsert`].
+///
+/// # Errors
+/// A legacy store fault, or an accepted entry that cannot be reread.
+pub fn project_salvo(
+    state: &AppState,
+    id: &str,
+    write: impl FnOnce() -> ControlResult<crate::salvo_store::VersionedSalvo>,
+) -> ControlResult<crate::salvo_store::VersionedSalvo> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return write();
+    }
+    let accepted = accepted_salvo(state, id).map_err(|e| after_commit(state, e))?;
+    if let Err(error) = state.salvos.put_versioned(accepted.clone()) {
+        tracing::warn!(id, %error, "accepted salvo committed; store projection failed");
+    }
+    Ok(accepted)
+}
+
+/// Project a committed salvo delete; see [`project_delete`].
+///
+/// # Errors
+/// A legacy store fault.
+pub fn project_salvo_delete(state: &AppState, id: &str) -> ControlResult<()> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return state.salvos.delete(id);
+    }
+    match state.salvos.delete(id) {
+        Ok(()) | Err(ControlError::NotFound { .. }) => {}
+        Err(error) => {
+            tracing::warn!(id, %error, "accepted salvo delete committed; store projection failed");
+        }
+    }
+    Ok(())
+}
+
+/// Accepted tally profiles with durable versions (review R2-01).
+///
+/// # Errors
+/// A corrupt accepted record or a store fault fails closed.
+pub fn accepted_profiles(
+    state: &AppState,
+) -> ControlResult<Vec<crate::tally_state::VersionedProfile>> {
+    if let Some(model) = &state.boot_model {
+        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+            let mut out: Vec<_> = desired
+                .config
+                .tally_profiles
+                .iter()
+                .map(|profile| crate::tally_state::VersionedProfile {
+                    version: accepted_version(&desired, "tally_profiles", &profile.id),
+                    profile: profile.clone(),
+                })
+                .collect();
+            out.sort_by(|a, b| a.profile.id.cmp(&b.profile.id));
+            return Ok(out);
+        }
+    }
+    state.tally_profiles.list()
+}
+
+/// One accepted tally profile; see [`accepted_profiles`].
+///
+/// # Errors
+/// An absent id is `NotFound`.
+pub fn accepted_profile(
+    state: &AppState,
+    id: &str,
+) -> ControlResult<crate::tally_state::VersionedProfile> {
+    if !has_envelope(state)? {
+        return state.tally_profiles.get(id);
+    }
+    accepted_profiles(state)?
+        .into_iter()
+        .find(|entry| entry.profile.id == id)
+        .ok_or_else(|| ControlError::NotFound {
+            kind: crate::tally_state::TALLY_PROFILE_KIND,
+            id: id.to_owned(),
+        })
+}
+
+/// Project a committed tally-profile upsert at its durable version.
+///
+/// # Errors
+/// A legacy store fault, or an accepted entry that cannot be reread.
+pub fn project_profile(
+    state: &AppState,
+    id: &str,
+    write: impl FnOnce() -> ControlResult<crate::tally_state::VersionedProfile>,
+) -> ControlResult<crate::tally_state::VersionedProfile> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return write();
+    }
+    let accepted = accepted_profile(state, id).map_err(|e| after_commit(state, e))?;
+    if let Err(error) = state.tally_profiles.put_versioned(accepted.clone()) {
+        tracing::warn!(id, %error, "accepted tally profile committed; store projection failed");
+    }
+    Ok(accepted)
+}
+
+/// Project a committed tally-profile delete.
+///
+/// # Errors
+/// A legacy store fault.
+pub fn project_profile_delete(state: &AppState, id: &str) -> ControlResult<()> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return state.tally_profiles.delete(id);
+    }
+    match state.tally_profiles.delete(id) {
+        Ok(()) | Err(ControlError::NotFound { .. }) => {}
+        Err(error) => {
+            tracing::warn!(id, %error, "accepted tally-profile delete committed; store projection failed");
+        }
+    }
+    Ok(())
 }
 
 /// Read the accepted audio singleton with a durable version, or use the

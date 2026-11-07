@@ -59,9 +59,7 @@ pub(crate) async fn list_probes(
     // rows outside the allowlist — exactly as `list_devices` does. A probe
     // carries no embedded device_ref, so the row filter alone is complete; it is
     // a no-op for an unscoped principal.
-    let probes = state
-        .probes
-        .list()?
+    let probes = crate::boot_model::accepted_family(&state, "probes", &state.probes)?
         .into_iter()
         .map(|v| v.resource)
         .filter(|resource| crate::auth::authorize_object(&principal, &resource.id).is_ok())
@@ -92,7 +90,7 @@ pub(crate) async fn get_probe(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.probes.get(&id)?;
+    let versioned = crate::boot_model::accepted_item(&state, "probes", &state.probes, &id)?;
     Ok(probe_response(StatusCode::OK, &versioned))
 }
 
@@ -127,7 +125,11 @@ pub(crate) async fn create_probe(
     };
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    crate::boot_model::require_absent(state.probes.get(&id), PROBE_KIND, &id)?;
+    crate::boot_model::require_absent(
+        crate::boot_model::accepted_item(&state, "probes", &state.probes, &id),
+        PROBE_KIND,
+        &id,
+    )?;
     crate::boot_model::commit_resource(
         &state,
         "probes",
@@ -136,10 +138,10 @@ pub(crate) async fn create_probe(
         Some(input.name.clone()),
     )
     .await?;
-    let versioned = state
-        .probes
-        .create(&id, input)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "probes", &state.probes, &id, || {
+            state.probes.create(&id, input)
+        })?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -186,7 +188,7 @@ pub(crate) async fn update_probe(
     // submitted body is itself invalid.
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.probes.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "probes", &state.probes, &id)?;
     if_match.require(PROBE_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
@@ -200,10 +202,10 @@ pub(crate) async fn update_probe(
         Some(input.name.clone()),
     )
     .await?;
-    let versioned = state
-        .probes
-        .update(&id, input)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "probes", &state.probes, &id, || {
+            state.probes.update(&id, input)
+        })?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -244,13 +246,10 @@ pub(crate) async fn delete_probe(
     crate::auth::authorize_object(&principal, &id)?;
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.probes.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "probes", &state.probes, &id)?;
     if_match.require(PROBE_KIND, &id, current.version)?;
     crate::boot_model::commit_resource(&state, "probes", &id, None, None).await?;
-    state
-        .probes
-        .delete(&id)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    crate::boot_model::project_delete(&state, "probes", &state.probes, &id)?;
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

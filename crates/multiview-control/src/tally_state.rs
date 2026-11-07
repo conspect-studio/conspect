@@ -246,6 +246,14 @@ pub trait TallyProfileRepository: Send + Sync + 'static {
     ///
     /// [`ControlError::NotFound`] if no profile has that id.
     fn delete(&self, id: &str) -> ControlResult<()>;
+
+    /// Insert or replace a profile at an exact, already-committed version
+    /// (the durable envelope allocates it; review R2-02).
+    ///
+    /// # Errors
+    ///
+    /// [`ControlError::Repository`] on a backing-store fault.
+    fn put_versioned(&self, entry: VersionedProfile) -> ControlResult<VersionedProfile>;
 }
 
 /// An in-memory [`TallyProfileRepository`] backed by a `Mutex<HashMap>`.
@@ -328,6 +336,11 @@ impl TallyProfileRepository for InMemoryProfileStore {
                 id: id.to_owned(),
             })
         }
+    }
+
+    fn put_versioned(&self, entry: VersionedProfile) -> ControlResult<VersionedProfile> {
+        self.lock().insert(entry.profile.id.clone(), entry.clone());
+        Ok(entry)
     }
 }
 

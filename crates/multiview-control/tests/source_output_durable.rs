@@ -68,6 +68,9 @@ impl ResourceRepository for FailedProjection {
     fn delete(&self, _: &str) -> ControlResult<()> {
         Err(fault())
     }
+    fn put_versioned(&self, _: VersionedResource) -> ControlResult<VersionedResource> {
+        Err(fault())
+    }
 }
 
 #[tokio::test]

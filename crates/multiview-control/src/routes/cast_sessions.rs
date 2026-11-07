@@ -543,7 +543,7 @@ pub(crate) async fn save_cast_session(
     // projection; a duplicate id is refused (409) before any durable write.
     let _mutation = state.lock_config_mutation().await;
     crate::boot_model::require_absent(
-        state.devices.get(&request.device_id),
+        crate::boot_model::accepted_item(&state, "devices", &state.devices, &request.device_id),
         DEVICE_KIND,
         &request.device_id,
     )
@@ -564,20 +564,28 @@ pub(crate) async fn save_cast_session(
     // Mirror the devices create route: clear any tombstone only while owning
     // the config lock, so an in-flight delete cannot tombstone after this.
     state.device_pollers.clear_tombstone(&request.device_id);
-    let versioned = state
-        .devices
-        .create(&request.device_id, ResourceInput { name, body })
-        .map_err(|err| match err {
-            // The store reports a duplicate id as `Validation` (the only
-            // `Validation` its `create` produces — the body was validated
-            // above); for the save promotion the honest status is a `409`:
-            // a device with that id already exists. Race-free (the store
-            // checks under its own lock), unlike a get-then-create probe.
-            ControlError::Validation(_) => {
-                ControlError::Conflict(format!("device {:?} already exists", request.device_id))
-            }
-            other => crate::boot_model::after_commit(&state, other),
-        })?;
+    let versioned = crate::boot_model::project_upsert(
+        &state,
+        "devices",
+        &state.devices,
+        &request.device_id,
+        || {
+            state
+                .devices
+                .create(&request.device_id, ResourceInput { name, body })
+        },
+    )
+    .map_err(|err| match err {
+        // The store reports a duplicate id as `Validation` (the only
+        // `Validation` its `create` produces — the body was validated
+        // above); for the save promotion the honest status is a `409`:
+        // a device with that id already exists. Race-free (the store
+        // checks under its own lock), unlike a get-then-create probe.
+        ControlError::Validation(_) => {
+            ControlError::Conflict(format!("device {:?} already exists", request.device_id))
+        }
+        other => crate::boot_model::after_commit(&state, other),
+    })?;
     state.device_status.ensure(&request.device_id);
 
     // Retire the ephemeral actor + record. A plain stop (abort) — NOT the
