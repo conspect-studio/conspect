@@ -12550,6 +12550,10 @@ fn open_and_stream(
     // Kept alive for this connection: the loopback server libav reads from.
     let mut hls_fetcher: Option<crate::hls_fetch::HlsFetcher> = None;
     let mut hls_event_bridge = None;
+    // An SRT listener's private in-process stream (`pipe:<fd>`), declared
+    // before `input` so libav closes its duplicate first.
+    #[cfg(feature = "srt-libsrt")]
+    let mut _srt_reader: Option<crate::srt_ingest::SrtReader> = None;
     let mut input = match &plan.location {
         SourceLocation::Path(p) => {
             ffmpeg::format::input_with_dictionary(p, opts).map_err(|e| e.to_string())?
@@ -12565,16 +12569,17 @@ fn open_and_stream(
             // the post-open discard + reconnect bracket as the remaining guards
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
             let open_url = main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h);
-            // libav cannot bind a dual-stack SRT listener: read its local relay.
-            // Without `srt-libsrt` a listener URL never reaches here —
+            // libav cannot bind a dual-stack SRT listener: read the shared
+            // bridge through a private socketpair (no listening socket). Without `srt-libsrt` a listener URL never reaches here —
             // `ingest_plan_for`'s `srt_resolved_url` already failed the build
             // closed for one (ADR-0039 decision 10, amended) — so this branch
             // is unreachable in that build and compiled out.
             #[cfg(feature = "srt-libsrt")]
             let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
-                crate::srt_ingest::acquire(&open_url)?
-                    .local_url()
-                    .to_owned()
+                let reader = crate::srt_ingest::acquire(&open_url)?.open_reader()?;
+                let url = reader.url().to_owned();
+                _srt_reader = Some(reader);
+                url
             } else {
                 open_url
             };
