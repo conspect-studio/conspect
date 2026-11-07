@@ -86,3 +86,32 @@ pub enum YoutubeError {
     #[error("yt-dlp extraction failed: {0}")]
     Resolve(String),
 }
+
+impl YoutubeError {
+    /// The honest, operator-facing reason a `youtube` source failed to resolve,
+    /// distinct from [`std::fmt::Display`] (which is the lower-level `tracing`
+    /// line): this is the short, non-technical text surfaced on the tile/source
+    /// status so an operator sees *why*, not a generic "ingest stream
+    /// ended/errored".
+    ///
+    /// Three honest cases, matching the brief:
+    /// - [`Self::NotLive`] ⇒ `"not a live stream (status: …)"` naming the exact
+    ///   yt-dlp classification ([`LiveStatus::wire_label`]) — `was_live` /
+    ///   `not_live` / `upcoming` / `post_live` (or `unknown` for a
+    ///   yt-dlp-emitted status this resolver does not model).
+    /// - [`Self::Unavailable`] ⇒ `"yt-dlp not found on the server"` (the
+    ///   capability gate's message, never a raw spawn-error dump).
+    /// - every other variant ⇒ the resolver's own [`std::fmt::Display`] text
+    ///   (JSON parse failure, no HLS master, or a yt-dlp extraction failure),
+    ///   which is already a plain-English sentence.
+    #[must_use]
+    pub fn operator_message(&self) -> String {
+        match self {
+            Self::NotLive(status) => {
+                format!("not a live stream (status: {})", status.wire_label())
+            }
+            Self::Unavailable(_) => "yt-dlp not found on the server".to_owned(),
+            other => other.to_string(),
+        }
+    }
+}

@@ -60,9 +60,27 @@ fn require_all_in_scope(principal: &Principal, config: &IptvConfig) -> ControlRe
     Ok(())
 }
 
+/// The publication `ETag`: the durable envelope version plus the content
+/// digest. The version strictly advances on every accepted change and survives
+/// restart, so an A→B→A edit can never hand a stale client its old tag back
+/// (a pure content hash would). Without a boot model nothing is durable and
+/// the content digest alone is used.
+fn publication_etag(state: &AppState, config: &IptvConfig) -> ControlResult<String> {
+    let digest = iptv::config_etag(config);
+    let version =
+        crate::boot_model::accepted_version(state, crate::boot_model::IPTV_KEY, "singleton")?;
+    Ok(version.map_or_else(
+        || digest.clone(),
+        |version| {
+            let content = digest.trim_matches('"').trim_start_matches("iptv-");
+            format!("\"iptv-v{}-{content}\"", version.get())
+        },
+    ))
+}
+
 fn envelope(state: &AppState, principal: &Principal) -> ControlResult<(IptvState, String)> {
     let publication = iptv::publication(state)?;
-    let etag = iptv::config_etag(&publication.config);
+    let etag = publication_etag(state, &publication.config)?;
     let mut config = publication.config.clone();
     config
         .entries
@@ -149,7 +167,7 @@ pub(crate) async fn put_iptv(
     let _mutation = state.lock_config_mutation().await;
     let (current_config, sources, outputs) = iptv::accepted_inputs(&state)?;
     let current_config = current_config.unwrap_or_default();
-    let current = iptv::config_etag(&current_config);
+    let current = publication_etag(&state, &current_config)?;
     let presented = headers
         .get(header::IF_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -191,11 +209,12 @@ pub(crate) async fn put_iptv(
     if state.boot_model.is_some() {
         let value = serde_json::to_value(&config)
             .map_err(|e| ControlError::Repository(format!("iptv serialization: {e}")))?;
-        let prospective = crate::boot_model::prospective_config(&state, "iptv", value)?;
-        crate::boot_model::commit_desired(
+        crate::boot_model::commit_resource(
             &state,
-            prospective,
-            crate::boot_model::layout_library(&state)?,
+            crate::boot_model::IPTV_KEY,
+            "singleton",
+            Some(value),
+            None,
         )
         .await?;
     } else {

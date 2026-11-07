@@ -113,7 +113,7 @@ fn public(path: &str) -> Request<Body> {
 #[tokio::test]
 async fn publication_round_trips_durably_and_serves_public_files() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, path) = durable_state(dir.path()).await;
+    let (state, path) = Box::pin(durable_state(dir.path())).await;
     let router = multiview_control::router(state);
 
     // Disabled by default: the public files 404, the API answers 200.
@@ -216,7 +216,7 @@ async fn publication_round_trips_durably_and_serves_public_files() {
 #[tokio::test]
 async fn invalid_references_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, _) = durable_state(dir.path()).await;
+    let (state, _) = Box::pin(durable_state(dir.path())).await;
     let router = multiview_control::router(state);
     let tag = etag(&send(&router, get("/api/v1/iptv", ADMIN_TOKEN)).await).unwrap();
     for (doc, why) in [
@@ -254,7 +254,7 @@ async fn invalid_references_are_rejected() {
 #[tokio::test]
 async fn scoped_principals_cannot_publish_or_see_out_of_scope_objects() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, _) = durable_state(dir.path()).await;
+    let (state, _) = Box::pin(durable_state(dir.path())).await;
     let router = multiview_control::router(state);
     let tag = etag(&send(&router, get("/api/v1/iptv", ADMIN_TOKEN)).await).unwrap();
     // SCOPED_TOKEN is an operator scoped to the single object id "scoped-layout".
@@ -289,7 +289,7 @@ async fn scoped_principals_cannot_publish_or_see_out_of_scope_objects() {
 #[tokio::test]
 async fn deleting_a_published_source_drops_it_from_the_playlist() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, _) = durable_state(dir.path()).await;
+    let (state, _) = Box::pin(durable_state(dir.path())).await;
     let router = multiview_control::router(state);
     let tag = etag(&send(&router, get("/api/v1/iptv", ADMIN_TOKEN)).await).unwrap();
     let doc = json!({"enabled": true, "entries": [{"kind": "source", "ref": "bars", "allow_direct_source_url": true}, {"kind": "output", "ref": "output-0"}]});

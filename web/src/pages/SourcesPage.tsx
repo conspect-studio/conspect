@@ -71,6 +71,8 @@ import { TileStateBadge } from '../components/TileStateBadge';
 import { SourceDemandBadge } from '../components/SourceDemandBadge';
 import { useSourceStatus } from '../api/sourceStatus';
 import type { SourceDemand } from '../api/sourceStatus';
+import { useSystemCapabilities } from '../api/systemQueries';
+import { Info, TriangleAlert } from 'lucide-react';
 
 /** The form-kind options offered in the picker (no legacy alias). */
 const FORM_KINDS: readonly SourceFormKind[] = SOURCE_KINDS.filter(
@@ -109,6 +111,55 @@ function SourceStatusCell({
       <SourceDemandBadge demand={demand} />
       {running && tile !== undefined && demand.phase !== 'live' ? <TileStateBadge state={tile.state} /> : null}
     </span>
+  );
+}
+
+/**
+ * The `youtube` source kind's live-only note + VT redirect, plus an honest
+ * capability warning when this server cannot actually resolve a YouTube URL
+ * right now (the `youtube` build feature off, or `yt-dlp` not found on the
+ * server). Rendered under the URL field so an operator sees both the scope
+ * limitation and the current server capability before saving.
+ */
+function YoutubeKindNote(): JSX.Element {
+  const { data: capabilities } = useSystemCapabilities();
+  const youtube = capabilities?.youtube ?? undefined;
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="flex items-start gap-2 text-xs text-muted-foreground">
+        <Info className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        <span>
+          <Trans>
+            Live streams only: this resolves a currently-broadcasting YouTube
+            URL, never a pre-recorded/past video. To play a pre-recorded video,
+            use a VT clip instead (not built yet).
+          </Trans>
+        </span>
+      </p>
+      {youtube !== undefined && !youtube.available ? (
+        <p
+          role="note"
+          className="flex items-start gap-2 rounded-md border border-status-stale/40 bg-status-stale/15 p-2 text-xs"
+        >
+          <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          <span>
+            {youtube.compiled ? (
+              <Trans>
+                This server cannot resolve YouTube sources right now: `yt-dlp`
+                was not found. A saved source will stay `NO_SIGNAL` until the
+                server operator installs it.
+              </Trans>
+            ) : (
+              <Trans>
+                This server build does not include YouTube live ingest. A
+                saved source will stay `NO_SIGNAL` until it is rebuilt with
+                the `youtube` feature.
+              </Trans>
+            )}
+          </span>
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -155,6 +206,7 @@ function SourceKindFields({
             setForm({ ...form, url: next });
           }}
         />
+        {form.kind === 'youtube' ? <YoutubeKindNote /> : null}
         {form.kind === 'rtsp' ? (
           <SelectField<RtspTransportChoice>
             label={t`RTSP transport`}

@@ -143,11 +143,19 @@ pub(crate) async fn put_salvo(
         .validate()
         .map_err(|e| crate::error::ControlError::Validation(e.to_string()))?;
 
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
+    let durable = crate::boot_model::config_value(&salvo)?;
     match state.salvos.get(&id) {
         Ok(current) => {
             // Replace: enforce the optimistic-concurrency precondition first.
             if_match.require(SALVO_KIND, &id, current.version)?;
-            let versioned = state.salvos.update(&id, salvo)?;
+            crate::boot_model::commit_resource(&state, "salvos", &id, Some(durable), None).await?;
+            let versioned = state
+                .salvos
+                .update(&id, salvo)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             // ADR-W024 round 6: a salvo definition is runtime-mutable running
             // state composed into active.toml; audit (the ONE persist choke
             // point) so the debounced persister captures the edit. The store
@@ -162,7 +170,11 @@ pub(crate) async fn put_salvo(
             Ok(salvo_response(StatusCode::OK, &versioned))
         }
         Err(crate::error::ControlError::NotFound { .. }) => {
-            let versioned = state.salvos.create(salvo)?;
+            crate::boot_model::commit_resource(&state, "salvos", &id, Some(durable), None).await?;
+            let versioned = state
+                .salvos
+                .create(salvo)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             state.audit(
                 &principal.key_id,
                 AuditAction::Create,
@@ -185,9 +197,16 @@ pub(crate) async fn delete_salvo(
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.salvos.get(&id)?;
     if_match.require(SALVO_KIND, &id, current.version)?;
-    state.salvos.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "salvos", &id, None, None).await?;
+    state
+        .salvos
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     // ADR-W024 round 6: removing a runtime-mutable salvo definition changes the
     // composed running state — audit so the persister rewrites active.toml.
     state.audit(

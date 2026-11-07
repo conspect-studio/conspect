@@ -20,6 +20,8 @@ export type CompositorCapability = components['schemas']['CompositorCapability']
 export type BuildInfo = components['schemas']['BuildInfo'];
 /** The effective build-profile licence literal (`LGPL-clean` | `GPL`). */
 export type EffectiveLicense = components['schemas']['EffectiveLicense'];
+/** The `youtube` source kind's resolve capability (ADR-0015). */
+export type YoutubeCapability = components['schemas']['YoutubeCapability'];
 
 export { OperationApiError } from './operations';
 export type { RequestOptions } from './operations';

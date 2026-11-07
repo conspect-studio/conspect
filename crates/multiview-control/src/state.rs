@@ -788,6 +788,20 @@ pub struct AppState {
     /// or realtime surfaces — and only to requests that carry an `Origin` (a
     /// non-browser publisher/player sees no CORS headers). Default `["*"]`.
     pub cors_allow_origins: Arc<Vec<String>>,
+    /// The externally-reachable **hostname** (no scheme, no port) viewer
+    /// playback URLs are derived against (`[control] public_host`, ADR-0101).
+    /// `None` ⇒ `GET /api/v1/outputs/{id}/playback` falls back to the
+    /// request's own `Host` header (nginx passes it through unchanged) and,
+    /// failing that, returns an honest "no public host known" note instead of
+    /// a guessed URL. Read-only control-plane state (invariant #10).
+    pub public_host: Option<Arc<str>>,
+    /// An explicit `[control] public_scheme` override (`"http"` or
+    /// `"https"`) for the scheme used to build an absolute viewer URL, when
+    /// the per-request `X-Forwarded-Proto` header is absent/invalid — see
+    /// [`multiview_config::resolve_public_scheme`]. `None` ⇒ no override (the
+    /// `X-Forwarded-Proto` header, else the `public_host`-configured default,
+    /// decides). Read-only control-plane state (invariant #10).
+    pub public_scheme: Option<Arc<str>>,
     /// The complete configuration document loaded at startup (serialized
     /// verbatim), used as the baseline for `GET /api/v1/config/export` so
     /// sections the resource stores do not carry (control, placement, audio,
@@ -1033,6 +1047,13 @@ impl AppState {
             // §9): a browser served from any web origin can WHIP-publish /
             // WHEP-play. The binary narrows this from `webrtc.cors_allow_origins`.
             cors_allow_origins: Arc::new(vec!["*".to_owned()]),
+            // No configured public_host by default: the playback route falls
+            // back to the request Host header, then an honest note.
+            public_host: None,
+            // No configured public_scheme override by default:
+            // X-Forwarded-Proto, then the public_host-configured default,
+            // decides.
+            public_scheme: None,
             // Empty + unpinned by default: the licence resource reports
             // unlicensed data and the install path refuses until the binary
             // pins an issuer key + wires a store (CONSPECT-10). Never off air.
@@ -1352,6 +1373,27 @@ impl AppState {
     #[must_use]
     pub fn with_cors_allow_origins(mut self, origins: Vec<String>) -> Self {
         self.cors_allow_origins = Arc::new(origins);
+        self
+    }
+
+    /// Set the externally-reachable `[control] public_host` viewer playback
+    /// URLs are derived against (ADR-0101). The binary maps
+    /// `config.control.public_host` through here; `None`/absent keeps the
+    /// request-`Host`-header fallback.
+    #[must_use]
+    pub fn with_public_host(mut self, public_host: Option<String>) -> Self {
+        self.public_host = public_host.map(Arc::from);
+        self
+    }
+
+    /// Set the `[control] public_scheme` override (ADR-0101 scheme
+    /// derivation) for the scheme used to build an absolute viewer URL. The
+    /// binary maps `config.control.public_scheme` through here; `None`/absent
+    /// keeps the `X-Forwarded-Proto`-header-then-`public_host`-default
+    /// derivation.
+    #[must_use]
+    pub fn with_public_scheme(mut self, public_scheme: Option<String>) -> Self {
+        self.public_scheme = public_scheme.map(Arc::from);
         self
     }
 

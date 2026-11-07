@@ -225,7 +225,22 @@ pub(crate) async fn create_overlay(
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // store-write → submit → adopt-snapshot sequence.
     let _mutation = state.lock_config_mutation().await;
-    let versioned = state.overlays.create(&id, input)?;
+    // Review H1: the durable desired envelope is the single source of truth.
+    // Check the store precondition, commit the prospective document, THEN
+    // project into the store (the same order as sources/outputs).
+    crate::boot_model::require_absent(state.overlays.get(&id), OVERLAY_KIND, &id)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "overlays",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .overlays
+        .create(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -283,7 +298,18 @@ pub(crate) async fn update_overlay(
         name: input.name,
         body: validated_body(TypedCollection::Overlays, &id, &input.body)?,
     };
-    let versioned = state.overlays.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "overlays",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .overlays
+        .update(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -333,7 +359,11 @@ pub(crate) async fn delete_overlay(
     let current = state.overlays.get(&id)?;
     if_match.require(OVERLAY_KIND, &id, current.version)?;
     let previous = parse_stored_overlay(&current.resource.body);
-    state.overlays.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "overlays", &id, None, None).await?;
+    state
+        .overlays
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

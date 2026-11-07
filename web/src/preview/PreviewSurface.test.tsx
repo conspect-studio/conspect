@@ -118,7 +118,7 @@ describe('<PreviewSurface>', () => {
     expect(queryByTestId('whep-player')).toBeNull();
   });
 
-  it('does not pretend JPEG is a live input when the scope advertises no whep', () => {
+  it('renders the JPEG rung with NO badge for an input scope that advertises no whep (honest primary)', () => {
     const { getByTestId, queryByTestId } = renderWithProviders(
       <PreviewSurface
         scope="input"
@@ -134,8 +134,9 @@ describe('<PreviewSurface>', () => {
         })}
       />,
     );
-    expect(queryByTestId('jpeg-rung')).toBeNull();
-    expect(getByTestId('input-preview-unavailable')).toBeInTheDocument();
+    expect(getByTestId('jpeg-rung')).toBeInTheDocument();
+    expect(getByTestId('still-preview-label')).toHaveTextContent('Still preview (~1 fps)');
+    expect(queryByTestId('input-preview-unavailable')).toBeNull();
     expect(queryByTestId('fallback-badge')).toBeNull();
   });
 
