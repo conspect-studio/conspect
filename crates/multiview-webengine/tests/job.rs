@@ -155,7 +155,7 @@ fn a_repeat_trigger_for_a_fill_queued_or_running_coalesces() {
         queue
             .trigger(fill("radar"), id("job-3"))
             .expect("coalesces"),
-        Trigger::Coalesced(id("job-1"))
+        Trigger::RerunQueued(id("job-1"))
     );
     assert_eq!(queue.pending_len(), 0, "no extra job was queued");
     assert_eq!(queue.running_len(), 1);

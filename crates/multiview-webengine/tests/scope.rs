@@ -300,18 +300,42 @@ fn a_process_tree_scope_without_a_real_starttime_is_refused_at_registration() {
     );
 }
 
+#[cfg(target_os = "linux")]
+/// Kills and reaps the child on drop, so a failed assertion cannot leak it.
+struct ReapOnDrop(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn register_spawned_reads_the_starttime_while_the_child_handle_is_held() {
     // MEDIUM: registration took a bare pid. `register_spawned` takes the live
     // `Child`, so the pid cannot have been reaped and reused before the read.
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
+    if std::process::Command::new("sleep")
+        .arg("0")
+        .status()
+        .map_or(true, |status| !status.success())
+    {
+        eprintln!("skipping: `sleep` is not available on PATH");
+        return;
+    }
+    let mut guard = ReapOnDrop(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep"),
+    );
+    let child = &mut guard.0;
     let mut registry = ScopeRegistry::new();
     let name = owner("spawned");
     let generation = registry
-        .register_spawned(name.clone(), &child, std::path::Path::new("/"))
+        .register_spawned(name.clone(), &*child, std::path::Path::new("/"))
         .expect("a live child registers");
     let scope = registry.get(&name).expect("registered").clone();
     assert_eq!(scope.generation, generation);
@@ -328,7 +352,7 @@ fn register_spawned_reads_the_starttime_while_the_child_handle_is_held() {
     child.kill().expect("kill");
     child.wait().expect("reap");
     let other = owner("late");
-    let result = registry.register_spawned(other.clone(), &child, std::path::Path::new("/"));
+    let result = registry.register_spawned(other.clone(), &*child, std::path::Path::new("/"));
     assert!(result.is_err(), "a reaped child has no identity to read");
     assert!(registry.get(&other).is_none());
 }
