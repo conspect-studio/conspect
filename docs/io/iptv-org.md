@@ -272,8 +272,9 @@ The mockup uses real rows from the 2026-11-07 snapshot; only the layout is illus
 └───────────────────────────────────────────────┴─────────────────────────────┘
 ```
 
-- **Place search** over every country, subdivision, city and region name in the gazetteer
-  (incl. alternative names), typo-tolerant, offline. Choosing a place flies the map there.
+- **Place search** over every country, subdivision, city and region name in the gazetteer,
+  typo-tolerant, offline. iptv-org publishes one name per place, so `alt` is empty and alternative
+  spellings match only through typo tolerance. Choosing a place flies the map there.
 - **Locality-ranked results:** this city → cities within the radius (great-circle) → the
   subdivision → the country → regions that include it. Each tier shows its count; the national
   tier is collapsed by default so local results lead.
