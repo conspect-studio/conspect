@@ -735,9 +735,9 @@
    "feed": "SD",
    "k": "s:kckslld001",
    "url": "http://example.test/kcks/index.m3u8",
-   "title": "KCKS-LD 25.3",
-   "ch": "KCKSLD.us",
-   "name": "KCKS-LD",
+   "title": "Kansas Statewide TV",
+   "ch": "KSStatewide.us",
+   "name": "Kansas Statewide",
    "area": [
     "s/US-KS"
    ],

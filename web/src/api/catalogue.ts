@@ -271,8 +271,8 @@ async function request<T>(
   if (!response.ok) {
     let message = `Request failed (${String(response.status)})`;
     try {
-      const body = (await response.json()) as { title?: unknown };
-      if (typeof body.title === 'string') {
+      const body: unknown = await response.json();
+      if (typeof body === 'object' && body !== null && 'title' in body && typeof body.title === 'string') {
         message = body.title;
       }
     } catch {
@@ -280,6 +280,8 @@ async function request<T>(
     }
     throw new CatalogueApiError(message, response.status);
   }
+  // The wire type is trusted until the generated schema replaces this module.
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   return (await response.json()) as T;
 }
 

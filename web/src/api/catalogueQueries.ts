@@ -21,8 +21,8 @@ import type {
 } from './catalogue';
 
 /** Catalogue status (sync state, counts, optional server location). */
-export function useCatalogueStatus(): UseQueryResult<CatalogueStatus, Error> {
-  return useQuery<CatalogueStatus, Error>({
+export function useCatalogueStatus(): UseQueryResult<CatalogueStatus> {
+  return useQuery<CatalogueStatus>({
     queryKey: ['catalogue', 'iptv-org', 'status'],
     queryFn: () => fetchStatus(),
     retry: false,
@@ -30,8 +30,8 @@ export function useCatalogueStatus(): UseQueryResult<CatalogueStatus, Error> {
 }
 
 /** The joined index (large; cached for the session — the server ETags it). */
-export function useCatalogueIndex(): UseQueryResult<CatalogueIndex, Error> {
-  return useQuery<CatalogueIndex, Error>({
+export function useCatalogueIndex(): UseQueryResult<CatalogueIndex> {
+  return useQuery<CatalogueIndex>({
     queryKey: ['catalogue', 'iptv-org', 'index'],
     queryFn: () => fetchIndex(),
     staleTime: 5 * 60_000,
@@ -39,8 +39,8 @@ export function useCatalogueIndex(): UseQueryResult<CatalogueIndex, Error> {
 }
 
 /** The place gazetteer slice. */
-export function useCataloguePlaces(): UseQueryResult<PlacesResponse, Error> {
-  return useQuery<PlacesResponse, Error>({
+export function useCataloguePlaces(): UseQueryResult<PlacesResponse> {
+  return useQuery<PlacesResponse>({
     queryKey: ['catalogue', 'iptv-org', 'places'],
     queryFn: () => fetchPlaces(),
     staleTime: 5 * 60_000,
@@ -48,8 +48,8 @@ export function useCataloguePlaces(): UseQueryResult<PlacesResponse, Error> {
 }
 
 /** Per-source link statuses (Sources page). Degrades quietly if unavailable. */
-export function useCatalogueLinks(enabled = true): UseQueryResult<LinksResponse, Error> {
-  return useQuery<LinksResponse, Error>({
+export function useCatalogueLinks(enabled = true): UseQueryResult<LinksResponse> {
+  return useQuery<LinksResponse>({
     queryKey: ['catalogue', 'iptv-org', 'links'],
     queryFn: () => fetchLinks(),
     enabled,

@@ -62,6 +62,14 @@ export const router = createBrowserRouter([
       { path: "layouts/new", element: <LayoutEditorPage /> },
       { path: "layouts/:id", element: <LayoutEditorPage /> },
       { path: "sources", element: <SourcesPage /> },
+      {
+        // A sub-page of Sources (no nav item): lazy so maplibre-gl stays out of
+        // the main bundle.
+        path: "sources/iptv-org",
+        lazy: async () => ({
+          Component: (await import("../iptv/IptvOrgPage")).IptvOrgPage,
+        }),
+      },
       { path: "outputs", element: <OutputsPage /> },
       { path: "overlays", element: <OverlaysPage /> },
       { path: "audio", element: <AudioPage /> },
