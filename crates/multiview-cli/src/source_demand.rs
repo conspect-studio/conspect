@@ -80,6 +80,23 @@ pub fn standing_pins(source: &Source) -> Vec<StandingPin> {
     pins
 }
 
+/// Whether `a` and `b` define the same media: they differ at most in standing
+/// policy (armed automation, activation), which changes leases, never the
+/// producer (review DMD-09).
+#[must_use]
+pub fn same_media(a: &Source, b: &Source) -> bool {
+    let strip = |source: &Source| {
+        let mut source = source.clone();
+        source.activation = None;
+        source.demand = None;
+        if let Some(events) = source.events.as_mut() {
+            events.automation = None;
+        }
+        source
+    };
+    strip(a) == strip(b)
+}
+
 /// The audio-route consumers of a routing document: any route names a consumer,
 /// even a muted one, because a route is also how its meter reaches an operator.
 #[must_use]
@@ -519,6 +536,29 @@ target = "slate""#
         let live = demand(&config(&armed(true), ""));
         assert_eq!(live["watched"].rails, Rails::VIDEO);
         assert_eq!(live["slate"].rails, Rails::VIDEO);
+    }
+
+    #[test]
+    fn policy_only_edits_keep_the_same_media() {
+        let base: Source = serde_json::from_value(serde_json::json!({
+            "id": "w", "kind": "hls", "url": "https://example.test/w.m3u8",
+            "events": {"automation": {"armed": false, "on_break_start": {"action": "swap_cell", "target": "s"}}}
+        }))
+        .unwrap();
+        let mut armed = base.clone();
+        armed
+            .events
+            .as_mut()
+            .unwrap()
+            .automation
+            .as_mut()
+            .unwrap()
+            .armed = true;
+        armed.activation = Some(multiview_config::SourceActivation::OnDemand);
+        assert!(same_media(&base, &armed));
+        let mut moved = base.clone();
+        moved.kind = multiview_config::SourceKind::Bars;
+        assert!(!same_media(&base, &moved));
     }
 
     #[test]

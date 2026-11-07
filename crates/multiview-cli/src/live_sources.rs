@@ -209,6 +209,14 @@ pub trait IngestSpawner: Send + Sync {
         false
     }
 
+    /// Apply an upsert that changes only standing policy (armed automation,
+    /// activation) without touching the producer. Returns `true` when it was
+    /// applied that way, so the hub neither tears down nor respawns (review
+    /// DMD-09). Hub worker only.
+    fn update_policy(&self, _spawn: &SourceSpawn) -> bool {
+        false
+    }
+
     /// A source now running without decoded audio. Hub worker only.
     fn source_without_audio(&self, _id: &str) {}
 
@@ -407,6 +415,11 @@ fn worker_loop(
                     ingest.source_without_audio(&spawn.id);
                 }
                 spawn_synth(spawn, &mut owned, registry, preview);
+            }
+            HubRequest::SpawnSource(spawn)
+                if ingest.is_some_and(|ingest| ingest.update_policy(&spawn)) =>
+            {
+                // Same media definition: the running producer stays untouched.
             }
             HubRequest::SpawnSource(spawn) => {
                 // The decoded-kind edit mirror of SpawnSynth: stop the old

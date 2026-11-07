@@ -7345,6 +7345,26 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
         true
     }
 
+    fn update_policy(&self, spawn: &crate::live_sources::SourceSpawn) -> bool {
+        let Some((catalogue, manager)) = &self.demand else {
+            return false;
+        };
+        let unchanged = catalogue
+            .load()
+            .get(&spawn.source.id)
+            .is_some_and(|entry| crate::source_demand::same_media(entry.source(), &spawn.source));
+        if !unchanged {
+            return false;
+        }
+        // Keep the catalogued store: the running producer publishes into it.
+        let _ = crate::source_rails::catalogue_upsert(catalogue, &spawn.source);
+        manager.set_pins(
+            &spawn.source.id,
+            crate::source_demand::standing_pins(&spawn.source),
+        );
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     // reason: the hub worker configures separate native caption forms and the
     // video producer together; no part of this runs on the output clock.

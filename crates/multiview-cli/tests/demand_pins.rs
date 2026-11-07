@@ -118,3 +118,91 @@ async fn boot_pins_are_owned_by_their_source_and_merge() {
     assert_eq!(watched, vec![(ConsumerClass::AlwaysOn, "always_on".into())]);
     demand.stop_all();
 }
+
+fn bars_doc(armed: bool) -> MultiviewConfig {
+    let mut doc = config(true);
+    let mut source = doc
+        .sources
+        .iter()
+        .find(|s| s.id == "watched")
+        .unwrap()
+        .clone();
+    source.id = "cam".into();
+    source.kind = multiview_config::SourceKind::Bars;
+    if let Some(rule) = source
+        .events
+        .as_mut()
+        .and_then(|events| events.automation.as_mut())
+    {
+        rule.armed = armed;
+    }
+    doc.sources.push(source);
+    doc
+}
+
+/// Review DMD-09: arming or disarming automation through the live-source hub
+/// changes pins only; the running producer is not restarted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arming_or_disarming_automation_never_restarts_the_producer() {
+    let doc = bars_doc(false);
+    let mut pipeline = Pipeline::build(&doc).expect("builds");
+    let demand = pipeline.demand();
+    demand.start();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !demand.status("cam").running.video {
+        assert!(
+            std::time::Instant::now() < end,
+            "{:?}",
+            demand.status("cam")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let generation = demand.status("cam").generation;
+    let transitions = demand.transitions();
+    let hub = multiview_cli::live_sources::LiveSourceHub::start_with_ingest(
+        pipeline.stop_registry(),
+        multiview_cli::live_sources::shared_stores(std::collections::HashMap::new()),
+        Some(pipeline.live_ingest_spawner()),
+    );
+    let handle = hub.handle();
+    for armed in [true, false, true] {
+        let source = bars_doc(armed)
+            .sources
+            .into_iter()
+            .find(|s| s.id == "cam")
+            .unwrap();
+        let store = pipeline.catalogue().load()["cam"].store().clone();
+        assert_eq!(
+            handle.request_spawn_source(SourceSpawn { source, store }),
+            multiview_cli::live_sources::HubSubmit::Accepted
+        );
+        let want = usize::from(armed);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while demand
+            .status("slate")
+            .consumers
+            .iter()
+            .filter(|tag| &*tag.label == "cam")
+            .count()
+            != want
+        {
+            assert!(
+                std::time::Instant::now() < end,
+                "pins never followed armed={armed}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        demand.status("cam").generation,
+        generation,
+        "producer restarted"
+    );
+    // Only the on-demand replacement (`slate`) may have started or stopped.
+    let moved = demand.transitions() - transitions;
+    assert!(moved <= 3, "unexpected transitions: {moved}");
+    assert!(demand.status("cam").running.video, "still running");
+    hub.shutdown();
+    demand.stop_all();
+}
