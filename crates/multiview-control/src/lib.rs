@@ -93,9 +93,14 @@ pub mod watch_status;
 pub mod whep_output;
 pub mod whip;
 
+pub mod source_demand;
 pub mod source_events;
 #[cfg(feature = "embed-web")]
 pub mod spa;
+pub use source_demand::{
+    SharedSourceDemand, SourceConsumerView, SourceDemandLease, SourceDemandPhase,
+    SourceDemandProvider, SourceDemandView,
+};
 pub use source_events::{SharedSourceEvents, SourceEventProvider, SourceEventsDto};
 
 #[cfg(feature = "openapi")]

@@ -464,6 +464,7 @@ async fn serve_control_plane(
             program_audio,
             webrtc_registry,
             &egress_registry,
+            multiview_cli::source_demand::installed_control_demand(),
         );
         (unified.whep, unified.whip, unified.whep_output)
     };
@@ -641,6 +642,13 @@ async fn run_pipeline_until_ctrl_c(
         let live_apply = live_apply.with_audio_routing(
             multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
         );
+        // Demand (docs/architecture/demand-driven-sources.md): build the manager
+        // before the hub and drain so live edits catalogue instead of spawning,
+        // and every consumer below takes leases from the same manager.
+        let demand = pipeline.demand();
+        multiview_cli::source_demand::install_control_demand(Some(Arc::new(
+            multiview_cli::source_demand::ControlDemand::new(demand, pipeline.catalogue()),
+        )));
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
             start,
@@ -679,7 +687,7 @@ async fn run_pipeline_until_ctrl_c(
         // The live overlay seam (ADR-W022) rides the same variant; the
         // live-source seam (ADR-W018) rides both.
         #[cfg(feature = "overlay")]
-        let drain: ControlDrain = Box::new(control::command_drain_with_seams(
+        let drain: ControlDrain = Box::new(control::command_drain_with_demand(
             command_rx,
             config.clone(),
             Arc::clone(&publisher),
@@ -690,15 +698,17 @@ async fn run_pipeline_until_ctrl_c(
             pipeline.audio_free_sources_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
+            pipeline.drain_demand(),
         ));
         #[cfg(not(feature = "overlay"))]
-        let drain: ControlDrain = Box::new(control::command_drain_with_audio_and_players(
+        let drain: ControlDrain = Box::new(control::command_drain_with_audio_players_and_demand(
             command_rx,
             config.clone(),
             Arc::clone(&publisher),
             pipeline.audio_route_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
+            pipeline.drain_demand(),
         ));
         (Some(handle), drain, Some(hub), Some(watch), Some(persist))
     } else {

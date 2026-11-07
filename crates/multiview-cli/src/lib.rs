@@ -201,6 +201,15 @@ pub mod player;
 #[cfg(feature = "ffmpeg")]
 pub mod pipeline;
 
+/// Which configured sources have a consumer, derived from the document
+/// (`docs/architecture/demand-driven-sources.md`).
+pub mod source_demand;
+
+/// The run's demand rail driver: starts and stops a source's video and audio
+/// rails as consumers come and go. Behind `ffmpeg` (it spawns real ingest).
+#[cfg(feature = "ffmpeg")]
+pub mod source_rails;
+
 /// Live HLS segment fetcher: parallel byte-range segment downloads served to
 /// the libav demuxer from memory over loopback, so a source whose single TCP
 /// flow delivers below real time still plays. Behind the `ffmpeg` feature.

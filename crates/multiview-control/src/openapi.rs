@@ -110,6 +110,8 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::sources::create_source,
         crate::routes::sources::update_source,
         crate::routes::sources::delete_source,
+        crate::routes::sources::list_source_status,
+        crate::routes::sources::get_source_status,
         crate::routes::inputs::get_input_streams,
         crate::routes::source_events::get_source_events,
         crate::routes::source_events::post_source_event_test,

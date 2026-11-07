@@ -500,6 +500,11 @@ impl WhepEgress {
         if session.is_connected() {
             let _ = entry.handle.advance_to(SessionState::Connected);
         }
+        // A peer that vanished (ICE timeout, tab closed without DELETE) ends the
+        // session, so its holder can release what it consumed.
+        if !session.is_alive() {
+            let _ = entry.handle.advance_to(SessionState::Closed);
+        }
         Ok(out)
     }
 

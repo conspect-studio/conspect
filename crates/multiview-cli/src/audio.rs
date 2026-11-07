@@ -195,6 +195,9 @@ pub struct AudioControlHandle {
     /// the bake consumer (after it changed the bus); read by the control side.
     channels:
         Arc<std::sync::RwLock<std::collections::HashMap<String, multiview_audio::RoutePoint>>>,
+    /// Publishes the audio-route consumers whenever a routing document applies
+    /// live, so a newly routed source starts and an unrouted one stops.
+    route_demand: Option<multiview_engine::ConsumerSet<multiview_compositor::pipeline::Nv12Image>>,
     /// Every source id that exists on this run, with or without audio: what a
     /// routing document may name and still apply live (an audio-free source
     /// mixes as silence — a restart would not change that).
@@ -280,6 +283,7 @@ impl AudioControlHandle {
             sources: shared_map(sources),
             channels: Arc::new(std::sync::RwLock::new(channels)),
             known: shared_map(known),
+            route_demand: None,
             routing: Arc::new(multiview_framestore::SwapCell::empty()),
             unrouted_unity: shared_map(std::collections::HashMap::new()),
             sample_rate: AudioFormat::CANONICAL_RATE,
@@ -313,6 +317,17 @@ impl AudioControlHandle {
             }
             next
         });
+        self
+    }
+
+    /// Publish the audio-route consumers through `set` on every live routing
+    /// change.
+    #[must_use]
+    pub fn with_route_demand(
+        mut self,
+        set: Option<multiview_engine::ConsumerSet<multiview_compositor::pipeline::Nv12Image>>,
+    ) -> Self {
+        self.route_demand = set;
         self
     }
 
@@ -484,6 +499,9 @@ impl AudioControlHandle {
             ));
         }
         self.pending_gains.store(Some(Arc::new(gains)));
+        if let Some(set) = &self.route_demand {
+            set.publish(crate::source_demand::audio_route_items(Some(routing)));
+        }
         true
     }
 

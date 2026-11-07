@@ -202,6 +202,13 @@ pub trait IngestSpawner: Send + Sync {
     /// rides the slate honestly).
     fn spawn(&self, spawn: SourceSpawn, registry: &StopRegistry) -> Option<SpawnedProducer>;
 
+    /// Record a decoded source's definition for demand-driven start instead of
+    /// spawning it. Returns `true` when the run manages sources by demand, in
+    /// which case the hub spawns nothing. Hub worker only.
+    fn catalogue(&self, _spawn: &SourceSpawn) -> bool {
+        false
+    }
+
     /// A source now running without decoded audio. Hub worker only.
     fn source_without_audio(&self, _id: &str) {}
 
@@ -450,6 +457,10 @@ fn spawn_decoded(
         return;
     };
     preview_insert(preview, &id, &spawn.store);
+    if spawner.catalogue(&spawn) {
+        // Demand-managed: the source starts when (and only while) consumed.
+        return;
+    }
     match spawner.spawn(spawn, registry) {
         Some(SpawnedProducer { stop, handle }) => {
             owned.insert(id, Producer { stop, handle });
@@ -663,6 +674,11 @@ fn join_bounded(id: &str, handle: JoinHandle<()>) {
     if handle.join().is_err() {
         tracing::error!(source = %id, "live producer thread panicked");
     }
+}
+
+/// Make `id`'s store previewable (a started source).
+pub fn preview_insert_shared(preview: &SharedStores, id: &str, store: &Arc<TileStore<Nv12Image>>) {
+    preview_insert(preview, id, store);
 }
 
 /// RCU-insert `id → store` into the shared preview map.

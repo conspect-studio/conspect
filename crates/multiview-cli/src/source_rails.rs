@@ -98,6 +98,25 @@ pub fn catalogue_upsert(catalogue: &Catalogue, source: &Source) -> Arc<TileStore
     store.unwrap_or_else(|| empty_store(&source.id))
 }
 
+/// Insert or replace one catalogue entry with the given store.
+pub fn catalogue_upsert_with(
+    catalogue: &Catalogue,
+    source: &Source,
+    store: &Arc<TileStore<Nv12Image>>,
+) {
+    catalogue.rcu(|current| {
+        let mut next = current.as_ref().clone();
+        next.insert(
+            source.id.clone(),
+            Arc::new(CatalogEntry(Catalogued {
+                source: source.clone(),
+                store: Arc::clone(store),
+            })),
+        );
+        next
+    });
+}
+
 /// Remove one catalogue entry.
 pub fn catalogue_remove(catalogue: &Catalogue, id: &str) {
     if catalogue.load().contains_key(id) {

@@ -588,6 +588,27 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         }
     }
 
+    /// Stop the worker, then stop every running rail. For run teardown, off the
+    /// output clock. Blocking, bounded by the driver's own grace periods.
+    pub fn stop_all(&self) {
+        self.shutdown();
+        let running: Vec<(Arc<str>, Rails)> = {
+            let book = lock(&self.inner.book);
+            book.entries
+                .iter()
+                .filter(|(_, entry)| !entry.running.is_empty())
+                .map(|(id, entry)| (Arc::clone(id), entry.running))
+                .collect()
+        };
+        for (id, rails) in running {
+            let outcome = self.inner.driver.transition(&id, rails, Rails::NONE, None);
+            self.inner.driver.retire(&id, rails);
+            if let Some(entry) = lock(&self.inner.book).entries.get_mut(&id) {
+                entry.running = outcome.map_or_else(|failure| failure.running, |running| running);
+            }
+        }
+    }
+
     /// Take a lease on `rails` of source `id`. Never blocks on a rail.
     pub fn acquire(
         &self,

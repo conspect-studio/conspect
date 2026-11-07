@@ -584,3 +584,95 @@ pub(crate) async fn delete_source(
     let mode = live_apply_remove(&state, &id);
     Ok(with_apply(mode, StatusCode::NO_CONTENT.into_response()))
 }
+
+/// Every source's demand state (role: read; per-object row visibility).
+///
+/// `idle` means nothing consumes the source, so it costs nothing; it is not a
+/// fault. Consumers start it (`starting`), it then runs (`live`) or keeps
+/// retrying with backoff (`failed`).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/sources/status",
+        tag = "sources",
+        responses(
+            (status = 200, description = "Every configured source's demand state, id-sorted.", body = [crate::source_demand::SourceDemandView]),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Authenticated but not authorized to read.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn list_source_status(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> ControlResult<Json<Vec<crate::source_demand::SourceDemandView>>> {
+    principal.role.require(Action::Read)?;
+    let ids: Vec<String> = crate::boot_model::accepted_resources(&state, "sources")?
+        .map_or_else(|| state.sources.list(), Ok)?
+        .into_iter()
+        .map(|v| v.resource.id)
+        .filter(|id| crate::auth::authorize_object(&principal, id).is_ok())
+        .collect();
+    Ok(Json(source_status_views(&state, ids)))
+}
+
+/// One source's demand state (role: read; per-object authz).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/sources/{id}/status",
+        tag = "sources",
+        params(("id" = String, Path, description = "Source id.")),
+        responses(
+            (status = 200, description = "The source's demand state.", body = crate::source_demand::SourceDemandView),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to read this source.", body = crate::problem::Problem),
+            (status = 404, description = "No such source.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn get_source_status(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Json<crate::source_demand::SourceDemandView>> {
+    principal.role.require(Action::Read)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let _exists = accepted_source(&state, &id)?;
+    Ok(Json(
+        source_status_views(&state, vec![id])
+            .pop()
+            .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle("")),
+    ))
+}
+
+/// The demand views of `ids`, in id order. Without a demand provider (a run
+/// path with no manager) the status is unknown, reported idle with no consumers.
+fn source_status_views(
+    state: &AppState,
+    mut ids: Vec<String>,
+) -> Vec<crate::source_demand::SourceDemandView> {
+    ids.sort();
+    ids.dedup();
+    let Some(demand) = &state.source_demand else {
+        return ids
+            .iter()
+            .map(|id| crate::source_demand::SourceDemandView::idle(id))
+            .collect();
+    };
+    let active: std::collections::HashMap<String, crate::source_demand::SourceDemandView> = demand
+        .active()
+        .into_iter()
+        .map(|view| (view.id.clone(), view))
+        .collect();
+    ids.iter()
+        .map(|id| {
+            active
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(id))
+        })
+        .collect()
+}

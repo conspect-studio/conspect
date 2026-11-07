@@ -1067,6 +1067,8 @@ fn resource_router() -> Router<AppState> {
         )
         // Sources resource CRUD (managed inputs), mirroring layouts.
         .route("/sources", get(sources::list_sources))
+        .route("/sources/status", get(sources::list_source_status))
+        .route("/sources/{id}/status", get(sources::get_source_status))
         .route("/sources/import/m3u", post(iptv::import_m3u))
         .route("/iptv", get(iptv::get_iptv).put(iptv::put_iptv))
         .route(

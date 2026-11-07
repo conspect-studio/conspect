@@ -55,6 +55,7 @@ pub fn spawn_unified_webrtc(
     program_audio: Option<crate::preview::ProgramAudioSlot>,
     webrtc_registry: WhipRegistry,
     egress_registry: &EgressRegistry,
+    demand: Option<multiview_control::SharedSourceDemand>,
 ) -> UnifiedWebrtc {
     let endpoint_config = endpoint_config_from(config);
     let builder = match UnifiedEndpoint::bind(endpoint_config) {
@@ -111,7 +112,8 @@ pub fn spawn_unified_webrtc(
         program_slot,
         shared_stores,
         program_audio,
-    );
+    )
+    .with_demand(demand);
     let builder = builder.with_preview(Arc::clone(&egress));
 
     // 4. `whip_push` outputs (one lane per configured output).

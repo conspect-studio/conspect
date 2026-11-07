@@ -236,6 +236,9 @@ where
     .with_warning_store(warnings);
     let mut break_provider: Option<multiview_control::source_events::SharedSourceBreakProvider> =
         None;
+    if let Some(demand) = crate::source_demand::installed_control_demand() {
+        state = state.with_source_demand(demand);
+    }
     if let Some(reader) = source_events {
         let reader = Arc::new(reader);
         let provider: Arc<dyn multiview_control::source_events::SourceEventProvider> =
@@ -1327,6 +1330,62 @@ pub fn command_drain_with_seams(
     }
 }
 
+/// [`command_drain_with_seams`] plus the demand seam, so binding changes take
+/// and release source leases. The production `overlay` run path wires this.
+#[cfg(all(feature = "ffmpeg", feature = "overlay"))]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub fn command_drain_with_demand(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    subtitle_route: Arc<
+        multiview_framestore::SwapCell<Option<Arc<crate::captions::SubtitleRouteHandle>>>,
+    >,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    overlays: crate::live_overlays::OverlayApplySlot,
+    tiles: Arc<multiview_framestore::SwapCell<Arc<Vec<crate::overlays::TileSpec>>>>,
+    audio_free: crate::pipeline::AudioFreeSources,
+    live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_subtitle_route(subtitle_route)
+        .with_audio_route(audio_route)
+        .with_live_overlays(overlays)
+        .with_tile_spec_apply(tiles)
+        .with_audio_free_sources(audio_free)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes)
+        .with_demand(demand);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
+/// [`command_drain_with_audio_and_players`] plus the demand seam (the
+/// non-overlay production run path).
+#[cfg(feature = "ffmpeg")]
+#[allow(clippy::implicit_hasher)]
+pub fn command_drain_with_audio_players_and_demand(
+    commands: CommandReceiver,
+    config: MultiviewConfig,
+    publisher: Arc<EnginePublisher<EngineStateSnapshot, Event>>,
+    audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
+    live: crate::live_sources::LiveSourceHandle,
+    player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
+    let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_audio_route(audio_route)
+        .with_live_sources(live)
+        .with_player_mailboxes(player_mailboxes)
+        .with_demand(demand);
+    move |drive: &mut CompositorDrive<Nv12Image>| {
+        let _applied = drain.apply(drive);
+    }
+}
+
 /// The maximum number of VIDEO→cell re-points applied in **one** frame-boundary
 /// pass (RT-6 / ADR-0034 cap-per-tick).
 ///
@@ -1446,6 +1505,16 @@ pub struct CommandDrain {
         std::collections::HashMap<String, std::sync::Arc<crate::player::TransportMailbox>>,
     /// One-shot: the drive's cell-id → index map is established the first tick.
     cell_ids_set: bool,
+    /// The demand seam (docs/architecture/demand-driven-sources.md): the drain
+    /// republishes the layout consumers when bindings change. Wait-free.
+    #[cfg(feature = "ffmpeg")]
+    demand: Option<crate::source_demand::DrainDemand<Nv12Image>>,
+    /// The drive's layout generation the demand seam last published for.
+    #[cfg(feature = "ffmpeg")]
+    demand_generation: Option<u64>,
+    /// The subtitle routes applied so far (layer → source), for demand.
+    #[cfg(feature = "ffmpeg")]
+    subtitle_routes: std::collections::BTreeMap<String, String>,
     /// Test-only spy counting how many times this drain calls `solve_layout`.
     #[cfg(test)]
     resolve_spy: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -1479,6 +1548,12 @@ impl CommandDrain {
             audio_free_sources: None,
             player_mailboxes: std::collections::HashMap::new(),
             cell_ids_set: false,
+            #[cfg(feature = "ffmpeg")]
+            demand: None,
+            #[cfg(feature = "ffmpeg")]
+            demand_generation: None,
+            #[cfg(feature = "ffmpeg")]
+            subtitle_routes: std::collections::BTreeMap::new(),
             #[cfg(test)]
             resolve_spy: None,
         }
@@ -1565,6 +1640,47 @@ impl CommandDrain {
         self
     }
 
+    /// Thread in the demand seam so binding changes take and release source
+    /// leases (new before old).
+    #[cfg(feature = "ffmpeg")]
+    #[must_use]
+    fn with_demand(mut self, demand: Option<crate::source_demand::DrainDemand<Nv12Image>>) -> Self {
+        self.demand = demand;
+        self
+    }
+
+    /// Publish the active layout's consumers when its bindings changed. One
+    /// integer compare per tick; on change a bounded vector build and a wait-free
+    /// publish, never a rail start (the demand worker does that off-clock).
+    #[cfg(feature = "ffmpeg")]
+    fn publish_demand(&mut self, drive: &CompositorDrive<Nv12Image>) {
+        let Some(demand) = &self.demand else {
+            return;
+        };
+        let generation = drive.layout_generation();
+        if self.demand_generation == Some(generation) {
+            return;
+        }
+        self.demand_generation = Some(generation);
+        demand
+            .layout
+            .publish(crate::source_demand::layout_items_for(drive.layout()));
+    }
+
+    /// Make sure a catalogued source has a store in the drive before a cell
+    /// binds it. A catalogued source's store exists even while it is idle.
+    #[cfg(feature = "ffmpeg")]
+    fn ensure_store(&self, id: &str, drive: &mut CompositorDrive<Nv12Image>) {
+        if drive.store(id).is_some() {
+            return;
+        }
+        if let Some(demand) = &self.demand {
+            if let Some(entry) = demand.catalogue.load().get(id) {
+                drive.insert_store(id.to_owned(), Arc::clone(entry.store()));
+            }
+        }
+    }
+
     /// Attach a test spy that counts every `solve_layout` re-solve the drain does.
     #[cfg(test)]
     #[must_use]
@@ -1634,6 +1750,10 @@ impl CommandDrain {
             let Some(intent) = self.pending.pop_front() else {
                 break;
             };
+            #[cfg(feature = "ffmpeg")]
+            if let RouteIntent::Video { source, .. } = &intent {
+                self.ensure_store(&source.input_id, drive);
+            }
             let mut route_applier = RouteApplier::new(&self.resolution);
             if let Err(e) = route_applier.apply_video(drive, std::slice::from_ref(&intent)) {
                 // An honest route error (unknown cell / source with no store): the
@@ -1646,6 +1766,8 @@ impl CommandDrain {
         if tile_binding_changed || applied != 0 {
             self.publish_tile_specs(drive);
         }
+        #[cfg(feature = "ffmpeg")]
+        self.publish_demand(drive);
         applied
     }
 
@@ -1753,6 +1875,16 @@ impl CommandDrain {
             return;
         }
         let cells = resolved.solved.cells.len();
+        #[cfg(feature = "ffmpeg")]
+        for id in resolved
+            .solved
+            .cells
+            .iter()
+            .filter_map(|cell| cell.source.clone())
+            .collect::<Vec<_>>()
+        {
+            self.ensure_store(&id, drive);
+        }
         match drive.set_layout(Arc::new(resolved.solved)) {
             Ok(()) => {
                 drive.set_cell_ids(resolved.document.cell_ids());
@@ -2122,6 +2254,9 @@ impl CommandDrain {
         // below gives the hub a head start on stopping a replaced producer,
         // shrinking the bounded window in which old and new frames can
         // interleave in the reused store on an edit (ADR-W018 §5).
+        // Demand-managed runs catalogue every kind and start it only when consumed.
+        #[cfg(feature = "ffmpeg")]
+        let synthetic = synthetic.filter(|_| self.demand.is_none());
         let submitted = match synthetic {
             Some(kind) => seam.request_spawn_synth(crate::live_sources::SynthSpawn {
                 id: id.clone(),
@@ -2447,7 +2582,7 @@ impl CommandDrain {
     /// source is the run-side caption-track work; identity-by-source is today's
     /// per-source caption model).
     #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
-    fn route_subtitle(&self, layer: &str, source: &multiview_config::routing::StreamRef) {
+    fn route_subtitle(&mut self, layer: &str, source: &multiview_config::routing::StreamRef) {
         let Some(slot) = self.subtitle_route.as_ref() else {
             tracing::warn!(
                 layer = %layer,
@@ -2465,6 +2600,26 @@ impl CommandDrain {
             return;
         };
         handle.request_repoint(layer, &source.input_id);
+        if let Some(demand) = &self.demand {
+            // A subtitle layer routed to another source consumes that source's
+            // captions, which ride its video rail.
+            if layer == source.input_id {
+                self.subtitle_routes.remove(layer);
+            } else {
+                self.subtitle_routes
+                    .insert(layer.to_owned(), source.input_id.clone());
+            }
+            demand.subtitles.publish(
+                self.subtitle_routes
+                    .iter()
+                    .map(|(layer, source)| multiview_engine::SetItem {
+                        id: source.as_str().into(),
+                        label: layer.as_str().into(),
+                        size: None,
+                    })
+                    .collect(),
+            );
+        }
     }
 
     /// Without `ffmpeg`+`overlay` the run renders no subtitles, so a `RouteSubtitle`
