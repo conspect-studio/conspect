@@ -1136,6 +1136,28 @@ fn await_shared_url(
     }
 }
 
+/// The audio rail's private SRT reader, when `plan.location` is an SRT
+/// listener: two libav contexts (video + audio) cannot both own the native
+/// listener port, so the audio rail acquires the SAME shared
+/// [`crate::srt_ingest::SrtIngestBridge`] the video rail does and opens its
+/// own in-process reader (`pipe:<fd>`, no listening socket). Opened per
+/// connection, so a reconnect gets a fresh stream. Only with `srt-libsrt`
+/// (ADR-0039 decision 10, amended); without it no bridge exists and the rail
+/// opens `plan.location` unchanged (which the video rail's own ingest-plan
+/// build already failed closed on).
+#[cfg(feature = "srt-libsrt")]
+fn audio_srt_reader(plan: &AudioIngestPlan) -> Option<crate::srt_ingest::SrtReader> {
+    if !multiview_output::sink::is_srt_listener_url(&plan.location) {
+        return None;
+    }
+    crate::srt_ingest::acquire(&plan.location)
+        .and_then(|bridge| bridge.open_reader())
+        .map_err(|reason| {
+            tracing::warn!(source = %plan.id, %reason, "srt audio listener unavailable");
+        })
+        .ok()
+}
+
 /// Drive a source's audio decode under the supervised-reconnect bracket: open +
 /// decode the source's best audio stream into `store` (resampling to the
 /// canonical 48 kHz stereo format), reconnecting a *live* source on EOF/error
@@ -1224,6 +1246,18 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         } else {
             None
         };
+        // The audio rail shares the video rail's SRT listener through its own
+        // private reader (see `audio_srt_reader`), held for this connection;
+        // without `srt-libsrt` no bridge exists at all, so this rail degrades
+        // the same way the video rail already did.
+        #[cfg(feature = "srt-libsrt")]
+        let srt_reader = if pinned.is_none() {
+            audio_srt_reader(plan)
+        } else {
+            None
+        };
+        #[cfg(feature = "srt-libsrt")]
+        let pinned = pinned.or_else(|| srt_reader.as_ref().map(|r| r.url().to_owned()));
         tracing::info!(
             source = %plan.id,
             location = %pinned.as_deref().unwrap_or(&plan.location),

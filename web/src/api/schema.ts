@@ -1704,6 +1704,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/outputs/{id}/link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/outputs/{id}/link` — the live link state of a push output
+         *     (role: read; per-object authz).
+         * @description Projects `outputs.<id>.link` out of the cached off-engine snapshot (inv
+         *     #10: never touches the engine). `404` when the output has no live push link
+         *     (not a push output, or the program is not running).
+         */
+        get: operations["get_output_link"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/outputs/{id}/playback": {
         parameters: {
             query?: never;
@@ -5066,6 +5089,44 @@ export interface components {
          * @enum {string}
          */
         OutputFlipDoc: "none" | "horizontal" | "vertical";
+        /**
+         * @description Live link state of a push output (SRT / RTMP / RIST / UDP) — the body of
+         *     `GET /api/v1/outputs/{id}/link`.
+         */
+        OutputLinkDoc: {
+            /**
+             * Format: int64
+             * @description Peers attached right now.
+             */
+            clients: number;
+            /**
+             * Format: int64
+             * @description Packets dropped for this output (no peer attached / slow peer).
+             */
+            dropped: number;
+            /** @description The last connect/listen/write error since the last successful connect. */
+            last_error?: string | null;
+            /** @description `caller` or `listener`. */
+            mode: string;
+            /** @description Attached peer addresses: an SRT listener's callers, or a caller's target. */
+            peers: string[];
+            /**
+             * Format: int64
+             * @description Peer sessions established this run.
+             */
+            sessions: number;
+            /** @description `idle` / `connecting` / `listening` / `connected` / `reconnecting`. */
+            state: string;
+            /** @description `srt` / `rtmp` / `rist` / `udp`. */
+            transport: string;
+            /** @description The (redacted) destination or bind URL. */
+            url: string;
+            /**
+             * Format: int64
+             * @description Packets written to peers.
+             */
+            written: number;
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::OutputMetadata` (ADR-0088): per-output
          *     declarative metadata intent, projected onto whatever the transport can carry.
@@ -11965,6 +12026,56 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_output_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Output id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The output's live push-link state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OutputLinkDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read this output. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No live push link for this output. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

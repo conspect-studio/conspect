@@ -6073,6 +6073,69 @@
         }
       }
     },
+    "/api/v1/outputs/{id}/link": {
+      "get": {
+        "tags": [
+          "outputs"
+        ],
+        "summary": "`GET /api/v1/outputs/{id}/link` — the live link state of a push output\n(role: read; per-object authz).",
+        "description": "Projects `outputs.<id>.link` out of the cached off-engine snapshot (inv\n#10: never touches the engine). `404` when the output has no live push link\n(not a push output, or the program is not running).",
+        "operationId": "get_output_link",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Output id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The output's live push-link state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputLinkDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live push link for this output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/outputs/{id}/playback": {
       "get": {
         "tags": [
@@ -15536,6 +15599,77 @@
           "horizontal",
           "vertical"
         ]
+      },
+      "OutputLinkDoc": {
+        "type": "object",
+        "description": "Live link state of a push output (SRT / RTMP / RIST / UDP) — the body of\n`GET /api/v1/outputs/{id}/link`.",
+        "required": [
+          "state",
+          "mode",
+          "transport",
+          "url",
+          "clients",
+          "sessions",
+          "dropped",
+          "written",
+          "peers"
+        ],
+        "properties": {
+          "clients": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Peers attached right now.",
+            "minimum": 0
+          },
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets dropped for this output (no peer attached / slow peer).",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last connect/listen/write error since the last successful connect."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`caller` or `listener`."
+          },
+          "peers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Attached peer addresses: an SRT listener's callers, or a caller's target."
+          },
+          "sessions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Peer sessions established this run.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "`idle` / `connecting` / `listening` / `connected` / `reconnecting`."
+          },
+          "transport": {
+            "type": "string",
+            "description": "`srt` / `rtmp` / `rist` / `udp`."
+          },
+          "url": {
+            "type": "string",
+            "description": "The (redacted) destination or bind URL."
+          },
+          "written": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packets written to peers.",
+            "minimum": 0
+          }
+        }
       },
       "OutputMetadataDoc": {
         "type": "object",

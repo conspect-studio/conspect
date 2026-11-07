@@ -276,3 +276,105 @@ async fn a_push_only_config_is_runnable_now_that_push_is_wired() {
     assert_eq!(report.frames, TICKS, "N ticks must produce N frames");
     assert!(!report.faltered, "output must never falter (invariant #1)");
 }
+
+/// Production finding: with no caller for longer than `SINK_WEDGE_GRACE` (2 s)
+/// the consumer marked the sink dead and the listener vanished. The whole real
+/// pipeline must keep the listener alive and then serve a late caller. Needs
+/// `srt-libsrt` (ADR-0039 decision 10, amended): `FFmpeg`'s libsrt cannot bind
+/// `[::]`, so without the native leaf this listener URL is rejected at build.
+#[cfg(feature = "srt-libsrt")]
+#[tokio::test]
+async fn srt_listener_with_no_caller_past_the_wedge_grace_still_serves_a_late_caller() {
+    const TICKS: u64 = 500; // 20 s @ 25 fps, paced in real time.
+    let port = 23_000 + u16::try_from(std::process::id() % 20_000).unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("in.ts");
+    generate_clip(&clip);
+    let toml = push_only_config_text(&clip, &format!("srt://[::]:{port}?mode=listener"))
+        .replace("kind = \"rtmp\"", "kind = \"srt\"");
+    let config = MultiviewConfig::load_from_toml(&toml).expect("parse config");
+    config.validate().expect("config validates");
+    let mut pipeline = Pipeline::build(&config).expect("build pipeline");
+
+    let late_caller = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(4)); // > SINK_WEDGE_GRACE
+                                                               // ffmpeg's own stream probing took ~6.5 s here, hence 14 s, not less.
+        Command::new("timeout")
+            .args(["14", "ffmpeg", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(format!("srt://[::1]:{port}?mode=caller"))
+            .args(["-frames:v", "10", "-f", "null", "-"])
+            .status()
+            .expect("spawn caller")
+    });
+    let report = pipeline.run_for(TICKS).await.expect("run completes");
+    assert_eq!(report.frames, TICKS, "N ticks must produce N frames");
+    assert!(!report.faltered, "output must never falter (invariant #1)");
+    let status = late_caller.join().expect("caller thread");
+    assert!(status.success(), "late caller decoded no frames: {status}");
+}
+
+/// The real ingest path, not just the relay: a caller over IPv4 pushes to a
+/// `[::]` listener SOURCE and its picture reaches the program output. White
+/// video makes the assertion unambiguous against the dark no-signal card.
+/// Needs `srt-libsrt` (ADR-0039 decision 10, amended): without the native leaf
+/// a `[::]` listener source fails closed at ingest-plan build time.
+#[cfg(feature = "srt-libsrt")]
+#[tokio::test]
+async fn srt_listener_source_on_the_wildcard_reaches_the_program() {
+    const TICKS: u64 = 375; // 15 s @ 25 fps.
+    let port = 24_000 + u16::try_from(std::process::id() % 20_000).unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("in.ts");
+    generate_clip(&clip);
+    let out_dir = dir.path().join("out");
+    let playlist = out_dir.join("index.m3u8");
+    let toml = config_text(&clip, &playlist, "rtmp://[::1]:1/live/none").replace(
+        &format!("kind = \"file\"\npath = \"{}\"", clip.display()),
+        &format!("kind = \"srt\"\nurl = \"srt://[::]:{port}?mode=listener\""),
+    );
+    // A unique source id: the pipeline keeps per-source-id state process-wide,
+    // so sharing `in_a` with a concurrently running test would cross-wire them.
+    let toml = toml
+        .replace("id = \"in_a\"", "id = \"srt_wildcard_in\"")
+        .replace("input_id = \"in_a\"", "input_id = \"srt_wildcard_in\"");
+    assert!(toml.contains("kind = \"srt\""), "the source was rewritten");
+    let config = MultiviewConfig::load_from_toml(&toml).expect("parse config");
+    config.validate().expect("config validates");
+    let mut pipeline = Pipeline::build(&config).expect("build pipeline");
+
+    let mut caller = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("color=c=white:size=320x240:rate=25")
+        .args(["-c:v", "mpeg2video", "-g", "25", "-f", "mpegts"])
+        .arg(format!(
+            "srt://127.0.0.1:{port}?mode=caller&connect_timeout=8000"
+        ))
+        .spawn()
+        .expect("spawn caller");
+    let report = pipeline.run_for(TICKS).await.expect("run completes");
+    caller.kill().expect("kill caller");
+    caller.wait().expect("reap caller");
+    assert_eq!(report.frames, TICKS, "N ticks must produce N frames");
+
+    let tail = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-sseof", "-1", "-i"])
+        .arg(out_dir.join("program.ts"))
+        .args(["-frames:v", "1", "-pix_fmt", "gray", "-f", "rawvideo", "-"])
+        .output()
+        .expect("extract the last frame");
+    assert!(!tail.stdout.is_empty(), "no final frame");
+    let mean = tail.stdout.iter().map(|b| u64::from(*b)).sum::<u64>()
+        / u64::try_from(tail.stdout.len()).unwrap();
+    assert!(
+        mean > 180,
+        "caller's white picture never reached the program: {mean}"
+    );
+}

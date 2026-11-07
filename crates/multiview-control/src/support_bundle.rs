@@ -45,6 +45,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use multiview_core::redact::{redact_resource_peer, redact_resource_url};
 use multiview_core::time::MediaTime;
 use multiview_telemetry::{RetentionStore, RetentionWindow};
 
@@ -403,7 +404,11 @@ pub fn redact_config_for_export(value: &serde_json::Value) -> serde_json::Value 
     // copy, so exactly one clone is inherent here; redaction is then the single
     // shared in-place pass — no second full-document rebuild.
     let mut owned = value.clone();
-    redact_inline_secrets_in_place(&mut owned);
+    // Export is outward-facing config-as-code: it keeps transport URLs intact
+    // (a reimportable `active.toml`/export document needs its `url`/`endpoint`
+    // hosts), so URL masking is OFF here — only inline secret scalars are
+    // scrubbed.
+    redact_inline_secrets_in_place(&mut owned, false);
     owned
 }
 
@@ -416,11 +421,19 @@ pub fn redact_config_for_export(value: &serde_json::Value) -> serde_json::Value 
 /// An inline secret is a scalar (string/number/bool) under a key [`key_is_secret`]
 /// classifies that is **not** a [`key_is_secret_reference`] pointer. A secret-named
 /// *object*/*array*/`null` is not itself the secret, so the walk recurses to keep
-/// its shape and still scrub any nested inline secret; transport URLs and
-/// `secret_ref` pointers are preserved (config-as-code needs them). The walk is
-/// total over arbitrary nesting, so a deeply-nested or adversarial document is
-/// fully scrubbed.
-fn redact_inline_secrets_in_place(value: &mut serde_json::Value) {
+/// its shape and still scrub any nested inline secret; `secret_ref` pointers are
+/// always preserved (config-as-code needs them). The walk is total over
+/// arbitrary nesting, so a deeply-nested or adversarial document is fully
+/// scrubbed.
+///
+/// `mask_urls` additionally applies [`redact_resource_url`]/[`redact_resource_peer`] to
+/// every scalar under a [`key_is_url`]-classified key (and every string item in
+/// an array under a key ending `peers`/`peer`), display-safing a stream key, SRT
+/// passphrase/streamid, RIST `secret=`/PSK or any `user:pass@` userinfo embedded
+/// in a transport URL (review SRT-03-R2). Export passes `false` (the
+/// config-as-code document needs real hosts to reimport); the read-role REST
+/// views pass `true` for a non-admin principal.
+fn redact_inline_secrets_in_place(value: &mut serde_json::Value, mask_urls: bool) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map.iter_mut() {
@@ -436,38 +449,76 @@ fn redact_inline_secrets_in_place(value: &mut serde_json::Value) {
                     // An inline cleartext secret (a scalar under a secret-named
                     // key): replace the value in place, keep the key.
                     *child = serde_json::Value::String(EXPORT_REDACTED_SENTINEL.to_owned());
-                } else {
-                    // A non-secret key, a `secret_ref` pointer, or a structured
-                    // holder under a secret-named key: recurse so the shape survives
-                    // and any nested inline secret is still scrubbed.
-                    redact_inline_secrets_in_place(child);
+                    continue;
                 }
+                if mask_urls && key_is_url(key) {
+                    if let serde_json::Value::String(url) = child {
+                        *url = redact_resource_url(url);
+                    }
+                    // A URL-named key never holds a nested object/array of
+                    // further secrets in this schema; nothing else to recurse.
+                    continue;
+                }
+                if mask_urls && key_is_peer_list(key) {
+                    if let serde_json::Value::Array(items) = child {
+                        for item in items.iter_mut() {
+                            if let serde_json::Value::String(peer) = item {
+                                *peer = redact_resource_peer(peer);
+                            }
+                        }
+                    } else if let serde_json::Value::String(peer) = child {
+                        *peer = redact_resource_peer(peer);
+                    }
+                    continue;
+                }
+                // A non-secret, non-URL key, a `secret_ref` pointer, or a
+                // structured holder under a secret-named key: recurse so the
+                // shape survives and any nested inline secret/URL is still
+                // scrubbed.
+                redact_inline_secrets_in_place(child, mask_urls);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_inline_secrets_in_place(item);
+                redact_inline_secrets_in_place(item, mask_urls);
             }
         }
-        // A scalar under a non-secret key (or at the top level) is kept verbatim.
+        // A scalar under a non-secret, non-URL key (or at the top level) is
+        // kept verbatim.
         _ => {}
     }
 }
 
-/// Mask inline cleartext secrets in a REST response view for a non-admin
-/// principal, using the same structurally-preserving policy as config export.
+/// Whether a JSON object **key** names a list (or single value) of peer
+/// endpoints that may carry transport-URL credentials (e.g. `peers`, RIST
+/// `bonding` peer URLs) and must be display-safed under [`redact_resource_peer`] when
+/// `mask_urls` is set.
+fn key_is_peer_list(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "peers" || k == "peer"
+}
+
+/// Mask inline cleartext secrets AND transport-URL credentials in a REST
+/// response view for a non-admin principal, using the same structurally-
+/// preserving policy as config export, plus URL masking (review SRT-03-R2: the
+/// export posture of "URLs stay intact" is right for config-as-code but wrong
+/// for a read-role REST view, which must not disclose a stream key, SRT
+/// passphrase/streamid, RIST secret or userinfo embedded in `url`/`peers`).
 ///
 /// The caller passes an owned response copy; this mutates that view **in place**
 /// (no second document clone) and never the stored document. An
 /// [`crate::auth::Role::Admin`] principal keeps the original value for operational
-/// access. Every less-privileged role receives [`EXPORT_REDACTED_SENTINEL`] in each
-/// inline-secret field.
+/// access (admin-reads-own-secret/own-credential is not an escalation; admin
+/// export/config-as-code needs the real URL). Every less-privileged role
+/// receives [`EXPORT_REDACTED_SENTINEL`] in each inline-secret field and the
+/// shared [`redact_resource_url`]/[`redact_resource_peer`] display-safe form in every
+/// URL-bearing field.
 pub(crate) fn redact_inline_secrets_for_read(
     principal: &crate::auth::Principal,
     value: &mut serde_json::Value,
 ) {
     if principal.role != crate::auth::Role::Admin {
-        redact_inline_secrets_in_place(value);
+        redact_inline_secrets_in_place(value, true);
     }
 }
 

@@ -58,6 +58,9 @@ wgpu = { version = "30", default-features = false, features = [
 multiview-ffmpeg = { workspace = true }
 multiview-input = { workspace = true }
 multiview-output = { workspace = true }
+# Dual-stack SRT listener input (`srt_ingest`). Runtime-loaded and link-free, so
+# it adds no native build dependency.
+multiview-srt-sys = { workspace = true, optional = true }
 multiview-audio = { workspace = true }
 multiview-overlay = { workspace = true }
 multiview-preview = { workspace = true }
@@ -454,6 +457,12 @@ ptp = ["multiview-engine/ptp"]
 # (LGPL `mpeg2video` by default) -> fan out to the file + HLS output sinks. Wires
 # the owning sub-crates' `ffmpeg` features and pulls `ffmpeg-next` only to name
 # its SAFE value types (no FFI in this crate). LGPL-clean: never escalates to GPL.
+# Deliberately does NOT pull `multiview-srt-sys` (ADR-0039 decision 10): the
+# dual-stack SRT listener leaf is a SEPARATE opt-in — see the `srt-libsrt`
+# feature below. A plain `ffmpeg` build still demuxes/muxes SRT in caller mode
+# through `FFmpeg`'s own `srt://` protocol; only a `[::]`/wildcard **listener**
+# needs the native leaf, and without it such a URL fails closed with a clear
+# "requires srt-libsrt" error (never libsrt's opaque "Bad parameters").
 ffmpeg = [
     "dep:ffmpeg-next",
     "dep:tempfile",
@@ -471,6 +480,18 @@ ffmpeg = [
     "multiview-output/ffmpeg",
     "multiview-audio/ffmpeg",
 ]
+
+# Dual-stack SRT **listener** leaf (ADR-0039 decision 10, amended 2026-11-07):
+# the owned `multiview-srt-sys` libsrt FFI binding (`dlopen`-resolved, never
+# linked/vendored) that binds one `AF_INET6` socket with `SRTO_IPV6ONLY = 0` —
+# the only way to serve a dual-stack `[::]` SRT listener, which `FFmpeg`'s
+# `libsrt` protocol cannot bind (it has no option to set `SRTO_IPV6ONLY`) and
+# whose listener additionally blocks its calling thread in `srt_accept`
+# (unworkable for a never-await-a-client sink, invariant #10). Off by default;
+# implies `ffmpeg` (the demux/mux side the relay/sink still rides). Included in
+# the `nvidia` deploy preset so the production build serves the operator's
+# required dual-stack listener.
+srt-libsrt = ["ffmpeg", "dep:multiview-srt-sys", "multiview-output/srt-libsrt"]
 
 # RIST (Reliable Internet Stream Transport, VSF TR-06) ingest + egress
 # (ADR-0095 Tier-0): wire a `rist` source through the libav `rist://` demuxer and
@@ -563,6 +584,12 @@ nvidia = [
     # forwarded the dependency crates' ffmpeg but not the cli's, so a `--features
     # nvidia` binary could not run a pipeline — surfaced by the on-hardware run).
     "ffmpeg",
+    # Dual-stack SRT listener leaf (ADR-0039 decision 10, amended): the operator
+    # requires IPv6-first `[::]` SRT listening for both the SRT input and output
+    # roles, which `FFmpeg`'s `libsrt` protocol cannot bind. Without this the
+    # deploy image's SRT listeners would fail closed with a clear "requires
+    # srt-libsrt" error instead of serving the production dual-stack listener.
+    "srt-libsrt",
     # Native overlay / caption burn-in. The native HLS-WebVTT caption ingest +
     # per-tile burn-in path (the `#47` fix) is entirely `#[cfg(feature =
     # "overlay")]`-gated (`prefetch_caption_plans` / `wire_source_captions` / the

@@ -2971,6 +2971,7 @@ dependencies = [
  "multiview-output",
  "multiview-overlay",
  "multiview-preview",
+ "multiview-srt-sys",
  "multiview-telemetry",
  "multiview-weather",
  "multiview-webrtc",
@@ -3291,6 +3292,7 @@ dependencies = [
  "multiview-input",
  "multiview-ndi-sys",
  "multiview-rist-sys",
+ "multiview-srt-sys",
  "multiview-telemetry",
  "proptest",
  "rustix",
@@ -3340,6 +3342,15 @@ version = "0.1.0"
 dependencies = [
  "libloading 0.9.0",
  "multiview-telemetry",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "multiview-srt-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading 0.9.0",
  "thiserror 2.0.18",
 ]
 

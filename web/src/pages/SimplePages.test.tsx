@@ -16,6 +16,7 @@ import { setupServer } from "msw/node";
 import { MemoryRouter } from "react-router-dom";
 
 import { OutputsPage, SourcesPage } from "./SimplePages";
+import { OutputLinkStatus } from "./OutputsPage";
 import { renderWithProviders } from "../test/render";
 
 const SOURCES = [
@@ -181,5 +182,56 @@ describe("OutputsPage runnability honesty", () => {
       screen.getByText("Not yet runnable in this build"),
     ).toBeInTheDocument();
     expect(screen.getByText("Runnable")).toBeInTheDocument();
+  });
+});
+
+describe("OutputLinkStatus", () => {
+  function renderLink(body: unknown, status = 200): void {
+    server.use(
+      http.get("*/api/v1/outputs/:id/link", () =>
+        HttpResponse.json(body as object, { status }),
+      ),
+    );
+    renderWithProviders(<OutputLinkStatus id="srt-main" />);
+  }
+  const link = {
+    state: "listening",
+    mode: "listener",
+    transport: "srt",
+    url: "srt://[::]:9000",
+    clients: 0,
+    sessions: 0,
+    dropped: 0,
+    written: 0,
+    peers: [],
+  };
+
+  it("tells the operator no caller is attached", async () => {
+    renderLink(link);
+    expect(
+      await screen.findByText("Listening, no caller attached"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows attached peers, the last error and drops", async () => {
+    renderLink({
+      ...link,
+      state: "connected",
+      clients: 2,
+      peers: ["[2001:db8::7]:5000", "192.0.2.4:5001"],
+      last_error: "connection lost",
+      dropped: 42,
+    });
+    expect(await screen.findByText("Connected (2)")).toBeInTheDocument();
+    expect(screen.getByText("[2001:db8::7]:5000")).toBeInTheDocument();
+    expect(screen.getByText("192.0.2.4:5001")).toBeInTheDocument();
+    expect(screen.getByText("connection lost")).toBeInTheDocument();
+    expect(screen.getByText("42 packets dropped")).toBeInTheDocument();
+  });
+
+  it("renders nothing while the program is stopped", async () => {
+    renderLink({ title: "not found", status: 404 }, 404);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.queryByTestId("output-link")).not.toBeInTheDocument();
   });
 });

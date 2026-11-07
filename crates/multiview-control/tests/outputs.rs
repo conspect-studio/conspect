@@ -381,3 +381,141 @@ async fn delete_requires_admin_role() {
     let resp = send(&h.router, get("/api/v1/outputs/main", ADMIN_TOKEN)).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// The live link surface, through the real router: projected from the snapshot
+/// by the runtime id, 404 with no running link, 403 outside a principal's scope.
+mod output_link {
+    use super::support::{
+        self, body_json, get, harness, post_json, send, OPERATOR_TOKEN, VIEWER_TOKEN,
+    };
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    fn link() -> serde_json::Value {
+        json!({ "link": {
+            "state": "listening", "mode": "listener", "transport": "srt",
+            "url": "srt://[::]:9000", "clients": 0, "sessions": 0,
+            "dropped": 7, "written": 0, "peers": []
+        }})
+    }
+
+    #[tokio::test]
+    async fn serves_the_link_by_runtime_id_and_guards_it() {
+        let h = harness();
+        let body = json!({
+            "id": "srt-main", "name": "SRT",
+            "body": { "kind": "srt", "id": "srt-main", "url": "srt://[::]:9000", "codec": "h264" }
+        });
+        let created = send(
+            &h.router,
+            post_json("/api/v1/outputs/srt-main", OPERATOR_TOKEN, &body),
+        )
+        .await;
+        assert!(
+            created.status().is_success(),
+            "create: {}",
+            created.status()
+        );
+
+        // No running program yet: an honest 404, never a stale state.
+        let resp = send(
+            &h.router,
+            get("/api/v1/outputs/srt-main/link", VIEWER_TOKEN),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        h.engine
+            .publish_state(json!({ "v": 1, "outputs": { "srt-main": link() } }));
+        let resp = send(
+            &h.router,
+            get("/api/v1/outputs/srt-main/link", VIEWER_TOKEN),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = body_json(resp).await;
+        assert_eq!(got["state"], "listening");
+        assert_eq!(got["dropped"], 7);
+
+        // BOLA: another principal's scope never reaches this output's link.
+        let resp = send(
+            &h.router,
+            get("/api/v1/outputs/srt-main/link", support::SCOPED_TOKEN),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // An id that is not an accepted output is 404 even if the blob has it.
+        h.engine
+            .publish_state(json!({ "v": 1, "outputs": { "ghost": link() } }));
+        let resp = send(&h.router, get("/api/v1/outputs/ghost/link", VIEWER_TOKEN)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// SRT-03: a read-role user never sees a stream key, passphrase, stream id,
+    /// RIST secret or userinfo in `url` or `peers`, for every push transport,
+    /// even if the published snapshot carried the raw form.
+    #[tokio::test]
+    async fn a_read_role_user_never_sees_a_push_secret() {
+        for (kind, raw, safe) in [
+            (
+                "rtmp",
+                "rtmp://live.example/sk_live_SECRET1",
+                "rtmp://live.example/***",
+            ),
+            (
+                "rtmp",
+                "rtmp://live.example/sk_live_SECRET1/",
+                "rtmp://live.example/***",
+            ),
+            (
+                "rtmp",
+                "rtmps://u:SECRET1@live.example:443/app/SECRET2?x=SECRET3",
+                "rtmps://live.example:443/app/***",
+            ),
+            (
+                "srt",
+                "srt://[2001:db8::1]:9000?mode=caller&passphrase=SECRET1&streamid=SECRET2",
+                "srt://[2001:db8::1]:9000",
+            ),
+            (
+                "rist",
+                "rist://u:SECRET1@[2001:db8::1]:8000/SECRET2?secret=SECRET3",
+                "rist://[2001:db8::1]:8000",
+            ),
+        ] {
+            let h = harness();
+            let body = json!({
+                "id": "push-out", "name": "Push",
+                "body": { "kind": kind, "id": "push-out", "url": safe, "codec": "h264" }
+            });
+            let created = send(
+                &h.router,
+                post_json("/api/v1/outputs/push-out", OPERATOR_TOKEN, &body),
+            )
+            .await;
+            assert!(
+                created.status().is_success(),
+                "{kind}: {}",
+                created.status()
+            );
+            h.engine
+                .publish_state(json!({ "v": 1, "outputs": { "push-out": { "link": {
+                    "state": "connected", "mode": "caller", "transport": kind,
+                    "url": raw, "clients": 1, "sessions": 1, "dropped": 0, "written": 0,
+                    "peers": [raw, "[::1]:5000"]
+                }}}}));
+            let resp = send(
+                &h.router,
+                get("/api/v1/outputs/push-out/link", VIEWER_TOKEN),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = body_json(resp).await;
+            let text = got.to_string();
+            assert!(!text.contains("SECRET"), "{raw} leaked: {text}");
+            assert_eq!(got["url"], safe, "{raw}");
+            assert_eq!(got["peers"], json!([safe, "[::1]:5000"]), "{raw}");
+        }
+    }
+}

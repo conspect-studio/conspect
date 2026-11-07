@@ -426,3 +426,118 @@ pub(crate) async fn get_output_playback(
 pub(crate) struct OutputPlaybackResponse {
     urls: Vec<crate::openapi_schemas::PlaybackUrlDoc>,
 }
+
+/// `GET /api/v1/outputs/{id}/link` — the live link state of a push output
+/// (role: read; per-object authz).
+///
+/// Projects `outputs.<id>.link` out of the cached off-engine snapshot (inv
+/// #10: never touches the engine). `404` when the output has no live push link
+/// (not a push output, or the program is not running).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        get,
+        path = "/api/v1/outputs/{id}/link",
+        tag = "outputs",
+        params(("id" = String, Path, description = "Output id.")),
+        responses(
+            (status = 200, description = "The output's live push-link state.", body = crate::openapi_schemas::OutputLinkDoc),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to read this output.", body = crate::problem::Problem),
+            (status = 404, description = "No live push link for this output.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn get_output_link(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Read)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let not_found = || crate::error::ControlError::NotFound {
+        kind: OUTPUT_KIND,
+        id: id.clone(),
+    };
+    let versioned = accepted_output(&state, &id)?;
+    let snapshot = state.engine.state.latest().ok_or_else(not_found)?;
+    let runtime_id = runtime_output_id(&versioned.resource.body, &id);
+    let mut link = output_link_from_snapshot(&snapshot, &runtime_id).ok_or_else(not_found)?;
+    redact_link_for_read(&mut link);
+    Ok((StatusCode::OK, Json(link)).into_response())
+}
+
+/// The id the running pipeline knows this output by. An output with no authored
+/// id is `output-N` here but keyed by its derived label at run time.
+fn runtime_output_id(body: &serde_json::Value, resource_id: &str) -> String {
+    serde_json::from_value::<multiview_config::Output>(body.clone())
+        .map_or_else(|_| resource_id.to_owned(), |output| output.id())
+}
+
+/// Defence in depth for a read-role response (review SRT-03): whatever the
+/// pipeline published, `url` and every URL-shaped `peers` entry leave here in
+/// the shared display-safe form, so no stream key, passphrase, stream id or
+/// RIST secret reaches a viewer. Idempotent on already-redacted values.
+fn redact_link_for_read(link: &mut serde_json::Value) {
+    use multiview_core::redact::{redact_peer, redact_transport_url};
+    if let Some(url) = link.get_mut("url") {
+        *url = url
+            .as_str()
+            .map_or(serde_json::Value::Null, |u| redact_transport_url(u).into());
+    }
+    if let Some(peers) = link
+        .get_mut("peers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for peer in peers.iter_mut() {
+            *peer = peer
+                .as_str()
+                .map_or(serde_json::Value::Null, |p| redact_peer(p).into());
+        }
+    }
+}
+
+/// `outputs.<id>.link` from the conflated snapshot, if present.
+fn output_link_from_snapshot(
+    snapshot: &crate::state::EngineStateSnapshot,
+    id: &str,
+) -> Option<serde_json::Value> {
+    snapshot
+        .get("outputs")
+        .and_then(|outputs| outputs.get(id))
+        .and_then(|output| output.get("link"))
+        .filter(|link| link.is_object())
+        .cloned()
+}
+
+#[cfg(test)]
+mod link_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::{output_link_from_snapshot, runtime_output_id};
+    use serde_json::json;
+
+    #[test]
+    fn resource_ids_resolve_to_the_runtime_key() {
+        let idless = json!({"kind": "srt", "url": "srt://[::]:9000", "codec": "h264"});
+        assert_eq!(
+            runtime_output_id(&idless, "output-0"),
+            "srt srt://[::]:9000"
+        );
+        let authored =
+            json!({"kind": "srt", "id": "main", "url": "srt://[::]:9000", "codec": "h264"});
+        assert_eq!(runtime_output_id(&authored, "main"), "main");
+        assert_eq!(runtime_output_id(&json!({"kind": "?"}), "x"), "x");
+    }
+
+    #[test]
+    fn projects_the_link_or_none() {
+        let snap = json!({
+            "v": 1,
+            "outputs": { "srt-out": { "link": { "state": "listening", "clients": 0 } } }
+        });
+        let link = output_link_from_snapshot(&snap, "srt-out").unwrap();
+        assert_eq!(link["state"], "listening");
+        assert!(output_link_from_snapshot(&snap, "other").is_none());
+        assert!(output_link_from_snapshot(&json!({"v": 1}), "srt-out").is_none());
+    }
+}

@@ -116,6 +116,7 @@ async fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    // Boxed: `dispatch` holds a whole `Pipeline` across awaits (clippy::large_futures).
     match Box::pin(dispatch(cli)).await {
         Ok(code) => code,
         Err(err) => {

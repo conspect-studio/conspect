@@ -57,6 +57,101 @@ pub struct Muxer {
     options: MuxOptions,
     header_written: bool,
     trailer_written: bool,
+    /// The interrupt state a push muxer's `AVIOInterruptCB` points at
+    /// ([`Muxer::create_push`]). Declared AFTER `output` so the context (and
+    /// its `AVIOContext`, which holds a copy of the callback) is closed before
+    /// this box is freed. `None` for file muxers (no callback installed).
+    interrupt: Option<std::sync::Arc<IoInterrupt>>,
+    /// The caller-owned byte sink of [`Muxer::create_with_writer`]. libav holds a
+    /// raw pointer to it; `Drop` frees the `AVIOContext` before this box goes.
+    writer: Option<Box<CustomIo>>,
+}
+
+/// A byte sink for [`Muxer::create_with_writer`]. Returns `false` when the
+/// transport failed, which libav reports as a write error. It must finish
+/// within [`IoBudget::deadline`] and give up once [`IoBudget::should_stop`].
+pub type PacketWriter = Box<dyn FnMut(&[u8], &IoBudget<'_>) -> bool + Send>;
+
+/// The operation-wide bound a [`PacketWriter`] call runs under: the absolute
+/// deadline armed by [`Muxer::arm_io_deadline`] for the WHOLE mux operation
+/// (it does not reset per callback) and the muxer's stop flag (review SRT-05).
+pub struct IoBudget<'a>(&'a IoInterrupt);
+
+impl IoBudget<'_> {
+    /// The absolute instant the current mux operation must finish by, if armed.
+    #[must_use]
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.0.deadline()
+    }
+
+    /// Whether the writer must give up now (stop raised or deadline passed).
+    #[must_use]
+    pub fn should_stop(&self) -> bool {
+        self.0.should_abort()
+    }
+}
+
+/// What a custom-I/O muxer's write callback reaches through `opaque`.
+struct CustomIo {
+    writer: PacketWriter,
+    interrupt: std::sync::Arc<IoInterrupt>,
+}
+
+impl Drop for Muxer {
+    fn drop(&mut self) {
+        if self.writer.is_some() {
+            push_ffi::free_custom_io(&mut self.output);
+        }
+    }
+}
+
+/// Lock-free interrupt state polled by a push muxer's `AVIOInterruptCB`.
+///
+/// libav polls the callback (every ~100 ms in `libsrt`'s epoll loop, and in
+/// the TCP/UDP poll loops) while a connect / `srt_accept` / write is blocked.
+/// It aborts when the shared `stop` flag is raised (end-of-program teardown) or
+/// when an armed I/O deadline has passed (a stalled peer), so a push can never
+/// wedge its sink thread or `stop` (invariants #1/#10).
+pub struct IoInterrupt {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    base: std::time::Instant,
+    /// Nanoseconds-since-`base` deadline, or `0` when disarmed.
+    deadline_ns: std::sync::atomic::AtomicU64,
+}
+
+impl IoInterrupt {
+    fn new(stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            stop,
+            base: std::time::Instant::now(),
+            deadline_ns: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn arm(&self, timeout: Option<std::time::Duration>) {
+        let ns = timeout.map_or(0, |t| {
+            let at = self.base.elapsed().saturating_add(t);
+            u64::try_from(at.as_nanos()).unwrap_or(u64::MAX).max(1)
+        });
+        self.deadline_ns
+            .store(ns, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The armed deadline as an absolute instant.
+    fn deadline(&self) -> Option<std::time::Instant> {
+        let ns = self.deadline_ns.load(std::sync::atomic::Ordering::Acquire);
+        (ns != 0).then(|| self.base + std::time::Duration::from_nanos(ns))
+    }
+
+    /// Whether a blocked libav I/O call should abort now.
+    fn should_abort(&self) -> bool {
+        if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        let deadline = self.deadline_ns.load(std::sync::atomic::Ordering::Acquire);
+        let now = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        deadline != 0 && now >= deadline
+    }
 }
 
 impl Muxer {
@@ -74,6 +169,8 @@ impl Muxer {
             options: MuxOptions::new(),
             header_written: false,
             trailer_written: false,
+            interrupt: None,
+            writer: None,
         })
     }
 
@@ -91,6 +188,8 @@ impl Muxer {
             options: MuxOptions::new(),
             header_written: false,
             trailer_written: false,
+            interrupt: None,
+            writer: None,
         })
     }
 
@@ -132,7 +231,95 @@ impl Muxer {
             options,
             header_written: false,
             trailer_written: false,
+            interrupt: None,
+            writer: None,
         })
+    }
+
+    /// Open a **live push** muxer on a network `url` (`srt://`, `rtmp://`,
+    /// `udp://`, `rist://`, …) forcing `format_name`, with an `AVIOInterruptCB`
+    /// installed **before** the connect so a blocked open/accept/write is
+    /// abortable.
+    ///
+    /// The callback aborts the blocked libav call when `stop` is raised (sink
+    /// teardown) or when the I/O deadline armed by
+    /// [`arm_io_deadline`](Muxer::arm_io_deadline) passes. `open_timeout` is
+    /// armed for the open itself (`None` = only `stop` aborts it — the right
+    /// shape for an SRT **listener**, which waits for a caller indefinitely);
+    /// it is disarmed once the open returns.
+    ///
+    /// # Errors
+    /// [`FfmpegError::Mux`] when the context cannot be allocated, the URL has an
+    /// interior NUL, or the connect/listen fails or is interrupted
+    /// (`AVERROR_EXIT` when aborted by `stop`, `ETIMEDOUT`-shaped on deadline).
+    pub fn create_push(
+        url: &str,
+        format_name: &str,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        open_timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        ensure_initialized()?;
+        let interrupt = std::sync::Arc::new(IoInterrupt::new(stop));
+        interrupt.arm(open_timeout);
+        let output = push_ffi::open_output_with_interrupt(url, format_name, &interrupt)?;
+        interrupt.arm(None);
+        Ok(Self {
+            output,
+            streams: Vec::new(),
+            options: MuxOptions::new(),
+            header_written: false,
+            trailer_written: false,
+            interrupt: Some(interrupt),
+            writer: None,
+        })
+    }
+
+    /// A muxer whose bytes go to `writer` instead of a libav protocol, in
+    /// `packet_size` chunks (one SRT live message for MPEG-TS). No I/O happens
+    /// here; `writer` runs on the thread driving this muxer.
+    ///
+    /// The muxer carries the same interrupt state as [`Muxer::create_push`]:
+    /// `stop` and the deadline armed by [`Muxer::arm_io_deadline`] are checked
+    /// before EVERY write callback (a callback after either fails the write
+    /// with `AVERROR_EXIT`), handed to `writer` as its [`IoBudget`], and
+    /// installed as the context's `AVIOInterruptCB` (review SRT-05).
+    ///
+    /// # Errors
+    /// [`FfmpegError::Mux`] when the context or its I/O cannot be allocated.
+    pub fn create_with_writer(
+        format_name: &str,
+        packet_size: usize,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        writer: PacketWriter,
+    ) -> Result<Self> {
+        ensure_initialized()?;
+        let interrupt = std::sync::Arc::new(IoInterrupt::new(stop));
+        let mut io = Box::new(CustomIo {
+            writer,
+            interrupt: std::sync::Arc::clone(&interrupt),
+        });
+        let output = push_ffi::open_output_with_writer(format_name, packet_size, &mut io)?;
+        Ok(Self {
+            output,
+            streams: Vec::new(),
+            options: MuxOptions::new(),
+            header_written: false,
+            trailer_written: false,
+            interrupt: Some(interrupt),
+            writer: Some(io),
+        })
+    }
+
+    /// Arm (or with `None`, disarm) the I/O deadline for the next mux operation
+    /// (header, one packet, trailer) as a whole, polled by a push muxer's
+    /// interrupt callback and, for a custom-writer muxer, before every write
+    /// callback: I/O past it aborts with an error instead of wedging the sink
+    /// thread. It is absolute, so it never resets per callback. A no-op for
+    /// file muxers.
+    pub fn arm_io_deadline(&self, timeout: Option<std::time::Duration>) {
+        if let Some(interrupt) = &self.interrupt {
+            interrupt.arm(timeout);
+        }
     }
 
     /// Register a stream from an opened encoder's codec context, recording the
@@ -452,5 +639,208 @@ impl Muxer {
         self.output.write_trailer().map_err(FfmpegError::Mux)?;
         self.trailer_written = true;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Push-open FFI: install an `AVIOInterruptCB` on the output context BEFORE
+// `avio_open2` connects (libsrt's listener blocks in `srt_accept` inside the
+// open, and its epoll wait polls exactly this callback). `ffmpeg_next`'s
+// `output_as` installs no callback, so the open is driven directly. Every
+// `unsafe` is bounded to libav objects we own and carries a SAFETY note; the
+// callback never allocates and is panic-free, so nothing unwinds across FFI.
+#[allow(unsafe_code)]
+mod push_ffi {
+    use std::ffi::CString;
+    use std::ptr;
+
+    use ffmpeg::ffi;
+    use ffmpeg_next as ffmpeg;
+    use libc::{c_int, c_void};
+
+    use super::{CustomIo, IoBudget, IoInterrupt};
+    use crate::error::{FfmpegError, Result};
+
+    /// `extern "C"` write callback: forwards one buffer to the owned writer
+    /// unless stop or the operation deadline has already passed (then
+    /// `AVERROR_EXIT`, so successful-but-slow callbacks cannot run on past
+    /// either). A panic in the writer is contained here and reported as an I/O
+    /// error.
+    extern "C" fn write_cb(opaque: *mut c_void, buf: *const u8, size: c_int) -> c_int {
+        let Ok(len) = usize::try_from(size) else {
+            return ffi::AVERROR(libc::EINVAL);
+        };
+        if opaque.is_null() || buf.is_null() {
+            return ffi::AVERROR(libc::EINVAL);
+        }
+        // SAFETY: `opaque` is the `CustomIo` box installed in
+        // `open_output_with_writer`, alive until `free_custom_io` removed this
+        // context; libav calls back synchronously on the thread driving the
+        // muxer, so there is no aliasing `&mut`. `buf` holds `len` bytes.
+        let (io, data) = unsafe {
+            (
+                &mut *opaque.cast::<CustomIo>(),
+                std::slice::from_raw_parts(buf, len),
+            )
+        };
+        if io.interrupt.should_abort() {
+            return ffi::AVERROR_EXIT;
+        }
+        let CustomIo { writer, interrupt } = io;
+        let budget = IoBudget(interrupt);
+        let wrote =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer(data, &budget)));
+        if matches!(wrote, Ok(true)) {
+            size
+        } else {
+            ffi::AVERROR(libc::EIO)
+        }
+    }
+
+    pub(super) fn open_output_with_writer(
+        format_name: &str,
+        packet_size: usize,
+        io: &mut Box<CustomIo>,
+    ) -> Result<ffmpeg::format::context::Output> {
+        let invalid = || FfmpegError::Mux(ffmpeg::Error::InvalidData);
+        let c_fmt = CString::new(format_name).map_err(|_| invalid())?;
+        let size = c_int::try_from(packet_size).map_err(|_| invalid())?;
+        let mut ctx: *mut ffi::AVFormatContext = ptr::null_mut();
+        // SAFETY: allocates an owned context into `ctx`; `c_fmt` outlives the call.
+        let r = unsafe {
+            ffi::avformat_alloc_output_context2(
+                &raw mut ctx,
+                ptr::null_mut(),
+                c_fmt.as_ptr(),
+                ptr::null(),
+            )
+        };
+        if r < 0 || ctx.is_null() {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(r.min(-1))));
+        }
+        // SAFETY: `av_malloc` returns an owned buffer or null; ownership passes
+        // to the AVIO context below, or is freed on its failure.
+        let buffer = unsafe { ffi::av_malloc(packet_size) }.cast::<u8>();
+        let opaque = ptr::from_mut::<CustomIo>(io.as_mut()).cast::<c_void>();
+        let interrupt = ptr::from_ref::<IoInterrupt>(io.interrupt.as_ref())
+            .cast::<c_void>()
+            .cast_mut();
+        // SAFETY: `buffer` holds `size` bytes; `opaque` is a stable heap address
+        // that the `Muxer` keeps alive until `free_custom_io` runs.
+        let pb = if buffer.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { ffi::avio_alloc_context(buffer, size, 1, opaque, None, Some(write_cb), None) }
+        };
+        if pb.is_null() {
+            // SAFETY: both are ours; `av_free` accepts null.
+            unsafe {
+                ffi::av_free(buffer.cast::<c_void>());
+                ffi::avformat_free_context(ctx);
+            }
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(ffi::AVERROR(
+                libc::ENOMEM,
+            ))));
+        }
+        // SAFETY: `ctx` and `pb` are valid. `max_packet_size` makes libav flush
+        // whole `packet_size` chunks; CUSTOM_IO stops libav closing `pb`. The
+        // `Output` wrapper's own destructor would `avio_close` it, which is why
+        // `free_custom_io` must null `pb` first. The interrupt callback's
+        // `opaque` is the `IoInterrupt` the `Muxer` keeps alive (an `Arc` held
+        // by both the `Muxer` and the `CustomIo`) for the context's lifetime.
+        unsafe {
+            (*ctx).interrupt_callback = ffi::AVIOInterruptCB {
+                callback: Some(interrupt_cb),
+                opaque: interrupt,
+            };
+            (*pb).max_packet_size = size;
+            (*ctx).pb = pb;
+            (*ctx).flags |= ffi::AVFMT_FLAG_CUSTOM_IO;
+            Ok(ffmpeg::format::context::Output::wrap(ctx))
+        }
+    }
+
+    /// Free a custom `AVIOContext` and clear `pb`, so the `Output` destructor's
+    /// `avio_close` (which assumes a `URLContext` opaque) sees null.
+    pub(super) fn free_custom_io(output: &mut ffmpeg::format::context::Output) {
+        // SAFETY: `output` owns the context; `pb` is the context allocated in
+        // `open_output_with_writer`, whose buffer libav may have reallocated, so
+        // it is read back from `pb`. Both are freed exactly once, then cleared.
+        unsafe {
+            let ctx = output.as_mut_ptr();
+            let mut pb = (*ctx).pb;
+            if !pb.is_null() {
+                ffi::av_freep((&raw mut (*pb).buffer).cast::<c_void>());
+                ffi::avio_context_free(&raw mut pb);
+                (*ctx).pb = ptr::null_mut();
+            }
+        }
+    }
+
+    /// `extern "C"` interrupt callback: `1` aborts the blocked libav call.
+    extern "C" fn interrupt_cb(opaque: *mut c_void) -> c_int {
+        if opaque.is_null() {
+            return 0;
+        }
+        // SAFETY: `opaque` is the `&IoInterrupt` installed by an open below;
+        // its owning `Arc` lives in the `Muxer` and is dropped only AFTER the
+        // output context (field order), so the pointer is valid whenever libav
+        // polls.
+        let interrupt: &IoInterrupt = unsafe { &*opaque.cast::<IoInterrupt>() };
+        c_int::from(interrupt.should_abort())
+    }
+
+    pub(super) fn open_output_with_interrupt(
+        url: &str,
+        format_name: &str,
+        interrupt: &IoInterrupt,
+    ) -> Result<ffmpeg::format::context::Output> {
+        let c_url = CString::new(url).map_err(|_| FfmpegError::Mux(ffmpeg::Error::InvalidData))?;
+        let c_fmt =
+            CString::new(format_name).map_err(|_| FfmpegError::Mux(ffmpeg::Error::InvalidData))?;
+        let mut ctx: *mut ffi::AVFormatContext = ptr::null_mut();
+        // SAFETY: allocates an owned output context into `ctx` (or leaves it
+        // null and returns < 0); both C strings outlive the call.
+        let r = unsafe {
+            ffi::avformat_alloc_output_context2(
+                &raw mut ctx,
+                ptr::null_mut(),
+                c_fmt.as_ptr(),
+                c_url.as_ptr(),
+            )
+        };
+        if r < 0 || ctx.is_null() {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(r.min(-1))));
+        }
+        // SAFETY: `ctx` is our freshly-allocated context. We install the
+        // interrupt callback on it, then (unless the muxer owns its own I/O,
+        // `AVFMT_NOFILE`, e.g. `rtsp`) open its `pb` with the SAME callback so
+        // the protocol's blocking connect/accept/write polls it.
+        let open = unsafe {
+            (*ctx).interrupt_callback = ffi::AVIOInterruptCB {
+                callback: Some(interrupt_cb),
+                opaque: ptr::from_ref(interrupt).cast::<c_void>().cast_mut(),
+            };
+            let oformat = (*ctx).oformat;
+            if !oformat.is_null() && ((*oformat).flags & ffi::AVFMT_NOFILE) != 0 {
+                return Ok(ffmpeg::format::context::Output::wrap(ctx));
+            }
+            ffi::avio_open2(
+                &raw mut (*ctx).pb,
+                c_url.as_ptr(),
+                ffi::AVIO_FLAG_WRITE,
+                &raw const (*ctx).interrupt_callback,
+                ptr::null_mut(),
+            )
+        };
+        if open < 0 {
+            // SAFETY: the open failed so `pb` is null; free the context we own.
+            unsafe { ffi::avformat_free_context(ctx) };
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(open)));
+        }
+        // SAFETY: `ctx` is a valid output context with an open `pb`;
+        // `Output::wrap` adopts it and frees both (`avio_close` +
+        // `avformat_free_context`) in its destructor.
+        Ok(unsafe { ffmpeg::format::context::Output::wrap(ctx) })
     }
 }

@@ -18,7 +18,7 @@ import { CircleCheck, Hourglass, MonitorCog } from 'lucide-react';
 import type { ColumnDef } from '@tanstack/react-table';
 
 import { OutputFromDeviceSection } from '../devices/FromDevice';
-import { useOutputs } from '../resources/queries';
+import { useOutputLink, useOutputs } from '../resources/queries';
 import { useAudioRouting } from '../resources/audioRouting';
 import type { SaveResourceVars } from '../resources/queries';
 import type { OutputKind, OutputView } from '../resources/types';
@@ -105,6 +105,52 @@ function RunnabilityNote({ kind }: { readonly kind: OutputKind }): JSX.Element {
         </span>
       );
   }
+}
+
+/** Output kinds that report a live network link. */
+function hasLiveLink(kind: OutputKind): boolean {
+  return kind === 'srt' || kind === 'rtmp' || kind === 'rist';
+}
+
+/** A push output's live link: whether a peer is attached, and what went wrong. */
+export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element | null {
+  const { t } = useLingui();
+  const link = useOutputLink(id, true).data;
+  if (link === undefined || link === null) {
+    return null;
+  }
+  const state = ((): string => {
+    switch (link.state) {
+      case 'listening':
+        return t`Listening, no caller attached`;
+      case 'connected':
+        return t`Connected (${link.clients})`;
+      case 'connecting':
+        return t`Connecting`;
+      case 'reconnecting':
+        return t`Reconnecting`;
+      default:
+        return t`Idle`;
+    }
+  })();
+  return (
+    <div className="flex flex-col gap-0.5 text-xs" data-testid="output-link">
+      <span>{state}</span>
+      {link.peers.map((peer) => (
+        <code key={peer} className="text-muted-foreground" lang="" dir="auto">
+          {peer}
+        </code>
+      ))}
+      {link.last_error !== undefined && link.last_error !== null ? (
+        <span className="text-destructive">{link.last_error}</span>
+      ) : null}
+      {link.dropped > 0 ? (
+        <span className="text-muted-foreground">
+          <Trans>{link.dropped} packets dropped</Trans>
+        </span>
+      ) : null}
+    </div>
+  );
 }
 
 /** The kind-specific destination + tuning fields. */
@@ -258,6 +304,7 @@ function OutputKindFields({
           value={form.url}
           required
           placeholder="srt://[2001:db8::1]:7001"
+          hint={t`To let callers pull the program, use srt://[::]:7001?mode=listener: one socket serves up to 16 IPv6 and IPv4 callers. 0.0.0.0 is IPv4 only.`}
           error={errors.url}
           onChange={(next): void => {
             setForm({ ...form, url: next });
@@ -811,7 +858,12 @@ export function OutputsPage(): JSX.Element {
         // Runnability is defined for the kinds this build knows; an unknown
         // kind gets an honest dash, never a claim about the folded kind.
         ctx.row.original.editable ? (
-          <RunnabilityNote kind={ctx.row.original.kind} />
+          <div className="flex flex-col gap-1">
+            <RunnabilityNote kind={ctx.row.original.kind} />
+            {hasLiveLink(ctx.row.original.kind) ? (
+              <OutputLinkStatus id={ctx.row.original.id} />
+            ) : null}
+          </div>
         ) : (
           <span className="text-sm text-muted-foreground" aria-hidden="true">
             —

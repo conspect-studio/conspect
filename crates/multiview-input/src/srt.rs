@@ -68,6 +68,22 @@ pub enum SrtError {
     /// pair, or an unknown `t=`/`m=` token is rejected outright.
     #[error("srt stream id is not a parseable Access-Control grammar: {0}")]
     StreamIdUnparseable(String),
+
+    /// An SRT **listener** URL (`mode=listener`, including the dual-stack
+    /// `[::]`/wildcard bind), but this build was compiled without the
+    /// `srt-libsrt` feature (ADR-0039 decision 10, amended): `FFmpeg`'s
+    /// `libsrt` protocol cannot bind the IPv6 wildcard at all (it has no
+    /// option to set `SRTO_IPV6ONLY`, so the bind fails with an opaque "Bad
+    /// parameters") and, for every listener bind, blocks its calling thread in
+    /// `srt_accept` after one caller — unworkable for a never-await-a-client
+    /// sink (invariant #10). Only the native `multiview-srt-sys` leaf serves
+    /// the listener role; without it a listener URL fails closed here.
+    #[error(
+        "SRT listener mode requires the srt-libsrt feature (off by default): FFmpeg's libsrt \
+         protocol cannot bind a dual-stack listener nor keep accepting after one caller \
+         (rebuild with --features srt-libsrt, or use mode=caller)"
+    )]
+    ListenerRequiresNativeLeaf,
 }
 
 impl SrtError {
@@ -714,10 +730,78 @@ impl SrtConfig {
             .join("&");
         // IPv6-first: an IPv6 literal host must be bracketed (`srt://[::1]:port`)
         // so the `:` of the address is not read as the port separator. Already
-        // bracketed or non-IPv6 hosts pass through unchanged.
+        // bracketed or non-IPv6 hosts pass through unchanged. The model keeps
+        // the configured host verbatim; the libav boundary applies
+        // [`listener_bind_host`] for a wildcard listener.
         let host = bracket_ipv6_host(&self.host);
         Ok(format!("srt://{host}:{}?{query}", self.port))
     }
+}
+
+/// The canonical dual-stack wildcard host of an SRT **listener**.
+pub const SRT_LISTENER_WILDCARD: &str = "[::]";
+
+/// Whether `host` spells the IPv6 wildcard: empty, `::`, or `[::]`. `0.0.0.0`
+/// is deliberately **not** a wildcard here: it is an explicit IPv4-only bind.
+#[must_use]
+pub fn is_wildcard_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.is_empty()
+        || bare
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_unspecified())
+}
+
+/// The bind host an SRT listener uses for `host`: every wildcard spelling
+/// becomes [`SRT_LISTENER_WILDCARD`]; a specific address is unchanged.
+///
+/// libsrt refuses to bind `[::]` unless `SRTO_IPV6ONLY` is set explicitly and
+/// `FFmpeg`'s `libsrt.c` exposes no way to set it, so a listener URL is **not**
+/// opened through libav: `multiview-srt-sys` binds one `AF_INET6` socket with
+/// `SRTO_IPV6ONLY = 0`, which serves IPv6 and IPv4 callers on the same port.
+#[must_use]
+pub fn listener_bind_host(host: &str) -> &str {
+    if is_wildcard_host(host) {
+        SRT_LISTENER_WILDCARD
+    } else {
+        host
+    }
+}
+
+/// Normalise an opaque `srt://host:port?…` **listener** URL's wildcard host to
+/// `[::]` (see [`listener_bind_host`]). Caller / rendezvous URLs, specific
+/// hosts, and anything that does not parse are returned unchanged.
+#[must_use]
+pub fn lower_listener_url(url: &str) -> String {
+    let (authority, query) = match url.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (url, None),
+    };
+    let is_listener = query.is_some_and(|q| {
+        q.split('&')
+            .any(|pair| pair.eq_ignore_ascii_case("mode=listener"))
+    });
+    if !is_listener {
+        return url.to_owned();
+    }
+    let Some(host_port) = authority.strip_prefix("srt://") else {
+        return url.to_owned();
+    };
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return url.to_owned();
+    };
+    if !is_wildcard_host(host) {
+        return url.to_owned();
+    }
+    let mut lowered = format!("srt://{SRT_LISTENER_WILDCARD}:{port}");
+    if let Some(query) = query {
+        lowered.push('?');
+        lowered.push_str(query);
+    }
+    lowered
 }
 
 /// Wrap a bare IPv6 literal host in `[...]` for use in a `host:port` URL; leave

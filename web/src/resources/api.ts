@@ -10,6 +10,7 @@
 // write ops — the calls go through `fetch` with EXPLICITLY-TYPED request/response
 // shapes and typed field guards. The opaque `body` is read with `stringField`/
 // `numberField`, never an `as`-cast of an untyped value.
+import type { components } from '../api/schema';
 import { getStoredToken } from '../api/token';
 import {
   parseOutputFormKind,
@@ -174,6 +175,49 @@ export async function getResource(
   }
   const etag = response.headers.get('ETag');
   return { record: body, etag: etag ?? undefined };
+}
+
+/** Live link state of a push output (`GET /api/v1/outputs/{id}/link`). */
+export type OutputLink = components['schemas']['OutputLinkDoc'];
+
+function isOutputLink(value: unknown): value is OutputLink {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'state' in value &&
+    typeof value.state === 'string' &&
+    'clients' in value &&
+    typeof value.clients === 'number' &&
+    'dropped' in value &&
+    typeof value.dropped === 'number' &&
+    'peers' in value &&
+    Array.isArray(value.peers)
+  );
+}
+
+/**
+ * Fetch a push output's live link state, or `null` when it has none (`404`:
+ * the program is not running, so there is no link to report).
+ */
+export async function getOutputLink(
+  id: string,
+  options: ResourceRequestOptions = {},
+): Promise<OutputLink | null> {
+  const response = await fetch(`${itemUrl('outputs', id, options)}/link`, {
+    method: 'GET',
+    headers: headersFor(options, false),
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw await readProblem(response);
+  }
+  const body: unknown = await response.json();
+  if (!isOutputLink(body)) {
+    throw new ResourceApiError('The server returned an unexpected link body.');
+  }
+  return body;
 }
 
 /**
