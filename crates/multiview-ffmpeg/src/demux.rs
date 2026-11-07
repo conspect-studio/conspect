@@ -378,7 +378,7 @@ impl Demuxer {
     /// * [`FfmpegError::ReadTimeout`] — the open exceeded `rw_timeout` (the input
     ///   never delivered a header; the wedged context was aborted).
     /// * [`FfmpegError::OpenInput`] — the container could not be opened/probed.
-    pub fn open_with_interrupt(path: &Path, options: DemuxOptions) -> Result<Self> {
+    pub fn open_with_interrupt(path: &Path, options: &DemuxOptions) -> Result<Self> {
         ensure_initialized()?;
         let source = path.display().to_string();
         let rw_timeout = options.rw_timeout();

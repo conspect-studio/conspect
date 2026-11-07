@@ -568,6 +568,7 @@ impl ProbeService {
     /// [`ControlError::TooManyRequests`] when the principal's per-minute budget or
     /// the global queue is exhausted (never blocks), [`ControlError::Validation`]
     /// for an unusable URL.
+    #[allow(clippy::too_many_lines)] // one admission path: cache, rate limit, queue
     pub fn submit(
         self: &Arc<Self>,
         principal: &str,

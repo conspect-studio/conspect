@@ -182,7 +182,7 @@ pub fn probe_segments(segments: &[Vec<u8>], budget: Duration) -> Result<MediaSam
 
     let mut sample = MediaSample::default();
     let opts = DemuxOptions::new().with_rw_timeout(Duration::from_secs(5));
-    let mut demux = match Demuxer::open_with_interrupt(file.path(), opts) {
+    let mut demux = match Demuxer::open_with_interrupt(file.path(), &opts) {
         Ok(d) => d,
         Err(e) => {
             sample.notes.push(format!("open: {e}"));

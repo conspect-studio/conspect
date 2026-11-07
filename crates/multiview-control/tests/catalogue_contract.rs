@@ -269,7 +269,7 @@ async fn endpoints_carry_every_field_the_web_contract_declares() {
     .await;
     has_all(&idx, INDEX_ENVELOPE, "index");
     let rows = idx["streams"].as_array().unwrap();
-    assert!(!rows.is_empty());
+    assert_ne!(rows.len(), 0);
     for r in rows {
         has_all(r, INDEX_STREAM, "index row");
         has_all(&r["geo"], GEO, "index row geo");
@@ -292,7 +292,7 @@ async fn endpoints_carry_every_field_the_web_contract_declares() {
     .await;
     has_all(&pl, PLACES_ENVELOPE, "places");
     let places = pl["places"].as_array().unwrap();
-    assert!(!places.is_empty());
+    assert_ne!(places.len(), 0);
     for p in places {
         has_all(p, PLACE, "place");
     }

@@ -156,6 +156,7 @@ const PROBE_LINKED_PER_ROUND: usize = 32;
 /// Stops at the first refusal (rate or queue full) rather than queueing more.
 /// Returns how many probes were admitted.
 #[cfg(feature = "catalogue")]
+#[must_use]
 pub fn probe_linked_round(state: &AppState) -> usize {
     let Some(svc) = state.catalogue_probe.as_ref() else {
         return 0;

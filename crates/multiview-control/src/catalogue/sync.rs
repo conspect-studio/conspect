@@ -178,13 +178,13 @@ pub async fn fetch_changed(
         } else {
             None
         };
-        let fetched = match fetcher.fetch(name, etag).await {
+        let outcome = match fetcher.fetch(name, etag).await {
             Ok(f) => f,
-            // An optional file (guides) that cannot be fetched must not fail the sync.
+            // An optional file (guides) that cannot be outcome must not fail the sync.
             Err(_) if !*required && !store.has_file(name) => continue,
             Err(e) => return Err(format!("{name}: {e}")),
         };
-        match fetched {
+        match outcome {
             FetchOutcome::NotModified => {}
             FetchOutcome::Body { bytes, etag } => {
                 changed.insert((*name).to_owned(), (bytes, etag));

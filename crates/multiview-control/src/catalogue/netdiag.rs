@@ -7,6 +7,7 @@
 //! (invariants #1/#10).
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde::Serialize;
 
@@ -169,10 +170,10 @@ pub fn redact_url(url: &str) -> String {
 pub fn curl_for(url: &str, headers: &NetworkRequestHeaders) -> String {
     let mut s = String::from("curl -sS -I");
     if let Some(ua) = &headers.user_agent {
-        s.push_str(&format!(" -A {}", shell_quote(ua)));
+        let _ = write!(s, " -A {}", shell_quote(ua));
     }
     if let Some(r) = &headers.referrer {
-        s.push_str(&format!(" -e {}", shell_quote(r)));
+        let _ = write!(s, " -e {}", shell_quote(r));
     }
     s.push(' ');
     s.push_str(&shell_quote(&redact_url(url)));
@@ -371,6 +372,6 @@ mod tests {
         assert!(a[0].contains("US") && a[0].contains("DE"));
         assert!(a[1].contains("IPv4 (200)") && a[1].contains("IPv6 (403)"));
         assert!(a[2].contains("cdn.example") && a[2].contains("playlist.example"));
-        assert!(assess(&report, Some("de")).len() == 2);
+        assert_eq!(assess(&report, Some("de")).len(), 2);
     }
 }

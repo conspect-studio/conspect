@@ -206,7 +206,7 @@ fn open_with_interrupt_under_guard_also_registers() {
     let ptr;
     {
         let _scope = ResourceGuard::enter(ResourceContext::output("rtsp-main"));
-        let demux = Demuxer::open_with_interrupt(&clip, DemuxOptions::new())
+        let demux = Demuxer::open_with_interrupt(&clip, &DemuxOptions::new())
             .expect("open container with interrupt");
         ptr = demux.format_ctx_ptr();
         let got = resolve_av_context(ptr).expect("the interrupt-open ctx is registered");

@@ -189,7 +189,7 @@ impl AudioFileDecoder {
             ]);
         }
         let mut decoder = Self::from_demuxer(
-            Demuxer::open_with_interrupt(path, options)?,
+            Demuxer::open_with_interrupt(path, &options)?,
             target_rate,
             target_channels,
         )?;

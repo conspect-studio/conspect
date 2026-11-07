@@ -290,6 +290,7 @@ impl Collector {
     }
 
     /// Resolve, screen and fetch one URL over every vetted address.
+    #[allow(clippy::too_many_lines)] // one linear per-address walk; splitting hides the order
     async fn probe_host(
         &self,
         url: &url::Url,
