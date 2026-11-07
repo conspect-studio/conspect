@@ -133,10 +133,11 @@ pub fn install(
     use std::sync::Arc;
     let dir =
         service::catalogue_dir(boot_path.unwrap_or_else(|| std::path::Path::new("multiview.toml")));
-    let fetcher: Arc<dyn sync::Fetcher> =
-        Arc::new(net::UpstreamFetcher::new(Arc::clone(&state.dial_policy)));
+    let fetcher: Arc<dyn sync::Fetcher> = Arc::new(net::UpstreamFetcher::new(Arc::clone(
+        &state.catalogue_dial_policy,
+    )));
     let catalogue = Catalogue::new(dir, cfg, fetcher);
-    let guard = guard::DialGuard::new(Arc::clone(&state.dial_policy));
+    let guard = guard::DialGuard::new(Arc::clone(&state.catalogue_dial_policy));
     let collector: Arc<dyn netdiag::NetworkCollector> = Arc::new(netdiag::collect::Collector::new(
         guard.clone(),
         egress_lookup,

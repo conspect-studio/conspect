@@ -790,7 +790,7 @@ pub async fn serve(state: &AppState, dir: &Path, url: &str) -> Logo {
             LogoCache::new(
                 dir.to_owned(),
                 crate::iptv::fetch::default_fetcher(),
-                Arc::clone(&state.dial_policy),
+                Arc::clone(&state.catalogue_dial_policy),
             )
         }))
     };

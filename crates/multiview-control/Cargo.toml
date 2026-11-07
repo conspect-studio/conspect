@@ -427,3 +427,8 @@ required-features = ["catalogue"]
 # Network-path diagnostics (§3a) against the [::1] fixture server.
 name = "catalogue_netdiag"
 required-features = ["catalogue"]
+
+[[test]]
+# Catalogue egress is public-only (PR192-01): private/CGNAT/ULA/redirect refusals.
+name = "catalogue_egress"
+required-features = ["catalogue"]

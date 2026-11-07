@@ -643,6 +643,14 @@ pub struct AppState {
     /// operator `control.device_dial_allow` allowlist tightens the dial to its own
     /// device subnet(s). Read-only control-plane state (invariant #10).
     pub dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
+    /// The outbound-dial policy for **catalogue egress** (IPTV-ORG sync, logo
+    /// fetches, deep probe incl. every redirect/playlist hop, and
+    /// `POST /sources/{id}/network`). Always public-only
+    /// ([`DialPolicy::deny_all_allowlistable`](multiview_config::device::net_guard::DialPolicy::deny_all_allowlistable)):
+    /// it is deliberately NOT `dial_policy` (the managed-device policy that permits
+    /// RFC1918/ULA/CGNAT), has no setter and is not configurable, so catalogue
+    /// content can never reach an internal service (SSRF).
+    pub catalogue_dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
     /// The IPTV publication runtime (epg-playlist): guide feed cache, the
     /// atomically swapped guide snapshot and the refresher wake signal.
     /// Control-plane only (invariant #10).
@@ -1002,6 +1010,9 @@ impl AppState {
             // dialable, never-legitimate ranges stay blocked. An operator
             // `control.device_dial_allow` allowlist tightens it (SEC-02/SEC-04).
             dial_policy: Arc::new(multiview_config::device::net_guard::DialPolicy::allow_lan()),
+            catalogue_dial_policy: Arc::new(
+                multiview_config::device::net_guard::DialPolicy::deny_all_allowlistable(),
+            ),
             iptv: Arc::new(crate::iptv::IptvService::default()),
             cast_sessions: Arc::new(CastSessionStore::new()),
             audio_routing: Arc::new(AudioRoutingStore::new()),

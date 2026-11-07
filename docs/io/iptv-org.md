@@ -356,6 +356,15 @@ Shown in the in-app “Data sources” footer of `/sources/iptv-org`:
 - Probe egress: attacker-influenced URLs ⇒ always through `net_guard` (resolved-IP screen, pinned
   dial, re-screened redirects), bounded as in §3. Probe is `operate`; refresh/import are
   `administer`.
+- **Catalogue egress is public-only.** Catalogue sync, logo fetches, the deep probe (the first URL
+  and every playlist, segment, key and redirect hop) and `POST /sources/{id}/network` all dial under
+  `AppState::catalogue_dial_policy` = `DialPolicy::deny_all_allowlistable()`, never the managed-device
+  `dial_policy` (which permits RFC1918/ULA/CGNAT for LAN devices). Private, ULA, CGNAT, loopback,
+  link-local/IMDS, unspecified, multicast and broadcast targets (IPv4-mapped IPv6 unwrapped) are refused
+  before any connection, for IP literals, every resolved DNS answer and every redirect hop. The policy has
+  no setter and no config key. **Consequence:** a source on a private network cannot be probed or
+  diagnosed from the catalogue; there are no private diagnostics in this release. The device/Cast policy
+  is unchanged.
 - Per-object authorization: `already_added` and link status only reveal sources the caller may see.
 - Logos are fetched and cached server-side (size-capped, image content types only) so the browser
   does not load third-party images.
