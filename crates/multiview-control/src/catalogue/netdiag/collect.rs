@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 use multiview_config::device::net_guard::{self, BlockClass};
 
 use super::{
-    assess, curl_for_addr, host_of, parse_trace, redact_url, NetworkAddress, NetworkCollector,
-    NetworkDns, NetworkEgress, NetworkHop, NetworkHost, NetworkReport, NetworkRequestHeaders,
-    NetworkTls,
+    assess, curl_for_addr, host_of, parse_trace, redact_text, redact_url, NetworkAddress,
+    NetworkCollector, NetworkDns, NetworkEgress, NetworkHop, NetworkHost, NetworkReport,
+    NetworkRequestHeaders, NetworkTls,
 };
 use crate::catalogue::guard::DialGuard;
 use crate::catalogue::probe::{parse_media, pick_variant, resolve_uri, ProbeRequest};
@@ -471,7 +471,8 @@ impl Collector {
                         location = header(&resp, "location");
                         if (400..500).contains(&status) {
                             let b = read_capped(&mut resp, EXCERPT_BYTES).await;
-                            let text = clean(&String::from_utf8_lossy(&b), EXCERPT_BYTES);
+                            let text =
+                                clean(&redact_text(&String::from_utf8_lossy(&b)), EXCERPT_BYTES);
                             hop.body_excerpt = (!text.trim().is_empty()).then_some(text);
                         } else if read_body && status == 200 {
                             body = read_capped(&mut resp, PLAYLIST_CAP).await;

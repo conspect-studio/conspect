@@ -83,7 +83,7 @@ async fn fixture() -> Fixture {
                     "/geo.m3u8" => (
                         403,
                         String::new(),
-                        "This content is not available in your region".to_owned(),
+                        "This content is not available in your region /live.m3u8?token=secret123&sig=abc 0123456789abcdef0123456789abcdef01234567".to_owned(),
                     ),
                     _ => (404, String::new(), "nope".to_owned()),
                 };
@@ -206,6 +206,10 @@ async fn egress_lookup_switch_off_makes_no_request_and_4xx_gets_an_excerpt() {
         .as_deref()
         .unwrap()
         .contains("not available in your region"));
+    let excerpt = report.hops[0].body_excerpt.as_deref().unwrap();
+    for leak in ["secret123", "sig=abc", "0123456789abcdef0123456789abcdef"] {
+        assert!(!excerpt.contains(leak), "{leak} leaked: {excerpt}");
+    }
 }
 
 #[tokio::test]

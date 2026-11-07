@@ -174,6 +174,74 @@ pub fn redact_url(url: &str) -> String {
     }
 }
 
+/// Redact free text (an upstream error body) before it is shown: strip URL
+/// userinfo and query/fragment anywhere, mask `token=`/`sig=`/`signature=`/
+/// `key=`/`auth=` values, and mask any 32+ char base64/hex run as `…`.
+#[must_use]
+pub fn redact_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut first = true;
+    for word in text.split(' ') {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        out.push_str(&redact_word(word));
+    }
+    out
+}
+
+fn redact_word(word: &str) -> String {
+    let mut w = word.to_owned();
+    // Userinfo inside any `scheme://user:pass@host` authority.
+    if let Some(i) = w.find("://") {
+        let rest = &w[i + 3..];
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some(at) = rest[..auth_end].rfind('@') {
+            w = format!("{}{}", &w[..i + 3], &rest[at + 1..]);
+        }
+    }
+    // Query string / fragment.
+    if let Some(i) = w.find(['?', '#']) {
+        w.truncate(i);
+    }
+    // Bare `key=value` secrets outside a query (`token=abc`, `sig:=`).
+    if let Some((k, _)) = w.split_once('=') {
+        let key = k.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        if ["token", "sig", "signature", "key", "auth"]
+            .iter()
+            .any(|s| key.eq_ignore_ascii_case(s))
+        {
+            return format!("{k}=…");
+        }
+    }
+    mask_long_runs(&w)
+}
+
+fn mask_long_runs(w: &str) -> String {
+    let is_tok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-');
+    let mut out = String::with_capacity(w.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.chars().count() >= 32 {
+            out.push('…');
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in w.chars() {
+        if is_tok(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 /// One equivalent `curl` command for a hop; URL redacted, header values shown
 /// only as the operator's own `User-Agent`/`Referer`.
 #[must_use]
@@ -301,6 +369,24 @@ pub fn assess(report: &NetworkReport, channel_country: Option<&str>) -> Vec<Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redact_text_strips_urls_and_masks_tokens() {
+        let hex = "0123456789abcdef0123456789abcdef01234567";
+        let body = format!(
+            "denied https://u:p@h.example/live.m3u8?token=secret123&sig=abc at /live.m3u8?token=secret123&sig=abc id {hex} token=zzz"
+        );
+        let out = redact_text(&body);
+        for leak in ["secret123", "sig=abc", "u:p", hex, "zzz"] {
+            assert!(!out.contains(leak), "{leak} leaked: {out}");
+        }
+        assert!(out.contains("https://h.example/live.m3u8"), "{out}");
+        assert!(out.contains('…'), "{out}");
+        assert_eq!(
+            redact_text("not available in your region"),
+            "not available in your region"
+        );
+    }
+
     use super::*;
 
     #[test]
