@@ -1,6 +1,6 @@
 # ADR-M015: IPTV-ORG catalogue — server-side sync, source provenance, deep stream probe
 
-- **Status:** Accepted
+- **Status:** Proposed <!-- R3 probe slice awaits operator sign-off -->
 - **Area:** Management / Web/API / Ingest
 - **Date:** 2026-11-07
 - **Source:** Operator request (IPTV-ORG source browser); design [`docs/io/iptv-org.md`](../io/iptv-org.md)
@@ -84,6 +84,8 @@ stays LGPL-clean and GPU-free; air-gapped installs must keep working.
 - `notify` default: a silent URL swap on an on-air source is surprising; operators opt in to `auto`.
 - Decode-level probing: a 200 on the playlist proves little (in a 120-stream sample, 86 returned a
   playlist; a playlist alone does not prove segments decode or that the stream is live).
+- Local coverage is limited by iptv-org itself (median 4 local streams per US state, Kansas 2); the
+  UI states this rather than implying complete coverage.
 - Wikidata covers 1,974 of the 1,983 cities iptv-org feeds reference; UN/LOCODE covers only 763.
 
 ## Alternatives considered
@@ -105,8 +107,8 @@ stays LGPL-clean and GPU-free; air-gapped installs must keep working.
 - `multiview-ffmpeg` HLS open gains two AVOptions (R2 data-plane crate change; no clock impact).
 - The probe extends `net_guard` usage to a new caller (R3: this ADR, a chaos test proving bounded
   concurrency/memory under hostile streams, and operator sign-off).
-- Web bundle grows by MapLibre (~800 KB min, lazy-loaded on the browser route only) and the
-  boundaries/gazetteer assets (~1 MB gz, lazy).
+- Web bundle grows by MapLibre (1,104 KB min, 298 KB gz, lazy-loaded on the browser route only) and the
+  boundary assets (~118 KB gz, lazy) and the gazetteer.
 - Follow-up (tracked, not in scope): SSRF screening of ordinary HLS source URLs at ingest.
 - iptv-org content terms: the catalogue is Unlicense; individual streams belong to their
   broadcasters. The UI states this and links each channel's website.

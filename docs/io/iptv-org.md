@@ -52,8 +52,13 @@ Facts that shape the design:
 - **Protocols:** 96 % HLS; a few `rtmp` (11), `srt` (3), `rtsp` (2), `mmsh` (2, unsupported).
 - **Geography (via feed `broadcast_area`):** country 14,362 · region 781 · city 754 · subdivision
   501 · none 108. 1,983 distinct cities are referenced; Wikidata has coordinates for 1,974.
-  In the US, 439 of ~3,000 streams are city/state-local, and call-sign stations are almost always
-  city-tagged — the "local broadcaster at a breaking event" case works.
+  In the US, 439 of ~3,000 streams are city/state-local, but coverage is thin and uneven: 46 of
+  51 states/DC have any, the median is 4 streams, California has 107, and Kansas has 2 (KCKS-LD
+  25.3 in Kansas City, WPS TV in Wichita, an education channel at 360p). The map finds the local
+  broadcasters **iptv-org lists**; many real stations are absent. It must say so when a place has
+  few or no local streams, and widen to the radius and state tiers rather than look empty.
+- **Local stations are often feeds of a network channel:** KSHB is `NBC.us@KSHBTV`, so the channel
+  name is "NBC". Search must index feed names and stream titles, and rows must lead with them.
 - **Freshness:** GitHub Pages serves `ETag`, `Last-Modified`, `Cache-Control: max-age=600`.
 
 ## 2. Architecture
@@ -93,12 +98,12 @@ The joined index row is one **stream**, carrying everything the UI filters on:
 ```jsonc
 {
   "k": "s:5f1c…",              // stable key: sha256(url)[..12]
-  "url": "https://…/index.m3u8", "title": "KAKE 10 News",
-  "ch": "KAKE.us", "feed": "SD", "name": "KAKE", "alt": ["ABC 10"], "net": "ABC",
-  "cats": ["news"], "langs": ["eng"], "country": "US",
-  "area": ["ct/USICT"], "geo": { "lvl": "city", "places": ["USICT"] },
+  "url": "https://…/index.m3u8", "title": "KSHB 41 (Kansas City MO)",
+  "ch": "NBC.us", "feed": "KSHBTV", "feed_name": "KSHB-TV", "name": "NBC", "alt": [], "net": null,
+  "cats": ["general"], "langs": ["eng"], "country": "US",
+  "area": ["ct/USMKC"], "geo": { "lvl": "city", "places": ["USMKC"] },
   "q": "720p", "proto": "hls",
-  "flags": ["geo_blocked", "needs_headers", "http_only"],
+  "flags": [],
   "ua": "…", "ref": null, "logo": "l:9a2e…",
   "closed": null, "replaced_by": null, "website": "https://…"
 }
@@ -125,8 +130,8 @@ honoured defensively).
 
 ```toml
 [[sources]]
-id = "kake-wichita"
-display_name = "KAKE 10 (Wichita)"
+id = "kshb-kansas-city"
+display_name = "KSHB 41 (Kansas City MO)"
 kind = "hls"
 url = "https://…/index.m3u8"
 user_agent = "Mozilla/5.0 …"     # new, optional, HLS only
@@ -134,10 +139,10 @@ referrer   = "https://…"         # new, optional, HLS only
 
 [sources.origin]                 # new, optional, any kind
 provider   = "iptv-org"
-channel    = "KAKE.us"           # absent for no-metadata streams
-feed       = "SD"
+channel    = "NBC.us"            # absent for no-metadata streams
+feed       = "KSHBTV"
 stream_url = "https://…/index.m3u8"   # URL as linked
-labels     = ["Geo-blocked"]
+labels     = []
 linked_at  = "2026-11-07T05:00:00Z"
 follow     = "notify"            # manual | notify (default) | auto
 ```
@@ -195,7 +200,8 @@ default). A linked source that starts failing raises its link-health warning.
 
 Sample (120 random HLS streams, probed from a Dallas host, 2026-11-07): 86 returned a playlist,
 22 errored, 7 × 403, 5 × 404; tags seen: PROGRAM-DATE-TIME 49, DISCONTINUITY 40, CUE-OUT 3,
-CUE-IN 1.
+CUE-IN 1. Only the cue tags are broadcast events, so expect event badges on roughly 3 % of streams;
+this one-shot sample read each playlist once and did not inspect in-band SCTE-35 or ID3.
 
 ## 3a. Network path diagnostics ("Network" panel)
 
@@ -229,15 +235,18 @@ Reached from **Browse IPTV-ORG** on the Sources page (a sub-page, not a separate
 
 ### 4.1 Map-first location search
 
+The mockup uses real rows from the 2026-11-07 snapshot; only the layout is illustrative.
+
 ```
 ┌───────────────────────────────────────────────┬─────────────────────────────┐
-│ 🔎 Where is it happening?  [ Wichita, KS    ] │  Near Wichita, Kansas       │
+│ 🔎 Where is it happening? [ Kansas City, MO ] │  Near Kansas City, Missouri │
 │                                               │  ── Local (city) ────────── │
-│      offline vector map — states shaded by    │  KAKE  ABC · 720p ✅ live 2m │
-│      stream count, pins for cities with       │  KSN   NBC · 1080p 🌐 Geo   │
-│      local streams, clustered when zoomed out │  ── State: Kansas ───────── │
-│              ◉ Wichita (3)                    │  KCKS-LD 25.3 · ⏱ Not 24/7  │
-│      ◉ Kansas City (5)                        │  ── National (US) ── 2,576 ▸│
+│      offline vector map — states shaded by    │  KSHB 41 · NBC · 720p       │
+│      stream count, pins for cities with       │  KCKS-LD 25.3 · 720p (KS)   │
+│      local streams, clustered when zoomed out │  ── Within 150 km ───────── │
+│              ◉ Kansas City (2)                │  PBS Sedalia (KMOS) · 1080p │
+│                   ◉ Sedalia (1)               │     🌐 Geo-blocked          │
+│                                               │  ── National (US) ── 2,576 ▸│
 │ [◎ near this server] [radius 150 km ▾]        │  [Probe all] [Add selected] │
 └───────────────────────────────────────────────┴─────────────────────────────┘
 ```
@@ -253,14 +262,14 @@ Reached from **Browse IPTV-ORG** on the Sources page (a sub-page, not a separate
   screen-reader path; shading is always paired with text counts.
 
 **Map stack:** MapLibre GL JS (BSD-3) rendering bundled Natural Earth admin-0 and admin-1
-boundaries (public domain, simplified, ~1 MB gz, lazy). City coordinates come from a committed
+boundaries (public domain, simplified, ~118 KB gz, lazy). City coordinates come from a committed
 gazetteer generated from Wikidata P625 (CC0) by `cargo xtask iptv-gazetteer` — the server never
 queries Wikidata at runtime. An optional operator basemap style URL is off by default.
 
 ### 4.2 Search, facets, results
 
-- **Search** (minisearch, fuzzy + prefix) across channel name, alt names, network, owners, stream
-  title.
+- **Search** (minisearch, fuzzy + prefix) across channel name, alt names, feed name, network, owners,
+  stream title.
 - **Facets** (multi-select, live counts): category · language · quality · protocol · flags ·
   location tree (region → country → subdivision → city).
 - **Results** grouped by channel (logo, flag emoji, categories, stream count); expand for feeds
