@@ -91,6 +91,11 @@ async fn the_served_tls_control_plane_handshakes_and_rate_limits_per_ip() {
     // ephemeral self-signed one — we are proving the handshake + the limiter, not
     // PKI. If the rustls termination were broken, `send()` would error here.
     let client = reqwest::Client::builder()
+        // This test targets our loopback listener, never an ambient CI proxy.
+        .no_proxy()
+        // Bound both requests, not only shutdown, so a transport stall fails here.
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
         .build()
         .expect("build reqwest client");
