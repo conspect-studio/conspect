@@ -289,7 +289,12 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
             return None;
         }
         let tag = ConsumerTag::new(ConsumerClass::HlsSession, label);
-        Some(Box::new(HeldLease(self.manager.acquire(id, Rails::ALL, tag, None))))
+        Some(Box::new(HeldLease(self.manager.acquire(
+            id,
+            Rails::ALL,
+            tag,
+            None,
+        ))))
     }
 
     fn touch_preview(&self, id: &str) -> Option<multiview_control::SourceDemandPhase> {
