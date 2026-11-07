@@ -19,6 +19,19 @@ alternative, the operator is told.
 > output clock (invariant #1) or makes the engine await a client (invariant #10). A linked source
 > is an ordinary `hls` (or `rtmp`/`srt`/`rtsp`) source to the engine.
 
+### Builds on (do not duplicate)
+
+The `release/mda001-rc3` line already ships the managed IPTV playlist and EPG
+([epg-playlist.md](../architecture/epg-playlist.md)). This feature reuses it:
+
+| Existing | Reuse |
+|---|---|
+| `crate::iptv::fetch` — SSRF-screened, bounded, conditional (`ETag`) `Fetcher` seam (`iptv-net` feature) | catalogue sync and every probe/network dial go through it (extended for per-hop reporting and request headers) |
+| `Source.playlist_metadata` (`tvg_id`, `name`, `logo`, `group`) | filled on add: `tvg_id = channel@feed`, `name`, `logo`, `group = first category` |
+| `Source.epg` (`mode`, `url`, `channel_id`) | filled on add when iptv-org `guides.json` has a guide for the channel/feed |
+| `Source.events` + HLS cue observer (ADR-0183) | the probe reuses `multiview_input::hls` cue parsing (`PlaylistCueMetadata`) for broadcast-event detection |
+| M3U import dialog (`POST /api/v1/sources/import/m3u`) | unchanged; the browser is the rich alternative for iptv-org specifically |
+
 ---
 
 ## 1. Upstream data (measured 2026-11-07)
@@ -69,7 +82,7 @@ iptv-org.github.io/api ──(fixed host, If-None-Match)──► catalogue::syn
 - Interval default **6 h** (minimum 10 min), jittered; manual refresh for administrators.
 - Conditional GET per file; a 304 for every file is a no-op. A partial failure keeps the previous
   snapshot (never a half-joined one) and records the error in `status`.
-- Bounded: 64 MiB per file, 60 s per request, `reqwest` (rustls), redirects off, the host is a
+- Bounded: 64 MiB per file, 60 s per request, via the existing `iptv::fetch` fetcher; the host is a
   compile-time constant. Kill switch: `[catalogues.iptv_org] enabled = false`.
 - Snapshot written atomically (`tmp` + rename) with its source ETags and a schema version.
 
@@ -184,6 +197,32 @@ Sample (120 random HLS streams, probed from a Dallas host, 2026-11-07): 86 retur
 22 errored, 7 × 403, 5 × 404; tags seen: PROGRAM-DATE-TIME 49, DISCONTINUITY 40, CUE-OUT 3,
 CUE-IN 1.
 
+## 3a. Network path diagnostics ("Network" panel)
+
+When a stream is geo-blocked from this server, the operator needs to see **which hosts the server
+really talks to, over which addresses, and how the internet sees the server**, so they can fix
+routing (egress via a different site/VPN/address family) instead of guessing. The panel opens from
+a probe result in the browser **and** from any existing source on the Sources page (it is not
+limited to iptv-org sources).
+
+`POST /api/v1/sources/{id}/network` (operate, per-object authorization) and the `network` block of
+every probe result return the same report. It is collected on the control plane with the probe
+bounds of §3 and every dial screened by `net_guard`.
+
+| Section | Contents |
+|---|---|
+| **Server egress identity** | Public IPv4 and IPv6 as seen from the internet, egress country and CDN edge (Cloudflare `cdn-cgi/trace`: `ip`, `loc`, `colo`), queried per family. Cached 10 min. Fixed host; disable with `[network_diagnostics] egress_lookup = false`. |
+| **Host chain** | Every distinct host involved: master playlist, media playlist, segment host(s), key URI host, every redirect hop. Segment CDNs often differ from the playlist host. |
+| **DNS** (per host) | CNAME chain, A and AAAA records with TTL, the resolver used, `net_guard` class of each address (public / private / blocked). |
+| **Connection** (per host) | Address and family actually used, TCP connect time per address (v6 and v4 tried separately), TLS version, ALPN/HTTP version, certificate subject/SAN/issuer/expiry. |
+| **HTTP** (per hop) | Status, redirect `Location` host, response time, `Server`, `Via`, `Age`, CDN identifiers (`cf-ray`, `x-cache`, `x-served-by`, `x-amz-cf-pop`, `x-akamai-*`, `x-cdn`), geo-related headers, and for 4xx a 512-byte text excerpt of the body (block pages often say "not available in your region"). Request headers sent (UA/Referer) are shown. |
+| **Assessment** | Plain-language hints, for example: "Channel country AU; this server egresses from US (DFW) → geo-block likely. Route this host via an AU egress." · "IPv6 path returns 403, IPv4 path returns 200 → prefer IPv4 for this host." · "Playlist OK, segment host `cdn.example` 403 → the CDN, not the origin, blocks." |
+| **Export** | Copy as text/JSON (credentials, userinfo and query strings redacted) and an equivalent `curl` command per hop (`--resolve`, `-4/-6`, headers) for reproducing from another host. |
+
+Per-family comparison is the key tool: each host is fetched over IPv6 **and** IPv4 when both
+exist, because many geo/CDN blocks differ by family. The probe never changes routing itself; the
+assessment says what to change.
+
 ## 4. The browser (`/sources/iptv-org`)
 
 Reached from **Browse IPTV-ORG** on the Sources page (a sub-page, not a separate nav item).
@@ -236,7 +275,7 @@ queries Wikidata at runtime. An optional operator basemap style URL is off by de
 ### 4.3 Sources page
 
 A **Link** column (`in sync`, `updated`, …) with **Review changes**, **Switch to alternative**,
-**Unlink**, and **Probe** actions.
+**Unlink**, and **Probe** and **Network** actions.
 
 ## 5. Security
 
@@ -255,8 +294,8 @@ A **Link** column (`in sync`, `updated`, …) with **Review changes**, **Switch 
 | Slice | Scope | Class |
 |---|---|---|
 | A | `origin` + HLS `user_agent`/`referrer` (config, validation, OpenAPI mirror, web form fields), libav AVOptions | R2 |
-| B | `catalogue` module: model (promoted from `xtask/src/iptv`), sync, snapshot, index/places/status/refresh/import/logos endpoints; `xtask iptv-gazetteer` + committed gazetteer | R2 |
-| C | Deep probe + endpoints; chaos test with hostile fixtures (slowloris, huge segments, redirect to loopback, endless playlist) | R3 |
+| B | `catalogue` module (on the `iptv-net` fetcher): model (promoted from `xtask/src/iptv`), sync, snapshot, index/places/status/refresh/import/logos endpoints; `xtask iptv-gazetteer` + committed gazetteer | R2 |
+| C | Deep probe + network-path diagnostics (§3a) + endpoints; chaos test with hostile fixtures (slowloris, huge segments, redirect to loopback, endless playlist) | R3 |
 | D | Link tracker, events, health warnings, `follow` modes | R2 |
 | E | Web: browser page, map, place search, facets, virtual list, probe panel, add/bulk add; Sources link column + review/switch dialogs | R2 |
 | F | Docs, runbook, e2e | R2 |

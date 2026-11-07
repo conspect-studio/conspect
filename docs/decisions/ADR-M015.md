@@ -20,6 +20,9 @@ What is true on `main` today (2026-11-07):
 - The control plane makes no outbound catalogue fetches. The only outbound dials are the managed-device
   poller and Cast sessions, both screened by the [ADR-M013](ADR-M013.md) `net_guard`.
 - HLS source URLs are not screened at all (`Source::validate`, reachability is "a runtime concern").
+- The rc3 line ships the managed IPTV playlist/EPG ([epg-playlist.md](../architecture/epg-playlist.md)):
+  `Source.playlist_metadata`, `Source.epg`, M3U import, and the SSRF-screened `iptv::fetch` fetcher.
+  This ADR builds on them and does not duplicate them.
 - `cargo xtask soak-iptv` already models, joins and classifies the iptv-org JSON (dev-only, `ureq`).
 - iptv-org streams have **no stable id**: 2,096 streams have no channel, 4,976 share a
   `channel@feed` with another stream; URLs are unique.
@@ -60,7 +63,12 @@ stays LGPL-clean and GPU-free; air-gapped installs must keep working.
    `net_guard` (resolved-IP screen, pinned IP, no unscreened redirects). Limits: 4 concurrent probes,
    20 s wall clock, 16 MiB per probe, 60 probes/min per principal. Results are cached and carry the
    probing host's identity ("from mda001").
-6. **Map.** The web UI renders a MapLibre GL map from bundled Natural Earth admin-0/1 boundaries
+6. **Network-path diagnostics.** The probe also returns a network report (host chain, DNS,
+   per-family connection, TLS, per-hop HTTP/CDN headers, block-page excerpt) and the server's
+   egress identity (public IPv4/IPv6 + country via the fixed host Cloudflare `cdn-cgi/trace`), with
+   a plain-language geo-block assessment. Available for any source via
+   `POST /api/v1/sources/{id}/network`.
+7. **Map.** The web UI renders a MapLibre GL map from bundled Natural Earth admin-0/1 boundaries
    (public domain) and a committed city gazetteer generated from Wikidata P625 (CC0) by
    `cargo xtask iptv-gazetteer`. No tile server is needed; an optional operator basemap URL is off
    by default.
