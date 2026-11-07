@@ -72,6 +72,37 @@ fn main() {
             std::hint::black_box(pack(&tile));
         }
         let fused = t0.elapsed().as_secs_f64() * 1e3 / f64::from(N);
+        for (label, flags) in [
+            (
+                "lanczos+accurate",
+                ffmpeg::software::scaling::Flags::LANCZOS
+                    | ffmpeg::software::scaling::Flags::ACCURATE_RND,
+            ),
+            ("bicubic", ffmpeg::software::scaling::Flags::BICUBIC),
+            ("area", ffmpeg::software::scaling::Flags::AREA),
+            ("bilinear", ffmpeg::software::scaling::Flags::BILINEAR),
+            (
+                "fast_bilinear",
+                ffmpeg::software::scaling::Flags::FAST_BILINEAR,
+            ),
+        ] {
+            let mut sws = Scaler::with_flags(
+                ScaleSpec::new(Pixel::NV12, sw, sh),
+                ScaleSpec::new(Pixel::NV12, tw, th),
+                flags,
+            )
+            .unwrap();
+            let t0 = Instant::now();
+            for _ in 0..N {
+                let out = sws.run(&src).unwrap();
+                std::hint::black_box(pack(&out));
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(N);
+            println!(
+                "  {sw}x{sh} swscale {label:16} {ms:6.3} ms/frame ({:4.1}% core @29.97)",
+                ms * 2.997
+            );
+        }
         println!(
             "{sw}x{sh} -> {tw}x{th}: source-size decode + swscale {full:6.3} ms/frame | \
              NVDEC fused resize (identity pack) {fused:6.3} ms/frame | \
