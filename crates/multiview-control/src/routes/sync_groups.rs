@@ -147,9 +147,18 @@ pub(crate) async fn create_sync_group(
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
     crate::boot_model::require_absent(state.sync_groups.get(&id), SYNC_GROUP_KIND, &id)?;
-    crate::boot_model::commit_resource(&state, "sync_groups", &id, Some(input.body.clone()), None)
-        .await?;
-    let versioned = state.sync_groups.create(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "sync_groups",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .sync_groups
+        .create(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -200,9 +209,18 @@ pub(crate) async fn update_sync_group(
         name: input.name,
         body: validated_body(TypedCollection::SyncGroups, &id, &input.body)?,
     };
-    crate::boot_model::commit_resource(&state, "sync_groups", &id, Some(input.body.clone()), None)
-        .await?;
-    let versioned = state.sync_groups.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "sync_groups",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .sync_groups
+        .update(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -246,7 +264,10 @@ pub(crate) async fn delete_sync_group(
     let current = state.sync_groups.get(&id)?;
     if_match.require(SYNC_GROUP_KIND, &id, current.version)?;
     crate::boot_model::commit_resource(&state, "sync_groups", &id, None, None).await?;
-    state.sync_groups.delete(&id)?;
+    state
+        .sync_groups
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

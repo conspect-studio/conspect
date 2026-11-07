@@ -179,9 +179,18 @@ pub(crate) async fn create_device(
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
     crate::boot_model::require_absent(state.devices.get(&id), DEVICE_KIND, &id)?;
-    crate::boot_model::commit_resource(&state, "devices", &id, Some(input.body.clone()), None)
-        .await?;
-    let versioned = state.devices.create(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "devices",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .devices
+        .create(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     // Seed the runtime status in ADOPTING (idempotent), so the read-only status
     // snapshot answers before any driver probe — the conflated status lane's
     // backing store (invariant #10: control-plane-only, never the engine).
@@ -244,9 +253,18 @@ pub(crate) async fn update_device(
         name: input.name,
         body: validated_body(TypedCollection::Devices, &id, &input.body)?,
     };
-    crate::boot_model::commit_resource(&state, "devices", &id, Some(input.body.clone()), None)
-        .await?;
-    let versioned = state.devices.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "devices",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .devices
+        .update(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     // Restart the supervised poller on an edit (DEV-A4): the address/credential/
     // desired-mode may have changed, so the registry replaces the running task
     // (the old one is aborted) and the fresh poller re-adopts + re-converges. A
@@ -311,7 +329,10 @@ pub(crate) async fn delete_device(
         )));
     }
     crate::boot_model::commit_resource(&state, "devices", &id, None, None).await?;
-    state.devices.delete(&id)?;
+    state
+        .devices
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     // Stop the supervised driver poller (DEV-A4): the device is gone, so its
     // poller must not keep probing — the registry tombstones the id (a racing
     // adopt's late `start` is rejected, never a ghost poller), aborts the task,

@@ -179,7 +179,10 @@ pub(crate) async fn put_profile(
                 None,
             )
             .await?;
-            let versioned = state.tally_profiles.put(profile)?;
+            let versioned = state
+                .tally_profiles
+                .put(profile)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             // ADR-W024 round 6: a tally profile is runtime-mutable running state
             // composed into active.toml; audit (the ONE persist choke point) so
             // the persister captures the edit. A pure store edit (no engine
@@ -202,7 +205,10 @@ pub(crate) async fn put_profile(
                 None,
             )
             .await?;
-            let versioned = state.tally_profiles.put(profile)?;
+            let versioned = state
+                .tally_profiles
+                .put(profile)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             state.audit(
                 &principal.key_id,
                 AuditAction::Create,
@@ -230,7 +236,10 @@ pub(crate) async fn delete_profile(
     let current = state.tally_profiles.get(&id)?;
     if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
     crate::boot_model::commit_resource(&state, "tally_profiles", &id, None, None).await?;
-    state.tally_profiles.delete(&id)?;
+    state
+        .tally_profiles
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     // ADR-W024 round 6: removing a runtime-mutable tally profile changes the
     // composed running state — audit so the persister rewrites active.toml.
     state.audit(

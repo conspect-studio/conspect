@@ -31,6 +31,7 @@ use std::time::Duration;
 use multiview_config::{MultiviewConfig, StartMode};
 
 use crate::error::{ControlError, ControlResult};
+use crate::resource_store::ResourceRepository;
 use crate::state::AppState;
 
 /// The state directory name under the boot config file's directory.
@@ -41,6 +42,27 @@ const LOADED_FILE: &str = "loaded.toml";
 const ACTIVE_FILE: &str = "active.toml";
 /// Atomic, authoritative write-ahead record of accepted operator intent.
 const DESIRED_FILE: &str = "desired.json";
+/// Families served from their store, whose versions the envelope must follow.
+const STORE_SERVED_KEYS: [&str; 6] = [
+    "overlays",
+    "probes",
+    "devices",
+    "sync_groups",
+    "salvos",
+    "tally_profiles",
+];
+/// Every family with a durable per-resource version in the envelope.
+const VERSIONED_KEYS: [&str; 9] = [
+    "sources",
+    "outputs",
+    "audio",
+    "overlays",
+    "probes",
+    "devices",
+    "sync_groups",
+    "salvos",
+    "tally_profiles",
+];
 
 /// The complete accepted intent. A library edit and its selected working layout
 /// share one atomic commit with the configuration, rather than racing SQLite
@@ -280,6 +302,20 @@ pub fn require_absent<T>(lookup: ControlResult<T>, kind: &str, id: &str) -> Cont
         Err(ControlError::NotFound { .. }) => Ok(()),
         Err(other) => Err(other),
     }
+}
+
+/// Report a store write that failed AFTER its durable commit. The edit is
+/// accepted, so a plain failure would tell the client to retry something that
+/// already landed. Without a boot model nothing was committed and the store
+/// error stands.
+#[must_use]
+pub fn after_commit(state: &AppState, error: ControlError) -> ControlError {
+    if state.boot_model.is_none() {
+        return error;
+    }
+    ControlError::CommitIndeterminate(format!(
+        "the change was committed, but its store projection failed; GET before retrying: {error}"
+    ))
 }
 
 /// Persist a prospective resource collection before its store changes.
@@ -528,8 +564,9 @@ async fn commit_desired_document_named(
     } else {
         None
     };
-    for key in ["sources", "outputs", "audio"] {
+    for key in VERSIONED_KEYS {
         let new_bodies = resource_bodies(&config, &output_ids, key)?;
+        let live = store_versions(state, key);
         let old_bodies = match (&previous, &legacy) {
             (Some(prior), _) => resource_bodies(&prior.config, &prior.output_ids, key)?,
             (None, Some(legacy)) => legacy
@@ -550,10 +587,20 @@ async fn commit_desired_document_named(
             }
         }
         for (id, body) in &new_bodies {
+            // Store-served families bump their store on every accepted write,
+            // so the envelope follows the higher of the two: a restart must
+            // never hand back a tag older than one a client already saw.
             let base = counters
                 .get(id)
                 .copied()
-                .unwrap_or_else(|| u64::from(old_bodies.contains_key(id) || key == "audio"));
+                .unwrap_or_else(|| u64::from(old_bodies.contains_key(id) || key == "audio"))
+                .max(live.get(id).copied().unwrap_or(0));
+            let touched = STORE_SERVED_KEYS.contains(&key)
+                && name_change
+                    .as_ref()
+                    .is_some_and(|(changed_key, changed_id, _)| {
+                        *changed_key == key && *changed_id == id
+                    });
             let name_changed =
                 name_change
                     .as_ref()
@@ -569,7 +616,7 @@ async fn commit_desired_document_named(
                                     != name
                             })
                     });
-            let version = if old_bodies.get(id) == Some(body) && !name_changed {
+            let version = if old_bodies.get(id) == Some(body) && !name_changed && !touched {
                 base.max(1)
             } else {
                 base.checked_add(1)
@@ -585,7 +632,7 @@ async fn commit_desired_document_named(
             prior.resource_names.clone()
         });
     if previous.is_none() {
-        for (key, store) in [("sources", &state.sources), ("outputs", &state.outputs)] {
+        for (key, store) in named_stores(state) {
             let names = resource_names.entry(key.to_owned()).or_default();
             for entry in store.list()? {
                 names.insert(entry.resource.id, entry.resource.name);
@@ -623,32 +670,99 @@ type LegacyResources = std::collections::BTreeMap<
     std::collections::BTreeMap<String, (serde_json::Value, u64)>,
 >;
 
-/// Import the accepted source/output/audio state from the legacy stores
-/// (review H2): the first durable transaction continues their counters.
+/// Re-serialize a stored body through its typed schema so an unchanged item
+/// compares equal to its config form (no spurious version bump). A body that
+/// does not parse is kept as stored.
+fn canonical_body<T>(body: serde_json::Value) -> ControlResult<serde_json::Value>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    match serde_json::from_value::<T>(body.clone()) {
+        Ok(typed) => config_value(&typed),
+        Err(_) => Ok(body),
+    }
+}
+
+/// The resource-repository families, keyed as in the config document.
+fn named_stores(state: &AppState) -> [(&'static str, &Arc<dyn ResourceRepository>); 6] {
+    [
+        ("sources", &state.sources),
+        ("outputs", &state.outputs),
+        ("overlays", &state.overlays),
+        ("probes", &state.probes),
+        ("devices", &state.devices),
+        ("sync_groups", &state.sync_groups),
+    ]
+}
+
+/// Current store versions for a store-served family. A failed read only loses
+/// the version floor for this commit; it must not reject accepted intent.
+fn store_versions(state: &AppState, key: &str) -> std::collections::BTreeMap<String, u64> {
+    if !STORE_SERVED_KEYS.contains(&key) {
+        return std::collections::BTreeMap::new();
+    }
+    let listed = match key {
+        "salvos" => state.salvos.list().map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.salvo.id, entry.version.get()))
+                .collect()
+        }),
+        "tally_profiles" => state.tally_profiles.list().map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.profile.id, entry.version.get()))
+                .collect()
+        }),
+        _ => named_stores(state)
+            .into_iter()
+            .find(|(name, _)| *name == key)
+            .map_or_else(
+                || Ok(std::collections::BTreeMap::new()),
+                |(_, store)| {
+                    store.list().map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| (entry.resource.id, entry.version.get()))
+                            .collect()
+                    })
+                },
+            ),
+    };
+    listed.unwrap_or_else(|error| {
+        tracing::warn!(key, %error, "desired commit: store version read failed");
+        std::collections::BTreeMap::new()
+    })
+}
+
+/// Import accepted state from the legacy stores (review H2): the first durable
+/// transaction continues their counters for every versioned family.
 fn legacy_resources(state: &AppState) -> ControlResult<LegacyResources> {
     let mut legacy = LegacyResources::new();
-    for (key, store) in [("sources", &state.sources), ("outputs", &state.outputs)] {
+    for (key, store) in named_stores(state) {
         let entries = legacy.entry(key).or_default();
         for entry in store.list()? {
-            // Canonicalise through the typed schema so an unchanged item
-            // compares equal to its config serialization (no spurious bump).
+            let stored = entry.resource.body;
             let body = match key {
-                "sources" => {
-                    serde_json::from_value::<multiview_config::Source>(entry.resource.body.clone())
-                        .ok()
-                        .map(|typed| config_value(&typed))
-                        .transpose()?
-                }
-                _ => {
-                    serde_json::from_value::<multiview_config::Output>(entry.resource.body.clone())
-                        .ok()
-                        .map(|typed| config_value(&typed))
-                        .transpose()?
-                }
-            }
-            .unwrap_or(entry.resource.body);
+                "sources" => canonical_body::<multiview_config::Source>(stored)?,
+                "outputs" => canonical_body::<multiview_config::Output>(stored)?,
+                "overlays" => canonical_body::<multiview_config::Overlay>(stored)?,
+                "probes" => canonical_body::<multiview_config::Probe>(stored)?,
+                "devices" => canonical_body::<multiview_config::Device>(stored)?,
+                _ => canonical_body::<multiview_config::SyncGroup>(stored)?,
+            };
             entries.insert(entry.resource.id, (body, entry.version.get()));
         }
+    }
+    let salvos = legacy.entry("salvos").or_default();
+    for entry in state.salvos.list()? {
+        let body = config_value(&entry.salvo)?;
+        salvos.insert(entry.salvo.id, (body, entry.version.get()));
+    }
+    let profiles = legacy.entry("tally_profiles").or_default();
+    for entry in state.tally_profiles.list()? {
+        let body = config_value(&entry.profile)?;
+        profiles.insert(entry.profile.id, (body, entry.version.get()));
     }
     let (routing, version) = state.audio_routing.snapshot();
     if let Some(routing) = routing {
@@ -658,6 +772,108 @@ fn legacy_resources(state: &AppState) -> ControlResult<LegacyResources> {
         );
     }
     Ok(legacy)
+}
+
+/// One family's accepted resources with their durable versions and names.
+/// An envelope written before this family was tracked falls back to the seeded
+/// store's name, then the id.
+fn accepted_entries(
+    desired: &DesiredState,
+    key: &str,
+    seeded: &Arc<dyn ResourceRepository>,
+) -> ControlResult<Vec<crate::resource_store::VersionedResource>> {
+    let seeded_names: std::collections::BTreeMap<String, String> = seeded
+        .list()?
+        .into_iter()
+        .map(|entry| (entry.resource.id, entry.resource.name))
+        .collect();
+    let versions = desired.resource_versions.get(key);
+    let names = desired.resource_names.get(key);
+    Ok(resource_bodies(&desired.config, &desired.output_ids, key)?
+        .into_iter()
+        .map(|(id, body)| {
+            let version = versions.and_then(|map| map.get(&id)).copied().unwrap_or(1);
+            let name = names
+                .and_then(|map| map.get(&id))
+                .or_else(|| seeded_names.get(&id))
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            crate::resource_store::VersionedResource {
+                version: crate::concurrency::Version::new(version.max(1)),
+                resource: crate::resource_store::Resource { id, name, body },
+            }
+        })
+        .collect())
+}
+
+/// Rebuild every config-backed store from the accepted envelope at startup, so
+/// names and `ETags` continue across a restart instead of being reseeded at 1.
+/// A pre-restart tag must stay stale, never match again (review H1/H2).
+///
+/// # Errors
+/// A store read or serialization fault fails startup rather than serving
+/// state that disagrees with accepted intent.
+pub fn restore_accepted_stores(
+    mut state: AppState,
+    desired: &DesiredState,
+) -> ControlResult<AppState> {
+    use crate::resource_store::{
+        InMemoryDeviceStore, InMemoryOutputStore, InMemoryOverlayStore, InMemoryProbeStore,
+        InMemorySourceStore, InMemorySyncGroupStore,
+    };
+    let sources = accepted_entries(desired, "sources", &state.sources)?;
+    let outputs = accepted_entries(desired, "outputs", &state.outputs)?;
+    let overlays = accepted_entries(desired, "overlays", &state.overlays)?;
+    let probes = accepted_entries(desired, "probes", &state.probes)?;
+    let devices = accepted_entries(desired, "devices", &state.devices)?;
+    let sync_groups = accepted_entries(desired, "sync_groups", &state.sync_groups)?;
+    state.sources = Arc::new(InMemorySourceStore::from_versioned(sources));
+    state.outputs = Arc::new(InMemoryOutputStore::from_versioned(outputs));
+    state.overlays = Arc::new(InMemoryOverlayStore::from_versioned(overlays));
+    state.probes = Arc::new(InMemoryProbeStore::from_versioned(probes));
+    state.devices = Arc::new(InMemoryDeviceStore::from_versioned(devices));
+    state.sync_groups = Arc::new(InMemorySyncGroupStore::from_versioned(sync_groups));
+    let version_of = |key: &str, id: &str| {
+        crate::concurrency::Version::new(
+            desired
+                .resource_versions
+                .get(key)
+                .and_then(|map| map.get(id))
+                .copied()
+                .unwrap_or(1)
+                .max(1),
+        )
+    };
+    state.salvos = Arc::new(crate::salvo_store::InMemorySalvoStore::from_versioned(
+        desired
+            .config
+            .salvos
+            .iter()
+            .map(|salvo| crate::salvo_store::VersionedSalvo {
+                version: version_of("salvos", &salvo.id),
+                salvo: salvo.clone(),
+            }),
+    ));
+    state.tally_profiles =
+        Arc::new(crate::tally_state::InMemoryProfileStore::from_versioned(
+            desired.config.tally_profiles.iter().map(|profile| {
+                crate::tally_state::VersionedProfile {
+                    version: version_of("tally_profiles", &profile.id),
+                    profile: profile.clone(),
+                }
+            }),
+        ));
+    Ok(state)
+}
+
+fn identified_bodies<T: serde::Serialize>(
+    items: &[T],
+    id: impl Fn(&T) -> &String,
+) -> Result<Vec<(String, serde_json::Value)>, serde_json::Error> {
+    items
+        .iter()
+        .map(|item| serde_json::to_value(item).map(|body| (id(item).clone(), body)))
+        .collect()
 }
 
 fn resource_bodies(
@@ -683,6 +899,12 @@ fn resource_bodies(
             .zip(output_ids)
             .map(|(output, id)| serde_json::to_value(output).map(|body| (id.clone(), body)))
             .collect::<Result<Vec<_>, _>>(),
+        "overlays" => identified_bodies(&config.overlays, |item| &item.id),
+        "probes" => identified_bodies(&config.probes, |item| &item.id),
+        "devices" => identified_bodies(&config.devices, |item| &item.id),
+        "sync_groups" => identified_bodies(&config.sync_groups, |item| &item.id),
+        "salvos" => identified_bodies(&config.salvos, |item| &item.id),
+        "tally_profiles" => identified_bodies(&config.tally_profiles, |item| &item.id),
         _ => {
             return Err(ControlError::Validation(format!(
                 "unsupported authoritative resource {key}"

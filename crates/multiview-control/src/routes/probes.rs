@@ -128,9 +128,18 @@ pub(crate) async fn create_probe(
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
     crate::boot_model::require_absent(state.probes.get(&id), PROBE_KIND, &id)?;
-    crate::boot_model::commit_resource(&state, "probes", &id, Some(input.body.clone()), None)
-        .await?;
-    let versioned = state.probes.create(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "probes",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .probes
+        .create(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -183,9 +192,18 @@ pub(crate) async fn update_probe(
         name: input.name,
         body: validated_body(TypedCollection::Probes, &id, &input.body)?,
     };
-    crate::boot_model::commit_resource(&state, "probes", &id, Some(input.body.clone()), None)
-        .await?;
-    let versioned = state.probes.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "probes",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned = state
+        .probes
+        .update(&id, input)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -229,7 +247,10 @@ pub(crate) async fn delete_probe(
     let current = state.probes.get(&id)?;
     if_match.require(PROBE_KIND, &id, current.version)?;
     crate::boot_model::commit_resource(&state, "probes", &id, None, None).await?;
-    state.probes.delete(&id)?;
+    state
+        .probes
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

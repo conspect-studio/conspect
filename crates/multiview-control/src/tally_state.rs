@@ -261,6 +261,19 @@ impl InMemoryProfileStore {
         Self::default()
     }
 
+    /// A store holding `entries` at their exact versions (restart restore).
+    #[must_use]
+    pub fn from_versioned(entries: impl IntoIterator<Item = VersionedProfile>) -> Self {
+        Self {
+            profiles: Mutex::new(
+                entries
+                    .into_iter()
+                    .map(|entry| (entry.profile.id.clone(), entry))
+                    .collect(),
+            ),
+        }
+    }
+
     /// Lock the inner map, recovering from a poisoned lock.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, VersionedProfile>> {
         match self.profiles.lock() {

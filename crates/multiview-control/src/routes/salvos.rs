@@ -152,7 +152,10 @@ pub(crate) async fn put_salvo(
             // Replace: enforce the optimistic-concurrency precondition first.
             if_match.require(SALVO_KIND, &id, current.version)?;
             crate::boot_model::commit_resource(&state, "salvos", &id, Some(durable), None).await?;
-            let versioned = state.salvos.update(&id, salvo)?;
+            let versioned = state
+                .salvos
+                .update(&id, salvo)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             // ADR-W024 round 6: a salvo definition is runtime-mutable running
             // state composed into active.toml; audit (the ONE persist choke
             // point) so the debounced persister captures the edit. The store
@@ -168,7 +171,10 @@ pub(crate) async fn put_salvo(
         }
         Err(crate::error::ControlError::NotFound { .. }) => {
             crate::boot_model::commit_resource(&state, "salvos", &id, Some(durable), None).await?;
-            let versioned = state.salvos.create(salvo)?;
+            let versioned = state
+                .salvos
+                .create(salvo)
+                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
             state.audit(
                 &principal.key_id,
                 AuditAction::Create,
@@ -197,7 +203,10 @@ pub(crate) async fn delete_salvo(
     let current = state.salvos.get(&id)?;
     if_match.require(SALVO_KIND, &id, current.version)?;
     crate::boot_model::commit_resource(&state, "salvos", &id, None, None).await?;
-    state.salvos.delete(&id)?;
+    state
+        .salvos
+        .delete(&id)
+        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
     // ADR-W024 round 6: removing a runtime-mutable salvo definition changes the
     // composed running state — audit so the persister rewrites active.toml.
     state.audit(

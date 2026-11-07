@@ -114,7 +114,12 @@ async fn unrelated_source_commit(router: &Router) {
 /// "Restart": rebuild the whole control state from the accepted envelope.
 fn restart(path: &Path) -> Router {
     let desired = load_desired(path).unwrap().expect("accepted envelope");
-    multiview_control::router(state_for(path, &desired.config))
+    let state = multiview_control::boot_model::restore_accepted_stores(
+        state_for(path, &desired.config),
+        &desired,
+    )
+    .unwrap();
+    multiview_control::router(state)
 }
 
 async fn upsert(router: &Router, uri: &str, put_only: bool, body: &Value) {
@@ -299,4 +304,113 @@ async fn salvo_and_tally_profile_edits_survive_restart_and_unrelated_commits() {
     let again = restart(&path);
     assert!(read(&again, "/api/v1/salvos/wide").await.is_none());
     assert!(read(&again, "/api/v1/tally/profiles/main").await.is_none());
+}
+
+fn etag_version(tag: &str) -> u64 {
+    tag.trim_start_matches("W/")
+        .trim_matches('"')
+        .parse()
+        .expect("numeric weak etag")
+}
+
+/// Edit `uri` twice, restart, then require the version to hold and the
+/// pre-restart stale tag to be refused.
+async fn etag_survives_restart(
+    router: &Router,
+    path: &Path,
+    uri: &str,
+    put_only: bool,
+    first: &Value,
+    second: &Value,
+) {
+    upsert(router, uri, put_only, first).await;
+    let stale = etag(&send(router, get(uri, ADMIN_TOKEN)).await).unwrap();
+    upsert(router, uri, put_only, second).await;
+    let current = etag(&send(router, get(uri, ADMIN_TOKEN)).await).unwrap();
+    assert!(etag_version(&current) > etag_version(&stale), "{uri}");
+    let restarted = restart(path);
+    let after = etag(&send(&restarted, get(uri, ADMIN_TOKEN)).await).unwrap();
+    assert_eq!(after, current, "{uri}: restart moved the ETag");
+    let refused = send(&restarted, put_json(uri, ADMIN_TOKEN, Some(&stale), second)).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::PRECONDITION_FAILED,
+        "{uri}: a pre-restart stale If-Match must be refused"
+    );
+}
+
+#[tokio::test]
+async fn resource_names_survive_restart() {
+    let (_dir, path, router) = running_with_desired().await;
+    let uri = "/api/v1/overlays/ov_clock";
+    let body = json!({"kind": "clock", "target": "canvas"});
+    upsert(&router, uri, false, &json!({"name": "first", "body": body})).await;
+    upsert(
+        &router,
+        uri,
+        false,
+        &json!({"name": "renamed", "body": body}),
+    )
+    .await;
+    let restarted = restart(&path);
+    let value = body_json(send(&restarted, get(uri, ADMIN_TOKEN)).await).await;
+    assert_eq!(value["name"], "renamed", "an acknowledged rename was lost");
+}
+
+#[tokio::test]
+async fn resource_etags_survive_restart_for_every_family() {
+    let (_dir, path, router) = running_with_desired().await;
+    etag_survives_restart(
+        &router,
+        &path,
+        "/api/v1/overlays/ov_clock",
+        false,
+        &json!({"name": "c", "body": {"kind": "clock", "target": "canvas"}}),
+        &json!({"name": "c", "body": {"kind": "clock", "target": "canvas", "format": "%H:%M"}}),
+    )
+    .await;
+    let salvo = |name: &str| json!({"id": "wide", "display_name": name, "tally": [{"cell": "cell_a", "color": "Red"}]});
+    etag_survives_restart(
+        &router,
+        &path,
+        "/api/v1/salvos/wide",
+        true,
+        &salvo("a"),
+        &salvo("b"),
+    )
+    .await;
+    let profile = |color: &str| json!({"id": "main", "bit_colors": [{"bit": 0, "color": color}], "index_cells": [{"index": 0, "cell": "cell_a"}]});
+    etag_survives_restart(
+        &router,
+        &path,
+        "/api/v1/tally/profiles/main",
+        true,
+        &profile("Red"),
+        &profile("Green"),
+    )
+    .await;
+}
+
+/// With an accepted model present, whole-document validation rejects a dangling
+/// reference before anything is stored, rather than poisoning the envelope.
+#[tokio::test]
+async fn a_dangling_reference_is_refused_before_any_durable_write() {
+    let (_dir, path, router) = running_with_desired().await;
+    let before = std::fs::read(path.parent().unwrap().join(".multiview/desired.json")).unwrap();
+    let response = send(
+        &router,
+        post_json(
+            "/api/v1/probes/orphan",
+            ADMIN_TOKEN,
+            &json!({"name": "p", "body": {
+                "id": "orphan", "cell": "no_such_cell", "kind": "black", "luma_threshold": 16,
+                "dwell": {"up_ms": 2000, "down_ms": 1000}, "severity": "Major", "latched": false
+            }}),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(read(&router, "/api/v1/probes/orphan").await.is_none());
+    let after = std::fs::read(path.parent().unwrap().join(".multiview/desired.json")).unwrap();
+    assert_eq!(before, after, "a refused edit must not touch the envelope");
 }

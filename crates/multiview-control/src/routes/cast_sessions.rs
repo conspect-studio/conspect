@@ -563,7 +563,7 @@ pub(crate) async fn save_cast_session(
         "devices",
         &request.device_id,
         Some(body.clone()),
-        None,
+        Some(name.clone()),
     )
     .await?;
     let versioned = state
@@ -578,7 +578,7 @@ pub(crate) async fn save_cast_session(
             ControlError::Validation(_) => {
                 ControlError::Conflict(format!("device {:?} already exists", request.device_id))
             }
-            other => other,
+            other => crate::boot_model::after_commit(&state, other),
         })?;
     state.device_status.ensure(&request.device_id);
 
