@@ -252,7 +252,7 @@ describe('IptvOrgPage', () => {
     const { toSourceForm } = await import('./toSource');
     const s = (index.streams as unknown as IndexStream[]).find((x) => x.logo_url === null);
     expect(s).toBeDefined();
-    expect(toSourceForm({ ...(s as IndexStream), logo: 'l:abc' }, new Set()).metaLogo).toBe('');
+    expect(toSourceForm({ ...s!, logo: 'l:abc' }, new Set()).metaLogo).toBe('');
   });
 
   it('shows a "Guide listed" badge with the XMLTV note in the detail', async () => {
