@@ -35,7 +35,7 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use libloading::Library;
 
@@ -729,23 +729,34 @@ impl SrtSocket {
         Ok(socket)
     }
 
-    /// Send `data` as live-mode messages of at most [`LIVE_PAYLOAD`] bytes.
-    /// Each message is retried on a send timeout until `deadline` elapses or
-    /// `should_stop()` is true.
+    /// Send `data` as live-mode messages of at most [`LIVE_PAYLOAD`] bytes,
+    /// all of it before the absolute `deadline`.
+    ///
+    /// `should_stop()` and `deadline` are checked before EVERY chunk and every
+    /// retry, not only after a failed send, so a slow-but-steady peer can never
+    /// stretch one call past `deadline` or ignore stop (review SRT-05). Each
+    /// libsrt call is additionally bounded by the per-call socket timeout
+    /// ([`IO_TIMEOUT_MS`]), so the call returns within `deadline` plus at most
+    /// one such timeout.
     ///
     /// # Errors
-    /// [`SrtError::TimedOut`] past `deadline`; [`SrtError::Interrupted`] on
+    /// [`SrtError::TimedOut`] at `deadline`; [`SrtError::Interrupted`] on
     /// stop; [`SrtError::Call`] when the connection is broken.
     pub fn send(
         &self,
         data: &[u8],
-        deadline: Duration,
+        deadline: Instant,
         should_stop: &dyn Fn() -> bool,
     ) -> Result<()> {
-        let started = Instant::now();
         for chunk in data.chunks(LIVE_PAYLOAD) {
             let len = c_int::try_from(chunk.len()).map_err(|_| SrtError::Invalid("chunk"))?;
             loop {
+                if should_stop() {
+                    return Err(SrtError::Interrupted);
+                }
+                if Instant::now() >= deadline {
+                    return Err(SrtError::TimedOut);
+                }
                 // SAFETY: `chunk` is `len` readable bytes for the call.
                 let r = unsafe { (self.lib.sendmsg)(self.sock, chunk.as_ptr().cast(), len, -1, 1) };
                 if r != SRT_ERROR {
@@ -753,12 +764,6 @@ impl SrtSocket {
                 }
                 if !self.lib.last_error_is_again() {
                     return Err(self.lib.call_error("srt_sendmsg"));
-                }
-                if should_stop() {
-                    return Err(SrtError::Interrupted);
-                }
-                if started.elapsed() >= deadline {
-                    return Err(SrtError::TimedOut);
                 }
             }
         }

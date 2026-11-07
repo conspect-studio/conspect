@@ -55,6 +55,12 @@ use crate::push_link::{redact_target, Backoff, PushLinkState, PushLinkStatus};
 const CLIENT_QUEUE_CAP: usize = 512;
 /// A single blocked write longer than this means the peer is gone.
 const WRITE_DEADLINE: Duration = Duration::from_secs(5);
+/// How long teardown waits, after raising stop, for writers to release their
+/// sockets: one libsrt per-call send timeout (500 ms) plus margin. With
+/// [`TEARDOWN_GRACE`] still inside the pipeline's 2 s sink-wedge grace.
+const RELEASE_GRACE: Duration = Duration::from_millis(700);
+/// Bound on the best-effort trailer write of an ending session.
+const TRAILER_DEADLINE: Duration = Duration::from_millis(500);
 /// Caller-mode connect deadline (libsrt's own `connect_timeout` is shorter).
 const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// How long writers may flush their trailer at end-of-program before the stop
@@ -293,7 +299,10 @@ fn teardown(shared: &Shared, link_thread: JoinHandle<()>) {
         std::thread::sleep(POLL);
     }
     shared.stop.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_millis(500);
+    // After stop every writer callback fails at once and an in-flight SRT
+    // message returns within its socket timeout (500 ms), so writers release
+    // their socket inside this bound; only a wedge beyond it is detached.
+    let deadline = Instant::now() + RELEASE_GRACE;
     while Instant::now() < deadline
         && (!link_thread.is_finished() || shared.writers().iter().any(|h| !h.is_finished()))
     {
@@ -436,8 +445,9 @@ fn accept_callers(
             );
             continue;
         }
-        let writer = socket_writer(socket, Arc::clone(&shared.stop));
-        match Muxer::create_with_writer(muxer_name, LIVE_PAYLOAD, writer) {
+        let writer = socket_writer(socket);
+        match Muxer::create_with_writer(muxer_name, LIVE_PAYLOAD, Arc::clone(&shared.stop), writer)
+        {
             Ok(muxer) => {
                 if let Some(handle) = start_session(shared, muxer, spec, peer.as_deref()) {
                     shared.writers().push(handle);
@@ -449,14 +459,26 @@ fn accept_callers(
 }
 
 /// The muxer byte sink for one accepted caller. The socket closes with the muxer.
+///
+/// Every send runs under the muxer's operation-wide [`IoBudget`]: the absolute
+/// deadline armed for the whole header / packet / trailer (never reset per
+/// callback) and the shared stop flag, both checked before every SRT message
+/// (review SRT-05). An unarmed budget still caps one callback at
+/// [`WRITE_DEADLINE`].
+///
+/// [`IoBudget`]: multiview_ffmpeg::IoBudget
 #[cfg(feature = "srt-libsrt")]
-fn socket_writer(socket: SrtSocket, stop: Arc<AtomicBool>) -> multiview_ffmpeg::PacketWriter {
-    Box::new(move |data: &[u8]| {
-        let stop = &stop;
-        socket
-            .send(data, WRITE_DEADLINE, &|| stop.load(Ordering::Acquire))
-            .is_ok()
-    })
+fn socket_writer(socket: SrtSocket) -> multiview_ffmpeg::PacketWriter {
+    Box::new(
+        move |data: &[u8], budget: &multiview_ffmpeg::IoBudget<'_>| {
+            let deadline = budget
+                .deadline()
+                .unwrap_or_else(|| Instant::now() + WRITE_DEADLINE);
+            socket
+                .send(data, deadline, &|| budget.should_stop())
+                .is_ok()
+        },
+    )
 }
 
 /// Join and drop writer handles that already finished (bounded bookkeeping).
@@ -514,7 +536,7 @@ fn writer_main(
 ) {
     let result = write_session(&mut muxer, rx, spec, link);
     // Best-effort trailer under a short deadline; the peer may be gone.
-    muxer.arm_io_deadline(Some(Duration::from_millis(500)));
+    muxer.arm_io_deadline(Some(TRAILER_DEADLINE));
     match muxer.finish() {
         Ok(()) | Err(_) => {}
     }

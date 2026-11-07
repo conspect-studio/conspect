@@ -96,3 +96,70 @@ fn one_wildcard_listener_accepts_ipv6_and_ipv4_callers() {
     let v4 = accept_and_read(&listener, "127.0.0.1", port);
     assert!(v4.is_ipv4(), "peer over 127.0.0.1 was {v4}");
 }
+
+/// SRT-05: `send` honours stop and its deadline BEFORE every chunk, not only
+/// after a failed send. Against a healthy, reading caller every send would
+/// succeed, so an expired deadline or a raised stop must still refuse at once.
+#[test]
+fn send_checks_stop_and_deadline_before_every_chunk() {
+    let cli_has_srt = Command::new("ffmpeg")
+        .args(["-hide_banner", "-protocols"])
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.trim() == "srt")
+        });
+    if SrtLib::shared().is_err() || !cli_has_srt {
+        eprintln!("SKIP: libsrt or an SRT-capable ffmpeg CLI is not present");
+        return;
+    }
+    let port = 23_000 + u16::try_from(std::process::id() % 20_000).unwrap();
+    let listener = SrtListener::bind(
+        format!("[::1]:{port}").parse().unwrap(),
+        &ListenerOptions::sender(),
+        2,
+    )
+    .unwrap();
+    let mut reader = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "quiet", "-i"])
+        .arg(format!("srt://[::1]:{port}?mode=caller"))
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn ffmpeg reader");
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let timer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        flag.store(true, Ordering::Release);
+    });
+    let flag = Arc::clone(&stop);
+    let (socket, _) = listener
+        .accept(&move || flag.load(Ordering::Acquire))
+        .expect("reader connects");
+    let data = vec![0x47_u8; 1316 * 4];
+    let started = std::time::Instant::now();
+    let never = || false;
+    socket
+        .send(&data, started + Duration::from_secs(5), &never)
+        .expect("a healthy peer takes a send inside its deadline");
+    assert!(matches!(
+        socket.send(&data, std::time::Instant::now(), &never),
+        Err(multiview_srt_sys::SrtError::TimedOut)
+    ));
+    let stopped = || true;
+    assert!(matches!(
+        socket.send(
+            &data,
+            std::time::Instant::now() + Duration::from_secs(5),
+            &stopped
+        ),
+        Err(multiview_srt_sys::SrtError::Interrupted)
+    ));
+    drop(socket);
+    let _ = reader.kill();
+    let _ = reader.wait();
+    stop.store(true, Ordering::Release);
+    timer.join().unwrap();
+}

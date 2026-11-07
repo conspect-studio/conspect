@@ -422,3 +422,46 @@ fn teardown_is_bounded_with_a_frozen_caller_attached() {
         "teardown took {elapsed:?}"
     );
 }
+
+/// SRT-05: teardown with a slow-but-alive caller (it reads at a crawl, so
+/// sends keep succeeding) is bounded, and the writer really RELEASES its
+/// session inside that bound instead of being detached still sending.
+#[test]
+fn teardown_is_bounded_and_releases_a_slow_caller() {
+    let port = port();
+    // Unpaced: the producer runs far faster than the caller reads.
+    let run = start(format!("srt://[::]:{port}?mode=listener"), true, None);
+    wait_for("listening", Duration::from_secs(5), || {
+        run.link.snapshot().state == PushLinkState::Listening
+    });
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "quiet",
+            "-readrate",
+            "0.1",
+            "-i",
+        ])
+        .arg(format!("srt://[::1]:{port}?mode=caller"))
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn slow caller");
+    wait_for("attach", Duration::from_secs(10), || {
+        run.link.clients() == 1
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    let started = Instant::now();
+    run.stop.store(true, Ordering::Release);
+    run.handle.join().unwrap();
+    let elapsed = started.elapsed();
+    let clients = run.link.clients();
+    child.kill().expect("kill caller");
+    child.wait().expect("reap caller");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "teardown took {elapsed:?}"
+    );
+    assert_eq!(clients, 0, "a writer was detached instead of released");
+}

@@ -61,15 +61,41 @@ pub struct Muxer {
     /// ([`Muxer::create_push`]). Declared AFTER `output` so the context (and
     /// its `AVIOContext`, which holds a copy of the callback) is closed before
     /// this box is freed. `None` for file muxers (no callback installed).
-    interrupt: Option<Box<IoInterrupt>>,
+    interrupt: Option<std::sync::Arc<IoInterrupt>>,
     /// The caller-owned byte sink of [`Muxer::create_with_writer`]. libav holds a
     /// raw pointer to it; `Drop` frees the `AVIOContext` before this box goes.
-    writer: Option<Box<PacketWriter>>,
+    writer: Option<Box<CustomIo>>,
 }
 
 /// A byte sink for [`Muxer::create_with_writer`]. Returns `false` when the
-/// transport failed, which libav reports as a write error.
-pub type PacketWriter = Box<dyn FnMut(&[u8]) -> bool + Send>;
+/// transport failed, which libav reports as a write error. It must finish
+/// within [`IoBudget::deadline`] and give up once [`IoBudget::should_stop`].
+pub type PacketWriter = Box<dyn FnMut(&[u8], &IoBudget<'_>) -> bool + Send>;
+
+/// The operation-wide bound a [`PacketWriter`] call runs under: the absolute
+/// deadline armed by [`Muxer::arm_io_deadline`] for the WHOLE mux operation
+/// (it does not reset per callback) and the muxer's stop flag (review SRT-05).
+pub struct IoBudget<'a>(&'a IoInterrupt);
+
+impl IoBudget<'_> {
+    /// The absolute instant the current mux operation must finish by, if armed.
+    #[must_use]
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.0.deadline()
+    }
+
+    /// Whether the writer must give up now (stop raised or deadline passed).
+    #[must_use]
+    pub fn should_stop(&self) -> bool {
+        self.0.should_abort()
+    }
+}
+
+/// What a custom-I/O muxer's write callback reaches through `opaque`.
+struct CustomIo {
+    writer: PacketWriter,
+    interrupt: std::sync::Arc<IoInterrupt>,
+}
 
 impl Drop for Muxer {
     fn drop(&mut self) {
@@ -109,6 +135,12 @@ impl IoInterrupt {
         });
         self.deadline_ns
             .store(ns, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The armed deadline as an absolute instant.
+    fn deadline(&self) -> Option<std::time::Instant> {
+        let ns = self.deadline_ns.load(std::sync::atomic::Ordering::Acquire);
+        (ns != 0).then(|| self.base + std::time::Duration::from_nanos(ns))
     }
 
     /// Whether a blocked libav I/O call should abort now.
@@ -227,7 +259,7 @@ impl Muxer {
         open_timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
         ensure_initialized()?;
-        let interrupt = Box::new(IoInterrupt::new(stop));
+        let interrupt = std::sync::Arc::new(IoInterrupt::new(stop));
         interrupt.arm(open_timeout);
         let output = push_ffi::open_output_with_interrupt(url, format_name, &interrupt)?;
         interrupt.arm(None);
@@ -246,30 +278,44 @@ impl Muxer {
     /// `packet_size` chunks (one SRT live message for MPEG-TS). No I/O happens
     /// here; `writer` runs on the thread driving this muxer.
     ///
+    /// The muxer carries the same interrupt state as [`Muxer::create_push`]:
+    /// `stop` and the deadline armed by [`Muxer::arm_io_deadline`] are checked
+    /// before EVERY write callback (a callback after either fails the write
+    /// with `AVERROR_EXIT`), handed to `writer` as its [`IoBudget`], and
+    /// installed as the context's `AVIOInterruptCB` (review SRT-05).
+    ///
     /// # Errors
     /// [`FfmpegError::Mux`] when the context or its I/O cannot be allocated.
     pub fn create_with_writer(
         format_name: &str,
         packet_size: usize,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         writer: PacketWriter,
     ) -> Result<Self> {
         ensure_initialized()?;
-        let mut writer = Box::new(writer);
-        let output = push_ffi::open_output_with_writer(format_name, packet_size, &mut writer)?;
+        let interrupt = std::sync::Arc::new(IoInterrupt::new(stop));
+        let mut io = Box::new(CustomIo {
+            writer,
+            interrupt: std::sync::Arc::clone(&interrupt),
+        });
+        let output = push_ffi::open_output_with_writer(format_name, packet_size, &mut io)?;
         Ok(Self {
             output,
             streams: Vec::new(),
             options: MuxOptions::new(),
             header_written: false,
             trailer_written: false,
-            interrupt: None,
-            writer: Some(writer),
+            interrupt: Some(interrupt),
+            writer: Some(io),
         })
     }
 
-    /// Arm (or with `None`, disarm) the per-operation I/O deadline polled by a
-    /// push muxer's interrupt callback: a write blocked past it aborts with an
-    /// error instead of wedging the sink thread. A no-op for file muxers.
+    /// Arm (or with `None`, disarm) the I/O deadline for the next mux operation
+    /// (header, one packet, trailer) as a whole, polled by a push muxer's
+    /// interrupt callback and, for a custom-writer muxer, before every write
+    /// callback: I/O past it aborts with an error instead of wedging the sink
+    /// thread. It is absolute, so it never resets per callback. A no-op for
+    /// file muxers.
     pub fn arm_io_deadline(&self, timeout: Option<std::time::Duration>) {
         if let Some(interrupt) = &self.interrupt {
             interrupt.arm(timeout);
@@ -612,11 +658,14 @@ mod push_ffi {
     use ffmpeg_next as ffmpeg;
     use libc::{c_int, c_void};
 
-    use super::{IoInterrupt, PacketWriter};
+    use super::{CustomIo, IoBudget, IoInterrupt};
     use crate::error::{FfmpegError, Result};
 
-    /// `extern "C"` write callback: forwards one buffer to the owned writer.
-    /// A panic in the writer is contained here and reported as an I/O error.
+    /// `extern "C"` write callback: forwards one buffer to the owned writer
+    /// unless stop or the operation deadline has already passed (then
+    /// `AVERROR_EXIT`, so successful-but-slow callbacks cannot run on past
+    /// either). A panic in the writer is contained here and reported as an I/O
+    /// error.
     extern "C" fn write_cb(opaque: *mut c_void, buf: *const u8, size: c_int) -> c_int {
         let Ok(len) = usize::try_from(size) else {
             return ffi::AVERROR(libc::EINVAL);
@@ -624,17 +673,23 @@ mod push_ffi {
         if opaque.is_null() || buf.is_null() {
             return ffi::AVERROR(libc::EINVAL);
         }
-        // SAFETY: `opaque` is the `PacketWriter` box installed in
+        // SAFETY: `opaque` is the `CustomIo` box installed in
         // `open_output_with_writer`, alive until `free_custom_io` removed this
         // context; libav calls back synchronously on the thread driving the
         // muxer, so there is no aliasing `&mut`. `buf` holds `len` bytes.
-        let (writer, data) = unsafe {
+        let (io, data) = unsafe {
             (
-                &mut *opaque.cast::<PacketWriter>(),
+                &mut *opaque.cast::<CustomIo>(),
                 std::slice::from_raw_parts(buf, len),
             )
         };
-        let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer(data)));
+        if io.interrupt.should_abort() {
+            return ffi::AVERROR_EXIT;
+        }
+        let CustomIo { writer, interrupt } = io;
+        let budget = IoBudget(interrupt);
+        let wrote =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer(data, &budget)));
         if matches!(wrote, Ok(true)) {
             size
         } else {
@@ -645,7 +700,7 @@ mod push_ffi {
     pub(super) fn open_output_with_writer(
         format_name: &str,
         packet_size: usize,
-        writer: &mut Box<PacketWriter>,
+        io: &mut Box<CustomIo>,
     ) -> Result<ffmpeg::format::context::Output> {
         let invalid = || FfmpegError::Mux(ffmpeg::Error::InvalidData);
         let c_fmt = CString::new(format_name).map_err(|_| invalid())?;
@@ -666,7 +721,10 @@ mod push_ffi {
         // SAFETY: `av_malloc` returns an owned buffer or null; ownership passes
         // to the AVIO context below, or is freed on its failure.
         let buffer = unsafe { ffi::av_malloc(packet_size) }.cast::<u8>();
-        let opaque = ptr::from_mut::<PacketWriter>(writer.as_mut()).cast::<c_void>();
+        let opaque = ptr::from_mut::<CustomIo>(io.as_mut()).cast::<c_void>();
+        let interrupt = ptr::from_ref::<IoInterrupt>(io.interrupt.as_ref())
+            .cast::<c_void>()
+            .cast_mut();
         // SAFETY: `buffer` holds `size` bytes; `opaque` is a stable heap address
         // that the `Muxer` keeps alive until `free_custom_io` runs.
         let pb = if buffer.is_null() {
@@ -687,8 +745,14 @@ mod push_ffi {
         // SAFETY: `ctx` and `pb` are valid. `max_packet_size` makes libav flush
         // whole `packet_size` chunks; CUSTOM_IO stops libav closing `pb`. The
         // `Output` wrapper's own destructor would `avio_close` it, which is why
-        // `free_custom_io` must null `pb` first.
+        // `free_custom_io` must null `pb` first. The interrupt callback's
+        // `opaque` is the `IoInterrupt` the `Muxer` keeps alive (an `Arc` held
+        // by both the `Muxer` and the `CustomIo`) for the context's lifetime.
         unsafe {
+            (*ctx).interrupt_callback = ffi::AVIOInterruptCB {
+                callback: Some(interrupt_cb),
+                opaque: interrupt,
+            };
             (*pb).max_packet_size = size;
             (*ctx).pb = pb;
             (*ctx).flags |= ffi::AVFMT_FLAG_CUSTOM_IO;
@@ -718,9 +782,10 @@ mod push_ffi {
         if opaque.is_null() {
             return 0;
         }
-        // SAFETY: `opaque` is the `&IoInterrupt` installed below; its owning
-        // `Box` lives in the `Muxer` and is dropped only AFTER the output
-        // context (field order), so the pointer is valid whenever libav polls.
+        // SAFETY: `opaque` is the `&IoInterrupt` installed by an open below;
+        // its owning `Arc` lives in the `Muxer` and is dropped only AFTER the
+        // output context (field order), so the pointer is valid whenever libav
+        // polls.
         let interrupt: &IoInterrupt = unsafe { &*opaque.cast::<IoInterrupt>() };
         c_int::from(interrupt.should_abort())
     }
