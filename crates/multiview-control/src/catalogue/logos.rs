@@ -532,60 +532,14 @@ impl LogoCache {
         let now = (self.now)();
         match result {
             Ok(FetchOutcome::Body {
-                mut file,
+                file,
                 content_type,
                 etag,
                 last_modified,
                 ..
             }) => {
-                let ctype = content_type.unwrap_or_default();
-                if !ALLOWED.contains(&ctype.as_str()) {
-                    return self
-                        .fail(
-                            h,
-                            prior,
-                            FailKind::Permanent,
-                            415,
-                            format!("content type {ctype:?} is not an allowed image type"),
-                        )
-                        .await;
-                }
-                let mut body = Vec::new();
-                if let Err(e) = (&mut file)
-                    .take(MAX_LOGO_BYTES_U64 + 1)
-                    .read_to_end(&mut body)
-                {
-                    return self
-                        .fail(h, prior, FailKind::Transient, 0, format!("spool: {e}"))
-                        .await;
-                }
-                if body.len() > MAX_LOGO_BYTES {
-                    return self
-                        .fail(
-                            h,
-                            prior,
-                            FailKind::Permanent,
-                            413,
-                            "logo exceeds the 512 KiB cap".to_owned(),
-                        )
-                        .await;
-                }
-                let meta = Meta {
-                    content_type: Some(ctype.clone()),
-                    fetched_at: now,
-                    etag,
-                    last_modified,
-                    status: 200,
-                    has_body: true,
-                    body_etag: Some(body_etag(&body)),
-                    ..Meta::default()
-                };
-                let image = Arc::new(Image {
-                    etag: body_etag(&body),
-                    content_type: ctype,
-                    bytes: body,
-                });
-                self.commit(h, meta, Some(image)).await
+                self.ingest(h, prior, file, content_type, etag, last_modified)
+                    .await
             }
             Ok(FetchOutcome::NotModified) => {
                 if let Some(p) = prior.filter(|p| p.image.is_some()) {
@@ -612,6 +566,67 @@ impl LogoCache {
                 self.fail(h, prior, kind, status, msg).await
             }
         }
+    }
+
+    /// Validate and store a freshly fetched body.
+    async fn ingest(
+        &self,
+        h: &str,
+        prior: Option<&Arc<Entry>>,
+        mut file: std::fs::File,
+        content_type: Option<String>,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Logo {
+        let now = (self.now)();
+        let ctype = content_type.unwrap_or_default();
+        if !ALLOWED.contains(&ctype.as_str()) {
+            return self
+                .fail(
+                    h,
+                    prior,
+                    FailKind::Permanent,
+                    415,
+                    format!("content type {ctype:?} is not an allowed image type"),
+                )
+                .await;
+        }
+        let mut body = Vec::new();
+        if let Err(e) = (&mut file)
+            .take(MAX_LOGO_BYTES_U64 + 1)
+            .read_to_end(&mut body)
+        {
+            return self
+                .fail(h, prior, FailKind::Transient, 0, format!("spool: {e}"))
+                .await;
+        }
+        if body.len() > MAX_LOGO_BYTES {
+            return self
+                .fail(
+                    h,
+                    prior,
+                    FailKind::Permanent,
+                    413,
+                    "logo exceeds the 512 KiB cap".to_owned(),
+                )
+                .await;
+        }
+        let meta = Meta {
+            content_type: Some(ctype.clone()),
+            fetched_at: now,
+            etag,
+            last_modified,
+            status: 200,
+            has_body: true,
+            body_etag: Some(body_etag(&body)),
+            ..Meta::default()
+        };
+        let image = Arc::new(Image {
+            etag: body_etag(&body),
+            content_type: ctype,
+            bytes: body,
+        });
+        self.commit(h, meta, Some(image)).await
     }
 
     /// Record a failure in the sidecar. A good cached copy is kept and served.

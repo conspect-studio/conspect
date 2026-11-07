@@ -89,7 +89,7 @@ impl Fetcher for Fake {
                     file.rewind().unwrap();
                     Ok(FetchOutcome::Body {
                         file,
-                        len: b.len() as u64,
+                        len: u64::try_from(b.len()).unwrap(),
                         etag: Some("\"up1\"".into()),
                         last_modified: None,
                         content_type: Some(ct.to_owned()),
@@ -312,10 +312,11 @@ async fn eviction_keeps_the_store_within_both_bounds() {
     let (n, bytes) = dir_usage(&rig.dir.path().join("logos"));
     assert!(n <= 10, "files {n}");
     assert!(n >= 8, "evicts only what it must: {n}");
-    let st = lock(&c.state);
-    assert!(st.total_files <= 10);
-    assert_eq!(st.total_bytes, bytes, "accounting matches the disk");
-    drop(st);
+    {
+        let st = lock(&c.state);
+        assert!(st.total_files <= 10);
+        assert_eq!(st.total_bytes, bytes, "accounting matches the disk");
+    }
     // Byte bound.
     let rig2 = Rig::new();
     let c2 = rig2.open(f.clone()).with_limits(SLOT_WAIT, 5_000, u64::MAX);
