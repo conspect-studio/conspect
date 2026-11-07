@@ -58,6 +58,41 @@ fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> 
             .eq(next.iter().filter(|(key, _)| media_field(key)))
 }
 
+/// Whether `events.automation` differs between two stored source bodies.
+fn automation_changed(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
+    let automation = |body: &serde_json::Value| {
+        body.get("events")
+            .and_then(|events| events.get("automation"))
+            .cloned()
+    };
+    automation(previous) != automation(next)
+}
+
+/// Tell the running engine a source's standing policy (armed automation)
+/// changed. On a demand-managed run the hub re-reads the owner's complete pin
+/// set and leaves the producer alone. A kind the run cannot apply live, or a
+/// shed submit, applies on restart and says so.
+fn submit_policy_update(state: &AppState, next: Option<multiview_config::Source>) -> ApplyMode {
+    let Some(next) = next else {
+        return ApplyMode::Restart;
+    };
+    if !state.live_sources.is_live(&next.kind) {
+        return ApplyMode::Restart;
+    }
+    let submitted = state
+        .commands
+        .try_submit(Command::UpsertSource {
+            op: OperationId::new(),
+            source: Box::new(next),
+        })
+        .is_ok();
+    if submitted {
+        ApplyMode::Live
+    } else {
+        ApplyMode::Restart
+    }
+}
+
 /// Persist an `events.automation` change to one source through the canonical
 /// durable path (`commit_resource` → store → audit), never restarting ingest
 /// (ADR-0183). `mutate` edits the stored body; returns the new body.
@@ -545,7 +580,14 @@ pub(crate) async fn update_source(
                 model.adopt_source(next.clone());
             }
         }
-        ApplyMode::Live
+        if automation_changed(&current.resource.body, &versioned.resource.body) {
+            // An automation edit changes which sources its rule keeps running:
+            // the same pins-only path the automation routes use (review
+            // R2-01). The hub sees unchanged media and never restarts it.
+            submit_policy_update(&state, next)
+        } else {
+            ApplyMode::Live
+        }
     } else {
         live_apply_upsert(&state, next, previous.as_ref())
     };

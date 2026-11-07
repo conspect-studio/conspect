@@ -341,3 +341,216 @@ async fn deleting_a_started_source_releases_its_start() {
     }
     demand.stop_all();
 }
+
+/// One raw HTTP/1.0 exchange against the bound control server.
+async fn http(addr: std::net::SocketAddr, request: String) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    response
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+}
+
+fn http_body(response: &str) -> serde_json::Value {
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str(body).unwrap()
+}
+
+/// Which owners hold `id` through automation.
+fn automation_holders(
+    demand: &multiview_engine::DemandManager<multiview_compositor::pipeline::Nv12Image>,
+    id: &str,
+) -> Vec<String> {
+    demand
+        .status(id)
+        .consumers
+        .iter()
+        .filter(|tag| tag.class == ConsumerClass::EventAutomation)
+        .map(|tag| tag.label.to_string())
+        .collect()
+}
+
+/// Review R2-01: an automation edit through the GENERIC source PUT updates
+/// the owner's pins (arm, retarget, disarm, remove the rule), never
+/// restarting its producer, and declares `live` only because it did.
+#[allow(clippy::too_many_lines)] // one REST walk through four policy edits
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generic_source_put_of_automation_updates_the_pins() {
+    std::env::set_var("MULTIVIEW_CONTROL_TOKEN", "test-secret");
+    let mut doc = config(false);
+    let mut alt = doc
+        .sources
+        .iter()
+        .find(|s| s.id == "slate")
+        .unwrap()
+        .clone();
+    alt.id = "alt".into();
+    doc.sources.push(alt);
+    let mut cam = doc
+        .sources
+        .iter()
+        .find(|s| s.id == "watched")
+        .unwrap()
+        .clone();
+    cam.id = "cam".into();
+    cam.kind = multiview_config::SourceKind::Bars;
+    cam.events = None;
+    doc.sources.push(cam);
+    let mut pipeline = Pipeline::build(&doc).expect("builds");
+    let demand = pipeline.demand();
+    demand.start();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !demand.status("cam").running.video {
+        assert!(
+            std::time::Instant::now() < end,
+            "{:?}",
+            demand.status("cam")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let generation = demand.status("cam").generation;
+    let hub = multiview_cli::live_sources::LiveSourceHub::start_with_ingest(
+        pipeline.stop_registry(),
+        multiview_cli::live_sources::shared_stores(std::collections::HashMap::new()),
+        Some(pipeline.live_ingest_spawner()),
+    );
+    let publisher = std::sync::Arc::new(multiview_engine::EnginePublisher::<
+        multiview_control::EngineStateSnapshot,
+        multiview_events::Event,
+    >::new(8));
+    let (commands, mut command_rx) = multiview_control::command_bus(8);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (addr, server, _state) = multiview_cli::control::bind_and_serve(
+        "[::1]:0",
+        &doc,
+        publisher,
+        commands,
+        multiview_control::no_preview(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        multiview_control::LiveApplyCaps::default(),
+        multiview_control::LiveSourceCapability::synthetic_and_network(),
+        None,
+        None,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    )
+    .await
+    .expect("control server binds");
+    let auth = "Authorization: Bearer admin.test-secret";
+    let rule = |target: &str| {
+        serde_json::json!({"armed": true, "restore_on_end": true, "max_duration_s": 60,
+            "on_break_start": {"action": "swap_cell", "target": target}})
+    };
+    let steps: [(Option<serde_json::Value>, [usize; 2]); 4] = [
+        (Some(rule("slate")), [1, 0]),
+        (Some(rule("alt")), [0, 1]),
+        (
+            Some({
+                let mut off = rule("alt");
+                off["armed"] = serde_json::json!(false);
+                off
+            }),
+            [0, 0],
+        ),
+        (None, [0, 0]),
+    ];
+    let handle = hub.handle();
+    for (automation, [on_slate, on_alt]) in steps {
+        let got = http(
+            addr,
+            format!("GET /api/v1/sources/cam HTTP/1.0\r\nHost: {addr}\r\n{auth}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        let etag = header(&got, "etag").unwrap().to_owned();
+        let mut resource = http_body(&got);
+        match &automation {
+            Some(rule) => resource["body"]["events"] = serde_json::json!({"automation": rule}),
+            None => {
+                resource["body"].as_object_mut().unwrap().remove("events");
+            }
+        }
+        let body =
+            serde_json::json!({"name": resource["name"], "body": resource["body"]}).to_string();
+        let put = http(
+            addr,
+            format!(
+                "PUT /api/v1/sources/cam HTTP/1.0\r\nHost: {addr}\r\n{auth}\r\nIf-Match: {etag}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(
+            put.starts_with("HTTP/1.0 200") || put.starts_with("HTTP/1.1 200"),
+            "{put}"
+        );
+        assert_eq!(header(&put, "x-multiview-apply"), Some("live"));
+        // Stand in for the engine drain: hand each upsert to the hub with
+        // the catalogued store, exactly as the drain reuses it.
+        for command in command_rx.try_drain() {
+            if let multiview_control::Command::UpsertSource { source, .. } = command {
+                let store = pipeline.catalogue().load()[source.id.as_str()]
+                    .store()
+                    .clone();
+                assert_eq!(
+                    handle.request_spawn_source(SourceSpawn {
+                        source: *source,
+                        store
+                    }),
+                    multiview_cli::live_sources::HubSubmit::Accepted
+                );
+            }
+        }
+        let watched = usize::from(
+            automation
+                .as_ref()
+                .is_some_and(|rule| rule["armed"] == true),
+        );
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let slate = automation_holders(&demand, "slate")
+                .iter()
+                .filter(|o| *o == "cam")
+                .count();
+            let alt = automation_holders(&demand, "alt")
+                .iter()
+                .filter(|o| *o == "cam")
+                .count();
+            let own = automation_holders(&demand, "cam").len();
+            if [slate, alt, own] == [on_slate, on_alt, watched] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "pins stale after {automation:?}: slate={slate} alt={alt} watched={own}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(
+        demand.status("cam").generation,
+        generation,
+        "producer restarted"
+    );
+    assert!(demand.status("cam").running.video, "still running");
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+    hub.shutdown();
+    demand.stop_all();
+}
