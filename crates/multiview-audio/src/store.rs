@@ -1127,6 +1127,7 @@ pub const TIMELINE_CAPACITY: usize = 1_440_000;
 /// should be an [`AudioStore::timeline`] store. See
 /// [`anchored_publish_loop`].
 #[cfg(feature = "ffmpeg")]
+#[allow(clippy::too_many_arguments)] // the HLS request headers ride beside the existing anchor inputs
 pub fn audio_decode_loop_anchored(
     path: impl AsRef<std::path::Path>,
     layout: crate::format::ChannelLayout,

@@ -1999,6 +1999,7 @@ mod tests {
 
     /// Serve a live playlist + one segment on loopback, recording every
     /// request's lower-cased header block keyed by path.
+    #[allow(clippy::type_complexity)] // test helper: (port, recorded (path, headers))
     fn recording_origin() -> (u16, Arc<Mutex<Vec<(String, String)>>>) {
         let listener = TcpListener::bind("[::1]:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -2030,7 +2031,10 @@ mod tests {
                             headers.push_str(&h.to_ascii_lowercase());
                         }
                         log.lock().expect("log").push((path.clone(), headers));
-                        let resp = if path.ends_with(".m3u8") {
+                        let is_playlist = std::path::Path::new(&path)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"));
+                        let resp = if is_playlist {
                             reply(
                                 "HTTP/1.1 200 OK",
                                 b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:5.6,\nseg5.ts\n",

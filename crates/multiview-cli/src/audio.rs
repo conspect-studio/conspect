@@ -1019,6 +1019,7 @@ fn await_shared_url(
 /// pace nor stall the output clock (invariant #1) nor back-pressure the engine
 /// (invariant #10); a wedged libav network call is bounded by the supervisor's
 /// detach-on-grace teardown, exactly as for video.
+#[allow(clippy::too_many_lines)] // one supervised reconnect loop; splitting hides the order
 pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop: &AtomicBool) {
     // Name this source on every line the audio thread emits: our own (the span)
     // and libav's synchronous lines (the thread-local resource context the log
