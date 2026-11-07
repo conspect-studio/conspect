@@ -150,6 +150,11 @@ mdns-sd = { version = "0.20.0", default-features = false, features = [
     "async",
 ], optional = true }
 serde_path_to_error = "0.1"
+# IPTV guide passthrough (epg-playlist): bounded streaming XMLTV filter and
+# gzip guide snapshots. quick-xml >= 0.41 (RUSTSEC-2026-0194/0195 fixed);
+# flate2 (MIT/Apache-2.0, pure-Rust miniz backend) was already in the lock.
+quick-xml = "0.41"
+flate2 = "1.1"
 
 # The live HTTP transport for the `zowietek` managed-device driver: OFF by
 # default (`zowietek` / `devices-net`). The typed JSON-RPC client + driver logic
@@ -333,6 +338,11 @@ tokio-rustls = "0.26"
 # flag): the `zowietek` HTTP transport, the `cast` CASTV2 wire layer, and the
 # `discovery` mDNS browse.
 "devices-net" = ["zowietek", "cast", "discovery"]
+# Outbound HTTP(S) for IPTV M3U import + XMLTV guide refresh (epg-playlist):
+# the SSRF-screened reqwest fetcher. Off by default (the pure parser/filter and
+# the routes are always compiled; without it, URL import/refresh report an
+# honest "no transport" error and pasted M3U text still imports).
+"iptv-net" = ["dep:reqwest", "dep:url"]
 # TEST-ONLY seam — do NOT enable in a shipped build. Exposes the config-watch
 # post-probe interpose hook (`WatchOptions::with_post_probe_interpose`) the
 # probe→apply TOCTOU regression test uses to WRITE the watched file mid-poll.

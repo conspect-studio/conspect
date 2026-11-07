@@ -32,6 +32,7 @@ pub mod devices;
 pub mod discovery;
 pub mod health;
 pub mod inputs;
+pub mod iptv;
 pub mod licence;
 pub mod logs;
 pub mod media_players;
@@ -1059,6 +1060,8 @@ fn resource_router() -> Router<AppState> {
         )
         // Sources resource CRUD (managed inputs), mirroring layouts.
         .route("/sources", get(sources::list_sources))
+        .route("/sources/import/m3u", post(iptv::import_m3u))
+        .route("/iptv", get(iptv::get_iptv).put(iptv::put_iptv))
         .route(
             "/sources/{id}",
             get(sources::get_source)

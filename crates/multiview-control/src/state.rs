@@ -635,6 +635,10 @@ pub struct AppState {
     /// operator `control.device_dial_allow` allowlist tightens the dial to its own
     /// device subnet(s). Read-only control-plane state (invariant #10).
     pub dial_policy: Arc<multiview_config::device::net_guard::DialPolicy>,
+    /// The IPTV publication runtime (epg-playlist): guide feed cache, the
+    /// atomically swapped guide snapshot and the refresher wake signal.
+    /// Control-plane only (invariant #10).
+    pub iptv: Arc<crate::iptv::IptvService>,
     /// The runtime store of **ephemeral** cast sessions (DEV-D2, ADR-M011):
     /// runtime-only records that never enter the devices store, so a config
     /// export can never emit them. "Save as device" promotes one into a
@@ -957,6 +961,7 @@ impl AppState {
             // dialable, never-legitimate ranges stay blocked. An operator
             // `control.device_dial_allow` allowlist tightens it (SEC-02/SEC-04).
             dial_policy: Arc::new(multiview_config::device::net_guard::DialPolicy::allow_lan()),
+            iptv: Arc::new(crate::iptv::IptvService::default()),
             cast_sessions: Arc::new(CastSessionStore::new()),
             audio_routing: Arc::new(AudioRoutingStore::new()),
             alarms: Arc::new(InMemoryAlarmStore::new()),

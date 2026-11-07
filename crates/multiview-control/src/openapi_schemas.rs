@@ -1081,6 +1081,58 @@ pub struct PlaylistMetadataDoc {
     pub group: Option<String>,
 }
 
+/// `OpenAPI` mirror of `multiview_config::IptvEntryKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IptvEntryKindDoc {
+    /// A configured HLS/LL-HLS output, published at its `/hls/…` URL.
+    Output,
+    /// A configured source, published at its upstream URL (userinfo removed).
+    Source,
+}
+
+/// `OpenAPI` mirror of `multiview_config::IptvEntry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct IptvEntryDoc {
+    /// Whether `ref` names an output or a source.
+    pub kind: IptvEntryKindDoc,
+    /// The referenced output id or source id.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// Published `tvg-id` override (also the guide channel id).
+    #[serde(default)]
+    pub tvg_id: Option<String>,
+    /// Display-name override.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `tvg-logo` override (credential-free http(s) URL).
+    #[serde(default)]
+    pub logo: Option<String>,
+    /// `group-title` override.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Explicit permission to publish a source's upstream URL (required for sources).
+    #[serde(default)]
+    pub allow_direct_source_url: bool,
+}
+
+/// `OpenAPI` mirror of `multiview_config::IptvConfig` (`[iptv]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct IptvConfigDoc {
+    /// Whether `/iptv/playlist.m3u8` and `/iptv/guide.xml` are served (default false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional absolute public base URL for playlist links (default: request Host).
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    /// Published entries in playlist order.
+    #[serde(default)]
+    pub entries: Vec<IptvEntryDoc>,
+}
+
 /// `OpenAPI` mirror of `multiview_config::Source` — the body accepted by
 /// `POST`/`PUT /api/v1/sources/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

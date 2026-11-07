@@ -53,6 +53,7 @@ pub mod cors;
 pub mod devices;
 pub mod error;
 pub mod event_automation;
+pub mod iptv;
 pub mod is07;
 pub mod jwt;
 /// Management-plane rate limiting (SEC-14): the keyed token-bucket + the
@@ -287,7 +288,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/v1", api)
         // The NMOS Node API lives under its own standardised `/x-nmos` base, not
         // under `/api/v1` — it is a separate, AMWA-specified surface.
-        .merge(nmos::nmos_router());
+        .merge(nmos::nmos_router())
+        // Public IPTV playlist + guide (epg-playlist): outside `/api/v1`, the
+        // same unauthenticated delivery model as the `/hls/{output}` mounts.
+        .merge(routes::iptv::public_router());
 
     #[cfg(feature = "openapi")]
     let app = app.merge(openapi::openapi_router());

@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 chrono = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
-quick-xml = { version = "0.37", features = ["serialize", "encoding"] }
+quick-xml = { version = "0.41", features = ["serialize", "encoding"] }
 
 [lints]
 workspace = true

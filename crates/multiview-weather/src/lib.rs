@@ -188,9 +188,12 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
                     let a = a.map_err(|e| ParseError::Xml(e.to_string()))?;
                     attrs.insert(
                         String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-                        a.decode_and_unescape_value(r.decoder())
-                            .map_err(|e| ParseError::Xml(e.to_string()))?
-                            .into_owned(),
+                        a.decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            r.decoder(),
+                        )
+                        .map_err(|e| ParseError::Xml(e.to_string()))?
+                        .into_owned(),
                     );
                 }
                 stack.push(Node {
@@ -211,9 +214,12 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
                     let a = a.map_err(|e| ParseError::Xml(e.to_string()))?;
                     attrs.insert(
                         String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-                        a.decode_and_unescape_value(r.decoder())
-                            .map_err(|e| ParseError::Xml(e.to_string()))?
-                            .into_owned(),
+                        a.decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            r.decoder(),
+                        )
+                        .map_err(|e| ParseError::Xml(e.to_string()))?
+                        .into_owned(),
                     );
                 }
                 let n = Node {
@@ -230,11 +236,34 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
             }
             Event::Text(t) => {
                 if let Some(n) = stack.last_mut() {
-                    let s = t.unescape().map_err(|e| ParseError::Xml(e.to_string()))?;
+                    let s = t
+                        .xml10_content()
+                        .map_err(|e| ParseError::Xml(e.to_string()))?;
                     if s.len() > l.max_text_bytes.saturating_sub(n.text.len()) {
                         return Err(ParseError::LimitExceeded("text"));
                     }
                     n.text.push_str(&s);
+                }
+            }
+            // quick-xml >= 0.41 reports `&amp;`/`&#38;` as separate events;
+            // only predefined and character references are accepted.
+            Event::GeneralRef(g) => {
+                if let Some(n) = stack.last_mut() {
+                    let char_ref = g
+                        .resolve_char_ref()
+                        .map_err(|e| ParseError::Xml(e.to_string()))?;
+                    let resolved = if let Some(ch) = char_ref {
+                        ch.to_string()
+                    } else {
+                        let name = g.decode().map_err(|e| ParseError::Xml(e.to_string()))?;
+                        quick_xml::escape::resolve_predefined_entity(&name)
+                            .ok_or_else(|| ParseError::Xml(format!("unknown entity &{name};")))?
+                            .to_owned()
+                    };
+                    if resolved.len() > l.max_text_bytes.saturating_sub(n.text.len()) {
+                        return Err(ParseError::LimitExceeded("text"));
+                    }
+                    n.text.push_str(&resolved);
                 }
             }
             Event::CData(t) => {

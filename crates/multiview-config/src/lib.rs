@@ -37,6 +37,7 @@ pub mod discovery;
 pub mod error;
 pub mod failover;
 pub mod grid;
+pub mod iptv;
 pub mod layout_doc;
 pub mod limits;
 pub mod media;
@@ -74,6 +75,7 @@ pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
 pub use error::ConfigError;
 pub use failover::{default_failover_slate, FailoverSlate};
+pub use iptv::{IptvConfig, IptvEntry, IptvEntryKind, MAX_IPTV_ENTRIES};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
@@ -387,6 +389,10 @@ pub struct MultiviewConfig {
     /// Bound onto the canvas by [`SourceKind::MediaPlayer`].
     #[serde(default)]
     pub media_players: Vec<MediaPlayer>,
+    /// Managed IPTV playlist + XMLTV guide publication (epg-playlist). Absent ⇒
+    /// nothing is published (`/iptv/*` answers 404). Presentation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iptv: Option<IptvConfig>,
 }
 
 /// Parse a `#RGB` / `#RRGGBB` hex color into its `(r, g, b)` bytes.
@@ -504,6 +510,12 @@ impl MultiviewConfig {
         }
 
         self.validate_unique_ids()?;
+        if let Some(iptv) = &self.iptv {
+            // Structural only: references are resolved when the publication is
+            // edited and again when it is served, so deleting a published
+            // source/output is never blocked — it simply drops out.
+            iptv.validate(None, None)?;
+        }
         if self.sources.len() > MAX_ADMITTED_SOURCES {
             return Err(ConfigError::Validation(format!(
                 "sources exceeds the live source capacity of {MAX_ADMITTED_SOURCES}"
