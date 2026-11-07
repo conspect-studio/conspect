@@ -42,6 +42,14 @@ export function useFollowLabel(): (f: OriginFollow) => string {
         : t`Auto — apply URL/header changes`;
 }
 
+/**
+ * Most sources one bulk add may create. Until the per-source `activation`
+ * choice (Always on / On demand) reaches this branch, every new source is
+ * always on: it opens a connection and a decoder at boot. Agreed with the rc3
+ * owner; lifted when the activation follow-up lands.
+ */
+export const BULK_ADD_MAX = 8;
+
 /** The bulk-add confirmation dialog. */
 export function BulkAddDialog({
   open,
@@ -65,7 +73,12 @@ export function BulkAddDialog({
   const [results, setResults] = useState<readonly ItemResult[] | null>(null);
   const [running, setRunning] = useState(false);
 
+  const overCap = streams.length > BULK_ADD_MAX;
+
   const run = async (): Promise<void> => {
+    if (overCap) {
+      return;
+    }
     setRunning(true);
     const taken = new Set(takenIds);
     const out: ItemResult[] = [];
@@ -135,6 +148,20 @@ export function BulkAddDialog({
                 </li>
               ))}
             </ul>
+            <p className="text-sm text-muted-foreground">
+              <Trans>
+                These {streams.length} sources start always on: each opens a connection and decoder
+                when the server starts.
+              </Trans>
+            </p>
+            {overCap ? (
+              <p role="alert" className="text-sm text-destructive">
+                <Trans>
+                  Add at most {BULK_ADD_MAX} sources at a time. Deselect {streams.length - BULK_ADD_MAX} to
+                  continue.
+                </Trans>
+              </p>
+            ) : null}
             <SelectField<OriginFollow>
               label={t`Follow upstream changes`}
               value={follow}
@@ -167,7 +194,7 @@ export function BulkAddDialog({
           {results === null ? (
             <Button
               type="button"
-              disabled={running || streams.length === 0}
+              disabled={running || streams.length === 0 || overCap}
               onClick={(): void => {
                 void run();
               }}

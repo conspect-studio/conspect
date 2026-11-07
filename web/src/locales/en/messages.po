@@ -682,7 +682,7 @@ msgid "Add"
 msgstr "Add"
 
 #. placeholder {0}: streams.length
-#: src/iptv/BulkAddDialog.tsx:175
+#: src/iptv/BulkAddDialog.tsx:202
 msgid "Add {0} sources"
 msgstr "Add {0} sources"
 
@@ -710,6 +710,11 @@ msgstr "Add at least one cell to the layout."
 #: src/resources/FormControls.tsx:118
 msgid "Add at least one member device to the group."
 msgstr "Add at least one member device to the group."
+
+#. placeholder {0}: streams.length - BULK_ADD_MAX
+#: src/iptv/BulkAddDialog.tsx:159
+msgid "Add at most {BULK_ADD_MAX} sources at a time. Deselect {0} to continue."
+msgstr "Add at most {BULK_ADD_MAX} sources at a time. Deselect {0} to continue."
 
 #: src/layout/components/GridLayoutEditor.tsx:652
 #: src/layout/components/LayoutEditor.tsx:181
@@ -742,7 +747,7 @@ msgstr "Add row"
 msgid "Add selected ({0})"
 msgstr "Add selected ({0})"
 
-#: src/iptv/BulkAddDialog.tsx:119
+#: src/iptv/BulkAddDialog.tsx:132
 msgid "Add selected streams as sources"
 msgstr "Add selected streams as sources"
 
@@ -1524,7 +1529,7 @@ msgid "Camera 1"
 msgstr "Camera 1"
 
 #: src/events/AutomationPanel.tsx:135
-#: src/iptv/BulkAddDialog.tsx:165
+#: src/iptv/BulkAddDialog.tsx:192
 #: src/iptv/SourceLinks.tsx:348
 #: src/iptv/SourceLinks.tsx:420
 #: src/layout/components/GridLayoutEditor.tsx:882
@@ -1924,7 +1929,7 @@ msgstr "Cleared only"
 msgid "Clip"
 msgstr "Clip"
 
-#: src/iptv/BulkAddDialog.tsx:165
+#: src/iptv/BulkAddDialog.tsx:192
 #: src/iptv/SourceLinks.tsx:403
 #: src/iptv/SourceLinks.tsx:445
 msgid "Close"
@@ -2657,8 +2662,8 @@ msgstr "Create your first layout"
 msgid "Create your first salvo"
 msgstr "Create your first salvo"
 
-#: src/iptv/BulkAddDialog.tsx:86
-#: src/iptv/BulkAddDialog.tsx:157
+#: src/iptv/BulkAddDialog.tsx:99
+#: src/iptv/BulkAddDialog.tsx:184
 #: src/resources/CrudPage.tsx:264
 msgid "Created"
 msgstr "Created"
@@ -3426,7 +3431,7 @@ msgstr "Each input continuously writes its newest decoded frame into a small per
 msgid "Each output picks its audio from this set: “program” mode carries the prog mix; “tracks” mode selects any of the names above. Manage that per-output choice on the Outputs page."
 msgstr "Each output picks its audio from this set: “program” mode carries the prog mix; “tracks” mode selects any of the names above. Manage that per-output choice on the Outputs page."
 
-#: src/iptv/BulkAddDialog.tsx:122
+#: src/iptv/BulkAddDialog.tsx:135
 msgid "Each stream becomes an ordinary source linked to its IPTV-ORG entry. Nothing is probed or applied beyond creating the sources."
 msgstr "Each stream becomes an ordinary source linked to its IPTV-ORG entry. Nothing is probed or applied beyond creating the sources."
 
@@ -3773,7 +3778,7 @@ msgstr "Face"
 
 #. placeholder {0}: a.error
 #. placeholder {0}: r.message
-#: src/iptv/BulkAddDialog.tsx:157
+#: src/iptv/BulkAddDialog.tsx:184
 #: src/iptv/NetworkDialog.tsx:107
 msgid "Failed: {0}"
 msgstr "Failed: {0}"
@@ -3866,7 +3871,7 @@ msgstr "Fix these before saving:"
 msgid "Flags"
 msgstr "Flags"
 
-#: src/iptv/BulkAddDialog.tsx:139
+#: src/iptv/BulkAddDialog.tsx:166
 #: src/iptv/SourceLinks.tsx:74
 msgid "Follow upstream changes"
 msgstr "Follow upstream changes"
@@ -4561,7 +4566,7 @@ msgstr "Internet (TCP)"
 msgid "Internet / unmanaged links"
 msgstr "Internet / unmanaged links"
 
-#: src/iptv/BulkAddDialog.tsx:77
+#: src/iptv/BulkAddDialog.tsx:90
 msgid "Invalid source"
 msgstr "Invalid source"
 
@@ -7432,7 +7437,7 @@ msgstr "Restore now"
 msgid "Restoring…"
 msgstr "Restoring…"
 
-#: src/iptv/BulkAddDialog.tsx:147
+#: src/iptv/BulkAddDialog.tsx:174
 #: src/iptv/IptvOrgPage.tsx:570
 msgid "Results"
 msgstr "Results"
@@ -8967,6 +8972,11 @@ msgstr "Theme: light. Switch to dark."
 #: src/components/ThemeToggle.tsx:24
 msgid "Theme: system. Switch to light."
 msgstr "Theme: system. Switch to light."
+
+#. placeholder {0}: streams.length
+#: src/iptv/BulkAddDialog.tsx:152
+msgid "These {0} sources start always on: each opens a connection and decoder when the server starts."
+msgstr "These {0} sources start always on: each opens a connection and decoder when the server starts."
 
 #: src/pages/docs/concepts/LatencyPage.tsx:99
 msgid "These are classes, not promises — encoder settings (especially keyframe interval), network conditions, and the viewer's player all move the number."

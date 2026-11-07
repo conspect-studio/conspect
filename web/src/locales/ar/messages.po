@@ -682,7 +682,7 @@ msgid "Add"
 msgstr ""
 
 #. placeholder {0}: streams.length
-#: src/iptv/BulkAddDialog.tsx:175
+#: src/iptv/BulkAddDialog.tsx:202
 msgid "Add {0} sources"
 msgstr ""
 
@@ -709,6 +709,11 @@ msgstr ""
 
 #: src/resources/FormControls.tsx:118
 msgid "Add at least one member device to the group."
+msgstr ""
+
+#. placeholder {0}: streams.length - BULK_ADD_MAX
+#: src/iptv/BulkAddDialog.tsx:159
+msgid "Add at most {BULK_ADD_MAX} sources at a time. Deselect {0} to continue."
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:652
@@ -742,7 +747,7 @@ msgstr ""
 msgid "Add selected ({0})"
 msgstr ""
 
-#: src/iptv/BulkAddDialog.tsx:119
+#: src/iptv/BulkAddDialog.tsx:132
 msgid "Add selected streams as sources"
 msgstr ""
 
@@ -1524,7 +1529,7 @@ msgid "Camera 1"
 msgstr ""
 
 #: src/events/AutomationPanel.tsx:135
-#: src/iptv/BulkAddDialog.tsx:165
+#: src/iptv/BulkAddDialog.tsx:192
 #: src/iptv/SourceLinks.tsx:348
 #: src/iptv/SourceLinks.tsx:420
 #: src/layout/components/GridLayoutEditor.tsx:882
@@ -1924,7 +1929,7 @@ msgstr ""
 msgid "Clip"
 msgstr ""
 
-#: src/iptv/BulkAddDialog.tsx:165
+#: src/iptv/BulkAddDialog.tsx:192
 #: src/iptv/SourceLinks.tsx:403
 #: src/iptv/SourceLinks.tsx:445
 msgid "Close"
@@ -2657,8 +2662,8 @@ msgstr ""
 msgid "Create your first salvo"
 msgstr ""
 
-#: src/iptv/BulkAddDialog.tsx:86
-#: src/iptv/BulkAddDialog.tsx:157
+#: src/iptv/BulkAddDialog.tsx:99
+#: src/iptv/BulkAddDialog.tsx:184
 #: src/resources/CrudPage.tsx:264
 msgid "Created"
 msgstr ""
@@ -3426,7 +3431,7 @@ msgstr ""
 msgid "Each output picks its audio from this set: “program” mode carries the prog mix; “tracks” mode selects any of the names above. Manage that per-output choice on the Outputs page."
 msgstr ""
 
-#: src/iptv/BulkAddDialog.tsx:122
+#: src/iptv/BulkAddDialog.tsx:135
 msgid "Each stream becomes an ordinary source linked to its IPTV-ORG entry. Nothing is probed or applied beyond creating the sources."
 msgstr ""
 
@@ -3773,7 +3778,7 @@ msgstr ""
 
 #. placeholder {0}: a.error
 #. placeholder {0}: r.message
-#: src/iptv/BulkAddDialog.tsx:157
+#: src/iptv/BulkAddDialog.tsx:184
 #: src/iptv/NetworkDialog.tsx:107
 msgid "Failed: {0}"
 msgstr ""
@@ -3866,7 +3871,7 @@ msgstr ""
 msgid "Flags"
 msgstr ""
 
-#: src/iptv/BulkAddDialog.tsx:139
+#: src/iptv/BulkAddDialog.tsx:166
 #: src/iptv/SourceLinks.tsx:74
 msgid "Follow upstream changes"
 msgstr ""
@@ -4561,7 +4566,7 @@ msgstr ""
 msgid "Internet / unmanaged links"
 msgstr ""
 
-#: src/iptv/BulkAddDialog.tsx:77
+#: src/iptv/BulkAddDialog.tsx:90
 msgid "Invalid source"
 msgstr ""
 
@@ -7432,7 +7437,7 @@ msgstr ""
 msgid "Restoring…"
 msgstr ""
 
-#: src/iptv/BulkAddDialog.tsx:147
+#: src/iptv/BulkAddDialog.tsx:174
 #: src/iptv/IptvOrgPage.tsx:570
 msgid "Results"
 msgstr ""
@@ -8966,6 +8971,11 @@ msgstr ""
 
 #: src/components/ThemeToggle.tsx:24
 msgid "Theme: system. Switch to light."
+msgstr ""
+
+#. placeholder {0}: streams.length
+#: src/iptv/BulkAddDialog.tsx:152
+msgid "These {0} sources start always on: each opens a connection and decoder when the server starts."
 msgstr ""
 
 #: src/pages/docs/concepts/LatencyPage.tsx:99
