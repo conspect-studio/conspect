@@ -10,7 +10,10 @@
 //! decode is sized at the **first** acquire's requested resolution; a later, larger
 //! acquire grows the recorded per-axis **supremum** *metadata* (ADR-0030 §3) but
 //! does **not** resize a live store. Callers that need the supremum acquire it up
-//! front (MP-2's `Pipeline::build` does); each consumer scales at composite.
+//! front (MP-2's `Pipeline::build` does); each consumer scales at composite. A
+//! decode that later resizes itself reports the new size through
+//! [`SourceRegistry::set_requested`]. The store has no geometry of its own: it
+//! carries whatever frame size the decode publishes.
 //!
 //! ## Isolation (inv #1 / inv #10)
 //!
@@ -543,6 +546,22 @@ impl<T> SourceRegistry<T> {
     #[must_use]
     pub fn requested_supremum(&self, key: &SourceKey) -> Option<RequestedSize> {
         lock(&self.entries).get(key).map(|entry| entry.supremum)
+    }
+
+    /// Replace the size recorded for `key` with `size`, in either direction,
+    /// returning whether `key` is registered.
+    ///
+    /// For the owner of a decode that has resized to follow a layout change, so
+    /// the recorded size tracks what is decoded now rather than the largest size
+    /// ever requested. O(1) under the entries lock, and like every registry call
+    /// this is lifecycle-only: never call it from the output clock.
+    pub fn set_requested(&self, key: &SourceKey, size: RequestedSize) -> bool {
+        let mut entries = lock(&self.entries);
+        let Some(entry) = entries.get_mut(key) else {
+            return false;
+        };
+        entry.supremum = size;
+        true
     }
 
     /// The shared [`TileStore`] registered for `key`, or [`None`] if no such source

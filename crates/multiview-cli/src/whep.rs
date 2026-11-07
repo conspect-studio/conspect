@@ -73,7 +73,8 @@ const DRIVER_TICK: Duration = Duration::from_millis(20);
 /// the preview longest-edge cap and re-stamped on the 90 kHz RTP clock.
 struct PreviewVideoEncoder {
     codec: PreviewCodec,
-    inner: Mutex<Option<VideoEncoder>>,
+    /// The open encoder and the frame size it was opened for.
+    inner: Mutex<Option<(VideoEncoder, (u32, u32))>>,
     /// The next 90 kHz RTP timestamp to stamp (monotonic; one step per frame).
     rtp_ts: AtomicU32,
     /// Whether the first emitted access unit (the keyframe) has been produced.
@@ -119,16 +120,20 @@ impl PreviewVideoEncoder {
 
     /// Encode one NV12 frame into an [`EncodedSample`] (or `None` if the encoder
     /// buffered it). The frame is fed at its native size; the encoder's configured
-    /// output size handles the scale. Best-effort: an encode fault yields `None`
-    /// (preview never propagates a failure).
+    /// output size handles the scale. A source's frames change size when its
+    /// decode follows a layout change, and a libav encoder cannot take a frame
+    /// of another size, so that reopens the encoder (which starts on a keyframe).
+    /// Best-effort: an encode fault yields `None` (preview never propagates a
+    /// failure).
     fn encode(&self, image: &Nv12Image) -> Option<EncodedSample> {
         let Ok(mut guard) = self.inner.lock() else {
             return None;
         };
-        if guard.is_none() {
-            *guard = self.open(image);
+        let size = (image.width(), image.height());
+        if guard.as_ref().is_none_or(|(_, opened)| *opened != size) {
+            *guard = self.open(image).map(|encoder| (encoder, size));
         }
-        let encoder = guard.as_mut()?;
+        let (encoder, _) = guard.as_mut()?;
         let video = nv12_to_video(image).ok()?;
         encoder.send_frame(&video).ok()?;
         let packet = encoder.receive_packet().ok()??;

@@ -1241,8 +1241,10 @@ pub fn command_drain_with_audio_and_players(
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    display_layout: crate::display_size::DisplayLayoutSlot,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
         .with_audio_route(audio_route)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
@@ -1313,8 +1315,10 @@ pub fn command_drain_with_seams(
         String,
         std::sync::Arc<crate::player::TransportMailbox>,
     >,
+    display_layout: crate::display_size::DisplayLayoutSlot,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
         .with_subtitle_route(subtitle_route)
         .with_audio_route(audio_route)
         .with_live_overlays(overlays)
@@ -1444,6 +1448,9 @@ pub struct CommandDrain {
     /// commands are surfaced held (warned), never a silent drop.
     player_mailboxes:
         std::collections::HashMap<String, std::sync::Arc<crate::player::TransportMailbox>>,
+    /// Where the live layout is published for the decode threads to follow.
+    /// `None` on runs with no decoders.
+    display_layout: Option<crate::display_size::DisplayLayoutSlot>,
     /// One-shot: the drive's cell-id → index map is established the first tick.
     cell_ids_set: bool,
     /// Test-only spy counting how many times this drain calls `solve_layout`.
@@ -1478,6 +1485,7 @@ impl CommandDrain {
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             audio_free_sources: None,
             player_mailboxes: std::collections::HashMap::new(),
+            display_layout: None,
             cell_ids_set: false,
             #[cfg(test)]
             resolve_spy: None,
@@ -1498,6 +1506,14 @@ impl CommandDrain {
         >,
     ) -> Self {
         self.player_mailboxes = mailboxes;
+        self
+    }
+
+    /// Publish every applied layout change to `slot` for the decode threads.
+    #[cfg(any(feature = "ffmpeg", test))]
+    #[must_use]
+    fn with_display_layout(mut self, slot: crate::display_size::DisplayLayoutSlot) -> Self {
+        self.display_layout = Some(slot);
         self
     }
 
@@ -1607,7 +1623,9 @@ impl CommandDrain {
         // bounded); every other command is applied immediately as before.
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         let mut tile_binding_changed = false;
+        let mut layout_applied = false;
         for command in self.commands.try_drain() {
+            layout_applied |= matches!(&command, Command::ApplyLayout { .. });
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             {
                 tile_binding_changed |= matches!(
@@ -1646,7 +1664,21 @@ impl CommandDrain {
         if tile_binding_changed || applied != 0 {
             self.publish_tile_specs(drive);
         }
+        if layout_applied || applied != 0 {
+            self.publish_display_layout(drive);
+        }
         applied
+    }
+
+    /// Hand the active layout to the decode threads. Only runs after a layout
+    /// or route command: O(cells) plus one wait-free store, and the decoders do
+    /// all the resulting work on their own threads (inv #1/#10).
+    fn publish_display_layout(&self, drive: &CompositorDrive<Nv12Image>) {
+        if let Some(slot) = &self.display_layout {
+            if *slot.load() != *drive.layout() {
+                slot.store(Arc::new(drive.layout().clone()));
+            }
+        }
     }
 
     /// Publish only when the active placements differ from the baker's snapshot.
@@ -2883,6 +2915,134 @@ input_id = "in_b"
     /// The matching canvas for `TWO_CELL_DOC` (64x64 @ 25/1).
     fn matching_canvas() -> serde_json::Value {
         serde_json::json!({ "width": 64, "height": 64, "fps": "25/1" })
+    }
+
+    /// The production fault: a boot layout that binds only some sources, then a
+    /// stored layout applied live. The drain must hand the active layout to the
+    /// decoders, and a decoder bound to a smaller cell must plan an NVDEC reopen
+    /// at the new tile size, while a source the layout drops goes to the small
+    /// unbound size, never the full canvas.
+    #[test]
+    fn applying_a_smaller_layout_makes_the_decoders_reopen_at_the_new_size() {
+        use crate::display_size::{
+            display_size, plan_display_change, DecoderState, DisplayChange, DisplayFollow,
+            DisplayFollower, DISPLAY_SETTLE, UNBOUND_DISPLAY_SIZE,
+        };
+        use multiview_ffmpeg::TileSize;
+
+        let config = test_config();
+        let boot = Arc::new(config.solve_layout().expect("boot layout"));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&boot)));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_display_layout(Arc::clone(&slot));
+        let mut drive = test_drive(&test_config());
+
+        // Both sources decode at their 32x64 boot cells.
+        let boot_size = display_size(&boot, "in_a");
+        assert_eq!(boot_size, (32, 64));
+        let source = TileSize::new(1920, 1080);
+        let opened = DecoderState {
+            source,
+            hardware: true,
+            resize: multiview_ffmpeg::nvdec_resize_target(
+                source,
+                TileSize::new(boot_size.0, boot_size.1),
+                None,
+            ),
+        };
+        let mut follower_a = DisplayFollower::new(
+            DisplayFollow::new(Arc::clone(&slot), None),
+            "in_a",
+            boot_size,
+        );
+        let mut follower_b = DisplayFollower::new(
+            DisplayFollow::new(Arc::clone(&slot), None),
+            "in_b",
+            boot_size,
+        );
+        let t0 = std::time::Instant::now();
+        assert_eq!(follower_a.due(t0), None, "the boot layout needs no change");
+
+        // A stored layout with in_a in a quarter cell and in_b dropped.
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "small", "rect": { "x": 0.0, "y": 0.0, "w": 0.25, "h": 0.25 },
+                  "source": { "input_id": "in_a" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("stored doc");
+        let solved = document.solve_named("small").expect("stored layout");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "small".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("apply layout");
+        let published = slot.load();
+        drain.apply(&mut drive);
+        assert!(
+            !Arc::ptr_eq(&published, &slot.load()),
+            "the drain must publish the applied layout"
+        );
+        assert_eq!(*slot.load(), *drive.layout());
+
+        // Debounced, then due at the new sizes.
+        assert_eq!(follower_a.due(t0), None);
+        let settled = t0 + DISPLAY_SETTLE;
+        let to_a = follower_a.due(settled).expect("in_a must resize");
+        assert_eq!(to_a, (16, 16));
+        assert_eq!(
+            plan_display_change(opened, boot_size, to_a, None),
+            DisplayChange::Reopen {
+                resize: Some(TileSize::new(16, 16))
+            },
+            "a running NVDEC decode must reopen at the new resize target"
+        );
+        let unbound = (
+            UNBOUND_DISPLAY_SIZE.0.min(64) & !1,
+            UNBOUND_DISPLAY_SIZE.1.min(64) & !1,
+        );
+        let _first = follower_b.due(t0);
+        assert_eq!(follower_b.due(settled), Some(unbound));
+
+        // A frame boundary with no layout change publishes nothing.
+        let current = slot.load();
+        drain.apply(&mut drive);
+        assert!(Arc::ptr_eq(&current, &slot.load()));
+    }
+
+    /// A video route moves a source between cells without a layout command;
+    /// the decoders must still see the new binding.
+    #[test]
+    fn a_video_route_republishes_the_active_layout() {
+        let config = test_config();
+        let boot = Arc::new(config.solve_layout().expect("boot layout"));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(boot));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_display_layout(Arc::clone(&slot));
+        let mut drive = test_drive(&test_config());
+        sender
+            .try_submit(Command::SwapSource {
+                op: OperationId::new(),
+                tile: "cell_b".to_owned(),
+                source: "in_a".to_owned(),
+            })
+            .expect("route");
+        drain.apply(&mut drive);
+        assert_eq!(
+            crate::display_size::cell_pixel_size(&slot.load(), "in_b"),
+            None,
+            "in_b is no longer bound anywhere"
+        );
     }
 
     /// A stored NewsOne-like layout replaces the boot tile chrome, not just the

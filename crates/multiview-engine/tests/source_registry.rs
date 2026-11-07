@@ -492,3 +492,24 @@ fn acquire_store_shares_one_store_and_grows_supremum() {
     assert!(!reg.contains(&key));
     reg.shutdown();
 }
+
+#[test]
+fn set_requested_replaces_the_record_in_either_direction() {
+    // A decode following a layout change reports its new size, including a
+    // smaller one, which the acquire-time supremum can never do.
+    let reg = SourceRegistry::<u64>::new();
+    let key = SourceKey::from_canonical("hls://news");
+    let shut = Arc::new(AtomicBool::new(false));
+    let _handle = reg
+        .acquire(key.clone(), size(1920, 1080), init("news", shut, None))
+        .unwrap();
+
+    assert!(reg.set_requested(&key, size(640, 360)));
+    assert_eq!(reg.requested_supremum(&key), Some(size(640, 360)));
+    assert!(reg.set_requested(&key, size(1280, 720)));
+    assert_eq!(reg.requested_supremum(&key), Some(size(1280, 720)));
+
+    let unknown = SourceKey::from_canonical("hls://nobody");
+    assert!(!reg.set_requested(&unknown, size(2, 2)));
+    assert_eq!(reg.requested_supremum(&unknown), None);
+}
