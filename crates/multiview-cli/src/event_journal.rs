@@ -263,6 +263,9 @@ pub fn section_timing(
             timing.uncertainty_ms = Some(anchor.uncertainty_ms);
             Some(utc)
         }
+        // Without a packet time the pre-roll is unknown, so a scheduled splice
+        // has no honest receive-time estimate: leave it blank, never "now".
+        None if pre_roll_ticks.is_none() && !immediate => None,
         None => {
             timing.clock_source = Some(JournalClockSource::ReceiveTime);
             timing.uncertainty_ms = Some(RECEIVE_UNCERTAINTY_MS);
@@ -995,6 +998,14 @@ mod tests {
         assert_eq!(t.clock_source, Some(JournalClockSource::ReceiveTime));
         assert_eq!(t.uncertainty_ms, Some(RECEIVE_UNCERTAINTY_MS));
         assert_eq!(t.start_at, Some(rfc3339_ns(NOW + 2_000_000_000)));
+    }
+
+    #[test]
+    fn a_scheduled_splice_without_a_packet_time_or_clock_stays_unknown() {
+        let t = section_timing(&decoded(), None, NOW, &Clocks::default());
+        assert_eq!(t.class, JournalTimingClass::Scheduled);
+        assert_eq!(t.splice_pts, Some(SPLICE));
+        assert_eq!((t.start_at, t.end_at, t.clock_source), (None, None, None));
     }
 
     #[test]

@@ -796,6 +796,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/events/journal.jsonl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_event_journal_export"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/graphics/channels": {
         parameters: {
             query?: never;
@@ -1167,6 +1183,38 @@ export interface paths {
         put?: never;
         /** `POST /api/v1/inputs/{id}/events/automation/restore` — restore now. */
         post: operations["post_automation_restore"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/inputs/{id}/events/journal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_event_journal"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/inputs/{id}/events/journal.jsonl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_event_journal_dump"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -4370,6 +4418,149 @@ export interface components {
             template: string;
         };
         /**
+         * @description Which clock produced a wall-clock prediction.
+         * @enum {string}
+         */
+        JournalClockSource: "pdt" | "id3_utc" | "receive_time";
+        /**
+         * @description Where a marker was carried.
+         * @enum {string}
+         */
+        JournalOrigin: "scte35" | "id3" | "hls";
+        /** @description One newest-first page. */
+        JournalPage: {
+            /** @description Pass as `cursor` for the next older page; absent on the last page. */
+            next_cursor?: string | null;
+            /** @description Records, newest first. */
+            records: components["schemas"]["JournalRecord"][];
+            /** @description Exact source identity. */
+            source_id: string;
+            /** @description Journal counters; `dropped` above zero means the history has gaps. */
+            stats: components["schemas"]["JournalStats"];
+        };
+        /** @description One raw observation with its full decode. */
+        JournalRecord: {
+            /** @description Whether this is a clock stamp rather than an event. */
+            clock_reference?: boolean;
+            /** @description The full decode. */
+            decoded?: unknown;
+            /** @description Why the payload could not be fully decoded. */
+            error?: string | null;
+            /** @description When the last identical sighting arrived. */
+            last_seen_at?: string | null;
+            /** @description Short name. */
+            name: string;
+            /** @description Carrier. */
+            origin: components["schemas"]["JournalOrigin"];
+            /** @description The raw payload. */
+            raw: string;
+            /** @description `base64` for binary payloads, `text` for HLS tag lines. */
+            raw_encoding: string;
+            /** @description Host receive time, UTC. */
+            received_at: string;
+            /** @description Host receive time, decimal nanoseconds past the Unix epoch. */
+            received_ns: string;
+            /** @description Sortable identity, assigned by the writer; also the page cursor. */
+            record_id?: string;
+            /**
+             * Format: int64
+             * @description Identical sightings after this record.
+             */
+            repeats?: number;
+            /** @description Exact source identity. */
+            source_id: string;
+            /**
+             * Format: int64
+             * @description 90 kHz PTS of the carrying packet. SCTE-35 sections have no PES header,
+             *     so the demuxer reports the last PCR for them.
+             */
+            source_pts?: number | null;
+            /** @description One-line decoded summary. */
+            summary: string;
+            timing?: null | components["schemas"]["JournalTiming"];
+            /** @description Transport context. */
+            transport: components["schemas"]["JournalTransport"];
+        };
+        /** @description Counter snapshot. */
+        JournalStats: {
+            /**
+             * Format: int64
+             * @description Observations dropped because the bounded queue was full.
+             */
+            dropped: number;
+            /**
+             * Format: int64
+             * @description Exact repeats folded into a counter since start.
+             */
+            repeats: number;
+            /**
+             * Format: int64
+             * @description Failed disk writes since start.
+             */
+            write_errors: number;
+            /**
+             * Format: int64
+             * @description Records written since start.
+             */
+            written: number;
+        };
+        /** @description Times derived for one marker. Predictions, never engine state. */
+        JournalTiming: {
+            /** @description Predicted instant the splice reaches this multiview's output, UTC. */
+            airs_at?: string | null;
+            /** @description Predicted instant the break end reaches this multiview's output, UTC. */
+            airs_end_at?: string | null;
+            /** @description How the time was derived. */
+            class: components["schemas"]["JournalTimingClass"];
+            clock_source?: null | components["schemas"]["JournalClockSource"];
+            /**
+             * Format: int64
+             * @description Declared duration.
+             */
+            duration_ms?: number | null;
+            /** @description Predicted break end on the source, UTC. */
+            end_at?: string | null;
+            /**
+             * Format: int64
+             * @description Splice point minus carrying packet time; negative means already past.
+             */
+            pre_roll_ms?: number | null;
+            /**
+             * Format: int64
+             * @description Splice point on the source timeline, 90 kHz, after `pts_adjustment`.
+             */
+            splice_pts?: number | null;
+            /** @description Predicted splice wall-clock on the source, UTC. */
+            start_at?: string | null;
+            /**
+             * Format: int64
+             * @description Estimated uncertainty of that clock.
+             */
+            uncertainty_ms?: number | null;
+        };
+        /**
+         * @description How a marker's time was derived.
+         * @enum {string}
+         */
+        JournalTimingClass: "scheduled" | "immediate" | "none";
+        /** @description Transport context of one observation. */
+        JournalTransport: {
+            /**
+             * Format: int64
+             * @description HLS media sequence of the carrying segment.
+             */
+            media_sequence?: number | null;
+            /**
+             * Format: int32
+             * @description Transport PID.
+             */
+            pid?: number | null;
+            /** @description That segment's `EXT-X-PROGRAM-DATE-TIME`. */
+            program_date_time?: string | null;
+            /** @description Carrying segment URI, without query or credentials. */
+            segment_uri?: string | null;
+        };
+        /**
          * @description `OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).
          *
          *     Serde-equivalent: a unit enum rendered `snake_case`.
@@ -5798,6 +5989,21 @@ export interface components {
              */
             url?: string | null;
         };
+        /** @description The source's embedded wall clock. A clock reference, never an event. */
+        SourceClockDto: {
+            /** @description Which embedded clock this is. */
+            clock_source: components["schemas"]["JournalClockSource"];
+            /** @description Host time of that reading. */
+            observed_at: string;
+            /**
+             * Format: int64
+             * @description Source clock minus host receive time, in milliseconds. Includes the
+             *     stream's delivery delay, so a live source reads negative.
+             */
+            offset_ms: number;
+            /** @description Latest decoded source UTC time. */
+            utc: string;
+        };
         /**
          * @description Availability of the latched presentation clock, not ingest health.
          * @enum {string}
@@ -5875,6 +6081,9 @@ export interface components {
             epoch: string;
             /** @description Bounded structured event history; an empty list is valid. */
             events: components["schemas"]["SourceEventDto"][];
+            /** @description Newest decoded markers first, with predicted times. */
+            markers?: components["schemas"]["SourceMarkerDto"][] | null;
+            source_clock?: null | components["schemas"]["SourceClockDto"];
             /** @description Exact source identity requested by the caller. */
             source_id: string;
         };
@@ -6015,6 +6224,41 @@ export interface components {
             sdp: string;
             /** @description Optional SAP session id or NMOS sender id for dynamic discovery. */
             session_id?: string | null;
+        };
+        /**
+         * @description One decoded marker with predicted times. Display evidence only: lifecycle
+         *     and automation stay on [`SourceEventDto`].
+         */
+        SourceMarkerDto: {
+            /** @description Predicted instant the splice reaches this multiview's output, UTC. */
+            airs_at?: string | null;
+            /** @description Predicted instant the break end reaches this multiview's output, UTC. */
+            airs_end_at?: string | null;
+            clock_source?: null | components["schemas"]["JournalClockSource"];
+            /**
+             * Format: int64
+             * @description Declared duration.
+             */
+            duration_ms?: number | null;
+            /** @description Predicted break end on the source, UTC. */
+            end_at?: string | null;
+            /** @description `splice_event_id` or `segmentation_event_id`. */
+            event_id?: string | null;
+            /** @description Short name. */
+            name: string;
+            /** @description Host receive time. */
+            received_at: string;
+            /** @description Journal record holding the full decode. */
+            record_id: string;
+            /** @description Predicted splice wall-clock on the source, UTC. */
+            start_at?: string | null;
+            /**
+             * Format: int64
+             * @description Estimated uncertainty of that clock.
+             */
+            uncertainty_ms?: number | null;
+            /** @description Decoded UPID with its type name. */
+            upid?: string | null;
         };
         /** @description `OpenAPI` mirror of [`multiview_config::SourceRecall`]. */
         SourceRecallDoc: {
@@ -8741,6 +8985,73 @@ export interface operations {
             };
         };
     };
+    get_event_journal_export: {
+        parameters: {
+            query?: {
+                /** @description Earliest receive time, RFC 3339. */
+                from?: string;
+                /** @description Latest receive time, RFC 3339. */
+                to?: string;
+                /** @description `scte35`, `id3` or `hls`. */
+                origin?: string;
+                /** @description Page size, at most 500. */
+                limit?: number;
+                /** @description `next_cursor` of the previous page. */
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Streamed JSONL of every source (unscoped administrators only). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            /** @description Invalid filter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Requires an unscoped administrator */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Journal unavailable or busy */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
     list_channels: {
         parameters: {
             query?: never;
@@ -9866,6 +10177,164 @@ export interface operations {
                 };
             };
             /** @description Executor unavailable or command bus busy */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_event_journal: {
+        parameters: {
+            query?: {
+                /** @description Earliest receive time, RFC 3339. */
+                from?: string;
+                /** @description Latest receive time, RFC 3339. */
+                to?: string;
+                /** @description `scte35`, `id3` or `hls`. */
+                origin?: string;
+                /** @description Page size, at most 500. */
+                limit?: number;
+                /** @description `next_cursor` of the previous page. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Exact source identity */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One newest-first page of raw marker observations. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JournalPage"];
+                };
+            };
+            /** @description Invalid filter or cursor */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source outside principal scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Journal unavailable or busy */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_event_journal_dump: {
+        parameters: {
+            query?: {
+                /** @description Earliest receive time, RFC 3339. */
+                from?: string;
+                /** @description Latest receive time, RFC 3339. */
+                to?: string;
+                /** @description `scte35`, `id3` or `hls`. */
+                origin?: string;
+                /** @description Page size, at most 500. */
+                limit?: number;
+                /** @description `next_cursor` of the previous page. */
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Exact source identity */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Streamed JSONL, oldest first; `repeat` lines fold into the record they name. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            /** @description Invalid filter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source outside principal scope */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Journal unavailable or busy */
             503: {
                 headers: {
                     [name: string]: unknown;

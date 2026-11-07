@@ -736,7 +736,7 @@ fn parse_segmentation(body: &[u8]) -> Option<Segmentation> {
     out.segments_expected = Some(bits.u8(8)?);
     // Sub-segment fields exist only for these types, and are optional there
     // because older encoders omit them.
-    if matches!(type_id, 0x34 | 0x36 | 0x38 | 0x3A) {
+    if matches!(type_id, 0x30 | 0x32 | 0x34 | 0x36 | 0x38 | 0x3A | 0x44 | 0x46) {
         out.sub_segment_num = bits.u8(8);
         out.sub_segments_expected = bits.u8(8);
     }
