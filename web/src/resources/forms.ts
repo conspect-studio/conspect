@@ -67,7 +67,8 @@ export type FormErrorCode =
   | 'time-of-day'
   | 'date-time'
   | 'members-required'
-  | 'duplicate-member';
+  | 'duplicate-member'
+  | 'header-invalid';
 
 /** Per-field validation errors keyed by form-state field name. */
 export type FieldErrors<Field extends string> = Partial<Record<Field, FormErrorCode>>;
@@ -471,6 +472,12 @@ export interface SourceFormState {
   readonly metaLogo: string;
   /** `playlist_metadata.group`. */
   readonly metaGroup: string;
+  /** HLS `user_agent` request header ('' = omit; HLS only, iptv-org ADR-M015). */
+  readonly userAgent: string;
+  /** HLS `referrer` request header ('' = omit; HLS only). */
+  readonly referrer: string;
+  /** Catalogue provenance (`origin`, any kind); `undefined` = not linked. */
+  readonly origin: SourceOrigin | undefined;
   /** Unmanaged body fields preserved verbatim across an edit. */
   readonly extra: Readonly<Record<string, unknown>>;
 }
@@ -480,6 +487,46 @@ export type EpgModeChoice = 'automatic' | 'manual' | 'disabled';
 
 /** The `epg.mode` choices offered in the UI, in display order. */
 export const EPG_MODES: readonly EpgModeChoice[] = ['automatic', 'manual', 'disabled'];
+/** How a linked source follows upstream catalogue changes (§2.4). */
+export type OriginFollow = 'manual' | 'notify' | 'auto';
+
+/** All follow modes, for building selectors. */
+export const ORIGIN_FOLLOWS: readonly OriginFollow[] = ['manual', 'notify', 'auto'];
+
+/** The `origin` provenance block on a source body (docs/io/iptv-org.md §2.3). */
+export interface SourceOrigin {
+  readonly provider: string;
+  readonly channel?: string;
+  readonly feed?: string;
+  readonly stream_url: string;
+  readonly labels: readonly string[];
+  readonly linked_at: string;
+  readonly follow: OriginFollow;
+}
+
+/** Parse an opaque `origin` value; `undefined` when absent or malformed. */
+export function parseSourceOrigin(value: unknown): SourceOrigin | undefined {
+  const o = asRecord(value);
+  const provider = asString(o?.provider);
+  const streamUrl = asString(o?.stream_url);
+  if (o === undefined || provider === undefined || streamUrl === undefined) {
+    return undefined;
+  }
+  const channel = asString(o.channel);
+  const feed = asString(o.feed);
+  const follow = ORIGIN_FOLLOWS.find((f) => f === asString(o.follow)) ?? 'notify';
+  return {
+    provider,
+    ...(channel !== undefined ? { channel } : {}),
+    ...(feed !== undefined ? { feed } : {}),
+    stream_url: streamUrl,
+    labels: Array.isArray(o.labels)
+      ? o.labels.filter((l): l is string => typeof l === 'string')
+      : [],
+    linked_at: asString(o.linked_at) ?? '',
+    follow,
+  };
+}
 
 /** The source-form fields that can carry a validation error. */
 export type SourceField =
@@ -502,7 +549,9 @@ export type SourceField =
   | 'epgUrl'
   | 'epgChannelId'
   | 'metaName'
-  | 'metaLogo';
+  | 'metaLogo'
+  | 'userAgent'
+  | 'referrer';
 
 /** Default fill colour for a fresh `solid` source. */
 export const SOLID_DEFAULT_COLOR = '#101014';
@@ -561,6 +610,9 @@ export function emptySourceForm(): SourceFormState {
     metaName: '',
     metaLogo: '',
     metaGroup: '',
+    userAgent: '',
+    referrer: '',
+    origin: undefined,
     extra: {},
   };
 }
@@ -605,6 +657,10 @@ const SOURCE_MANAGED_KEYS: readonly string[] = [
   // media identity.
   'epg',
   'playlist_metadata',
+  // HLS request headers + catalogue provenance (iptv-org, ADR-M015).
+  'user_agent',
+  'referrer',
+  'origin',
 ];
 
 /** Whether a source kind's locator is its `url`. */
@@ -734,6 +790,14 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
     // `rist` options block (when present in the stored body) round-trips through
     // `form.extra` until a dedicated options sub-form lands (ADR-0095).
     case 'hls':
+      body.url = form.url.trim();
+      if (form.userAgent.trim() !== '') {
+        body.user_agent = form.userAgent.trim();
+      }
+      if (form.referrer.trim() !== '') {
+        body.referrer = form.referrer.trim();
+      }
+      break;
     case 'youtube':
     case 'ts':
     case 'srt':
@@ -762,6 +826,17 @@ export function sourceFormToBody(form: SourceFormState): Record<string, unknown>
       }
       break;
     }
+  }
+  if (form.origin !== undefined) {
+    body.origin = {
+      provider: form.origin.provider,
+      ...(form.origin.channel !== undefined ? { channel: form.origin.channel } : {}),
+      ...(form.origin.feed !== undefined ? { feed: form.origin.feed } : {}),
+      stream_url: form.origin.stream_url,
+      labels: [...form.origin.labels],
+      linked_at: form.origin.linked_at,
+      follow: form.origin.follow,
+    };
   }
   if (form.authSecretRef.trim() !== '') {
     body.auth = { secret_ref: form.authSecretRef.trim() };
@@ -990,8 +1065,17 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
     metaName: asString(playlistMetadata?.name) ?? '',
     metaLogo: asString(playlistMetadata?.logo) ?? '',
     metaGroup: asString(playlistMetadata?.group) ?? '',
+    userAgent: kind === 'hls' ? (asString(body.user_agent) ?? '') : '',
+    referrer: kind === 'hls' ? (asString(body.referrer) ?? '') : '',
+    origin: parseSourceOrigin(body.origin),
     extra: extraOf(body, SOURCE_MANAGED_KEYS),
   };
+}
+
+/** A header value: printable, no CR/LF, ≤ 1 KiB (docs/io/iptv-org.md §2.3). */
+export function isValidHeaderValue(value: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return value.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 /** Validate a source form, returning per-field machine codes. */
@@ -1154,6 +1238,13 @@ export function validateSourceForm(
   }
   if (form.metaLogo.trim() !== '' && !isValidUrl(form.metaLogo, ['http', 'https'])) {
     errors.metaLogo = 'scheme-http';
+  if (form.kind === 'hls') {
+    if (!isValidHeaderValue(form.userAgent)) {
+      errors.userAgent = 'header-invalid';
+    }
+    if (!isValidHeaderValue(form.referrer)) {
+      errors.referrer = 'header-invalid';
+    }
   }
   return errors;
 }
