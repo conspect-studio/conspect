@@ -31,6 +31,11 @@ use std::time::Duration;
 use multiview_output::push_link::Backoff;
 use multiview_srt_sys::{parse_listener_url, ListenerSpec, SrtError, SrtListener, SrtSocket};
 
+/// Readers one bridge serves at once: the video and audio rails, plus one
+/// overlapping reconnect each. A further [`SrtIngestBridge::open_reader`] fails.
+pub const MAX_READERS: usize = 4;
+/// Per-reader backlog bound in bytes, beyond what the socket buffer holds.
+const READER_BACKLOG_BYTES: usize = 2 * 1024 * 1024;
 /// libsrt handshakes queued while a caller is being served.
 const LISTEN_BACKLOG: u16 = 1;
 /// Largest SRT message read in one call.
@@ -53,9 +58,12 @@ impl Reader {
     /// Queue `message` behind any backlog and write as much as the socket
     /// takes, never blocking. `false` when the reader has hung up.
     fn push(&mut self, message: &[u8], dropped: &AtomicU64) -> bool {
-        let _ = dropped;
-        self.backlog_bytes += message.len();
-        self.backlog.push_back(message.to_vec());
+        if self.backlog_bytes.saturating_add(message.len()) > READER_BACKLOG_BYTES {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.backlog_bytes += message.len();
+            self.backlog.push_back(message.to_vec());
+        }
         while let Some(front) = self.backlog.front_mut() {
             match self.tx.write(front) {
                 Ok(n) if n == front.len() => {
@@ -133,9 +141,13 @@ impl SrtIngestBridge {
     /// A new private reader of this listener's caller stream.
     ///
     /// # Errors
-    /// A reason string when the socketpair cannot be created.
+    /// A reason string when [`MAX_READERS`] readers are already open or the
+    /// socketpair cannot be created.
     pub fn open_reader(&self) -> Result<SrtReader, String> {
         let mut readers = lock(&self.readers);
+        if readers.list.len() >= MAX_READERS {
+            return Err(format!("srt input: all {MAX_READERS} reader slots in use"));
+        }
         let (tx, rx) = UnixStream::pair().map_err(|e| format!("srt input socketpair: {e}"))?;
         // Both ends non-blocking: the relay never waits on a reader, and libav
         // bounds an empty read with `rw_timeout` and its interrupt callback.
@@ -326,7 +338,7 @@ fn relay(socket: &SrtSocket, readers: &SharedReaders, dropped: &AtomicU64, stop:
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{acquire, start_with, Spawn};
+    use super::{acquire, lock, start_with, Spawn, MAX_READERS, READER_BACKLOG_BYTES};
     use multiview_srt_sys::parse_listener_url;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
@@ -464,6 +476,35 @@ mod tests {
         assert!(video.open_reader().unwrap().url().starts_with("pipe:"));
         let err = acquire("srt://[::1]:29872?mode=listener&fec=hunter2").unwrap_err();
         assert!(err.contains("fec") && !err.contains("hunter2"), "{err}");
+    }
+
+    /// SRT-02: a bridge serves at most `MAX_READERS` readers (no thread per
+    /// reader), a dropped reader frees its slot, and a reader that never reads
+    /// holds a bounded backlog instead of growing.
+    #[test]
+    fn readers_are_capped_and_an_idle_reader_stays_bounded() {
+        let bridge = acquire("srt://[::1]:29875?mode=listener").unwrap();
+        let mut held: Vec<_> = (0..MAX_READERS)
+            .map(|_| bridge.open_reader().unwrap())
+            .collect();
+        let refused = bridge.open_reader().unwrap_err();
+        assert!(refused.contains("reader slots"), "{refused}");
+        held.pop();
+        let again = bridge.open_reader().unwrap();
+        let message = [0x47_u8; 1316];
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        {
+            let mut readers = lock(&bridge.readers);
+            let reader = readers.list.iter_mut().last().unwrap();
+            // Nobody reads `again`: ~10 MB offered, far past socket + backlog.
+            for _ in 0..8_000 {
+                assert!(reader.push(&message, &dropped));
+            }
+            assert!(reader.backlog_bytes <= READER_BACKLOG_BYTES);
+        }
+        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        drop(again);
+        assert_eq!(lock(&bridge.readers).list.len(), MAX_READERS - 1);
     }
 
     /// A real caller over each family reaches a real in-process libav reader
