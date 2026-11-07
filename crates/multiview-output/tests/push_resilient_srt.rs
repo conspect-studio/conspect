@@ -42,6 +42,45 @@ fn port() -> u16 {
     base + NEXT_PORT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// How many of THIS PROCESS's live OS threads have `name` as their `comm`
+/// (review SRT-05 / round 2: `link.clients() == 0` alone proves only that
+/// `writer_main` called `client_detached`, NOT that its Muxer — and the
+/// `SrtSocket` its writer closure owns — actually dropped; `client_detached`
+/// runs, then the function returns and ONLY THEN does the `muxer` local drop.
+/// A straggler writer thread still mid-trailer-flush, or wedged past its
+/// deadline waiting to be detected, would ALSO show `clients() == 0` while
+/// still running and still holding its Muxer/socket open. Linux truncates
+/// `pthread_setname_np`/`comm` to 15 bytes, so this must match the
+/// crate's own writer-thread name truncated the same way).
+///
+/// SRT accepted connections share the LISTENER's one OS-level UDP socket
+/// (`srt_accept` returns a new libsrt-internal socket id, not a new file
+/// descriptor — confirmed by observation: this process's `/proc/self/fd`
+/// count is IDENTICAL whether a caller is attached or not), so counting
+/// file descriptors cannot distinguish "the writer's Muxer/SrtSocket
+/// dropped" from "the listener is still up"; the writer thread's own
+/// liveness is the correct, OS-visible signal for "is this specific
+/// writer's Muxer/socket, which the thread owns on its stack, still here".
+fn live_threads_named(name: &str) -> usize {
+    let mut n = 0;
+    for entry in std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task")
+        .flatten()
+    {
+        if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
+            if comm.trim() == name {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The exact name [`crate`]'s push writer thread is spawned with
+/// (`sink/push.rs`'s `start_session`), truncated to Linux's 15-byte `comm`
+/// limit — `"multiview-push-writer"` becomes `"multiview-push-"`.
+const WRITER_THREAD_COMM: &str = "multiview-push-";
+
 /// A live packet source: encodes a frame per tick until `stop`.
 struct LiveSource {
     encoder: VideoEncoder,
@@ -423,12 +462,32 @@ fn teardown_is_bounded_with_a_frozen_caller_attached() {
     );
 }
 
-/// SRT-05: teardown with a slow-but-alive caller (it reads at a crawl, so
-/// sends keep succeeding) is bounded, and the writer really RELEASES its
-/// session inside that bound instead of being detached still sending.
+/// SRT-05 / round 2: teardown with a slow-but-alive caller (it reads at a
+/// crawl, so sends keep succeeding) is bounded, and the writer really
+/// RELEASES its session — its OS thread, and the Muxer/`SrtSocket` that
+/// thread owns on its stack, actually terminate — inside that bound,
+/// instead of a straggler merely being detached from the link-status
+/// counter while its thread (and socket) is still running.
+///
+/// Round-2 review finding: the prior version of this test asserted only
+/// `link.clients() == 0`. That counter is decremented by `client_detached`,
+/// which `writer_main` calls unconditionally right before it RETURNS — a
+/// straggler writer thread that is slow to actually finish (still flushing
+/// its trailer, or blocked past its own deadline inside a libsrt call)
+/// would show the SAME `clients() == 0` while its thread, and the Muxer
+/// (and the `SrtSocket`/libsrt socket its writer closure owns) it is still
+/// running on, have not actually gone away. Counting this process's own
+/// `multiview-push-writer` OS threads closes that gap: unlike SRT's shared
+/// per-listener UDP file descriptor (confirmed by observation to be
+/// identical with or without an attached caller, so fd-counting cannot see
+/// a per-connection release here), the writer's own thread is a real,
+/// directly observable OS resource that can only disappear once the thread
+/// function has actually returned — which is exactly when its `Muxer`
+/// local (and the `SrtSocket` inside it) has dropped.
 #[test]
 fn teardown_is_bounded_and_releases_a_slow_caller() {
     let port = port();
+    let threads_before = live_threads_named(WRITER_THREAD_COMM);
     // Unpaced: the producer runs far faster than the caller reads.
     let run = start(format!("srt://[::]:{port}?mode=listener"), true, None);
     wait_for("listening", Duration::from_secs(5), || {
@@ -452,11 +511,24 @@ fn teardown_is_bounded_and_releases_a_slow_caller() {
         run.link.clients() == 1
     });
     std::thread::sleep(Duration::from_secs(1));
+    // The attached caller's session really runs on its own OS thread.
+    let threads_connected = live_threads_named(WRITER_THREAD_COMM);
+    assert!(
+        threads_connected > threads_before,
+        "the attached caller must have a live writer thread: \
+         before={threads_before} connected={threads_connected}"
+    );
     let started = Instant::now();
     run.stop.store(true, Ordering::Release);
     run.handle.join().unwrap();
     let elapsed = started.elapsed();
     let clients = run.link.clients();
+    // Measured BEFORE killing the caller process: the caller is still alive
+    // and connected from ITS side, so the writer thread could only have
+    // actually exited because teardown really released it (ran its
+    // best-effort trailer under its bound, then returned, dropping its
+    // Muxer/socket) — not because the peer went away.
+    let threads_after_teardown = live_threads_named(WRITER_THREAD_COMM);
     child.kill().expect("kill caller");
     child.wait().expect("reap caller");
     assert!(
@@ -464,4 +536,11 @@ fn teardown_is_bounded_and_releases_a_slow_caller() {
         "teardown took {elapsed:?}"
     );
     assert_eq!(clients, 0, "a writer was detached instead of released");
+    assert_eq!(
+        threads_after_teardown, threads_before,
+        "the writer's OS thread (and the Muxer/SrtSocket it owns) is still \
+         running after teardown returned: before={threads_before} \
+         connected={threads_connected} after={threads_after_teardown} \
+         (clients()==0 alone does not prove the Muxer/SrtSocket dropped)"
+    );
 }
