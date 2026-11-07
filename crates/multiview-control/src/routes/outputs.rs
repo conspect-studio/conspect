@@ -337,7 +337,8 @@ pub(crate) async fn get_output_link(
     let versioned = accepted_output(&state, &id)?;
     let snapshot = state.engine.state.latest().ok_or_else(not_found)?;
     let runtime_id = runtime_output_id(&versioned.resource.body, &id);
-    let link = output_link_from_snapshot(&snapshot, &runtime_id).ok_or_else(not_found)?;
+    let mut link = output_link_from_snapshot(&snapshot, &runtime_id).ok_or_else(not_found)?;
+    redact_link_for_read(&mut link);
     Ok((StatusCode::OK, Json(link)).into_response())
 }
 
@@ -346,6 +347,29 @@ pub(crate) async fn get_output_link(
 fn runtime_output_id(body: &serde_json::Value, resource_id: &str) -> String {
     serde_json::from_value::<multiview_config::Output>(body.clone())
         .map_or_else(|_| resource_id.to_owned(), |output| output.id())
+}
+
+/// Defence in depth for a read-role response (review SRT-03): whatever the
+/// pipeline published, `url` and every URL-shaped `peers` entry leave here in
+/// the shared display-safe form, so no stream key, passphrase, stream id or
+/// RIST secret reaches a viewer. Idempotent on already-redacted values.
+fn redact_link_for_read(link: &mut serde_json::Value) {
+    use multiview_core::redact::{redact_peer, redact_transport_url};
+    if let Some(url) = link.get_mut("url") {
+        *url = url
+            .as_str()
+            .map_or(serde_json::Value::Null, |u| redact_transport_url(u).into());
+    }
+    if let Some(peers) = link
+        .get_mut("peers")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for peer in peers.iter_mut() {
+            *peer = peer
+                .as_str()
+                .map_or(serde_json::Value::Null, |p| redact_peer(p).into());
+        }
+    }
 }
 
 /// `outputs.<id>.link` from the conflated snapshot, if present.

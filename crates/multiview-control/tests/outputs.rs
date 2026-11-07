@@ -451,4 +451,71 @@ mod output_link {
         let resp = send(&h.router, get("/api/v1/outputs/ghost/link", VIEWER_TOKEN)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    /// SRT-03: a read-role user never sees a stream key, passphrase, stream id,
+    /// RIST secret or userinfo in `url` or `peers`, for every push transport,
+    /// even if the published snapshot carried the raw form.
+    #[tokio::test]
+    async fn a_read_role_user_never_sees_a_push_secret() {
+        for (kind, raw, safe) in [
+            (
+                "rtmp",
+                "rtmp://live.example/sk_live_SECRET1",
+                "rtmp://live.example/***",
+            ),
+            (
+                "rtmp",
+                "rtmp://live.example/sk_live_SECRET1/",
+                "rtmp://live.example/***",
+            ),
+            (
+                "rtmp",
+                "rtmps://u:SECRET1@live.example:443/app/SECRET2?x=SECRET3",
+                "rtmps://live.example:443/app/***",
+            ),
+            (
+                "srt",
+                "srt://[2001:db8::1]:9000?mode=caller&passphrase=SECRET1&streamid=SECRET2",
+                "srt://[2001:db8::1]:9000",
+            ),
+            (
+                "rist",
+                "rist://u:SECRET1@[2001:db8::1]:8000/SECRET2?secret=SECRET3",
+                "rist://[2001:db8::1]:8000",
+            ),
+        ] {
+            let h = harness();
+            let body = json!({
+                "id": "push-out", "name": "Push",
+                "body": { "kind": kind, "id": "push-out", "url": safe, "codec": "h264" }
+            });
+            let created = send(
+                &h.router,
+                post_json("/api/v1/outputs/push-out", OPERATOR_TOKEN, &body),
+            )
+            .await;
+            assert!(
+                created.status().is_success(),
+                "{kind}: {}",
+                created.status()
+            );
+            h.engine
+                .publish_state(json!({ "v": 1, "outputs": { "push-out": { "link": {
+                    "state": "connected", "mode": "caller", "transport": kind,
+                    "url": raw, "clients": 1, "sessions": 1, "dropped": 0, "written": 0,
+                    "peers": [raw, "[::1]:5000"]
+                }}}}));
+            let resp = send(
+                &h.router,
+                get("/api/v1/outputs/push-out/link", VIEWER_TOKEN),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = body_json(resp).await;
+            let text = got.to_string();
+            assert!(!text.contains("SECRET"), "{raw} leaked: {text}");
+            assert_eq!(got["url"], safe, "{raw}");
+            assert_eq!(got["peers"], json!([safe, "[::1]:5000"]), "{raw}");
+        }
+    }
 }

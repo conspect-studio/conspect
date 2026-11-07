@@ -267,27 +267,13 @@ impl PushLinkStatus {
     }
 }
 
-/// A display-safe form of a push URL: no query (passphrase, stream id), no
-/// userinfo, and for RTMP no stream key (the final path segment).
+/// A display-safe form of a push URL (see
+/// [`multiview_core::redact::redact_transport_url`]): no query (passphrase,
+/// stream id), no userinfo, no non-RTMP path, and for RTMP no stream key (the
+/// final path segment, even when it is the only one).
 #[must_use]
 pub fn redact_target(url: &str) -> String {
-    let base = url.split(['?', '#']).next().unwrap_or(url);
-    let Some((scheme, rest)) = base.split_once("://") else {
-        return "***".to_owned();
-    };
-    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if !scheme.starts_with("rtmp") || path.is_empty() {
-        return if path.is_empty() {
-            format!("{scheme}://{host}")
-        } else {
-            format!("{scheme}://{host}/{path}")
-        };
-    }
-    match path.rsplit_once('/') {
-        Some((app, _key)) => format!("{scheme}://{host}/{app}/***"),
-        None => format!("{scheme}://{host}/{path}"),
-    }
+    multiview_core::redact::redact_transport_url(url)
 }
 
 /// Exponential reconnect back-off: `min` doubling to `max`, ±20 % jitter.
@@ -377,6 +363,19 @@ mod tests {
                 "rist://[2001:db8::1]:8000",
             ),
             ("not a url with secret", "***"),
+            // SRT-03: a single-segment RTMP path IS the stream key.
+            ("rtmp://live.example/sk_secret", "rtmp://live.example/***"),
+            ("rtmp://live.example/sk_secret/", "rtmp://live.example/***"),
+            (
+                "rtmp://live.example/app/sk_secret//",
+                "rtmp://live.example/app/***",
+            ),
+            // Non-RTMP paths carry no meaning for the link view; never shown.
+            (
+                "rist://[2001:db8::1]:8000/sk_secret",
+                "rist://[2001:db8::1]:8000",
+            ),
+            ("srt://[::1]:9000/sk_secret?streamid=x", "srt://[::1]:9000"),
         ] {
             assert_eq!(redact_target(url), want);
         }
