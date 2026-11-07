@@ -5,8 +5,10 @@
 //! The read counts are measured here, against a **fixture** `/proc` in a tempdir,
 //! never the host's.
 //!
-//! Run it with `cargo run -p multiview-webengine --example sweep_cost`; pass
-//! `--why-no-allocator` for why the heap figure is not measured here.
+//! Run it with `cargo run -p multiview-webengine --example sweep_cost`; pass a
+//! number to report `N` sweeps over the same process (so an external profiler
+//! has a measurable region), and `--why-no-allocator` for why the heap figure is
+//! not measured here.
 //!
 //! Two shapes are measured, mirroring the efficiency test:
 //!
@@ -25,7 +27,7 @@ use std::cell::Cell;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use multiview_webengine::{sample_process_tree, Error, FsRoot, Pid, Result};
+use multiview_webengine::{sample_process_tree, Error, ExpectedRoot, FsRoot, Pid, Result};
 
 /// The size of the tree measured: root `1` plus `2..=SIZE`.
 const SIZE: u32 = 200;
@@ -134,23 +136,34 @@ fn stat_line(pid: u32, parent: u32) -> String {
     format!("{pid} (chrome) {}\n", fields.join(" "))
 }
 
-/// Measure one sweep over a freshly written `with_strands` tree.
-fn measure(label: &str, with_strands: bool) -> Result<String> {
+/// Measure `sweeps` sweeps over a freshly written `with_strands` tree.
+///
+/// The read counts are the **totals** across all `sweeps`, so a caller compares
+/// `N = 1` against `N = 11` (or runs the whole example under an external
+/// profiler and subtracts) rather than re-reading a per-sweep average.
+fn measure(label: &str, with_strands: bool, sweeps: u64) -> Result<String> {
     let dir = tempfile::tempdir().map_err(|source| Error::io("tempdir", source))?;
     write_tree(dir.path(), with_strands)?;
     let root = CountingRoot::new(dir.path());
+    let expected = ExpectedRoot::read(dir.path(), Pid::new(1))
+        .ok_or_else(|| Error::missing("proc/1/stat: the fixture root has no readable starttime"))?;
 
-    let Some(sample) = sample_process_tree(&root, Pid::new(1), None)?.into_sample() else {
-        return Err(Error::missing(
-            "proc/1/stat: the fixture root vanished mid-sweep",
-        ));
-    };
+    let mut descendants = 0;
+    for _ in 0..sweeps {
+        let Some(sample) =
+            sample_process_tree(&root, Pid::new(1), Some(&expected), None)?.into_sample()
+        else {
+            return Err(Error::missing(
+                "proc/1/stat: the fixture root vanished mid-sweep",
+            ));
+        };
+        descendants = sample.process_count();
+    }
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{label}: {} descendants | {} stat reads, {} children reads, {} total file reads",
-        sample.process_count(),
+        "{label}: {descendants} descendants | {sweeps} sweep(s) | {} stat reads, {} children reads, {} total file reads",
         root.stat_reads.get(),
         root.children_reads.get(),
         root.total_reads.get(),
@@ -172,7 +185,19 @@ level would have to be relaxed at the Cargo manifest level, which changes the \
 whole crate's lint contract for every target to serve one measurement.
 
 A global allocator also cannot see zero-sized allocations, so it would have been \
-a lower bound by construction. The read counts below are exact.";
+a lower bound by construction.
+
+A **total** heap-allocation count therefore needs an external tool — `valgrind \
+--tool=massif` or `heaptrack` — on a host where one is installed:
+
+    valgrind --tool=massif ./target/debug/examples/sweep_cost 1
+    valgrind --tool=massif ./target/debug/examples/sweep_cost 11
+
+The difference between the two reports is the cost of ten sweeps. The retained \
+per-sweep state is separately asserted (len and allocation footprint must not \
+grow between sweep 2 and sweep 50) by \
+`tests/usage.rs::the_per_sweep_collections_do_not_grow_over_fifty_sweeps`. The \
+read counts below are exact.";
 
 fn main() -> Result<()> {
     if std::env::args().any(|arg| arg == "--why-no-allocator") {
@@ -180,7 +205,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    print!("{}", measure("bare    (ppid scan)", false)?);
-    print!("{}", measure("strands (no scan) ", true)?);
+    let sweeps: u64 = std::env::args()
+        .skip(1)
+        .find_map(|arg| arg.parse::<u64>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(1);
+
+    print!("{}", measure("bare    (ppid scan)", false, sweeps)?);
+    print!("{}", measure("strands (no scan) ", true, sweeps)?);
     Ok(())
 }

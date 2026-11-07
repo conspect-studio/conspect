@@ -101,6 +101,20 @@ pub enum ScopeKind {
     ProcessTree {
         /// The root pid the tree is discovered from.
         root: Pid,
+        /// The root's `starttime` (field 22 of `/proc/<pid>/stat`) **at
+        /// registration**, read by the caller right after spawning the process.
+        ///
+        /// A pid alone does not identify a process: the kernel recycles pids, so
+        /// a browser that died between registration and the first sample could
+        /// have its pid, its whole tree and its CPU charged to this scope. The
+        /// sampler compares this value on **every** sample, the first included,
+        /// and reports [`RootGone`](crate::TreeSample::RootGone) on a mismatch.
+        ///
+        /// `0` means the caller could not read the field; the check then degrades
+        /// to the pid alone, which is weaker but not wrong-by-construction.
+        /// [`ExpectedRoot::read`](crate::process_tree::ExpectedRoot::read) is the
+        /// way to obtain a value that is never silently `0`.
+        root_starttime: u64,
     },
     /// A named browser pool (ADR-0099 decision 11): several sources share one
     /// browser, so the pool is accounted for **through its backing**, and each
@@ -156,9 +170,45 @@ impl ScopeKind {
     /// estimate, including the pool total.
     #[must_use]
     pub fn estimated_pool(id: impl Into<String>, root: Pid) -> Self {
+        Self::estimated_pool_at(id, root, 0)
+    }
+
+    /// The same as [`estimated_pool`](Self::estimated_pool), carrying the root's
+    /// registration-time `starttime` so the backing walk has a real identity to
+    /// compare against.
+    #[must_use]
+    pub fn estimated_pool_at(id: impl Into<String>, root: Pid, root_starttime: u64) -> Self {
         Self::Pool {
             id: id.into(),
-            backing: Box::new(Self::ProcessTree { root }),
+            backing: Box::new(Self::ProcessTree {
+                root,
+                root_starttime,
+            }),
+        }
+    }
+
+    /// The root pid of a process-tree-backed scope, if that is what this is.
+    ///
+    /// `None` for a cgroup, and for a pool whose backing is a cgroup. A nested
+    /// pool of a pool still resolves, because the backing chain is followed.
+    #[must_use]
+    pub fn process_tree_root(&self) -> Option<Pid> {
+        match self {
+            Self::Cgroup(_) => None,
+            Self::ProcessTree { root, .. } => Some(*root),
+            Self::Pool { backing, .. } => backing.process_tree_root(),
+        }
+    }
+
+    /// The registration-time `starttime` of a process-tree-backed scope, if that
+    /// is what this is. See [`ProcessTree`](Self::ProcessTree)'s field doc for
+    /// what a `0` means.
+    #[must_use]
+    pub fn process_tree_root_starttime(&self) -> Option<u64> {
+        match self {
+            Self::Cgroup(_) => None,
+            Self::ProcessTree { root_starttime, .. } => Some(*root_starttime),
+            Self::Pool { backing, .. } => backing.process_tree_root_starttime(),
         }
     }
 }
@@ -429,7 +479,10 @@ mod tests {
             .register(ResourceScope::new(
                 owner("b"),
                 Generation::new(0),
-                ScopeKind::ProcessTree { root: Pid::new(10) },
+                ScopeKind::ProcessTree {
+                    root: Pid::new(10),
+                    root_starttime: 4_242,
+                },
             ))
             .expect("registered");
         registry

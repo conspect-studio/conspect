@@ -49,6 +49,7 @@ fn a_registry_snapshots_every_owner_with_its_kind() {
             vt2,
             ScopeKind::ProcessTree {
                 root: Pid::new(4242),
+                root_starttime: 9_001,
             },
         ))
         .expect("registered");
@@ -65,7 +66,8 @@ fn a_registry_snapshots_every_owner_with_its_kind() {
     assert_eq!(
         second.kind,
         ScopeKind::ProcessTree {
-            root: Pid::new(4242)
+            root: Pid::new(4242),
+            root_starttime: 9_001,
         }
     );
 }

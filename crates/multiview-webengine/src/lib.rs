@@ -51,9 +51,9 @@ pub mod scope;
 pub mod usage;
 
 pub use cgroup::{
-    delegation_status, parse_cpu_stat, plan_leaf_move, plan_with_rollback, probe_child_name,
-    probe_child_path, read_cgroup_usage, rollback_for, CgroupUsage, ControllerSet, CpuStat,
-    DelegationReport, FailureAction, LeafMoveStep, NotDelegated, CGROUP_CONTROLLERS, CGROUP_PROCS,
+    delegation_status, parse_cpu_stat, plan_leaf_move, probe_child_name, probe_child_path,
+    read_cgroup_usage, rollback_for, CgroupUsage, ControllerSet, CpuStat, DelegationReport,
+    FailureAction, LeafMoveStep, NotDelegated, CGROUP_CONTROLLERS, CGROUP_PROCS,
     CGROUP_SUBTREE_CONTROL, CPU_STAT, DELEGATION_PROBE_PREFIX, ENGINE_LEAF, MEMORY_CURRENT,
     MEMORY_PEAK, PIDS_CURRENT, REQUIRED_CONTROLLERS,
 };
@@ -63,10 +63,10 @@ pub use job::{percent_u8, FillId, Job, JobId, JobPhase, JobQueue, JobState, Trig
 pub use process_tree::{
     children_of, chromium_process_type, chromium_type_arg, exited_since, parse_stat_comm,
     parse_stat_cpu_ticks, parse_stat_ppid, parse_stat_starttime, read_memory, read_process,
-    sample_process_tree, scan_ppid_children, ticks_to_seconds, walk_tree, ChromiumProcessType,
-    MemorySource, PpidIndex, PreviousSweep, ProcRecord, ProcessTicks, ProcessTreeSample, RootStat,
-    TreeSample, TypeAccounting, TypeAccountingArray, TypeSecondsArray, CHROMIUM_PROCESS_TYPES,
-    PROC, TYPE_COUNT, USER_HZ,
+    read_starttime, sample_process_tree, scan_ppid_children, ticks_to_seconds, walk_tree,
+    ChromiumProcessType, ExpectedRoot, MemorySource, PpidIndex, PreviousSweep, ProcRecord,
+    ProcessTicks, ProcessTreeSample, RootStat, TreeSample, TypeAccounting, TypeAccountingArray,
+    TypeSecondsArray, CHROMIUM_PROCESS_TYPES, PROC, TYPE_COUNT, USER_HZ,
 };
 pub use scope::{Generation, ResourceScope, ScopeKind, ScopeOwner, ScopeRegistry};
 pub use usage::{

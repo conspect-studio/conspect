@@ -14,14 +14,14 @@
 //! later 1 Hz task owns the actual cadence off the data plane.
 
 use crate::cgroup::CgroupUsage;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fsroot::FsRoot;
 use crate::job::JobPhase;
 use crate::process_tree::{
-    ratio_to_f32, sample_process_tree, ticks_to_seconds, PreviousSweep, ProcessTreeSample,
-    TreeSample, TypeAccountingArray, TypeSecondsArray, TYPE_COUNT,
+    ratio_to_f32, sample_process_tree, ticks_to_seconds, ExpectedRoot, PreviousSweep,
+    ProcessTreeSample, TreeSample, TypeAccountingArray, TypeSecondsArray, TYPE_COUNT,
 };
-use crate::scope::{Generation, ScopeOwner, ScopeRegistry};
+use crate::scope::{Generation, ResourceScope, ScopeOwner, ScopeRegistry};
 
 /// The cap a reported CPU figure saturates at, in cores.
 ///
@@ -193,7 +193,26 @@ struct Reading {
 /// The sampler owns no clock and performs no I/O: [`record`](Self::record) takes
 /// the monotonic time as an argument. It is not `Sync` and holds no thread — the
 /// later 1 Hz task calls it from one place, off the data plane.
-#[derive(Clone, Debug, Default)]
+///
+/// # One sampler per `{owner, generation}`
+///
+/// A sampler's retained sweep state and cumulative CPU total belong to **one**
+/// process tree. When a tree walk reports
+/// [`RootGone`](TreeSample::RootGone) the sampler **clears** that state, latches
+/// itself finished, and refuses every further
+/// [`sample_tree`](Self::sample_tree) with
+/// [`Error::ScopeEnded`](crate::Error::ScopeEnded). The caller retires the scope
+/// and registers a new generation, which gets a new sampler — so a generation
+/// boundary can never carry the old tree's identity map or held CPU total into
+/// the next browser, and there is no way to "reuse" a finished sampler by
+/// mistake. [`is_finished`](Self::is_finished) reports the latch, and
+/// [`finish`](Self::finish) applies the same clearing for a scope the caller
+/// retires for any other reason.
+///
+/// The sampler carries the owner and generation it was built for purely so the
+/// refusal names them; the latch is per-sampler, and generation keying is the
+/// caller's, via [`ScopeRegistry`].
+#[derive(Clone, Debug)]
 pub struct Sampler {
     previous: Option<Reading>,
     /// The per-pid map and running totals from the last tree walk. Only this
@@ -201,16 +220,135 @@ pub struct Sampler {
     /// so a sweep does not clone every record it just produced.
     previous_sweep: Option<PreviousSweep>,
     accounting: Accounting,
+    /// The identity a process tree must still match, when this sampler drives a
+    /// walk. `None` for a sampler that only records cgroup readings.
+    expected: Option<ExpectedRoot>,
+    /// The owner this sampler's figures are charged to, for diagnostics.
+    owner: Option<ScopeOwner>,
+    /// The generation this sampler belongs to, for diagnostics.
+    generation: Generation,
+    /// Set once the scope has ended; every further sample is refused.
+    finished: bool,
+}
+
+impl Default for Sampler {
+    fn default() -> Self {
+        Self {
+            previous: None,
+            previous_sweep: None,
+            accounting: Accounting::default(),
+            expected: None,
+            owner: None,
+            generation: Generation::FIRST,
+            finished: false,
+        }
+    }
 }
 
 impl Sampler {
     /// A sampler for a scope whose figures are `accounting`.
+    ///
+    /// Use this for a cgroup-backed scope, which is sampled with
+    /// [`record`](Self::record) alone and has no root identity to check.
     #[must_use]
     pub fn new(accounting: Accounting) -> Self {
         Self {
             accounting,
             ..Self::default()
         }
+    }
+
+    /// A sampler for the process-tree scope `{owner, generation}` rooted at
+    /// `expected`.
+    ///
+    /// `expected` is the identity read at registration with
+    /// [`ExpectedRoot::read`](crate::process_tree::ExpectedRoot::read), so the
+    /// **first** sample is already checked: a pid the kernel recycled between
+    /// the spawn and the first sweep reports
+    /// [`RootGone`](TreeSample::RootGone) instead of being charged to this
+    /// owner.
+    #[must_use]
+    pub fn for_scope(
+        owner: ScopeOwner,
+        generation: Generation,
+        expected: ExpectedRoot,
+        accounting: Accounting,
+    ) -> Self {
+        Self {
+            accounting,
+            expected: Some(expected),
+            owner: Some(owner),
+            generation,
+            ..Self::default()
+        }
+    }
+
+    /// A sampler for a registered [`ResourceScope`].
+    ///
+    /// The scope's own [`ScopeKind`] supplies the root pid and the
+    /// registration-time `starttime`, so the two cannot drift apart at the call
+    /// site. A cgroup scope has no walk to guard and yields a sampler that only
+    /// accepts [`record`](Self::record); a process-tree scope (including a pool
+    /// backed by one) checks that root's identity on every
+    /// [`sample_scope`](Self::sample_scope).
+    #[must_use]
+    pub fn for_resource_scope(scope: &ResourceScope, accounting: Accounting) -> Self {
+        // A cgroup scope has no walk, so `process_tree_root` is already `None`
+        // for it and for a pool backed by a cgroup.
+        let expected = scope.kind.process_tree_root().map(|pid| ExpectedRoot {
+            pid,
+            starttime: scope.kind.process_tree_root_starttime().unwrap_or(0),
+        });
+        Self {
+            accounting,
+            expected,
+            owner: Some(scope.owner.clone()),
+            generation: scope.generation,
+            ..Self::default()
+        }
+    }
+
+    /// The owner this sampler was built for, when it was named.
+    #[must_use]
+    pub fn owner(&self) -> Option<&ScopeOwner> {
+        self.owner.as_ref()
+    }
+
+    /// The generation this sampler belongs to.
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Whether the scope has ended and every further sample will be refused.
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// The retained per-pid state of the last sweep, for a cost measurement.
+    ///
+    /// This is the state a sweep keeps *between* calls — the growth of its map
+    /// against a fixed tree is what the per-sweep allocation test measures.
+    #[must_use]
+    pub fn previous_sweep(&self) -> Option<&PreviousSweep> {
+        self.previous_sweep.as_ref()
+    }
+
+    /// Retire the scope: drop the retained sweep state and the held CPU reading,
+    /// and refuse every further sample.
+    ///
+    /// Called automatically when a walk reports
+    /// [`RootGone`](TreeSample::RootGone); a caller retiring a scope for any
+    /// other reason (a job cancelled by the operator) calls it explicitly rather
+    /// than dropping the sampler and hoping.
+    pub fn finish(&mut self) {
+        self.previous = None;
+        self.previous_sweep = None;
+        // The registered identity belongs to a process that is gone; keeping it
+        // would invite a "just carry on" call that the latch refuses anyway.
+        self.expected = None;
+        self.finished = true;
     }
 
     /// Record one reading at monotonic `now_seconds`, returning the CPU cores
@@ -281,7 +419,8 @@ impl Sampler {
         }
     }
 
-    /// Sample a process tree rooted at `root` through `fs` and return the walk.
+    /// Sample the process tree rooted at `expected` through `fs` and return the
+    /// walk.
     ///
     /// The returned sample's `exited_cpu_ticks` carries the CPU time of
     /// processes that exited since the previous walk — identified by
@@ -289,30 +428,97 @@ impl Sampler {
     /// whose counter dropped is not booked as exited — so a per-type breakdown
     /// stays truthful while the cumulative figure stays monotonic.
     ///
-    /// The **root's** identity is tracked the same way, from the first sample on
-    /// ([`PreviousSweep::root`]): a sweep whose root pid now carries a different
-    /// `starttime` returns [`TreeSample::RootGone`], and the sampler keeps no
-    /// state from it — the scope is over and the caller retires it and registers
-    /// a new generation rather than charging the impostor to the old owner.
-    /// Keeping the retained state (rather than resetting it to the impostor)
-    /// means a root that is still the wrong process keeps reporting `RootGone`
-    /// until the caller acts.
+    /// The **root's** identity is checked on every sweep, the first included:
+    /// `expected` is the registration-time identity (see
+    /// [`ExpectedRoot`](crate::process_tree::ExpectedRoot)) and a sweep that
+    /// finds a different process behind the pid returns
+    /// [`TreeSample::RootGone`]. A `RootGone` **finishes** the sampler: it drops
+    /// the retained per-pid state and the held CPU total and refuses every
+    /// further sample with [`Error::ScopeEnded`], so the impostor's figures can
+    /// never be folded into the old owner's — see the type-level one-sampler-per
+    /// `{owner, generation}` contract on [`Sampler`].
     ///
     /// # Errors
     ///
+    /// [`crate::error::Error::ScopeEnded`] once the scope has ended, and
     /// [`crate::error::Error::Io`] or [`crate::error::Error::Parse`] when the
     /// root process's own `/proc` entry cannot be read.
     pub fn sample_tree<F: FsRoot + ?Sized>(
         &mut self,
         fs: &F,
-        root: crate::fsroot::Pid,
+        expected: ExpectedRoot,
     ) -> Result<TreeSample> {
-        let sample = sample_process_tree(fs, root, self.previous_sweep.as_ref())?;
-        if let TreeSample::Sampled(reading) = &sample {
+        if self.finished {
+            return Err(self.scope_ended("the root of this scope was already reported gone"));
+        }
+        // Defence in depth: a sampler built with a registered identity
+        // (`for_scope` / `for_resource_scope`) refuses to be pointed at a
+        // different process than the one its generation was opened for.
+        if let Some(registered) = self.expected {
+            if registered != expected {
+                return Err(self.scope_ended(
+                    "the identity handed to sample_tree is not the one this \
+                     sampler's scope was registered with",
+                ));
+            }
+        }
+        let sample = sample_process_tree(
+            fs,
+            expected.pid,
+            Some(&expected),
+            self.previous_sweep.as_ref(),
+        )?;
+        match &sample {
             // Keep only the compact per-pid state, never a clone of the sample.
-            self.previous_sweep = Some(PreviousSweep::from_sample(reading));
+            TreeSample::Sampled(reading) => {
+                self.previous_sweep = Some(PreviousSweep::from_sample(reading));
+            }
+            TreeSample::RootGone => self.finish(),
         }
         Ok(sample)
+    }
+
+    /// Sample the process tree of a registered process-tree [`ResourceScope`].
+    ///
+    /// The scope's root pid and registration-time `starttime` are the identity
+    /// the walk is checked against, so a sample can only ever be attributed to
+    /// the process the scope was registered for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ScopeEnded`] when this sampler has finished (including a scope
+    /// whose root was already reported gone), and the errors of
+    /// [`sample_tree`](Self::sample_tree) otherwise.
+    pub fn sample_scope<F: FsRoot + ?Sized>(
+        &mut self,
+        fs: &F,
+        scope: &ResourceScope,
+    ) -> Result<TreeSample> {
+        let expected = match scope.kind.process_tree_root() {
+            Some(pid) => ExpectedRoot {
+                pid,
+                starttime: scope.kind.process_tree_root_starttime().unwrap_or(0),
+            },
+            None => return Err(Error::parse(
+                scope.owner.as_str(),
+                "scope is cgroup-backed: sample it with record() and release(), not a tree walk",
+            )),
+        };
+        self.owner = Some(scope.owner.clone());
+        self.generation = scope.generation;
+        self.sample_tree(fs, expected)
+    }
+
+    /// The refusal a finished sampler returns.
+    fn scope_ended(&self, detail: &str) -> Error {
+        Error::ScopeEnded {
+            owner: self
+                .owner
+                .as_ref()
+                .map_or_else(|| "unknown".to_owned(), |owner| owner.as_str().to_owned()),
+            generation: self.generation.get(),
+            detail: detail.to_owned(),
+        }
     }
 
     /// CPU seconds for a process-tree walk.
