@@ -970,18 +970,34 @@ mod tests {
 
         // The INDEPENDENT fairness observer: a separate task on the SAME
         // single-threaded runtime, genuinely contending with the driver for
-        // the one worker thread. It does no useful work beyond counting its
-        // own polls — the only way its counter ever advances is if the
-        // runtime actually schedules it, which requires the driver to keep
-        // yielding under the flood (review PR193-03: removing the production
-        // `yield_now` starves this, not just the test's own gate).
-        let observer_polls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // the one worker thread. The fairness statistic is computed HERE, at
+        // the observer's own polls (review PR193-03-R2): at each poll it reads
+        // the driver's exhaustion count and records how many exhaustions ran
+        // since ITS previous poll; the result is the max of those deltas. No
+        // coordinator timer samples the counters, so scheduler/timer latency
+        // cannot inflate the statistic, and the observer takes one final poll
+        // after the driver has stopped, so a trailing starved interval with no
+        // observer progress is counted too.
+        let driver_done = Arc::new(AtomicBool::new(false));
         let observer = {
-            let observer_polls = Arc::clone(&observer_polls);
-            let stop = Arc::clone(&stop);
+            let probe = Arc::clone(&probe);
+            let driver_done = Arc::clone(&driver_done);
             tokio::spawn(async move {
-                while !stop.load(Ordering::Relaxed) {
-                    observer_polls.fetch_add(1, Ordering::Relaxed);
+                let mut last = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+                let mut max_gap = 0u64;
+                let mut polls = 0u64;
+                loop {
+                    // Read `done` BEFORE the counter: once the driver has
+                    // returned no further exhaustion can occur, so this poll's
+                    // delta closes the final interval up to driver stop.
+                    let done = driver_done.load(Ordering::Acquire);
+                    let now = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
+                    max_gap = max_gap.max(now - last);
+                    last = now;
+                    polls += 1;
+                    if done {
+                        return (max_gap, polls);
+                    }
                     tokio::task::yield_now().await;
                 }
             })
@@ -1008,8 +1024,11 @@ mod tests {
         let driver = {
             let probe = Arc::clone(&probe);
             let stop = Arc::clone(&stop);
+            let driver_done = Arc::clone(&driver_done);
             tokio::spawn(tokio::task::unconstrained(async move {
-                endpoint.run_inner(stop, &probe).await
+                let result = endpoint.run_inner(stop, &probe).await;
+                driver_done.store(true, Ordering::Release);
+                result
             }))
         };
 
@@ -1041,47 +1060,26 @@ mod tests {
         })
         .await;
 
-        // The independent fairness observer's MAX-GAP check — the PR193-03
-        // discriminator. While the flood KEEPS saturating (it is not stopped
-        // until after this check), walk `FAIRNESS_WINDOW_EXHAUSTIONS` further
-        // exhaustions and record, each time the observer's poll counter
-        // advances, how many exhaustions occurred since its PREVIOUS advance.
-        // The largest such gap is the signal: with the production `yield_now`
-        // firing on every exhausted budget, the single-threaded runtime
-        // schedules the observer within a handful of exhaustions every time
-        // (small, stable max gap); without it, exhaustions keep re-arming the
-        // readable arm immediately and the observer is parked until the far
-        // rarer idle-tick `Pending` happens to fall due, so dozens run back
-        // to back first (a much larger max gap) — see `MAX_TOLERATED_GAP`'s
-        // doc comment for the measured numbers on this host.
+        // Keep the flood saturating for `FAIRNESS_WINDOW_EXHAUSTIONS` further
+        // budgets while the observer measures; this loop only decides WHEN to
+        // stop, it computes nothing (the statistic lives in the observer).
         let exh_start = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
-        let mut last_poll_exh = exh_start;
-        let mut last_polls = observer_polls.load(Ordering::Relaxed);
-        let mut max_gap: u64 = 0;
-        tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                let cur_exh = probe.recv_budgets_exhausted.load(Ordering::Relaxed);
-                let cur_polls = observer_polls.load(Ordering::Relaxed);
-                if cur_polls > last_polls {
-                    max_gap = max_gap.max(cur_exh - last_poll_exh);
-                    last_poll_exh = cur_exh;
-                    last_polls = cur_polls;
-                }
-                if cur_exh >= exh_start + FAIRNESS_WINDOW_EXHAUSTIONS {
-                    return;
-                }
+        let window = tokio::time::timeout(Duration::from_secs(60), async {
+            while probe.recv_budgets_exhausted.load(Ordering::Relaxed)
+                < exh_start + FAIRNESS_WINDOW_EXHAUSTIONS
+            {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
-        .await
-        .expect(
-            "the flood must keep driving further exhaustions within the bound \
-             while the fairness window measures them",
-        );
+        .await;
 
         stop.store(true, Ordering::Release);
         let stopped = tokio::time::timeout(Duration::from_secs(30), driver).await;
-        let _ = tokio::time::timeout(Duration::from_secs(30), observer).await;
+        // Hang guard only: the observer returns once it sees the driver stop.
+        let (max_gap, observer_polls) = tokio::time::timeout(Duration::from_secs(30), observer)
+            .await
+            .expect("the observer finishes once the driver has stopped")
+            .expect("the observer task completes");
         // Stop + join the flooder now (the guard also does this on any panic
         // path above, review PR193-05).
         drop(flood_guard);
@@ -1116,6 +1114,15 @@ mod tests {
              release command (close the ring) within the bound — an entry-only \
              counter cannot prove this; the real command-drain step was starved \
              or skipped (review PR193-02)"
+        );
+        assert!(
+            window.is_ok(),
+            "the flood must keep driving further exhaustions within the bound \
+             while the observer measures them"
+        );
+        assert!(
+            observer_polls > 1,
+            "the observer must have polled during the run (got {observer_polls})"
         );
         assert!(
             max_gap <= MAX_TOLERATED_GAP,
