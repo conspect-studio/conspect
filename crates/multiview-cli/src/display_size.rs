@@ -143,6 +143,18 @@ pub fn frac_to_px(frac: f32, extent: u32) -> u32 {
 pub struct DisplayFollow {
     layout: DisplayLayoutSlot,
     registry: Option<Arc<SourceRegistry<Nv12Image>>>,
+    #[cfg(test)]
+    rehearsal: Option<Arc<Rehearsal>>,
+}
+
+/// Test seam: run the reopen path on a GPU-free box with software decoders.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct Rehearsal {
+    /// Replacement decoders opened.
+    pub opens: AtomicUsize,
+    /// Cutovers the decode loop performed.
+    pub cutovers: AtomicUsize,
 }
 
 impl DisplayFollow {
@@ -152,7 +164,51 @@ impl DisplayFollow {
         layout: DisplayLayoutSlot,
         registry: Option<Arc<SourceRegistry<Nv12Image>>>,
     ) -> Self {
-        Self { layout, registry }
+        Self {
+            layout,
+            registry,
+            #[cfg(test)]
+            rehearsal: None,
+        }
+    }
+
+    /// Treat this decode as NVDEC, with software replacements, counting into
+    /// `rehearsal`.
+    #[cfg(test)]
+    #[must_use]
+    pub fn rehearsing(mut self, rehearsal: Arc<Rehearsal>) -> Self {
+        self.rehearsal = Some(rehearsal);
+        self
+    }
+
+    /// Whether this decode is a test rehearsal of the reopen path. Always false
+    /// outside tests.
+    #[must_use]
+    pub fn rehearses_reopen(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.rehearsal.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Count a replacement open in a rehearsal.
+    pub fn note_open(&self) {
+        #[cfg(test)]
+        if let Some(rehearsal) = &self.rehearsal {
+            rehearsal.opens.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Count a cutover in a rehearsal.
+    pub fn note_cutover(&self) {
+        #[cfg(test)]
+        if let Some(rehearsal) = &self.rehearsal {
+            rehearsal.cutovers.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// The size `source_id` wants under the live layout.

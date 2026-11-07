@@ -10226,6 +10226,8 @@ struct DecoderOpenArgs {
     time_base: Rational,
     declared_fps: Rational,
     cuda_ordinal: Option<String>,
+    /// Open in software: only a test rehearsal of the reopen path sets this.
+    rehearsal: bool,
 }
 
 impl DecoderOpenArgs {
@@ -10236,6 +10238,11 @@ impl DecoderOpenArgs {
         resize: Option<multiview_ffmpeg::TileSize>,
     ) -> Result<StreamVideoDecoder, String> {
         let _resource = ingest_resource_scope(&self.id);
+        if self.rehearsal {
+            return StreamVideoDecoder::new(self.params, self.time_base)
+                .map(|decoder| decoder.with_declared_fps(Some(self.declared_fps)))
+                .map_err(|e| e.to_string());
+        }
         let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
             self.params,
             self.time_base,
@@ -12663,7 +12670,7 @@ fn open_and_stream(
     let mut display = plan.display.clone().map(|follow| {
         let state = DecoderState {
             source: source_size,
-            hardware: used_hw,
+            hardware: used_hw || follow.rehearses_reopen(),
             resize: decoder.hw_resize(),
         };
         DisplayDriver::<StreamVideoDecoder>::new(follow, &plan.id, tile, state, resize_env)
@@ -12981,8 +12988,18 @@ fn open_and_stream(
                     time_base,
                     declared_fps,
                     cuda_ordinal: reopen_ordinal.clone(),
+                    rehearsal: plan
+                        .display
+                        .as_ref()
+                        .is_some_and(DisplayFollow::rehearses_reopen),
                 };
-                move || args.open(resize)
+                let counted = plan.display.clone();
+                move || {
+                    if let Some(follow) = &counted {
+                        follow.note_open();
+                    }
+                    args.open(resize)
+                }
             });
             match display_step {
                 DisplayStep::Idle => {}
@@ -12997,6 +13014,9 @@ fn open_and_stream(
                     carried = frames;
                     skip.arm(skip_through);
                     to_tile = TileScaler::new(w, h);
+                    if let Some(follow) = &plan.display {
+                        follow.note_cutover();
+                    }
                     continue;
                 }
             }
@@ -20220,11 +20240,16 @@ mod packet_reader_tests {
 /// handover relies on; `*_cuvid` itself needs the host.
 #[cfg(all(test, feature = "ffmpeg"))]
 mod display_follow_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use std::path::Path;
     use std::process::Command;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
 
     use multiview_ffmpeg::StreamVideoDecoder;
@@ -20339,9 +20364,92 @@ segment_ms = 1000
         });
     }
 
+    /// The production decode loop itself takes the reopen: a helper-thread open,
+    /// a cutover in `open_and_stream`, and frames still flowing afterwards.
+    #[test]
+    fn the_decode_loop_cuts_over_to_a_reopened_decoder_and_keeps_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        clip(&path, 12);
+        let boot = config(&path, 1.0);
+        let slot: DisplayLayoutSlot =
+            Arc::new(SwapCell::new(Arc::new(boot.solve_layout().unwrap())));
+        let store = Arc::new(TileStore::new(
+            "clip",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let mut plan = ingest_plan_for(
+            &boot.sources[0],
+            320,
+            240,
+            Arc::clone(&store),
+            CanvasColor::default(),
+            Rational::new(25, 1),
+        )
+        .unwrap();
+        let rehearsal = Arc::new(crate::display_size::Rehearsal::default());
+        plan.display =
+            Some(DisplayFollow::new(Arc::clone(&slot), None).rehearsing(Arc::clone(&rehearsal)));
+        let stop = AtomicBool::new(false);
+        let count = |counter: &AtomicUsize| counter.load(Ordering::Acquire);
+        let wait = |done: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < end {
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| ingest_loop(&plan, &stop));
+            let started = wait(&|| store.sequence() > 0);
+            slot.store(Arc::new(config(&path, 0.25).solve_layout().unwrap()));
+            let cut = wait(&|| count(&rehearsal.cutovers) == 1);
+            let at_cut = store.sequence();
+            let flowing = wait(&|| store.sequence() >= at_cut + 10);
+            let size = store
+                .read_at(MediaTime::from_nanos(i64::MAX))
+                .frame()
+                .map(|frame| (frame.width(), frame.height()));
+            stop.store(true, Ordering::Release);
+            assert!(started, "the decode must start");
+            assert!(
+                cut,
+                "the loop must cut over, not fall back to the host scaler"
+            );
+            assert_eq!(
+                count(&rehearsal.opens),
+                1,
+                "one reopen for one layout change"
+            );
+            assert!(flowing, "frames must keep flowing after the cutover");
+            assert_eq!(size, Some((80, 60)));
+        });
+    }
+
+    /// FNV-1a over the visible luma, so a frame with the right timestamp but a
+    /// damaged picture fails the comparison.
+    fn picture_hash(frame: &Video) -> u64 {
+        let width = usize::try_from(frame.width()).unwrap();
+        let height = usize::try_from(frame.height()).unwrap();
+        let stride = frame.stride(0);
+        let plane = frame.data(0);
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for row in 0..height {
+            for &byte in &plane[row * stride..row * stride + width] {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
     /// Decode `path`, handing over to a fresh decoder after `cut` packets when
     /// given, with the decode loop's ordering. Returns the frames taken, in order.
-    fn decode(path: &Path, cut: Option<usize>) -> Vec<i64> {
+    fn decode(path: &Path, cut: Option<usize>) -> Vec<(i64, u64)> {
         multiview_ffmpeg::ensure_initialized().unwrap();
         let mut input = ffmpeg::format::input(&path).unwrap();
         let (stream_index, params, time_base, _fps) = best_video_stream_params(&input).unwrap();
@@ -20359,7 +20467,8 @@ segment_ms = 1000
                 None => decoder.receive_frame().unwrap(),
             } {
                 if !skip.drops(frame.raw_pts) {
-                    seen.push(frame.raw_pts.expect("clip frames carry a timestamp"));
+                    let pts = frame.raw_pts.expect("clip frames carry a timestamp");
+                    seen.push((pts, picture_hash(&frame.frame)));
                 }
             }
             if eof {
@@ -20367,7 +20476,7 @@ segment_ms = 1000
                 return seen;
             }
             if let Some(running) = handover.as_mut() {
-                match running.poll(seen.last().copied(), Instant::now()) {
+                match running.poll(seen.last().map(|(pts, _)| *pts), Instant::now()) {
                     HandoverPoll::Pending => {}
                     HandoverPoll::Abandoned(reason) => panic!("handover abandoned: {reason}"),
                     HandoverPoll::Ready {
