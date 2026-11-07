@@ -321,6 +321,10 @@ pub struct DemandSettings {
     /// How many sources may start at once. Default 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_starts: Option<u32>,
+    /// How many timed-out source opens may still hold a thread before new
+    /// starts are refused. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stuck_opens: Option<u32>,
 }
 
 /// The operator's NDI® SDK runtime license acceptance (ADR-0008 §7.5).

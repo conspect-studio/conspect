@@ -38,6 +38,9 @@ pub fn demand_config(config: &MultiviewConfig) -> DemandConfig {
         if let Some(starts) = settings.max_concurrent_starts {
             tuned.max_concurrent_starts = usize::try_from(starts).unwrap_or(usize::MAX).max(1);
         }
+        if let Some(stuck) = settings.max_stuck_opens {
+            tuned.max_stuck_opens = usize::try_from(stuck).unwrap_or(usize::MAX).max(1);
+        }
     }
     tuned
 }
@@ -595,8 +598,9 @@ target = "slate""#
     fn close_after_start_timeout_and_concurrency_come_from_system_demand() {
         let tuned = demand_config(&config(
             "",
-            "[system.demand]\nclose_after_secs = 5\nstart_timeout_secs = 7\nmax_concurrent_starts = 2\n",
+            "[system.demand]\nclose_after_secs = 5\nstart_timeout_secs = 7\nmax_concurrent_starts = 2\nmax_stuck_opens = 3\n",
         ));
+        assert_eq!(tuned.max_stuck_opens, 3);
         assert_eq!(tuned.close_after, std::time::Duration::from_secs(5));
         assert_eq!(tuned.start_timeout, std::time::Duration::from_secs(7));
         assert_eq!(tuned.max_concurrent_starts, 2);

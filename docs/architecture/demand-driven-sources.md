@@ -36,6 +36,7 @@ Config:
 | `[system.demand] close_after_secs` | 30 | `linger_secs` is read as an alias. |
 | `[system.demand] start_timeout_secs` | 20 | |
 | `[system.demand] max_concurrent_starts` | 8 | |
+| `[system.demand] max_stuck_opens` | 8 | Timed-out opens that have not returned (a hung native open cannot be cancelled) still hold a thread, deleted sources included. Opening plus stuck starts never exceed this; at the cap a new start reads `failed` ("too many stuck source opens") until one returns. A start that returns after its deadline is stale and stopped, whenever the worker next runs. |
 | `[iptv] guide_refresh_minutes` | 30 | Validated 5..=1440; settable on the IPTV page. `guide_idle_secs` is removed. |
 
 ### Demand leases (engine: `multiview-engine/src/demand.rs`)

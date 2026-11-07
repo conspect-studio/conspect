@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
@@ -338,6 +338,10 @@ pub struct DemandConfig {
     pub health_period: Duration,
     /// Default retry cap (`None`: retry forever, the always-on behaviour).
     pub retry_cap: Option<u32>,
+    /// How many timed-out opens may still hold their (uncancellable) thread
+    /// across the whole process (review R2-03). At the cap every new start
+    /// is refused, reading `failed`, until one of them returns.
+    pub max_stuck_opens: usize,
 }
 
 /// The default [`DemandConfig::close_after`].
@@ -354,6 +358,8 @@ pub const MAX_TIMED_LEASES: usize = 64;
 /// How long [`DemandManager::stop_all`] waits for in-flight transitions before
 /// it leaves them to tear themselves down when they return.
 pub const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+/// The default [`DemandConfig::max_stuck_opens`].
+pub const DEFAULT_MAX_STUCK_OPENS: usize = 8;
 /// Upper bound on remembered generations of retired source records.
 pub const MAX_RETIRED_GENERATIONS: usize = 4096;
 
@@ -368,9 +374,14 @@ impl Default for DemandConfig {
             backoff_max: Duration::from_secs(30),
             health_period: Duration::from_secs(1),
             retry_cap: None,
+            max_stuck_opens: DEFAULT_MAX_STUCK_OPENS,
         }
     }
 }
+
+/// The manager's time source. [`Instant::now`] in production; a test can
+/// substitute a controllable clock ([`DemandManager::with_clock`]).
+pub type DemandClock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Turns demand into running rails. Implemented by the run path, and by a
 /// counting fake in tests.
@@ -523,6 +534,8 @@ struct Entry<T> {
     /// Started by boot (adopted), not by this manager: it never held a start
     /// slot, so it must not occupy one while awaiting its first media.
     booted: bool,
+    /// A start is being refused because too many opens are stuck.
+    refused: bool,
 }
 
 impl<T> Entry<T> {
@@ -550,6 +563,7 @@ impl<T> Entry<T> {
             close_now: false,
             gave_up: false,
             booted: false,
+            refused: false,
         }
     }
 
@@ -697,6 +711,11 @@ struct Inner<T> {
     passes: AtomicU64,
     /// Where [`TransitionEvent`]s go.
     sink: OnceLock<TransitionSink>,
+    /// Timed-out opens whose thread has not returned yet, including those of
+    /// deleted sources. Changed only under the book lock (review R2-03).
+    stuck_opens: AtomicUsize,
+    /// The time source.
+    clock: DemandClock,
     /// The tile-chip view, republished on change only.
     activity: SwapCell<Arc<ActivityMap>>,
 }
@@ -822,6 +841,17 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         driver: Arc<dyn RailDriver<T>>,
         config: DemandConfig,
     ) -> Self {
+        Self::with_clock(registry, driver, config, Arc::new(Instant::now))
+    }
+
+    /// [`new`](Self::new) reading time from `clock`.
+    #[must_use]
+    pub fn with_clock(
+        registry: Arc<SourceRegistry<T>>,
+        driver: Arc<dyn RailDriver<T>>,
+        config: DemandConfig,
+        clock: DemandClock,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 book: Mutex::new(Book {
@@ -844,6 +874,8 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 pending: AtomicU64::new(0),
                 passes: AtomicU64::new(0),
                 sink: OnceLock::new(),
+                stuck_opens: AtomicUsize::new(0),
+                clock,
                 activity: SwapCell::from_pointee(HashMap::new()),
             }),
         }
@@ -936,7 +968,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         let key: Arc<str> = Arc::from(id);
         {
             let mut book = lock(&self.inner.book);
-            let now = Instant::now();
+            let now = self.inner.now();
             let entry = book.entry(&key, now);
             entry.leases.insert(lease_id, LeaseRecord { rails, tag });
             entry.close_now = false;
@@ -967,7 +999,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         ttl: Duration,
     ) -> Option<DemandPhase> {
         let key = (Arc::<str>::from(id), tag.clone());
-        let until = Instant::now() + ttl;
+        let until = self.inner.now() + ttl;
         {
             let mut book = lock(&self.inner.book);
             if let Some(timed) = book.timed.get_mut(&key) {
@@ -1090,7 +1122,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         }
         let handle = rails.video.then(|| self.inner.registry_handle(id, None));
         let mut book = lock(&self.inner.book);
-        let now = Instant::now();
+        let now = self.inner.now();
         let entry = book.entry(&Arc::from(id), now);
         let fresh = entry.running.is_empty();
         entry.running = entry.running.union(rails);
@@ -1149,7 +1181,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     #[must_use]
     pub fn status(&self, id: &str) -> DemandStatus {
         let book = lock(&self.inner.book);
-        let now = Instant::now();
+        let now = self.inner.now();
         book.entries.get(id).map_or_else(
             || DemandStatus::idle(id),
             |entry| report(&self.inner, id, entry, now),
@@ -1160,7 +1192,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     #[must_use]
     pub fn snapshot(&self) -> Vec<DemandStatus> {
         let book = lock(&self.inner.book);
-        let now = Instant::now();
+        let now = self.inner.now();
         let mut out: Vec<DemandStatus> = book
             .entries
             .iter()
@@ -1344,6 +1376,10 @@ fn report<T: Send + Sync + 'static>(
 }
 
 impl<T> Inner<T> {
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
     fn wake(&self) {
         if let Some(thread) = self.worker.get() {
             thread.unpark();
@@ -1533,6 +1569,17 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 .filter(|e| e.in_flight && !e.timed_out)
                 .count();
             let thread_limit = config.max_concurrent_starts.max(1).saturating_mul(2);
+            // Timed-out opens keep their thread and cannot be cancelled: past
+            // the cap no new start may add another (review R2-03).
+            let stuck = self.stuck_opens.load(Ordering::Acquire);
+            // Opens still inside their deadline may become stuck too, so they
+            // share the bound: stuck plus opening never exceeds it.
+            let mut opening = book
+                .entries
+                .values()
+                .filter(|e| e.in_flight && !e.timed_out && e.open_deadline.is_some())
+                .count();
+            let stuck_cap = config.max_stuck_opens.max(1);
             for (id, entry) in &mut book.entries {
                 let asked = entry.wanted();
                 let wanted = self.driver.resolve(id, asked);
@@ -1549,6 +1596,12 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 } else {
                     bounds.close_after.unwrap_or(config.close_after)
                 };
+                if (entry.restart || entry.stale) && entry.running.is_empty() {
+                    // Nothing runs to stop: no thread for a no-op transition.
+                    entry.restart = false;
+                    entry.stale = false;
+                    entry.close_now = false;
+                }
                 let target = if entry.restart || entry.stale {
                     Rails::NONE
                 } else {
@@ -1574,10 +1627,21 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 }
                 let starting = !entry.running.covers(target);
                 if starting {
+                    if stuck >= stuck_cap {
+                        refuse_start(id, entry, stuck);
+                        continue;
+                    }
+                    // Waits (bounded: one record per wanted source) until an
+                    // open returns or times out.
+                    if stuck + opening >= stuck_cap {
+                        continue;
+                    }
                     let cap = bounds.retry_cap.or(config.retry_cap);
                     if !admit_start(entry, cap, &mut slots_used, config, now) {
                         continue;
                     }
+                    entry.refused = false;
+                    opening += 1;
                 } else if target.is_empty() && entry.close_now {
                     "stopped by an operator".clone_into(&mut entry.reason);
                 }
@@ -1635,6 +1699,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
     /// whatever it eventually returns is stopped as stale. Book lock held.
     fn expire_open(&self, entry: &mut Entry<T>, now: Instant) {
         entry.timed_out = true;
+        self.stuck_opens.fetch_add(1, Ordering::AcqRel);
         entry.failures = entry.failures.saturating_add(1);
         entry.phase = DemandPhase::Failed;
         "start timeout".clone_into(&mut entry.reason);
@@ -1761,11 +1826,14 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let mut orphaned = Rails::NONE;
         {
             let mut book = lock(&self.book);
-            let now = Instant::now();
+            let now = self.now();
             // The worker is gone: nothing would ever stop these rails, so this
             // thread does (checked under the lock `stop_all` snapshots under).
             if self.stopping.load(Ordering::Acquire) {
                 if let Some(entry) = book.entries.get_mut(id) {
+                    if std::mem::take(&mut entry.timed_out) {
+                        self.stuck_opens.fetch_sub(1, Ordering::AcqRel);
+                    }
                     entry.in_flight = false;
                     entry.open_deadline = None;
                     entry.running = Rails::NONE;
@@ -1776,6 +1844,9 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 entry.in_flight = false;
                 entry.open_deadline = None;
                 let late = std::mem::take(&mut entry.timed_out);
+                if late {
+                    self.stuck_opens.fetch_sub(1, Ordering::AcqRel);
+                }
                 if running.is_empty() {
                     entry.close_now = false;
                 }
@@ -1879,6 +1950,22 @@ fn admit_start<T>(
     true
 }
 
+/// Refuse a start because `stuck` opens already hold threads that cannot be
+/// cancelled. The source reads failed, with one log line per refusal; it is
+/// retried, never queued, when a stuck open returns and wakes the worker.
+fn refuse_start<T>(id: &str, entry: &mut Entry<T>, stuck: usize) {
+    if entry.refused {
+        return;
+    }
+    entry.refused = true;
+    entry.phase = DemandPhase::Failed;
+    "start refused: too many stuck source opens".clone_into(&mut entry.reason);
+    entry.detail = Some(format!(
+        "{stuck} source opens are stuck; starts resume when one returns"
+    ));
+    tracing::warn!(source = %id, stuck, "source start refused: too many stuck opens");
+}
+
 /// What a source's rails should do now.
 enum Desired {
     /// Stay put, optionally until a deadline.
@@ -1950,7 +2037,7 @@ fn default_reason(phase: DemandPhase) -> String {
 fn worker_loop<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
     while !inner.stopping.load(Ordering::Acquire) {
         inner.passes.fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
+        let now = inner.now();
         let restarts = inner.restarts.swap(Arc::new(Vec::new()));
         if !restarts.is_empty() {
             let manager = DemandManager {
@@ -1966,7 +2053,7 @@ fn worker_loop<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
         match [next_timed, next_step].into_iter().flatten().min() {
             // Parks with no timeout while everything is idle: no timer at all.
             None => std::thread::park(),
-            Some(at) => std::thread::park_timeout(at.saturating_duration_since(Instant::now())),
+            Some(at) => std::thread::park_timeout(at.saturating_duration_since(inner.now())),
         }
     }
 }
@@ -2004,6 +2091,9 @@ mod tests {
         publish_on_start: AtomicBool,
         /// Sources whose start blocks until removed from this set (a wedged open).
         wedged: Mutex<HashSet<String>>,
+        /// Transition threads blocked in a wedged open right now, and the peak.
+        blocked: AtomicUsize,
+        blocked_peak: AtomicUsize,
     }
 
     impl RailDriver<u8> for Fake {
@@ -2034,10 +2124,13 @@ mod tests {
                     reason: "connection refused".to_owned(),
                 });
             }
-            if to.video && !from.video {
+            if to.video && !from.video && lock(&self.wedged).contains(id) {
+                let now = self.blocked.fetch_add(1, Ordering::SeqCst) + 1;
+                self.blocked_peak.fetch_max(now, Ordering::SeqCst);
                 while lock(&self.wedged).contains(id) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                self.blocked.fetch_sub(1, Ordering::SeqCst);
             }
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
@@ -2080,6 +2173,7 @@ mod tests {
             backoff_max: Duration::from_millis(40),
             health_period: Duration::from_millis(5),
             retry_cap: None,
+            max_stuck_opens: DEFAULT_MAX_STUCK_OPENS,
         }
     }
 
@@ -2863,6 +2957,70 @@ mod tests {
         );
         assert_eq!(lock(&manager.inner.book).pins.len(), 0);
         assert_eq!(lock(&manager.inner.book).timed.len(), 0);
+        manager.shutdown();
+    }
+
+    /// Review R2-03: opens that never return cannot pile up threads. Across
+    /// many distinct create/Start/delete cycles the blocked threads stay at
+    /// the stuck cap; past it starts are refused (failed, with a reason and an
+    /// event) instead of spawning; deleting a source keeps its stuck open
+    /// counted; and once they return, starts work again.
+    #[test]
+    fn stuck_opens_are_globally_capped_across_deleted_sources() {
+        const CAP: usize = 3;
+        let fake = Arc::new(Fake::default());
+        for i in 0..40 {
+            lock(&fake.wedged).insert(format!("hung{i}"));
+        }
+        let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(&fake);
+        let manager = DemandManager::new(
+            SourceRegistry::new(),
+            driver,
+            DemandConfig {
+                start_timeout: Duration::from_millis(20),
+                max_stuck_opens: CAP,
+                ..config(10)
+            },
+        );
+        let events = events_into(&manager);
+        manager.start();
+        for i in 0..40 {
+            let id = format!("hung{i}");
+            manager.start_source(&id);
+            wait("timed out or refused", || {
+                manager.status(&id).phase == DemandPhase::Failed
+            });
+            assert!(fake.blocked.load(Ordering::SeqCst) <= CAP);
+            assert!(manager.inner.pending.load(Ordering::SeqCst) <= CAP as u64);
+            manager.remove_source(&id);
+        }
+        // A fresh source is refused while the cap is held, with a clear reason.
+        manager.start_source("fresh");
+        wait("refused", || {
+            manager.status("fresh").phase == DemandPhase::Failed
+        });
+        let refused = manager.status("fresh");
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("stuck")),
+            "{refused:?}"
+        );
+        assert!(lock(&events).iter().any(|e| e.source_id == "fresh"
+            && e.to == DemandPhase::Failed
+            && e.reason.contains("stuck")));
+        assert_eq!(fake.blocked_peak.load(Ordering::SeqCst), CAP, "bounded");
+        assert_eq!(manager.inner.stuck_opens.load(Ordering::SeqCst), CAP);
+        assert_eq!(fake.video_starts.load(Ordering::SeqCst), 0);
+        // The hung opens return: deleted sources are stopped and forgotten,
+        // the count drains, and the refused source starts.
+        lock(&fake.wedged).clear();
+        wait("fresh starts", || manager.status("fresh").running.video);
+        wait("stuck drained", || {
+            manager.inner.stuck_opens.load(Ordering::SeqCst) == 0
+        });
+        wait("deleted records retired", || manager.active_len() == 1);
         manager.shutdown();
     }
 
