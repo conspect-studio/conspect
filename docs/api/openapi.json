@@ -3991,7 +3991,17 @@
             }
           },
           "404": {
-            "description": "No such input, or it has not been probed yet.",
+            "description": "No such input.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not probed yet: the input is idle (nothing consumes it) or still starting. Its streams are read when a consumer starts it; preview it to start it.",
             "content": {
               "application/json": {
                 "schema": {
@@ -17030,7 +17040,7 @@
       },
       "SourceDemandView": {
         "type": "object",
-        "description": "One source's demand state.",
+        "description": "One source's demand state. Flat booleans keep the wire shape simple for\nthe SPA (one per rail per direction).",
         "required": [
           "id",
           "phase",

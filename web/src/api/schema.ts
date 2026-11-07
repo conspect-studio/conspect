@@ -5882,7 +5882,10 @@ export interface components {
          * @enum {string}
          */
         SourceDemandPhase: "idle" | "starting" | "live" | "failed";
-        /** @description One source's demand state. */
+        /**
+         * @description One source's demand state. Flat booleans keep the wire shape simple for
+         *     the SPA (one per rail per direction).
+         */
         SourceDemandView: {
             /** @description Whether its audio rail is running. */
             audio_running: boolean;
@@ -10079,8 +10082,17 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
-            /** @description No such input, or it has not been probed yet. */
+            /** @description No such input. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not probed yet: the input is idle (nothing consumes it) or still starting. Its streams are read when a consumer starts it; preview it to start it. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

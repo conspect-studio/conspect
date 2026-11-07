@@ -280,6 +280,18 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
         ))))
     }
 
+    fn session_lease(
+        &self,
+        id: &str,
+        label: &str,
+    ) -> Option<Box<dyn multiview_control::SourceDemandLease>> {
+        if !self.catalogue.load().contains_key(id) {
+            return None;
+        }
+        let tag = ConsumerTag::new(ConsumerClass::HlsSession, label);
+        Some(Box::new(HeldLease(self.manager.acquire(id, Rails::ALL, tag, None))))
+    }
+
     fn touch_preview(&self, id: &str) -> Option<multiview_control::SourceDemandPhase> {
         if !self.catalogue.load().contains_key(id) {
             return None;

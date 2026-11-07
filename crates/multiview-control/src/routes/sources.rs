@@ -104,6 +104,18 @@ pub(crate) async fn update_source_automation(
             model.adopt_source(next);
         }
     }
+    // Arming or disarming changes what keeps a source (and its replacement)
+    // running under demand. Tell the running engine; on a demand-managed run
+    // this re-reads the source's standing leases and restarts nothing that is
+    // not already running. Best-effort: a shed submit applies on restart.
+    if let Some(next) = parse_stored_source(&versioned.resource.body) {
+        if state.live_sources.is_live(&next.kind) {
+            let _ = state.commands.try_submit(Command::UpsertSource {
+                op: OperationId::new(),
+                source: Box::new(next),
+            });
+        }
+    }
     state.audit(
         actor,
         AuditAction::Update,

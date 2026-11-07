@@ -92,6 +92,15 @@ pub trait SourceDemandProvider: Send + Sync {
     /// `None` when `id` is not a configured source.
     fn preview_lease(&self, id: &str, label: &str) -> Option<Box<dyn SourceDemandLease>>;
 
+    /// Take a lease on `id`'s video and audio for an on-demand HLS session
+    /// labelled `label` (`feat/rc-on-demand-hls` calls this). `None` when `id`
+    /// is not a configured source. The default refuses, for providers without
+    /// session support.
+    fn session_lease(&self, id: &str, label: &str) -> Option<Box<dyn SourceDemandLease>> {
+        let _ = (id, label);
+        None
+    }
+
     /// Take or extend a short preview lease (for a poller with no close event).
     /// Returns the phase, or `None` when `id` is unknown or the bound on timed
     /// leases is reached.
