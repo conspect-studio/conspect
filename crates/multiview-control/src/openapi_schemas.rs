@@ -2304,3 +2304,42 @@ pub struct LogRecordDoc {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub repeated: Option<u64>,
 }
+
+/// `OpenAPI` mirror of `multiview_config::schema::EventAutomationRule` (ADR-0183).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct EventAutomationRuleDoc {
+    /// Whether the rule acts (default `false`). Use the arm/disarm routes.
+    #[serde(default)]
+    pub armed: bool,
+    /// What to take at break start.
+    pub on_break_start: BreakStartActionDoc,
+    /// Restore the pre-break routing at the confirmed end (default `true`).
+    #[serde(default)]
+    pub restore_on_end: Option<bool>,
+    /// Watchdog seconds (1..=86400, default 600).
+    #[serde(default)]
+    pub max_duration_s: Option<u32>,
+    /// Optional `http://` hook that receives a `POST` on break start/end.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+}
+/// `OpenAPI` mirror of `multiview_config::schema::BreakStartAction`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BreakStartActionDoc {
+    /// `swap_cell` (cells only) or `route_program` (cells + program audio).
+    pub action: BreakActionKindDoc,
+    /// A source id, or `bars` / `bars_tone`.
+    pub target: String,
+    /// Cells to replace; absent = every cell showing the source.
+    #[serde(default)]
+    pub cells: Option<Vec<String>>,
+}
+/// `OpenAPI` mirror of `multiview_config::schema::BreakActionKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakActionKindDoc {
+    /// Swap the cell(s) showing the source.
+    SwapCell,
+    /// Swap the cell(s) and re-point the source's program-bus audio.
+    RouteProgram,
+}

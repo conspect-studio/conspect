@@ -200,8 +200,14 @@ impl SourceEvent {
                 epoch,
                 position_ns,
             } if source_id == &self.key.source_id => {
-                if *epoch != self.key.epoch {
+                // Only a STRICTLY newer clock supersedes this occurrence. A
+                // delayed older clock says nothing about future-epoch evidence:
+                // it projects Uncertain so terminal pruning retains it (F3).
+                if *epoch > self.key.epoch {
                     p.lifecycle = EventLifecycle::Superseded;
+                    return p;
+                }
+                if *epoch < self.key.epoch {
                     return p;
                 }
                 *position_ns

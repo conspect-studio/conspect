@@ -1043,7 +1043,7 @@ pub struct Source {
 }
 
 /// Per-source event observation configuration (ADR-0183).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceEventsConfig {
     /// Whether HLS cue/DATERANGE/SCTE-35/ID3 observation runs for this source.
     /// Defaults to `true`: for an HLS source, observation is read-only parsing
@@ -1052,11 +1052,115 @@ pub struct SourceEventsConfig {
     /// opt out explicitly. This flag never arms automation.
     #[serde(default = "default_observe")]
     pub observe: bool,
+    /// Optional ad-break automation rule. Absent means no automation; present
+    /// but `armed = false` (the default) means configured but inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<EventAutomationRule>,
 }
 impl Default for SourceEventsConfig {
     fn default() -> Self {
-        Self { observe: true }
+        Self {
+            observe: true,
+            automation: None,
+        }
     }
+}
+
+/// Upper bound for [`EventAutomationRule::max_duration_s`] (24 h).
+pub const MAX_AUTOMATION_DURATION_S: u32 = 86_400;
+/// Upper bound on [`BreakStartAction::cells`] entries.
+pub const MAX_AUTOMATION_CELLS: usize = 64;
+/// Upper bound on a webhook URL's length in bytes.
+pub const MAX_WEBHOOK_URL_BYTES: usize = 2048;
+
+/// Per-source ad-break automation (ADR-0183): when this source enters a
+/// confirmed break, take a replacement; restore at break end. Disarmed by
+/// default; every effect goes through the management-plane executor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventAutomationRule {
+    /// Whether the rule acts. Defaults to `false` (disarmed).
+    #[serde(default)]
+    pub armed: bool,
+    /// What to take when a break starts.
+    pub on_break_start: BreakStartAction,
+    /// Restore the pre-break routing at the confirmed break end (default `true`).
+    #[serde(default = "default_true")]
+    pub restore_on_end: bool,
+    /// Watchdog: restore after this many seconds even without an end (default 600).
+    #[serde(default = "default_max_duration_s")]
+    pub max_duration_s: u32,
+    /// Optional `http://` hook that receives a small JSON `POST` on break start/end,
+    /// so external VT/automation systems can react. Dialled through the SSRF
+    /// guard with bounded timeouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
+/// The replacement taken at break start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakStartAction {
+    /// Where the replacement goes.
+    pub action: BreakActionKind,
+    /// A source id, or the reserved `"bars"` / `"bars_tone"` targets, which use
+    /// the first configured `bars` source (`bars_tone` also routes its 1 kHz
+    /// line-up tone onto this source's program-bus audio).
+    pub target: String,
+    /// Cells to replace; absent means every cell currently showing the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<String>>,
+}
+
+/// Break-start action kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakActionKind {
+    /// Swap the video of the cell(s) showing this source.
+    SwapCell,
+    /// Swap the cell(s) AND re-point this source's program-bus audio.
+    RouteProgram,
+}
+
+impl EventAutomationRule {
+    /// Validate bounds; does not resolve ids (they may be created later).
+    ///
+    /// # Errors
+    /// A message naming the violated rule.
+    pub fn validate(&self, source_id: &str) -> Result<(), String> {
+        let target = self.on_break_start.target.as_str();
+        if target.is_empty() || target.len() > 256 || target.chars().any(char::is_control) {
+            return Err("automation target must be a non-empty id".into());
+        }
+        if target == source_id {
+            return Err("automation target must differ from the source itself".into());
+        }
+        if !(1..=MAX_AUTOMATION_DURATION_S).contains(&self.max_duration_s) {
+            return Err(format!(
+                "automation max_duration_s must be 1..={MAX_AUTOMATION_DURATION_S}"
+            ));
+        }
+        if let Some(cells) = &self.on_break_start.cells {
+            if cells.len() > MAX_AUTOMATION_CELLS
+                || cells
+                    .iter()
+                    .any(|c| c.is_empty() || c.len() > 256 || c.chars().any(char::is_control))
+            {
+                return Err("automation cells must be at most 64 non-empty ids".into());
+            }
+        }
+        if let Some(url) = &self.webhook_url {
+            let lower = url.to_ascii_lowercase();
+            if url.len() > MAX_WEBHOOK_URL_BYTES
+                || !lower.starts_with("http://")
+                || url.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err("automation webhook_url must be an http:// URL".into());
+            }
+        }
+        Ok(())
+    }
+}
+fn default_max_duration_s() -> u32 {
+    600
 }
 fn default_observe() -> bool {
     true

@@ -44,6 +44,7 @@ pub mod alarm_store;
 pub mod audio_routing;
 pub mod audit;
 pub mod auth;
+pub mod automation;
 pub mod boot_model;
 pub mod command;
 pub mod concurrency;

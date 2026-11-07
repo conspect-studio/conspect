@@ -1440,6 +1440,16 @@ fn parse_fit(fit: Option<&str>) -> FitMode {
 }
 
 impl Source {
+    /// Validate the optional `events.automation` rule bounds (ADR-0183).
+    fn validate_automation(&self) -> Result<(), ConfigError> {
+        if let Some(rule) = self.events.as_ref().and_then(|e| e.automation.as_ref()) {
+            rule.validate(&self.id).map_err(|e| {
+                ConfigError::Validation(format!("source {:?} events.automation: {e}", self.id))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Validate this source's per-item semantics — the same checks
     /// [`MultiviewConfig::validate`] applies per source (id non-empty, GPU pin,
     /// solid hex colour, clock timezone bounds). Document-level rules
@@ -1459,6 +1469,7 @@ impl Source {
                 ConfigError::Validation(format!("source {:?} gpu_pin: {e}", self.id))
             })?;
         }
+        self.validate_automation()?;
         match &self.kind {
             SourceKind::Solid { color } => {
                 if parse_hex_color(color).is_none() {

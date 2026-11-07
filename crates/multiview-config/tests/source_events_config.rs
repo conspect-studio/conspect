@@ -61,7 +61,10 @@ fn events_observe_true_parses_and_round_trips_through_toml_and_json() {
         .expect("parse");
     assert_eq!(
         cfg.sources[0].events,
-        Some(SourceEventsConfig { observe: true })
+        Some(SourceEventsConfig {
+            observe: true,
+            automation: None
+        })
     );
     let json = cfg.to_json().expect("to_json");
     assert_eq!(
@@ -81,7 +84,10 @@ fn events_observe_false_parses_to_its_variant() {
         .expect("parse");
     assert_eq!(
         cfg.sources[0].events,
-        Some(SourceEventsConfig { observe: false })
+        Some(SourceEventsConfig {
+            observe: false,
+            automation: None
+        })
     );
 }
 
@@ -93,10 +99,60 @@ fn events_table_present_without_observe_defaults_true() {
     let cfg = MultiviewConfig::load_from_toml(&doc_with_events("events = {}")).expect("parse");
     assert_eq!(
         cfg.sources[0].events,
-        Some(SourceEventsConfig { observe: true })
+        Some(SourceEventsConfig {
+            observe: true,
+            automation: None
+        })
     );
     assert_eq!(
         SourceEventsConfig::default(),
-        SourceEventsConfig { observe: true }
+        SourceEventsConfig {
+            observe: true,
+            automation: None
+        }
     );
+}
+
+#[test]
+fn automation_rule_defaults_disarmed_and_round_trips() {
+    use multiview_config::schema::{BreakActionKind, EventAutomationRule};
+    let cfg = MultiviewConfig::load_from_toml(&doc_with_events(
+        "events = { automation = { on_break_start = { action = \"swap_cell\", target = \"bars\" } } }",
+    ))
+    .expect("parse");
+    let rule: &EventAutomationRule = cfg.sources[0]
+        .events
+        .as_ref()
+        .unwrap()
+        .automation
+        .as_ref()
+        .unwrap();
+    assert!(!rule.armed, "automation must default to disarmed");
+    assert!(rule.restore_on_end);
+    assert_eq!(rule.max_duration_s, 600);
+    assert_eq!(rule.on_break_start.action, BreakActionKind::SwapCell);
+    assert!(cfg.sources[0].events.as_ref().unwrap().observe);
+    let json = cfg.to_json().expect("to_json");
+    assert_eq!(MultiviewConfig::load_from_json(&json).expect("json"), cfg);
+    let toml_text = cfg.to_toml().expect("to_toml");
+    assert_eq!(
+        MultiviewConfig::load_from_toml(&toml_text).expect("toml"),
+        cfg
+    );
+}
+
+#[test]
+fn automation_rule_bounds_are_validated() {
+    for bad in [
+        "events = { automation = { on_break_start = { action = \"swap_cell\", target = \"in_0\" } } }",
+        "events = { automation = { max_duration_s = 0, on_break_start = { action = \"swap_cell\", target = \"bars\" } } }",
+        "events = { automation = { webhook_url = \"file:///etc/passwd\", on_break_start = { action = \"swap_cell\", target = \"bars\" } } }",
+        "events = { automation = { on_break_start = { action = \"explode\", target = \"bars\" } } }",
+    ] {
+        let parsed = MultiviewConfig::load_from_toml(&doc_with_events(bad));
+        assert!(
+            parsed.is_err() || parsed.unwrap().validate().is_err(),
+            "{bad} must be rejected"
+        );
+    }
 }

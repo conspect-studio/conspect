@@ -99,6 +99,10 @@ pub struct SpliceInsert {
     pub break_duration_90k: Option<u64>,
     /// Whether the break auto-returns to the network feed at duration end.
     pub auto_return: bool,
+    /// `program_splice_flag`: `true` for a whole-program splice. `false` means
+    /// component mode — only the listed elementary streams splice, so the cue
+    /// must never be projected as a whole-source break boundary (F4).
+    pub program_splice: bool,
 }
 
 /// A decoded `time_signal` command (a bare `splice_time`).
@@ -502,6 +506,8 @@ fn parse_splice_insert(reader: &mut BitReader<'_>) -> Result<SpliceInsert, ScteE
             pts_time_90k: None,
             break_duration_90k: None,
             auto_return: false,
+            // A cancel withdraws the whole event id regardless of mode.
+            program_splice: true,
         });
     }
     let out_of_network = reader.flag()?;
@@ -546,6 +552,7 @@ fn parse_splice_insert(reader: &mut BitReader<'_>) -> Result<SpliceInsert, ScteE
         pts_time_90k,
         break_duration_90k,
         auto_return,
+        program_splice,
     })
 }
 

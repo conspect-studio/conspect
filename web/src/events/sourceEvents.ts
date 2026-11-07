@@ -65,3 +65,66 @@ export function nanosecondsToSeconds(value: string): string | undefined {
   const fraction = (ns % 1_000_000_000n).toString().padStart(9, '0').replace(/0+$/, '');
   return `${(ns / 1_000_000_000n).toString()}${fraction === '' ? '' : `.${fraction}`}`;
 }
+
+export type AutomationView = components['schemas']['AutomationView'];
+export type AutomationRule = components['schemas']['EventAutomationRuleDoc'];
+
+const automationKey = (id: string): readonly unknown[] => ['inputs', id, 'events', 'automation'];
+
+async function problemDetail(response: Response): Promise<string | undefined> {
+  try {
+    const body: unknown = await response.clone().json();
+    if (typeof body === 'object' && body !== null && 'detail' in body && typeof body.detail === 'string') return body.detail;
+    if (typeof body === 'object' && body !== null && 'title' in body && typeof body.title === 'string') return body.title;
+  } catch { /* not a problem document */ }
+  return undefined;
+}
+
+/** Automation rule, live status and action log (polled while the dialog is open). */
+export function useAutomation(id: string) {
+  return useQuery({
+    queryKey: automationKey(id),
+    queryFn: async ({ signal }): Promise<AutomationView> => {
+      const { data, response } = await createApiClient().GET('/api/v1/inputs/{id}/events/automation', {
+        params: { path: { id } }, signal, cache: 'no-store',
+      });
+      if (!response.ok || data === undefined) {
+        throw new OperationApiError('Automation request failed', response.status, await problemDetail(response));
+      }
+      return data;
+    },
+    refetchInterval: 1000,
+    retry: false,
+    gcTime: 0,
+    staleTime: 0,
+  });
+}
+
+/** Arm/disarm/restore/save the rule; each returns the fresh automation view. */
+export type AutomationCommand =
+  | { readonly kind: 'arm' | 'disarm' | 'restore' }
+  | { readonly kind: 'save'; readonly rule: AutomationRule | null };
+
+export function useAutomationCommand(id: string): UseMutationResult<AutomationView, OperationApiError, AutomationCommand> {
+  const queryClient = useQueryClient();
+  return useMutation<AutomationView, OperationApiError, AutomationCommand>({
+    mutationFn: async (command): Promise<AutomationView> => {
+      const client = createApiClient();
+      const params = { params: { path: { id } } };
+      const result = command.kind === 'save'
+        ? await client.PUT('/api/v1/inputs/{id}/events/automation', { ...params, body: { rule: command.rule } })
+        : command.kind === 'arm'
+          ? await client.POST('/api/v1/inputs/{id}/events/automation/arm', params)
+          : command.kind === 'disarm'
+            ? await client.POST('/api/v1/inputs/{id}/events/automation/disarm', params)
+            : await client.POST('/api/v1/inputs/{id}/events/automation/restore', params);
+      if (!result.response.ok || result.data === undefined) {
+        throw new OperationApiError('Automation command failed', result.response.status, await problemDetail(result.response));
+      }
+      return result.data;
+    },
+    onSuccess: (view): void => {
+      queryClient.setQueryData(automationKey(id), view);
+    },
+  });
+}

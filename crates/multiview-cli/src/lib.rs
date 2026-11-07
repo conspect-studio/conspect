@@ -123,6 +123,8 @@ pub mod outputs;
 pub mod placement;
 pub mod preview;
 pub mod run;
+#[cfg(test)]
+mod source_event_automation_e2e;
 pub mod source_event_hls_bridge;
 pub mod source_event_ingest;
 pub mod source_event_packet;

@@ -234,10 +234,13 @@ where
     )
     .with_preview(preview)
     .with_warning_store(warnings);
+    let mut break_provider: Option<multiview_control::source_events::SharedSourceBreakProvider> =
+        None;
     if let Some(reader) = source_events {
         let reader = Arc::new(reader);
         let provider: Arc<dyn multiview_control::source_events::SourceEventProvider> =
             reader.clone();
+        break_provider = Some(reader.clone());
         let injector: Arc<dyn multiview_control::source_events::SourceEventTestInjector> = reader;
         state = state
             .with_source_events(provider)
@@ -404,7 +407,7 @@ where
     // `/api/v1/mesh/*` renders + toggles the live discovery state. `None` keeps the
     // empty always-on default (a store-only run / test). Control-plane only; the
     // store holds no engine handle and can never back-pressure the engine (inv #10).
-    let state = match mesh {
+    let mut state = match mesh {
         Some(mesh) => state.with_mesh(mesh),
         None => state,
     };
@@ -430,6 +433,13 @@ where
     // handle — promote there correctly skips suppression (nothing to suppress).
     if state.boot_model.is_some() {
         state.install_watch_handle(multiview_control::config_watch::ConfigWatchHandle::new());
+    }
+    // ADR-0183 ad-break automation executor: a management-plane tokio task that
+    // polls the source-event service and issues ordinary bounded bus commands.
+    // It never runs on (or blocks) the output clock; every rule is disarmed
+    // until an operator arms it.
+    if let Some(provider) = break_provider {
+        state = start_event_automation(state, provider);
     }
     // IPTV guide refresher (epg-playlist): one control-plane task that only
     // fetches while `[iptv] enabled`; never touches the engine (inv #1/#10).
@@ -603,6 +613,39 @@ fn device_poller_registry(
 /// unparseable entry logs a warning and falls back — fail-closed — to denying
 /// every allowlistable range (globally-routable hosts only), never silently
 /// widening back to the LAN default the operator was tightening away from.
+/// Build, bind and spawn the ADR-0183 automation executor; returns the state
+/// carrying it so the routes can read status and trigger manual restores.
+fn start_event_automation(
+    state: AppState,
+    provider: multiview_control::source_events::SharedSourceBreakProvider,
+) -> AppState {
+    use multiview_control::automation::{
+        http_webhook_sink, AutomationExecutor, CommandSink, StateConfigProvider,
+    };
+    let config = Arc::new(StateConfigProvider::new());
+    config.bind(state.clone());
+    let audit_state = state.clone();
+    let audit: multiview_control::automation::AuditSink = Arc::new(move |id, detail| {
+        audit_state.audit(
+            "automation",
+            multiview_control::audit::AuditAction::Command,
+            "source",
+            id,
+            Some(detail),
+        );
+    });
+    let sink: Arc<dyn CommandSink> = Arc::new(state.commands.clone());
+    let executor = Arc::new(AutomationExecutor::new(
+        provider,
+        sink,
+        config,
+        audit,
+        Some(http_webhook_sink(Arc::clone(&state.dial_policy))),
+    ));
+    let _task = executor.spawn();
+    state.with_automation(executor)
+}
+
 fn device_dial_policy(
     control: Option<&multiview_config::ControlConfig>,
 ) -> Arc<multiview_config::device::net_guard::DialPolicy> {

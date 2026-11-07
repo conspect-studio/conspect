@@ -117,6 +117,10 @@ impl ScteSourceEventAdapter {
             self.diagnostics.invalid_identity = self.diagnostics.invalid_identity.saturating_add(1);
             return Ok(out);
         }
+        if component_only(&section) {
+            self.diagnostics.unsupported = self.diagnostics.unsupported.saturating_add(1);
+            return Ok(out);
+        }
         for event in section.normalized_cue_events() {
             let cue = event.cue;
             let edge = semantic_edge(&event);
@@ -228,6 +232,15 @@ impl ScteSourceEventAdapter {
         }
         out
     }
+}
+/// F4: a component-mode `splice_insert` only splices the listed elementary
+/// streams. Component semantics are not represented in source events, so it
+/// must never become a whole-source Start/End boundary.
+fn component_only(section: &SpliceInfoSection) -> bool {
+    matches!(
+        section.command,
+        crate::scte::splice35::SpliceCommand::Insert(insert) if !insert.program_splice
+    )
 }
 fn asset_identity(u: &crate::scte::splice35::SegmentationUpid) -> String {
     use std::fmt::Write;
