@@ -1,3 +1,5 @@
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import type { UseMutationResult } from '@tanstack/react-query';
 import { useQuery } from '@tanstack/react-query';
 import { createApiClient } from '../api/client';
 import { OperationApiError } from '../api/operations';
@@ -24,6 +26,34 @@ export function useSourceEvents(id: string) {
     retry: false,
     gcTime: 0,
     staleTime: 0,
+  });
+}
+
+/** Operator test-injection request body (ADR-0183 item 5). */
+export interface TestEventRequest {
+  boundary: 'start' | 'end';
+  duration_ns?: number;
+}
+
+/**
+ * Inject a clearly-labelled synthetic event for this source (administer
+ * role). Invalidates the live `useSourceEvents` query on success so an open
+ * panel reflects the injected evidence on its next poll.
+ */
+export function useInjectTestEvent(id: string): UseMutationResult<undefined, OperationApiError, TestEventRequest> {
+  const queryClient = useQueryClient();
+  return useMutation<undefined, OperationApiError, TestEventRequest>({
+    mutationFn: async (body): Promise<undefined> => {
+      const { response } = await createApiClient().POST('/api/v1/inputs/{id}/events/test', {
+        params: { path: { id } },
+        body,
+      });
+      if (!response.ok) throw new OperationApiError('Test event injection failed', response.status);
+      return undefined;
+    },
+    onSuccess: (): void => {
+      void queryClient.invalidateQueries({ queryKey: ['inputs', id, 'events'] });
+    },
   });
 }
 

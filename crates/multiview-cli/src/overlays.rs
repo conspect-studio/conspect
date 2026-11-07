@@ -1847,7 +1847,7 @@ mod tests {
                 .unwrap();
             let added = &rendered.primitives[baseline.primitives.len()..];
             if geom.width < MIN_TILE_PX || geom.height <= 48 {
-                assert!(added.is_empty());
+                assert_eq!(added, []);
             } else {
                 assert!(added.len() > 1);
             }

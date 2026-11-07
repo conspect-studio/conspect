@@ -34,6 +34,7 @@ import {
   DialogTitle,
 } from '../components/ui/dialog';
 import { PreviewSurface } from '../preview/PreviewSurface';
+import { SourceEventsButton } from '../events/SourceEventsButton';
 import { programFidelity, usePreviewCapabilities } from '../preview/capabilities';
 import type { ProgramFidelity } from '../preview/capabilities';
 import { useJpegPreview } from '../preview/useJpegPreview';
@@ -295,7 +296,10 @@ function InputThumbnail(props: {
           <code className="truncate text-xs" lang="" dir="auto">
             {props.id}
           </code>
-          {props.tile !== undefined ? <TileStateBadge state={props.tile.state} /> : null}
+          <div className="flex items-center gap-2">
+            {props.tile !== undefined ? <TileStateBadge state={props.tile.state} /> : null}
+            <SourceEventsButton id={props.id} name={props.id} />
+          </div>
         </CardContent>
       </Card>
 

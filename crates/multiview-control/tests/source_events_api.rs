@@ -2,11 +2,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 use axum::http::StatusCode;
 use multiview_control::source_events::{
-    SourceEventAvailability, SourceEventProvider, SourceEventsDto,
+    SourceEventAvailability, SourceEventProvider, SourceEventTestInjector, SourceEventsDto,
+    TestEventBoundary, TestEventOutcome,
 };
 use std::sync::{Arc, Mutex};
 mod support;
-use support::{body_json, get, harness, harness_with, send, SCOPED_TOKEN, VIEWER_TOKEN};
+use support::{
+    body_json, get, harness, harness_with, post_json, send, ADMIN_TOKEN, OPERATOR_TOKEN,
+    SCOPED_TOKEN, VIEWER_TOKEN,
+};
 
 #[derive(Default)]
 struct Spy {
@@ -257,4 +261,126 @@ async fn unavailable_unknown_and_empty_are_distinct() {
     assert_eq!(body["epoch"], "9007199254740993");
     assert_eq!(body["events"], serde_json::json!([]));
     assert_eq!(body["availability"], "available");
+}
+
+#[derive(Default)]
+struct InjectorSpy {
+    calls: Mutex<Vec<(String, TestEventBoundary)>>,
+}
+impl SourceEventTestInjector for InjectorSpy {
+    fn inject_test_event(&self, id: &str, boundary: TestEventBoundary) -> TestEventOutcome {
+        self.calls.lock().unwrap().push((id.to_owned(), boundary));
+        match id {
+            "unknown" => TestEventOutcome::Unknown,
+            "full" => TestEventOutcome::Overflow,
+            _ => TestEventOutcome::Queued,
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_injection_requires_administer_role_and_object_scope() {
+    let spy = Arc::new(InjectorSpy::default());
+    let h = harness_with(|s| s.with_source_event_test_injector(spy.clone()));
+    let body = serde_json::json!({ "boundary": "start" });
+    for (token, id, status) in [
+        ("", "cam", StatusCode::UNAUTHORIZED),
+        (VIEWER_TOKEN, "cam", StatusCode::FORBIDDEN),
+        (OPERATOR_TOKEN, "cam", StatusCode::FORBIDDEN),
+        (SCOPED_TOKEN, "cam", StatusCode::FORBIDDEN),
+    ] {
+        let response = send(
+            &h.router,
+            post_json(&format!("/api/v1/inputs/{id}/events/test"), token, &body),
+        )
+        .await;
+        assert_eq!(response.status(), status, "token {token:?} id {id:?}");
+    }
+    assert!(spy.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_injection_is_unavailable_without_an_adapter() {
+    let h = harness();
+    let response = send(
+        &h.router,
+        post_json(
+            "/api/v1/inputs/cam/events/test",
+            ADMIN_TOKEN,
+            &serde_json::json!({ "boundary": "start" }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_injection_distinguishes_queued_unknown_and_overflow() {
+    let spy = Arc::new(InjectorSpy::default());
+    let h = harness_with(|s| s.with_source_event_test_injector(spy.clone()));
+    let queued = send(
+        &h.router,
+        post_json(
+            "/api/v1/inputs/cam/events/test",
+            ADMIN_TOKEN,
+            &serde_json::json!({ "boundary": "start", "duration_ns": 30_000_000_000_i64 }),
+        ),
+    )
+    .await;
+    assert_eq!(queued.status(), StatusCode::ACCEPTED);
+    let end = send(
+        &h.router,
+        post_json(
+            "/api/v1/inputs/cam/events/test",
+            ADMIN_TOKEN,
+            &serde_json::json!({ "boundary": "end" }),
+        ),
+    )
+    .await;
+    assert_eq!(end.status(), StatusCode::ACCEPTED);
+    let unknown = send(
+        &h.router,
+        post_json(
+            "/api/v1/inputs/unknown/events/test",
+            ADMIN_TOKEN,
+            &serde_json::json!({ "boundary": "start" }),
+        ),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let full = send(
+        &h.router,
+        post_json(
+            "/api/v1/inputs/full/events/test",
+            ADMIN_TOKEN,
+            &serde_json::json!({ "boundary": "start" }),
+        ),
+    )
+    .await;
+    assert_eq!(full.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let calls = spy.calls.lock().unwrap();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[0].0, "cam");
+    assert_eq!(
+        calls[0].1,
+        TestEventBoundary::Start {
+            duration_ns: Some(30_000_000_000)
+        }
+    );
+    assert_eq!(calls[1].1, TestEventBoundary::End);
+}
+
+#[cfg(feature = "openapi")]
+#[test]
+fn openapi_exposes_the_test_injection_route() {
+    use utoipa::OpenApi;
+    let spec = serde_json::to_value(multiview_control::openapi::ApiDoc::openapi()).unwrap();
+    let operation = &spec["paths"]["/api/v1/inputs/{id}/events/test"]["post"];
+    assert_eq!(
+        operation["security"][0]["bearer_auth"],
+        serde_json::json!([])
+    );
+    for status in ["202", "401", "403", "404", "503"] {
+        assert!(operation["responses"][status].is_object());
+    }
 }

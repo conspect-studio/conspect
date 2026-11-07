@@ -1070,6 +1070,10 @@ fn resource_router() -> Router<AppState> {
         // input offers, projected from the off-engine cached snapshot (inv #10).
         .route("/inputs/{id}/streams", get(inputs::get_input_streams))
         .route("/inputs/{id}/events", get(source_events::get_source_events))
+        .route(
+            "/inputs/{id}/events/test",
+            post(source_events::post_source_event_test),
+        )
         // Outputs resource CRUD (managed sinks/servers), mirroring layouts.
         .route("/outputs", get(outputs::list_outputs))
         .route(

@@ -1292,7 +1292,11 @@ mod tests {
             Some("original")
         );
         assert!(begin_generation(id) > generation);
-        observe_playlist(&active, &AtomicBool::new(false), &Default::default());
+        observe_playlist(
+            &active,
+            &AtomicBool::new(false),
+            &multiview_input::hls::PlaylistCueMetadata::default(),
+        );
         assert_eq!(observations.lock().unwrap().len(), 0);
     }
 
@@ -1410,7 +1414,11 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         worker.join().unwrap();
         retirement.join().unwrap();
-        observe_playlist(&gate, &AtomicBool::new(false), &Default::default());
+        observe_playlist(
+            &gate,
+            &AtomicBool::new(false),
+            &multiview_input::hls::PlaylistCueMetadata::default(),
+        );
         assert!(evidence.lock().unwrap().is_empty());
         assert!(gate.lock().unwrap().is_none());
     }
@@ -1455,7 +1463,7 @@ mod tests {
     fn listing(seqs: std::ops::Range<u64>) -> OriginPlaylist {
         OriginPlaylist {
             target_duration: 6.0,
-            cue_metadata: Default::default(),
+            cue_metadata: multiview_input::hls::PlaylistCueMetadata::default(),
             segments: seqs
                 .map(|seq| OriginSegment {
                     seq,

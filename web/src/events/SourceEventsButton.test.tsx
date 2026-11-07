@@ -21,8 +21,13 @@ beforeAll(() => { server.listen({ onUnhandledRequest: 'error' }); });
 afterEach(() => { server.resetHandlers(); vi.useRealTimers(); });
 afterAll(() => { server.close(); });
 const endpoint = '*/api/v1/inputs/:id/events';
-async function open() {
-  const view = renderWithProviders(<SourceEventsButton id="source-a" name="Camera A" />);
+const testEndpoint = '*/api/v1/inputs/:id/events/test';
+async function open(eventObservation?: 'observing' | 'disabled' | 'not_supported') {
+  const view = renderWithProviders(
+    eventObservation === undefined
+      ? <SourceEventsButton id="source-a" name="Camera A" />
+      : <SourceEventsButton id="source-a" name="Camera A" eventObservation={eventObservation} />,
+  );
   await userEvent.click(screen.getByRole('button', { name: 'Events: Camera A' }));
   return view;
 }
@@ -127,5 +132,68 @@ describe('read-only source events', () => {
     view.rerender(<SourceEventsButton id="source-b" name="Camera B" />);
     expect(screen.queryByText('cue-1')).not.toBeInTheDocument();
     await waitFor(() => { expect(screen.getByText(/No source events in the current server snapshot/)).toBeInTheDocument(); });
+  });
+
+  it.each([
+    ['observing' as const, /Observing: HLS cue\/DATERANGE/],
+    ['disabled' as const, /Observation disabled for this source/],
+    ['not_supported' as const, /Not supported for this source kind/],
+  ])('shows the per-source observation status honestly (%s)', async (status, pattern) => {
+    server.use(http.get(endpoint, () => HttpResponse.json(snapshot([]))));
+    await open(status);
+    await screen.findByText(pattern);
+  });
+
+  it('explains what the empty state means for an observing source', async () => {
+    server.use(http.get(endpoint, () => HttpResponse.json(snapshot([]))));
+    await open('observing');
+    expect(await screen.findByText(/a badge\/countdown overlay will appear automatically/)).toBeInTheDocument();
+  });
+});
+
+describe('test-injection aid (admin only, clearly labelled)', () => {
+  it('labels the controls as a test aid and injects start/end requests', async () => {
+    let lastBody: unknown;
+    server.use(
+      http.get(endpoint, () => HttpResponse.json(snapshot([]))),
+      http.post(testEndpoint, async ({ request }) => {
+        lastBody = await request.json();
+        return new HttpResponse(null, { status: 202 });
+      }),
+    );
+    await open('observing');
+    expect(screen.getByText(/Test aid \(admin only\) — not live evidence/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Inject test break start (30s)' }));
+    await waitFor(() => {
+      expect(lastBody).toEqual({ boundary: 'start', duration_ns: 30_000_000_000 });
+    });
+    await userEvent.click(screen.getByRole('button', { name: 'Inject test break end' }));
+    await waitFor(() => {
+      expect(lastBody).toEqual({ boundary: 'end' });
+    });
+  });
+
+  it.each([
+    [403, /Administer role required/],
+    [503, /Test injection is unavailable/],
+    [404, /This source has never been active/],
+  ])('reports test-injection failure %s honestly', async (status, pattern) => {
+    server.use(
+      http.get(endpoint, () => HttpResponse.json(snapshot([]))),
+      http.post(testEndpoint, () => new HttpResponse(null, { status })),
+    );
+    await open('observing');
+    await userEvent.click(screen.getByRole('button', { name: 'Inject test break start (30s)' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(pattern);
+  });
+
+  it('renders a TEST badge on an injected (external-origin, test:-prefixed) event row', async () => {
+    server.use(http.get(endpoint, () => HttpResponse.json(snapshot([
+      row({ event_id: 'test:break', origin: 'external', lifecycle: 'active' }),
+    ]))));
+    await open('observing');
+    await screen.findByText('test:break');
+    expect(screen.getByText('Test')).toBeInTheDocument();
+    expect(screen.getByText(/External evidence \(test injection or authenticated hook\)/)).toBeInTheDocument();
   });
 });

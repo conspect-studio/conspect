@@ -235,7 +235,13 @@ where
     .with_preview(preview)
     .with_warning_store(warnings);
     if let Some(reader) = source_events {
-        state = state.with_source_events(Arc::new(reader));
+        let reader = Arc::new(reader);
+        let provider: Arc<dyn multiview_control::source_events::SourceEventProvider> =
+            reader.clone();
+        let injector: Arc<dyn multiview_control::source_events::SourceEventTestInjector> = reader;
+        state = state
+            .with_source_events(provider)
+            .with_source_event_test_injector(injector);
     }
     // Stored layouts persist across restarts (#176): seeding installs a fresh
     // in-memory store holding the config's working layout; move that layout into

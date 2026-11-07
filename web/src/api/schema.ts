@@ -829,6 +829,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/inputs/{id}/events/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/inputs/{id}/events/test` — inject a clearly-labelled synthetic
+         *     event for operator/automation testing (ADR-0183 item 5; role: administer).
+         * @description This can only affect a source that already has an ACTIVE event-tracking
+         *     generation (a source the running engine has ingested, live or previously
+         *     connected) — it never allocates a new source identity or epoch, and the
+         *     injected evidence is tagged `origin: "external"` with a `test:` event id
+         *     prefix so it is unmistakably distinguishable from real evidence in the
+         *     API/UI. It never bypasses the bounded worker queue or payload limits real
+         *     evidence uses.
+         */
+        post: operations["post_source_event_test"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/inputs/{id}/streams": {
         parameters: {
             query?: never;
@@ -5513,6 +5540,21 @@ export interface components {
             /** @description The schema version (stable across machine + portal). */
             version: string;
         };
+        /** @description Request body for the operator test-injection aid. */
+        TestEventRequest: {
+            /** @description `"start"` or `"end"` — see [`TestEventBoundary`]. */
+            boundary: components["schemas"]["TestEventRequestBoundary"];
+            /**
+             * Format: int64
+             * @description Declared break duration in nanoseconds (only meaningful for `"start"`).
+             */
+            duration_ns?: number | null;
+        };
+        /**
+         * @description Wire boundary selector, internally tagged (never untagged).
+         * @enum {string}
+         */
+        TestEventRequestBoundary: "start" | "end";
         /**
          * @description A ticket: a `CS-xxxx` id, the subject + severity, the auto-attached machine
          *     context, an append-only update thread (opening body first), and the route +
@@ -7826,6 +7868,67 @@ export interface operations {
                 };
             };
             /** @description Source event provider unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    post_source_event_test: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact source identity; no suffix normalization */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TestEventRequest"];
+            };
+        };
+        responses: {
+            /** @description Synthetic observation accepted into the bounded worker queue. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid credentials */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source outside principal scope, or insufficient role */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Unknown or never-active source */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Source event test-injection adapter unavailable, or the queue is full */
             503: {
                 headers: {
                     [name: string]: unknown;

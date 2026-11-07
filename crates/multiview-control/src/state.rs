@@ -722,6 +722,10 @@ pub struct AppState {
     pub preview: crate::preview::SharedPreview,
     /// Optional read-only source-event adapter; absent until wired by the binary.
     pub source_events: Option<crate::source_events::SharedSourceEvents>,
+    /// Optional operator test-injection adapter (ADR-0183 item 5); absent
+    /// until wired by the binary. Administer-only; never a general evidence
+    /// submission surface.
+    pub source_event_test_injector: Option<crate::source_events::SharedSourceEventTestInjector>,
     /// The WHEP focus transport seam (sub-second WebRTC focus per scope). The
     /// default ([`NoWhep`](crate::preview::NoWhep)) refuses every focus with an
     /// honest `503 fallback`; the binary swaps in a transport-backed provider
@@ -987,6 +991,7 @@ impl AppState {
             ack_clock: Arc::new(system_ack_clock),
             preview: crate::preview::no_preview(),
             source_events: None,
+            source_event_test_injector: None,
             whep: crate::preview::no_whep(),
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
@@ -1237,6 +1242,16 @@ impl AppState {
         provider: crate::source_events::SharedSourceEvents,
     ) -> Self {
         self.source_events = Some(provider);
+        self
+    }
+
+    /// Attach the operator test-injection adapter (ADR-0183 item 5).
+    #[must_use]
+    pub fn with_source_event_test_injector(
+        mut self,
+        injector: crate::source_events::SharedSourceEventTestInjector,
+    ) -> Self {
+        self.source_event_test_injector = Some(injector);
         self
     }
 

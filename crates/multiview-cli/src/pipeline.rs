@@ -2333,7 +2333,9 @@ impl Pipeline {
             // Reserve the authoritative epoch before either startup rail starts.
             // Old detached publishers from a previous run retain their old token.
             plan.lifecycle = begin_live_lifecycle(&source.id);
-            plan.source_events = source_events.activate(&source.id, plan.lifecycle);
+            plan.source_events = source_events_enabled(source)
+                .then(|| source_events.activate(&source.id, plan.lifecycle))
+                .flatten();
 
             // Stamp this source's NDI license acceptance from `[system.ndi]`
             // (ADR-0008 §7.5), like `cuda_ordinal` below — the per-source drive
@@ -7099,7 +7101,9 @@ impl LiveIngestSpawner {
         };
         plan.output_origin = Arc::clone(&self.output_origin);
         plan.lifecycle = lifecycle;
-        plan.source_events = self.source_events.activate(&source.id, lifecycle);
+        plan.source_events = source_events_enabled(&source)
+            .then(|| self.source_events.activate(&source.id, lifecycle))
+            .flatten();
         #[cfg(feature = "overlay")]
         {
             // The hub worker stopped old readers. Use the SAME lifecycle token
@@ -10598,6 +10602,24 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
     })
 }
 
+/// Whether source-linked event observation (ADR-0183) should activate for this
+/// source: only HLS/`YouTube` (an HLS wrapper, ADR-0015) carry the cue
+/// surfaces this tracker understands (`EXT-X-DATERANGE`, SCTE-35, timed ID3,
+/// vendor `EXT-X-ASSET`), so every other kind never activates regardless of
+/// the per-source `events` config. For an HLS/`YouTube` source, `observe`
+/// defaults to `true`: the watcher only reads metadata the fetch/demux path
+/// already receives on this branch (no extra network request, no extra disk
+/// write, bounded off-clock parse cost per the ADR-0183 ledger's stress
+/// numbers) — not a default cost, so default-on is the honest posture.
+/// Automation stays disarmed independently of this flag.
+fn source_events_enabled(source: &Source) -> bool {
+    let hls_like = matches!(
+        source.kind,
+        SourceKind::Hls { .. } | SourceKind::Youtube { .. }
+    );
+    hls_like && source.events.is_none_or(|events| events.observe)
+}
+
 /// Resolve a `bars` synthetic source's **line-up tone** plan (AUD-5): the source
 /// id + the output cadence the 1 kHz reference tone is paced to.
 ///
@@ -10616,6 +10638,64 @@ fn tone_ingest_plan_for(
             cadence,
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod source_events_enabled_tests {
+    use super::{source_events_enabled, Source};
+
+    /// Build a `Source` via serde (the type is `#[non_exhaustive]`, so a struct
+    /// literal is not available cross-module — config is produced by
+    /// deserialization anyway).
+    fn source(json: serde_json::Value) -> Source {
+        serde_json::from_value(json).expect("source deserializes")
+    }
+
+    #[test]
+    fn hls_defaults_to_observing_when_events_is_absent() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "hls", "url": "https://example.com/index.m3u8",
+        }));
+        assert!(source_events_enabled(&s));
+    }
+
+    #[test]
+    fn hls_respects_an_explicit_opt_out() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "hls", "url": "https://example.com/index.m3u8",
+            "events": { "observe": false },
+        }));
+        assert!(!source_events_enabled(&s));
+    }
+
+    #[test]
+    fn hls_respects_an_explicit_opt_in() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "hls", "url": "https://example.com/index.m3u8",
+            "events": { "observe": true },
+        }));
+        assert!(source_events_enabled(&s));
+    }
+
+    #[test]
+    fn non_hls_kinds_never_observe_even_with_an_explicit_opt_in() {
+        let bars = source(serde_json::json!({
+            "id": "s", "kind": "bars", "events": { "observe": true },
+        }));
+        assert!(!source_events_enabled(&bars));
+        let solid = source(serde_json::json!({
+            "id": "s", "kind": "solid", "color": "#000000", "events": { "observe": true },
+        }));
+        assert!(!source_events_enabled(&solid));
+    }
+
+    #[test]
+    fn youtube_defaults_to_observing_as_an_hls_wrapper() {
+        let s = source(serde_json::json!({
+            "id": "s", "kind": "youtube", "url": "https://www.youtube.com/watch?v=abcdEFGH123",
+        }));
+        assert!(source_events_enabled(&s));
     }
 }
 
@@ -12672,7 +12752,7 @@ fn open_and_stream(
                             events.ingest(&packet.packet.bytes, mapping);
                         }
                         crate::source_event_packet::MetadataKind::Scte35 => {
-                            events.observe_scte_untimed(&packet.packet.bytes)
+                            events.observe_scte_untimed(&packet.packet.bytes);
                         }
                     }
                 }

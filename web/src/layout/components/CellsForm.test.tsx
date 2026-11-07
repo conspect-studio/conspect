@@ -18,8 +18,8 @@ import type { SourceView } from '../../resources/types';
 import { renderWithProviders } from '../../test/render';
 
 const SOURCES: readonly SourceView[] = [
-  { id: 'cam-1', name: 'Camera One', kind: 'rtsp', rawKind: 'rtsp', editable: true, locator: 'rtsp://cam-1' },
-  { id: 'cam-2', name: 'Camera Two', kind: 'rtsp', rawKind: 'rtsp', editable: true, locator: 'rtsp://cam-2' },
+  { id: 'cam-1', name: 'Camera One', kind: 'rtsp', rawKind: 'rtsp', editable: true, locator: 'rtsp://cam-1', eventObservation: 'not_supported' },
+  { id: 'cam-2', name: 'Camera Two', kind: 'rtsp', rawKind: 'rtsp', editable: true, locator: 'rtsp://cam-2', eventObservation: 'not_supported' },
 ];
 
 function seeded() {
