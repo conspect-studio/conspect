@@ -978,7 +978,8 @@ mod tests {
         const SAFETY_TIMEOUT: Duration = Duration::from_secs(120);
         // Count bound for each servicing-effect phase: give up (and fail on
         // the phase's assertion) after this many further exhausted budgets.
-        const SERVICE_EXHAUSTION_CAP: u64 = 20_000;
+        // Correct code needs 0-3 per phase (measured), so this is >300x slack.
+        const SERVICE_EXHAUSTION_CAP: u64 = 1_000;
         // An idle-tick period no test run approaches, so the tick arm fires
         // exactly once (immediately, before any command is queued).
         const HANDOFF_ONLY_TICK: Duration = Duration::from_secs(3600);
@@ -1110,17 +1111,26 @@ mod tests {
         // queued strictly AFTER the idle tick's one immediate firing and after
         // the flood has demonstrably reached the handoff path (PR193-02-R2).
         let saturated = tokio::time::timeout(SAFETY_TIMEOUT, async {
-            while probe.recv_budgets_exhausted.load(Ordering::Relaxed) < TARGET_EXHAUSTIONS
-                || probe.handoff_services.load(Ordering::Relaxed) == 0
-            {
+            while probe.recv_budgets_exhausted.load(Ordering::Relaxed) < TARGET_EXHAUSTIONS {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await;
         assert!(
             saturated.is_ok(),
-            "the flood must exhaust {TARGET_EXHAUSTIONS} receive budgets and \
-             complete a handoff before any command is queued (hang guard hit)"
+            "the flood must exhaust {TARGET_EXHAUSTIONS} receive budgets (hang \
+             guard hit: the flood never saturated or the driver wedged)"
+        );
+        let first_handoff =
+            within_exhaustions(&probe, SERVICE_EXHAUSTION_CAP, SAFETY_TIMEOUT, || {
+                probe.handoff_services.load(Ordering::Relaxed) > 0
+            })
+            .await;
+        assert!(
+            first_handoff,
+            "no exhaustion handoff completed within {SERVICE_EXHAUSTION_CAP} \
+             exhausted budgets: the handoff is missing or returns early \
+             (invariant #10 BLOCKER)"
         );
 
         // Mid-flood Register: ONLY a handoff can drain it now.
