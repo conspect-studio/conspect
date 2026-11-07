@@ -1,4 +1,5 @@
-// Weather — BOM forecast/observation locations and weather graphics.
+// Graphics → Data: data sources. Today the only provider is BOM weather
+// (the former Weather page, moved here unchanged in behaviour).
 //
 // Lists the configured locations (`GET /api/v1/weather/locations`) with their
 // fetch status and freshness, an add/edit form (NSW presets verified against
@@ -23,20 +24,19 @@ import {
   observationOf,
   putWeatherLocation,
   weatherSourceBody,
-} from '../api/weather';
+} from '../../api/weather';
 import type {
   OperationApiError,
   WeatherLocationInput,
   WeatherLocationView,
   WeatherTemplate,
-} from '../api/weather';
-import { PageHeader } from '../components/PageHeader';
-import { Badge } from '../components/ui/badge';
-import type { BadgeProps } from '../components/ui/badge';
-import { Button } from '../components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
-import { Input } from '../components/ui/input';
-import { Label } from '../components/ui/label';
+} from '../../api/weather';
+import { Badge } from '../../components/ui/badge';
+import type { BadgeProps } from '../../components/ui/badge';
+import { Button } from '../../components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/card';
+import { Input } from '../../components/ui/input';
+import { Label } from '../../components/ui/label';
 import {
   Table,
   TableBody,
@@ -45,8 +45,8 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from '../components/ui/table';
-import { toast } from '../components/ui/use-toast';
+} from '../../components/ui/table';
+import { toast } from '../../components/ui/use-toast';
 
 const weatherKeys = { list: ['weather-locations'] as const };
 
@@ -118,7 +118,7 @@ function when(iso: string | null | undefined): string {
 }
 
 /** The weather locations page. */
-export function WeatherPage(): JSX.Element {
+export function DataView(): JSX.Element {
   const { t } = useLingui();
   const queryClient = useQueryClient();
   const locations = useQuery<WeatherLocationView[], OperationApiError>({
@@ -221,15 +221,13 @@ export function WeatherPage(): JSX.Element {
 
   return (
     <div>
-      <PageHeader
-        title={<Trans>Weather</Trans>}
-        description={
-          <Trans>
-            Bureau of Meteorology forecasts and observations, fetched by the server at most every
-            10 minutes per product. Every graphic shows “Source: Bureau of Meteorology”.
-          </Trans>
-        }
-      />
+      <p className="mb-4 text-sm text-muted-foreground">
+        <Trans>
+          Data sources feed graphics templates. Bureau of Meteorology weather (bom_weather) is
+          fetched by the server at most every 10 minutes per product; every weather graphic shows
+          “Source: Bureau of Meteorology”. More providers (RSS news) plug in here later.
+        </Trans>
+      </p>
 
       <Card className="mb-6">
         <CardHeader>

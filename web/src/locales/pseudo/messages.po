@@ -13,7 +13,7 @@ msgstr ""
 "Language-Team: \n"
 "Plural-Forms: \n"
 
-#: src/pages/WeatherPage.tsx:485
+#: src/pages/graphics/DataView.tsx:483
 msgid "“Create … source” makes an opaque graphic with a dark gradient. For a video background, tick “transparent background” before creating the source: its panels and text then carry a real alpha channel (NV12 + alpha) and everything else is clear."
 msgstr ""
 
@@ -41,12 +41,12 @@ msgstr ""
 #. placeholder {0}: f.area_name
 #. placeholder {1}: f.product
 #. placeholder {2}: f.issued_local ?? f.issued_utc
-#: src/pages/WeatherPage.tsx:524
+#: src/pages/graphics/DataView.tsx:522
 msgid "{0} · {1} issued {2}"
 msgstr ""
 
 #. placeholder {0}: view.location.name
-#: src/pages/WeatherPage.tsx:183
+#: src/pages/graphics/DataView.tsx:183
 msgid "{0} 7-day weather"
 msgstr ""
 
@@ -69,7 +69,7 @@ msgid "{0} documentation results"
 msgstr ""
 
 #. placeholder {0}: view.location.name
-#: src/pages/WeatherPage.tsx:184
+#: src/pages/graphics/DataView.tsx:184
 msgid "{0} today weather"
 msgstr ""
 
@@ -528,6 +528,14 @@ msgstr ""
 msgid "About tile lifecycle states"
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:471
+msgid "Accent"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:145
+msgid "Accent colour (#RRGGBB, optional)"
+msgstr ""
+
 #: src/pages/SourcesPage.tsx:288
 msgid "Accept the publisher's audio (Opus)"
 msgstr ""
@@ -578,6 +586,7 @@ msgstr ""
 #: src/pages/AudioPage.tsx:443
 #: src/pages/CastPage.tsx:320
 #: src/pages/DevicesPage.tsx:634
+#: src/pages/graphics/DataView.tsx:364
 #: src/pages/LayoutsPage.tsx:86
 #: src/pages/OutputsPage.tsx:713
 #: src/pages/OverlaysPage.tsx:194
@@ -585,7 +594,6 @@ msgstr ""
 #: src/pages/SourcesPage.tsx:885
 #: src/pages/SyncGroupsPage.tsx:295
 #: src/pages/TallyPage.tsx:367
-#: src/pages/WeatherPage.tsx:366
 msgid "Actions"
 msgstr ""
 
@@ -619,6 +627,7 @@ msgid "Actor"
 msgstr ""
 
 #: src/layout/components/SourcePalette.tsx:103
+#: src/pages/graphics/PlayoutView.tsx:447
 msgid "Add"
 msgstr ""
 
@@ -643,8 +652,8 @@ msgstr ""
 msgid "Add column"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:237
-#: src/pages/WeatherPage.tsx:309
+#: src/pages/graphics/DataView.tsx:235
+#: src/pages/graphics/DataView.tsx:307
 msgid "Add location"
 msgstr ""
 
@@ -662,6 +671,10 @@ msgstr ""
 
 #: src/layout/components/SourcePalette.tsx:159
 msgid "Add to layout"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:424
+msgid "Add to rundown"
 msgstr ""
 
 #: src/pages/CastPage.tsx:256
@@ -833,6 +846,10 @@ msgstr ""
 
 #: src/pages/docs/concepts/TransportsPage.tsx:241
 msgid "An honest comparison — figures are typical classes, not guarantees; the network you run on dominates:"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:107
+msgid "An item is a template bound to data with a style — the thing you cue and take to air."
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:386
@@ -1147,6 +1164,11 @@ msgstr ""
 msgid "Backends"
 msgstr ""
 
+#: src/pages/graphics/LibraryView.tsx:138
+#: src/pages/graphics/PlayoutView.tsx:469
+msgid "Background"
+msgstr ""
+
 #: src/pages/docs/ConfigPage.tsx:94
 msgid "Background fill as a hex color (e.g. #101014)."
 msgstr ""
@@ -1191,7 +1213,7 @@ msgstr ""
 msgid "Bind device stream as a source"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:189
+#: src/pages/graphics/DataView.tsx:189
 msgid "Bind it to a cell on the Layouts page, or preview it on Sources."
 msgstr ""
 
@@ -1229,7 +1251,7 @@ msgstr ""
 msgid "Blocking"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:500
+#: src/pages/graphics/DataView.tsx:498
 msgid "BOM daily forecasts carry seven days and no hourly or morning/afternoon breakdown, so the “today” graphic shows the day’s forecast with the latest observation, never invented values."
 msgstr ""
 
@@ -1323,10 +1345,6 @@ msgstr ""
 msgid "Build diagnostics snapshot"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:227
-msgid "Bureau of Meteorology forecasts and observations, fetched by the server at most every 10 minutes per product. Every graphic shows “Source: Bureau of Meteorology”."
-msgstr ""
-
 #: src/pages/TallyPage.tsx:321
 msgid "Bus"
 msgstr ""
@@ -1345,6 +1363,8 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:969
 #: src/pages/DeviceDetailPage.tsx:1091
 #: src/pages/DeviceDetailPage.tsx:1210
+#: src/pages/graphics/DataView.tsx:319
+#: src/pages/graphics/LibraryView.tsx:155
 #: src/pages/LayoutsPage.tsx:319
 #: src/pages/MediaPlayersPage.tsx:493
 #: src/pages/SalvosPage.tsx:281
@@ -1352,7 +1372,6 @@ msgstr ""
 #: src/pages/SalvosPage.tsx:433
 #: src/pages/SystemActionsPage.tsx:151
 #: src/pages/TallyPage.tsx:432
-#: src/pages/WeatherPage.tsx:321
 #: src/resources/CrudPage.tsx:370
 #: src/resources/CrudPage.tsx:415
 msgid "Cancel"
@@ -1560,6 +1579,10 @@ msgstr ""
 msgid "Changing the mode restarts the device's own pipeline: its bound sources ride the tile ladder until it returns. No Multiview program output is interrupted."
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:212
+msgid "Channel"
+msgstr ""
+
 #: src/pages/AudioPage.tsx:421
 msgid "Channels"
 msgstr ""
@@ -1572,8 +1595,16 @@ msgstr ""
 msgid "Checking…"
 msgstr ""
 
+#: src/pages/graphics/LibraryView.tsx:131
+msgid "Choose a data source…"
+msgstr ""
+
 #: src/pages/AudioPage.tsx:117
 msgid "Choose an input"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:433
+msgid "Choose an item…"
 msgstr ""
 
 #: src/pages/SettingsPage.tsx:158
@@ -1639,6 +1670,10 @@ msgstr ""
 #: src/devices/FromDevice.tsx:60
 #: src/pages/SettingsPage.tsx:229
 msgid "Clear"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:280
+msgid "CLEAR"
 msgstr ""
 
 #: src/devices/FromDevice.tsx:56
@@ -1839,7 +1874,7 @@ msgstr ""
 msgid "Configured sync groups."
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:346
+#: src/pages/graphics/DataView.tsx:344
 msgid "Configured weather locations"
 msgstr ""
 
@@ -1976,8 +2011,12 @@ msgstr ""
 msgid "Could not create"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:192
+#: src/pages/graphics/DataView.tsx:192
 msgid "Could not create source"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:147
+msgid "Could not create sources"
 msgstr ""
 
 #: src/resources/CrudPage.tsx:290
@@ -1988,7 +2027,7 @@ msgstr ""
 msgid "Could not delete layout"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:174
+#: src/pages/graphics/DataView.tsx:174
 msgid "Could not delete location"
 msgstr ""
 
@@ -1998,6 +2037,10 @@ msgstr ""
 
 #: src/pages/SalvosPage.tsx:138
 msgid "Could not delete salvo"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:90
+msgid "Could not delete the item"
 msgstr ""
 
 #: src/resources/FormControls.tsx:604
@@ -2047,6 +2090,10 @@ msgstr ""
 #: src/pages/DevicesPage.tsx:518
 #: src/resources/CrudPage.tsx:238
 msgid "Could not load for editing"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:188
+msgid "Could not load graphics channels."
 msgstr ""
 
 #: src/pages/LayoutsPage.tsx:232
@@ -2146,7 +2193,7 @@ msgstr ""
 msgid "Could not load tickets:"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:381
+#: src/pages/graphics/DataView.tsx:379
 msgid "Could not load weather locations."
 msgstr ""
 
@@ -2188,7 +2235,7 @@ msgstr ""
 msgid "Could not save layout"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:168
+#: src/pages/graphics/DataView.tsx:168
 msgid "Could not save location"
 msgstr ""
 
@@ -2198,6 +2245,14 @@ msgstr ""
 
 #: src/pages/AudioPage.tsx:523
 msgid "Could not save the audio routing:"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:85
+msgid "Could not save the item"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:138
+msgid "Could not save the rundown"
 msgstr ""
 
 #: src/pages/SupportPage.tsx:210
@@ -2264,15 +2319,23 @@ msgstr ""
 msgid "Create"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:431
+#: src/pages/graphics/DataView.tsx:429
 msgid "Create 7-day source"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:340
+#: src/pages/graphics/LibraryView.tsx:151
+msgid "Create item"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:254
+msgid "Create PVW/PGM sources"
+msgstr ""
+
+#: src/pages/graphics/DataView.tsx:338
 msgid "Create sources with a transparent background (for layering over video)"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:441
+#: src/pages/graphics/DataView.tsx:439
 msgid "Create today source"
 msgstr ""
 
@@ -2288,8 +2351,12 @@ msgstr ""
 msgid "Created"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:188
+#: src/pages/graphics/DataView.tsx:188
 msgid "Created source {id}"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:144
+msgid "Created the PVW and PGM sources"
 msgstr ""
 
 #: src/pages/DeviceDetailPage.tsx:1117
@@ -2340,7 +2407,11 @@ msgstr ""
 msgid "Cued"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:138
+#: src/pages/graphics/PlayoutView.tsx:232
+msgid "Cued:"
+msgstr ""
+
+#: src/pages/graphics/DataView.tsx:138
 msgid "Current"
 msgstr ""
 
@@ -2361,12 +2432,16 @@ msgstr ""
 msgid "Custom…"
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:310
+msgid "CUT"
+msgstr ""
+
 #: src/pages/SourcesPage.tsx:446
 msgid "D:HH:MM:SS (drop day when zero)"
 msgstr ""
 
 #. placeholder {0}: view.location.name
-#: src/pages/WeatherPage.tsx:534
+#: src/pages/graphics/DataView.tsx:532
 msgid "Daily forecast for {0}"
 msgstr ""
 
@@ -2377,10 +2452,24 @@ msgstr ""
 
 #: src/app/navigation.tsx:76
 #: src/pages/DataPage.tsx:377
+#: src/pages/GraphicsPage.tsx:20
 msgid "Data"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:539
+#: src/pages/graphics/LibraryView.tsx:129
+#: src/pages/graphics/PlayoutView.tsx:467
+msgid "Data source"
+msgstr ""
+
+#: src/pages/graphics/DataView.tsx:225
+msgid "Data sources feed graphics templates. Bureau of Meteorology weather (bom_weather) is fetched by the server at most every 10 minutes per product; every weather graphic shows “Source: Bureau of Meteorology”. More providers (RSS news) plug in here later."
+msgstr ""
+
+#: src/pages/graphics/TemplatesView.tsx:38
+msgid "Data:"
+msgstr ""
+
+#: src/pages/graphics/DataView.tsx:537
 msgid "Day"
 msgstr ""
 
@@ -2492,9 +2581,16 @@ msgstr ""
 msgid "Delete"
 msgstr ""
 
+#. placeholder {0}: item.name
 #. placeholder {0}: l.name
-#: src/pages/WeatherPage.tsx:458
+#: src/pages/graphics/DataView.tsx:456
+#: src/pages/graphics/LibraryView.tsx:200
 msgid "Delete {0}"
+msgstr ""
+
+#. placeholder {0}: item.name
+#: src/pages/graphics/LibraryView.tsx:202
+msgid "Delete {0}? If it is on air it is cut off air."
 msgstr ""
 
 #: src/pages/LayoutsPage.tsx:112
@@ -2700,8 +2796,8 @@ msgstr ""
 msgid "Display format"
 msgstr ""
 
+#: src/pages/graphics/DataView.tsx:276
 #: src/pages/SalvosPage.tsx:357
-#: src/pages/WeatherPage.tsx:278
 msgid "Display name"
 msgstr ""
 
@@ -2828,6 +2924,10 @@ msgstr ""
 
 #: src/pages/SourcesPage.tsx:306
 msgid "Dual (analogue face + digital readout)"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:315
+msgid "Duration (frames)"
 msgstr ""
 
 #: src/pages/SourcesPage.tsx:634
@@ -2975,14 +3075,20 @@ msgstr ""
 msgid "Edit"
 msgstr ""
 
+#. placeholder {0}: item.name
 #. placeholder {0}: l.name
-#: src/pages/WeatherPage.tsx:446
+#: src/pages/graphics/DataView.tsx:444
+#: src/pages/graphics/LibraryView.tsx:182
 msgid "Edit {0}"
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:639
 #: src/pages/DevicesPage.tsx:668
 msgid "Edit device"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:105
+msgid "Edit item"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:144
@@ -2997,7 +3103,7 @@ msgstr ""
 msgid "Edit layout"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:237
+#: src/pages/graphics/DataView.tsx:235
 msgid "Edit location"
 msgstr ""
 
@@ -3228,8 +3334,8 @@ msgstr ""
 msgid "Expected return in"
 msgstr ""
 
+#: src/pages/graphics/DataView.tsx:142
 #: src/pages/LicencePage.tsx:157
-#: src/pages/WeatherPage.tsx:142
 msgid "Expired"
 msgstr ""
 
@@ -3296,8 +3402,12 @@ msgstr ""
 msgid "Feature guide"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:144
+#: src/pages/graphics/DataView.tsx:144
 msgid "Fetch error"
+msgstr ""
+
+#: src/pages/graphics/TemplatesView.tsx:41
+msgid "Fields:"
 msgstr ""
 
 #: src/pages/docs/concepts/TransportsPage.tsx:324
@@ -3355,11 +3465,11 @@ msgstr ""
 msgid "Forced CVT-RB timing (EDID-less screen)"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:290
+#: src/pages/graphics/DataView.tsx:288
 msgid "Forecast area code (aac)"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:284
+#: src/pages/graphics/DataView.tsx:282
 msgid "Forecast product"
 msgstr ""
 
@@ -3544,6 +3654,23 @@ msgstr ""
 
 #: src/pages/LicencePage.tsx:166
 msgid "Grace until"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:140
+msgid "Gradient (opaque)"
+msgstr ""
+
+#: src/app/navigation.tsx:63
+#: src/pages/GraphicsPage.tsx:29
+msgid "Graphics"
+msgstr ""
+
+#: src/pages/GraphicsPage.tsx:31
+msgid "Graphics playout (CG): prepare items from templates and live data, cue them on preview, and take them to air on a graphics channel the switcher layers over video."
+msgstr ""
+
+#: src/pages/GraphicsPage.tsx:37
+msgid "Graphics views"
 msgstr ""
 
 #: src/components/TallyLampBadge.tsx:36
@@ -3767,7 +3894,7 @@ msgstr ""
 msgid "ICE connection failed. The network cause is unknown."
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:542
+#: src/pages/graphics/DataView.tsx:540
 msgid "Icon code"
 msgstr ""
 
@@ -3827,7 +3954,7 @@ msgstr ""
 msgid "In spec"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:492
+#: src/pages/graphics/DataView.tsx:490
 msgid "In the layout, place a media player (looping clip) cell and the weather cell over the same area, with the weather cell on a higher z. Set the weather cell’s opacity (for example 0.9) to taste. Transparent graphics composite on the CPU path; opaque ones also run on the GPU."
 msgstr ""
 
@@ -3956,8 +4083,12 @@ msgstr ""
 msgid "IPv6"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:360
+#: src/pages/graphics/DataView.tsx:358
 msgid "Issued"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:113
+msgid "Item id"
 msgstr ""
 
 #: src/pages/LayoutEditorPage.tsx:255
@@ -4033,7 +4164,7 @@ msgstr ""
 msgid "Last contact"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:363
+#: src/pages/graphics/DataView.tsx:361
 msgid "Last fetched"
 msgstr ""
 
@@ -4085,7 +4216,7 @@ msgstr ""
 msgid "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:480
+#: src/pages/graphics/DataView.tsx:478
 msgid "Layering over a looped video background"
 msgstr ""
 
@@ -4185,6 +4316,10 @@ msgstr ""
 
 #: src/pages/LogsPage.tsx:171
 msgid "Level"
+msgstr ""
+
+#: src/pages/GraphicsPage.tsx:18
+msgid "Library"
 msgstr ""
 
 #: src/app/navigation.tsx:74
@@ -4465,8 +4600,9 @@ msgid "Loading tickets…"
 msgstr ""
 
 #: src/pages/DashboardPage.tsx:67
+#: src/pages/graphics/DataView.tsx:372
+#: src/pages/graphics/PlayoutView.tsx:185
 #: src/pages/SettingsPage.tsx:77
-#: src/pages/WeatherPage.tsx:374
 msgid "Loading…"
 msgstr ""
 
@@ -4478,11 +4614,11 @@ msgstr ""
 msgid "Locale"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:351
+#: src/pages/graphics/DataView.tsx:349
 msgid "Location"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:272
+#: src/pages/graphics/DataView.tsx:270
 msgid "Location id"
 msgstr ""
 
@@ -4603,7 +4739,7 @@ msgstr ""
 msgid "Manifest signalling"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:262
+#: src/pages/graphics/DataView.tsx:260
 msgid "Manual entry"
 msgstr ""
 
@@ -4615,7 +4751,7 @@ msgstr ""
 msgid "Matrix"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:545
+#: src/pages/graphics/DataView.tsx:543
 msgid "Max"
 msgstr ""
 
@@ -4705,7 +4841,7 @@ msgstr ""
 msgid "Migration accepted"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:548
+#: src/pages/graphics/DataView.tsx:546
 msgid "Min"
 msgstr ""
 
@@ -4734,6 +4870,10 @@ msgstr ""
 #: src/layout/components/CellsForm.tsx:317
 #: src/layout/components/GridLayoutEditor.tsx:704
 msgid "Missing source:"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:310
+msgid "MIX"
 msgstr ""
 
 #: src/docs/registry.ts:688
@@ -4793,6 +4933,16 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1159
 #: src/pages/OutputsPage.tsx:122
 msgid "Mount point"
+msgstr ""
+
+#. placeholder {0}: nameOf(id)
+#: src/pages/graphics/PlayoutView.tsx:403
+msgid "Move {0} down"
+msgstr ""
+
+#. placeholder {0}: nameOf(id)
+#: src/pages/graphics/PlayoutView.tsx:400
+msgid "Move {0} up"
 msgstr ""
 
 #: src/layout/components/GridLayoutEditor.tsx:511
@@ -4900,6 +5050,8 @@ msgstr ""
 #: src/pages/DeviceDetailPage.tsx:1145
 #: src/pages/DevicesPage.tsx:125
 #: src/pages/DevicesPage.tsx:533
+#: src/pages/graphics/LibraryView.tsx:117
+#: src/pages/graphics/PlayoutView.tsx:463
 #: src/pages/LayoutsPage.tsx:61
 #: src/pages/OutputsPage.tsx:657
 #: src/pages/OutputsPage.tsx:798
@@ -4981,6 +5133,10 @@ msgstr ""
 msgid "New cell"
 msgstr ""
 
+#: src/pages/graphics/LibraryView.tsx:105
+msgid "New graphics item"
+msgstr ""
+
 #: src/pages/LicencePage.tsx:190
 msgid "New instances allowed"
 msgstr ""
@@ -5022,6 +5178,10 @@ msgstr ""
 #: src/pages/SyncGroupsPage.tsx:327
 #: src/pages/SyncGroupsPage.tsx:328
 msgid "New sync group"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:292
+msgid "NEXT"
 msgstr ""
 
 #: src/pages/DataPage.tsx:121
@@ -5096,6 +5256,15 @@ msgstr ""
 msgid "No GPUs are reported on this host."
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:116
+#: src/pages/graphics/PlayoutView.tsx:134
+msgid "No graphics channel"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:164
+msgid "No graphics items yet."
+msgstr ""
+
 #: src/pages/SystemPage.tsx:309
 msgid "No host-memory sample."
 msgstr ""
@@ -5140,7 +5309,7 @@ msgstr ""
 msgid "No live tiles yet. They appear once the engine streams a snapshot."
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:388
+#: src/pages/graphics/DataView.tsx:386
 msgid "No locations yet. Nothing is fetched until one is added."
 msgstr ""
 
@@ -5154,6 +5323,10 @@ msgstr ""
 
 #: src/pages/DevicesPage.tsx:589
 msgid "No mode reported."
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:81
+msgid "No monitor source yet — use “Create PVW/PGM sources” below."
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:84
@@ -5368,7 +5541,7 @@ msgstr ""
 msgid "Notifications"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:252
+#: src/pages/graphics/DataView.tsx:250
 msgid "NSW preset"
 msgstr ""
 
@@ -5398,7 +5571,7 @@ msgstr ""
 msgid "Observation disabled for this source (events.observe = false in its configuration)."
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:296
+#: src/pages/graphics/DataView.tsx:294
 msgid "Observation product (optional)"
 msgstr ""
 
@@ -5414,7 +5587,7 @@ msgstr ""
 #. placeholder {5}: o.wind_dir ?? '—'
 #. placeholder {6}: o.wind_kmh === null ? '' : `${String(o.wind_kmh)} km/h`
 #. placeholder {7}: o.pressure_hpa === null ? '—' : `${String(o.pressure_hpa)} hPa`
-#: src/pages/WeatherPage.tsx:578
+#: src/pages/graphics/DataView.tsx:576
 msgid "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
 msgstr ""
 
@@ -5451,6 +5624,10 @@ msgstr ""
 #: src/pages/DataPage.tsx:207
 #: src/pages/MeshPage.tsx:144
 msgid "On"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:238
+msgid "On air:"
 msgstr ""
 
 #: src/layout/components/CellPropertiesPanel.tsx:166
@@ -5728,6 +5905,11 @@ msgstr ""
 msgid "Pending actions"
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:236
+#: src/pages/graphics/PlayoutView.tsx:398
+msgid "PGM"
+msgstr ""
+
 #: src/devices/FromDevice.tsx:231
 msgid "Pick a device to list its decode slots."
 msgstr ""
@@ -5744,7 +5926,7 @@ msgstr ""
 msgid "Pick an exact EDID mode"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:240
+#: src/pages/graphics/DataView.tsx:238
 msgid "Pick an NSW preset, or enter any BOM location manually: the state forecast product (for example IDV10753 for Victoria) and its area code (aac, for example VIC_PT042), plus optionally the state observations product (for example IDV60920) and the station WMO id. Codes are listed in the product XML on ftp://ftp.bom.gov.au/anon/gen/fwo/."
 msgstr ""
 
@@ -5810,6 +5992,14 @@ msgstr ""
 msgid "Playing"
 msgstr ""
 
+#: src/pages/GraphicsPage.tsx:17
+msgid "Playout"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:129
+msgid "Playout command failed"
+msgstr ""
+
 #: src/pages/MediaPlayersPage.tsx:258
 msgid "Position (frames)"
 msgstr ""
@@ -5818,7 +6008,7 @@ msgstr ""
 msgid "Pre-encode canvas approximation"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:551
+#: src/pages/graphics/DataView.tsx:549
 msgid "Précis"
 msgstr ""
 
@@ -5892,7 +6082,7 @@ msgstr ""
 msgid "Product telemetry"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:354
+#: src/pages/graphics/DataView.tsx:352
 msgid "Products"
 msgstr ""
 
@@ -5996,6 +6186,11 @@ msgstr ""
 msgid "Push to/from streaming platforms"
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:230
+#: src/pages/graphics/PlayoutView.tsx:399
+msgid "PVW"
+msgstr ""
+
 #: src/pages/SupportPage.tsx:153
 msgid "Question"
 msgstr ""
@@ -6008,11 +6203,11 @@ msgstr ""
 msgid "Radius (px)"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:557
+#: src/pages/graphics/DataView.tsx:555
 msgid "Rain amount"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:554
+#: src/pages/graphics/DataView.tsx:552
 msgid "Rain chance"
 msgstr ""
 
@@ -6185,6 +6380,11 @@ msgstr ""
 #: src/layout/components/GridLayoutEditor.tsx:538
 #: src/pages/SyncGroupsPage.tsx:170
 msgid "Remove"
+msgstr ""
+
+#. placeholder {0}: nameOf(id)
+#: src/pages/graphics/PlayoutView.tsx:409
+msgid "Remove {0} from the rundown"
 msgstr ""
 
 #: src/layout/components/CellsForm.tsx:401
@@ -6441,6 +6641,11 @@ msgstr ""
 msgid "Run Multiview with Docker — single container or the compose stack — with optional GPU access, persistent volumes, and healthchecks."
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:345
+#: src/pages/graphics/PlayoutView.tsx:353
+msgid "Rundown"
+msgstr ""
+
 #: src/pages/OutputsPage.tsx:77
 msgid "Runnable"
 msgstr ""
@@ -6515,12 +6720,16 @@ msgstr ""
 msgid "Save audio routing"
 msgstr ""
 
+#: src/pages/graphics/LibraryView.tsx:151
+msgid "Save item"
+msgstr ""
+
 #: src/layout/components/GridLayoutEditor.tsx:269
 #: src/layout/components/LayoutEditor.tsx:190
 msgid "Save layout"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:309
+#: src/pages/graphics/DataView.tsx:307
 msgid "Save location"
 msgstr ""
 
@@ -6533,8 +6742,10 @@ msgstr ""
 msgid "Saved"
 msgstr ""
 
+#. placeholder {0}: item.name
 #. placeholder {0}: view.location.name
-#: src/pages/WeatherPage.tsx:162
+#: src/pages/graphics/DataView.tsx:162
+#: src/pages/graphics/LibraryView.tsx:80
 msgid "Saved {0}"
 msgstr ""
 
@@ -6642,8 +6853,16 @@ msgstr ""
 msgid "Select cell"
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:460
+msgid "Select or cue an item to see its fields."
+msgstr ""
+
 #: src/pages/AudioPage.tsx:246
 msgid "Selectable tracks"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:456
+msgid "Selected item"
 msgstr ""
 
 #. placeholder {0}: String(selection.top + 1)
@@ -6719,6 +6938,10 @@ msgstr ""
 
 #: src/pages/LoudnessMeter.tsx:168
 msgid "Short-term (3 s)"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:335
+msgid "Shortcuts: F1 = TAKE (preview to air), F2 = CLEAR (off air), Space = NEXT (cue the next rundown item). Click a rundown row to cue it. Drag rows, or press Alt+↑ / Alt+↓ on a row, to reorder."
 msgstr ""
 
 #: src/pages/SettingsPage.tsx:276
@@ -6907,14 +7130,14 @@ msgstr ""
 msgid "Static source hint"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:302
+#: src/pages/graphics/DataView.tsx:300
 msgid "Station WMO id (optional)"
 msgstr ""
 
 #: src/pages/DataPage.tsx:88
+#: src/pages/graphics/DataView.tsx:355
 #: src/pages/MeshPage.tsx:62
 #: src/pages/OutputsPage.tsx:685
-#: src/pages/WeatherPage.tsx:357
 msgid "Status"
 msgstr ""
 
@@ -7029,6 +7252,10 @@ msgstr ""
 msgid "Style"
 msgstr ""
 
+#: src/pages/graphics/TemplatesView.tsx:44
+msgid "Style options:"
+msgstr ""
+
 #: src/pages/docs/ConfigPage.tsx:203
 msgid "Styling: <0>z</0> stacking order, <1>opacity</1>, <2>corner_radius</2>, and a <3>border</3>."
 msgstr ""
@@ -7111,6 +7338,10 @@ msgstr ""
 #: src/pages/RoutingPage.tsx:432
 #: src/pages/SalvosPage.tsx:269
 msgid "Take"
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:268
+msgid "TAKE"
 msgstr ""
 
 #: src/pages/RoutingPage.tsx:192
@@ -7220,6 +7451,15 @@ msgstr ""
 msgid "Temperature"
 msgstr ""
 
+#: src/pages/graphics/LibraryView.tsx:121
+#: src/pages/graphics/PlayoutView.tsx:465
+msgid "Template"
+msgstr ""
+
+#: src/pages/GraphicsPage.tsx:19
+msgid "Templates"
+msgstr ""
+
 #: src/events/SourceEventsButton.tsx:32
 msgid "Test"
 msgstr ""
@@ -7294,6 +7534,10 @@ msgstr ""
 
 #: src/layout/components/validationMessages.tsx:35
 msgid "The cell is too small."
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:246
+msgid "The channel is a source the switcher uses: put its PGM source in a layout cell above program/video (it is transparent when clear), or use it full-screen."
 msgstr ""
 
 #: src/pages/docs/ContainerPage.tsx:151
@@ -7552,6 +7796,10 @@ msgstr ""
 
 #: src/docs/registry.ts:193
 msgid "The REST base, long-running operations, ETags, the WebSocket and SSE streams, and the live API playground."
+msgstr ""
+
+#: src/pages/graphics/PlayoutView.tsx:350
+msgid "The rundown is empty. Add items from the library below."
 msgstr ""
 
 #: src/pages/docs/concepts/ColorPage.tsx:54
@@ -7940,6 +8188,15 @@ msgstr ""
 msgid "Transfer ownership"
 msgstr ""
 
+#: src/pages/graphics/PlayoutView.tsx:297
+#: src/pages/graphics/PlayoutView.tsx:298
+msgid "Transition"
+msgstr ""
+
+#: src/pages/graphics/LibraryView.tsx:141
+msgid "Transparent (key over video)"
+msgstr ""
+
 #: src/pages/DataPage.tsx:109
 #: src/pages/docs/concepts/TransportsPage.tsx:257
 #: src/pages/LicencePage.tsx:247
@@ -8199,7 +8456,7 @@ msgstr ""
 msgid "Waiting for a frame…"
 msgstr ""
 
-#: src/pages/WeatherPage.tsx:140
+#: src/pages/graphics/DataView.tsx:140
 msgid "Waiting for first fetch"
 msgstr ""
 
@@ -8252,11 +8509,6 @@ msgstr ""
 
 #: src/pages/SettingsPage.tsx:85
 msgid "Watching"
-msgstr ""
-
-#: src/app/navigation.tsx:63
-#: src/pages/WeatherPage.tsx:225
-msgid "Weather"
 msgstr ""
 
 #: src/pages/docs/concepts/TransportsPage.tsx:317

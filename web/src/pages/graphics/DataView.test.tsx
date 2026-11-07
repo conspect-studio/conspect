@@ -1,4 +1,4 @@
-// WeatherPage — lists BOM locations with status/freshness, shows the latest
+// Graphics DataView (formerly WeatherPage) — lists BOM locations with status/freshness, shows the latest
 // data exactly as served (absent stays "—"), saves via PUT, applies NSW
 // presets, and creates weather sources through the sources API.
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -7,8 +7,8 @@ import { http, HttpResponse } from 'msw';
 import { setupServer } from 'msw/node';
 import { MemoryRouter } from 'react-router-dom';
 
-import { WeatherPage } from './WeatherPage';
-import { renderWithProviders } from '../test/render';
+import { DataView } from './DataView';
+import { renderWithProviders } from '../../test/render';
 
 const VIEW = {
   location: {
@@ -94,12 +94,12 @@ afterAll(() => {
 function renderPage(): void {
   renderWithProviders(
     <MemoryRouter>
-      <WeatherPage />
+      <DataView />
     </MemoryRouter>,
   );
 }
 
-describe('WeatherPage', () => {
+describe('Graphics DataView', () => {
   it('lists a location with status, error and its latest data', async () => {
     renderPage();
     const id = await screen.findByText('sydney');
