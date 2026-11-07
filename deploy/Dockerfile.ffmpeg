@@ -46,6 +46,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG FFMPEG_VERSION=8.1.1
 ARG FFMPEG_SHA256=b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
 ARG FFMPEG_GPG_KEY=FCF986EA15E6E293A5644F10B4322F04D67658D8
+# Fallback only when ffmpeg.org is unreachable: FFmpeg upstream git tag n8.1.1,
+# content-pinned to this commit (git ls-remote https://github.com/FFmpeg/FFmpeg n8.1.1^{}).
+ARG FFMPEG_GIT_COMMIT=239f2c733de417201d7ad3b3b8b0d9b63285b2b1
 # nv-codec-headers content-pinned by git commit (tag n13.0.19.0 → this commit).
 # Only consumed when FF_HWACCEL=nvidia.
 ARG NVCODEC_COMMIT=e844e5b26f46bb77479f063029595293aa8f812d
@@ -89,6 +92,7 @@ RUN chmod 0755 /usr/local/bin/ffmpeg-build.sh \
     FFMPEG_VERSION="${FFMPEG_VERSION}" \
     FFMPEG_SHA256="${FFMPEG_SHA256}" \
     FFMPEG_GPG_KEY="${FFMPEG_GPG_KEY}" \
+    FFMPEG_GIT_COMMIT="${FFMPEG_GIT_COMMIT}" \
     NVCODEC_COMMIT="${NVCODEC_COMMIT}" \
     FF_LICENSE="${FF_LICENSE}" \
     TARGETARCH="${TARGETARCH:-amd64}" \
