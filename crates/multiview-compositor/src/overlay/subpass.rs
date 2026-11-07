@@ -31,8 +31,10 @@
 //! one back-to-front list; the sub-pass walks it once, so the cost is constant
 //! in the tile count.
 
+use multiview_core::color::ColorInfo;
+
 use crate::blend::{over, LinearRgba, PremulRgba};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::overlay::text::{RasterizedGlyph, RasterizedRun};
 use crate::pipeline::{
     canvas_linear_to_output_yuv, tile_yuv_to_canvas_linear, CanvasColor, Nv12Image,
@@ -1350,34 +1352,18 @@ fn apply_overlays_with_limit(
     // in raster order, so `write_nv12_pixel`'s last-writer-wins chroma matches the
     // reference exactly; any residual overlapping rects re-process the source
     // value (idempotent).
+    //
+    // Each rect is processed in list order (overlapping rects rely on this for
+    // raster/last-writer order), but a large rect's OWN rows are split into
+    // even-row-aligned bands and decoded/blended/re-encoded on separate threads
+    // (`bake_rect_bands`): the per-band work is identical to the serial body
+    // below modulo which rows it owns, so the output is byte-identical
+    // regardless of the thread count (see `bake_rect_band` doc comment for the
+    // region-invariance argument).
     let w = usize::try_from(width).unwrap_or(0);
+    let workers = parallel_worker_count();
     for rect in &rects {
-        let mut buffer = LinearCanvasBuffer::region(*rect);
-        for y in rect.y0..rect.y1 {
-            for x in rect.x0..rect.x1 {
-                let Some((y8, cb8, cr8)) = image.sample(x, y) else {
-                    continue;
-                };
-                let lin = tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?;
-                if let Some(idx) = buffer.index(x, y) {
-                    if let Some(slot) = buffer.pixels.get_mut(idx) {
-                        *slot = [lin[0], lin[1], lin[2], 1.0];
-                    }
-                }
-            }
-        }
-        // Preserve primitive order for source-over, but never re-rasterize
-        // unrelated glyphs/meters once for every other dirty rectangle.
-        for (primitive, footprint) in list.primitives.iter().zip(&footprints) {
-            if footprint.is_some_and(|footprint| footprint.intersects(*rect)) {
-                blend_primitive(&mut buffer, primitive);
-            }
-        }
-
-        // A merged bounding rectangle may contain holes. Decode can cover the
-        // bounding rectangle, but only original chroma-aligned footprints may
-        // write output; each skipped block retains its input Y and UV bytes.
-        let members: Vec<_> = if original.len() > COALESCE_LIMIT {
+        let members: Vec<DirtyRect> = if original.len() > COALESCE_LIMIT {
             // The fallback has no merged bounding boxes: this region itself
             // is an original footprint, with no holes or membership scan.
             vec![*rect]
@@ -1388,26 +1374,291 @@ fn apply_overlays_with_limit(
                 .filter(|r| r.intersects(*rect))
                 .collect()
         };
-        for y in (rect.y0..rect.y1).step_by(2) {
-            for x in (rect.x0..rect.x1).step_by(2) {
-                if !members
-                    .iter()
-                    .any(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
-                {
-                    continue;
+        bake_rect_bands(
+            image,
+            list,
+            &footprints,
+            *rect,
+            &members,
+            color,
+            canvas,
+            w,
+            workers,
+            &mut y_plane,
+            &mut uv_plane,
+        )?;
+    }
+
+    Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag())
+}
+
+/// Below this many pixels a rect's thread-spawn overhead outweighs the win, so
+/// it bakes on the calling thread (also covers tiny/test rects).
+const PARALLEL_RECT_PIXEL_THRESHOLD: u64 = 64 * 64;
+
+/// The number of worker threads to fan a large dirty rect's bands across: the
+/// machine's available parallelism minus 2 (reserve headroom for the encoder
+/// and the rest of the pipeline on the same host), clamped to `[1, 8]`. Falls
+/// back to 1 (serial) when the count is unavailable.
+fn parallel_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .saturating_sub(2)
+        .clamp(1, 8)
+}
+
+/// Bake one dirty `rect` of the production region-limited path into `y_plane`
+/// / `uv_plane`, splitting it into row bands across up to `workers` threads
+/// when it is large enough to amortise the spawn cost.
+///
+/// `footprints` is the full per-primitive footprint list (parallel to
+/// `list.primitives`), used to skip primitives whose footprint does not touch
+/// `rect` at all (same pre-filter the serial path always applied).
+/// `members` is the set of original (pre-coalesce) footprints whose union
+/// composes `rect`, used to skip the holes between them when writing output.
+#[allow(clippy::too_many_arguments)]
+// reason: the band kernel needs the image/list/canvas/color plus the band's
+// own disjoint plane slices; a struct would not reduce this and would obscure
+// which arguments are shared read-only state vs. per-band mutable output.
+fn bake_rect_bands(
+    image: &Nv12Image,
+    list: &OverlayDrawList,
+    footprints: &[Option<DirtyRect>],
+    rect: DirtyRect,
+    members: &[DirtyRect],
+    color: ColorInfo,
+    canvas: CanvasColor,
+    w: usize,
+    workers: usize,
+    y_plane: &mut [u8],
+    uv_plane: &mut [u8],
+) -> Result<()> {
+    let rect_rows = rect.y1.saturating_sub(rect.y0);
+    let rect_cols = rect.x1.saturating_sub(rect.x0);
+    let rect_pixels = u64::from(rect_rows) * u64::from(rect_cols);
+    // Chroma row-pairs in this rect (even-aligned, so always divisible by 2).
+    let pairs = rect_rows / 2;
+    if workers <= 1 || pairs <= 1 || rect_pixels < PARALLEL_RECT_PIXEL_THRESHOLD {
+        return bake_rect_band(
+            image, list, footprints, rect, rect.y0, rect.y1, members, color, canvas, w, y_plane,
+            uv_plane,
+        );
+    }
+
+    // Even split of chroma row-pairs across workers (ceil); the number of
+    // resulting bands may be < `workers`. Each band's `[band_y0, band_y1)` is a
+    // whole-NV12 even row range, so a 2×2 chroma block never spans two bands.
+    let pairs_per_band = pairs.div_ceil(u32::try_from(workers).unwrap_or(1)).max(1);
+    let band_rows = pairs_per_band.saturating_mul(2);
+
+    // Disjoint full-canvas-row chunks of the output planes: every band owns
+    // whole global rows (never touching another band's rows), so each band's
+    // `&mut` slice is provably non-overlapping with every other band's — the
+    // borrow checker proves the split race-free, exactly as `composite_parallel`
+    // does for the full-frame composite.
+    let y_row_bytes = w;
+    let uv_row_bytes = w;
+    // Skip the rows before `rect.y0`: bands only cover the rect's own extent.
+    let (_, y_tail) = y_plane.split_at_mut(usize::try_from(rect.y0).unwrap_or(0) * y_row_bytes);
+    let (y_rect, _) = y_tail.split_at_mut(usize::try_from(rect_rows).unwrap_or(0) * y_row_bytes);
+    let (_, uv_tail) =
+        uv_plane.split_at_mut(usize::try_from(rect.y0 / 2).unwrap_or(0) * uv_row_bytes);
+    let (uv_rect, _) =
+        uv_tail.split_at_mut(usize::try_from(rect_rows / 2).unwrap_or(0) * uv_row_bytes);
+
+    let y_bands = y_rect.chunks_mut(usize::try_from(band_rows).unwrap_or(1) * y_row_bytes);
+    let uv_bands = uv_rect.chunks_mut(usize::try_from(band_rows / 2).unwrap_or(1) * uv_row_bytes);
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for (band_index, (band_y, band_uv)) in y_bands.zip(uv_bands).enumerate() {
+            let band_y0 = rect.y0.saturating_add(
+                u32::try_from(band_index)
+                    .unwrap_or(0)
+                    .saturating_mul(band_rows),
+            );
+            let band_h = u32::try_from(band_y.len() / y_row_bytes.max(1)).unwrap_or(0);
+            let band_y1 = band_y0.saturating_add(band_h);
+            // The band touches only its own global rows, offset into `band_y`
+            // / `band_uv` by the band's local row index: pass a zero-origin
+            // view via a tiny adapter closure instead of re-deriving indices.
+            let handle = scope.spawn(move || {
+                bake_rect_band_into(
+                    image, list, footprints, rect, band_y0, band_y1, members, color, canvas, w,
+                    band_y, band_uv,
+                )
+            });
+            handles.push(handle);
+        }
+        let mut first_err: Option<Error> = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
                 }
-                for (px, py) in [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)] {
-                    let premul = buffer.pixel(px, py).unwrap_or(PremulRgba::TRANSPARENT);
-                    let straight = premul.unpremultiplied();
-                    let out =
-                        canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
-                    write_nv12_pixel(&mut y_plane, &mut uv_plane, w, px, py, out);
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(Error::Geometry(
+                            "overlay band worker thread panicked".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })
+}
+
+/// Bake rows `[band_y0, band_y1)` of `rect` directly into the full-canvas
+/// `y_plane` / `uv_plane` (used by the serial, non-parallel path: `band_y0`/
+/// `band_y1` equal `rect.y0`/`rect.y1` and there is exactly one "band").
+#[allow(clippy::too_many_arguments)]
+fn bake_rect_band(
+    image: &Nv12Image,
+    list: &OverlayDrawList,
+    footprints: &[Option<DirtyRect>],
+    rect: DirtyRect,
+    band_y0: u32,
+    band_y1: u32,
+    members: &[DirtyRect],
+    color: ColorInfo,
+    canvas: CanvasColor,
+    w: usize,
+    y_plane: &mut [u8],
+    uv_plane: &mut [u8],
+) -> Result<()> {
+    // `bake_rect_band_into` always writes rows relative to `band_y0` (row 0 of
+    // its `out_y`/`out_uv` slices is global row `band_y0`), matching the
+    // parallel path's per-band chunk. Slice the full plane the same way here so
+    // the serial (one-band) call uses the identical addressing.
+    let y_row_bytes = w;
+    let uv_row_bytes = w;
+    let y_start = usize::try_from(band_y0).unwrap_or(0) * y_row_bytes;
+    let y_end = usize::try_from(band_y1).unwrap_or(0) * y_row_bytes;
+    let uv_start = usize::try_from(band_y0 / 2).unwrap_or(0) * uv_row_bytes;
+    let uv_end = usize::try_from(band_y1 / 2).unwrap_or(0) * uv_row_bytes;
+    let out_y = y_plane.get_mut(y_start..y_end).unwrap_or(&mut []);
+    let out_uv = uv_plane.get_mut(uv_start..uv_end).unwrap_or(&mut []);
+    bake_rect_band_into(
+        image, list, footprints, rect, band_y0, band_y1, members, color, canvas, w, out_y, out_uv,
+    )
+}
+
+/// The shared per-band kernel: decode rows `[band_y0, band_y1)` of `rect` into
+/// a **band-local** [`LinearCanvasBuffer::region`] accumulator, blend every
+/// primitive whose footprint intersects the band (in `list` order — identical
+/// primitive order to the serial/full-rect path, since the filter only skips
+/// primitives that touch NEITHER the band NOR therefore the rect), then
+/// re-encode the band's member-covered 2×2 blocks into `out_y` / `out_uv`.
+///
+/// # Region-invariance (why this is byte-identical to baking the whole `rect`
+/// in one accumulator)
+///
+/// Every `blend_*` routine ([`blend_filled_rect`], [`blend_glyph`],
+/// [`blend_stroke`], [`blend_ring`], [`blend_image`]) walks its OWN bounded
+/// footprint and calls [`LinearCanvasBuffer::blend_at`], which resolves
+/// `(x, y)` to a buffer-local index via [`LinearCanvasBuffer::index`] using the
+/// buffer's `origin_x`/`origin_y` and clips silently (`None` -> no write) for
+/// any `(x, y)` outside the buffer's extent. None of the coverage/AA math
+/// (`rect_coverage`, `point_segment_distance`, nearest-neighbour sampling) reads
+/// the buffer's size or origin — every coverage value is a pure function of the
+/// **global** pixel coordinate and the primitive's own parameters, so clipping
+/// a primitive's footprint to a smaller buffer changes WHICH pixels receive a
+/// write, never the VALUE written at a pixel both buffers cover. A primitive
+/// whose footprint spans two bands therefore blends identically into each
+/// band's accumulator at the rows that band owns, as it would have into one
+/// accumulator spanning both bands — this is the same invariant the existing
+/// per-rect `LinearCanvasBuffer::region` already relies on (a rect's
+/// accumulator is already smaller than the full canvas).
+///
+/// `out_y`/`out_uv` are either the full-canvas planes (serial path, `band_y0`/
+/// `band_y1` cover the whole rect) or a disjoint per-band chunk (parallel
+/// path); the caller passes the matching coordinate space by offsetting
+/// `write_nv12_pixel`'s `w`-stride indices from `band_y0`'s plane row.
+#[allow(clippy::too_many_arguments)]
+fn bake_rect_band_into(
+    image: &Nv12Image,
+    list: &OverlayDrawList,
+    footprints: &[Option<DirtyRect>],
+    rect: DirtyRect,
+    band_y0: u32,
+    band_y1: u32,
+    members: &[DirtyRect],
+    color: ColorInfo,
+    canvas: CanvasColor,
+    w: usize,
+    out_y: &mut [u8],
+    out_uv: &mut [u8],
+) -> Result<()> {
+    if band_y0 >= band_y1 {
+        return Ok(());
+    }
+    let band = DirtyRect {
+        x0: rect.x0,
+        y0: band_y0,
+        x1: rect.x1,
+        y1: band_y1,
+    };
+    let mut buffer = LinearCanvasBuffer::region(band);
+    for y in band.y0..band.y1 {
+        for x in band.x0..band.x1 {
+            let Some((y8, cb8, cr8)) = image.sample(x, y) else {
+                continue;
+            };
+            let lin = tile_yuv_to_canvas_linear(y8, cb8, cr8, color, canvas)?;
+            if let Some(idx) = buffer.index(x, y) {
+                if let Some(slot) = buffer.pixels.get_mut(idx) {
+                    *slot = [lin[0], lin[1], lin[2], 1.0];
                 }
             }
         }
     }
+    // Preserve primitive order for source-over, but never re-rasterize
+    // unrelated glyphs/meters once for every other dirty rectangle/band.
+    for (primitive, footprint) in list.primitives.iter().zip(footprints) {
+        if footprint.is_some_and(|footprint| footprint.intersects(band)) {
+            blend_primitive(&mut buffer, primitive);
+        }
+    }
 
-    Nv12Image::new(width, height, y_plane, uv_plane, canvas.output_tag())
+    // `out_y`/`out_uv` are addressed relative to the GLOBAL plane with `w` the
+    // full canvas stride, but rebased so row `band_y0` is row 0 of the slice
+    // the caller handed us (full-canvas planes in the serial path: the offset
+    // is simply `band_y0` itself, which is correct since there the slice IS the
+    // full plane). This matches `composite_band`'s py_start rebasing.
+    for y in (band.y0..band.y1).step_by(2) {
+        let local_y = y.saturating_sub(band_y0);
+        for x in (band.x0..band.x1).step_by(2) {
+            if !members
+                .iter()
+                .any(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
+            {
+                continue;
+            }
+            for (px, local_py) in [
+                (x, local_y),
+                (x + 1, local_y),
+                (x, local_y + 1),
+                (x + 1, local_y + 1),
+            ] {
+                let global_py = band_y0.saturating_add(local_py);
+                let premul = buffer
+                    .pixel(px, global_py)
+                    .unwrap_or(PremulRgba::TRANSPARENT);
+                let straight = premul.unpremultiplied();
+                let out =
+                    canvas_linear_to_output_yuv([straight.r, straight.g, straight.b], canvas)?;
+                write_nv12_pixel(out_y, out_uv, w, px, local_py, out);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// An even-aligned, canvas-clamped half-open rectangle `[x0, x1) × [y0, y1)`.
