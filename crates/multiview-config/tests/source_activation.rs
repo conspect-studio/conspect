@@ -70,3 +70,48 @@ fn the_removed_guide_idle_setting_is_rejected_loudly() {
         serde_json::from_value(serde_json::json!({"guide_idle_secs": 60}));
     assert!(parsed.is_err());
 }
+
+/// Review DMD-10: a legacy `demand.always_on` must survive read → write → read
+/// in JSON and TOML, and an explicit `activation` keeps precedence.
+#[test]
+fn the_legacy_alias_survives_a_json_and_toml_round_trip() {
+    let cases = [
+        (
+            serde_json::json!({"id": "a", "kind": "bars", "demand": {"always_on": false}}),
+            SourceActivation::OnDemand,
+        ),
+        (
+            serde_json::json!({"id": "a", "kind": "bars", "demand": {"always_on": true}}),
+            SourceActivation::AlwaysOn,
+        ),
+        (
+            serde_json::json!({
+                "id": "a", "kind": "bars", "activation": "always_on", "demand": {"always_on": false}
+            }),
+            SourceActivation::AlwaysOn,
+        ),
+        (
+            serde_json::json!({
+                "id": "a", "kind": "bars", "activation": "on_demand", "demand": {"always_on": true}
+            }),
+            SourceActivation::OnDemand,
+        ),
+    ];
+    for (doc, want) in cases {
+        let first = source(doc.clone());
+        assert_eq!(first.effective_activation(), want, "{doc}");
+        let json = serde_json::to_value(&first).unwrap();
+        assert!(json.get("demand").is_none(), "{json}");
+        let again: Source = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(again.effective_activation(), want, "json {json}");
+        let toml = toml::to_string(&first).unwrap();
+        let again: Source = toml::from_str(&toml).unwrap();
+        assert_eq!(again.effective_activation(), want, "toml {toml}");
+    }
+    // A source built in code with only the legacy field also serialises it.
+    let mut built = source(serde_json::json!({"id": "a", "kind": "bars"}));
+    built.demand = serde_json::from_value(serde_json::json!({"always_on": false})).unwrap();
+    built.activation = None;
+    let json = serde_json::to_value(&built).unwrap();
+    assert_eq!(json["activation"], "on_demand", "{json}");
+}

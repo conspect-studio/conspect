@@ -992,7 +992,12 @@ impl SourceKind {
 
 /// A managed input: a stable `id`, a display name, the kind-specific payload,
 /// and optional auth/color overrides.
+///
+/// Serialisation is canonical: a legacy `demand = { always_on = .. }` alias is
+/// written back as the `activation` it means (review DMD-10), so a read/write
+/// round trip never changes what starts at boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 #[non_exhaustive]
 pub struct Source {
     /// Stable input id (referenced by `cells.source.input_id`).
@@ -1132,6 +1137,23 @@ pub struct SourceDemandPolicy {
     /// Ignored (see the type docs).
     #[serde(default)]
     pub journal_events: Option<bool>,
+}
+
+impl Serialize for Source {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.activation.is_none() && self.demand.and_then(|d| d.always_on).is_some() {
+            let mut canonical = self.clone();
+            canonical.activation = Some(self.effective_activation());
+            return Source::serialize(&canonical, serializer);
+        }
+        Source::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Source::deserialize(deserializer)
+    }
 }
 
 impl Source {
