@@ -30,6 +30,7 @@ import {
   UserCircle,
   ListChecks,
   LifeBuoy,
+  CloudSun,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -59,6 +60,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { path: "/tally", label: <Trans>Tally</Trans>, Icon: CircleDot },
   { path: "/salvos", label: <Trans>Salvos</Trans>, Icon: Zap },
   { path: "/media-players", label: <Trans>Media players</Trans>, Icon: Clapperboard },
+  { path: "/weather", label: <Trans>Weather</Trans>, Icon: CloudSun },
   { path: "/probes", label: <Trans>Probes</Trans>, Icon: ShieldAlert },
   { path: "/alarms", label: <Trans>Alarms</Trans>, Icon: Bell },
   { path: "/system", label: <Trans>System</Trans>, Icon: Activity },

@@ -13,6 +13,10 @@ msgstr ""
 "Language-Team: \n"
 "Plural-Forms: \n"
 
+#: src/pages/WeatherPage.tsx:485
+msgid "“Create … source” makes an opaque graphic with a dark gradient. For a video background, tick “transparent background” before creating the source: its panels and text then carry a real alpha channel (NV12 + alpha) and everything else is clear."
+msgstr "“Create … source” makes an opaque graphic with a dark gradient. For a video background, tick “transparent background” before creating the source: its panels and text then carry a real alpha channel (NV12 + alpha) and everything else is clear."
+
 #: src/layout/components/CellPropertiesPanel.tsx:120
 msgid "\"No signal\" card"
 msgstr "\"No signal\" card"
@@ -34,6 +38,18 @@ msgstr "(desired: {0})"
 msgid "(opens in a new tab)"
 msgstr "(opens in a new tab)"
 
+#. placeholder {0}: f.area_name
+#. placeholder {1}: f.product
+#. placeholder {2}: f.issued_local ?? f.issued_utc
+#: src/pages/WeatherPage.tsx:524
+msgid "{0} · {1} issued {2}"
+msgstr "{0} · {1} issued {2}"
+
+#. placeholder {0}: view.location.name
+#: src/pages/WeatherPage.tsx:183
+msgid "{0} 7-day weather"
+msgstr "{0} 7-day weather"
+
 #. placeholder {0}: names.length
 #. placeholder {1}: editableCells(model).length
 #. placeholder {2}: sourceLabels.size
@@ -51,6 +67,11 @@ msgstr "{0} cell(s) · {1} bound to a source"
 #: src/pages/docs/DocsSearch.tsx:109
 msgid "{0} documentation results"
 msgstr "{0} documentation results"
+
+#. placeholder {0}: view.location.name
+#: src/pages/WeatherPage.tsx:184
+msgid "{0} today weather"
+msgstr "{0} today weather"
 
 #: src/pages/DevicesPage.tsx:586
 msgid "{desired} (desired)"
@@ -519,7 +540,7 @@ msgstr "Accessible editing path: Cells form + Inspector in the editor"
 msgid "Accessible toasts announce via a live region."
 msgstr "Accessible toasts announce via a live region."
 
-#: src/app/navigation.tsx:73
+#: src/app/navigation.tsx:75
 #: src/pages/AccountPage.tsx:139
 msgid "Account"
 msgstr "Account"
@@ -564,6 +585,7 @@ msgstr "Action"
 #: src/pages/SourcesPage.tsx:879
 #: src/pages/SyncGroupsPage.tsx:295
 #: src/pages/TallyPage.tsx:367
+#: src/pages/WeatherPage.tsx:366
 msgid "Actions"
 msgstr "Actions"
 
@@ -620,6 +642,11 @@ msgstr "Add cell"
 #: src/layout/components/GridLayoutEditor.tsx:423
 msgid "Add column"
 msgstr "Add column"
+
+#: src/pages/WeatherPage.tsx:237
+#: src/pages/WeatherPage.tsx:309
+msgid "Add location"
+msgstr "Add location"
 
 #: src/pages/SyncGroupsPage.tsx:193
 msgid "Add member"
@@ -736,7 +763,7 @@ msgstr "Alarm policy (dwell, severity, latching)"
 msgid "Alarm when offline"
 msgstr "Alarm when offline"
 
-#: src/app/navigation.tsx:63
+#: src/app/navigation.tsx:65
 #: src/docs/registry.ts:262
 #: src/pages/AlarmsPage.tsx:152
 #: src/pages/docs/FeaturesPage.tsx:164
@@ -1016,7 +1043,7 @@ msgstr "ATSC A/85 (−24 LKFS)"
 msgid "Attached automatically"
 msgstr "Attached automatically"
 
-#: src/app/navigation.tsx:53
+#: src/app/navigation.tsx:54
 #: src/pages/AudioPage.tsx:342
 #: src/pages/OutputsPage.tsx:583
 msgid "Audio"
@@ -1034,7 +1061,7 @@ msgstr "Audio routes"
 msgid "Audio silence"
 msgstr "Audio silence"
 
-#: src/app/navigation.tsx:68
+#: src/app/navigation.tsx:70
 #: src/pages/AuditPage.tsx:55
 msgid "Audit"
 msgstr "Audit"
@@ -1160,6 +1187,10 @@ msgstr "Bind decode slot to an output"
 msgid "Bind device stream as a source"
 msgstr "Bind device stream as a source"
 
+#: src/pages/WeatherPage.tsx:189
+msgid "Bind it to a cell on the Layouts page, or preview it on Sources."
+msgstr "Bind it to a cell on the Layouts page, or preview it on Sources."
+
 #: src/pages/DeviceDetailPage.tsx:550
 msgid "Bindable streams"
 msgstr "Bindable streams"
@@ -1193,6 +1224,10 @@ msgstr "Blank renders UTC."
 #: src/pages/SupportPage.tsx:155
 msgid "Blocking"
 msgstr "Blocking"
+
+#: src/pages/WeatherPage.tsx:500
+msgid "BOM daily forecasts carry seven days and no hourly or morning/afternoon breakdown, so the “today” graphic shows the day’s forecast with the latest observation, never invented values."
+msgstr "BOM daily forecasts carry seven days and no hourly or morning/afternoon breakdown, so the “today” graphic shows the day’s forecast with the latest observation, never invented values."
 
 #: src/layout/components/CellPropertiesPanel.tsx:261
 msgid "Border"
@@ -1284,6 +1319,10 @@ msgstr "Build & licence"
 msgid "Build diagnostics snapshot"
 msgstr "Build diagnostics snapshot"
 
+#: src/pages/WeatherPage.tsx:227
+msgid "Bureau of Meteorology forecasts and observations, fetched by the server at most every 10 minutes per product. Every graphic shows “Source: Bureau of Meteorology”."
+msgstr "Bureau of Meteorology forecasts and observations, fetched by the server at most every 10 minutes per product. Every graphic shows “Source: Bureau of Meteorology”."
+
 #: src/pages/TallyPage.tsx:321
 msgid "Bus"
 msgstr "Bus"
@@ -1309,6 +1348,7 @@ msgstr "Camera 1"
 #: src/pages/SalvosPage.tsx:433
 #: src/pages/SystemActionsPage.tsx:151
 #: src/pages/TallyPage.tsx:432
+#: src/pages/WeatherPage.tsx:321
 #: src/resources/CrudPage.tsx:370
 #: src/resources/CrudPage.tsx:415
 msgid "Cancel"
@@ -1379,7 +1419,7 @@ msgstr "Canvas width and height must be positive whole numbers."
 msgid "Canvas width in pixels."
 msgstr "Canvas width in pixels."
 
-#: src/app/navigation.tsx:65
+#: src/app/navigation.tsx:67
 #: src/pages/CapabilitiesPage.tsx:235
 #: src/pages/DeviceDetailPage.tsx:490
 msgid "Capabilities"
@@ -1397,7 +1437,7 @@ msgstr "Captions"
 msgid "Carry the file to an online portal to obtain a signed lease."
 msgstr "Carry the file to an online portal to obtain a signed lease."
 
-#: src/app/navigation.tsx:56
+#: src/app/navigation.tsx:57
 #: src/pages/CastPage.tsx:215
 #: src/pages/CastPage.tsx:257
 msgid "Cast"
@@ -1795,6 +1835,10 @@ msgstr "Configured overlay layers."
 msgid "Configured sync groups."
 msgstr "Configured sync groups."
 
+#: src/pages/WeatherPage.tsx:346
+msgid "Configured weather locations"
+msgstr "Configured weather locations"
+
 #: src/components/ConnectionStatus.tsx:29
 msgid "Connected"
 msgstr "Connected"
@@ -1928,6 +1972,10 @@ msgstr "Could not copy diagnostics. Select the safe technical details and copy t
 msgid "Could not create"
 msgstr "Could not create"
 
+#: src/pages/WeatherPage.tsx:192
+msgid "Could not create source"
+msgstr "Could not create source"
+
 #: src/resources/CrudPage.tsx:290
 msgid "Could not delete"
 msgstr "Could not delete"
@@ -1935,6 +1983,10 @@ msgstr "Could not delete"
 #: src/pages/LayoutsPage.tsx:184
 msgid "Could not delete layout"
 msgstr "Could not delete layout"
+
+#: src/pages/WeatherPage.tsx:174
+msgid "Could not delete location"
+msgstr "Could not delete location"
 
 #: src/pages/TallyPage.tsx:166
 msgid "Could not delete profile"
@@ -2090,6 +2142,10 @@ msgstr "Could not load the ticket:"
 msgid "Could not load tickets:"
 msgstr "Could not load tickets:"
 
+#: src/pages/WeatherPage.tsx:381
+msgid "Could not load weather locations."
+msgstr "Could not load weather locations."
+
 #: src/pages/DeviceDetailPage.tsx:746
 #: src/pages/SyncGroupsPage.tsx:221
 msgid "Could not measure"
@@ -2127,6 +2183,10 @@ msgstr "Could not save as a device"
 #: src/pages/LayoutEditorPage.tsx:132
 msgid "Could not save layout"
 msgstr "Could not save layout"
+
+#: src/pages/WeatherPage.tsx:168
+msgid "Could not save location"
+msgstr "Could not save location"
 
 #: src/pages/SalvosPage.tsx:118
 msgid "Could not save salvo"
@@ -2200,6 +2260,18 @@ msgstr "CPU utilisation trend: ours over host total"
 msgid "Create"
 msgstr "Create"
 
+#: src/pages/WeatherPage.tsx:431
+msgid "Create 7-day source"
+msgstr "Create 7-day source"
+
+#: src/pages/WeatherPage.tsx:340
+msgid "Create sources with a transparent background (for layering over video)"
+msgstr "Create sources with a transparent background (for layering over video)"
+
+#: src/pages/WeatherPage.tsx:441
+msgid "Create today source"
+msgstr "Create today source"
+
 #: src/pages/LayoutsPage.tsx:242
 msgid "Create your first layout"
 msgstr "Create your first layout"
@@ -2211,6 +2283,10 @@ msgstr "Create your first salvo"
 #: src/resources/CrudPage.tsx:264
 msgid "Created"
 msgstr "Created"
+
+#: src/pages/WeatherPage.tsx:188
+msgid "Created source {id}"
+msgstr "Created source {id}"
 
 #: src/pages/DeviceDetailPage.tsx:1117
 msgid "Creates an ordinary managed output bound to this device via device_ref; the driver points the decode slot at it."
@@ -2260,6 +2336,10 @@ msgstr "Cue player to in-point"
 msgid "Cued"
 msgstr "Cued"
 
+#: src/pages/WeatherPage.tsx:138
+msgid "Current"
+msgstr "Current"
+
 #: src/pages/DeviceDetailPage.tsx:958
 msgid "Current mode: {currentMode}"
 msgstr "Current mode: {currentMode}"
@@ -2281,15 +2361,24 @@ msgstr "Custom…"
 msgid "D:HH:MM:SS (drop day when zero)"
 msgstr "D:HH:MM:SS (drop day when zero)"
 
-#: src/app/navigation.tsx:48
+#. placeholder {0}: view.location.name
+#: src/pages/WeatherPage.tsx:534
+msgid "Daily forecast for {0}"
+msgstr "Daily forecast for {0}"
+
+#: src/app/navigation.tsx:49
 #: src/pages/DashboardPage.tsx:50
 msgid "Dashboard"
 msgstr "Dashboard"
 
-#: src/app/navigation.tsx:74
+#: src/app/navigation.tsx:76
 #: src/pages/DataPage.tsx:377
 msgid "Data"
 msgstr "Data"
+
+#: src/pages/WeatherPage.tsx:539
+msgid "Day"
+msgstr "Day"
 
 #: src/pages/AccountPage.tsx:190
 msgid "Deactivate"
@@ -2399,6 +2488,11 @@ msgstr "Degraded event evidence: information may be incomplete."
 msgid "Delete"
 msgstr "Delete"
 
+#. placeholder {0}: l.name
+#: src/pages/WeatherPage.tsx:458
+msgid "Delete {0}"
+msgstr "Delete {0}"
+
 #: src/pages/LayoutsPage.tsx:112
 msgid "Delete layout"
 msgstr "Delete layout"
@@ -2500,7 +2594,7 @@ msgstr "Device id"
 msgid "Device-reported streams"
 msgstr "Device-reported streams"
 
-#: src/app/navigation.tsx:55
+#: src/app/navigation.tsx:56
 #: src/docs/registry.ts:158
 #: src/pages/DevicesPage.tsx:656
 #: src/pages/docs/ConfigPage.tsx:329
@@ -2603,6 +2697,7 @@ msgid "Display format"
 msgstr "Display format"
 
 #: src/pages/SalvosPage.tsx:357
+#: src/pages/WeatherPage.tsx:278
 msgid "Display name"
 msgstr "Display name"
 
@@ -2630,7 +2725,7 @@ msgstr "docker run"
 msgid "docker run and docker compose, GPU access, volumes, healthchecks, and the API token."
 msgstr "docker run and docker compose, GPU access, volumes, healthchecks, and the API token."
 
-#: src/app/navigation.tsx:69
+#: src/app/navigation.tsx:71
 msgid "Docs"
 msgstr "Docs"
 
@@ -2876,6 +2971,11 @@ msgstr "EBU R128 (−23 LUFS)"
 msgid "Edit"
 msgstr "Edit"
 
+#. placeholder {0}: l.name
+#: src/pages/WeatherPage.tsx:446
+msgid "Edit {0}"
+msgstr "Edit {0}"
+
 #: src/pages/DevicesPage.tsx:639
 #: src/pages/DevicesPage.tsx:668
 msgid "Edit device"
@@ -2892,6 +2992,10 @@ msgstr "Edit device"
 #: src/pages/LayoutEditorPage.tsx:334
 msgid "Edit layout"
 msgstr "Edit layout"
+
+#: src/pages/WeatherPage.tsx:237
+msgid "Edit location"
+msgstr "Edit location"
 
 #: src/pages/OutputsPage.tsx:718
 #: src/pages/OutputsPage.tsx:747
@@ -3121,6 +3225,7 @@ msgid "Expected return in"
 msgstr "Expected return in"
 
 #: src/pages/LicencePage.tsx:157
+#: src/pages/WeatherPage.tsx:142
 msgid "Expired"
 msgstr "Expired"
 
@@ -3187,6 +3292,10 @@ msgstr "Fast production LAN"
 msgid "Feature guide"
 msgstr "Feature guide"
 
+#: src/pages/WeatherPage.tsx:144
+msgid "Fetch error"
+msgstr "Fetch error"
+
 #: src/pages/docs/concepts/TransportsPage.tsx:324
 msgid "File / synthetic"
 msgstr "File / synthetic"
@@ -3241,6 +3350,14 @@ msgstr "Force lamp"
 #: src/pages/OutputsPage.tsx:430
 msgid "Forced CVT-RB timing (EDID-less screen)"
 msgstr "Forced CVT-RB timing (EDID-less screen)"
+
+#: src/pages/WeatherPage.tsx:290
+msgid "Forecast area code (aac)"
+msgstr "Forecast area code (aac)"
+
+#: src/pages/WeatherPage.tsx:284
+msgid "Forecast product"
+msgstr "Forecast product"
 
 #: src/layout/components/CellsForm.tsx:348
 msgid "Forward"
@@ -3646,6 +3763,10 @@ msgstr "ICE (Interactive Connectivity Establishment)"
 msgid "ICE connection failed. The network cause is unknown."
 msgstr "ICE connection failed. The network cause is unknown."
 
+#: src/pages/WeatherPage.tsx:542
+msgid "Icon code"
+msgstr "Icon code"
+
 #: src/pages/docs/ApiPage.tsx:80
 msgid "Idempotency"
 msgstr "Idempotency"
@@ -3701,6 +3822,10 @@ msgstr "In a multiview chain there are two transports in the path: the one each 
 #: src/pages/LoudnessMeter.tsx:50
 msgid "In spec"
 msgstr "In spec"
+
+#: src/pages/WeatherPage.tsx:492
+msgid "In the layout, place a media player (looping clip) cell and the weather cell over the same area, with the weather cell on a higher z. Set the weather cell’s opacity (for example 0.9) to taste. Transparent graphics composite on the CPU path; opaque ones also run on the GPU."
+msgstr "In the layout, place a media player (looping clip) cell and the weather cell over the same area, with the weather cell on a higher z. Set the weather cell’s opacity (for example 0.9) to taste. Transparent graphics composite on the CPU path; opaque ones also run on the GPU."
 
 #: src/pages/docs/ApiPage.tsx:141
 msgid "In this UI, set your token under Settings, then API access. For a container, supply it as the <0>MULTIVIEW_CONTROL_TOKEN</0> environment variable — the presented token is <1>admin.<secret></1>. When that variable is unset, the server generates a token and logs it once at startup. The unauthenticated surface is just <2>/</2>, <3>/docs</3>, and <4>/api/v1/openapi.json</4>; every <5>/api/v1</5> data route requires the token."
@@ -3815,6 +3940,10 @@ msgstr "IPv4 (legacy)"
 msgid "IPv6"
 msgstr "IPv6"
 
+#: src/pages/WeatherPage.tsx:360
+msgid "Issued"
+msgstr "Issued"
+
 #: src/pages/LayoutEditorPage.tsx:255
 msgid "Its tiles overlap (picture-in-picture), which a grid cannot express. Convert to free-form instead."
 msgstr "Its tiles overlap (picture-in-picture), which a grid cannot express. Convert to free-form instead."
@@ -3888,6 +4017,10 @@ msgstr "last changed"
 msgid "Last contact"
 msgstr "Last contact"
 
+#: src/pages/WeatherPage.tsx:363
+msgid "Last fetched"
+msgstr "Last fetched"
+
 #: src/pages/SettingsPage.tsx:105
 msgid "Last rejected:"
 msgstr "Last rejected:"
@@ -3936,6 +4069,10 @@ msgstr "Latency profile (optional)"
 msgid "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 msgstr "Latency, robustness, and scale pull against each other. Buffering is what absorbs network jitter and gives retransmission time to repair loss — so cutting the buffer cuts your protection with it. A 120 ms SRT window is snappy but fragile on a lossy link; a 2 s window rides out trouble at the cost of 2 s. Plain HTTP segments are the most robust and scalable delivery there is, and also the slowest."
 
+#: src/pages/WeatherPage.tsx:480
+msgid "Layering over a looped video background"
+msgstr "Layering over a looped video background"
+
 #: src/docs/registry.ts:133
 #: src/pages/docs/ConfigPage.tsx:110
 msgid "Layout"
@@ -3970,7 +4107,7 @@ msgstr "Layout saved & applied live"
 msgid "Layout saved, but apply failed"
 msgstr "Layout saved, but apply failed"
 
-#: src/app/navigation.tsx:49
+#: src/app/navigation.tsx:50
 #: src/docs/registry.ts:227
 #: src/pages/DashboardPage.tsx:58
 #: src/pages/docs/FeaturesPage.tsx:25
@@ -4034,7 +4171,7 @@ msgstr "Letting many viewers watch the composed wall: HLS, or LL-HLS when delay 
 msgid "Level"
 msgstr "Level"
 
-#: src/app/navigation.tsx:72
+#: src/app/navigation.tsx:74
 #: src/pages/LicencePage.tsx:459
 msgid "Licence"
 msgstr "Licence"
@@ -4313,6 +4450,7 @@ msgstr "Loading tickets…"
 
 #: src/pages/DashboardPage.tsx:67
 #: src/pages/SettingsPage.tsx:77
+#: src/pages/WeatherPage.tsx:374
 msgid "Loading…"
 msgstr "Loading…"
 
@@ -4324,6 +4462,14 @@ msgstr "Local YYYY-MM-DDTHH:MM:SS, resolved in the timezone below."
 msgid "Locale"
 msgstr "Locale"
 
+#: src/pages/WeatherPage.tsx:351
+msgid "Location"
+msgstr "Location"
+
+#: src/pages/WeatherPage.tsx:272
+msgid "Location id"
+msgstr "Location id"
+
 #: src/pages/SourcesPage.tsx:844
 msgid "Locator"
 msgstr "Locator"
@@ -4332,7 +4478,7 @@ msgstr "Locator"
 msgid "Locking every device's frame timing to one shared reference signal so all frames start at the same instant across a facility. Classically an analog black-burst or tri-level signal; in IP facilities PTP carries the same role. Genlock aligns <0>phase</0>; timecode merely labels frames."
 msgstr "Locking every device's frame timing to one shared reference signal so all frames start at the same instant across a facility. Classically an analog black-burst or tri-level signal; in IP facilities PTP carries the same role. Genlock aligns <0>phase</0>; timecode merely labels frames."
 
-#: src/app/navigation.tsx:67
+#: src/app/navigation.tsx:69
 #: src/pages/LogsPage.tsx:90
 msgid "Logs"
 msgstr "Logs"
@@ -4441,6 +4587,10 @@ msgstr "Management address"
 msgid "Manifest signalling"
 msgstr "Manifest signalling"
 
+#: src/pages/WeatherPage.tsx:262
+msgid "Manual entry"
+msgstr "Manual entry"
+
 #: src/pages/TallyPage.tsx:200
 msgid "Manual override"
 msgstr "Manual override"
@@ -4448,6 +4598,10 @@ msgstr "Manual override"
 #: src/pages/SourcesPage.tsx:747
 msgid "Matrix"
 msgstr "Matrix"
+
+#: src/pages/WeatherPage.tsx:545
+msgid "Max"
+msgstr "Max"
 
 #: src/pages/CapabilitiesPage.tsx:81
 msgid "Max resolution"
@@ -4488,7 +4642,7 @@ msgstr "Measured, never assumed"
 msgid "Measurement running"
 msgstr "Measurement running"
 
-#: src/app/navigation.tsx:61
+#: src/app/navigation.tsx:62
 #: src/docs/registry.ts:257
 #: src/pages/docs/FeaturesPage.tsx:149
 #: src/pages/MediaPlayersPage.tsx:220
@@ -4522,7 +4676,7 @@ msgstr "Members"
 msgid "Memory"
 msgstr "Memory"
 
-#: src/app/navigation.tsx:75
+#: src/app/navigation.tsx:77
 #: src/pages/MeshPage.tsx:281
 msgid "Mesh"
 msgstr "Mesh"
@@ -4534,6 +4688,10 @@ msgstr "Message"
 #: src/pages/RoutingPage.tsx:197
 msgid "Migration accepted"
 msgstr "Migration accepted"
+
+#: src/pages/WeatherPage.tsx:548
+msgid "Min"
+msgstr "Min"
 
 #: src/pages/LogsPage.tsx:102
 msgid "Minimum level"
@@ -4595,7 +4753,7 @@ msgstr "Modern GPUs and SoCs contain dedicated video engines — separate silico
 msgid "Momentary (400 ms)"
 msgstr "Momentary (400 ms)"
 
-#: src/app/navigation.tsx:58
+#: src/app/navigation.tsx:59
 #: src/pages/MonitoringPage.tsx:155
 msgid "Monitoring"
 msgstr "Monitoring"
@@ -4966,6 +5124,10 @@ msgstr "No live state"
 msgid "No live tiles yet. They appear once the engine streams a snapshot."
 msgstr "No live tiles yet. They appear once the engine streams a snapshot."
 
+#: src/pages/WeatherPage.tsx:388
+msgid "No locations yet. Nothing is fetched until one is added."
+msgstr "No locations yet. Nothing is fetched until one is added."
+
 #: src/pages/LogsPage.tsx:163
 msgid "No log records match the filter."
 msgstr "No log records match the filter."
@@ -5186,6 +5348,10 @@ msgstr "Notice"
 msgid "Notifications"
 msgstr "Notifications"
 
+#: src/pages/WeatherPage.tsx:252
+msgid "NSW preset"
+msgstr "NSW preset"
+
 #: src/docs/registry.ts:708
 #: src/pages/docs/concepts/GlossaryPage.tsx:219
 msgid "NV12"
@@ -5208,9 +5374,25 @@ msgstr "NVIDIA"
 msgid "Object"
 msgstr "Object"
 
+#: src/pages/WeatherPage.tsx:296
+msgid "Observation product (optional)"
+msgstr "Observation product (optional)"
+
 #: src/events/SourceEventsButton.tsx:14
 msgid "Observed"
 msgstr "Observed"
+
+#. placeholder {0}: o.time_display
+#. placeholder {1}: o.station_name
+#. placeholder {2}: deg(o.air_temp_c)
+#. placeholder {3}: deg(o.apparent_temp_c)
+#. placeholder {4}: o.rel_humidity_pct === null ? '—' : `${String(o.rel_humidity_pct)}%`
+#. placeholder {5}: o.wind_dir ?? '—'
+#. placeholder {6}: o.wind_kmh === null ? '' : `${String(o.wind_kmh)} km/h`
+#. placeholder {7}: o.pressure_hpa === null ? '—' : `${String(o.pressure_hpa)} hPa`
+#: src/pages/WeatherPage.tsx:578
+msgid "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
+msgstr "Observed {0} at {1}: {2} (feels like {3}), humidity {4}, wind {5} {6}, pressure {7}."
 
 #: src/components/TallyLampBadge.tsx:48
 #: src/pages/DataPage.tsx:207
@@ -5410,7 +5592,7 @@ msgstr "Output path"
 msgid "Output playback unavailable: the configured playlist path is missing."
 msgstr "Output playback unavailable: the configured playlist path is missing."
 
-#: src/app/navigation.tsx:51
+#: src/app/navigation.tsx:52
 #: src/docs/registry.ts:153
 #: src/docs/registry.ts:237
 #: src/pages/docs/ConfigPage.tsx:258
@@ -5427,7 +5609,7 @@ msgstr "Over ceiling"
 msgid "Over the layout drop zone."
 msgstr "Over the layout drop zone."
 
-#: src/app/navigation.tsx:52
+#: src/app/navigation.tsx:53
 #: src/docs/registry.ts:148
 #: src/docs/registry.ts:242
 #: src/layout/components/SourcePalette.tsx:224
@@ -5534,6 +5716,10 @@ msgstr "Pick a rectangle of squares with the arrow keys (hold Shift to extend) o
 msgid "Pick an exact EDID mode"
 msgstr "Pick an exact EDID mode"
 
+#: src/pages/WeatherPage.tsx:240
+msgid "Pick an NSW preset, or enter any BOM location manually: the state forecast product (for example IDV10753 for Victoria) and its area code (aac, for example VIC_PT042), plus optionally the state observations product (for example IDV60920) and the station WMO id. Codes are listed in the product XML on ftp://ftp.bom.gov.au/anon/gen/fwo/."
+msgstr "Pick an NSW preset, or enter any BOM location manually: the state forecast product (for example IDV10753 for Victoria) and its area code (aac, for example VIC_PT042), plus optionally the state observations product (for example IDV60920) and the station WMO id. Codes are listed in the product XML on ftp://ftp.bom.gov.au/anon/gen/fwo/."
+
 #: src/pages/ProbesPage.tsx:142
 msgid "Pick the cell this probe watches."
 msgstr "Pick the cell this probe watches."
@@ -5604,6 +5790,10 @@ msgstr "Position (frames)"
 msgid "Pre-encode canvas approximation"
 msgstr "Pre-encode canvas approximation"
 
+#: src/pages/WeatherPage.tsx:551
+msgid "Précis"
+msgstr "Précis"
+
 #: src/pages/docs/DevicesHelpPage.tsx:57
 msgid "Present only in the untrusted discovery inventory — not a device yet. Adoption is always an explicit operator action."
 msgstr "Present only in the untrusted discovery inventory — not a device yet. Adoption is always an explicit operator action."
@@ -5665,7 +5855,7 @@ msgstr "Probe now"
 msgid "Probe requested"
 msgstr "Probe requested"
 
-#: src/app/navigation.tsx:62
+#: src/app/navigation.tsx:64
 #: src/pages/ProbesPage.tsx:474
 msgid "Probes"
 msgstr "Probes"
@@ -5673,6 +5863,10 @@ msgstr "Probes"
 #: src/pages/DataPage.tsx:190
 msgid "Product telemetry"
 msgstr "Product telemetry"
+
+#: src/pages/WeatherPage.tsx:354
+msgid "Products"
+msgstr "Products"
 
 #: src/pages/TallyPage.tsx:162
 msgid "Profile deleted"
@@ -5785,6 +5979,14 @@ msgstr "Queued remote actions you can cancel locally, and the immutable account 
 #: src/pages/OverlaysPage.tsx:96
 msgid "Radius (px)"
 msgstr "Radius (px)"
+
+#: src/pages/WeatherPage.tsx:557
+msgid "Rain amount"
+msgstr "Rain amount"
+
+#: src/pages/WeatherPage.tsx:554
+msgid "Rain chance"
+msgstr "Rain chance"
 
 #: src/pages/SupportPage.tsx:100
 msgid "Raise a support ticket against your entitled queue."
@@ -6152,7 +6354,7 @@ msgstr "Route each input's audio: program-mix membership and discrete tracks."
 msgid "Routes to"
 msgstr "Routes to"
 
-#: src/app/navigation.tsx:57
+#: src/app/navigation.tsx:58
 #: src/pages/RoutingPage.tsx:227
 msgid "Routing"
 msgstr "Routing"
@@ -6245,7 +6447,7 @@ msgstr "Salvo deleted"
 msgid "Salvo saved"
 msgstr "Salvo saved"
 
-#: src/app/navigation.tsx:60
+#: src/app/navigation.tsx:61
 #: src/docs/registry.ts:252
 #: src/pages/docs/FeaturesPage.tsx:137
 #: src/pages/SalvosPage.tsx:171
@@ -6290,6 +6492,10 @@ msgstr "Save audio routing"
 msgid "Save layout"
 msgstr "Save layout"
 
+#: src/pages/WeatherPage.tsx:309
+msgid "Save location"
+msgstr "Save location"
+
 #: src/layout/components/GridLayoutEditor.tsx:288
 #: src/layout/components/LayoutEditor.tsx:208
 msgid "Save stores this layout for later use. Save & apply stores it, then asks the running engine to use it now. Saved layouts are not separate live renderers."
@@ -6298,6 +6504,11 @@ msgstr "Save stores this layout for later use. Save & apply stores it, then asks
 #: src/resources/CrudPage.tsx:264
 msgid "Saved"
 msgstr "Saved"
+
+#. placeholder {0}: view.location.name
+#: src/pages/WeatherPage.tsx:162
+msgid "Saved {0}"
+msgstr "Saved {0}"
 
 #: src/pages/AudioPage.tsx:506
 msgid "Saved and applied live: the program mix is now following the new routing."
@@ -6459,7 +6670,7 @@ msgstr "Set the receiver volume"
 msgid "Set volume"
 msgstr "Set volume"
 
-#: src/app/navigation.tsx:70
+#: src/app/navigation.tsx:72
 #: src/pages/SettingsPage.tsx:147
 msgid "Settings"
 msgstr "Settings"
@@ -6574,7 +6785,7 @@ msgstr "Source preview"
 msgid "Source URL"
 msgstr "Source URL"
 
-#: src/app/navigation.tsx:50
+#: src/app/navigation.tsx:51
 #: src/docs/registry.ts:138
 #: src/docs/registry.ts:232
 #: src/layout/components/SourcePalette.tsx:203
@@ -6668,9 +6879,14 @@ msgstr "State"
 msgid "Static source hint"
 msgstr "Static source hint"
 
+#: src/pages/WeatherPage.tsx:302
+msgid "Station WMO id (optional)"
+msgstr "Station WMO id (optional)"
+
 #: src/pages/DataPage.tsx:88
 #: src/pages/MeshPage.tsx:62
 #: src/pages/OutputsPage.tsx:685
+#: src/pages/WeatherPage.tsx:357
 msgid "Status"
 msgstr "Status"
 
@@ -6809,7 +7025,7 @@ msgstr "Successive frames differing by less than this per-mille of full-scale lu
 msgid "Superseded"
 msgstr "Superseded"
 
-#: src/app/navigation.tsx:76
+#: src/app/navigation.tsx:78
 #: src/pages/SupportPage.tsx:527
 msgid "Support"
 msgstr "Support"
@@ -6854,12 +7070,12 @@ msgstr "Synchronized output"
 msgid "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 msgstr "Synthetic sources (bars, solid colour, clock, timer) apply to the running engine immediately when saved, and deleting any source removes it from the running engine immediately. Network and file sources (RTSP, HLS, MPEG-TS, SRT, RTMP, RIST, file) also apply live on a full-engine run; on the software engine, and for NDI / YouTube / AES67, they are stored and go live via config export + restart. Each save response declares which applied (X-Multiview-Apply: live or restart)."
 
-#: src/app/navigation.tsx:64
+#: src/app/navigation.tsx:66
 #: src/pages/SystemPage.tsx:236
 msgid "System"
 msgstr "System"
 
-#: src/app/navigation.tsx:66
+#: src/app/navigation.tsx:68
 #: src/pages/SystemActionsPage.tsx:297
 msgid "System actions"
 msgstr "System actions"
@@ -6894,7 +7110,7 @@ msgstr "Take vamp exit"
 msgid "Takes effect at the next frame boundary."
 msgstr "Takes effect at the next frame boundary."
 
-#: src/app/navigation.tsx:59
+#: src/app/navigation.tsx:60
 #: src/docs/registry.ts:247
 #: src/docs/registry.ts:753
 #: src/pages/docs/concepts/GlossaryPage.tsx:326
@@ -7935,6 +8151,10 @@ msgstr "VT transport for the configured media-player channels. Load an asset, cu
 msgid "Waiting for a frame…"
 msgstr "Waiting for a frame…"
 
+#: src/pages/WeatherPage.tsx:140
+msgid "Waiting for first fetch"
+msgstr "Waiting for first fetch"
+
 #: src/pages/LoudnessMeter.tsx:110
 msgid "Waiting for loudness telemetry (realtime offline)…"
 msgstr "Waiting for loudness telemetry (realtime offline)…"
@@ -7985,6 +8205,11 @@ msgstr "Watch program"
 #: src/pages/SettingsPage.tsx:85
 msgid "Watching"
 msgstr "Watching"
+
+#: src/app/navigation.tsx:63
+#: src/pages/WeatherPage.tsx:225
+msgid "Weather"
+msgstr "Weather"
 
 #: src/pages/docs/concepts/TransportsPage.tsx:317
 msgid "WebRTC (WHIP / WHEP)"

@@ -21,6 +21,7 @@ import { DeviceDetailPage } from "../pages/DeviceDetailPage";
 import { DevicesPage } from "../pages/DevicesPage";
 import { ProbesPage } from "../pages/ProbesPage";
 import { SyncGroupsPage } from "../pages/SyncGroupsPage";
+import { WeatherPage } from "../pages/WeatherPage";
 import { AuditPage } from "../pages/AuditPage";
 import { SystemPage } from "../pages/SystemPage";
 import { CapabilitiesPage } from "../pages/CapabilitiesPage";
@@ -68,6 +69,7 @@ export const router = createBrowserRouter([
       { path: "cast", element: <CastPage /> },
       { path: "routing", element: <RoutingPage /> },
       { path: "sync-groups", element: <SyncGroupsPage /> },
+      { path: "weather", element: <WeatherPage /> },
       { path: "probes", element: <ProbesPage /> },
       { path: "monitoring", element: <MonitoringPage /> },
       { path: "tally", element: <TallyPage /> },
