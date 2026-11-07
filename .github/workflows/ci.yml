@@ -655,12 +655,41 @@ jobs:
         # opus/srt/oneVPL) let the ffmpeg-linked test binary LOAD (else exit 127),
         # and the guard step above proves that on every run. `--lib aes67` filters to
         # the lib target's aes67-named tests; --locked enforces Cargo.lock — cargo ignores it otherwise.
+        timeout-minutes: 10
         run: >
           cargo test
           --locked
           -p multiview-cli
           --features ffmpeg,aes67
           --lib aes67
+      - name: test multiview-cli --features ffmpeg,aes67 (audio lib tests)
+        # The ffmpeg-linked `audio`-module lib unit tests (route-seam crossfade +
+        # mailbox backpressure, player/vamp-window looping, shared-URL fetcher wait,
+        # loudness telemetry on real decoded audio) never ran in CI before this step:
+        # the only ffmpeg,aes67 leg filtered to `--lib aes67`, so this whole module was
+        # compiled-but-never-executed on the real libav build. Deliberately NOT the
+        # full `multiview-cli` ffmpeg suite — issue #163 records `streaming_encode`
+        # hanging there; `--lib audio` stays scoped to this module only.
+        timeout-minutes: 10
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,aes67
+          --lib audio
+      - name: test multiview-cli --features ffmpeg,aes67 (hls_fetch lib tests)
+        # Same gap as the audio step above, for the `hls_fetch`-module lib unit
+        # tests (live/VOD playlist parsing, byte-range scheduling, 403/429 backoff,
+        # gzip decoding, dispatch/retirement lifecycle fencing). Deliberately scoped
+        # to `--lib hls_fetch` only — NOT the full ffmpeg suite (issue #163:
+        # `streaming_encode` hangs there).
+        timeout-minutes: 10
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features ffmpeg,aes67
+          --lib hls_fetch
 
   # ── AsyncAPI 3.0 spec validation (SUR-6b follow-on, folded into IN-7) ────────
   # Validates docs/api/asyncapi.json against the AsyncAPI 3.0 JSON Schema using
