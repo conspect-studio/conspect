@@ -10910,6 +10910,12 @@ impl HttpHeaders {
         self.user_agent.is_none() && self.referer.is_none()
     }
 
+    /// The same headers for the in-process fetchers (loopback segment fetcher,
+    /// variant-pin master fetch); control characters are dropped there.
+    fn request_headers(&self) -> crate::hls_fetch::RequestHeaders {
+        crate::hls_fetch::RequestHeaders::new(self.user_agent.as_deref(), self.referer.as_deref())
+    }
+
     /// Set the headers as libav open options on `opts`.
     fn apply(&self, opts: &mut ffmpeg::Dictionary<'_>) {
         if let Some(ua) = &self.user_agent {
@@ -11300,11 +11306,36 @@ fn resolve_hls_variant_url_with(
 /// original `url` is returned unchanged. Best-effort: this never fails the open
 /// (invariants #1/#10) — a fall-through to the original URL still has the post-open
 /// discard + reconnect bracket as guards.
-fn main_demuxer_open_url(url: &str, location: &SourceLocation, tile_h: u32) -> String {
+fn main_demuxer_open_url(
+    url: &str,
+    location: &SourceLocation,
+    tile_h: u32,
+    headers: &HttpHeaders,
+) -> String {
     if !is_hls_location(location) {
         return url.to_owned();
     }
-    resolve_hls_variant_url(url, Some(tile_h)).unwrap_or_else(|| url.to_owned())
+    let resolved = if headers.is_empty() {
+        resolve_hls_variant_url(url, Some(tile_h))
+    } else {
+        resolve_hls_variant_url_with(
+            url,
+            Some(tile_h),
+            &HeaderPlaylistFetcher(headers.request_headers()),
+        )
+    };
+    resolved.unwrap_or_else(|| url.to_owned())
+}
+
+/// Master-playlist fetcher for the variant pin that carries the source's
+/// operator `User-Agent`/`Referer` (control/IO plane, bounded, best-effort).
+struct HeaderPlaylistFetcher(crate::hls_fetch::RequestHeaders);
+
+impl crate::captions::PlaylistFetcher for HeaderPlaylistFetcher {
+    fn fetch(&self, url: &str) -> Result<crate::captions::FetchedPlaylist, String> {
+        crate::hls_fetch::fetch_text(&self.0, url, 8 * 1024 * 1024)
+            .map(|(url, body)| crate::captions::FetchedPlaylist { url, body })
+    }
 }
 
 /// The per-source streaming-ingest loop, run on a dedicated thread (BUG-2 fix).
@@ -12467,19 +12498,14 @@ fn open_and_stream(
             // best-effort — a fetch/parse miss falls back to the original URL with
             // the post-open discard + reconnect bracket as the remaining guards
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
-            // A source with operator headers is opened by libav directly (it
-            // carries the `user_agent`/`referer` AVOptions); the variant-pin and
-            // the loopback fetcher do not carry them, so both are skipped.
-            let open_url = if plan.http_headers.is_empty() {
-                main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h)
-            } else {
-                u.clone()
-            };
+            // Operator `user_agent`/`referrer` headers ride the variant-pin
+            // request and the loopback fetcher (and libav's own opts).
+            let open_url =
+                main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h, &plan.http_headers);
             // A live HLS media playlist is fetched by our parallel-range segment
             // fetcher and read by libav from loopback memory (see `hls_fetch`);
             // anything it cannot serve (VOD, encrypted, fMP4) opens directly.
             let open_url = if plan.live
-                && plan.http_headers.is_empty()
                 && is_hls_location(&plan.location)
                 && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none()
             {
@@ -12495,16 +12521,24 @@ fn open_and_stream(
                 } else {
                     (None, None)
                 };
+                let fetch_headers = plan.http_headers.request_headers();
                 let start_result = if observer.is_some() {
                     crate::hls_fetch::HlsFetcher::start_with_observer(
                         &plan.id,
                         &open_url,
+                        &fetch_headers,
                         stop,
                         plan.lifecycle,
                         observer,
                     )
                 } else {
-                    crate::hls_fetch::HlsFetcher::start(&plan.id, &open_url, stop, plan.lifecycle)
+                    crate::hls_fetch::HlsFetcher::start(
+                        &plan.id,
+                        &open_url,
+                        &fetch_headers,
+                        stop,
+                        plan.lifecycle,
+                    )
                 };
                 match start_result {
                     Ok(fetcher) => {
@@ -12534,7 +12568,8 @@ fn open_and_stream(
             let Some(url) = resolved_youtube_url.as_deref() else {
                 return Err("youtube source did not resolve a manifest url".to_owned());
             };
-            let open_url = main_demuxer_open_url(url, &plan.location, plan.tile_h);
+            let open_url =
+                main_demuxer_open_url(url, &plan.location, plan.tile_h, &plan.http_headers);
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
