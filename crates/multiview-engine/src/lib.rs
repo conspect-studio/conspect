@@ -99,6 +99,7 @@ pub mod error;
 pub mod ha;
 pub mod heads;
 pub mod isolation;
+pub mod lifecycle;
 pub mod migration;
 pub mod placement;
 pub mod probe;
@@ -125,8 +126,9 @@ pub use cycle::{FreezeTile, RoundRobin};
 pub use degrade::{ControlLoop, ControlStep};
 pub use demand::{
     ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig, DemandLease, DemandManager, DemandPhase,
-    DemandStatus, RailDriver, RailFailure, Rails, SetItem, DEFAULT_LINGER,
-    DEFAULT_MAX_CONCURRENT_STARTS, MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
+    DemandStatus, KindBounds, RailDriver, RailFailure, Rails, SetItem, StartingPhase,
+    TransitionEvent, TransitionSink, DEFAULT_CLOSE_AFTER, DEFAULT_MAX_CONCURRENT_STARTS,
+    DEFAULT_START_TIMEOUT, MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
 };
 pub use drive::{CompositedFrame, CompositorDrive};
 pub use epoch::{
@@ -143,6 +145,9 @@ pub use heads::{HeadBinding, HeadPlacement, WallComposition};
 pub use isolation::{
     event_stream, EnginePublisher, EventStream, EventSubscription, LatestState, RecvError,
     SeqEvent, TryRecvError,
+};
+pub use lifecycle::{
+    OwnerFuture, OwnerRails, ResourceScope, ScopeKind, ScopeRegistry, SourceOwner,
 };
 pub use migration::{
     drain_stop, validate_migration, KeepaliveSink, LoadSnapshot, MigrationOutcome,

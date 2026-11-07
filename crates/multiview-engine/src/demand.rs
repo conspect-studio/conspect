@@ -3,8 +3,13 @@
 //!
 //! [`DemandManager`] is the lifecycle layer above [`SourceRegistry`]. A consumer
 //! takes a [`DemandLease`] naming the [`Rails`] it needs; the first lease starts
-//! those rails off-clock, and the last release stops them after a linger so a
-//! layout flip does not thrash. Video rails are refcounted through the registry:
+//! those rails off-clock, and the last release stops them `close after` a delay
+//! so a layout flip does not thrash. A source set `always_on` holds a standing
+//! lease from boot, so it is started whether or not anything else consumes it.
+//!
+//! States are `idle` / `starting` / `ready` / `failed` ([`DemandPhase`]). They
+//! are a separate axis from a tile's signal state (LIVE/STALE/NO_SIGNAL) and
+//! from tally. Every phase change is reported as a [`TransitionEvent`]. Video rails are refcounted through the registry:
 //! each video lease holds a [`SourceHandle`], and the manager holds one more
 //! while the rail runs, so a registry entry exists exactly while a source is
 //! consumed or still winding down.
@@ -106,10 +111,10 @@ pub enum ConsumerClass {
     HlsSession,
     /// Armed event automation, on the watched source or its replacement.
     EventAutomation,
-    /// Explicitly enabled event journaling.
-    EventJournal,
-    /// The operator pinned the source with `demand.always_on`.
+    /// The source's `activation = "always_on"` setting (the default).
     AlwaysOn,
+    /// An operator pressed Start.
+    Manual,
 }
 
 impl ConsumerClass {
@@ -123,8 +128,8 @@ impl ConsumerClass {
             Self::Preview => "preview",
             Self::HlsSession => "hls_session",
             Self::EventAutomation => "event_automation",
-            Self::EventJournal => "event_journal",
             Self::AlwaysOn => "always_on",
+            Self::Manual => "manual",
         }
     }
 }
@@ -149,17 +154,41 @@ impl ConsumerTag {
     }
 }
 
-/// A source's demand state as operators see it.
+/// A source's lifecycle state as operators see it. Not the tile signal state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DemandPhase {
-    /// No consumer and nothing running. Not a fault.
+    /// Not started: no connection, decoder or thread. Not a fault.
     Idle,
-    /// Wanted, but its first frame has not arrived yet.
+    /// Wanted, but its first media has not arrived yet ([`StartingPhase`]).
     Starting,
-    /// Producing.
-    Live,
-    /// Wanted, but not producing. It keeps retrying with backoff.
+    /// Started and producing.
+    Ready,
+    /// Wanted, but not producing. It retries with backoff (up to the kind's
+    /// retry cap).
     Failed,
+}
+
+/// Where a `starting` source is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartingPhase {
+    /// Waiting for a start slot ([`DemandConfig::max_concurrent_starts`]).
+    Queued,
+    /// The start call is running (open, connect, launch).
+    Opening,
+    /// Started; waiting for its first media.
+    AwaitingMedia,
+}
+
+impl StartingPhase {
+    /// The stable wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Opening => "opening",
+            Self::AwaitingMedia => "awaiting_media",
+        }
+    }
 }
 
 impl DemandPhase {
@@ -169,7 +198,7 @@ impl DemandPhase {
         match self {
             Self::Idle => "idle",
             Self::Starting => "starting",
-            Self::Live => "live",
+            Self::Ready => "ready",
             Self::Failed => "failed",
         }
     }
@@ -190,13 +219,75 @@ pub struct DemandStatus {
     pub consumers: Vec<ConsumerTag>,
     /// Why it is failed.
     pub detail: Option<String>,
+    /// While `starting`: where it is.
+    pub starting: Option<StartingPhase>,
+    /// While `starting` (opening or awaiting media): time left before it
+    /// reads `failed` (the start timeout).
+    pub deadline_in: Option<Duration>,
+    /// The start generation: increments on every start from nothing.
+    pub generation: u64,
+}
+
+impl DemandStatus {
+    /// The status of a source with no record: idle.
+    #[must_use]
+    pub fn idle(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            phase: DemandPhase::Idle,
+            wanted: Rails::NONE,
+            running: Rails::NONE,
+            consumers: Vec::new(),
+            detail: None,
+            starting: None,
+            deadline_in: None,
+            generation: 0,
+        }
+    }
+}
+
+/// One lifecycle transition, reported on the event path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TransitionEvent {
+    /// The source id.
+    pub source_id: String,
+    /// The start generation the transition belongs to.
+    pub generation: u64,
+    /// The previous phase.
+    pub from: DemandPhase,
+    /// The new phase.
+    pub to: DemandPhase,
+    /// Why, operator-safe (never a URL or credential).
+    pub reason: String,
+    /// When.
+    pub at: std::time::SystemTime,
+    /// Who held a lease at the time, sorted.
+    pub lease_holders: Vec<ConsumerTag>,
+}
+
+/// Receives [`TransitionEvent`]s. Called off the output clock (worker and
+/// transition threads) after the book lock is released; must not block.
+pub type TransitionSink = Arc<dyn Fn(&TransitionEvent) + Send + Sync>;
+
+/// Lifecycle bounds for one source kind. `None` fields use the manager's
+/// [`DemandConfig`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct KindBounds {
+    /// How long a start may take to first media before it reads `failed`.
+    pub start_timeout: Option<Duration>,
+    /// How long an unconsumed source keeps running before it stops.
+    pub close_after: Option<Duration>,
+    /// How many consecutive failed starts before retrying stops (the source
+    /// stays `failed` until a new consumer, Start or edit). Login-based kinds
+    /// set this so a retry cannot lock out an account.
+    pub retry_cap: Option<u32>,
 }
 
 /// Lifecycle tuning.
 #[derive(Clone, Copy, Debug)]
 pub struct DemandConfig {
-    /// How long a rail outlives its last lease.
-    pub linger: Duration,
+    /// "Close after": how long a rail outlives its last lease.
+    pub close_after: Duration,
     /// How many sources may be starting at once, across the whole process.
     pub max_concurrent_starts: usize,
     /// How long a start may go without a first frame before it reads as failed
@@ -211,10 +302,14 @@ pub struct DemandConfig {
     /// How often active sources are checked for progress. One timer for the
     /// whole manager, armed only while a source is active.
     pub health_period: Duration,
+    /// Default retry cap (`None`: retry forever, the always-on behaviour).
+    pub retry_cap: Option<u32>,
 }
 
-/// The default [`DemandConfig::linger`].
-pub const DEFAULT_LINGER: Duration = Duration::from_secs(30);
+/// The default [`DemandConfig::close_after`].
+pub const DEFAULT_CLOSE_AFTER: Duration = Duration::from_secs(30);
+/// The default [`DemandConfig::start_timeout`].
+pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// The default [`DemandConfig::max_concurrent_starts`].
 pub const DEFAULT_MAX_CONCURRENT_STARTS: usize = 8;
 /// Upper bound on queued [`DemandManager::request_restart`] requests.
@@ -226,13 +321,14 @@ pub const MAX_TIMED_LEASES: usize = 64;
 impl Default for DemandConfig {
     fn default() -> Self {
         Self {
-            linger: DEFAULT_LINGER,
+            close_after: DEFAULT_CLOSE_AFTER,
             max_concurrent_starts: DEFAULT_MAX_CONCURRENT_STARTS,
-            start_timeout: Duration::from_secs(20),
+            start_timeout: DEFAULT_START_TIMEOUT,
             stall_after: Duration::from_secs(15),
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             health_period: Duration::from_secs(1),
+            retry_cap: None,
         }
     }
 }
@@ -261,6 +357,25 @@ pub trait RailDriver<T>: Send + Sync + 'static {
         to: Rails,
         requested: Option<RequestedSize>,
     ) -> Result<Rails, RailFailure>;
+
+    /// [`transition`](Self::transition) with the start `generation` and the
+    /// `deadline` a start must meet. The default ignores both; an owner-backed
+    /// driver ([`crate::lifecycle::OwnerRails`]) passes them to its owner.
+    ///
+    /// # Errors
+    /// As [`transition`](Self::transition).
+    fn transition_at(
+        &self,
+        id: &str,
+        from: Rails,
+        to: Rails,
+        requested: Option<RequestedSize>,
+        generation: u64,
+        deadline: Instant,
+    ) -> Result<Rails, RailFailure> {
+        let _ = (generation, deadline);
+        self.transition(id, from, to, requested)
+    }
 
     /// Stop `rails` of `id` for run teardown: producers only. Unlike a
     /// transition it leaves downstream wiring (the program bus, the frame
@@ -293,6 +408,13 @@ pub trait RailDriver<T>: Send + Sync + 'static {
     fn finite(&self, id: &str) -> bool {
         let _ = id;
         false
+    }
+
+    /// Lifecycle bounds for `id`'s kind. Runs under the manager's lock: must be
+    /// a wait-free read. The default defers to the manager's config.
+    fn bounds(&self, id: &str) -> KindBounds {
+        let _ = id;
+        KindBounds::default()
     }
 }
 
@@ -329,6 +451,16 @@ struct Entry<T> {
     progress_at: Instant,
     /// The manager's own registry reference while a video rail runs.
     handle: Option<SourceHandle<T>>,
+    /// The start generation (see [`DemandStatus::generation`]).
+    generation: u64,
+    /// The phase last reported as a [`TransitionEvent`].
+    reported: DemandPhase,
+    /// Why the phase last changed (for the transition event).
+    reason: String,
+    /// An operator Stop: skip `close after` once nothing wants the rails.
+    close_now: bool,
+    /// The kind's retry cap was reached: no more automatic starts.
+    gave_up: bool,
 }
 
 impl<T> Entry<T> {
@@ -346,7 +478,25 @@ impl<T> Entry<T> {
             progress: 0,
             progress_at: now,
             handle: None,
+            generation: 0,
+            reported: DemandPhase::Idle,
+            reason: String::new(),
+            close_now: false,
+            gave_up: false,
         }
+    }
+
+    /// Where a `starting` source is.
+    fn starting_phase(&self) -> Option<StartingPhase> {
+        (self.phase == DemandPhase::Starting).then(|| {
+            if self.in_flight {
+                StartingPhase::Opening
+            } else if self.running.is_empty() {
+                StartingPhase::Queued
+            } else {
+                StartingPhase::AwaitingMedia
+            }
+        })
     }
 
     fn wanted(&self) -> Rails {
@@ -409,6 +559,10 @@ struct Inner<T> {
     restarts: SwapCell<Arc<Vec<Arc<str>>>>,
     /// Transition threads spawned so far, for tests and diagnostics.
     transitions: AtomicU64,
+    /// Worker passes so far, for idle-wakeup measurement.
+    passes: AtomicU64,
+    /// Where [`TransitionEvent`]s go.
+    sink: OnceLock<TransitionSink>,
 }
 
 /// The source demand manager. Cheap to clone.
@@ -431,7 +585,7 @@ impl<T> Clone for DemandManager<T> {
 }
 
 /// "I need this source". Dropping it releases the demand, never blocking on a
-/// rail: the stop happens on the worker after the linger.
+/// rail: the stop happens on the worker `close after` the last release.
 #[must_use = "dropping a lease releases the demand"]
 pub struct DemandLease<T> {
     inner: Arc<Inner<T>>,
@@ -549,6 +703,8 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 sets: Mutex::new(Vec::new()),
                 restarts: SwapCell::from_pointee(Vec::new()),
                 transitions: AtomicU64::new(0),
+                passes: AtomicU64::new(0),
+                sink: OnceLock::new(),
             }),
         }
     }
@@ -637,6 +793,12 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 .entry(Arc::clone(&key))
                 .or_insert_with(|| Entry::new(now));
             entry.leases.insert(lease_id, LeaseRecord { rails, tag });
+            entry.close_now = false;
+            if entry.gave_up {
+                entry.gave_up = false;
+                entry.failures = 0;
+                entry.not_before = None;
+            }
         }
         self.inner.wake();
         DemandLease {
@@ -745,6 +907,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 entry.restart = true;
                 entry.not_before = None;
                 entry.failures = 0;
+                entry.gave_up = false;
             }
         }
         self.inner.wake();
@@ -773,16 +936,10 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     #[must_use]
     pub fn status(&self, id: &str) -> DemandStatus {
         let book = lock(&self.inner.book);
+        let now = Instant::now();
         book.entries.get(id).map_or_else(
-            || DemandStatus {
-                id: id.to_owned(),
-                phase: DemandPhase::Idle,
-                wanted: Rails::NONE,
-                running: Rails::NONE,
-                consumers: Vec::new(),
-                detail: None,
-            },
-            |entry| report(self.inner.driver.as_ref(), id, entry),
+            || DemandStatus::idle(id),
+            |entry| report(&self.inner, id, entry, now),
         )
     }
 
@@ -790,10 +947,11 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     #[must_use]
     pub fn snapshot(&self) -> Vec<DemandStatus> {
         let book = lock(&self.inner.book);
+        let now = Instant::now();
         let mut out: Vec<DemandStatus> = book
             .entries
             .iter()
-            .map(|(id, entry)| report(self.inner.driver.as_ref(), id, entry))
+            .map(|(id, entry)| report(&self.inner, id, entry, now))
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
@@ -810,11 +968,83 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     pub fn transitions(&self) -> u64 {
         self.inner.transitions.load(Ordering::Relaxed)
     }
+
+    /// Worker passes so far. Constant while every source is idle.
+    #[must_use]
+    pub fn worker_passes(&self) -> u64 {
+        self.inner.passes.load(Ordering::Relaxed)
+    }
+
+    /// Send every [`TransitionEvent`] to `sink`. Set once, before
+    /// [`start`](Self::start); a second call is ignored.
+    pub fn set_transition_sink(&self, sink: TransitionSink) {
+        let _ = self.inner.sink.set(sink);
+    }
+
+    /// Operator Start: hold `id` ready until [`stop`](Self::stop). Clears a
+    /// given-up retry. Never blocks on the source.
+    pub fn start_source(&self, id: &str) {
+        let tag = ConsumerTag::new(ConsumerClass::Manual, "operator");
+        self.set_pins(&manual_key(id), vec![(id.to_owned(), Rails::ALL, tag)]);
+    }
+
+    /// Operator Stop. Refused, naming them, while any consumer other than an
+    /// operator Start holds the source (an `always_on` setting is one). On
+    /// success the source stops at once, skipping `close after`.
+    ///
+    /// # Errors
+    /// The consumers still holding the source, sorted.
+    pub fn stop_source(&self, id: &str) -> Result<(), Vec<ConsumerTag>> {
+        let previous = {
+            let mut book = lock(&self.inner.book);
+            let holders: Vec<ConsumerTag> = book.entries.get(id).map_or_else(Vec::new, |entry| {
+                let mut tags: Vec<ConsumerTag> = entry
+                    .leases
+                    .values()
+                    .filter(|lease| lease.tag.class != ConsumerClass::Manual)
+                    .map(|lease| lease.tag.clone())
+                    .collect();
+                tags.sort();
+                tags.dedup();
+                tags
+            });
+            if !holders.is_empty() {
+                return Err(holders);
+            }
+            if let Some(entry) = book.entries.get_mut(id) {
+                entry.close_now = true;
+                entry.surplus_since = None;
+            }
+            book.pins.remove(&manual_key(id))
+        };
+        drop(previous);
+        self.inner.wake();
+        Ok(())
+    }
 }
 
-fn report<T: 'static>(driver: &dyn RailDriver<T>, id: &str, entry: &Entry<T>) -> DemandStatus {
-    let wanted = entry.wanted();
-    let unstartable = !wanted.is_empty() && driver.resolve(id, wanted).is_empty();
+/// The pin owner key for an operator Start. NUL cannot appear in a source id.
+fn manual_key(id: &str) -> String {
+    format!("\u{0}manual\u{0}{id}")
+}
+
+/// The phase operators see: an entry with nothing running and nothing it can
+/// start (no consumer, or only unsatisfiable ones) is idle, never a fault.
+fn effective_phase<T: 'static>(
+    driver: &dyn RailDriver<T>,
+    id: &str,
+    entry: &Entry<T>,
+) -> DemandPhase {
+    if entry.running.is_empty() && !entry.in_flight {
+        let wanted = entry.wanted();
+        if wanted.is_empty() || driver.resolve(id, wanted).is_empty() {
+            return DemandPhase::Idle;
+        }
+    }
+    entry.phase
+}
+
+fn holders<T>(entry: &Entry<T>) -> Vec<ConsumerTag> {
     let mut consumers: Vec<ConsumerTag> = entry
         .leases
         .values()
@@ -822,20 +1052,40 @@ fn report<T: 'static>(driver: &dyn RailDriver<T>, id: &str, entry: &Entry<T>) ->
         .collect();
     consumers.sort();
     consumers.dedup();
+    consumers
+}
+
+fn report<T: Send + Sync + 'static>(
+    inner: &Inner<T>,
+    id: &str,
+    entry: &Entry<T>,
+    now: Instant,
+) -> DemandStatus {
+    // A source still within `close after` is running, so it stays truthful
+    // about what the host is paying for.
+    let phase = effective_phase(inner.driver.as_ref(), id, entry);
+    let starting = if phase == DemandPhase::Starting {
+        entry.starting_phase()
+    } else {
+        None
+    };
+    let deadline_in = match starting {
+        Some(StartingPhase::Opening | StartingPhase::AwaitingMedia) => {
+            let timeout = inner.start_timeout(id);
+            Some(timeout.saturating_sub(now.saturating_duration_since(entry.progress_at)))
+        }
+        _ => None,
+    };
     DemandStatus {
         id: id.to_owned(),
-        // A lingering source is still running, so it stays truthful about what
-        // the host is paying for. Nothing running and nothing startable (an
-        // audio consumer on a run with no bus) is idle, never a fault.
-        phase: if entry.running.is_empty() && unstartable {
-            DemandPhase::Idle
-        } else {
-            entry.phase
-        },
-        wanted,
+        phase,
+        wanted: entry.wanted(),
         running: entry.running,
-        consumers,
+        consumers: holders(entry),
         detail: entry.detail.clone(),
+        starting,
+        deadline_in,
+        generation: entry.generation,
     }
 }
 
@@ -848,6 +1098,48 @@ impl<T> Inner<T> {
 }
 
 impl<T: Send + Sync + 'static> Inner<T> {
+    fn start_timeout(&self, id: &str) -> Duration {
+        self.driver
+            .bounds(id)
+            .start_timeout
+            .unwrap_or(self.config.start_timeout)
+    }
+
+    /// The transition events for `entry` since it was last reported, marking
+    /// it reported. Book lock held; the caller emits after releasing it.
+    fn note(&self, id: &str, entry: &mut Entry<T>, out: &mut Vec<TransitionEvent>) {
+        let phase = effective_phase(self.driver.as_ref(), id, entry);
+        if phase == entry.reported {
+            return;
+        }
+        if self.sink.get().is_some() {
+            let reason = if entry.reason.is_empty() {
+                default_reason(phase)
+            } else {
+                std::mem::take(&mut entry.reason)
+            };
+            out.push(TransitionEvent {
+                source_id: id.to_owned(),
+                generation: entry.generation,
+                from: entry.reported,
+                to: phase,
+                reason,
+                at: std::time::SystemTime::now(),
+                lease_holders: holders(entry),
+            });
+        }
+        entry.reason.clear();
+        entry.reported = phase;
+    }
+
+    fn emit(&self, events: &[TransitionEvent]) {
+        if let Some(sink) = self.sink.get() {
+            for event in events {
+                sink(event);
+            }
+        }
+    }
+
     /// One registry reference for `id`. `None` for an unconfigured source.
     fn registry_handle(&self, id: &str, size: Option<RequestedSize>) -> Option<SourceHandle<T>> {
         let store = self.driver.store(id)?;
@@ -939,8 +1231,9 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let mut sooner = |at: Instant| {
             wake = Some(wake.map_or(at, |current: Instant| current.min(at)));
         };
-        let mut launches: Vec<(Arc<str>, Rails, Rails, bool)> = Vec::new();
+        let mut launches: Vec<(Arc<str>, Rails, Rails, bool, u64)> = Vec::new();
         let mut released = Vec::new();
+        let mut events = Vec::new();
         {
             let mut book = lock(&self.book);
             let mut slots_used = book
@@ -954,6 +1247,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
             for (id, entry) in &mut book.entries {
                 let asked = entry.wanted();
                 let wanted = self.driver.resolve(id, asked);
+                let bounds = self.driver.bounds(id);
                 if !entry.running.is_empty() && !entry.in_flight {
                     self.check_health(id, entry, now);
                     sooner(now + config.health_period);
@@ -961,10 +1255,15 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 if entry.in_flight {
                     continue;
                 }
+                let close_after = if entry.close_now {
+                    Duration::ZERO
+                } else {
+                    bounds.close_after.unwrap_or(config.close_after)
+                };
                 let target = if entry.restart {
                     Rails::NONE
                 } else {
-                    match desired_rails(entry, wanted, now, config.linger) {
+                    match desired_rails(entry, wanted, now, close_after) {
                         Desired::Hold(deadline) => {
                             if let Some(deadline) = deadline {
                                 sooner(deadline);
@@ -986,14 +1285,46 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 }
                 let starting = !entry.running.covers(target);
                 if starting {
+                    // The kind's retry cap: stay failed, no further attempts,
+                    // until a new consumer, an operator Start or an edit.
+                    let cap = bounds.retry_cap.or(config.retry_cap);
+                    if cap.is_some_and(|cap| entry.failures >= cap) {
+                        if !entry.gave_up {
+                            entry.gave_up = true;
+                            entry.detail = Some(format!(
+                                "gave up after {} failed starts; press Start to retry",
+                                entry.failures
+                            ));
+                        }
+                        continue;
+                    }
                     if slots_used >= config.max_concurrent_starts.max(1) {
                         continue;
                     }
                     slots_used += 1;
+                    if entry.running.is_empty() {
+                        entry.generation = entry.generation.wrapping_add(1);
+                        entry.phase = DemandPhase::Starting;
+                        if entry.reason.is_empty() {
+                            entry.reason = "a consumer needs it".to_owned();
+                        }
+                    }
+                    entry.progress_at = now;
+                } else if target.is_empty() && entry.close_now {
+                    entry.reason = "stopped by an operator".to_owned();
                 }
                 in_flight += 1;
                 entry.in_flight = true;
-                launches.push((Arc::clone(id), entry.running, target, entry.restart));
+                launches.push((
+                    Arc::clone(id),
+                    entry.running,
+                    target,
+                    entry.restart,
+                    entry.generation,
+                ));
+            }
+            for (id, entry) in &mut book.entries {
+                self.note(id, entry, &mut events);
             }
             // Forget sources nothing wants and nothing runs.
             let finished: Vec<Arc<str>> = book
@@ -1014,8 +1345,9 @@ impl<T: Send + Sync + 'static> Inner<T> {
             }
         }
         drop(released);
-        for (id, from, to, restarting) in launches {
-            self.launch(&id, from, to, restarting);
+        self.emit(&events);
+        for (id, from, to, restarting, generation) in launches {
+            self.launch(&id, from, to, restarting, generation);
         }
         wake
     }
@@ -1026,18 +1358,23 @@ impl<T: Send + Sync + 'static> Inner<T> {
         if progress != entry.progress {
             entry.progress = progress;
             entry.progress_at = now;
-            entry.phase = DemandPhase::Live;
+            if entry.phase != DemandPhase::Ready {
+                entry.reason = "media arrived".to_owned();
+            }
+            entry.phase = DemandPhase::Ready;
             entry.detail = None;
             entry.failures = 0;
             return;
         }
         let silent = now.saturating_duration_since(entry.progress_at);
         match entry.phase {
-            DemandPhase::Starting if silent >= self.config.start_timeout => {
+            DemandPhase::Starting if silent >= self.start_timeout(id) => {
+                entry.reason = "start timeout".to_owned();
                 entry.phase = DemandPhase::Failed;
                 entry.detail = Some("no media yet; still retrying".to_owned());
             }
-            DemandPhase::Live if silent >= self.config.stall_after && !self.driver.finite(id) => {
+            DemandPhase::Ready if silent >= self.config.stall_after && !self.driver.finite(id) => {
+                entry.reason = "no media received recently".to_owned();
                 entry.phase = DemandPhase::Failed;
                 entry.detail = Some("no media received recently; still retrying".to_owned());
             }
@@ -1047,8 +1384,16 @@ impl<T: Send + Sync + 'static> Inner<T> {
 
     /// Run one transition on a transient thread. The caller holds a start slot
     /// for it, so the thread count is bounded.
-    fn launch(self: &Arc<Self>, id: &Arc<str>, from: Rails, to: Rails, restarting: bool) {
+    fn launch(
+        self: &Arc<Self>,
+        id: &Arc<str>,
+        from: Rails,
+        to: Rails,
+        restarting: bool,
+        generation: u64,
+    ) {
         self.transitions.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + self.start_timeout(id);
         let inner = Arc::clone(self);
         let thread_id = Arc::clone(id);
         let spawned = std::thread::Builder::new()
@@ -1059,7 +1404,8 @@ impl<T: Send + Sync + 'static> Inner<T> {
                     .requested_supremum(&SourceKey::from_canonical(&*thread_id));
                 let driver = Arc::clone(&inner.driver);
                 let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    let outcome = driver.transition(&thread_id, from, to, requested);
+                    let outcome =
+                        driver.transition_at(&thread_id, from, to, requested, generation, deadline);
                     let running = outcome
                         .as_ref()
                         .map_or_else(|failure| failure.running, |running| *running);
@@ -1107,11 +1453,15 @@ impl<T: Send + Sync + 'static> Inner<T> {
             .flatten();
         let progress = self.driver.progress(id, running);
         let mut surplus = None;
+        let mut events = Vec::new();
         {
             let mut book = lock(&self.book);
             let now = Instant::now();
             if let Some(entry) = book.entries.get_mut(id) {
                 entry.in_flight = false;
+                if running.is_empty() {
+                    entry.close_now = false;
+                }
                 if to.is_empty() {
                     entry.restart = false;
                 }
@@ -1139,6 +1489,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                         tracing::warn!(source = %id, %reason, "source rail change failed; retrying with backoff");
                         entry.failures = entry.failures.saturating_add(1);
                         entry.phase = DemandPhase::Failed;
+                        entry.reason.clone_from(&reason);
                         entry.detail = Some(reason);
                         let delay = backoff(
                             self.config.backoff_base,
@@ -1148,9 +1499,14 @@ impl<T: Send + Sync + 'static> Inner<T> {
                         entry.not_before = Some(now + delay);
                     }
                 }
+                if running.is_empty() && entry.reason.is_empty() {
+                    entry.reason = "stopped".to_owned();
+                }
+                self.note(id, entry, &mut events);
             }
         }
         drop(surplus);
+        self.emit(&events);
         self.wake();
     }
 }
@@ -1163,13 +1519,13 @@ enum Desired {
     Move(Rails),
 }
 
-/// Added rails start at once. Surplus rails stop only after the linger, so a
+/// Added rails start at once. Surplus rails stop only `close_after` later, so a
 /// new consumer arriving meanwhile finds them still running.
 fn desired_rails<T>(
     entry: &mut Entry<T>,
     wanted: Rails,
     now: Instant,
-    linger: Duration,
+    close_after: Duration,
 ) -> Desired {
     if entry.running == wanted {
         entry.surplus_since = None;
@@ -1177,13 +1533,13 @@ fn desired_rails<T>(
     }
     if entry.running.covers(wanted) {
         let since = *entry.surplus_since.get_or_insert(now);
-        let deadline = since + linger;
+        let deadline = since + close_after;
         if now >= deadline {
             return Desired::Move(wanted);
         }
         return Desired::Hold(Some(deadline));
     }
-    // Keep surplus rails through the add; the linger applies to them afterwards.
+    // Keep surplus rails through the add; `close after` applies afterwards.
     Desired::Move(entry.running.union(wanted))
 }
 
@@ -1193,8 +1549,19 @@ fn backoff(base: Duration, max: Duration, failures: u32) -> Duration {
     base.saturating_mul(1_u32 << exponent).min(max)
 }
 
+fn default_reason(phase: DemandPhase) -> String {
+    match phase {
+        DemandPhase::Idle => "no consumer",
+        DemandPhase::Starting => "starting",
+        DemandPhase::Ready => "media arrived",
+        DemandPhase::Failed => "not producing",
+    }
+    .to_owned()
+}
+
 fn worker_loop<T: Send + Sync + 'static>(inner: &Arc<Inner<T>>) {
     while !inner.stopping.load(Ordering::Acquire) {
+        inner.passes.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let restarts = inner.restarts.swap(Arc::new(Vec::new()));
         if !restarts.is_empty() {
@@ -1303,21 +1670,22 @@ mod tests {
         }
     }
 
-    fn config(linger_ms: u64) -> DemandConfig {
+    fn config(close_after_ms: u64) -> DemandConfig {
         DemandConfig {
-            linger: Duration::from_millis(linger_ms),
+            close_after: Duration::from_millis(close_after_ms),
             max_concurrent_starts: 4,
             start_timeout: Duration::from_millis(100),
             stall_after: Duration::from_millis(100),
             backoff_base: Duration::from_millis(10),
             backoff_max: Duration::from_millis(40),
             health_period: Duration::from_millis(5),
+            retry_cap: None,
         }
     }
 
-    fn manager(fake: &Arc<Fake>, linger_ms: u64) -> DemandManager<u8> {
+    fn manager(fake: &Arc<Fake>, close_after_ms: u64) -> DemandManager<u8> {
         let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(fake);
-        let manager = DemandManager::new(SourceRegistry::new(), driver, config(linger_ms));
+        let manager = DemandManager::new(SourceRegistry::new(), driver, config(close_after_ms));
         manager.start();
         manager
     }
@@ -1354,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn first_lease_starts_and_last_lease_stops_only_after_the_linger() {
+    fn first_lease_starts_and_last_lease_stops_only_after_close_after() {
         let fake = Arc::new(Fake::default());
         let manager = manager(&fake, 150);
         let first = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
@@ -1376,7 +1744,7 @@ mod tests {
         });
         assert!(
             released.elapsed() >= Duration::from_millis(140),
-            "stopped before the linger"
+            "stopped before close after"
         );
         wait("record removed", || manager.active_len() == 0);
         assert_eq!(fake.video_starts.load(Ordering::SeqCst), 1, "one decode");
@@ -1384,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn a_consumer_returning_inside_the_linger_does_not_restart() {
+    fn a_consumer_returning_inside_close_after_does_not_restart() {
         let fake = Arc::new(Fake::default());
         let manager = manager(&fake, 200);
         let lease = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
@@ -1565,15 +1933,15 @@ mod tests {
     }
 
     #[test]
-    fn progress_makes_a_source_live_and_a_stall_fails_it() {
+    fn progress_makes_a_source_ready_and_a_stall_fails_it() {
         let fake = Arc::new(Fake::default());
         let manager = manager(&fake, 10);
         let lease = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
         wait("start", || fake.video_starts.load(Ordering::SeqCst) == 1);
         assert_eq!(manager.status("cam").phase, DemandPhase::Starting);
-        wait("live", || {
+        wait("ready", || {
             fake.progress.fetch_add(1, Ordering::SeqCst);
-            manager.status("cam").phase == DemandPhase::Live
+            manager.status("cam").phase == DemandPhase::Ready
         });
         wait("stalled", || {
             manager.status("cam").phase == DemandPhase::Failed
@@ -1719,6 +2087,206 @@ mod tests {
         );
         set.publish(Vec::new());
         wait("stopped", || fake.video_stops.load(Ordering::SeqCst) == 1);
+        manager.shutdown();
+    }
+
+    fn events_into(manager: &DemandManager<u8>) -> Arc<Mutex<Vec<TransitionEvent>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        manager.set_transition_sink(Arc::new(move |event: &TransitionEvent| {
+            lock(&sink).push(event.clone());
+        }));
+        seen
+    }
+
+    #[test]
+    fn operator_start_holds_a_source_and_stop_closes_it_at_once() {
+        let fake = Arc::new(Fake::default());
+        // A long close-after: an operator Stop must not wait for it.
+        let manager = manager(&fake, 60_000);
+        manager.start_source("cam");
+        wait("started", || fake.video_starts.load(Ordering::SeqCst) == 1);
+        let status = manager.status("cam");
+        assert_eq!(status.consumers[0].class, ConsumerClass::Manual);
+        assert_eq!(status.generation, 1);
+        manager.stop_source("cam").expect("no other consumer");
+        wait("stopped at once", || {
+            fake.video_stops.load(Ordering::SeqCst) == 1
+        });
+        wait("idle", || manager.active_len() == 0);
+        assert_eq!(manager.status("cam").phase, DemandPhase::Idle);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn stop_is_refused_while_consumers_hold_the_source_and_names_them() {
+        let fake = Arc::new(Fake::default());
+        let manager = manager(&fake, 10);
+        let cell = manager.acquire(
+            "cam",
+            Rails::ALL,
+            ConsumerTag::new(ConsumerClass::LayoutCell, "cell-1"),
+            None,
+        );
+        manager.set_pins(
+            "cam",
+            vec![(
+                "cam".to_owned(),
+                Rails::ALL,
+                ConsumerTag::new(ConsumerClass::AlwaysOn, "always_on"),
+            )],
+        );
+        manager.start_source("cam");
+        wait("started", || fake.video_starts.load(Ordering::SeqCst) == 1);
+        let holders = manager.stop_source("cam").expect_err("refused");
+        let names: Vec<_> = holders.iter().map(|t| (t.class, &*t.label)).collect();
+        assert_eq!(
+            names,
+            vec![
+                (ConsumerClass::LayoutCell, "cell-1"),
+                (ConsumerClass::AlwaysOn, "always_on")
+            ]
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fake.video_stops.load(Ordering::SeqCst), 0, "still running");
+        drop(cell);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn every_phase_change_is_one_transition_event_with_generation_and_holders() {
+        let fake = Arc::new(Fake::default());
+        let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(&fake);
+        let manager = DemandManager::new(SourceRegistry::new(), driver, config(10));
+        let seen = events_into(&manager);
+        manager.start();
+        let lease = manager.acquire("cam", Rails::VIDEO, tag("viewer"), None);
+        wait("ready", || {
+            fake.progress.fetch_add(1, Ordering::SeqCst);
+            manager.status("cam").phase == DemandPhase::Ready
+        });
+        drop(lease);
+        wait("idle", || manager.active_len() == 0);
+        manager.shutdown();
+        let events = lock(&seen).clone();
+        let path: Vec<_> = events.iter().map(|e| (e.from, e.to)).collect();
+        assert_eq!(
+            path,
+            vec![
+                (DemandPhase::Idle, DemandPhase::Starting),
+                (DemandPhase::Starting, DemandPhase::Ready),
+                (DemandPhase::Ready, DemandPhase::Idle),
+            ],
+            "{events:?}"
+        );
+        assert!(events
+            .iter()
+            .all(|e| e.generation == 1 && e.source_id == "cam"));
+        assert_eq!(&*events[0].lease_holders[0].label, "viewer");
+        assert_eq!(events[1].reason, "media arrived");
+        assert!(events[2].lease_holders.is_empty());
+    }
+
+    #[test]
+    fn a_restart_is_a_new_generation() {
+        let fake = Arc::new(Fake::default());
+        let manager = manager(&fake, 10);
+        let lease = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
+        wait("start", || fake.video_starts.load(Ordering::SeqCst) == 1);
+        assert_eq!(manager.status("cam").generation, 1);
+        manager.restart("cam");
+        wait("restart", || fake.video_starts.load(Ordering::SeqCst) == 2);
+        wait("generation 2", || manager.status("cam").generation == 2);
+        drop(lease);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn the_kind_retry_cap_stops_retrying_until_start_is_pressed() {
+        struct Capped(Arc<Fake>);
+        impl RailDriver<u8> for Capped {
+            fn store(&self, id: &str) -> Option<Arc<TileStore<u8>>> {
+                self.0.store(id)
+            }
+            fn resolve(&self, id: &str, asked: Rails) -> Rails {
+                self.0.resolve(id, asked)
+            }
+            fn transition(
+                &self,
+                id: &str,
+                from: Rails,
+                to: Rails,
+                size: Option<RequestedSize>,
+            ) -> Result<Rails, RailFailure> {
+                self.0.transition(id, from, to, size)
+            }
+            fn progress(&self, id: &str, rails: Rails) -> u64 {
+                self.0.progress(id, rails)
+            }
+            fn bounds(&self, _id: &str) -> KindBounds {
+                KindBounds {
+                    retry_cap: Some(2),
+                    ..KindBounds::default()
+                }
+            }
+        }
+        let fake = Arc::new(Fake::default());
+        lock(&fake.failing).insert("login".to_owned());
+        let driver: Arc<dyn RailDriver<u8>> = Arc::new(Capped(Arc::clone(&fake)));
+        let manager = DemandManager::new(SourceRegistry::new(), driver, config(10));
+        manager.start();
+        manager.start_source("login");
+        wait("gave up", || {
+            manager
+                .status("login")
+                .detail
+                .is_some_and(|d| d.starts_with("gave up"))
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(fake.attempts.load(Ordering::SeqCst), 2, "no lockout storm");
+        assert_eq!(manager.status("login").phase, DemandPhase::Failed);
+        lock(&fake.failing).clear();
+        manager.start_source("login");
+        wait("Start retries", || {
+            fake.video_starts.load(Ordering::SeqCst) == 1
+        });
+        manager.shutdown();
+    }
+
+    #[test]
+    fn a_starting_source_reports_its_phase_and_deadline() {
+        let fake = Arc::new(Fake::default());
+        let manager = DemandManager::new(
+            SourceRegistry::new(),
+            Arc::<Fake>::clone(&fake) as Arc<dyn RailDriver<u8>>,
+            DemandConfig {
+                start_timeout: Duration::from_secs(20),
+                ..config(10)
+            },
+        );
+        let lease = manager.acquire("cam", Rails::VIDEO, tag("a"), None);
+        // No worker yet: wanted, waiting for a slot.
+        let queued = manager.status("cam");
+        assert_eq!(queued.phase, DemandPhase::Starting);
+        assert_eq!(queued.starting, Some(StartingPhase::Queued));
+        manager.start();
+        wait("awaiting media", || {
+            manager.status("cam").starting == Some(StartingPhase::AwaitingMedia)
+        });
+        let deadline = manager.status("cam").deadline_in.expect("deadline");
+        assert!(deadline <= Duration::from_secs(20) && deadline > Duration::from_secs(15));
+        drop(lease);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn an_idle_manager_never_wakes() {
+        let fake = Arc::new(Fake::default());
+        let manager = manager(&fake, 10);
+        std::thread::sleep(Duration::from_millis(50));
+        let before = manager.worker_passes();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(manager.worker_passes(), before, "idle wakeups");
         manager.shutdown();
     }
 }
