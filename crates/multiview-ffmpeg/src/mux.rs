@@ -14,7 +14,28 @@
 //! input PTS.
 //! Callers must finish with [`Muxer::finish`] (writes the trailer) — dropping
 //! without it leaves a container missing its trailer, so `finish` is explicit.
+//!
+//! ## Segment rotation without a continuity-counter reset ([`Muxer::redirect_output`])
+//! An HLS/segmented MPEG-TS run must **not** allocate a fresh muxer per
+//! segment: libav's `mpegtsenc` keeps its PAT/PMT/SDT/ES continuity counters
+//! (`cc`) as per-PID state on the single `AVFormatContext` it was initialized
+//! with, so a new `Muxer::create_as(...)` per segment restarts every PID's `cc`
+//! at 0 — the exact bug a TS demuxer complains about as "discontinuity
+//! (received 0, expected N)" at every segment boundary. This mirrors
+//! `libavformat/hlsenc.c`'s own approach (`hls_mux_init` builds ONE inner
+//! `mpegts` `AVFormatContext` per variant for the whole run; `hls_write_packet`
+//! only swaps the `AVIOContext` — via `hlsenc_io_open`/`ff_format_io_close` — at
+//! each segment cut, and sets the muxer's `mpegts_flags=resend_headers`
+//! `AVOption` so the still-open context re-emits PAT/PMT/SDT at the START of
+//! the new file without touching any `cc`).
+//! [`redirect_output`](Muxer::redirect_output) is the safe-wrapper sibling:
+//! call it on an **already-initialized** (`write_header` already called)
+//! MPEG-TS `Muxer` to close the current `AVIOContext`, open a new one at
+//! `path`, and set `mpegts_flags=resend_headers` so the very next packet
+//! re-emits PAT/PMT/SDT (self-contained segment start) while every PID's `cc`
+//! continues exactly where it left off.
 
+use std::ffi::CString;
 use std::path::Path;
 
 use ffmpeg::{codec, format, Dictionary};
@@ -638,6 +659,155 @@ impl Muxer {
         }
         self.output.write_trailer().map_err(FfmpegError::Mux)?;
         self.trailer_written = true;
+        Ok(())
+    }
+
+    /// Flush every packet this muxer is currently holding onto the CURRENT
+    /// `pb`, without touching `pb` itself — the two-stage flush
+    /// `av_write_trailer` performs at end-of-stream, exposed standalone so a
+    /// caller can force every already-written byte of the CURRENT segment
+    /// file onto disk before e.g. renaming it into place, ahead of
+    /// [`redirect_output`](Muxer::redirect_output) swapping `pb` to the next
+    /// segment's file:
+    /// 1. `av_interleaved_write_frame(ctx, NULL)` drains any packet still held
+    ///    back by the interleave reorder queue (one stream waiting on another
+    ///    to establish dts order) — the same flush
+    ///    [`write_packet`](Muxer::write_packet)'s `write_interleaved` relies on.
+    /// 2. `av_write_frame(ctx, NULL)` — the **non-interleaved** flush entry
+    ///    point — triggers the muxer's own `FF_OFMT_FLAG_ALLOW_FLUSH` path
+    ///    (`mpegtsenc`'s `mpegts_write_flush`), which writes out any PARTIAL TS
+    ///    packet still buffered per-PID (`ts_st->payload`) — the exact flush
+    ///    HLS's `hlsenc.c` performs via `av_write_frame(oc, NULL)` before every
+    ///    segment cut.
+    ///
+    /// Idempotent: calling it again with nothing pending is a no-op (both
+    /// stages report "flushed, nothing more to flush").
+    ///
+    /// # Errors
+    /// * [`FfmpegError::Mux`] — the header was not yet written, the trailer was
+    ///   already written, or either flush stage failed.
+    #[allow(unsafe_code)]
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.header_written || self.trailer_written {
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        // SAFETY: `self.output.as_mut_ptr()` is the live, owned output
+        // `AVFormatContext` (we hold `&mut self`; the header has been
+        // written). `av_interleaved_write_frame(ctx, NULL)` and
+        // `av_write_frame(ctx, NULL)` are the documented null-packet flush
+        // calls described above; both accept a null `AVPacket*` and write only
+        // onto the CURRENT `pb`. A non-negative return (0, or 1 meaning
+        // "flushed, nothing more to flush") from either is success; only a
+        // negative return is an error.
+        let rc = unsafe {
+            let ctx = self.output.as_mut_ptr();
+            let interleave_flush =
+                ffmpeg::ffi::av_interleaved_write_frame(ctx, std::ptr::null_mut());
+            if interleave_flush < 0 {
+                interleave_flush
+            } else {
+                ffmpeg::ffi::av_write_frame(ctx, std::ptr::null_mut())
+            }
+        };
+        if rc < 0 {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(rc)));
+        }
+        Ok(())
+    }
+
+    /// Redirect this **already-initialized** muxer's output to a new file at
+    /// `path`, without rebuilding the `AVFormatContext` (so per-PID continuity
+    /// counters, PCR/PTS bookkeeping, etc. carry over unbroken) — the
+    /// MPEG-TS/HLS segment-rotation primitive (see the module doc).
+    ///
+    /// This is the direct analogue of `libavformat/hlsenc.c`'s segment cut: it
+    /// [`flush`](Muxer::flush)es, then closes the current `AVIOContext` (same
+    /// as `ff_format_io_close` — a no-op the first time, when no segment has
+    /// been written to this muxer yet), opens a fresh one at `path`
+    /// (`avio_open`, write mode), and — for the `mpegts` muxer specifically —
+    /// sets the `mpegts_flags=resend_headers` `AVOption` on the format's
+    /// private data so the very next packet re-emits PAT/PMT/SDT (making the
+    /// new file self-contained/independently decodable) without touching any
+    /// stream's continuity counter. For a non-`mpegts` muxer (the
+    /// `format_name` this `Muxer` was created with) the header re-emission
+    /// step is skipped — the caller must not rely on it for other containers.
+    ///
+    /// If the caller already flushed (to rename the just-closed segment file
+    /// into place first, for example), this repeats the now-idempotent flush
+    /// harmlessly before swapping `pb`.
+    ///
+    /// Must be called **after** [`write_header`](Muxer::write_header) (there is
+    /// nothing to redirect before the header has initialized the muxer) and
+    /// **before** the next [`write_packet`](Muxer::write_packet). Calling this
+    /// before `write_header` or after [`finish`](Muxer::finish) is a contract
+    /// violation, surfaced as a typed error rather than a libav crash.
+    ///
+    /// # Errors
+    /// * [`FfmpegError::Mux`] — the header was not yet written, the trailer was
+    ///   already written, `path` is not valid UTF-8 or carries an interior NUL,
+    ///   the flush failed, or the new `AVIOContext` could not be opened.
+    #[allow(unsafe_code)]
+    pub fn redirect_output(&mut self, path: &Path) -> Result<()> {
+        self.flush()?;
+        if !self.header_written || self.trailer_written {
+            return Err(FfmpegError::Mux(ffmpeg::Error::InvalidData));
+        }
+        let path_str = path.to_str().ok_or_else(nul_err)?;
+        let cpath = CString::new(path_str).map_err(|_| nul_err())?;
+        // SAFETY: `self.output.as_mut_ptr()` is the live, owned output
+        // `AVFormatContext` (we hold `&mut self`; the header has been
+        // written and `self.flush()` above already landed every buffered
+        // byte on the OLD `pb`). `avio_closep` is null-safe (a no-op on a
+        // null `pb`, i.e. the very first call) and nulls the slot it is
+        // handed; `avio_open` then allocates a fresh write-mode `AVIOContext`
+        // into the same slot. `cpath` is a valid NUL-terminated C string that
+        // outlives the call.
+        let rc = unsafe {
+            let ctx = self.output.as_mut_ptr();
+            ffmpeg::ffi::avio_closep(&raw mut (*ctx).pb);
+            ffmpeg::ffi::avio_open(
+                &raw mut (*ctx).pb,
+                cpath.as_ptr(),
+                ffmpeg::ffi::AVIO_FLAG_WRITE,
+            )
+        };
+        if rc < 0 {
+            return Err(FfmpegError::Mux(ffmpeg::Error::from(rc)));
+        }
+        // mpegts-only: ask the still-open inner context to re-emit PAT/PMT/SDT
+        // before the next packet (the segment-start self-containment libav's own
+        // HLS muxer gets via the identical `mpegts_flags=resend_headers`
+        // `AVOption`, set on `oc->priv_data` in `hlsenc.c`). A non-mpegts muxer
+        // has no such flag/private-data shape, so this is a best-effort no-op
+        // for it (the caller must not rely on it in that case — documented
+        // above).
+        //
+        // SAFETY: `ctx` is still the same live `AVFormatContext`; `oformat` and
+        // `priv_data` are populated since the header has already been written.
+        // `priv_class` identifies the mpegts muxer's `AVOption`-enabled private
+        // struct; `av_opt_set` only reads the two NUL-terminated C strings
+        // below, which outlive the call. A failure here (unexpected on the
+        // mpegts muxer) is swallowed: resend-headers is a best-effort
+        // self-containment aid, not required for correctness (continuity is
+        // already preserved by not rebuilding the context), so it must not turn
+        // a successful redirect into an error.
+        unsafe {
+            let ctx = self.output.as_mut_ptr();
+            let priv_data = (*ctx).priv_data;
+            let is_mpegts = !priv_data.is_null()
+                && !(*ctx).oformat.is_null()
+                && !(*(*ctx).oformat).priv_class.is_null()
+                && *(priv_data.cast::<*const ffmpeg::ffi::AVClass>())
+                    == (*(*ctx).oformat).priv_class;
+            if is_mpegts {
+                if let (Ok(key), Ok(val)) =
+                    (CString::new("mpegts_flags"), CString::new("resend_headers"))
+                {
+                    let _ignored =
+                        ffmpeg::ffi::av_opt_set(priv_data, key.as_ptr(), val.as_ptr(), 0);
+                }
+            }
+        }
         Ok(())
     }
 }

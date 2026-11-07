@@ -1815,18 +1815,31 @@ impl StreamSeed<'_> {
 }
 
 /// Per-run segmentation state: the open segment, completed segments, and stats.
+///
+/// ## One long-lived muxer per run (continuity counters, root-caused)
+/// [`current`](Self::current) holds exactly **one** [`Muxer`] for the entire
+/// run (opened lazily by the first keyframe), not one muxer per segment. A
+/// segment boundary calls [`Muxer::redirect_output`] to point the SAME
+/// `AVFormatContext` at the next segment's file; it never calls
+/// `Muxer::create_as` again. This is required because libav's `mpegtsenc`
+/// keeps PAT/PMT/SDT/ES continuity counters (`cc`) as per-PID state on the
+/// `AVFormatContext`: a fresh muxer per segment restarted every `cc` at 0,
+/// which a player demuxing the HLS output as one continuous MPEG-TS reports as
+/// a continuity-counter discontinuity at every segment cut (see the
+/// [`Muxer::redirect_output`] doc for the libav-source cross-reference). The
+/// discrete per-rendition audio muxers ([`AudioRenditionState::current`])
+/// carry the identical one-muxer-per-rendition-for-the-run fix.
 struct SegmentState<'a> {
     dir: &'a Path,
     prefix: &'a str,
     time_base: Rational,
-    /// The **single** run-wide codec-parameter seed. Each new segment muxer
-    /// copies the same codec parameters from this; the codec is fixed across the
-    /// encode (invariant #7), so the seed is borrowed once — never per segment.
+    /// The **single** run-wide codec-parameter seed. The one long-lived video
+    /// muxer's stream is registered from this ONCE, at first open; the codec is
+    /// fixed across the encode (invariant #7).
     seed: StreamSeed<'a>,
-    /// The optional program-audio stream registered into every segment muxer
-    /// alongside the video (AUD-4). `None` for the encoder-fed (video-only)
-    /// [`SegmentSink`]; the codec is fixed for the run so this too is borrowed
-    /// once and reused per segment.
+    /// The optional program-audio stream registered on the long-lived video
+    /// muxer alongside the video (AUD-4), once at first open. `None` for the
+    /// encoder-fed (video-only) [`SegmentSink`].
     audio: Option<MuxStream<'a>>,
     current: Option<OpenSegment>,
     /// Completed `(path, duration_seconds)` in order. For the batch flavour this
@@ -1851,23 +1864,29 @@ struct SegmentState<'a> {
     /// historical `done.len()`-derived names.
     seg_index: u64,
     /// OUTMETA (ADR-0088/0089): the per-output metadata + tag-path display
-    /// matrix to apply to **every** segment muxer before its header is written
-    /// (the codec/stream layout is fixed for the run, invariant #7). `None`
-    /// (the default, and always for the encoder-fed `SegmentSink`) ⇒ no metadata
-    /// to apply, byte-identical to before this field existed.
+    /// matrix applied to the long-lived video muxer ONCE, before its first
+    /// `write_header` (the codec/stream layout is fixed for the run, invariant
+    /// #7). `None` (the default, and always for the encoder-fed `SegmentSink`)
+    /// ⇒ no metadata to apply, byte-identical to before this field existed.
     meta: Option<(&'a MuxMetadata, Option<DisplayMatrix>)>,
     /// Audio-only rendition muxers mirror video GOP boundaries off the hot path.
     renditions: Option<AudioRenditions<'a>>,
-    /// The discrete tracks (#152) registered into every segment muxer after
-    /// the program audio, plus the per-track seeds. Empty ⇒ unchanged layout.
+    /// The discrete tracks (#152) registered on the long-lived video muxer
+    /// ONCE, after the program audio, plus the per-track seeds. Empty ⇒
+    /// unchanged layout.
     tracks: Option<(&'a AudioSelection, &'a [MuxStream<'a>])>,
 }
 
-/// One audio-only MPEG-TS muxer, opened at the same video GOP boundary.
+/// One audio-only MPEG-TS muxer, opened ONCE at the run's first video keyframe
+/// and redirected (never rebuilt) to a new file at every later GOP boundary —
+/// same continuity-counter-preserving fix as [`OpenSegment`].
 struct AudioSegment {
     muxer: Muxer,
     stream_index: usize,
+    /// The **final** path the current segment is published under.
     path: PathBuf,
+    /// The path the muxer is currently redirected to (the live flavour's
+    /// same-directory `<seg>.tmp`, renamed onto `path` on close).
     write_path: PathBuf,
     packets: u64,
 }
@@ -1888,23 +1907,26 @@ struct AudioRenditions<'a> {
     retention_window: usize,
 }
 
-/// An in-progress segment: its muxer, registered stream index, file path, and
-/// the PTS of its first frame (for duration computation).
+/// The one long-lived segment muxer's state: its (never rebuilt) `Muxer`, its
+/// registered stream indices, the current segment's file path, and the PTS of
+/// its first frame (for duration computation). A segment boundary redirects
+/// [`Self::muxer`] to a new file in place — it never replaces this struct's
+/// `muxer` with a fresh one.
 struct OpenSegment {
     muxer: Muxer,
     stream_index: usize,
-    /// The audio stream index registered on this segment muxer, if the run
-    /// carries program audio (AUD-4); `None` for a video-only run.
+    /// The audio stream index registered on the muxer, if the run carries
+    /// program audio (AUD-4); `None` for a video-only run.
     audio_index: Option<usize>,
-    /// `(track index, stream index)` of each discrete track on this segment.
+    /// `(track index, stream index)` of each discrete track, registered once.
     track_indices: TrackIndices,
-    /// The **final** path the closed segment is published under (referenced by
-    /// the playlist).
+    /// The **final** path the current segment is published under (referenced
+    /// by the playlist).
     path: PathBuf,
-    /// The path the muxer actually writes to while the segment is open. For the
-    /// **live** flavour this is a same-directory `<path>.tmp` that is renamed onto
-    /// `path` only after `Muxer::finish` (HLS-1 atomic publish); for the batch
-    /// flavour it equals `path` (mux in place, byte-identical to before).
+    /// The path the muxer is currently redirected to. For the **live** flavour
+    /// this is a same-directory `<path>.tmp` that is renamed onto `path` only
+    /// after the segment closes (HLS-1 atomic publish); for the batch flavour
+    /// it equals `path` (mux in place, byte-identical to before).
     write_path: PathBuf,
     start_pts: MediaTime,
 }
@@ -2078,6 +2100,13 @@ impl<'a> SegmentState<'a> {
         });
     }
 
+    /// Open or redirect every audio-only rendition muxer to segment `index`'s
+    /// file. The FIRST call per rendition builds its one long-lived `Muxer`
+    /// (registers its stream, writes the header); every later call
+    /// [`Muxer::redirect_output`]s the SAME muxer to the new file instead of
+    /// rebuilding it — preserving that rendition's own PAT/PMT/SDT/ES
+    /// continuity counters across segment boundaries (identical fix to the
+    /// video muxer; see [`SegmentState`]'s doc).
     fn open_audio_segments(&mut self, index: u64) -> Result<()> {
         let Some(renditions) = self.renditions.as_mut() else {
             return Ok(());
@@ -2089,18 +2118,25 @@ impl<'a> SegmentState<'a> {
         {
             let path = self.dir.join(format!("{}{index}.ts", state.prefix));
             let write_path = segment_temp_path(&path);
-            let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
-            let stream_index = muxer
-                .add_stream_from_parameters(state.stream.params, state.stream.time_base)
-                .map_err(ff)?;
-            muxer.write_header().map_err(ff)?;
-            state.current = Some(AudioSegment {
-                muxer,
-                stream_index,
-                path,
-                write_path,
-                packets: 0,
-            });
+            if let Some(segment) = state.current.as_mut() {
+                segment.muxer.redirect_output(&write_path).map_err(ff)?;
+                segment.path = path;
+                segment.write_path = write_path;
+                segment.packets = 0;
+            } else {
+                let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+                let stream_index = muxer
+                    .add_stream_from_parameters(state.stream.params, state.stream.time_base)
+                    .map_err(ff)?;
+                muxer.write_header().map_err(ff)?;
+                state.current = Some(AudioSegment {
+                    muxer,
+                    stream_index,
+                    path,
+                    write_path,
+                    packets: 0,
+                });
+            }
         }
         Ok(())
     }
@@ -2127,6 +2163,12 @@ impl<'a> SegmentState<'a> {
         Ok(())
     }
 
+    /// Publish each rendition's just-finished segment (rename `<seg>.tmp` onto
+    /// its final name, push it into the rendition's rolling playlist) WITHOUT
+    /// finishing (trailer-writing) the muxer — it stays open and gets
+    /// [`Muxer::redirect_output`]ed to the next file by the following
+    /// [`SegmentState::open_audio_segments`] call. [`Self::finish_audio_segments`]
+    /// is the true end-of-run (or error-path) trailer write.
     fn close_audio_segments(&mut self, duration: f64, start_pts_ns: i64) -> Result<()> {
         let Some(renditions) = self.renditions.as_mut() else {
             return Ok(());
@@ -2136,10 +2178,9 @@ impl<'a> SegmentState<'a> {
             .iter_mut()
             .chain(std::iter::once(&mut renditions.video))
         {
-            let Some(mut segment) = state.current.take() else {
+            let Some(segment) = state.current.as_mut() else {
                 continue;
             };
-            segment.muxer.finish().map_err(ff)?;
             if segment.packets == 0 {
                 match std::fs::remove_file(&segment.write_path) {
                     Ok(()) | Err(_) => {}
@@ -2147,6 +2188,12 @@ impl<'a> SegmentState<'a> {
                 // Never list an empty audio segment as a playable rendition.
                 continue;
             }
+            // Flush every buffered byte of THIS segment onto `write_path`
+            // before renaming it into place — `redirect_output` (called next,
+            // from `SegmentState::open_audio_segments`) also flushes, but that
+            // is too late for an atomic rename of the file we are about to
+            // retire.
+            segment.muxer.flush().map_err(ff)?;
             std::fs::rename(&segment.write_path, &segment.path)
                 .map_err(|e| Error::Output(format!("publishing audio segment: {e}")))?;
             let uri = segment
@@ -2159,6 +2206,51 @@ impl<'a> SegmentState<'a> {
                 .push_closed_segment(uri, segment.path.clone(), duration, start_pts_ns)?;
         }
         Ok(())
+    }
+
+    /// True end-of-run (or best-effort error-path) finalize: write the trailer
+    /// on every rendition's long-lived muxer and drop it. Must run AFTER the
+    /// final [`Self::close_audio_segments`] (the publish/rename for the last
+    /// segment) — mirrors the video muxer's split between
+    /// [`SegmentState::publish_current_segment`] (bookkeeping, muxer stays
+    /// open) and the real `finish()` here.
+    fn finish_audio_segments(&mut self) -> Result<()> {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return Ok(());
+        };
+        for state in renditions
+            .states
+            .iter_mut()
+            .chain(std::iter::once(&mut renditions.video))
+        {
+            if let Some(mut segment) = state.current.take() {
+                segment.muxer.finish().map_err(ff)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort finalize of every rendition's long-lived muxer on the
+    /// mid-run error path: writes the trailer (closing the container
+    /// structurally) and drops it, WITHOUT publishing/renaming the in-flight
+    /// segment (it is left at its `.tmp`/direct write path, matching the
+    /// video muxer's [`SegmentState::finalize_open_segment_best_effort`]).
+    /// Any finish failure is swallowed — the original drive error wins.
+    fn finalize_audio_segments_best_effort(&mut self) {
+        let Some(renditions) = self.renditions.as_mut() else {
+            return;
+        };
+        for state in renditions
+            .states
+            .iter_mut()
+            .chain(std::iter::once(&mut renditions.video))
+        {
+            if let Some(mut segment) = state.current.take() {
+                match segment.muxer.finish() {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+        }
     }
 
     /// Attach the discrete-track selection + seeds (#152) every segment muxer
@@ -2304,10 +2396,12 @@ impl<'a> SegmentState<'a> {
     }
 
     /// Best-effort finalize of the currently-open segment on the error path: the
-    /// open segment muxer's trailer is written (so its container is structurally
-    /// closed) and the segment dropped. Any finish failure is intentionally
-    /// swallowed — the original drive error is the one that propagates. Idempotent
-    /// (`close_current` no-ops once `current` is taken).
+    /// long-lived segment muxer's trailer is written (so its container is
+    /// structurally closed) and the segment dropped — WITHOUT publishing the
+    /// in-flight segment (the last file it was redirected to is left exactly as
+    /// written, matching [`finalize_audio_segments_best_effort`]). Any finish
+    /// failure is intentionally swallowed — the original drive error is the one
+    /// that propagates. Idempotent (no-ops once `current` is taken).
     fn finalize_open_segment_best_effort(&mut self) {
         let Some(mut segment) = self.current.take() else {
             return;
@@ -2318,11 +2412,16 @@ impl<'a> SegmentState<'a> {
             Ok(()) | Err(_) => {}
         }
         note_segment_finalized();
+        self.finalize_audio_segments_best_effort();
     }
 
-    /// Close the current segment (if any) and open a new MPEG-TS segment muxer
-    /// starting at `start_pts`. Called on every keyframe so segments are
-    /// GOP-aligned and each begins on a keyframe.
+    /// Close the current segment (if any — published, muxer kept open and
+    /// redirected rather than rebuilt) and start a new one at `start_pts`.
+    /// Called on every keyframe so segments are GOP-aligned and each begins on
+    /// a keyframe. The one long-lived video [`Muxer`] (and each audio
+    /// rendition's own long-lived muxer) is built on the FIRST call only; every
+    /// later call redirects it in place — see [`SegmentState`]'s doc for why
+    /// this is the continuity-counter fix, not an optimization.
     fn start_segment(&mut self, start_pts: MediaTime) -> Result<()> {
         self.close_current(start_pts)?;
         // Filename index: the live flavour uses a monotonic counter (so a name is
@@ -2343,49 +2442,61 @@ impl<'a> SegmentState<'a> {
         };
         let path = self.dir.join(format!("{}{index}.ts", self.prefix));
         // Atomic publish (HLS-1, live only): the muxer writes to a same-directory
-        // `<seg>.tmp` and is renamed onto `path` after `Muxer::finish`. The batch
+        // `<seg>.tmp` and is renamed onto `path` once the segment closes. The batch
         // flavour muxes in place (`write_path == path`), unchanged.
         let write_path = if self.live.is_some() {
             segment_temp_path(&path)
         } else {
             path.clone()
         };
-        // The run's single seed encoder only seeds the muxer stream's codec
-        // parameters; the actual packets all come from the shared encoder in the
-        // drive loop (one *encode* — invariant #7), while each segment file is
-        // its own self-contained MPEG-TS container. The seed is reused for every
-        // segment — never rebuilt per segment.
-        let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
-        // Register video then audio BEFORE the header — every segment carries the
-        // same pinned two-stream layout (ADR-R005 §3.3, AUD-4).
-        let stream_index = self.seed.add_stream(&mut muxer, self.time_base)?;
-        let audio_index = match self.audio {
-            Some(a) => Some(
-                muxer
-                    .add_stream_from_parameters(a.params, a.time_base)
-                    .map_err(ff)?,
-            ),
-            None => None,
-        };
-        let track_indices = match self.tracks {
-            Some((selection, streams)) => add_track_streams(&mut muxer, selection, streams)?,
-            None => Vec::new(),
-        };
-        // OUTMETA: tag every segment's container/streams (SDT/PMT, …) before its
-        // header (ADR-0088 §3); the display matrix is `None` for MPEG-TS (no
-        // rotation tag — validated at config time) so it is a no-op here.
-        self.apply_segment_meta(&mut muxer, stream_index)?;
-        muxer.write_header().map_err(ff)?;
         self.open_audio_segments(index)?;
-        self.current = Some(OpenSegment {
-            muxer,
-            stream_index,
-            audio_index,
-            track_indices,
-            path,
-            write_path,
-            start_pts,
-        });
+        if let Some(segment) = self.current.as_mut() {
+            // Redirect the SAME long-lived muxer to the new file. Every
+            // PID's continuity counter, PCR bookkeeping, etc. on this
+            // `AVFormatContext` carries over unbroken (the fix: see
+            // `Muxer::redirect_output`'s doc). `mpegts_flags=resend_headers`
+            // (set inside `redirect_output`) makes the new file
+            // independently decodable (fresh PAT/PMT/SDT at its start).
+            segment.muxer.redirect_output(&write_path).map_err(ff)?;
+            segment.path = path;
+            segment.write_path = write_path;
+            segment.start_pts = start_pts;
+        } else {
+            // First segment of the run: build the ONE long-lived muxer +
+            // register its streams. Never rebuilt for a later segment.
+            let mut muxer = Muxer::create_as(&write_path, "mpegts").map_err(ff)?;
+            // Register video then audio BEFORE the header — every segment
+            // carries the same pinned two-stream layout (ADR-R005 §3.3,
+            // AUD-4).
+            let stream_index = self.seed.add_stream(&mut muxer, self.time_base)?;
+            let audio_index = match self.audio {
+                Some(a) => Some(
+                    muxer
+                        .add_stream_from_parameters(a.params, a.time_base)
+                        .map_err(ff)?,
+                ),
+                None => None,
+            };
+            let track_indices = match self.tracks {
+                Some((selection, streams)) => add_track_streams(&mut muxer, selection, streams)?,
+                None => Vec::new(),
+            };
+            // OUTMETA: tag the container/streams (SDT/PMT, …) once before the
+            // header (ADR-0088 §3); the display matrix is `None` for MPEG-TS
+            // (no rotation tag — validated at config time) so it is a no-op
+            // here.
+            self.apply_segment_meta(&mut muxer, stream_index)?;
+            muxer.write_header().map_err(ff)?;
+            self.current = Some(OpenSegment {
+                muxer,
+                stream_index,
+                audio_index,
+                track_indices,
+                path,
+                write_path,
+                start_pts,
+            });
+        }
         Ok(())
     }
 
@@ -2412,30 +2523,47 @@ impl<'a> SegmentState<'a> {
         }
     }
 
-    /// Finalize the current segment (if any), recording its duration as the gap
-    /// from its start PTS to `end_pts`, bounded below by one frame.
+    /// Publish the current segment (if any), recording its duration as the gap
+    /// from its start PTS to `end_pts`, bounded below by one frame. The
+    /// long-lived video muxer (and every audio rendition's own long-lived
+    /// muxer) is **kept open** — its trailer is NOT written here, so it can be
+    /// [`Muxer::redirect_output`]ed to the next segment's file by the
+    /// following [`Self::start_segment`] call without ever restarting a
+    /// continuity counter. [`Self::finish`] is where the final open segment's
+    /// muxer(s) actually get a trailer.
     ///
-    /// For the **live** flavour this is also where atomic publish happens: after
-    /// `Muxer::finish` writes the trailer, the `<seg>.tmp` is renamed onto its
-    /// final path (so a fronting server never sees a half-written segment), then
-    /// the closed segment is pushed into the rolling [`LivePlaylist`] (which
-    /// re-publishes the windowed `.m3u8` atomically and prunes the evicted `.ts`).
-    /// The batch flavour leaves the muxed-in-place file untouched and only records
-    /// it for the finalize-time playlist render — byte-identical to before.
+    /// For the **live** flavour this is also where atomic publish happens: the
+    /// `<seg>.tmp` is renamed onto its final path (so a fronting server never
+    /// sees a half-written segment) once every buffered byte has landed
+    /// (`redirect_output`'s own flush, run by the caller before this), then the
+    /// closed segment is pushed into the rolling [`LivePlaylist`] (which
+    /// re-publishes the windowed `.m3u8` atomically and prunes the evicted
+    /// `.ts`). The batch flavour leaves the muxed-in-place file untouched and
+    /// only records it for the finalize-time playlist render — byte-identical
+    /// to before.
     fn close_current(&mut self, end_pts: MediaTime) -> Result<()> {
-        let Some(mut segment) = self.current.take() else {
+        let Some(segment) = self.current.as_mut() else {
             return Ok(());
         };
-        segment.muxer.finish().map_err(ff)?;
         note_segment_finalized();
         let span_ns = end_pts
             .as_nanos()
             .saturating_sub(segment.start_pts.as_nanos());
         let frame_ns = rescale(1, self.time_base, Rational::new(1, NANOS_PER_SEC));
         let duration = seconds_from_ns(span_ns.max(frame_ns));
-        self.close_audio_segments(duration, segment.start_pts.as_nanos())?;
-        // Live atomic publish: the muxer wrote to `<seg>.tmp`; rename it onto its
-        // final path now that the trailer is durable, then roll the playlist.
+        let start_pts_ns = segment.start_pts.as_nanos();
+        self.close_audio_segments(duration, start_pts_ns)?;
+        let Some(segment) = self.current.as_mut() else {
+            return Ok(());
+        };
+        // Live atomic publish: flush every buffered byte of THIS segment onto
+        // `write_path` before renaming it into place — the following
+        // `start_segment` call's `redirect_output` also flushes, but that is
+        // too late for an atomic rename of the file we are about to retire.
+        if self.live.is_some() && segment.write_path != segment.path {
+            segment.muxer.flush().map_err(ff)?;
+        }
+        let segment = &*segment;
         if let Some(live) = self.live.as_mut() {
             if segment.write_path != segment.path {
                 std::fs::rename(&segment.write_path, &segment.path).map_err(|e| {
@@ -2505,11 +2633,19 @@ impl<'a> SegmentState<'a> {
                 );
             }
         }
-        self.done.push((segment.path, duration));
+        let Some(segment) = self.current.as_ref() else {
+            return Ok(());
+        };
+        self.done.push((segment.path.clone(), duration));
         Ok(())
     }
 
     /// Finalize the final open segment and append every segment to `playlist`.
+    ///
+    /// Publishes the last segment ([`Self::close_current`], muxers still open),
+    /// THEN writes the trailer on the long-lived video muxer and every audio
+    /// rendition's long-lived muxer ([`Self::finish_audio_segments`]) — the
+    /// true end-of-run close, now that nothing will redirect them again.
     ///
     /// For the **live** flavour this also finalizes the on-disk rolling playlist
     /// (`#EXT-X-ENDLIST` + a last atomic publish): the `LivePlaylist` owns the
@@ -2520,6 +2656,10 @@ impl<'a> SegmentState<'a> {
             .last_pts
             .saturating_add(MediaTime::from_nanos(frame_ns));
         self.close_current(end)?;
+        if let Some(mut segment) = self.current.take() {
+            segment.muxer.finish().map_err(ff)?;
+        }
+        self.finish_audio_segments()?;
         for (path, duration) in &self.done {
             let uri = path
                 .file_name()
