@@ -308,6 +308,23 @@ where
     // map `[webrtc].cors_allow_origins` (default `["*"]`) onto the control plane
     // so a browser served from a web origin can WHIP-publish / WHEP-play.
     .with_cors_allow_origins(config.webrtc.cors_allow_origins.clone())
+    // Viewer playback URL derivation (ADR-0101): map `control.public_host`
+    // (absent ⇒ the route falls back to the request Host header) through.
+    .with_public_host(
+        config
+            .control
+            .as_ref()
+            .and_then(|control| control.public_host.clone()),
+    )
+    // The `[control] public_scheme` override (ADR-0101 scheme derivation):
+    // only needed when a front end does NOT set `X-Forwarded-Proto` (the
+    // production nginx config does).
+    .with_public_scheme(
+        config
+            .control
+            .as_ref()
+            .and_then(|control| control.public_scheme.clone()),
+    )
     .with_live_apply(live_apply)
     // The run-path live-apply capability (ADR-W018): which source kinds the
     // running engine can take live — synthetic always, network/file only when
@@ -760,44 +777,48 @@ pub struct HlsMount {
 /// usable becomes `out`). Distinct resolved ids that collide *after*
 /// sanitisation are deduplicated with a deterministic `-2`, `-3`, … suffix in
 /// declaration order, so every configured output stays reachable.
+///
+/// Delegates the segment/dedup/playlist resolution to
+/// [`multiview_config::playback::resolve_hls_mounts`] — the SAME function the
+/// control-plane's `GET /api/v1/outputs/{id}/playback` route uses (ADR-0101),
+/// so a viewer playback URL can never name a mount this router does not
+/// actually serve.
 #[must_use]
 pub fn hls_mounts(config: &MultiviewConfig) -> Vec<HlsMount> {
     use multiview_config::Output;
-    let mut taken = std::collections::HashSet::new();
-    let mut mounts = Vec::new();
-    for output in &config.outputs {
-        let (Output::Hls { path, .. } | Output::LlHls { path, .. }) = output else {
-            continue;
-        };
-        let dir = match std::path::Path::new(path).parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            // A bare filename (or a root path): serve the process working dir
-            // (where such a playlist would be written).
-            _ => std::path::PathBuf::from("."),
-        };
-        let mut segment = sanitize_mount_segment(&output.id());
-        if !taken.insert(segment.clone()) {
-            // Deterministic suffix dedupe; bounded by the output count.
-            let mut n: u32 = 2;
-            segment = loop {
-                let candidate = format!("{segment}-{n}");
-                if taken.insert(candidate.clone()) {
-                    break candidate;
-                }
-                n = n.saturating_add(1);
+    let hls_outputs: Vec<(String, &str)> = config
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            Output::Hls { path, .. } | Output::LlHls { path, .. } => {
+                Some((output.id(), path.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = hls_outputs
+        .iter()
+        .map(|(id, path)| (id.as_str(), *path))
+        .collect();
+    let resolved = multiview_config::playback::resolve_hls_mounts(&refs);
+    hls_outputs
+        .into_iter()
+        .filter_map(|(output_id, path)| {
+            let route = resolved.get(&output_id)?;
+            let dir = match std::path::Path::new(path).parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                // A bare filename (or a root path): serve the process working dir
+                // (where such a playlist would be written).
+                _ => std::path::PathBuf::from("."),
             };
-        }
-        let playlist = std::path::Path::new(path)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        mounts.push(HlsMount {
-            route: format!("/hls/{segment}"),
-            dir,
-            output_id: output.id(),
-            playlist,
-        });
-    }
-    mounts
+            Some(HlsMount {
+                route: route.route.clone(),
+                dir,
+                output_id,
+                playlist: route.playlist.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Build the Cast **delivery map** (DEV-D2, ADR-M011): the validated
@@ -873,26 +894,6 @@ pub fn cast_delivery(
         );
     }
     Some(std::sync::Arc::new(delivery))
-}
-
-/// Map an output id to a URL-segment-safe mount name (see [`hls_mounts`]).
-fn sanitize_mount_segment(id: &str) -> String {
-    let segment: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // `.`/`..`/empty are not usable URL path segments.
-    if segment.is_empty() || segment.chars().all(|c| c == '.') {
-        "out".to_owned()
-    } else {
-        segment
-    }
 }
 
 /// Project a composited program frame into the compact JSON snapshot the control
@@ -3865,7 +3866,7 @@ input_id = "in_a"
     fn unusable_ids_fall_back_to_out() {
         for id in ["..", "", "..."] {
             assert_eq!(
-                sanitize_mount_segment(id),
+                multiview_config::hls_mount_segment(id),
                 "out",
                 "id {id:?} must map to the `out` fallback"
             );
@@ -3889,7 +3890,7 @@ input_id = "in_a"
     #[test]
     fn already_safe_ids_pass_through_unchanged() {
         for id in ["program", "low-latency_1.0~alt", "ABC123"] {
-            assert_eq!(sanitize_mount_segment(id), id);
+            assert_eq!(multiview_config::hls_mount_segment(id), id);
         }
     }
 }

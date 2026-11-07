@@ -6013,6 +6013,69 @@
         }
       }
     },
+    "/api/v1/outputs/{id}/playback": {
+      "get": {
+        "tags": [
+          "outputs"
+        ],
+        "summary": "`GET /api/v1/outputs/{id}/playback` — derive this output's viewer\nplayback URL(s) (ADR-0101: \"a link to copy the actual URL to paste into a\ntool like VLC\"). Role: read; per-object authz (BOLA) identical to\n`get_output`.",
+        "description": "Never returns a secret: an SRT/RIST pre-shared key is never read here (it\nis a `secret_ref`, resolved only at the engine's run path) — an encrypted\nlistener instead carries an operator-facing note that a passphrase is\nrequired out-of-band.",
+        "operationId": "get_output_playback",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Output id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This output's viewer playback URL(s).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputPlaybackResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this output.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No output with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/overlays": {
       "get": {
         "tags": [
@@ -15154,6 +15217,22 @@
         },
         "additionalProperties": false
       },
+      "OutputPlaybackResponseDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body.",
+        "required": [
+          "urls"
+        ],
+        "properties": {
+          "urls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlaybackUrlDoc"
+            },
+            "description": "This output's viewer playback URL(s) (one or more; a push-only\ntransport returns a single no-URL entry with an explanatory note)."
+          }
+        }
+      },
       "OutputResourceInputDoc": {
         "type": "object",
         "description": "The request envelope for `POST`/`PUT /api/v1/outputs/{id}` (`name` + body).",
@@ -15406,6 +15485,40 @@
           "composite",
           "encode"
         ]
+      },
+      "PlaybackUrlDoc": {
+        "type": "object",
+        "description": "`OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one\nviewer playback URL (or no-URL note) for an output\n(`GET /api/v1/outputs/{id}/playback`, ADR-0101).",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Short human label, e.g. `\"SRT (caller)\"` or `\"HLS playlist\"`."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra operator-facing notes: an encryption-passphrase reminder, a\nredacted push destination, a missing-host explanation. Never a secret."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The URL a viewer pastes into VLC/ffplay/a browser. Absent when this\noutput has no viewer-reachable address — see `notes` for why."
+          },
+          "vlc_command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The exact shell command an operator pastes to open this URL in VLC\n(`None` when [`url`](Self::url) is `None`). For an SRT row this is\nVLC's own `vlc --srt-latency=<ms> srt://host:port` form — NOT\n`vlc <url>` — because VLC's `srt://` access does not read the\nffmpeg-style `latency=`/`streamid=` URL query options; every other\nkind uses `vlc <url>`."
+          }
+        }
       },
       "PlaylistMetadataDoc": {
         "type": "object",
