@@ -1222,6 +1222,32 @@ impl Source {
     }
 }
 
+/// `[events]`: retention bounds of the raw marker journal. Absent means the
+/// defaults. A change applies at the next restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventsConfig {
+    /// Days of journal history kept.
+    #[serde(default = "default_journal_retention_days")]
+    pub journal_retention_days: u32,
+    /// Total journal bytes kept across all sources.
+    #[serde(default = "default_journal_max_bytes")]
+    pub journal_max_bytes: u64,
+}
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            journal_retention_days: default_journal_retention_days(),
+            journal_max_bytes: default_journal_max_bytes(),
+        }
+    }
+}
+const fn default_journal_retention_days() -> u32 {
+    14
+}
+const fn default_journal_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
 /// Upper bound for [`EventAutomationRule::max_duration_s`] (24 h).
 pub const MAX_AUTOMATION_DURATION_S: u32 = 86_400;
 /// Upper bound on [`BreakStartAction::cells`] entries.

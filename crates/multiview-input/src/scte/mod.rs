@@ -18,6 +18,7 @@
 //! Both are **pure** byte-slice → value codecs: no sockets, bounded allocation,
 //! panic-free. A malformed message surfaces as a typed [`ScteError`].
 
+pub mod decode;
 pub mod scte104;
 pub mod splice35;
 
@@ -137,7 +138,8 @@ pub fn segmentation_type_name(type_id: u8) -> Option<&'static str> {
         0x13 => "Program Breakaway",
         0x14 => "Program Resumption",
         0x17 => "Program Overlap Start",
-        0x19 => "Program Blackout Override",
+        0x18 => "Program Blackout Override",
+        0x19 => "Program Start - In Progress",
         0x20 => "Chapter Start",
         0x21 => "Chapter End",
         0x22 => "Break Start",

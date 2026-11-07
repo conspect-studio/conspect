@@ -123,6 +123,8 @@ pub(crate) struct OriginPlaylist {
     pub segments: Vec<OriginSegment>,
     /// Bounded original manifest evidence; never inferred splice boundaries.
     pub cue_metadata: multiview_input::hls::PlaylistCueMetadata,
+    /// The playlist text, for the event journal.
+    pub text: Arc<str>,
 }
 
 /// Why a playlist cannot be fetched this way (the caller lets libav open the
@@ -205,6 +207,7 @@ pub(crate) fn parse_media_playlist(text: &str) -> Result<OriginPlaylist, Unsuppo
                 ..Default::default()
             },
         ),
+        text: Arc::from(text),
     })
 }
 
@@ -666,6 +669,7 @@ impl HlsFetcher {
                     agent: &agent,
                     playlist: &base,
                     segments: &segment_base,
+                    journal: has_observer.then(crate::event_journal::feed).flatten(),
                 };
                 coordinate(&origin, first, &coord_shared, &st, &observation_active);
             })
@@ -922,6 +926,8 @@ pub(crate) fn fetch_segment(
 /// The origin URLs one coordinator works against.
 struct Origin<'a> {
     id: &'a str,
+    /// Raw evidence feed; `None` when this source is not observed.
+    journal: Option<crate::event_journal::JournalFeed>,
     agent: &'a ureq::Agent,
     /// The playlist as requested (reloads start here).
     playlist: &'a url::Url,
@@ -1050,6 +1056,13 @@ fn coordinate(
             // Preserve metadata before scheduling consumes the original playlist.
             // A rejected backwards snapshot must not clear marker presence.
             let metadata = p.cue_metadata.clone();
+            if let Some(journal) = &origin.journal {
+                journal.offer(crate::event_journal::Observation::Playlist {
+                    source: id.to_owned(),
+                    text: Arc::clone(&p.text),
+                    received_ns: crate::event_journal::wall_now_ns(),
+                });
+            }
             target = p.target_duration;
             shared.lock().target_duration = target;
             let Some(lost) = sched.absorb(p) else {
@@ -1130,6 +1143,15 @@ fn coordinate(
                 Ok((bytes, ranged, wall)) => {
                     stats.record(bytes.len(), seg.duration, wall, ranged);
                     stats.throttle.segment_ok();
+                    if let Some(journal) = &origin.journal {
+                        journal.offer(crate::event_journal::Observation::Segment {
+                            source: id.to_owned(),
+                            media_sequence: seg.seq,
+                            uri: multiview_input::hls_journal::sanitize_uri(&seg.uri),
+                            first_pts: multiview_input::hls_journal::first_pes_pts(&bytes),
+                            pids: multiview_input::hls_journal::metadata_pids(&bytes),
+                        });
+                    }
                     let gap = std::mem::take(&mut sched.gap);
                     shared.publish(seg.duration, seg.discontinuity || gap, bytes);
                     last_progress = Instant::now();
@@ -2111,6 +2133,7 @@ mod tests {
         OriginPlaylist {
             target_duration: 6.0,
             cue_metadata: multiview_input::hls::PlaylistCueMetadata::default(),
+            text: Arc::from(""),
             segments: seqs
                 .map(|seq| OriginSegment {
                     seq,

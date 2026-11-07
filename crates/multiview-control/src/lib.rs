@@ -94,6 +94,7 @@ pub mod watch_status;
 pub mod whep_output;
 pub mod whip;
 
+pub mod event_journal;
 pub mod source_demand;
 pub mod source_events;
 #[cfg(feature = "embed-web")]

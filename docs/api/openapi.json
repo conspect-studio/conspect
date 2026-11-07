@@ -2412,6 +2412,119 @@
         }
       }
     },
+    "/api/v1/events/journal.jsonl": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "get_event_journal_export",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Earliest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Latest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "description": "`scte35`, `id3` or `hls`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, at most 500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed JSONL of every source (unscoped administrators only).",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Requires an unscoped administrator",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Journal unavailable or busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/graphics/channels": {
       "get": {
         "tags": [
@@ -3893,6 +4006,270 @@
           },
           "503": {
             "description": "Executor unavailable or command bus busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/journal": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "get_event_journal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Earliest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Latest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "description": "`scte35`, `id3` or `hls`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, at most 500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One newest-first page of raw marker observations.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JournalPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter or cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Journal unavailable or busy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/inputs/{id}/events/journal.jsonl": {
+      "get": {
+        "tags": [
+          "inputs"
+        ],
+        "operationId": "get_event_journal_dump",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Exact source identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Earliest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Latest receive time, RFC 3339.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "description": "`scte35`, `id3` or `hls`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, at most 500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the previous page.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Streamed JSONL, oldest first; `repeat` lines fold into the record they name.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Source outside principal scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Journal unavailable or busy",
             "content": {
               "application/json": {
                 "schema": {
@@ -14120,6 +14497,331 @@
         },
         "additionalProperties": false
       },
+      "JournalClockSource": {
+        "type": "string",
+        "description": "Which clock produced a wall-clock prediction.",
+        "enum": [
+          "pdt",
+          "id3_utc",
+          "receive_time"
+        ]
+      },
+      "JournalOrigin": {
+        "type": "string",
+        "description": "Where a marker was carried.",
+        "enum": [
+          "scte35",
+          "id3",
+          "hls"
+        ]
+      },
+      "JournalPage": {
+        "type": "object",
+        "description": "One newest-first page.",
+        "required": [
+          "source_id",
+          "records",
+          "stats"
+        ],
+        "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `cursor` for the next older page; absent on the last page."
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JournalRecord"
+            },
+            "description": "Records, newest first."
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Exact source identity."
+          },
+          "stats": {
+            "$ref": "#/components/schemas/JournalStats",
+            "description": "Journal counters; `dropped` above zero means the history has gaps."
+          }
+        }
+      },
+      "JournalRecord": {
+        "type": "object",
+        "description": "One raw observation with its full decode.",
+        "required": [
+          "source_id",
+          "received_at",
+          "received_ns",
+          "origin",
+          "name",
+          "summary",
+          "transport",
+          "raw_encoding",
+          "raw"
+        ],
+        "properties": {
+          "clock_reference": {
+            "type": "boolean",
+            "description": "Whether this is a clock stamp rather than an event."
+          },
+          "decoded": {
+            "description": "The full decode."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the payload could not be fully decoded."
+          },
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the last identical sighting arrived."
+          },
+          "name": {
+            "type": "string",
+            "description": "Short name."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/JournalOrigin",
+            "description": "Carrier."
+          },
+          "raw": {
+            "type": "string",
+            "description": "The raw payload."
+          },
+          "raw_encoding": {
+            "type": "string",
+            "description": "`base64` for binary payloads, `text` for HLS tag lines."
+          },
+          "received_at": {
+            "type": "string",
+            "description": "Host receive time, UTC."
+          },
+          "received_ns": {
+            "type": "string",
+            "description": "Host receive time, decimal nanoseconds past the Unix epoch."
+          },
+          "record_id": {
+            "type": "string",
+            "description": "Sortable identity, assigned by the writer; also the page cursor."
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Identical sightings after this record.",
+            "minimum": 0
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Exact source identity."
+          },
+          "source_pts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "90 kHz time of the carrying packet. SCTE-35 sections have no PES header, so\nthe demuxer reports the last PCR, which trails video PTS by the mux delay.",
+            "minimum": 0
+          },
+          "summary": {
+            "type": "string",
+            "description": "One-line decoded summary."
+          },
+          "timing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JournalTiming",
+                "description": "Derived times."
+              }
+            ]
+          },
+          "transport": {
+            "$ref": "#/components/schemas/JournalTransport",
+            "description": "Transport context."
+          }
+        }
+      },
+      "JournalStats": {
+        "type": "object",
+        "description": "Counter snapshot.",
+        "required": [
+          "dropped",
+          "written",
+          "repeats",
+          "write_errors"
+        ],
+        "properties": {
+          "dropped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Observations dropped because the bounded queue was full.",
+            "minimum": 0
+          },
+          "repeats": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact repeats folded into a counter since start.",
+            "minimum": 0
+          },
+          "write_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Failed disk writes since start.",
+            "minimum": 0
+          },
+          "written": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Records written since start.",
+            "minimum": 0
+          }
+        }
+      },
+      "JournalTiming": {
+        "type": "object",
+        "description": "Times derived for one marker. Predictions, never engine state.",
+        "required": [
+          "class"
+        ],
+        "properties": {
+          "airs_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the splice reaches this multiview's output, UTC."
+          },
+          "airs_end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the break end reaches this multiview's output, UTC."
+          },
+          "class": {
+            "$ref": "#/components/schemas/JournalTimingClass",
+            "description": "How the time was derived."
+          },
+          "clock_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JournalClockSource",
+                "description": "Clock used for the wall-clock fields."
+              }
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Declared duration.",
+            "minimum": 0
+          },
+          "end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted break end on the source, UTC."
+          },
+          "pre_roll_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Splice point minus carrying packet time; negative means already past."
+          },
+          "splice_pts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Splice point on the source timeline, 90 kHz, after `pts_adjustment`.",
+            "minimum": 0
+          },
+          "start_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted splice wall-clock on the source, UTC."
+          },
+          "uncertainty_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Estimated uncertainty of that clock.",
+            "minimum": 0
+          }
+        }
+      },
+      "JournalTimingClass": {
+        "type": "string",
+        "description": "How a marker's time was derived.",
+        "enum": [
+          "scheduled",
+          "immediate",
+          "none"
+        ]
+      },
+      "JournalTransport": {
+        "type": "object",
+        "description": "Transport context of one observation.",
+        "properties": {
+          "media_sequence": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "HLS media sequence of the carrying segment.",
+            "minimum": 0
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Transport PID.",
+            "minimum": 0
+          },
+          "program_date_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "That segment's `EXT-X-PROGRAM-DATE-TIME`."
+          },
+          "segment_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Carrying segment URI, without query or credentials."
+          }
+        }
+      },
       "LadderStateDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_licence::LadderState`] (the seven conditions).\n\nSerde-equivalent: a unit enum rendered `snake_case`.",
@@ -17553,6 +18255,35 @@
           }
         }
       },
+      "SourceClockDto": {
+        "type": "object",
+        "description": "The source's embedded wall clock. A clock reference, never an event.",
+        "required": [
+          "utc",
+          "offset_ms",
+          "clock_source",
+          "observed_at"
+        ],
+        "properties": {
+          "clock_source": {
+            "$ref": "#/components/schemas/JournalClockSource",
+            "description": "Which embedded clock this is."
+          },
+          "observed_at": {
+            "type": "string",
+            "description": "Host time of that reading."
+          },
+          "offset_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Source clock minus host receive time, in milliseconds. Includes the\nstream's delivery delay, so a live source reads negative."
+          },
+          "utc": {
+            "type": "string",
+            "description": "Latest decoded source UTC time."
+          }
+        }
+      },
       "SourceConsumerView": {
         "type": "object",
         "description": "One consumer of a source.",
@@ -17861,6 +18592,28 @@
             },
             "description": "Bounded structured event history; an empty list is valid.",
             "maxItems": 256
+          },
+          "markers": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SourceMarkerDto"
+            },
+            "description": "Newest decoded markers first, with predicted times.",
+            "maxItems": 32
+          },
+          "source_clock": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceClockDto",
+                "description": "The source's latest embedded wall clock, when it carries one."
+              }
+            ]
           },
           "source_id": {
             "type": "string",
@@ -18335,6 +19088,100 @@
           }
         ],
         "description": "`OpenAPI` mirror of `multiview_config::SourceKind` (tagged by `kind`)."
+      },
+      "SourceMarkerDto": {
+        "type": "object",
+        "description": "One decoded marker with predicted times. Display evidence only: lifecycle\nand automation stay on [`SourceEventDto`].",
+        "required": [
+          "record_id",
+          "name",
+          "received_at"
+        ],
+        "properties": {
+          "airs_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the splice reaches this multiview's output, UTC."
+          },
+          "airs_end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted instant the break end reaches this multiview's output, UTC."
+          },
+          "clock_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/JournalClockSource",
+                "description": "Clock used for the wall-clock fields."
+              }
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Declared duration.",
+            "minimum": 0
+          },
+          "end_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted break end on the source, UTC."
+          },
+          "event_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`splice_event_id` or `segmentation_event_id`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Short name."
+          },
+          "received_at": {
+            "type": "string",
+            "description": "Host receive time."
+          },
+          "record_id": {
+            "type": "string",
+            "description": "Journal record holding the full decode."
+          },
+          "start_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Predicted splice wall-clock on the source, UTC."
+          },
+          "uncertainty_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Estimated uncertainty of that clock.",
+            "minimum": 0
+          },
+          "upid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Decoded UPID with its type name."
+          }
+        }
       },
       "SourceRecallDoc": {
         "type": "object",

@@ -1,5 +1,6 @@
 //! Authorized read-only source event snapshots, and the operator
 //! test-injection aid (ADR-0183 item 5). No automation hooks live here.
+use crate::event_journal::{valid_cursor, JournalOrigin, JournalPage, JournalQuery, JournalReader};
 use crate::{
     audit::AuditAction,
     auth::{authorize_object, Action, Principal},
@@ -8,12 +9,14 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    body::Body,
+    extract::{Path, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[cfg_attr(feature = "openapi", utoipa::path(
     get, path = "/api/v1/inputs/{id}/events", tag = "inputs",
@@ -59,6 +62,285 @@ pub(crate) async fn get_source_events(
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+/// Query of the journal routes.
+#[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
+pub(crate) struct JournalParams {
+    /// Earliest receive time, RFC 3339.
+    from: Option<String>,
+    /// Latest receive time, RFC 3339.
+    to: Option<String>,
+    /// `scte35`, `id3` or `hls`.
+    origin: Option<String>,
+    /// Page size, at most 500.
+    limit: Option<usize>,
+    /// `next_cursor` of the previous page.
+    cursor: Option<String>,
+}
+
+/// A refusal, boxed because `Response` is too large for an `Err` variant.
+type Refused = Box<Response>;
+
+fn parse_time(value: Option<&str>) -> Result<Option<i64>, Refused> {
+    value
+        .map(|text| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .ok()
+                .and_then(|at| at.timestamp_nanos_opt())
+                .ok_or_else(|| bad_request("from and to must be RFC 3339 times"))
+        })
+        .transpose()
+}
+
+#[allow(clippy::unnecessary_box_returns)] // reason: `Refused` is the `Err` type of every journal helper.
+fn bad_request(title: &str) -> Refused {
+    Box::new(Problem::new(400, "bad-request", title).into_response())
+}
+
+fn journal_query(params: &JournalParams) -> Result<JournalQuery, Refused> {
+    let origin = match params.origin.as_deref() {
+        None | Some("") => None,
+        Some("scte35") => Some(JournalOrigin::Scte35),
+        Some("id3") => Some(JournalOrigin::Id3),
+        Some("hls") => Some(JournalOrigin::Hls),
+        Some(_) => return Err(bad_request("origin must be scte35, id3 or hls")),
+    };
+    if params.cursor.as_deref().is_some_and(|c| !valid_cursor(c)) {
+        return Err(bad_request("Invalid cursor"));
+    }
+    Ok(JournalQuery {
+        from_ns: parse_time(params.from.as_deref())?,
+        to_ns: parse_time(params.to.as_deref())?,
+        origin,
+        limit: params.limit.unwrap_or(crate::event_journal::DEFAULT_PAGE),
+        cursor: params.cursor.clone(),
+    })
+}
+
+#[allow(clippy::unnecessary_box_returns)] // reason: `Refused` is the `Err` type of every journal helper.
+fn journal_busy() -> Refused {
+    Box::new(Problem::new(503, "event-journal-busy", "Event journal is busy").into_response())
+}
+
+#[allow(clippy::unnecessary_box_returns)] // reason: `Refused` is the `Err` type of every journal helper.
+fn journal_unavailable() -> Refused {
+    Box::new(
+        Problem::new(
+            503,
+            "event-journal-unavailable",
+            "Event journal unavailable",
+        )
+        .into_response(),
+    )
+}
+
+/// Authorize one source and find its journal. A source that has left the
+/// running set stays readable while its history is retained.
+async fn journal_for(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<JournalReader, Refused> {
+    principal
+        .role
+        .require(Action::Read)
+        .map_err(|error| Box::new(error.into_response()))?;
+    authorize_object(principal, id).map_err(|error| Box::new(error.into_response()))?;
+    let reader = state
+        .event_journal
+        .clone()
+        .ok_or_else(journal_unavailable)?;
+    let known = state
+        .source_events
+        .as_ref()
+        .is_some_and(|provider| provider.source_events(id).is_some());
+    if known {
+        return Ok(reader);
+    }
+    let probe = reader.clone();
+    let owned = id.to_owned();
+    let retained = tokio::task::spawn_blocking(move || probe.has_source(&owned))
+        .await
+        .map_err(|_| journal_unavailable())?;
+    if retained {
+        Ok(reader)
+    } else {
+        Err(Box::new(
+            Problem::new(404, "not-found", "Unknown source").into_response(),
+        ))
+    }
+}
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get, path = "/api/v1/inputs/{id}/events/journal", tag = "inputs",
+    params(("id" = String, Path, description = "Exact source identity"), JournalParams),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "One newest-first page of raw marker observations.", body = crate::event_journal::JournalPage),
+        (status = 400, description = "Invalid filter or cursor", body = Problem),
+        (status = 401, description = "Missing or invalid credentials", body = Problem),
+        (status = 403, description = "Source outside principal scope", body = Problem),
+        (status = 404, description = "Unknown source", body = Problem),
+        (status = 503, description = "Journal unavailable or busy", body = Problem),
+    )
+))]
+pub(crate) async fn get_event_journal(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+    Query(params): Query<JournalParams>,
+) -> Response {
+    no_store(
+        read_page(&state, &principal, id, &params)
+            .await
+            .unwrap_or_else(|refused| *refused),
+    )
+}
+
+async fn read_page(
+    state: &AppState,
+    principal: &Principal,
+    id: String,
+    params: &JournalParams,
+) -> Result<Response, Refused> {
+    let reader = journal_for(state, principal, &id).await?;
+    let query = journal_query(params)?;
+    let permit = Arc::clone(&reader.permits)
+        .try_acquire_owned()
+        .map_err(|_| journal_busy())?;
+    let page: std::io::Result<JournalPage> = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        reader.page(&id, &query)
+    })
+    .await
+    .map_err(|_| journal_unavailable())?;
+    page.map(|page| Json(page).into_response())
+        .map_err(|_| journal_unavailable())
+}
+
+/// Stream matching lines off the runtime, in bounded chunks, holding a permit.
+fn stream_dump(
+    reader: JournalReader,
+    source: Option<String>,
+    query: JournalQuery,
+    filename: &str,
+) -> Result<Response, Refused> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let permit = Arc::clone(&reader.permits)
+        .try_acquire_owned()
+        .map_err(|_| journal_busy())?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut chunk = Vec::with_capacity(CHUNK_BYTES);
+        let result = reader.dump(source.as_deref(), &query, &mut |line| {
+            chunk.extend_from_slice(line.as_bytes());
+            chunk.push(b'\n');
+            if chunk.len() < CHUNK_BYTES {
+                return true;
+            }
+            let full = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_BYTES));
+            tx.blocking_send(full.into()).is_ok()
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "event journal dump stopped");
+        }
+        if !chunk.is_empty() {
+            let _ = tx.blocking_send(chunk.into());
+        }
+    });
+    let stream = async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            yield Ok::<_, std::convert::Infallible>(chunk);
+        }
+    };
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    let mut response = Body::from_stream(stream).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
+}
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get, path = "/api/v1/inputs/{id}/events/journal.jsonl", tag = "inputs",
+    params(("id" = String, Path, description = "Exact source identity"), JournalParams),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Streamed JSONL, oldest first; `repeat` lines fold into the record they name.", content_type = "application/x-ndjson", body = String),
+        (status = 400, description = "Invalid filter", body = Problem),
+        (status = 401, description = "Missing or invalid credentials", body = Problem),
+        (status = 403, description = "Source outside principal scope", body = Problem),
+        (status = 404, description = "Unknown source", body = Problem),
+        (status = 503, description = "Journal unavailable or busy", body = Problem),
+    )
+))]
+pub(crate) async fn get_event_journal_dump(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+    Query(params): Query<JournalParams>,
+) -> Response {
+    let result = journal_for(&state, &principal, &id)
+        .await
+        .and_then(|reader| {
+            let query = journal_query(&params)?;
+            let filename = format!(
+                "{}-events.jsonl",
+                crate::event_journal::source_dir_name(&id).replace('%', "_")
+            );
+            stream_dump(reader, Some(id.clone()), query, &filename)
+        });
+    no_store(result.unwrap_or_else(|refused| *refused))
+}
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get, path = "/api/v1/events/journal.jsonl", tag = "inputs",
+    params(JournalParams),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Streamed JSONL of every source (unscoped administrators only).", content_type = "application/x-ndjson", body = String),
+        (status = 400, description = "Invalid filter", body = Problem),
+        (status = 401, description = "Missing or invalid credentials", body = Problem),
+        (status = 403, description = "Requires an unscoped administrator", body = Problem),
+        (status = 503, description = "Journal unavailable or busy", body = Problem),
+    )
+))]
+pub(crate) async fn get_event_journal_export(
+    State(state): State<AppState>,
+    principal: Principal,
+    Query(params): Query<JournalParams>,
+) -> Response {
+    if let Err(error) = principal.role.require(Action::Administer) {
+        return no_store(error.into_response());
+    }
+    // An object-scoped admin must not read sources outside its scope.
+    if principal.scoped_object_ids.is_some() {
+        return no_store(
+            Problem::new(403, "forbidden", "Requires an unscoped administrator").into_response(),
+        );
+    }
+    let Some(reader) = state.event_journal.clone() else {
+        return no_store(*journal_unavailable());
+    };
+    let result = journal_query(&params)
+        .and_then(|query| stream_dump(reader, None, query, "all-sources-events.jsonl"));
+    no_store(result.unwrap_or_else(|refused| *refused))
 }
 
 /// Request body for the operator test-injection aid.

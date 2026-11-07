@@ -111,12 +111,12 @@ pub use routing::{
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
-    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, Fps, Layout, MetadataCapability,
-    MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, Output,
-    OutputFlip, OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata,
-    Overlay, PlaylistMetadata, Rect, RistAesBits, RistEncryption, RistOptions, RistPeer,
-    RistProfile, RistUrlError, Source, SourceActivation, SourceAuth, SourceKind, SrtBackend,
-    SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
+    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, EventsConfig, Fps, Layout,
+    MetadataCapability, MetadataField, OrientationMechanism, OrientationMode,
+    OrientationTagCapability, Output, OutputFlip, OutputMetadata, OutputMetadataPlan,
+    OutputOrientation, OutputTimedMetadata, Overlay, PlaylistMetadata, Rect, RistAesBits,
+    RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source, SourceActivation,
+    SourceAuth, SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -498,6 +498,9 @@ pub struct MultiviewConfig {
     /// Boxed: one pointer in the (often moved/cloned) config document.
     #[serde(default, skip_serializing_if = "graphics::is_empty_boxed")]
     pub graphics: Box<GraphicsConfig>,
+    /// `[events]`: retention bounds of the raw marker journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventsConfig>,
 }
 
 /// Shape-check the id a weather / graphics source references.

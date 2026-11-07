@@ -732,6 +732,8 @@ pub struct AppState {
     /// Source demand status and preview leases. `None` on run paths with no
     /// demand manager: every source then reports as running at boot did.
     pub source_demand: Option<crate::source_demand::SharedSourceDemand>,
+    /// Optional raw marker journal reader; absent until wired by the binary.
+    pub event_journal: Option<crate::event_journal::JournalReader>,
     /// Optional operator test-injection adapter (ADR-0183 item 5); absent
     /// until wired by the binary. Administer-only; never a general evidence
     /// submission surface.
@@ -1030,6 +1032,7 @@ impl AppState {
             preview: crate::preview::no_preview(),
             source_events: None,
             source_demand: None,
+            event_journal: None,
             source_event_test_injector: None,
             automation: None,
             whep: crate::preview::no_whep(),
@@ -1326,6 +1329,13 @@ impl AppState {
         provider: crate::source_demand::SharedSourceDemand,
     ) -> Self {
         self.source_demand = Some(provider);
+        self
+    }
+
+    /// Attach the raw marker journal reader.
+    #[must_use]
+    pub fn with_event_journal(mut self, reader: crate::event_journal::JournalReader) -> Self {
+        self.event_journal = Some(reader);
         self
     }
 

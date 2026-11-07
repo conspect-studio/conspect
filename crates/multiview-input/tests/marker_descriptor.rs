@@ -73,7 +73,11 @@ fn segmentation_type_table_matches_every_standard_name() {
         (0x13, "Program Breakaway"),
         (0x14, "Program Resumption"),
         (0x17, "Program Overlap Start"),
-        (0x19, "Program Blackout Override"),
+        // Corrected 2026-11-08: SCTE 35 Table 23 assigns 0x18 to Program
+        // Blackout Override and 0x19 to Program Start - In Progress; this
+        // table previously pinned 0x19 to the wrong name.
+        (0x18, "Program Blackout Override"),
+        (0x19, "Program Start - In Progress"),
         (0x20, "Chapter Start"),
         (0x21, "Chapter End"),
         (0x22, "Break Start"),

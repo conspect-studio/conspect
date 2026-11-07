@@ -242,7 +242,7 @@ impl SourceEventProvider for RuntimeReader {
                     })
                     .collect()
             });
-        Some(SourceEventsDto::new(
+        let snapshot = SourceEventsDto::new(
             id,
             epoch,
             if valid {
@@ -252,7 +252,11 @@ impl SourceEventProvider for RuntimeReader {
             },
             read.as_ref().is_some_and(|read| read.degraded),
             rows,
-        ))
+        );
+        Some(match crate::event_journal::live_summary(id) {
+            Some(live) => snapshot.with_decoded(live.clock.clone(), live.markers.clone()),
+            None => snapshot,
+        })
     }
 }
 impl SourceBreakProvider for RuntimeReader {
@@ -552,6 +556,11 @@ impl NativeEvents {
             self.mark_degraded();
             return;
         };
+        // Per-segment clock stamps are a clock reference, not event evidence:
+        // the journal keeps them and the panel shows them as the source clock.
+        if multiview_input::id3::is_clock_only(&tag) {
+            return;
+        }
         if self.id3.contains(&tag) {
             return;
         }
@@ -796,6 +805,27 @@ mod tests {
         native.ingest_hls();
         native.mapping(None);
         assert!(native.hls.is_none());
+        runtime.shutdown().expect("join");
+    }
+    #[test]
+    fn id3_clock_stamps_are_not_event_evidence() {
+        let runtime = Runtime::new().expect("worker");
+        let lease = runtime.activate("s", 1).expect("lease");
+        let mut native = NativeEvents::new("s".into(), &lease).expect("connection");
+        let mut payload = multiview_input::id3::ELEMENTAL_UTC_OWNER
+            .as_bytes()
+            .to_vec();
+        payload.push(0);
+        payload.extend_from_slice(b"2026-11-03T21:14:58Z");
+        let frame = u8::try_from(payload.len()).expect("frame");
+        let total = u8::try_from(payload.len() + 10).expect("tag");
+        let mut tag = b"ID3\x04\x00\x00\x00\x00\x00".to_vec();
+        tag.push(total);
+        tag.extend_from_slice(&[b'P', b'R', b'I', b'V', 0, 0, 0, frame, 0, 0]);
+        tag.extend_from_slice(&payload);
+        native.observe_id3(&tag);
+        assert_eq!(native.id3.len(), 0);
+        assert!(!native.loss.get());
         runtime.shutdown().expect("join");
     }
     #[test]

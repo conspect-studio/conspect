@@ -1078,6 +1078,18 @@ fn resource_router() -> Router<AppState> {
         .route("/inputs/{id}/streams", get(inputs::get_input_streams))
         .route("/inputs/{id}/events", get(source_events::get_source_events))
         .route(
+            "/inputs/{id}/events/journal",
+            get(source_events::get_event_journal),
+        )
+        .route(
+            "/inputs/{id}/events/journal.jsonl",
+            get(source_events::get_event_journal_dump),
+        )
+        .route(
+            "/events/journal.jsonl",
+            get(source_events::get_event_journal_export),
+        )
+        .route(
             "/inputs/{id}/events/test",
             post(source_events::post_source_event_test),
         )

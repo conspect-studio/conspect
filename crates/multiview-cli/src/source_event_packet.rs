@@ -248,6 +248,20 @@ mod tests {
         let result = frame(&mut g, 2, 903_600, 0);
         assert!(result[0].trusted);
     }
+    /// libav stamps a PES-less SCTE-35 section with the last PCR (measured on a
+    /// synthetic TS: section at PCR 113400, first video PTS 133200). PCR runs behind
+    /// the video PTS by the mux delay, so the stamp falls before its bracket and the
+    /// section stays untrusted.
+    /// This gate remains the only path to a splice boundary.
+    #[test]
+    fn a_pcr_stamped_section_ahead_of_its_video_pts_is_not_trusted() {
+        let mut g = PacketGate::default();
+        frame(&mut g, 1, 133_200, 0);
+        g.push(packet(Some(113_400), 1));
+        let result = frame(&mut g, 2, 136_800, 0);
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].trusted);
+    }
     #[test]
     fn missing_transport_pts_is_observational_even_with_plausible_payload() {
         let mut g = PacketGate::default();
