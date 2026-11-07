@@ -326,6 +326,11 @@ async fn srt_listener_source_on_the_wildcard_reaches_the_program() {
         &format!("kind = \"file\"\npath = \"{}\"", clip.display()),
         &format!("kind = \"srt\"\nurl = \"srt://[::]:{port}?mode=listener\""),
     );
+    // A unique source id: the pipeline keeps per-source-id state process-wide,
+    // so sharing `in_a` with a concurrently running test would cross-wire them.
+    let toml = toml
+        .replace("id = \"in_a\"", "id = \"srt_wildcard_in\"")
+        .replace("input_id = \"in_a\"", "input_id = \"srt_wildcard_in\"");
     assert!(toml.contains("kind = \"srt\""), "the source was rewritten");
     let config = MultiviewConfig::load_from_toml(&toml).expect("parse config");
     config.validate().expect("config validates");

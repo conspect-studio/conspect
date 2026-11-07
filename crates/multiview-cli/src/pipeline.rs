@@ -3858,8 +3858,9 @@ impl Pipeline {
         // Push-output link states (listening / connected / reconnecting /
         // drops), re-serialised every `PUSH_LINK_REFRESH_TICKS` from atomics +
         // a lock-free load and otherwise cloned (a handful of small objects).
-        let push_links = Arc::clone(&self.push_links);
-        let mut push_fragment: Option<serde_json::Value> = None;
+        // Boxed: the per-tick closure lives in the run's future, which must stay
+        // under clippy's `large_futures` bound.
+        let mut push_links = Box::new((Arc::clone(&self.push_links), None::<serde_json::Value>));
         // (The DRM/KMS display heads — and their DEV-B4 audio sinks — were
         // started above, before the egress spawn, so the bake consumer received
         // the audio publishers; `display_publishers` feeds the video mailboxes
@@ -3990,10 +3991,11 @@ impl Pipeline {
             // seeded with the CURRENT tile states (the `tiles` `$snapshot`)
             // instead of waiting for the next sparse `tile.state` delta.
             crate::control::fold_tile_states(&mut snapshot, &frame.source_states);
-            if push_fragment.is_none() || frame.tick.index % PUSH_LINK_REFRESH_TICKS == 0 {
-                push_fragment = crate::control::push_links_fragment(&push_links.load());
+            let (links, fragment) = &mut *push_links;
+            if fragment.is_none() || frame.tick.index % PUSH_LINK_REFRESH_TICKS == 0 {
+                *fragment = crate::control::push_links_fragment(&links.load());
             }
-            crate::control::insert_output_fragment(&mut snapshot, push_fragment.as_ref());
+            crate::control::insert_output_fragment(&mut snapshot, fragment.as_ref());
             snapshot
         };
         // Sparse tile-state events: emit at most one `tile.state` change per tick
