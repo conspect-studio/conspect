@@ -108,6 +108,10 @@ impl ScteSourceEventAdapter {
     ///
     /// # Errors
     /// Returns the SCTE parser error for malformed/CRC-invalid sections, with no effects.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered parse -> classify -> name -> publish pass per section"
+    )]
     pub fn ingest_section(
         &mut self,
         bytes: &[u8],
