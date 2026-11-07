@@ -146,6 +146,11 @@ function SourceKindFields({
           value={form.url}
           required
           placeholder={placeholder}
+          {...(form.kind === 'srt'
+            ? {
+                hint: t`To receive from a remote encoder, use srt://[::]:7001?mode=listener: one socket accepts an IPv6 or IPv4 caller, one at a time. 0.0.0.0 is IPv4 only.`,
+              }
+            : {})}
           error={errors.url}
           onChange={(next): void => {
             setForm({ ...form, url: next });

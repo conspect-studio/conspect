@@ -12796,7 +12796,8 @@
           "clients",
           "sessions",
           "dropped",
-          "written"
+          "written",
+          "peers"
         ],
         "properties": {
           "clients": {
@@ -12822,12 +12823,12 @@
             "type": "string",
             "description": "`caller` or `listener`."
           },
-          "peer": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The attached peer's address, when known (caller mode)."
+          "peers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Attached peer addresses: an SRT listener's callers, or a caller's target."
           },
           "sessions": {
             "type": "integer",

@@ -765,6 +765,11 @@ pub enum SourceKind {
     /// yet — that is SRT-2 (#58).
     Srt {
         /// Source URL (`srt://host:port`, IPv6-first: bracket IPv6 literals).
+        ///
+        /// With `mode=listener`, `srt://[::]:port` (or an empty host) is one
+        /// dual-stack socket that accepts IPv6 and IPv4 callers, one caller at a
+        /// time. `0.0.0.0` is IPv4 only; a specific address binds only that
+        /// address.
         url: String,
         /// Optional typed SRT options: mode, latency, `AES` encryption via a
         /// passphrase reference, stream id, listener, `oheadbw_pct`, `maxbw`,
@@ -1862,6 +1867,11 @@ pub enum Output {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         /// Destination URL (`srt://host:port`, IPv6-first: bracket IPv6 literals).
+        ///
+        /// With `mode=listener` this is the bind address and callers pull the
+        /// program: `srt://[::]:port` (or an empty host) is one dual-stack socket
+        /// serving up to 16 simultaneous IPv6 and IPv4 callers. `0.0.0.0` is IPv4
+        /// only; a specific address binds only that address.
         url: String,
         /// Video codec.
         codec: String,

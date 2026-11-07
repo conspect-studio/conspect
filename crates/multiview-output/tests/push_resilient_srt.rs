@@ -147,9 +147,13 @@ fn caller(port: u16, frames: u32) -> Child {
 }
 
 fn caller_over(host: &str, port: u16, frames: u32) -> Child {
+    caller_over_query(host, port, frames, "")
+}
+
+fn caller_over_query(host: &str, port: u16, frames: u32, query: &str) -> Child {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(format!("srt://{host}:{port}?mode=caller"))
+        .arg(format!("srt://{host}:{port}?mode=caller{query}"))
         .args(["-frames:v", &frames.to_string(), "-f", "null", "-"])
         .stdin(Stdio::null())
         .spawn()
@@ -363,4 +367,71 @@ fn teardown_is_bounded_while_waiting_for_a_caller() {
         started.elapsed()
     );
     assert_eq!(run.link.snapshot().state, PushLinkState::Idle);
+}
+
+/// Encryption options must really reach the native socket: the right passphrase
+/// decodes, and a caller with the wrong one never attaches.
+#[test]
+fn encrypted_listener_admits_only_the_right_passphrase() {
+    let port = port();
+    let secret = "correct-horse-battery";
+    let run = start(
+        format!("srt://[::]:{port}?mode=listener&pbkeylen=32&passphrase={secret}"),
+        true,
+        paced(),
+    );
+    wait_for("listening", Duration::from_secs(5), || {
+        run.link.snapshot().state == PushLinkState::Listening
+    });
+    let wrong = Command::new("timeout")
+        .args(["6", "ffmpeg", "-hide_banner", "-loglevel", "quiet", "-i"])
+        .arg(format!(
+            "srt://[::1]:{port}?mode=caller&pbkeylen=32&passphrase=wrong-passphrase-x"
+        ))
+        .args(["-frames:v", "5", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .status()
+        .expect("spawn wrong caller");
+    assert!(!wrong.success(), "a wrong passphrase must not decode");
+    assert_eq!(run.link.snapshot().sessions, 0, "wrong passphrase attached");
+    assert_decoded(
+        caller_over_query(
+            "[::1]",
+            port,
+            20,
+            &format!("&pbkeylen=32&passphrase={secret}"),
+        ),
+        "right passphrase",
+    );
+    run.stop.store(true, Ordering::Release);
+    run.handle.join().unwrap();
+}
+
+/// `stop` must stay bounded with a caller attached that has stopped reading:
+/// the writer is mid-send to a peer that is alive but silent.
+#[test]
+fn teardown_is_bounded_with_a_frozen_caller_attached() {
+    let port = port();
+    let run = start(format!("srt://[::]:{port}?mode=listener"), true, None);
+    wait_for("listening", Duration::from_secs(5), || {
+        run.link.snapshot().state == PushLinkState::Listening
+    });
+    let mut child = caller_over("[::1]", port, 100_000);
+    wait_for("attach", Duration::from_secs(10), || {
+        run.link.clients() == 1
+    });
+    let pid = child.id().to_string();
+    let frozen = Command::new("kill").args(["-STOP", &pid]).status().unwrap();
+    assert!(frozen.success());
+    std::thread::sleep(Duration::from_secs(1));
+    let started = Instant::now();
+    run.stop.store(true, Ordering::Release);
+    run.handle.join().unwrap();
+    let elapsed = started.elapsed();
+    child.kill().expect("kill caller");
+    child.wait().expect("reap caller");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "teardown took {elapsed:?}"
+    );
 }
