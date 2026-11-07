@@ -336,10 +336,17 @@ fn working_document(state: &AppState) -> ControlResult<serde_json::Value> {
 pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<serde_json::Value> {
     let working = working_document(state)?;
 
-    let collect = |repo: &std::sync::Arc<dyn crate::resource_store::ResourceRepository>|
+    // Review R3-01: compose from the SAME truth GET serves — the accepted
+    // envelope when one exists, never straight from a store whose projection
+    // write can fail after a durable commit. `accepted_family` returns the
+    // envelope's resources (falling back to the live store only when no
+    // envelope exists yet, e.g. a store-only run or the pre-first-commit
+    // window), so a failed store write can never make export/promote
+    // disagree with GET or persist stale state.
+    let collect = |key: &str,
+                   repo: &std::sync::Arc<dyn crate::resource_store::ResourceRepository>|
      -> ControlResult<Vec<serde_json::Value>> {
-        Ok(repo
-            .list()?
+        Ok(crate::boot_model::accepted_family(state, key, repo)?
             .into_iter()
             .map(|v| v.resource.body)
             .collect())
@@ -384,19 +391,19 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     );
     doc.insert(
         "sources".to_owned(),
-        serde_json::Value::Array(collect(&state.sources)?),
+        serde_json::Value::Array(collect("sources", &state.sources)?),
     );
     doc.insert(
         "outputs".to_owned(),
-        serde_json::Value::Array(collect(&state.outputs)?),
+        serde_json::Value::Array(collect("outputs", &state.outputs)?),
     );
     doc.insert(
         "overlays".to_owned(),
-        serde_json::Value::Array(collect(&state.overlays)?),
+        serde_json::Value::Array(collect("overlays", &state.overlays)?),
     );
     doc.insert(
         "probes".to_owned(),
-        serde_json::Value::Array(collect(&state.probes)?),
+        serde_json::Value::Array(collect("probes", &state.probes)?),
     );
     // Managed devices + sync groups (ADR-M008): config-as-code is the durable
     // source, so a device or sync group adopted at runtime via the API must
@@ -405,11 +412,11 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     // here, so live status never leaks into the desired-state document.
     doc.insert(
         "devices".to_owned(),
-        serde_json::Value::Array(collect(&state.devices)?),
+        serde_json::Value::Array(collect("devices", &state.devices)?),
     );
     doc.insert(
         "sync_groups".to_owned(),
-        serde_json::Value::Array(collect(&state.sync_groups)?),
+        serde_json::Value::Array(collect("sync_groups", &state.sync_groups)?),
     );
     // The store-backed singletons/collections that overlay the base document —
     // `audio`, `salvos`, `tally_profiles` — are composed FROM their stores
@@ -445,7 +452,13 @@ fn insert_store_backed_sections(
     doc: &mut serde_json::Map<String, serde_json::Value>,
     state: &AppState,
 ) -> ControlResult<()> {
-    let (audio, _) = state.audio_routing.snapshot();
+    // Review R3-01: `audio`/`salvos`/`tally_profiles` compose from the SAME
+    // accepted envelope GET serves (`accepted_audio`/`accepted_salvos`/
+    // `accepted_profiles`), not straight from a store whose projection write
+    // can fail after a durable commit. Each helper falls back to the live
+    // store only while no envelope exists yet (store-only run, or before the
+    // first commit).
+    let (audio, _) = crate::boot_model::accepted_audio(state)?;
     if let Some(routing) = audio {
         doc.insert(
             "audio".to_owned(),
@@ -459,9 +472,7 @@ fn insert_store_backed_sections(
     doc.insert(
         "salvos".to_owned(),
         serde_json::to_value(
-            state
-                .salvos
-                .list()?
+            crate::boot_model::accepted_salvos(state)?
                 .into_iter()
                 .map(|v| v.salvo)
                 .collect::<Vec<_>>(),
@@ -473,9 +484,7 @@ fn insert_store_backed_sections(
     doc.insert(
         "tally_profiles".to_owned(),
         serde_json::to_value(
-            state
-                .tally_profiles
-                .list()?
+            crate::boot_model::accepted_profiles(state)?
                 .into_iter()
                 .map(|v| v.profile)
                 .collect::<Vec<_>>(),

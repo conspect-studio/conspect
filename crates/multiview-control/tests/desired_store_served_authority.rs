@@ -28,7 +28,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use support::{body_json, delete_if_match, etag, get, post_json, put_json, send, ADMIN_TOKEN};
+use support::{
+    body_bytes, body_json, delete_if_match, etag, get, post_json, put_json, send, ADMIN_TOKEN,
+};
 
 const BOOT: &str = r##"schema_version = 1
 [canvas]
@@ -496,4 +498,94 @@ async fn recreated_identity_never_reuses_a_tag_and_keeps_it_across_restart() {
             family.uri
         );
     }
+}
+
+/// Build a `POST` request with a Bearer token, no body, and an optional
+/// `Idempotency-Key` — used for `promote`, which takes neither a JSON body
+/// nor an `If-Match` header.
+fn post_idem(path: &str, token: &str, key: Option<&str>) -> axum::http::Request<axum::body::Body> {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(key) = key {
+        builder = builder.header("Idempotency-Key", key);
+    }
+    builder
+        .body(axum::body::Body::empty())
+        .expect("request should build")
+}
+
+/// R3-01: a store write that fails after a durable commit must not make
+/// `export` or `promote` disagree with GET. Both must compose from the same
+/// accepted envelope GET serves, not from the store the failed projection
+/// never updated.
+#[tokio::test]
+async fn export_and_promote_after_a_failed_store_write_carry_the_committed_body() {
+    let (_dir, path, router, fail) = faultable().await;
+    let family = &families()[0]; // overlays — a store-served family (R3-01).
+
+    // Create normally, then commit an edit whose store projection write fails.
+    let old = create(&router, family, &family.create).await;
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let committed = send(
+        &router,
+        put_json(family.uri, ADMIN_TOKEN, Some(&old), &family.edit),
+    )
+    .await;
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        committed.status(),
+        StatusCode::OK,
+        "the commit itself must still succeed even though the store projection failed"
+    );
+
+    // GET already serves the committed body from the envelope (R2-01).
+    let (status, _, get_body) = read(&router, family.uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(get_body[family.field], family.edited, "GET");
+
+    // `export` must carry the SAME committed body, not the stale pre-commit
+    // one still sitting in the faulted store.
+    let export_response = send(&router, get("/api/v1/config/export", ADMIN_TOKEN)).await;
+    assert_eq!(export_response.status(), StatusCode::OK, "export");
+    let export_bytes = body_bytes(export_response).await;
+    let export_toml = String::from_utf8(export_bytes).expect("export body should be UTF-8");
+    let exported: Value = toml::from_str(&export_toml).expect("export body should be TOML");
+    let exported_overlay = exported["overlays"]
+        .as_array()
+        .expect("exported overlays array")
+        .iter()
+        .find(|o| o["id"] == "ov_clock")
+        .expect("exported overlay ov_clock");
+    assert_eq!(
+        exported_overlay[family.field], family.edited,
+        "export must carry the committed body, not a stale store projection"
+    );
+
+    // `promote` must write the SAME committed body to the boot file, not a
+    // stale pre-commit one.
+    let promote_response = send(
+        &router,
+        post_idem("/api/v1/config/promote", ADMIN_TOKEN, None),
+    )
+    .await;
+    assert_eq!(
+        promote_response.status(),
+        StatusCode::OK,
+        "promote: {:?}",
+        body_bytes(promote_response).await
+    );
+    let boot_toml = std::fs::read_to_string(&path).expect("boot file should be readable");
+    let boot: Value = toml::from_str(&boot_toml).expect("boot file should be TOML");
+    let promoted_overlay = boot["overlays"]
+        .as_array()
+        .expect("promoted overlays array")
+        .iter()
+        .find(|o| o["id"] == "ov_clock")
+        .expect("promoted overlay ov_clock");
+    assert_eq!(
+        promoted_overlay[family.field], family.edited,
+        "promote must write the committed body to the boot file, not a stale store projection"
+    );
 }
