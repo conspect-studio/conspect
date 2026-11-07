@@ -17381,7 +17381,7 @@
           },
           "label": {
             "type": "string",
-            "description": "The consumer's identity within its kind (a cell, a route target, ...)."
+            "description": "The consumer's identity within its kind (a cell, a route target, ...).\n`restricted` when it names an object the caller may not read."
           }
         }
       },

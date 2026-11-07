@@ -70,7 +70,13 @@ pub fn standing_pins(source: &Source) -> Vec<StandingPin> {
     if let Some(rule) = rule {
         let watch = ConsumerTag::new(ConsumerClass::EventAutomation, "watched");
         pins.push((source.id.clone(), Rails::VIDEO, watch));
-        let target = ConsumerTag::new(ConsumerClass::EventAutomation, source.id.as_str());
+        // The replacement's holder names the watching source: an object of
+        // its own, authorized separately (review DMD-04).
+        let target = ConsumerTag::naming(
+            ConsumerClass::EventAutomation,
+            source.id.as_str(),
+            source.id.as_str(),
+        );
         let rails = match rule.on_break_start.action {
             multiview_config::schema::BreakActionKind::SwapCell => Rails::VIDEO,
             multiview_config::schema::BreakActionKind::RouteProgram => Rails::ALL,
@@ -220,6 +226,12 @@ struct HeldLease(
 #[cfg(feature = "ffmpeg")]
 impl multiview_control::SourceDemandLease for HeldLease {}
 
+/// The control-plane view of one holder, carrying the object it names.
+fn consumer_view(tag: &ConsumerTag) -> multiview_control::SourceConsumerView {
+    multiview_control::SourceConsumerView::new(tag.class.as_str(), tag.label.to_string())
+        .naming(tag.object.as_deref())
+}
+
 /// Map an engine status onto the control-plane view.
 #[must_use]
 pub fn view_of(status: &multiview_engine::DemandStatus) -> multiview_control::SourceDemandView {
@@ -237,14 +249,7 @@ pub fn view_of(status: &multiview_engine::DemandStatus) -> multiview_control::So
         audio_wanted: status.wanted.audio,
         video_running: status.running.video,
         audio_running: status.running.audio,
-        consumers: status
-            .consumers
-            .iter()
-            .map(|tag| multiview_control::SourceConsumerView {
-                kind: tag.class.as_str().to_owned(),
-                label: tag.label.to_string(),
-            })
-            .collect(),
+        consumers: status.consumers.iter().map(consumer_view).collect(),
         detail: status.detail.clone(),
         starting_phase: status.starting.map(|phase| match phase {
             multiview_engine::StartingPhase::Queued => {
@@ -290,9 +295,9 @@ pub fn lifecycle_event(event: &multiview_engine::TransitionEvent) -> multiview_e
         event
             .lease_holders
             .iter()
-            .map(|tag| multiview_events::LeaseHolder {
-                kind: tag.class.as_str().to_owned(),
-                label: tag.label.to_string(),
+            .map(|tag| {
+                multiview_events::LeaseHolder::new(tag.class.as_str(), tag.label.to_string())
+                    .naming(tag.object.as_deref())
             })
             .collect(),
     ))
@@ -310,15 +315,7 @@ impl multiview_control::SourceDemandProvider for ControlDemand {
 
     fn stop_source(&self, id: &str) -> Result<(), multiview_control::StopRefusal> {
         self.manager.stop_source(id).map_err(|holders| {
-            multiview_control::StopRefusal::InUse(
-                holders
-                    .iter()
-                    .map(|tag| multiview_control::SourceConsumerView {
-                        kind: tag.class.as_str().to_owned(),
-                        label: tag.label.to_string(),
-                    })
-                    .collect(),
-            )
+            multiview_control::StopRefusal::InUse(holders.iter().map(consumer_view).collect())
         })
     }
 

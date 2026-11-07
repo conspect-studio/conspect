@@ -5993,7 +5993,10 @@ export interface components {
              *     `event_automation`, `always_on` or `manual` (an operator Start).
              */
             kind: string;
-            /** @description The consumer's identity within its kind (a cell, a route target, ...). */
+            /**
+             * @description The consumer's identity within its kind (a cell, a route target, ...).
+             *     `restricted` when it names an object the caller may not read.
+             */
             label: string;
         };
         /**

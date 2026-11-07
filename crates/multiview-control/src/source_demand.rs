@@ -66,7 +66,47 @@ pub struct SourceConsumerView {
     /// `event_automation`, `always_on` or `manual` (an operator Start).
     pub kind: String,
     /// The consumer's identity within its kind (a cell, a route target, ...).
+    /// `restricted` when it names an object the caller may not read.
     pub label: String,
+    /// The authorizable object `label` names (an automation pin's owning
+    /// source). Not on the wire: used to redact `label` per principal (review
+    /// DMD-04).
+    #[serde(skip)]
+    pub object_id: Option<String>,
+}
+
+/// The label shown in place of a holder naming an object out of scope.
+pub const RESTRICTED_LABEL: &str = "restricted";
+
+impl SourceConsumerView {
+    /// A consumer of `kind` labelled `label`, naming no other object.
+    #[must_use]
+    pub fn new(kind: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            label: label.into(),
+            object_id: None,
+        }
+    }
+
+    /// The same consumer, naming `object` (when `Some`).
+    #[must_use]
+    pub fn naming(mut self, object: Option<&str>) -> Self {
+        self.object_id = object.map(str::to_owned);
+        self
+    }
+
+    /// Hide the label unless `visible` permits the object it names.
+    pub fn redact_unless(&mut self, visible: impl Fn(&str) -> bool) {
+        if self
+            .object_id
+            .as_deref()
+            .is_some_and(|object| !visible(object))
+        {
+            RESTRICTED_LABEL.clone_into(&mut self.label);
+            self.object_id = None;
+        }
+    }
 }
 
 /// One source's demand state. Flat booleans keep the wire shape simple for

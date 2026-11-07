@@ -49,6 +49,7 @@ impl SourceDemandProvider for FakeDemand {
             consumers: vec![SourceConsumerView {
                 kind: "layout_cell".into(),
                 label: "cell-1".into(),
+                object_id: None,
             }],
             detail: None,
             starting_phase: None,
@@ -72,6 +73,7 @@ impl SourceDemandProvider for FakeDemand {
             return Err(StopRefusal::InUse(vec![SourceConsumerView {
                 kind: "layout_cell".into(),
                 label: "cell-1".into(),
+                object_id: None,
             }]));
         }
         self.stopped.lock().unwrap().push(id.to_owned());
@@ -243,4 +245,104 @@ async fn stopping_a_source_in_use_is_refused_naming_its_consumers() {
     .await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(*demand.stopped.lock().unwrap(), vec!["idle".to_owned()]);
+}
+
+/// Holds `scoped-layout` (the scoped key's only object) as the replacement of
+/// a rule owned by `secret-watcher`, a source that key may not read.
+struct ReplacementDemand;
+
+impl ReplacementDemand {
+    fn holders() -> Vec<SourceConsumerView> {
+        vec![
+            SourceConsumerView::new("event_automation", "secret-watcher")
+                .naming(Some("secret-watcher")),
+            SourceConsumerView::new("layout_cell", "cell-1"),
+        ]
+    }
+}
+
+impl SourceDemandProvider for ReplacementDemand {
+    fn status(&self, id: &str) -> SourceDemandView {
+        self.active()
+            .into_iter()
+            .find(|view| view.id == id)
+            .unwrap_or_else(|| SourceDemandView::idle(id))
+    }
+    fn active(&self) -> Vec<SourceDemandView> {
+        vec![SourceDemandView {
+            consumers: Self::holders(),
+            phase: SourceDemandPhase::Ready,
+            ..SourceDemandView::idle("scoped-layout")
+        }]
+    }
+    fn preview_lease(&self, _id: &str, _label: &str) -> Option<Box<dyn SourceDemandLease>> {
+        None
+    }
+    fn touch_preview(&self, _id: &str) -> Option<SourceDemandPhase> {
+        None
+    }
+    fn start_source(&self, _id: &str) -> bool {
+        true
+    }
+    fn stop_source(&self, _id: &str) -> Result<(), StopRefusal> {
+        Err(StopRefusal::InUse(Self::holders()))
+    }
+}
+
+/// Review DMD-04: a key scoped to the replacement source never learns the
+/// out-of-scope watching source's id, from status, the list, Start or Stop;
+/// an unscoped operator still sees it.
+#[tokio::test]
+async fn holder_labels_naming_out_of_scope_sources_are_redacted() {
+    let mut doc = base_document();
+    doc["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": "scoped-layout", "kind": "bars"}));
+    let config: multiview_config::MultiviewConfig = serde_json::from_value(doc).unwrap();
+    let seeded = multiview_control::seed_resources(&config).unwrap();
+    let h = harness_with(move |state| {
+        state
+            .with_source_demand(Arc::new(ReplacementDemand))
+            .with_seeded_resources(seeded)
+    });
+    let leaks = |text: &str| text.contains("secret-watcher");
+    for (request, expect) in [
+        (
+            get("/api/v1/sources/scoped-layout/status", SCOPED_TOKEN),
+            StatusCode::OK,
+        ),
+        (get("/api/v1/sources/status", SCOPED_TOKEN), StatusCode::OK),
+        (
+            post_json(
+                "/api/v1/sources/scoped-layout/start",
+                SCOPED_TOKEN,
+                &json!({}),
+            ),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            post_json(
+                "/api/v1/sources/scoped-layout/stop",
+                SCOPED_TOKEN,
+                &json!({}),
+            ),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let resp = send(&h.router, request).await;
+        assert_eq!(resp.status(), expect);
+        let body = body_json(resp).await.to_string();
+        assert!(!leaks(&body), "{body}");
+        assert!(body.contains("restricted") || body == "[]", "{body}");
+    }
+    let resp = send(
+        &h.router,
+        get("/api/v1/sources/scoped-layout/status", OPERATOR_TOKEN),
+    )
+    .await;
+    assert!(
+        leaks(&body_json(resp).await.to_string()),
+        "unscoped sees it"
+    );
 }

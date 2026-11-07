@@ -141,6 +141,11 @@ pub struct ConsumerTag {
     pub class: ConsumerClass,
     /// A short identity within the class (cell id, session id, ...).
     pub label: Arc<str>,
+    /// The authorizable object this holder names, when its label identifies
+    /// another resource (an automation pin's owning source). The control plane
+    /// redacts the label for a principal that cannot read this object (review
+    /// DMD-04).
+    pub object: Option<Arc<str>>,
 }
 
 impl ConsumerTag {
@@ -150,6 +155,21 @@ impl ConsumerTag {
         Self {
             class,
             label: label.into(),
+            object: None,
+        }
+    }
+
+    /// A tag of `class` labelled `label` that names object `object`.
+    #[must_use]
+    pub fn naming(
+        class: ConsumerClass,
+        label: impl Into<Arc<str>>,
+        object: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            class,
+            label: label.into(),
+            object: Some(object.into()),
         }
     }
 }
@@ -1449,6 +1469,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 let tag = ConsumerTag {
                     class: slot.class,
                     label: Arc::clone(&item.label),
+                    object: None,
                 };
                 manager.acquire(&item.id, slot.rails, tag, item.size)
             });

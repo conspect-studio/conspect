@@ -96,6 +96,18 @@ async fn boot_pins_are_owned_by_their_source_and_merge() {
         ],
         "both rules hold their shared replacement"
     );
+    // Each replacement holder names its owning source as an object, so the
+    // control plane can redact it per principal (review DMD-04).
+    assert!(demand
+        .status("slate")
+        .consumers
+        .iter()
+        .all(|tag| tag.object.as_deref() == Some(&*tag.label)));
+    let view = multiview_cli::source_demand::view_of(&demand.status("slate"));
+    assert!(view
+        .consumers
+        .iter()
+        .all(|c| c.object_id.as_deref() == Some(c.label.as_str())));
 
     // Disarm `watched` at runtime: its replacement pin goes, `other`'s stays.
     let spawner = pipeline.live_ingest_spawner();

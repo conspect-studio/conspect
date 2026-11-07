@@ -308,6 +308,7 @@ fn input_lifecycle_is_object_scoped_and_round_trips() {
         vec![LeaseHolder {
             kind: "layout_cell".into(),
             label: "cell-1".into(),
+            object_id: None,
         }],
     );
     let e = Event::InputLifecycle(body.clone());

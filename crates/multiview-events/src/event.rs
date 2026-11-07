@@ -570,6 +570,30 @@ pub struct LeaseHolder {
     pub kind: String,
     /// The holder's identity within its kind.
     pub label: String,
+    /// The authorizable object the label names (an automation pin's owning
+    /// source), never on the wire: the realtime session redacts `label` for a
+    /// principal that cannot read it (review DMD-04).
+    #[serde(skip)]
+    pub object_id: Option<String>,
+}
+
+impl LeaseHolder {
+    /// A holder of `kind` labelled `label`, naming no other object.
+    #[must_use]
+    pub fn new(kind: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            label: label.into(),
+            object_id: None,
+        }
+    }
+
+    /// The same holder, naming `object` (when `Some`).
+    #[must_use]
+    pub fn naming(mut self, object: Option<&str>) -> Self {
+        self.object_id = object.map(str::to_owned);
+        self
+    }
 }
 
 /// `input.lifecycle` (topic `inputs`): a source moved between idle /

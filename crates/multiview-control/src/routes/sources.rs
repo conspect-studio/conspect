@@ -633,7 +633,7 @@ pub(crate) async fn list_source_status(
             .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
             .map(|v| (v.resource.id.clone(), activation_of(&v.resource)))
             .collect();
-    Ok(Json(source_status_views(&state, sources)))
+    Ok(Json(source_status_views(&state, &principal, sources)))
 }
 
 /// One source's demand state (role: read; per-object authz).
@@ -662,7 +662,7 @@ pub(crate) async fn get_source_status(
     let source = accepted_source(&state, &id)?;
     let activation = activation_of(&source.resource);
     Ok(Json(
-        source_status_views(&state, vec![(id, activation)])
+        source_status_views(&state, &principal, vec![(id, activation)])
             .pop()
             .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle("")),
     ))
@@ -747,7 +747,7 @@ pub(crate) async fn start_source(
         Some(serde_json::json!({"command": "start"})),
     );
     let activation = activation_of(&source.resource);
-    let view = source_status_views(&state, vec![(id, activation)])
+    let view = source_status_views(&state, &principal, vec![(id, activation)])
         .pop()
         .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(""));
     Ok((StatusCode::ACCEPTED, Json(view)).into_response())
@@ -788,7 +788,8 @@ pub(crate) async fn stop_source(
     );
     match outcome {
         Ok(()) => {}
-        Err(crate::source_demand::StopRefusal::InUse(consumers)) => {
+        Err(crate::source_demand::StopRefusal::InUse(mut consumers)) => {
+            redact_holders(&principal, &mut consumers);
             let names: Vec<String> = consumers
                 .iter()
                 .map(|c| format!("{} {}", c.kind, c.label))
@@ -812,7 +813,7 @@ pub(crate) async fn stop_source(
         Some(serde_json::json!({"command": "stop"})),
     );
     let activation = activation_of(&source.resource);
-    let view = source_status_views(&state, vec![(id, activation)])
+    let view = source_status_views(&state, &principal, vec![(id, activation)])
         .pop()
         .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(""));
     Ok((StatusCode::ACCEPTED, Json(view)).into_response())
@@ -820,8 +821,21 @@ pub(crate) async fn stop_source(
 
 /// The demand views of `ids`, in id order. Without a demand provider (a run
 /// path with no manager) the status is unknown, reported idle with no consumers.
+/// Hide every holder label that names an object `principal` may not read
+/// (review DMD-04): the source row is authorized, but an automation holder
+/// names its owning source, which is authorized on its own.
+fn redact_holders(
+    principal: &Principal,
+    consumers: &mut [crate::source_demand::SourceConsumerView],
+) {
+    for consumer in consumers {
+        consumer.redact_unless(|object| crate::auth::authorize_object(principal, object).is_ok());
+    }
+}
+
 fn source_status_views(
     state: &AppState,
+    principal: &Principal,
     mut sources: Vec<(String, crate::source_demand::SourceActivationView)>,
 ) -> Vec<crate::source_demand::SourceDemandView> {
     sources.sort_by(|a, b| a.0.cmp(&b.0));
@@ -845,6 +859,7 @@ fn source_status_views(
                 .cloned()
                 .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(&id));
             view.activation = activation;
+            redact_holders(principal, &mut view.consumers);
             view
         })
         .collect()
