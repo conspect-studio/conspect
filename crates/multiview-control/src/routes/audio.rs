@@ -352,7 +352,10 @@ pub(crate) async fn put_audio_routing(
         let value = serde_json::to_value(&routing)
             .map_err(|e| ControlError::Repository(format!("audio serialization: {e}")))?;
         let mut prospective = crate::boot_model::prospective_config(&state, "audio", value)?;
-        let output_ids = crate::boot_model::output_ids_for_config(&state, &prospective)?;
+        // The ACCEPTED identity map, not one re-derived from bodies: the
+        // propagation below changes id-less output bodies, which re-derivation
+        // refuses as ambiguous once an envelope exists.
+        let output_ids = crate::boot_model::accepted_output_ids(&state)?.unwrap_or_default();
         outputs_updated = apply_routing_propagation(
             &principal,
             old_routing.as_ref(),
@@ -360,12 +363,7 @@ pub(crate) async fn put_audio_routing(
             &mut prospective,
             &output_ids,
         )?;
-        crate::boot_model::commit_desired(
-            &state,
-            prospective,
-            crate::boot_model::layout_library(&state)?,
-        )
-        .await?;
+        crate::boot_model::commit_keeping_output_ids(&state, prospective).await?;
     }
     // The compare-and-swap re-checks the version under the store lock, so two
     // racing PUTs that both passed the read above cannot both win.

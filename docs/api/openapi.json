@@ -2753,6 +2753,16 @@
               }
             }
           },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Unknown item / invalid preset.",
             "content": {
@@ -2971,6 +2981,16 @@
               }
             }
           },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Invalid body.",
             "content": {
@@ -3026,6 +3046,16 @@
           },
           "409": {
             "description": "Still bound by an item.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3170,6 +3200,16 @@
               }
             }
           },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Invalid body.",
             "content": {
@@ -3215,6 +3255,16 @@
           },
           "404": {
             "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
             "content": {
               "application/json": {
                 "schema": {
@@ -9819,6 +9869,16 @@
               }
             }
           },
+          "412": {
+            "description": "A sent If-Match is stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
           "422": {
             "description": "The body is not a valid location (detail names the field).",
             "content": {
@@ -9874,6 +9934,16 @@
           },
           "404": {
             "description": "No location with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A sent If-Match is stale.",
             "content": {
               "application/json": {
                 "schema": {

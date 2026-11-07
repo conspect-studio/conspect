@@ -51,8 +51,31 @@ const STORE_SERVED_KEYS: [&str; 6] = [
     "salvos",
     "tally_profiles",
 ];
+/// The section-level families (rc3 additions) whose bodies live inside the
+/// config document rather than a resource store: the IPTV publication
+/// singleton and the three graphics collections. Their versions advance on
+/// every accepted body change, survive restart and never repeat.
+pub const IPTV_KEY: &str = "iptv";
+/// Graphics data sources (`[[graphics.data_sources]]`).
+pub const GRAPHICS_DATA_SOURCES_KEY: &str = "graphics_data_sources";
+/// Graphics items (`[[graphics.items]]`).
+pub const GRAPHICS_ITEMS_KEY: &str = "graphics_items";
+/// Graphics channels (`[[graphics.channels]]`).
+pub const GRAPHICS_CHANNELS_KEY: &str = "graphics_channels";
+/// The whole `[graphics]` section as one commit unit: a single edit can touch
+/// several graphics collections (deleting an item also edits rundowns) and the
+/// `[weather]` mirror, so they land atomically. Per-collection versions are
+/// derived from the body changes.
+pub const GRAPHICS_KEY: &str = "graphics";
+/// The families whose bodies live in a config section, not a resource store.
+const SECTION_KEYS: [&str; 4] = [
+    IPTV_KEY,
+    GRAPHICS_DATA_SOURCES_KEY,
+    GRAPHICS_ITEMS_KEY,
+    GRAPHICS_CHANNELS_KEY,
+];
 /// Every family with a durable per-resource version in the envelope.
-const VERSIONED_KEYS: [&str; 9] = [
+const VERSIONED_KEYS: [&str; 13] = [
     "sources",
     "outputs",
     "audio",
@@ -62,6 +85,10 @@ const VERSIONED_KEYS: [&str; 9] = [
     "sync_groups",
     "salvos",
     "tally_profiles",
+    IPTV_KEY,
+    GRAPHICS_DATA_SOURCES_KEY,
+    GRAPHICS_ITEMS_KEY,
+    GRAPHICS_CHANNELS_KEY,
 ];
 
 /// The complete accepted intent. A library edit and its selected working layout
@@ -321,8 +348,8 @@ pub fn after_commit(state: &AppState, error: ControlError) -> ControlError {
 /// Persist a prospective resource collection before its store changes.
 ///
 /// Every runtime-mutable config collection (sources, outputs, overlays,
-/// probes, devices, sync groups, salvos, tally profiles) commits through here
-/// (review H1), so `desired.json` is the single source of truth for accepted
+/// probes, devices, sync groups, salvos, tally profiles) and section (`iptv`,
+/// `graphics` with its `weather` mirror) commits through here (review H1), so `desired.json` is the single source of truth for accepted
 /// configuration and an unrelated later commit can never revert an edit.
 ///
 /// # Errors
@@ -336,6 +363,9 @@ pub async fn commit_resource(
 ) -> ControlResult<()> {
     if state.boot_model.is_none() {
         return Ok(());
+    }
+    if key == IPTV_KEY || key == GRAPHICS_KEY {
+        return commit_section(state, key, replacement).await;
     }
     let mut document = current_desired_config(state)?;
     let object = document
@@ -408,15 +438,7 @@ pub async fn commit_resource(
         .boot_model
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
-    let mut output_ids = previous.map_or_else(
-        || {
-            (0..state.outputs.list().map_or(0, |items| items.len()))
-                .map(|index| format!("output-{index}"))
-                .collect::<Vec<_>>()
-        },
-        |desired| desired.output_ids,
-    );
+    let mut output_ids = current_output_ids(state, model)?;
     if key == "outputs" {
         if !output_ids.iter().any(|existing| existing == id) {
             if is_create {
@@ -427,6 +449,102 @@ pub async fn commit_resource(
         }
     }
     commit_desired_with_output_ids(state, config, layouts, output_ids, Some((key, id, name))).await
+}
+
+/// The accepted output identity map, or the seeded positional ids before the
+/// first envelope. An edit that keeps the output list must carry this map
+/// forward: re-deriving identities from bodies refuses id-less outputs whose
+/// body changed, or that are equal to one another.
+fn current_output_ids(state: &AppState, model: &BootModel) -> ControlResult<Vec<String>> {
+    Ok(load_desired(model.boot_path())
+        .map_err(ControlError::Repository)?
+        .map_or_else(
+            || {
+                (0..state.outputs.list().map_or(0, |items| items.len()))
+                    .map(|index| format!("output-{index}"))
+                    .collect::<Vec<_>>()
+            },
+            |desired| desired.output_ids,
+        ))
+}
+
+/// Commit a section-level family (`[iptv]`, `[graphics]`) through the same
+/// transaction as every collection. A `[graphics]` commit also rewrites its
+/// `[weather]` mirror, so a rollback to a pre-graphics build keeps the
+/// `bom_weather` sources.
+async fn commit_section(
+    state: &AppState,
+    key: &str,
+    replacement: Option<serde_json::Value>,
+) -> ControlResult<()> {
+    let model = state
+        .boot_model
+        .as_ref()
+        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+    let mut document = current_desired_config(state)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?;
+    if key == GRAPHICS_KEY {
+        let graphics: multiview_config::GraphicsConfig = replacement
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| ControlError::Validation(format!("graphics document: {e}")))?
+            .unwrap_or_default();
+        let mut legacy = multiview_config::WeatherConfig::default();
+        legacy.locations = graphics
+            .data_sources
+            .iter()
+            .filter_map(multiview_config::GraphicsDataSource::as_weather_location)
+            .collect();
+        object.insert("weather".into(), config_value(&legacy)?);
+    }
+    match replacement {
+        Some(body) => object.insert(key.to_owned(), body),
+        None => object.remove(key),
+    };
+    let config: MultiviewConfig = serde_path_to_error::deserialize(document).map_err(|e| {
+        ControlError::Validation(format!(
+            "prospective configuration at `{}`: {}",
+            e.path(),
+            e.inner()
+        ))
+    })?;
+    let layouts = layout_library(state)?;
+    let output_ids = current_output_ids(state, model)?;
+    commit_desired_with_output_ids(state, config, layouts, output_ids, None).await
+}
+
+/// Commit a multi-resource edit that keeps the accepted output identities: the
+/// audio-routing singleton plus the output selections its rename/removal
+/// propagation rewrote land in one transaction.
+///
+/// # Errors
+/// Invalid intent or failed atomic I/O prevents publication.
+pub async fn commit_keeping_output_ids(
+    state: &AppState,
+    config: MultiviewConfig,
+) -> ControlResult<()> {
+    let Some(model) = state.boot_model.as_ref() else {
+        return Ok(());
+    };
+    let layouts = layout_library(state)?;
+    let output_ids = current_output_ids(state, model)?;
+    commit_desired_with_output_ids(state, config, layouts, output_ids, None).await
+}
+
+/// The accepted output identities, aligned with the prospective `outputs`.
+/// `None` without a boot model.
+///
+/// # Errors
+/// A corrupt accepted record fails closed.
+pub fn accepted_output_ids(state: &AppState) -> ControlResult<Option<Vec<String>>> {
+    state
+        .boot_model
+        .as_ref()
+        .map(|model| current_output_ids(state, model))
+        .transpose()
 }
 
 /// Commit a prospective output identity map alongside the full config.
@@ -593,7 +711,17 @@ async fn commit_desired_document_named(
             let base = counters
                 .get(id)
                 .copied()
-                .unwrap_or_else(|| u64::from(old_bodies.contains_key(id) || key == "audio"))
+                .unwrap_or_else(|| {
+                    // Section families have a pre-envelope tag of 1 for state
+                    // the prior config did not carry: the IPTV default, the
+                    // hub's default channel and legacy `[weather]` sources.
+                    // Starting at 1 makes their first edit advance past it.
+                    u64::from(
+                        old_bodies.contains_key(id)
+                            || key == "audio"
+                            || SECTION_KEYS.contains(&key),
+                    )
+                })
                 .max(live.get(id).copied().unwrap_or(0));
             let touched = STORE_SERVED_KEYS.contains(&key)
                 && name_change
@@ -764,6 +892,38 @@ fn legacy_resources(state: &AppState) -> ControlResult<LegacyResources> {
         let body = config_value(&entry.profile)?;
         profiles.insert(entry.profile.id, (body, entry.version.get()));
     }
+    // Section-level families (rc3): before the first envelope the effective
+    // runtime state is accepted at version 1, so the first change advances it
+    // to 2 instead of handing a pre-envelope tag back (review H2 class).
+    let (iptv, _, _) = crate::iptv::accepted_inputs(state)?;
+    if let Some(iptv) = iptv {
+        legacy
+            .entry(IPTV_KEY)
+            .or_default()
+            .insert("singleton".to_owned(), (config_value(&iptv)?, 1));
+    }
+    let graphics = state.graphics.config();
+    for (key, bodies) in [
+        (
+            GRAPHICS_DATA_SOURCES_KEY,
+            identified_bodies(&graphics.data_sources, |item| &item.id),
+        ),
+        (
+            GRAPHICS_ITEMS_KEY,
+            identified_bodies(&graphics.items, |item| &item.id),
+        ),
+        (
+            GRAPHICS_CHANNELS_KEY,
+            identified_bodies(&graphics.channels, |item| &item.id),
+        ),
+    ] {
+        let entries = legacy.entry(key).or_default();
+        for (id, body) in bodies.map_err(|error| {
+            ControlError::Repository(format!("serializing graphics resource: {error}"))
+        })? {
+            entries.insert(id, (body, 1));
+        }
+    }
     let (routing, version) = state.audio_routing.snapshot();
     if let Some(routing) = routing {
         legacy.entry("audio").or_default().insert(
@@ -905,6 +1065,17 @@ fn resource_bodies(
         "sync_groups" => identified_bodies(&config.sync_groups, |item| &item.id),
         "salvos" => identified_bodies(&config.salvos, |item| &item.id),
         "tally_profiles" => identified_bodies(&config.tally_profiles, |item| &item.id),
+        IPTV_KEY => config
+            .iptv
+            .as_ref()
+            .map(|iptv| serde_json::to_value(iptv).map(|body| ("singleton".to_owned(), body)))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>(),
+        GRAPHICS_DATA_SOURCES_KEY => {
+            identified_bodies(&config.graphics.data_sources, |item| &item.id)
+        }
+        GRAPHICS_ITEMS_KEY => identified_bodies(&config.graphics.items, |item| &item.id),
+        GRAPHICS_CHANNELS_KEY => identified_bodies(&config.graphics.channels, |item| &item.id),
         _ => {
             return Err(ControlError::Validation(format!(
                 "unsupported authoritative resource {key}"
@@ -950,6 +1121,36 @@ pub fn accepted_resources(
             })
             .collect(),
     ))
+}
+
+/// The durable version of one accepted resource of a section-level family
+/// (`IPTV_KEY`, the graphics keys), read from the envelope. `None` when this
+/// run has no boot model (nothing is durable, so no version is promised);
+/// `Some(1)` before the first envelope commit (the legacy import starts every
+/// existing resource at 1 and its first change advances it to 2).
+///
+/// # Errors
+/// A corrupt accepted record fails closed.
+pub fn accepted_version(
+    state: &AppState,
+    key: &str,
+    id: &str,
+) -> ControlResult<Option<crate::concurrency::Version>> {
+    let Some(model) = &state.boot_model else {
+        return Ok(None);
+    };
+    let version = load_desired(model.boot_path())
+        .map_err(ControlError::Repository)?
+        .and_then(|desired| {
+            desired
+                .resource_versions
+                .get(key)
+                .and_then(|map| map.get(id))
+                .copied()
+        })
+        .unwrap_or(1)
+        .max(1);
+    Ok(Some(crate::concurrency::Version::new(version)))
 }
 
 /// Read the accepted audio singleton with a durable version, or use the

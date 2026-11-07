@@ -431,6 +431,31 @@ fn insert_store_backed_sections(
     doc: &mut serde_json::Map<String, serde_json::Value>,
     state: &AppState,
 ) -> ControlResult<()> {
+    // `[graphics]`, its `[weather]` mirror and `[iptv]` have no resource store:
+    // the envelope owns them. Reading the startup base here would drop accepted
+    // edits from export, `active.toml` and promote, and hide them from the
+    // revert diff (which would then leave the runtime hub on reverted content).
+    if let Some(model) = &state.boot_model {
+        if let Some(desired) = crate::boot_model::load_desired(model.boot_path())
+            .map_err(crate::error::ControlError::Repository)?
+        {
+            let accepted = serde_json::to_value(&desired.config).map_err(|e| {
+                crate::error::ControlError::Repository(format!(
+                    "serializing the accepted configuration: {e}"
+                ))
+            })?;
+            for key in ["graphics", "weather", "iptv"] {
+                match accepted.get(key) {
+                    Some(section) => {
+                        doc.insert(key.to_owned(), section.clone());
+                    }
+                    None => {
+                        doc.remove(key);
+                    }
+                }
+            }
+        }
+    }
     let (audio, _) = state.audio_routing.snapshot();
     if let Some(routing) = audio {
         doc.insert(

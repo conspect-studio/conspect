@@ -9086,6 +9086,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Unknown item / invalid preset. */
             422: {
                 headers: {
@@ -9255,6 +9264,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body. */
             422: {
                 headers: {
@@ -9305,6 +9323,15 @@ export interface operations {
             };
             /** @description Still bound by an item. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A sent If-Match is stale. */
+            412: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9418,6 +9445,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body. */
             422: {
                 headers: {
@@ -9459,6 +9495,15 @@ export interface operations {
             };
             /** @description Unknown id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A sent If-Match is stale. */
+            412: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -14823,6 +14868,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description The body is not a valid location (detail names the field). */
             422: {
                 headers: {
@@ -14873,6 +14927,15 @@ export interface operations {
             };
             /** @description No location with that id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A sent If-Match is stale. */
+            412: {
                 headers: {
                     [name: string]: unknown;
                 };
