@@ -9902,8 +9902,12 @@ fn apply_output_audio_selections(
             RunnableOutput::File { id, sink, .. }
             | RunnableOutput::Hls { id, sink, .. }
             | RunnableOutput::Push { id, sink, .. } => (id.as_str(), sink),
-            #[allow(unreachable_patterns)]
-            _ => continue,
+            #[cfg(feature = "webrtc-native")]
+            RunnableOutput::WebRtc { .. } => continue,
+            #[cfg(feature = "ndi-bindings")]
+            RunnableOutput::Ndi { .. } => continue,
+            #[cfg(feature = "aes67")]
+            RunnableOutput::Aes67 { .. } => continue,
         };
         if let Some(output) = outputs.iter().find(|o| o.id() == id) {
             sink.set_audio_selection(output_audio_selection(output, tracks));
@@ -12672,7 +12676,7 @@ fn open_and_stream(
                             events.ingest(&packet.packet.bytes, mapping);
                         }
                         crate::source_event_packet::MetadataKind::Scte35 => {
-                            events.observe_scte_untimed(&packet.packet.bytes)
+                            events.observe_scte_untimed(&packet.packet.bytes);
                         }
                     }
                 }
@@ -16948,6 +16952,7 @@ segment_ms = 1000
     }
 
     /// Real local HLS `WebVTT` survives captions-on → off → on with a fresh store.
+    #[cfg(feature = "overlay")]
     #[test]
     #[allow(clippy::too_many_lines)]
     // reason: one offline test creates a real master, transitions source identity,

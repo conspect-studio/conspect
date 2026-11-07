@@ -303,6 +303,7 @@ async fn run_capturing(
         pipeline.audio_route_slot(),
         pipeline.overlay_apply_slot(),
         pipeline.tile_spec_apply_slot(),
+        pipeline.audio_free_sources_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
     );
@@ -372,7 +373,7 @@ async fn route_video_repoints_the_cell_in_the_running_pipeline() {
         cell: "cell_a".to_owned(),
         source: StreamRef::best("in_bright", StreamKind::Video),
     };
-    let cap = run_capturing(&mut pipeline, &config, command).await;
+    let cap = Box::pin(run_capturing(&mut pipeline, &config, command)).await;
 
     let before = centre_luma(&cap.before);
     let after = centre_luma(&cap.after);
@@ -401,7 +402,7 @@ async fn swap_source_back_compat_still_repoints_the_cell() {
         tile: "cell_a".to_owned(),
         source: "in_bright".to_owned(),
     };
-    let cap = run_capturing(&mut pipeline, &config, command).await;
+    let cap = Box::pin(run_capturing(&mut pipeline, &config, command)).await;
 
     assert!(
         centre_luma(&cap.before) < 80.0,
@@ -437,6 +438,7 @@ async fn run_command_to_hls(pipeline: &mut Pipeline, config: &MultiviewConfig, c
         pipeline.audio_route_slot(),
         pipeline.overlay_apply_slot(),
         pipeline.tile_spec_apply_slot(),
+        pipeline.audio_free_sources_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
     );
@@ -494,7 +496,7 @@ async fn route_subtitle_repoints_the_layer_in_the_running_pipeline() {
         layer: "in_dark".to_owned(),
         source: StreamRef::best("spare", StreamKind::Subtitle),
     };
-    run_command_to_hls(&mut pipeline, &config, command).await;
+    Box::pin(run_command_to_hls(&mut pipeline, &config, command)).await;
 
     // A clean baseline run (no caption store at all) — the empty-band reference.
     let (mut clean, clean_playlist) = build_pipeline(dir.path(), "sub_clean", "in_dark");
