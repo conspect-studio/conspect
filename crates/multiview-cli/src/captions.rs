@@ -366,6 +366,9 @@ impl SubtitleRouter {
 /// A resolved per-source caption reader plan: which rendition `m3u8` to demux and
 /// the store its decoded cues are published into.
 pub struct CaptionPlan {
+    /// Operator HLS `user_agent`/`referrer` of the owning source, sent on every
+    /// request the rendition demux makes. Values are never logged.
+    pub http_headers: multiview_ffmpeg::HttpHeaders,
     /// The source id this reader serves (the tile its cues burn into).
     pub id: String,
     /// The absolute rendition media-playlist URL to demux for `WebVTT` cues.
@@ -705,7 +708,30 @@ pub fn webvtt_language(
 /// must never fail the pipeline build of a live source).
 #[must_use]
 pub fn caption_plan_for(source: &multiview_config::Source) -> Option<CaptionPlan> {
-    caption_plan_for_with(source, &LibavFetcher)
+    let headers = source_http_headers(&source.kind);
+    if headers.is_empty() {
+        return caption_plan_for_with(source, &LibavFetcher);
+    }
+    tracing::debug!(source = %source.id, "caption master fetch carries operator request headers");
+    caption_plan_for_with(
+        source,
+        &crate::pipeline::HeaderPlaylistFetcher(crate::hls_fetch::RequestHeaders::new(
+            headers.user_agent(),
+            headers.referer(),
+        )),
+    )
+}
+
+/// The operator HLS request headers a source kind carries (empty otherwise).
+fn source_http_headers(kind: &multiview_config::SourceKind) -> multiview_ffmpeg::HttpHeaders {
+    match kind {
+        multiview_config::SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } => multiview_ffmpeg::HttpHeaders::new(user_agent.as_deref(), referrer.as_deref()),
+        _ => multiview_ffmpeg::HttpHeaders::default(),
+    }
 }
 
 /// [`caption_plan_for`] with an injectable [`PlaylistFetcher`] — the
@@ -718,7 +744,9 @@ pub fn caption_plan_for_with(
     let selector = source.captions.as_ref()?;
     let language = webvtt_language(&source.kind, selector)?;
     let master_url = hls_url(&source.kind)?;
-    resolve_caption_plan(&source.id, master_url, language.as_deref(), fetcher)
+    let mut plan = resolve_caption_plan(&source.id, master_url, language.as_deref(), fetcher)?;
+    plan.http_headers = source_http_headers(&source.kind);
+    Some(plan)
 }
 
 /// Resolve EVERY source's HLS `WebVTT` caption plan **concurrently**, off the
@@ -731,13 +759,14 @@ pub fn caption_plan_for_with(
 /// yields no plan and never fails the build (invariants #1/#10).
 #[must_use]
 pub fn resolve_caption_plans(sources: &[multiview_config::Source]) -> Vec<CaptionPlan> {
-    resolve_caption_plans_with(sources, &LibavFetcher)
+    par_filter_map(sources, caption_plan_for)
 }
 
 /// [`resolve_caption_plans`] with an injectable, thread-shareable fetcher — the
 /// concurrent fetch seam, exercised offline in tests with canned bytes (no
 /// network, no FFI).
 #[must_use]
+#[cfg(test)]
 fn resolve_caption_plans_with(
     sources: &[multiview_config::Source],
     fetcher: &(dyn PlaylistFetcher + Sync),
@@ -827,6 +856,7 @@ fn resolve_caption_plan(
         "native HLS WebVTT caption rendition resolved"
     );
     Some(CaptionPlan {
+        http_headers: multiview_ffmpeg::HttpHeaders::default(),
         id: id.to_owned(),
         rendition_url,
         store: Arc::new(CueStore::new()),
@@ -1045,6 +1075,12 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
     // promptly rather than after a multi-second whole-playlist read-ahead.
     let mut opts = ffmpeg::Dictionary::new();
     opts.set("extension_picky", "0");
+    for (key, value) in plan.http_headers.open_options() {
+        opts.set(key, &value);
+    }
+    if !plan.http_headers.is_empty() {
+        tracing::debug!(source = %plan.id, "caption rendition demux carries operator request headers");
+    }
     opts.set("allowed_extensions", "ALL");
     opts.set("probesize", "131072");
     opts.set("analyzeduration", "0");
@@ -1864,6 +1900,7 @@ input_id = "cam_b"
             },
         ))));
         let plan = CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
             id: "huge-batch".to_owned(),
             rendition_url: String::new(),
             store: Arc::clone(&store),
@@ -1959,6 +1996,7 @@ input_id = "cam_b"
         )
         .unwrap();
         let plan = CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
             id: "seek".to_owned(),
             rendition_url: String::new(),
             store: Arc::clone(&store),
@@ -1994,6 +2032,7 @@ input_id = "cam_b"
             },
         ))));
         let plan = CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
             id: "buffered".to_owned(),
             rendition_url: String::new(),
             store: Arc::clone(&store),
@@ -2237,5 +2276,71 @@ input_id = "cam_b"
             Some(&vec!["charlie".to_owned()]),
             "the newest re-point (cam_c) must be the one in effect after the storm"
         );
+    }
+
+    /// A one-shot `[::1]` HTTP server that records the request head it receives
+    /// and answers `body` as a playlist.
+    fn serve_once(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0_u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://{addr}/master.m3u8"), rx)
+    }
+
+    #[test]
+    fn caption_master_fetch_and_plan_carry_the_operator_headers() {
+        let (url, rx) = serve_once(MASTER_WITH_SUBS);
+        let source = hls_source_for_test(&url, Some("Opera/Test 9"), Some("https://ref.example/"));
+        let plan = caption_plan_for(&source).expect("caption plan");
+        let head = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request seen")
+            .to_ascii_lowercase();
+        assert!(head.contains("user-agent: opera/test 9"), "{head}");
+        assert!(head.contains("referer: https://ref.example/"), "{head}");
+        assert_eq!(plan.http_headers.user_agent(), Some("Opera/Test 9"));
+        assert_eq!(plan.http_headers.referer(), Some("https://ref.example/"));
+    }
+
+    #[test]
+    fn caption_plan_without_headers_has_an_empty_header_set() {
+        let source = hls_source_for_test("https://x.test/m.m3u8", None, None);
+        let plan = caption_plan_for_with(&source, &CannedFetcher(Ok(MASTER_WITH_SUBS.to_owned())))
+            .expect("plan");
+        assert!(plan.http_headers.is_empty());
+    }
+
+    fn hls_source_for_test(
+        url: &str,
+        ua: Option<&str>,
+        referrer: Option<&str>,
+    ) -> multiview_config::Source {
+        let mut source: multiview_config::Source = serde_json::from_value(serde_json::json!({
+            "id": "h", "kind": "hls", "url": url, "captions": {"mode": "auto"},
+        }))
+        .expect("source");
+        if let multiview_config::SourceKind::Hls {
+            user_agent,
+            referrer: r,
+            ..
+        } = &mut source.kind
+        {
+            *user_agent = ua.map(str::to_owned);
+            *r = referrer.map(str::to_owned);
+        }
+        source
     }
 }

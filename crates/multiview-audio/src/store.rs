@@ -1017,11 +1017,36 @@ pub fn audio_decode_loop(
     store: &AudioStore,
     stop: &std::sync::atomic::AtomicBool,
 ) {
+    audio_decode_loop_with_headers(
+        path,
+        layout,
+        store,
+        stop,
+        &multiview_ffmpeg::HttpHeaders::default(),
+    );
+}
+
+/// [`audio_decode_loop`] for a live network source opened with operator HTTP
+/// `headers` (same bounded-stall open as the anchored loop). Control/IO plane
+/// thread only.
+#[cfg(feature = "ffmpeg")]
+pub fn audio_decode_loop_with_headers(
+    path: impl AsRef<std::path::Path>,
+    layout: crate::format::ChannelLayout,
+    store: &AudioStore,
+    stop: &std::sync::atomic::AtomicBool,
+    headers: &multiview_ffmpeg::HttpHeaders,
+) {
     // Honour an already-raised stop before doing any (potentially blocking) open.
     if stop.load(Ordering::Acquire) {
         return;
     }
-    let mut decoder = match crate::decode::AudioFileDecoder::open(path.as_ref(), layout) {
+    let opened = if headers.is_empty() {
+        crate::decode::AudioFileDecoder::open(path.as_ref(), layout)
+    } else {
+        crate::decode::AudioFileDecoder::open_live_with_headers(path.as_ref(), layout, headers)
+    };
+    let mut decoder = match opened {
         Ok(decoder) => decoder,
         Err(error) => {
             tracing::warn!(%error, "audio decode loop: open failed; source rides silence");
@@ -1110,11 +1135,16 @@ pub fn audio_decode_loop_anchored(
     anchor: &(dyn Fn() -> Option<PtsAnchor> + Sync),
     log: Option<std::sync::Arc<crate::sync_log::SyncLog>>,
     source: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
 ) {
     if stop.load(Ordering::Acquire) {
         return;
     }
-    let mut decoder = match crate::decode::AudioFileDecoder::open_live(path.as_ref(), layout) {
+    let mut decoder = match crate::decode::AudioFileDecoder::open_live_with_headers(
+        path.as_ref(),
+        layout,
+        headers,
+    ) {
         Ok(decoder) => decoder,
         Err(error) => {
             tracing::warn!(%error, "audio decode loop: open failed; source rides silence");

@@ -191,7 +191,7 @@ fn should_interrupt(now_ns: u64, deadline_ns: u64) -> bool {
 /// TCP/RTSP/SRT/UDP read aborts within `rw_timeout` (via both the libav
 /// `rw_timeout` option **and** the injected `AVIOInterruptCB`) instead of
 /// blocking forever, letting recovery tear the wedged demuxer down.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DemuxOptions {
     /// The read/write timeout. `None` opens with no timeout (like
@@ -200,6 +200,64 @@ pub struct DemuxOptions {
     rw_timeout: Option<Duration>,
     /// Extra libav open options, `(key, value)`, applied after `rw_timeout`.
     extra: &'static [(&'static str, &'static str)],
+    /// Operator HTTP request headers (`user_agent` / `referer` open options).
+    headers: HttpHeaders,
+}
+
+/// Operator-set HTTP request headers for an HLS input (libav `user_agent` /
+/// `referer` open options). Not secrets, but never logged by value. Values
+/// holding any control character (header injection) are dropped on
+/// construction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpHeaders {
+    user_agent: Option<String>,
+    referer: Option<String>,
+}
+
+impl HttpHeaders {
+    /// Build from optional values, dropping empty or control-character values.
+    #[must_use]
+    pub fn new(user_agent: Option<&str>, referer: Option<&str>) -> Self {
+        let clean = |v: Option<&str>| {
+            v.filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        Self {
+            user_agent: clean(user_agent),
+            referer: clean(referer),
+        }
+    }
+
+    /// Whether no header is set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.user_agent.is_none() && self.referer.is_none()
+    }
+
+    /// The `User-Agent` value, if set.
+    #[must_use]
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
+    /// The `Referer` value, if set.
+    #[must_use]
+    pub fn referer(&self) -> Option<&str> {
+        self.referer.as_deref()
+    }
+
+    /// The libav open options these headers become, in a fixed order.
+    #[must_use]
+    pub fn open_options(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some(ua) = &self.user_agent {
+            out.push(("user_agent", ua.clone()));
+        }
+        if let Some(r) = &self.referer {
+            out.push(("referer", r.clone()));
+        }
+        out
+    }
 }
 
 impl DemuxOptions {
@@ -223,6 +281,20 @@ impl DemuxOptions {
     pub const fn with_options(mut self, extra: &'static [(&'static str, &'static str)]) -> Self {
         self.extra = extra;
         self
+    }
+
+    /// Send these HTTP request headers on every request libav makes for this
+    /// input (playlist, segments, redirects).
+    #[must_use]
+    pub fn with_http_headers(mut self, headers: HttpHeaders) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// The configured HTTP request headers.
+    #[must_use]
+    pub const fn http_headers(&self) -> &HttpHeaders {
+        &self.headers
     }
 
     /// The configured read/write timeout, if any.
@@ -319,8 +391,13 @@ impl Demuxer {
             deadline.arm(timeout);
         }
 
-        let input =
-            open_input_with_interrupt(path, deadline.as_ref(), rw_timeout, options.extra())?;
+        let input = open_input_with_interrupt(
+            path,
+            deadline.as_ref(),
+            rw_timeout,
+            options.extra(),
+            &options.headers.open_options(),
+        )?;
         deadline.disarm();
 
         let registration = register_format_context(&input);
@@ -825,6 +902,7 @@ mod ffi_open {
         deadline: &ReadDeadline,
         rw_timeout: Option<Duration>,
         extra: &[(&'static str, &'static str)],
+        headers: &[(&'static str, String)],
     ) -> Result<ffmpeg::format::context::Input> {
         let source = path.display().to_string();
         let curl = CString::new(source.as_str())
@@ -865,8 +943,12 @@ mod ffi_open {
             }
         }
 
-        for (key, value) in extra {
-            if set_option(&mut opts, key, value).is_err() {
+        let extra_all = extra
+            .iter()
+            .map(|(k, v)| (*k, (*v).to_owned()))
+            .chain(headers.iter().map(|(k, v)| (*k, v.clone())));
+        for (key, value) in extra_all {
+            if set_option(&mut opts, key, &value).is_err() {
                 // SAFETY: as above, both are still owned here.
                 unsafe {
                     ffi::av_dict_free(&raw mut opts);

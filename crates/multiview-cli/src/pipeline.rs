@@ -10619,6 +10619,7 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         live,
         lifecycle: 0,
         anchor_floor: 0,
+        http_headers: http_headers_for(&source.kind).to_ffmpeg(),
     })
 }
 
@@ -10914,6 +10915,11 @@ impl HttpHeaders {
     /// variant-pin master fetch); control characters are dropped there.
     fn request_headers(&self) -> crate::hls_fetch::RequestHeaders {
         crate::hls_fetch::RequestHeaders::new(self.user_agent.as_deref(), self.referer.as_deref())
+    }
+
+    /// The same headers as the libav-level value the audio rail opens with.
+    fn to_ffmpeg(&self) -> multiview_ffmpeg::HttpHeaders {
+        multiview_ffmpeg::HttpHeaders::new(self.user_agent.as_deref(), self.referer.as_deref())
     }
 
     /// Set the headers as libav open options on `opts`.
@@ -11230,11 +11236,27 @@ pub(crate) fn resolve_hls_variant_url(
 /// outran real time and starved the audio (~40-60 % audible). A pinned media
 /// playlist also carries no `WebVTT` rendition (ADR-T011). Best-effort: `None`
 /// opens the original URL.
-pub(crate) fn resolve_hls_audio_url(master_url: &str) -> Option<String> {
-    resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher)
+///
+/// The master fetch carries the source's operator `User-Agent`/`Referer`
+/// (a source with none uses the libav fetcher).
+pub(crate) fn resolve_hls_audio_url_with_headers(
+    master_url: &str,
+    headers: &multiview_ffmpeg::HttpHeaders,
+) -> Option<String> {
+    if headers.is_empty() {
+        return resolve_hls_audio_url_with(master_url, &crate::captions::LibavFetcher);
+    }
+    tracing::debug!("audio pin: master fetch carries operator request headers");
+    resolve_hls_audio_url_with(
+        master_url,
+        &HeaderPlaylistFetcher(crate::hls_fetch::RequestHeaders::new(
+            headers.user_agent(),
+            headers.referer(),
+        )),
+    )
 }
 
-/// [`resolve_hls_audio_url`] with an injectable fetcher (offline tests).
+/// [`resolve_hls_audio_url_with_headers`] with an injectable fetcher (offline tests).
 fn resolve_hls_audio_url_with(
     master_url: &str,
     fetcher: &dyn crate::captions::PlaylistFetcher,
@@ -11329,7 +11351,7 @@ fn main_demuxer_open_url(
 
 /// Master-playlist fetcher for the variant pin that carries the source's
 /// operator `User-Agent`/`Referer` (control/IO plane, bounded, best-effort).
-struct HeaderPlaylistFetcher(crate::hls_fetch::RequestHeaders);
+pub(crate) struct HeaderPlaylistFetcher(pub(crate) crate::hls_fetch::RequestHeaders);
 
 impl crate::captions::PlaylistFetcher for HeaderPlaylistFetcher {
     fn fetch(&self, url: &str) -> Result<crate::captions::FetchedPlaylist, String> {
@@ -17272,6 +17294,7 @@ input_id = "net1"
     #[test]
     fn caption_reader_registers_a_prefixed_stop_flag() {
         let plan = crate::captions::CaptionPlan {
+            http_headers: multiview_ffmpeg::HttpHeaders::default(),
             id: "net1".to_owned(),
             rendition_url: "http://[::1]:1/never/subs.m3u8".to_owned(),
             store: Arc::new(crate::captions::CueStore::new()),
@@ -20073,7 +20096,79 @@ mod packet_reader_tests {
 
 #[cfg(test)]
 mod http_headers_tests {
-    use super::{ffmpeg, http_headers_for, SourceKind};
+    use super::{
+        audio_ingest_plan_for, ffmpeg, http_headers_for, resolve_hls_audio_url_with_headers,
+        SourceKind,
+    };
+    use multiview_config::Source;
+
+    #[test]
+    fn audio_plan_carries_hls_headers_and_other_kinds_carry_none() {
+        let mut hls: Source = serde_json::from_value(serde_json::json!({
+            "id": "a", "kind": "hls", "url": "https://o.test/m.m3u8",
+            "user_agent": "UA/1", "referrer": "https://r.test/",
+        }))
+        .expect("hls");
+        let plan = audio_ingest_plan_for(&hls).expect("hls audio plan");
+        assert_eq!(plan.http_headers.user_agent(), Some("UA/1"));
+        assert_eq!(plan.http_headers.referer(), Some("https://r.test/"));
+        let opts = plan.http_headers.open_options();
+        assert_eq!(opts[0], ("user_agent", "UA/1".to_owned()));
+        assert_eq!(opts[1], ("referer", "https://r.test/".to_owned()));
+        let ts: Source = serde_json::from_value(serde_json::json!({
+            "id": "t", "kind": "ts", "url": "udp://[::1]:1234",
+        }))
+        .expect("ts");
+        assert!(audio_ingest_plan_for(&ts)
+            .expect("ts plan")
+            .http_headers
+            .is_empty());
+        if let SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } = &mut hls.kind
+        {
+            *user_agent = Some("bad\r\nX: 1".to_owned());
+            *referrer = None;
+        }
+        assert!(audio_ingest_plan_for(&hls)
+            .expect("plan")
+            .http_headers
+            .is_empty());
+    }
+
+    #[test]
+    fn audio_master_pin_fetch_sends_the_operator_headers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("[::1]:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0_u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1.4d401f,mp4a.40.2\"\nv/a.m3u8\n";
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let headers =
+            multiview_ffmpeg::HttpHeaders::new(Some("Opera/Test 9"), Some("https://ref.example/"));
+        let url = format!("http://{addr}/master.m3u8");
+        let pinned = resolve_hls_audio_url_with_headers(&url, &headers);
+        let head = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request seen")
+            .to_ascii_lowercase();
+        assert!(head.contains("user-agent: opera/test 9"), "{head}");
+        assert!(head.contains("referer: https://ref.example/"), "{head}");
+        assert!(pinned.is_some_and(|u| u.ends_with("/v/a.m3u8")));
+    }
 
     #[test]
     fn hls_headers_become_libav_user_agent_and_referer_options() {
