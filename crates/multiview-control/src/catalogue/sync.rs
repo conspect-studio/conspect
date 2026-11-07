@@ -108,6 +108,7 @@ pub fn assemble(
                 FileMeta {
                     etag,
                     rows: u64::try_from(raw.len_of(name)).unwrap_or(0),
+                    digest: Some(super::store::digest_of(bytes)),
                 },
             );
         } else if store.has_file(name) {
@@ -121,11 +122,19 @@ pub fn assemble(
     if raw.streams.is_empty() {
         return Err("streams file has no rows; refusing to publish an empty catalogue".to_owned());
     }
+    // Stage every changed file first (dropping `staged` on error removes the temp
+    // files and leaves the previous generation untouched), then rename them all.
+    let mut staged = Vec::with_capacity(changed.len());
     for (name, (bytes, _)) in changed {
-        store
-            .write_file(name, bytes)
-            .map_err(|e| format!("persist {name}: {e}"))?;
+        staged.push(
+            store
+                .stage_file(name, bytes)
+                .map_err(|e| format!("persist {name}: {e}"))?,
+        );
     }
+    store
+        .commit_staged(staged)
+        .map_err(|e| format!("persist files: {e}"))?;
     let synced_at = now_rfc3339();
     let manifest = Manifest {
         schema: SCHEMA_VERSION,
@@ -169,12 +178,14 @@ pub async fn fetch_changed(
     let mut changed = BTreeMap::new();
     for (name, required) in FILES {
         // Only offer an ETag for a file we really hold, so a 304 can never leave a hole.
+        // ...and only when the on-disk bytes still match the digest recorded with
+        // that ETag, so a torn or mixed generation is refetched, never 304'd.
         let etag = if store.has_file(name) {
-            prior
-                .files
-                .get(*name)
-                .and_then(|m| m.etag.as_deref())
-                .filter(|e| !e.starts_with("import:"))
+            prior.files.get(*name).and_then(|m| {
+                let digest = m.digest.as_deref()?;
+                let etag = m.etag.as_deref().filter(|e| !e.starts_with("import:"))?;
+                (store.file_digest(name).as_deref() == Some(digest)).then_some(etag)
+            })
         } else {
             None
         };
@@ -192,4 +203,102 @@ pub async fn fetch_changed(
         }
     }
     Ok(changed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/tests/fixtures/iptv-org/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    fn generation(suffix: &str, tag: &str) -> BTreeMap<String, (Vec<u8>, Option<String>)> {
+        ["streams", "channels", "feeds"]
+            .iter()
+            .map(|n| {
+                let mut b = fixture(n);
+                b.extend_from_slice(suffix.as_bytes());
+                ((*n).to_owned(), (b, Some(tag.to_owned())))
+            })
+            .collect()
+    }
+
+    fn snapshot_of_dir(store: &Store) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(store.dir())
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                (
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&p).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mid_write_failure_leaves_the_previous_generation_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let g = Gazetteer::default();
+        assemble(&store, &g, &generation("\n", "\"v1\""), "o").unwrap();
+        let before = snapshot_of_dir(&store);
+
+        store.fail_stage_at(1);
+        let err = assemble(&store, &g, &generation("\n\n", "\"v2\""), "o").err();
+        assert!(err.is_some_and(|e| e.contains("injected")), "must fail");
+
+        assert_eq!(
+            snapshot_of_dir(&store),
+            before,
+            "files, manifest and temp files are exactly the previous generation"
+        );
+    }
+
+    struct Recorder(Mutex<Vec<(String, Option<String>)>>);
+    impl Fetcher for Recorder {
+        fn fetch<'a>(
+            &'a self,
+            name: &'a str,
+            etag: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<FetchOutcome, String>> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), etag.map(str::to_owned)));
+            Box::pin(async { Ok(FetchOutcome::NotModified) })
+        }
+    }
+
+    #[tokio::test]
+    async fn if_none_match_is_only_sent_when_the_disk_digest_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        assemble(
+            &store,
+            &Gazetteer::default(),
+            &generation("\n", "\"v1\""),
+            "o",
+        )
+        .unwrap();
+        // New bytes landed on disk but the manifest still describes the old ones.
+        store.write_file("channels", b"[]").unwrap();
+        let rec = Recorder(Mutex::new(Vec::new()));
+        fetch_changed(&rec, &store).await.unwrap();
+        let calls = rec.0.lock().unwrap().clone();
+        let etag = |n: &str| calls.iter().find(|c| c.0 == n).unwrap().1.clone();
+        assert_eq!(etag("streams").as_deref(), Some("\"v1\""));
+        assert_eq!(etag("feeds").as_deref(), Some("\"v1\""));
+        assert_eq!(
+            etag("channels"),
+            None,
+            "digest mismatch => unconditional GET"
+        );
+    }
 }

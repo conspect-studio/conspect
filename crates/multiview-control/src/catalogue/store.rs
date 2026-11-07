@@ -72,6 +72,11 @@ pub struct FileMeta {
     /// Rows parsed.
     #[serde(default)]
     pub rows: u64,
+    /// SHA-256 (hex) of the persisted JSON bytes. A conditional GET is only sent
+    /// when the on-disk file still hashes to this, so a torn write never hides
+    /// behind a stale `ETag`.
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// `manifest.json`.
@@ -95,13 +100,109 @@ pub struct Manifest {
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
+    /// Test seam: `(stage calls so far, fail at this call index or MAX)`.
+    #[cfg(test)]
+    stage_fault: std::sync::Arc<(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    )>,
+}
+
+/// A fully written and fsynced temp file awaiting its atomic rename. Dropping it
+/// removes the temp file.
+pub struct StagedFile {
+    name: String,
+    tmp: tempfile::NamedTempFile,
+}
+
+/// Hex SHA-256 of `bytes` (the per-file content digest).
+#[must_use]
+pub fn digest_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex_prefix(&Sha256::digest(bytes), 32)
 }
 
 impl Store {
     /// A store rooted at `dir` (created on first write).
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            #[cfg(test)]
+            stage_fault: std::sync::Arc::new((
+                std::sync::atomic::AtomicUsize::new(0),
+                std::sync::atomic::AtomicUsize::new(usize::MAX),
+            )),
+        }
+    }
+
+    /// Test seam: make the `n`th (0-based) subsequent [`Self::stage_file`] fail.
+    #[cfg(test)]
+    pub(crate) fn fail_stage_at(&self, n: usize) {
+        use std::sync::atomic::Ordering;
+        self.stage_fault.0.store(0, Ordering::SeqCst);
+        self.stage_fault.1.store(n, Ordering::SeqCst);
+    }
+
+    /// Digest of the persisted JSON for `name`, or `None` when absent/unreadable.
+    #[must_use]
+    pub fn file_digest(&self, name: &str) -> Option<String> {
+        self.read_file(name).ok().map(|b| digest_of(&b))
+    }
+
+    /// Write `json` (gzip) to a fsynced temp file without publishing it.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors.
+    pub fn stage_file(&self, name: &str, json: &[u8]) -> std::io::Result<StagedFile> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let call = self.stage_fault.0.fetch_add(1, Ordering::SeqCst);
+            if call == self.stage_fault.1.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected stage failure"));
+            }
+        }
+        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(json)?;
+        let gz = enc.finish()?;
+        std::fs::create_dir_all(&self.dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+        tmp.write_all(&gz)?;
+        tmp.as_file().sync_all()?;
+        Ok(StagedFile {
+            name: name.to_owned(),
+            tmp,
+        })
+    }
+
+    /// Rename every staged file into place. If a rename fails, files already
+    /// renamed are restored to their previous bytes (or removed if new).
+    ///
+    /// # Errors
+    ///
+    /// The first rename error (after the rollback attempt).
+    pub fn commit_staged(&self, staged: Vec<StagedFile>) -> std::io::Result<()> {
+        let mut done: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+        for f in staged {
+            let path = self.file_path(&f.name);
+            let previous = std::fs::read(&path).ok();
+            if let Err(e) = f.tmp.persist(&path) {
+                for (p, prev) in done.into_iter().rev() {
+                    let _ = match prev {
+                        Some(bytes) => self.atomic_write(&p, &bytes),
+                        None => std::fs::remove_file(&p),
+                    };
+                }
+                return Err(e.error);
+            }
+            done.push((path, previous));
+        }
+        if let Ok(d) = std::fs::File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
 
     /// The directory.
@@ -256,6 +357,7 @@ mod tests {
             FileMeta {
                 etag: Some("\"x\"".into()),
                 rows: 1,
+                digest: None,
             },
         );
         store.write_manifest(&m).unwrap();
