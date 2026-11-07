@@ -753,7 +753,7 @@ function GroupRow({
         }}
       />
       {first?.logo != null ? (
-        <CatalogueLogo logoKey={first.logo} className="size-8 shrink-0 object-contain" />
+        <CatalogueLogo logoKey={first.logo} name={name} className="size-8 shrink-0 object-contain" />
       ) : null}
       <div className="min-w-0 flex-1 space-y-1">
         <p className="flex flex-wrap items-center gap-2">

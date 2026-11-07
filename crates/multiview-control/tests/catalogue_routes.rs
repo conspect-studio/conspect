@@ -895,3 +895,143 @@ async fn probe_jobs_are_visible_only_to_their_owner_or_admin_and_while_sources_s
     assert!(d.status().is_success(), "{}", d.status());
     assert_eq!(status(SCOPED_TOKEN).await.status(), StatusCode::NOT_FOUND);
 }
+
+#[cfg(feature = "catalogue")]
+mod logo_route {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request};
+    use multiview_config::device::net_guard::DialPolicy;
+    use multiview_control::catalogue::logos::{self, LogoCache};
+    use multiview_control::iptv::fetch as ifetch;
+
+    struct LogoUpstream {
+        reply: Mutex<Result<(Vec<u8>, &'static str), &'static str>>,
+        calls: Mutex<usize>,
+    }
+
+    impl ifetch::Fetcher for LogoUpstream {
+        fn fetch(&self, _: ifetch::FetchRequest, _: Arc<DialPolicy>) -> ifetch::FetchFuture<'_> {
+            use std::io::{Seek, Write};
+            *self.calls.lock().unwrap() += 1;
+            let reply = self.reply.lock().unwrap().clone();
+            Box::pin(async move {
+                let (b, ct) = reply?;
+                let mut file = tempfile::tempfile().unwrap();
+                file.write_all(&b).unwrap();
+                file.rewind().unwrap();
+                Ok(ifetch::FetchOutcome::Body {
+                    file,
+                    len: b.len() as u64,
+                    etag: None,
+                    last_modified: None,
+                    content_type: Some(ct.to_owned()),
+                })
+            })
+        }
+    }
+
+    async fn rig(
+        reply: Result<(Vec<u8>, &'static str), &'static str>,
+    ) -> (
+        tempfile::TempDir,
+        support::Harness,
+        String,
+        Arc<LogoUpstream>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = catalogue_in(dir.path(), FixtureFetcher::new());
+        let h = harness_for(&cat);
+        let ok = send(
+            &h.router,
+            post_json("/api/v1/catalogues/iptv-org/import", ADMIN_TOKEN, &bundle()),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let idx = body_json(
+            send(
+                &h.router,
+                get("/api/v1/catalogues/iptv-org/index", VIEWER_TOKEN),
+            )
+            .await,
+        )
+        .await;
+        let key = idx["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|r| r["logo"].as_str())
+            .unwrap()
+            .to_owned();
+        let up = Arc::new(LogoUpstream {
+            reply: Mutex::new(reply),
+            calls: Mutex::new(0),
+        });
+        logos::register(
+            &cat.logo_dir(),
+            LogoCache::new(
+                cat.logo_dir(),
+                up.clone(),
+                Arc::new(DialPolicy::allow_lan()),
+            ),
+        );
+        (dir, h, key, up)
+    }
+
+    fn logo_path(k: &str) -> String {
+        format!("/api/v1/catalogues/iptv-org/logos/{k}")
+    }
+
+    #[tokio::test]
+    async fn logo_200_has_long_cache_headers_and_304_on_matching_etag() {
+        let (_d, h, key, up) = rig(Ok((b"PNGDATA".to_vec(), "image/png"))).await;
+        let r = send(&h.router, get(&logo_path(&key), VIEWER_TOKEN)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let hd = r.headers().clone();
+        assert_eq!(hd["cache-control"], "private, max-age=2592000, immutable");
+        assert_eq!(hd["content-type"], "image/png");
+        assert_eq!(hd["x-content-type-options"], "nosniff");
+        assert!(hd["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("sandbox"));
+        let etag = hd["etag"].to_str().unwrap().to_owned();
+        assert!(etag.starts_with('"') && !etag.starts_with("W/"));
+        assert_eq!(body_bytes(r).await, b"PNGDATA");
+
+        let req = Request::builder()
+            .uri(logo_path(&key))
+            .header(header::AUTHORIZATION, format!("Bearer {VIEWER_TOKEN}"))
+            .header(header::IF_NONE_MATCH, &etag)
+            .body(Body::empty())
+            .unwrap();
+        let r = send(&h.router, req).await;
+        assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(r.headers()["etag"], etag.as_str());
+        assert_eq!(*up.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn known_missing_logos_answer_204_with_a_day_of_cache() {
+        // Upstream 404 → negative cached → 204, not refetched.
+        let (_d, h, key, up) = rig(Err("https://x/y.png: HTTP 404 Not Found")).await;
+        for _ in 0..2 {
+            let r = send(&h.router, get(&logo_path(&key), VIEWER_TOKEN)).await;
+            assert_eq!(r.status(), StatusCode::NO_CONTENT);
+            assert_eq!(r.headers()["cache-control"], "private, max-age=86400");
+        }
+        assert_eq!(*up.calls.lock().unwrap(), 1);
+        // Unknown key → 204, never 404.
+        let r = send(&h.router, get(&logo_path("l:nope"), VIEWER_TOKEN)).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert_eq!(r.headers()["cache-control"], "private, max-age=86400");
+        // Wrong type → 204.
+        let (_d, h, key, _) = rig(Ok((b"<html>".to_vec(), "text/html"))).await;
+        let r = send(&h.router, get(&logo_path(&key), VIEWER_TOKEN)).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        // Oversized → 204.
+        let (_d, h, key, _) = rig(Ok((vec![0; 512 * 1024 + 1], "image/png"))).await;
+        let r = send(&h.router, get(&logo_path(&key), VIEWER_TOKEN)).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    }
+}

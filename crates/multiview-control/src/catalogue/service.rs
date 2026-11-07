@@ -193,6 +193,12 @@ impl Catalogue {
         Some((s.places.clone(), s.etag.clone()))
     }
 
+    /// The persistent logo cache directory (`<store dir>/logos`).
+    #[must_use]
+    pub fn logo_dir(&self) -> PathBuf {
+        self.store.dir().join("logos")
+    }
+
     /// Resolve a logo key to its upstream URL.
     #[must_use]
     pub fn logo_url(&self, key: &str) -> Option<String> {
