@@ -726,6 +726,8 @@ pub struct AppState {
     /// until wired by the binary. Administer-only; never a general evidence
     /// submission surface.
     pub source_event_test_injector: Option<crate::source_events::SharedSourceEventTestInjector>,
+    /// ADR-0183 ad-break automation executor (management plane), if running.
+    pub automation: Option<Arc<crate::automation::AutomationExecutor>>,
     /// The WHEP focus transport seam (sub-second WebRTC focus per scope). The
     /// default ([`NoWhep`](crate::preview::NoWhep)) refuses every focus with an
     /// honest `503 fallback`; the binary swaps in a transport-backed provider
@@ -992,6 +994,7 @@ impl AppState {
             preview: crate::preview::no_preview(),
             source_events: None,
             source_event_test_injector: None,
+            automation: None,
             whep: crate::preview::no_whep(),
             whip: crate::whip::no_whip(),
             whep_output: crate::whep_output::no_whep_output(),
@@ -1242,6 +1245,13 @@ impl AppState {
         provider: crate::source_events::SharedSourceEvents,
     ) -> Self {
         self.source_events = Some(provider);
+        self
+    }
+
+    /// Attach the ADR-0183 ad-break automation executor.
+    #[must_use]
+    pub fn with_automation(mut self, executor: Arc<crate::automation::AutomationExecutor>) -> Self {
+        self.automation = Some(executor);
         self
     }
 

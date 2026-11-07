@@ -936,6 +936,7 @@ pub(crate) async fn cmd_apply_layout(
         document: Some(Box::new(resolved)),
     };
     let corr_key = crate::realtime::CorrKey::for_command(&command);
+    state.commands.observe(&command);
     permit.send(command);
     if let Some(key) = corr_key {
         state.corr.record(key, op.clone());
@@ -1073,6 +1074,22 @@ fn resource_router() -> Router<AppState> {
         .route(
             "/inputs/{id}/events/test",
             post(source_events::post_source_event_test),
+        )
+        .route(
+            "/inputs/{id}/events/automation",
+            get(source_events::get_automation).put(source_events::put_automation),
+        )
+        .route(
+            "/inputs/{id}/events/automation/arm",
+            post(source_events::post_automation_arm),
+        )
+        .route(
+            "/inputs/{id}/events/automation/disarm",
+            post(source_events::post_automation_disarm),
+        )
+        .route(
+            "/inputs/{id}/events/automation/restore",
+            post(source_events::post_automation_restore),
         )
         // Outputs resource CRUD (managed sinks/servers), mirroring layouts.
         .route("/outputs", get(outputs::list_outputs))

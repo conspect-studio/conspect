@@ -69,6 +69,8 @@ struct Generation {
     active: AtomicBool,
     overflow: AtomicU64,
     degraded: AtomicBool,
+    /// Operator test-occurrence sequence for this generation.
+    test_sequence: AtomicU64,
     snapshot: SwapCell<Arc<SourceEventSnapshot>>,
 }
 /// Process-unique opaque service identity (S2): a read from one service can
@@ -221,7 +223,15 @@ impl SourceEventRegistry {
             return None;
         }
         let epoch = generation.epoch;
-        let observation = boundary.into_observation(source.to_owned(), epoch);
+        let sequence = match boundary {
+            crate::source_event_test_inject::TestBoundary::Start { .. } => {
+                generation.test_sequence.fetch_add(1, Ordering::AcqRel) + 1
+            }
+            crate::source_event_test_inject::TestBoundary::End => {
+                generation.test_sequence.load(Ordering::Acquire).max(1)
+            }
+        };
+        let observation = boundary.into_numbered_observation(source.to_owned(), epoch, sequence);
         if observation.key.event_id.is_empty()
             || observation.key.event_id.len() > self.0.max_string_bytes
         {
@@ -480,6 +490,7 @@ impl RegistrationController {
             active: AtomicBool::new(true),
             overflow: AtomicU64::new(0),
             degraded: AtomicBool::new(false),
+            test_sequence: AtomicU64::new(0),
             snapshot: SwapCell::new(Arc::new(SourceEventSnapshot {
                 source_id: source.into(),
                 epoch,

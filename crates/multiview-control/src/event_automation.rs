@@ -375,6 +375,11 @@ impl SafetyModel {
             next_id: 1,
         })
     }
+    /// Current presentation epoch.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
     /// Trusted control-plane posture change. Disarm never silently restores.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;

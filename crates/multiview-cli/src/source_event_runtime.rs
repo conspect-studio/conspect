@@ -4,7 +4,7 @@ use crate::source_event_service::{
     ServiceLimits, SourceEventProducer, SourceEventRegistry, SourceEventService,
 };
 use multiview_control::source_events::{
-    SourceEventAvailability, SourceEventDto, SourceEventLabel, SourceEventLifecycle,
+    ActiveBreak, BreakStatus, SourceBreakProvider, SourceEventAvailability, SourceEventDto, SourceEventLabel, SourceEventLifecycle,
     SourceEventOrigin, SourceEventProvider, SourceEventTestInjector, SourceEventTimer,
     SourceEventTimerKind, SourceEventsDto, TestEventBoundary, TestEventOutcome,
 };
@@ -252,6 +252,64 @@ impl SourceEventProvider for RuntimeReader {
             read.as_ref().is_some_and(|read| read.degraded),
             rows,
         ))
+    }
+}
+impl SourceBreakProvider for RuntimeReader {
+    /// Fresh acquisition every call (S1). Only explicit, non-vendor evidence
+    /// counts: a timed start must be presented on the latched frame clock; an
+    /// untimed start counts only for external/operator evidence. Cancelled,
+    /// ended, superseded or uncertain occurrences are never "in break".
+    fn break_status(&self, id: &str) -> Option<BreakStatus> {
+        use multiview_core::source_event::{EventBoundary, EventLifecycle, EventOrigin};
+        let context = self.context(id)?;
+        let read = self.registry.snapshot(id)?;
+        let samples = self.sampled.load();
+        let position = samples.get(id).and_then(|sample| {
+            (sample.presented
+                && sample.epoch == read.epoch
+                && sample.sampled_at.elapsed() < std::time::Duration::from_secs(1)
+                && context.matches(&read, sample.frame))
+            .then(|| sample.frame.pts.as_nanos())
+        });
+        let clock = position.map_or(PresentationClock::Unknown, |position_ns| {
+            PresentationClock::Fresh {
+                source_id: id.to_owned(),
+                epoch: read.epoch,
+                position_ns,
+            }
+        });
+        let active = read.events.iter().find_map(|event| {
+            if matches!(event.key.origin, EventOrigin::VendorMarker { .. })
+                || event.key.epoch != read.epoch
+            {
+                return None;
+            }
+            let mut start = None;
+            let mut ended = false;
+            for o in event.observations() {
+                match o.boundary {
+                    EventBoundary::Start { pts_ns, .. } => start = Some(pts_ns),
+                    EventBoundary::End { .. } | EventBoundary::Cancel => ended = true,
+                    _ => {}
+                }
+            }
+            let in_break = match start? {
+                Some(_) => event.project(&clock).lifecycle == EventLifecycle::Active,
+                None => matches!(event.key.origin, EventOrigin::External) && !ended,
+            };
+            in_break.then(|| ActiveBreak {
+                event_id: event.key.event_id.clone(),
+                test: event.key.event_id.starts_with("test:"),
+            })
+        });
+        // Anything published between acquisition and here makes this answer
+        // obsolete: report degraded so no NEW action starts on it this tick.
+        let degraded = read.degraded || !self.registry.is_current(&read);
+        Some(BreakStatus {
+            epoch: read.epoch,
+            active,
+            degraded,
+        })
     }
 }
 impl SourceEventTestInjector for RuntimeReader {

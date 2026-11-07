@@ -287,3 +287,35 @@ impl SourceEventsDto {
         self.source_id == id && self.source_id.len() <= MAX_SOURCE_EVENT_ID_BYTES
     }
 }
+
+/// Break state of one source for the automation executor (ADR-0183), derived
+/// from reliable explicit evidence only (never vendor presence markers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakStatus {
+    /// Exact service epoch the status was derived from.
+    pub epoch: u64,
+    /// The occurrence currently in break, if any (presented start, no end).
+    pub active: Option<ActiveBreak>,
+    /// Evidence loss is latched: never start a new automated action.
+    pub degraded: bool,
+}
+/// One break occurrence currently presented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveBreak {
+    /// Occurrence identity (origin-qualified, never an asset id).
+    pub event_id: String,
+    /// Whether this is operator-injected test evidence.
+    pub test: bool,
+}
+/// Management-plane break-status adapter, implemented by the runtime binary.
+/// Reads are bounded and lock-free on the engine side; never called on the
+/// output clock.
+pub trait SourceBreakProvider: Send + Sync {
+    /// Reacquire and evaluate the current break status of `id`. Every call is
+    /// a FRESH acquisition, so calling it immediately before an effect is the
+    /// S1 revalidation (a cancellation/revision published since an earlier
+    /// call changes the answer).
+    fn break_status(&self, id: &str) -> Option<BreakStatus>;
+}
+/// Shared optional break-status adapter.
+pub type SharedSourceBreakProvider = Arc<dyn SourceBreakProvider>;

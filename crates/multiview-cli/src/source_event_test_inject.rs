@@ -29,6 +29,24 @@ impl TestBoundary {
     /// than leaking a new identity per call.
     #[must_use]
     pub fn into_observation(self, source_id: String, epoch: u64) -> SourceEventObservation {
+        self.into_numbered_observation(source_id, epoch, 0)
+    }
+    /// Build the observation for test occurrence `sequence`: each injected
+    /// start opens a NEW occurrence (`test:break:N`, `N >= 1`) so repeated
+    /// operator tests in one epoch are distinct breaks for the automation
+    /// replay gate; an end targets the latest one. `0` keeps `test:break`.
+    #[must_use]
+    pub fn into_numbered_observation(
+        self,
+        source_id: String,
+        epoch: u64,
+        sequence: u64,
+    ) -> SourceEventObservation {
+        let event_id = if sequence == 0 {
+            "test:break".to_owned()
+        } else {
+            format!("test:break:{sequence}")
+        };
         let boundary = match self {
             Self::Start { duration_ns } => EventBoundary::Start {
                 pts_ns: None,
@@ -41,7 +59,7 @@ impl TestBoundary {
                 source_id,
                 epoch,
                 origin: EventOrigin::External,
-                event_id: "test:break".to_owned(),
+                event_id,
             },
             // Each boundary kind (`Start`/`End`) dedups on its own revision
             // slot, so a fresh `1` is valid for either — a repeated call with

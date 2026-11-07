@@ -41,11 +41,73 @@ fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> 
         // An unchanged body is not a guide edit; it keeps the canonical path.
         return false;
     }
-    let media_field = |key: &str| key != "epg" && key != "playlist_metadata";
-    previous
-        .iter()
-        .filter(|(key, _)| media_field(key))
-        .eq(next.iter().filter(|(key, _)| media_field(key)))
+    let media_field = |key: &str| key != "epg" && key != "playlist_metadata" && key != "events";
+    // `events.automation` is control-plane only (ADR-0183): arming or editing a
+    // rule must never restart the producer. `events.observe` stays media.
+    let observe = |body: &serde_json::Map<String, serde_json::Value>| {
+        body.get("events").map(|events| events.get("observe").cloned())
+    };
+    observe(previous) == observe(next)
+        && previous
+            .iter()
+            .filter(|(key, _)| media_field(key))
+            .eq(next.iter().filter(|(key, _)| media_field(key)))
+}
+
+/// Persist an `events.automation` change to one source through the canonical
+/// durable path (commit_resource → store → audit), never restarting ingest
+/// (ADR-0183). `mutate` edits the stored body; returns the new body.
+///
+/// # Errors
+/// Unknown source (404), invalid resulting document (422) or commit failure.
+pub(crate) async fn update_source_automation(
+    state: &AppState,
+    actor: &str,
+    id: &str,
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> ControlResult<()>,
+) -> ControlResult<serde_json::Value> {
+    let _mutation = state.lock_config_mutation().await;
+    let current = accepted_source(state, id)?;
+    let mut body = current.resource.body.clone();
+    let object = body.as_object_mut().ok_or_else(|| {
+        crate::error::ControlError::Validation("stored source body is not an object".into())
+    })?;
+    mutate(object)?;
+    let input = ResourceInput {
+        name: current.resource.name.clone(),
+        body: validated_body(TypedCollection::Sources, id, &body)?,
+    };
+    crate::boot_model::commit_resource(
+        state,
+        "sources",
+        id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.sources.update(id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted automation committed; store projection failed");
+    }
+    let versioned = accepted_source(state, id)?;
+    if let (Some(model), Some(next)) = (
+        state.boot_model.as_ref(),
+        parse_stored_source(&versioned.resource.body),
+    ) {
+        if model.adopted_sources().iter().any(|source| source.id == id) {
+            model.adopt_source(next);
+        }
+    }
+    state.audit(
+        actor,
+        AuditAction::Update,
+        SOURCE_KIND,
+        id,
+        Some(serde_json::json!({ "events": versioned.resource.body.get("events") })),
+    );
+    Ok(versioned.resource.body)
 }
 
 #[cfg(test)]
@@ -64,6 +126,13 @@ mod guide_change_tests {
         assert!(guide_only_change(&next, &source));
         next["url"] = json!("https://example.com/other");
         assert!(!guide_only_change(&source, &next));
+        let mut armed = source.clone();
+        armed["events"] = json!({"automation": {"armed": true,
+            "on_break_start": {"action": "swap_cell", "target": "bars"}}});
+        assert!(guide_only_change(&source, &armed), "automation is control-plane only");
+        let mut observe = source.clone();
+        observe["events"] = json!({"observe": false});
+        assert!(!guide_only_change(&source, &observe), "observe restarts ingest");
     }
 
     #[test]
