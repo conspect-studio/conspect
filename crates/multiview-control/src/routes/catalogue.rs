@@ -668,7 +668,7 @@ pub(crate) async fn post_source_network(
             .and_then(|r| r.country.clone())
     });
     // The same permit pool as the probes: the diagnostics obey the probe bounds.
-    let _permit = svc.acquire_for_diagnostics().await?;
+    let _permit = svc.acquire_for_diagnostics(&principal.key_id).await?;
     let report = collector
         .collect(
             ProbeRequest {

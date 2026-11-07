@@ -467,6 +467,22 @@ impl std::fmt::Debug for ProbeService {
     }
 }
 
+/// RAII admission slot: released on completion and on cancellation/drop.
+struct AdmissionSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A probe permit plus its admission slot, held for the duration of a
+/// diagnostics run.
+pub struct DiagnosticsPermit {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _slot: AdmissionSlot,
+}
+
 fn cache_key(r: &ProbeRequest) -> String {
     format!(
         "{}\u{0}{}\u{0}{}",
@@ -508,27 +524,63 @@ impl ProbeService {
         })
     }
 
+    /// Reserve one admission slot atomically; `None` when the queue is full.
+    fn try_reserve(&self) -> Option<AdmissionSlot> {
+        use std::sync::atomic::Ordering;
+        self.admitted
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_CONCURRENT + MAX_QUEUED).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| AdmissionSlot(Arc::clone(&self.admitted)))
+    }
+
     /// Acquire a probe permit (the same semaphore the probes use) for work that
-    /// must obey the probe bounds, such as an on-demand network report.
+    /// must obey the probe bounds, such as an on-demand network report. The
+    /// admission slot is reserved before waiting and released when the returned
+    /// permit is dropped or the waiting future is cancelled; the per-principal
+    /// budget is shared with [`Self::submit`].
     ///
     /// # Errors
     ///
-    /// [`ControlError::TooManyRequests`] when the probe queue is full.
+    /// [`ControlError::TooManyRequests`] when the principal's per-minute budget or
+    /// the probe queue is exhausted.
     pub async fn acquire_for_diagnostics(
         &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, ControlError> {
-        if self.permits.available_permits() == 0
-            && self.admitted.load(std::sync::atomic::Ordering::Acquire)
-                >= MAX_CONCURRENT + MAX_QUEUED
-        {
-            return Err(ControlError::TooManyRequests(
-                "probe queue is full; retry shortly".to_owned(),
-            ));
-        }
-        Arc::clone(&self.permits)
+        principal: &str,
+    ) -> Result<DiagnosticsPermit, ControlError> {
+        let now = Instant::now();
+        let slot = {
+            let mut g = self.lock();
+            let q = g.rate.entry(principal.to_owned()).or_default();
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60))
+            {
+                q.pop_front();
+            }
+            if q.len() >= PER_PRINCIPAL_PER_MINUTE {
+                return Err(ControlError::TooManyRequests(format!(
+                    "probe rate limit of {PER_PRINCIPAL_PER_MINUTE}/min reached"
+                )));
+            }
+            let slot = self.try_reserve().ok_or_else(|| {
+                ControlError::TooManyRequests("probe queue is full; retry shortly".to_owned())
+            })?;
+            g.rate
+                .entry(principal.to_owned())
+                .or_default()
+                .push_back(now);
+            slot
+        };
+        let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
-            .map_err(|_| ControlError::Conflict("probe service closed".to_owned()))
+            .map_err(|_| ControlError::Conflict("probe service closed".to_owned()))?;
+        Ok(DiagnosticsPermit {
+            _permit: permit,
+            _slot: slot,
+        })
     }
 
     /// The network collector, when diagnostics are enabled.
@@ -581,7 +633,7 @@ impl ProbeService {
         }
         let key = cache_key(&req);
         let now = Instant::now();
-        {
+        let slot = {
             let mut g = self.lock();
             let q = g.rate.entry(principal.to_owned()).or_default();
             while q
@@ -608,18 +660,15 @@ impl ProbeService {
                     }
                 }
             }
-            if self.admitted.load(std::sync::atomic::Ordering::Acquire)
-                >= MAX_CONCURRENT + MAX_QUEUED
-            {
+            let Some(reserved) = self.try_reserve() else {
                 return Err(ControlError::TooManyRequests(
                     "probe queue is full; retry shortly".to_owned(),
                 ));
-            }
+            };
             let q = g.rate.entry(principal.to_owned()).or_default();
             q.push_back(now);
-        }
-        self.admitted
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            reserved
+        };
         let id = uuid::Uuid::new_v4().to_string();
         let queued = ProbeResult {
             id: id.clone(),
@@ -648,6 +697,7 @@ impl ProbeService {
         }
         let me = Arc::clone(self);
         tokio::spawn(async move {
+            let _slot = slot;
             let _permit = me.permits.acquire().await;
             {
                 let mut g = me.lock();
@@ -673,8 +723,6 @@ impl ProbeService {
                 let mut g = me.lock();
                 Self::store(&mut g, result);
             }
-            me.admitted
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         });
         Ok(queued)
     }
@@ -1077,5 +1125,78 @@ mod tests {
         let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720\nmid.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080\nhi.m3u8\n";
         let (uri, bw, _) = pick_variant(master, Some("720p")).unwrap();
         assert_eq!((uri.as_str(), bw), ("mid.m3u8", Some(3_000_000)));
+    }
+
+    struct Instant0;
+    impl ProbeRunner for Instant0 {
+        fn run(
+            &self,
+            id: String,
+            _: ProbeRequest,
+        ) -> super::super::sync::BoxFuture<'_, ProbeResult> {
+            Box::pin(async move { timeout_result(&id, "h") })
+        }
+    }
+
+    fn req(quality: Option<&str>) -> ProbeRequest {
+        ProbeRequest {
+            url: "https://a/x.m3u8".into(),
+            user_agent: Some("UA".into()),
+            referrer: None,
+            quality: quality.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_queue_is_capped_and_cancellation_releases_slots() {
+        let svc = ProbeService::new(Arc::new(Instant0), "h".into());
+        let mut held = Vec::new();
+        for i in 0..MAX_CONCURRENT {
+            held.push(svc.acquire_for_diagnostics(&format!("h{i}")).await.unwrap());
+        }
+        let mut waiters = Vec::new();
+        for i in 0..MAX_QUEUED {
+            let s = Arc::clone(&svc);
+            waiters.push(tokio::spawn(async move {
+                s.acquire_for_diagnostics(&format!("w{i}"))
+                    .await
+                    .map(|_| ())
+            }));
+        }
+        for _ in 0..10_000 {
+            if svc.admitted.load(std::sync::atomic::Ordering::Acquire)
+                == MAX_CONCURRENT + MAX_QUEUED
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let over = svc.acquire_for_diagnostics("over").await;
+        assert!(
+            matches!(over, Err(ControlError::TooManyRequests(_))),
+            "cap reached"
+        );
+        // Dropping (cancelling) a waiter frees its admission slot.
+        let w = waiters.pop().unwrap();
+        w.abort();
+        let _ = w.await;
+        let again = tokio::time::timeout(
+            Duration::from_millis(50),
+            svc.acquire_for_diagnostics("again"),
+        )
+        .await;
+        assert!(again.is_err(), "admitted and now waiting, not rejected");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_share_the_per_principal_rate_limit() {
+        let svc = ProbeService::new(Arc::new(Instant0), "h".into());
+        for _ in 0..PER_PRINCIPAL_PER_MINUTE {
+            drop(svc.acquire_for_diagnostics("p").await.unwrap());
+        }
+        let r = svc.acquire_for_diagnostics("p").await;
+        assert!(matches!(r, Err(ControlError::TooManyRequests(_))));
+        assert!(svc.acquire_for_diagnostics("other").await.is_ok());
     }
 }

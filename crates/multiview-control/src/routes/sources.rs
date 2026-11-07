@@ -43,8 +43,7 @@ fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> 
     }
     // `origin` is catalogue provenance/follow metadata, not media; `user_agent`
     // and `referrer` are replayed on the wire and stay media.
-    let media_field =
-        |key: &str| !matches!(key, "epg" | "playlist_metadata" | "events" | "origin");
+    let media_field = |key: &str| !matches!(key, "epg" | "playlist_metadata" | "events" | "origin");
     // `events.automation` is control-plane only (ADR-0183): arming or editing a
     // rule must never restart the producer. `events.observe` stays media.
     // Effective `observe` (absent block or field => the documented default `true`).
