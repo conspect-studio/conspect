@@ -2189,3 +2189,28 @@ pub struct LogRecordDoc {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub repeated: Option<u64>,
 }
+
+/// `OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one
+/// viewer playback URL (or no-URL note) for an output
+/// (`GET /api/v1/outputs/{id}/playback`, ADR-0101).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PlaybackUrlDoc {
+    /// Short human label, e.g. `"SRT (caller)"` or `"HLS playlist"`.
+    pub label: String,
+    /// The URL a viewer pastes into VLC/ffplay/a browser. Absent when this
+    /// output has no viewer-reachable address — see `notes` for why.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub url: Option<String>,
+    /// Extra operator-facing notes: an encryption-passphrase reminder, a
+    /// redacted push destination, a missing-host explanation. Never a secret.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OutputPlaybackResponseDoc {
+    /// This output's viewer playback URL(s) (one or more; a push-only
+    /// transport returns a single no-URL entry with an explanatory note).
+    pub urls: Vec<PlaybackUrlDoc>,
+}

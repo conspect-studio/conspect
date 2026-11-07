@@ -43,6 +43,7 @@ pub mod media;
 pub mod multicast;
 pub mod origin;
 pub mod placement;
+pub mod playback;
 pub mod probe;
 pub mod program;
 pub mod routing;
@@ -86,6 +87,10 @@ pub use multicast::{
 };
 pub use origin::{Origin, OriginParseError};
 pub use placement::{DevicePin, MigrationPolicy, PinVendor, PlacementConfig, PlacementWeights};
+pub use playback::{
+    hls_mount_segment, host_header_hostname, is_ip_literal, resolve_hls_mounts, HlsMountRoute,
+    PlaybackContext, PlaybackUrl,
+};
 pub use probe::{DetectionZone, Dwell, LoudnessTarget, Probe, ProbeKind};
 pub use program::{ProgramId, ProgramKind, ProgramSpec};
 pub use routing::{
@@ -170,6 +175,20 @@ pub struct ControlConfig {
     /// are refused).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_media_base: Option<String>,
+    /// The externally-reachable **hostname** (no scheme, no port) viewer
+    /// playback URLs are derived against (`GET
+    /// /api/v1/outputs/{id}/playback`): substituted for a wildcard/loopback
+    /// listener bind when building an `srt://`/`rist://` caller URL, and the
+    /// host of an absolute `/hls/{mount}` playlist URL. Absent ⇒ the
+    /// control plane falls back to the request's own `Host` header (an nginx
+    /// reverse proxy passes `Host` through unchanged, so this is usually
+    /// unnecessary); when neither is available the playback route returns an
+    /// honest "no public host known" note instead of a guessed URL. Unlike
+    /// [`cast_media_base`](Self::cast_media_base) this is a **bare
+    /// hostname/IP literal**, no scheme and no port (every output's own port
+    /// is substituted in per-URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_host: Option<String>,
     /// The outbound-dial SSRF allowlist (SEC-02/SEC-04, CWE-918, ADR-M013): the
     /// operator CIDRs the managed-device poller and Cast session actor lock their
     /// outbound dial to. IPv6-first (e.g. `["fd00:db8::/32", "192.168.0.0/16"]`);
@@ -828,6 +847,33 @@ impl MultiviewConfig {
                     return Err(ConfigError::Validation(format!(
                         "control.cast_media_base {base:?} must be an http:// or https:// base \
                          URL (Cast receivers fetch HLS over HTTP)"
+                    )));
+                }
+            }
+            if let Some(host) = &control.public_host {
+                // A bare hostname/IP literal: non-empty, no scheme, no path/query,
+                // no port (every output's own port is substituted in per-URL). A
+                // bracketed IPv6 literal is accepted and kept bracketed.
+                if host.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "control.public_host is empty (omit the field to fall back to the \
+                         request Host header)"
+                            .to_owned(),
+                    ));
+                }
+                if host.contains("://") {
+                    return Err(ConfigError::Validation(format!(
+                        "control.public_host {host:?} must be a bare hostname/IP literal, not a \
+                         URL (no scheme)"
+                    )));
+                }
+                let unbracketed = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'));
+                let is_valid_ipv6_literal =
+                    unbracketed.is_some_and(|inner| inner.parse::<std::net::Ipv6Addr>().is_ok());
+                if host.contains(['/', '?', '#', ':']) && !is_valid_ipv6_literal {
+                    return Err(ConfigError::Validation(format!(
+                        "control.public_host {host:?} must be a bare hostname/IP literal (no \
+                         path, query, or port) — bracket an IPv6 literal as [::1]"
                     )));
                 }
             }

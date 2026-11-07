@@ -99,6 +99,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::outputs::create_output,
         crate::routes::outputs::update_output,
         crate::routes::outputs::delete_output,
+        crate::routes::outputs::get_output_playback,
         crate::routes::overlays::list_overlays,
         crate::routes::overlays::get_overlay,
         crate::routes::overlays::create_overlay,
@@ -469,6 +470,9 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::nmos::is10::Is10Claims,
         crate::nmos::is10::NmosApiClaim,
         crate::nmos::is10::NmosAccess,
+        // Viewer playback URL derivation (ADR-0101).
+        crate::openapi_schemas::PlaybackUrlDoc,
+        crate::openapi_schemas::OutputPlaybackResponseDoc,
     )),
     tags(
         (name = "layouts", description = "Layout resource CRUD"),

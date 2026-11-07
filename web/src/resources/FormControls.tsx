@@ -392,6 +392,51 @@ export function DerivedUrlField({
   );
 }
 
+/**
+ * One derived viewer **playback URL** row (ADR-0101 — "a link to copy the
+ * actual URL to paste into a tool like VLC"): the URL itself (via
+ * {@link DerivedUrlField}'s existing copy-to-clipboard field) plus an "Open in
+ * VLC" row that copies the exact `vlc <url>` command text, and any
+ * operator-facing notes (a passphrase reminder, a redacted push destination, a
+ * missing-public-host explanation). When this entry carries no URL (a push
+ * destination, or an unresolvable listener), only the notes render.
+ */
+export function PlaybackUrlRow({
+  idPrefix,
+  label,
+  url,
+  notes,
+}: {
+  readonly idPrefix: string;
+  readonly label: string;
+  readonly url: string | undefined;
+  readonly notes: readonly string[];
+}): JSX.Element {
+  const { t } = useLingui();
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+      {url !== undefined ? (
+        <>
+          <DerivedUrlField id={`${idPrefix}-url`} label={label} value={url} />
+          <DerivedUrlField
+            id={`${idPrefix}-vlc-command`}
+            label={t`Open in VLC`}
+            value={`vlc ${url}`}
+            hint={<Trans>Paste this command into a terminal to open the stream in VLC.</Trans>}
+          />
+        </>
+      ) : (
+        <p className="text-sm font-medium">{label}</p>
+      )}
+      {notes.map((note, index) => (
+        <p key={index} className="text-xs text-muted-foreground">
+          {note}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 /** A labelled <Select> over fixed string options, with optional display text. */
 export function SelectField<Option extends string>({
   label,

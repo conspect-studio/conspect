@@ -1092,6 +1092,9 @@ fn resource_router() -> Router<AppState> {
                 .put(outputs::update_output)
                 .delete(outputs::delete_output),
         )
+        // Viewer playback URL derivation (ADR-0101): "a link to copy the
+        // actual URL to paste into a tool like VLC".
+        .route("/outputs/{id}/playback", get(outputs::get_output_playback))
         // The audio-routing singleton document (program-bus + discrete tracks).
         .route(
             "/audio-routing",

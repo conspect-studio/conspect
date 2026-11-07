@@ -1342,6 +1342,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/outputs/{id}/playback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/outputs/{id}/playback` — derive this output's viewer
+         *     playback URL(s) (ADR-0101: "a link to copy the actual URL to paste into a
+         *     tool like VLC"). Role: read; per-object authz (BOLA) identical to
+         *     `get_output`.
+         * @description Never returns a secret: an SRT/RIST pre-shared key is never read here (it
+         *     is a `secret_ref`, resolved only at the engine's run path) — an encrypted
+         *     listener instead carries an operator-facing note that a passphrase is
+         *     required out-of-band.
+         */
+        get: operations["get_output_playback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/overlays": {
         parameters: {
             query?: never;
@@ -4240,6 +4266,14 @@ export interface components {
             /** @description The clockwise quarter-turn. Defaults to `none`. */
             turn?: components["schemas"]["QuarterTurnDoc"];
         };
+        /** @description `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body. */
+        OutputPlaybackResponseDoc: {
+            /**
+             * @description This output's viewer playback URL(s) (one or more; a push-only
+             *     transport returns a single no-URL entry with an explanatory note).
+             */
+            urls: components["schemas"]["PlaybackUrlDoc"][];
+        };
         /** @description The request envelope for `POST`/`PUT /api/v1/outputs/{id}` (`name` + body). */
         OutputResourceInputDoc: {
             /** @description The output document. */
@@ -4364,6 +4398,25 @@ export interface components {
          * @enum {string}
          */
         PipelineStage: "decode" | "composite" | "encode";
+        /**
+         * @description `OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one
+         *     viewer playback URL (or no-URL note) for an output
+         *     (`GET /api/v1/outputs/{id}/playback`, ADR-0101).
+         */
+        PlaybackUrlDoc: {
+            /** @description Short human label, e.g. `"SRT (caller)"` or `"HLS playlist"`. */
+            label: string;
+            /**
+             * @description Extra operator-facing notes: an encryption-passphrase reminder, a
+             *     redacted push destination, a missing-host explanation. Never a secret.
+             */
+            notes?: string[];
+            /**
+             * @description The URL a viewer pastes into VLC/ffplay/a browser. Absent when this
+             *     output has no viewer-reachable address — see `notes` for why.
+             */
+            url?: string | null;
+        };
         /**
          * @description The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview
          *     transports this build can serve, so the SPA picks WHEP vs the JPEG ladder
@@ -9633,6 +9686,56 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_output_playback: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Output id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This output's viewer playback URL(s). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OutputPlaybackResponseDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read this output. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No output with that id. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

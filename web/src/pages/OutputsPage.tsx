@@ -46,10 +46,12 @@ import {
   DerivedUrlField,
   ExportConfigButton,
   FormField,
+  PlaybackUrlRow,
   SecretField,
   SelectField,
 } from '../resources/FormControls';
 import { whepPlayUrl } from '../resources/api';
+import { useOutputPlayback } from '../resources/outputPlayback';
 import { HelpLink } from '../components/HelpLink';
 
 const AUDIO_CHOICES: readonly OutputAudioChoice[] = ['default', 'program', 'tracks'];
@@ -280,6 +282,36 @@ function OutputKindFields({
     case 'whip-push':
       return <WhipPushOutputFields form={form} setForm={setForm} errors={errors} />;
   }
+}
+
+/**
+ * The viewer **playback URL(s)** section (ADR-0101 — "a link to copy the
+ * actual URL to paste into a tool like VLC"): one {@link PlaybackUrlRow} per
+ * URL the server derives for this output (`GET
+ * /api/v1/outputs/{id}/playback`). Only rendered for a SAVED output (the
+ * route needs a real id); an unsaved (still-creating) output shows nothing
+ * here — there is nothing to derive yet.
+ */
+function PlaybackUrlsSection({ outputId }: { readonly outputId: string }): JSX.Element | null {
+  const { t } = useLingui();
+  const playback = useOutputPlayback(outputId === '' ? undefined : outputId);
+  if (outputId === '' || playback.data === undefined || playback.data.length === 0) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-sm font-medium">{t`Playback URL`}</p>
+      {playback.data.map((entry, index) => (
+        <PlaybackUrlRow
+          key={`${entry.label}-${String(index)}`}
+          idPrefix={`output-playback-${outputId}-${String(index)}`}
+          label={entry.label}
+          url={entry.url ?? undefined}
+          notes={entry.notes ?? []}
+        />
+      ))}
+    </div>
+  );
 }
 
 /**
@@ -815,6 +847,7 @@ export function OutputsPage(): JSX.Element {
           <OutputKindFields form={form} setForm={setForm} errors={errors} />
           <CodecFields form={form} setForm={setForm} errors={errors} />
           <OutputAdvancedFields form={form} setForm={setForm} errors={errors} />
+          {!creating ? <PlaybackUrlsSection outputId={form.id} /> : null}
         </>
       )}
     />
