@@ -197,7 +197,7 @@ impl ExpectedRoot {
     /// wants the reason.
     #[must_use]
     pub fn read<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Option<Self> {
-        let starttime = read_starttime(fs, pid)?;
+        let starttime = read_starttime(fs, pid).filter(|starttime| *starttime != 0)?;
         Some(Self { pid, starttime })
     }
 
@@ -211,18 +211,25 @@ impl ExpectedRoot {
         let path = format!("{PROC}/{pid}/stat");
         let body = fs.read_to_string(&path)?;
         let starttime = parse_stat_starttime(&body)
-            .ok_or_else(|| Error::parse(&path, "could not read starttime (field 22)"))?;
+            .filter(|starttime| *starttime != 0)
+            .ok_or_else(|| Error::parse(&path, "could not read a non-zero starttime (field 22)"))?;
         Ok(Self { pid, starttime })
     }
 
     /// Whether `root_stat` is still the process this identity was registered
-    /// for. A `0` registered `starttime` (a kernel that did not report the
-    /// field) degrades the check to the pid alone, exactly as
-    /// [`ProcRecord::starttime`] does for a descendant.
+    /// for.
+    ///
+    /// Strict: the pid **and** the `starttime` must both be equal. There is no
+    /// "unchecked" value. A registered `starttime` of `0` is never a real
+    /// identity (the kernel's field 22 is positive for every process the
+    /// sampler can see), so it matches nothing and the scope is reported gone —
+    /// fail closed, rather than degrading to a pid-only comparison that a
+    /// recycled pid would pass.
     #[must_use]
     pub const fn matches(&self, pid: Pid, root_stat: &RootStat) -> bool {
         self.pid.as_u32() == pid.as_u32()
-            && (self.starttime == 0 || self.starttime == root_stat.starttime)
+            && self.starttime != 0
+            && self.starttime == root_stat.starttime
     }
 }
 
@@ -235,7 +242,8 @@ impl ExpectedRoot {
 pub struct RootStat {
     /// `utime + stime` of the root itself, in clock ticks.
     pub cpu_ticks: u64,
-    /// `stat` field 22 for the root; `0` when the field could not be parsed.
+    /// `stat` field 22 for the root. Always parsed: a root whose `starttime`
+    /// cannot be read has no identity and is an error, not a `0`.
     pub starttime: u64,
 }
 
@@ -244,8 +252,7 @@ pub struct RootStat {
 pub struct ProcessTreeSample {
     /// The root the tree was discovered from.
     pub root: Pid,
-    /// The root's `starttime` at this sweep (field 22 of its `stat`; `0` when the
-    /// field could not be parsed).
+    /// The root's `starttime` at this sweep (field 22 of its `stat`).
     ///
     /// The root's identity, recorded from the **first** sample on, so a later
     /// sweep can tell a live root from a pid the kernel reused for a new
@@ -543,15 +550,22 @@ impl TreeSample {
 /// # Errors
 ///
 /// [`Error::Io`] or [`Error::Parse`] when the root process's own `/proc` entry
-/// exists but cannot be read or parsed. A descendant that vanishes mid-walk is
-/// skipped, not an error — a live tree changes under the reader.
+/// exists but cannot be read or parsed (including a `stat` with no parseable
+/// `starttime`, which would leave the root without an identity). A root whose
+/// `/proc` entry is **absent** (`ENOENT`/`ESRCH`) is not an error: the browser
+/// exited, which is [`TreeSample::RootGone`]. A descendant that vanishes
+/// mid-walk is skipped, not an error — a live tree changes under the reader.
 pub fn sample_process_tree<F: FsRoot + ?Sized>(
     fs: &F,
     root: Pid,
     expected: Option<&ExpectedRoot>,
     previous: Option<&PreviousSweep>,
 ) -> Result<TreeSample> {
-    let root_stat = read_root_stat(fs, root)?;
+    let Some(root_stat) = read_root_stat(fs, root)? else {
+        // The root's /proc entry is gone: the browser exited. That ends the
+        // scope; it is not a failure of the accounting.
+        return Ok(TreeSample::RootGone);
+    };
     if let Some(expected) = expected {
         if !expected.matches(root, &root_stat) {
             // The registered process is not this pid any more (or the pid now
@@ -568,7 +582,10 @@ pub fn sample_process_tree<F: FsRoot + ?Sized>(
 
     let (root_memory_bytes, root_memory_source) = read_memory(fs, root);
 
-    let mut records: Vec<ProcRecord> = Vec::new();
+    // Sized from the previous sweep: over a stable tree the record buffer is
+    // allocated once at its final size instead of regrowing by doubling.
+    let mut records: Vec<ProcRecord> =
+        Vec::with_capacity(previous.map_or(0, |state| state.live.len()));
     walk_tree(fs, root, &mut |record| records.push(record));
 
     let mut by_type: TypeAccountingArray = [TypeAccounting::default(); TYPE_COUNT];
@@ -798,26 +815,48 @@ pub fn read_process<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Option<ProcRecord> 
 
 /// The root's own identity and CPU time, from one `stat` read.
 ///
-/// Errors when the root's `/proc` entry cannot be read or its CPU fields cannot
-/// be parsed: a live root must exist for the scope to mean anything. A missing
-/// `starttime` is **not** an error — it degrades the identity check to the pid
-/// alone, exactly as [`read_process`] does for a descendant.
-fn read_root_stat<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<RootStat> {
+/// `Ok(None)` when the root's `/proc` entry is **absent** (see [`is_gone`]): the
+/// process exited. Every other failure is an error — an unreadable entry
+/// (`EACCES`, `EIO`) says nothing about whether the process lives, so it must not
+/// be reported as the scope ending. A `stat` whose CPU fields or `starttime`
+/// cannot be parsed is an error too: a root without an identity cannot be
+/// attributed.
+fn read_root_stat<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<Option<RootStat>> {
     let path = format!("{PROC}/{pid}/stat");
-    let stat = fs.read_to_string(&path)?;
+    let stat = match fs.read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if is_gone(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let cpu_ticks = parse_stat_cpu_ticks(&stat)
         .ok_or_else(|| Error::parse(&path, "could not read utime/stime after the comm paren"))?;
-    Ok(RootStat {
+    let starttime = parse_stat_starttime(&stat)
+        .ok_or_else(|| Error::parse(&path, "could not read starttime (field 22)"))?;
+    Ok(Some(RootStat {
         cpu_ticks,
-        starttime: parse_stat_starttime(&stat).unwrap_or(0),
-    })
+        starttime,
+    }))
+}
+
+/// Whether `error` says the process behind a `/proc/<pid>/...` read no longer
+/// exists: `ENOENT` (the entry is gone) or `ESRCH` (the task exited while the
+/// file was being opened or read). Nothing else is "gone".
+fn is_gone(error: &Error) -> bool {
+    /// `ESRCH` on every Linux this crate targets.
+    const ESRCH: i32 = 3;
+    matches!(
+        error,
+        Error::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound
+                || source.raw_os_error() == Some(ESRCH)
+    )
 }
 
 fn ppid_of<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<Option<Pid>> {
     let path = format!("{PROC}/{pid}/stat");
     match fs.read_to_string(&path) {
         Ok(body) => Ok(parse_stat_ppid(&body)),
-        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if is_gone(&error) => Ok(None),
         Err(other) => Err(other),
     }
 }

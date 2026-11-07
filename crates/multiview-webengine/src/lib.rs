@@ -53,7 +53,7 @@ pub mod usage;
 pub use cgroup::{
     delegation_status, parse_cpu_stat, plan_leaf_move, probe_child_name, probe_child_path,
     read_cgroup_usage, rollback_for, CgroupUsage, ControllerSet, CpuStat, DelegationReport,
-    FailureAction, LeafMoveStep, NotDelegated, CGROUP_CONTROLLERS, CGROUP_PROCS,
+    FailureAction, LeafMoveStep, NotDelegated, VerifyMembership, CGROUP_CONTROLLERS, CGROUP_PROCS,
     CGROUP_SUBTREE_CONTROL, CPU_STAT, DELEGATION_PROBE_PREFIX, ENGINE_LEAF, MEMORY_CURRENT,
     MEMORY_PEAK, PIDS_CURRENT, REQUIRED_CONTROLLERS,
 };

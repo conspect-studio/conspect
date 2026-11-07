@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::error::{Error, Result};
-use crate::fsroot::Pid;
+use crate::fsroot::{FsRoot, Pid};
+use crate::process_tree::ExpectedRoot;
 
 /// The owner a scope's resources are charged to: a source id, a job id, a pool
 /// id or a fixed engine id such as `"engine"`.
@@ -110,10 +111,19 @@ pub enum ScopeKind {
         /// sampler compares this value on **every** sample, the first included,
         /// and reports [`RootGone`](crate::TreeSample::RootGone) on a mismatch.
         ///
-        /// `0` means the caller could not read the field; the check then degrades
-        /// to the pid alone, which is weaker but not wrong-by-construction.
-        /// [`ExpectedRoot::read`](crate::process_tree::ExpectedRoot::read) is the
-        /// way to obtain a value that is never silently `0`.
+        /// **There is no "unchecked" value.** `0` is not a real `starttime`; a
+        /// scope carrying it is refused by [`ScopeRegistry::register`] and, if
+        /// one is sampled anyway, matches no process (fail closed).
+        ///
+        /// **Contract:** read this *before the child can be waited on*. While
+        /// the parent still holds the child handle (`std::process::Child`) the
+        /// kernel cannot reap the process and recycle its pid, so the read is
+        /// guaranteed to be the spawned process's own identity. Reading it from
+        /// a bare pid some time later is the race this field exists to close.
+        /// [`ScopeRegistry::register_spawned`] does exactly that and is the preferred way to
+        /// build this variant; otherwise use
+        /// [`ExpectedRoot::read`](crate::process_tree::ExpectedRoot::read),
+        /// which fails closed.
         root_starttime: u64,
     },
     /// A named browser pool (ADR-0099 decision 11): several sources share one
@@ -168,21 +178,17 @@ impl ScopeKind {
 
     /// A named pool with no cgroup of its own: every figure is a process-tree
     /// estimate, including the pool total.
+    ///
+    /// Takes the root's registered identity ([`ExpectedRoot`], from
+    /// [`ExpectedRoot::read`] or [`ScopeRegistry::register_spawned`]) so a pool can never be
+    /// built without a real `starttime`.
     #[must_use]
-    pub fn estimated_pool(id: impl Into<String>, root: Pid) -> Self {
-        Self::estimated_pool_at(id, root, 0)
-    }
-
-    /// The same as [`estimated_pool`](Self::estimated_pool), carrying the root's
-    /// registration-time `starttime` so the backing walk has a real identity to
-    /// compare against.
-    #[must_use]
-    pub fn estimated_pool_at(id: impl Into<String>, root: Pid, root_starttime: u64) -> Self {
+    pub fn estimated_pool(id: impl Into<String>, root: ExpectedRoot) -> Self {
         Self::Pool {
             id: id.into(),
             backing: Box::new(Self::ProcessTree {
-                root,
-                root_starttime,
+                root: root.pid,
+                root_starttime: root.starttime,
             }),
         }
     }
@@ -277,8 +283,17 @@ impl ScopeRegistry {
     /// # Errors
     ///
     /// [`Error::StaleGeneration`] when `scope.generation` is below the next
-    /// generation this registry would issue for that owner.
+    /// generation this registry would issue for that owner, and
+    /// [`Error::InvalidScope`] for a process-tree scope with `starttime == 0`.
     pub fn register(&mut self, scope: ResourceScope) -> Result<Generation> {
+        if scope.kind.process_tree_root_starttime() == Some(0) {
+            return Err(Error::InvalidScope {
+                owner: scope.owner.as_str().to_owned(),
+                detail: "a process-tree scope needs the root's real starttime \
+                         (0 is not an identity); read it with ExpectedRoot::read \
+                         or register_spawned",
+            });
+        }
         let expected = self.next_generation(&scope.owner);
         if scope.generation < expected {
             return Err(Error::StaleGeneration {
@@ -291,6 +306,43 @@ impl ScopeRegistry {
         self.next.insert(scope.owner.clone(), generation.next());
         self.scopes.insert(scope.owner.clone(), scope);
         Ok(generation)
+    }
+
+    /// Register a process-tree scope for a **just-spawned** child, reading the
+    /// root's `starttime` while the caller still holds the child handle.
+    ///
+    /// This is the race-free registration: the kernel cannot reap `child` (and so
+    /// cannot recycle its pid) while the `std::process::Child` is alive and
+    /// un-waited, so the `starttime` read here is the spawned process's own. The
+    /// generation is the registry's [`next_generation`](Self::next_generation) for
+    /// `owner`; the registry is `&mut`, so the read and the registration are one
+    /// serialised step. Reading from a bare pid after `wait()` — or long after
+    /// spawn — is the bug this exists to prevent.
+    ///
+    /// Spawns nothing: the caller owns the launch (and `fs` is `Path::new("/")`
+    /// in production, a fixture in tests).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] / [`Error::Parse`] when the child's `stat` cannot be read —
+    /// including a child that was already reaped. Nothing is registered then
+    /// (fail closed).
+    pub fn register_spawned<F: FsRoot + ?Sized>(
+        &mut self,
+        owner: ScopeOwner,
+        child: &std::process::Child,
+        fs: &F,
+    ) -> Result<Generation> {
+        let identity = ExpectedRoot::try_read(fs, Pid::new(child.id()))?;
+        let generation = self.next_generation(&owner);
+        self.register(ResourceScope::new(
+            owner,
+            generation,
+            ScopeKind::ProcessTree {
+                root: identity.pid,
+                root_starttime: identity.starttime,
+            },
+        ))
     }
 
     /// Remove the scope for `owner`, returning it when one was registered.
@@ -366,6 +418,13 @@ mod tests {
 
     fn owner(name: &str) -> ScopeOwner {
         ScopeOwner::new(name)
+    }
+
+    fn identity(pid: u32) -> ExpectedRoot {
+        ExpectedRoot {
+            pid: Pid::new(pid),
+            starttime: 7,
+        }
     }
 
     fn cgroup_scope(name: &str, generation: u64, path: &str) -> ResourceScope {
@@ -531,7 +590,7 @@ mod tests {
             .register(ResourceScope::new(
                 walked.clone(),
                 generation,
-                ScopeKind::estimated_pool("sydney", Pid::new(400)),
+                ScopeKind::estimated_pool("sydney", identity(400)),
             ))
             .expect("registered");
         let scope = registry.get(&walked).expect("a registered pool");
@@ -547,10 +606,10 @@ mod tests {
         // The guard is the backing's `is_exact`, whatever shape it takes: a
         // process-tree pool stays estimated even nested behind the pool variant.
         for kind in [
-            ScopeKind::estimated_pool("p", Pid::new(1)),
+            ScopeKind::estimated_pool("p", identity(1)),
             ScopeKind::Pool {
                 id: "p".to_owned(),
-                backing: Box::new(ScopeKind::estimated_pool("inner", Pid::new(2))),
+                backing: Box::new(ScopeKind::estimated_pool("inner", identity(2))),
             },
         ] {
             assert!(!kind.is_exact(), "{kind:?}");

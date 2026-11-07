@@ -17,7 +17,9 @@
 
 use std::path::PathBuf;
 
-use multiview_webengine::{Generation, Pid, ResourceScope, ScopeKind, ScopeOwner, ScopeRegistry};
+use multiview_webengine::{
+    ExpectedRoot, Generation, Pid, ResourceScope, ScopeKind, ScopeOwner, ScopeRegistry,
+};
 
 fn owner(name: &str) -> ScopeOwner {
     ScopeOwner::new(name)
@@ -114,7 +116,13 @@ fn a_pool_scope_is_exact_only_when_backed_by_a_cgroup() {
         .register(ResourceScope::new(
             walked.clone(),
             generation,
-            ScopeKind::estimated_pool("sydney", Pid::new(4242)),
+            ScopeKind::estimated_pool(
+                "sydney",
+                ExpectedRoot {
+                    pid: Pid::new(4242),
+                    starttime: 9_001,
+                },
+            ),
         ))
         .expect("registered");
     let scope = registry.get(&walked).expect("the estimated pool scope");
@@ -256,4 +264,71 @@ fn cgroup_scope_at(name: &str, generation: Generation) -> ResourceScope {
             "/sys/fs/cgroup/engine/web/{name}-{generation}"
         ))),
     )
+}
+
+#[test]
+fn a_process_tree_scope_without_a_real_starttime_is_refused_at_registration() {
+    // HIGH (review 4): `0` used to mean "unchecked", so a pool built through
+    // `estimated_pool` skipped the identity check and a recycled pid was
+    // accepted. There is no unchecked value any more.
+    let mut registry = ScopeRegistry::new();
+    let name = owner("vt-0");
+    let generation = registry.next_generation(&name);
+    for kind in [
+        ScopeKind::ProcessTree {
+            root: Pid::new(7),
+            root_starttime: 0,
+        },
+        ScopeKind::estimated_pool(
+            "p",
+            ExpectedRoot {
+                pid: Pid::new(7),
+                starttime: 0,
+            },
+        ),
+    ] {
+        let error = registry
+            .register(ResourceScope::new(name.clone(), generation, kind))
+            .expect_err("a zero starttime is not an identity");
+        assert!(error.to_string().contains("vt-0"), "{error}");
+    }
+    assert!(registry.is_empty(), "nothing was registered");
+    assert_eq!(
+        registry.next_generation(&name),
+        generation,
+        "no generation burned"
+    );
+}
+
+#[test]
+fn register_spawned_reads_the_starttime_while_the_child_handle_is_held() {
+    // MEDIUM: registration took a bare pid. `register_spawned` takes the live
+    // `Child`, so the pid cannot have been reaped and reused before the read.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let mut registry = ScopeRegistry::new();
+    let name = owner("spawned");
+    let generation = registry
+        .register_spawned(name.clone(), &child, std::path::Path::new("/"))
+        .expect("a live child registers");
+    let scope = registry.get(&name).expect("registered").clone();
+    assert_eq!(scope.generation, generation);
+    assert_eq!(scope.kind.process_tree_root(), Some(Pid::new(child.id())));
+    let want = ExpectedRoot::read(std::path::Path::new("/"), Pid::new(child.id()))
+        .expect("the live child has a starttime");
+    assert_eq!(
+        scope.kind.process_tree_root_starttime(),
+        Some(want.starttime)
+    );
+    assert_ne!(want.starttime, 0);
+
+    // A child that has already been reaped fails closed: nothing registered.
+    child.kill().expect("kill");
+    child.wait().expect("reap");
+    let other = owner("late");
+    let result = registry.register_spawned(other.clone(), &child, std::path::Path::new("/"));
+    assert!(result.is_err(), "a reaped child has no identity to read");
+    assert!(registry.get(&other).is_none());
 }
