@@ -201,6 +201,10 @@ pub mod pipeline;
 /// flow delivers below real time still plays. Behind the `ffmpeg` feature.
 #[cfg(feature = "ffmpeg")]
 pub mod hls_fetch;
+/// Dual-stack SRT listener input: one native socket per listener URL, relayed
+/// to libav over loopback. Behind the `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod srt_ingest;
 
 /// Per-source **runtime audio ingest** (AUD-2): the audio peer of the video
 /// decode thread. Opens + decodes each file/URL source's audio on its own

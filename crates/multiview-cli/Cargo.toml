@@ -57,6 +57,9 @@ wgpu = { version = "30", default-features = false, features = [
 multiview-ffmpeg = { workspace = true }
 multiview-input = { workspace = true }
 multiview-output = { workspace = true }
+# Dual-stack SRT listener input (`srt_ingest`). Runtime-loaded and link-free, so
+# it adds no native build dependency.
+multiview-srt-sys = { workspace = true, optional = true }
 multiview-audio = { workspace = true }
 multiview-overlay = { workspace = true }
 multiview-preview = { workspace = true }
@@ -440,6 +443,7 @@ ptp = ["multiview-engine/ptp"]
 # its SAFE value types (no FFI in this crate). LGPL-clean: never escalates to GPL.
 ffmpeg = [
     "dep:ffmpeg-next",
+    "dep:multiview-srt-sys",
     "dep:tempfile",
     "dep:ureq",
     "dep:url",

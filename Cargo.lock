@@ -2969,6 +2969,7 @@ dependencies = [
  "multiview-output",
  "multiview-overlay",
  "multiview-preview",
+ "multiview-srt-sys",
  "multiview-telemetry",
  "multiview-weather",
  "multiview-webrtc",

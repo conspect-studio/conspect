@@ -1029,6 +1029,15 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
     .entered();
     let _resource =
         multiview_ffmpeg::ResourceGuard::enter(multiview_ffmpeg::ResourceContext::source(&plan.id));
+    // The audio rail shares the video rail's SRT listener through its relay; two
+    // libav contexts could not both own the port.
+    let srt_listener = multiview_output::sink::is_srt_listener_url(&plan.location)
+        .then(|| crate::srt_ingest::acquire(&plan.location))
+        .transpose()
+        .unwrap_or_else(|reason| {
+            tracing::warn!(source = %plan.id, %reason, "srt audio listener unavailable");
+            None
+        });
     let mut attempt: u32 = 0;
     let mut jitter = JitterRng::seeded(&plan.id);
     loop {
@@ -1076,6 +1085,7 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         } else {
             None
         };
+        let pinned = pinned.or_else(|| srt_listener.as_ref().map(|b| b.local_url().to_owned()));
         tracing::info!(
             source = %plan.id,
             location = %pinned.as_deref().unwrap_or(&plan.location),

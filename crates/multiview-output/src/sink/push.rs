@@ -544,8 +544,55 @@ fn write_session(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::is_srt_listener_url;
+    use super::{deliver, is_srt_listener_url, Client};
+    use crate::push_link::PushLinkStatus;
+    use ffmpeg_next::codec::packet::{Flags, Packet};
+    use multiview_ffmpeg::EncodedPacket;
+
+    fn video(key: bool) -> EncodedPacket {
+        let mut packet = Packet::new(16);
+        if key {
+            packet.set_flags(Flags::KEY);
+        }
+        EncodedPacket::from_packet(packet)
+    }
+
+    #[test]
+    fn a_session_starts_on_a_video_keyframe_and_overflow_regates_it() {
+        let link = PushLinkStatus::new("srt", true, "srt://[::]:9000");
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let mut client = Client { tx, gated: true };
+        let mut audio = Packet::new(16);
+        audio.set_flags(Flags::KEY); // every AAC packet is flagged key
+        let audio = EncodedPacket::from_audio_packet(audio);
+
+        assert!(deliver(&mut client, &video(false), &link));
+        assert!(deliver(&mut client, &audio, &link));
+        assert!(rx.try_recv().is_err(), "nothing before the first video key");
+        assert_eq!(link.dropped(), 2);
+
+        assert!(deliver(&mut client, &video(true), &link));
+        assert!(!client.gated, "the keyframe opened the gate");
+        assert!(deliver(&mut client, &audio, &link));
+        assert!(rx.try_recv().unwrap().is_keyframe(), "first out is the key");
+        assert!(rx.try_recv().is_ok(), "audio flows after the gate");
+
+        // Fill the queue: overflow sheds and re-gates instead of a mid-GOP hole.
+        assert!(deliver(&mut client, &video(false), &link));
+        assert!(deliver(&mut client, &video(false), &link));
+        assert!(deliver(&mut client, &video(false), &link));
+        assert!(client.gated, "overflow re-gates on the next keyframe");
+        assert_eq!(link.dropped(), 3);
+
+        drop(rx);
+        client.gated = false;
+        assert!(
+            !deliver(&mut client, &video(true), &link),
+            "gone writer is removed"
+        );
+    }
 
     #[test]
     fn listener_detection() {

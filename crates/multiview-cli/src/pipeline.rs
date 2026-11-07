@@ -11459,6 +11459,14 @@ fn ingest_loop(plan: &IngestPlan, stop: &AtomicBool) {
         drive_ndi(plan, name, stop);
         return;
     }
+    // Hold an SRT listener across reconnects so its port never closes between
+    // attempts; `open_and_stream` reports a bad URL through the retry bracket.
+    let _srt_listener = match &plan.location {
+        SourceLocation::Url(url) if multiview_output::sink::is_srt_listener_url(url) => {
+            crate::srt_ingest::acquire(url).ok()
+        }
+        _ => None,
+    };
     let tag = CanvasColor::default().output_tag();
     let mut attempt: u32 = 0;
     let mut jitter = JitterRng::seeded(&plan.id);
@@ -12537,6 +12545,14 @@ fn open_and_stream(
             // the post-open discard + reconnect bracket as the remaining guards
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
             let open_url = main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h);
+            // libav cannot bind a dual-stack SRT listener: read its local relay.
+            let open_url = if multiview_output::sink::is_srt_listener_url(&open_url) {
+                crate::srt_ingest::acquire(&open_url)?
+                    .local_url()
+                    .to_owned()
+            } else {
+                open_url
+            };
             // A live HLS media playlist is fetched by our parallel-range segment
             // fetcher and read by libav from loopback memory (see `hls_fetch`);
             // anything it cannot serve (VOD, encrypted, fMP4) opens directly.

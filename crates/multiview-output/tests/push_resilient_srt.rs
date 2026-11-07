@@ -221,6 +221,23 @@ fn wildcard_listener_is_dual_stack_and_reports_real_peers() {
     run.handle.join().unwrap();
 }
 
+/// `0.0.0.0` is what production configs say today; on the native path it binds
+/// v4-mapped, which must still take IPv4 callers.
+#[test]
+fn explicit_ipv4_wildcard_listener_still_serves_ipv4_callers() {
+    let port = port();
+    let run = start(format!("srt://0.0.0.0:{port}?mode=listener"), true, paced());
+    wait_for("listening", Duration::from_secs(5), || {
+        run.link.snapshot().state == PushLinkState::Listening
+    });
+    assert_decoded(caller_over("127.0.0.1", port, 20), "ipv4 caller");
+    let snap = run.link.snapshot();
+    assert_eq!(snap.sessions, 1, "exactly the one caller: {snap:?}");
+    assert!(snap.written > 0, "packets reached the caller: {snap:?}");
+    run.stop.store(true, Ordering::Release);
+    run.handle.join().unwrap();
+}
+
 /// Chaos (R3, invariants #1/#10): callers connecting and vanishing without a
 /// clean close must never slow the producer, and every session must be released.
 #[test]
