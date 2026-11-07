@@ -14,6 +14,7 @@ use multiview_config::{MultiviewConfig, StartMode};
 use multiview_control::{
     boot_model::{load_desired, BootModel},
     command_bus,
+    config_watch::{spawn as spawn_watch, WatchOptions},
     routes::graphics::effective_graphics,
     AppState, EngineStateSnapshot, InMemoryRepository,
 };
@@ -499,4 +500,45 @@ async fn revert_to_start_removes_graphics_edits_for_good() {
     let restarted = restart(&path);
     assert_eq!(read(&restarted, ITEM).await.0, StatusCode::NOT_FOUND);
     assert_eq!(read(&restarted, SOURCE).await.0, StatusCode::NOT_FOUND);
+}
+
+/// A file edit replaces the whole envelope. The hub is the base of the next
+/// graphics mutation, so it must follow, or that mutation writes back content
+/// the accepted file no longer holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_edit_cannot_be_undone_by_the_next_graphics_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boot.toml");
+    std::fs::write(&path, BOOT).unwrap();
+    let config = MultiviewConfig::load_from_toml(BOOT).unwrap();
+    let state = state_for(&path, &config);
+    let router = multiview_control::router(state.clone());
+    let (options, mut poll) = WatchOptions::default().with_manual_poll();
+    let watch = spawn_watch(path.clone(), config, state.clone(), options);
+    for _ in 0..2 {
+        assert!(poll.poll_once().await);
+    }
+    seed_graphics(&router).await;
+
+    let edited = dir.path().join("edited.toml");
+    std::fs::write(&edited, BOOT.replace("#101014", "#202024")).unwrap();
+    std::fs::rename(&edited, &path).unwrap();
+    for _ in 0..2 {
+        assert!(poll.poll_once().await);
+    }
+    assert_eq!(state.config_watch.snapshot().applied_count, 1);
+
+    put_ok(
+        &router,
+        "/api/v1/graphics/data-sources/other",
+        None,
+        &data_source("Other"),
+    )
+    .await;
+    let desired = load_desired(&path).unwrap().unwrap();
+    assert!(
+        desired.config.graphics.item("syd7").is_none(),
+        "a graphics commit resurrected content the file edit replaced"
+    );
+    watch.stop();
 }
