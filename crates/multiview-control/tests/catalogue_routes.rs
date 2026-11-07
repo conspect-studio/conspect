@@ -514,7 +514,7 @@ fn linked_source(id: &str, url: &str, channel: &str, feed: &str) -> Value {
 }
 
 #[tokio::test]
-async fn already_added_is_scoped_to_the_callers_visible_sources() {
+async fn index_carries_no_already_added_and_is_identical_across_principals() {
     let dir = tempfile::tempdir().unwrap();
     let cat = catalogue_in(dir.path(), FixtureFetcher::new());
     let h = harness_for(&cat);
@@ -551,44 +551,36 @@ async fn already_added_is_scoped_to_the_callers_visible_sources() {
         .await;
         assert_eq!(r.status(), StatusCode::CREATED, "{id}");
     }
-    let flagged = |idx: &Value, k: &str| {
-        idx["streams"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["k"] == k)
-            .unwrap()["flags"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f == "already_added")
+    // `already_added` is client-computed: the server never sets it, and the
+    // index is byte-identical for principals with different visible sources
+    // (so nothing about other callers' sources can leak through it).
+    let fetch = |tok: &'static str| {
+        let router = h.router.clone();
+        async move {
+            let resp = send(&router, get("/api/v1/catalogues/iptv-org/index", tok)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let etag = support::etag(&resp);
+            (etag, body_bytes(resp).await)
+        }
     };
-    let admin_idx = body_json(
-        send(
-            &h.router,
-            get("/api/v1/catalogues/iptv-org/index", ADMIN_TOKEN),
-        )
-        .await,
-    )
-    .await;
-    assert!(
-        flagged(&admin_idx, a["k"].as_str().unwrap())
-            && flagged(&admin_idx, b["k"].as_str().unwrap())
+    let (admin_etag, admin_raw) = fetch(ADMIN_TOKEN).await;
+    let (scoped_etag, scoped_raw) = fetch(SCOPED_TOKEN).await;
+    assert_eq!(
+        admin_raw, scoped_raw,
+        "index bytes must not depend on the caller"
     );
-    // The scoped principal may only see `scoped-layout`: src-a must NOT be revealed.
-    let scoped_idx = body_json(
-        send(
-            &h.router,
-            get("/api/v1/catalogues/iptv-org/index", SCOPED_TOKEN),
-        )
-        .await,
-    )
-    .await;
-    assert!(
-        !flagged(&scoped_idx, a["k"].as_str().unwrap()),
-        "BOLA: scoped caller learned another source is linked"
-    );
-    assert!(flagged(&scoped_idx, b["k"].as_str().unwrap()));
+    assert_eq!(admin_etag, scoped_etag, "base ETag for every caller");
+    let idx: Value = serde_json::from_slice(&admin_raw).unwrap();
+    for r in idx["streams"].as_array().unwrap() {
+        assert!(
+            !r["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "already_added"),
+            "server must not set already_added: {r}"
+        );
+    }
 }
 
 #[tokio::test]

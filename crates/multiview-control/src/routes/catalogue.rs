@@ -7,7 +7,7 @@
 //! | `POST probes` | write (operate) |
 //! | `POST refresh` / `POST import` | administer |
 //!
-//! `already_added` and link status are computed per caller over the sources the
+//! Link status is computed per caller over the sources the
 //! caller may see (per-object authz, BOLA) — never over the global set.
 
 use std::collections::HashSet;
@@ -49,34 +49,6 @@ fn enabled(state: &AppState) -> ControlResult<&std::sync::Arc<crate::catalogue::
             "the IPTV-ORG catalogue is disabled ([catalogues.iptv_org] enabled = false)".to_owned(),
         ))
     }
-}
-
-/// Per-caller view of the sources' `origin.stream_url`s → `already_added` row keys.
-fn added_keys(
-    state: &AppState,
-    principal: &Principal,
-    snapshot: &crate::catalogue::index::Snapshot,
-) -> ControlResult<HashSet<String>> {
-    let urls: HashSet<String> = super::sources::visible_sources(state, principal)?
-        .iter()
-        .filter(|s| {
-            s.origin
-                .as_ref()
-                .is_some_and(|o| o.provider == links::PROVIDER)
-        })
-        .filter_map(|s| {
-            s.origin
-                .as_ref()
-                .and_then(|o| o.stream_url.clone())
-                .or_else(|| links::source_url(s))
-        })
-        .collect();
-    Ok(snapshot
-        .rows
-        .iter()
-        .filter(|r| urls.contains(&r.url))
-        .map(|r| r.k.clone())
-        .collect())
 }
 
 /// `GET /api/v1/catalogues/iptv-org/status`.
@@ -150,8 +122,8 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
         operation_id = "get_catalogue_index",
         tag = "catalogue",
         responses(
-            (status = 200, description = "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; `already_added` flagged per caller.", body = serde_json::Value),
-            (status = 304, description = "If-None-Match matched (and the caller has no linked sources)."),
+            (status = 200, description = "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; identical for every caller (`already_added` is computed by the web).", body = serde_json::Value),
+            (status = 304, description = "If-None-Match matched ."),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 503, description = "No snapshot yet; refresh or import first.", body = crate::problem::Problem),
         ),
@@ -169,56 +141,26 @@ pub(crate) async fn get_index(
             "no catalogue snapshot yet; POST /catalogues/iptv-org/refresh or /import".to_owned(),
         )
     })?;
-    let added = added_keys(&state, &principal, &snapshot)?;
-    // The shared cached body is only valid when nothing is `already_added` for this
-    // caller; otherwise the ETag also hashes the caller's added set.
-    let mut etag = snapshot.etag.clone();
-    if !added.is_empty() {
-        let mut keys: Vec<&String> = added.iter().collect();
-        keys.sort();
-        let mut h = <sha2::Sha256 as sha2::Digest>::new();
-        for k in keys {
-            sha2::Digest::update(&mut h, k.as_bytes());
-        }
-        etag = format!(
-            "{etag}-{}",
-            crate::catalogue::store::hex_prefix(&sha2::Digest::finalize(h), 4)
-        );
-    }
+    // The index is identical for every caller (`already_added` is computed by
+    // the web from its own visible sources), so the shared cached gzip body and
+    // the base ETag serve everyone.
+    let etag = snapshot.etag.clone();
     if etag_matches(&headers, &etag) {
         return Ok(with_etag(StatusCode::NOT_MODIFIED.into_response(), &etag));
     }
     let gz = accepts_gzip(&headers);
-    let body: Vec<u8> = if added.is_empty() {
-        match cat.cached_index() {
-            Some((cached, _)) if gz => cached.as_ref().clone(),
-            _ => {
-                let raw = index_body(&snapshot, None).ok_or_else(|| {
-                    ControlError::Repository("index serialization failed".to_owned())
-                })?;
-                if gz {
-                    crate::catalogue::store::gzip(&raw)
-                        .map_err(|e| ControlError::Repository(e.to_string()))?
-                } else {
-                    raw
-                }
+    let body: Vec<u8> = match cat.cached_index() {
+        Some((cached, _)) if gz => cached.as_ref().clone(),
+        _ => {
+            let raw = index_body(&snapshot, None)
+                .ok_or_else(|| ControlError::Repository("index serialization failed".to_owned()))?;
+            if gz {
+                crate::catalogue::store::gzip(&raw)
+                    .map_err(|e| ControlError::Repository(e.to_string()))?
+            } else {
+                raw
             }
         }
-    } else {
-        let snap = snapshot.clone();
-        let added = added.clone();
-        tokio::task::spawn_blocking(move || {
-            let raw = index_body(&snap, Some(&added))?;
-            if gz {
-                crate::catalogue::store::gzip(&raw).ok()
-            } else {
-                Some(raw)
-            }
-        })
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| ControlError::Repository("index serialization failed".to_owned()))?
     };
     let mut r = (StatusCode::OK, body).into_response();
     r.headers_mut().insert(

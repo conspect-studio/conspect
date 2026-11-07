@@ -531,7 +531,7 @@ impl ProbeService {
     fn try_reserve(&self) -> Option<AdmissionSlot> {
         use std::sync::atomic::Ordering;
         self.admitted
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_CONCURRENT + MAX_QUEUED).then_some(n + 1)
             })
             .ok()

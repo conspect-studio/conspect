@@ -142,7 +142,7 @@ The joined index row is one **stream**, carrying everything the UI filters on:
 | `blocklisted` | channel on the DMCA/NSFW blocklist — hidden by default | `blocklist` |
 | `unsupported` | protocol Conspect cannot ingest (`mmsh`) | URL scheme |
 | `no_metadata` | stream has no channel | `channel == null` |
-| `already_added` | a source is linked to this stream (computed per request, scoped to the caller's visible sources) | sources |
+| `already_added` | a source is linked to this stream — **client-computed**: the web derives it from the caller's own visible sources (`flagsOf`); the server never sets it | sources (web) |
 
 NSFW channels are excluded (iptv-org stopped distributing them in January 2024; the flag is still
 honoured defensively).
@@ -368,9 +368,8 @@ Where the implementation made a concrete choice or deviates from §2–§3:
   gazetteer (`crates/multiview-control/assets/iptv-org-gazetteer.tsv`, 1,973 cities, 42 KB;
   only cities referenced by a feed's `broadcast_area`). The embedded format is TSV, not
   gzip: it is already smaller than the header cost of compressing it.
-- **`already_added`** is computed per request over the sources the caller may see
-  (`authorize_object`), by `origin.stream_url` (else the source URL). The index `ETag` for
-  such callers also hashes their added set.
+- **`already_added`** is client-computed (web `flagsOf` over the sources the caller may see). The index is
+  byte-identical for every caller and shares one cached gzip body and the base `ETag`.
 - **Link status** is served at `GET /api/v1/catalogues/iptv-org/links` (per-object
   scoped; includes the change diff and ranked alternatives) and as a tally on `status`.
   `catalogue.link_status` is a lossless event on topic `inputs`, scoped by source id. The
@@ -409,10 +408,7 @@ release build is smaller and faster; host checks on mda001 are listed at the end
 | Web: MapLibre | 1,078 KB (286 KB gzip) + worker 507 KB (143 KB gzip) + CSS 70 KB (10 KB gzip) | Lazy: the main chunk contains no MapLibre code. |
 | Web: boundaries | 392 KB (115 KB gzip) | Lazy, fetched by the map only. |
 
-**Known cost to fix:** for a caller who already has linked sources, the index body is rebuilt and
-re-gzipped per request to mark `already_added`, which took about 3 s per request in this debug build.
-The web derives `already_added` itself from the stream URLs, so the server flag is redundant for the
-UI; the fix is to stop marking it server-side so every caller gets the shared cached body.
+**Fixed:** the server no longer marks `already_added` (the web computes it), so every caller gets the shared cached gzip body instead of a ~3 s per-request rebuild.
 
 **Host checks still needed on mda001 (release build):** RSS delta, sync wall time and CPU with a
 changed upstream, and probe CPU while the engine runs at full load.
