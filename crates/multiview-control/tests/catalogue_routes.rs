@@ -746,7 +746,7 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
                 &h.router,
                 get(
                     &format!("/api/v1/catalogues/iptv-org/probes/{id}"),
-                    VIEWER_TOKEN,
+                    OPERATOR_TOKEN,
                 ),
             )
             .await,
@@ -827,4 +827,79 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
     let p = limited.expect("rate limit reached");
     assert_eq!(p["type"], "/problems/too-many-requests");
     assert_eq!(p["status"], 429);
+}
+
+#[tokio::test]
+async fn probe_jobs_are_visible_only_to_their_owner_or_admin_and_while_sources_stay_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat = catalogue_in(dir.path(), FixtureFetcher::new());
+    let cat2 = Arc::clone(&cat);
+    let h = harness_with(move |s| {
+        s.with_catalogue(
+            cat2,
+            probe::ProbeService::new(Arc::new(Canned), "route-host".into()),
+        )
+    });
+    send(
+        &h.router,
+        post_json("/api/v1/catalogues/iptv-org/import", ADMIN_TOKEN, &bundle()),
+    )
+    .await;
+    let r = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/scoped-layout",
+            ADMIN_TOKEN,
+            &linked_source(
+                "scoped-layout",
+                "https://example.invalid/a.m3u8",
+                "NBC.us",
+                "SD",
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/catalogues/iptv-org/probes",
+            SCOPED_TOKEN,
+            &json!({ "source_ids": ["scoped-layout"] }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v1/catalogues/iptv-org/probes/{id}");
+    let status = |tok: &'static str| {
+        let router = h.router.clone();
+        let path = path.clone();
+        async move { send(&router, get(&path, tok)).await }
+    };
+    assert_eq!(status(SCOPED_TOKEN).await.status(), StatusCode::OK);
+    assert_eq!(status(ADMIN_TOKEN).await.status(), StatusCode::OK);
+    // Another principal: 404 with the same body as an unknown id.
+    let other = status(OPERATOR_TOKEN).await;
+    assert_eq!(other.status(), StatusCode::NOT_FOUND);
+    let other_body = body_json(other).await;
+    let unknown = send(
+        &h.router,
+        get("/api/v1/catalogues/iptv-org/probes/nope", OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let unknown_body = body_json(unknown).await;
+    assert_eq!(other_body["title"], unknown_body["title"]);
+    assert_eq!(other_body["status"], unknown_body["status"]);
+    // The owner loses access to the source: the job disappears for them.
+    let g = send(&h.router, get("/api/v1/sources/scoped-layout", ADMIN_TOKEN)).await;
+    let tag = support::etag(&g).unwrap();
+    let d = send(
+        &h.router,
+        support::delete_if_match("/api/v1/sources/scoped-layout", ADMIN_TOKEN, Some(&tag)),
+    )
+    .await;
+    assert!(d.status().is_success(), "{}", d.status());
+    assert_eq!(status(SCOPED_TOKEN).await.status(), StatusCode::NOT_FOUND);
 }

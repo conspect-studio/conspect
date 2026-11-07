@@ -446,6 +446,8 @@ struct Shared {
     order: VecDeque<String>,
     cache: HashMap<String, (Instant, String)>,
     jobs: HashMap<String, Vec<JobEntry>>,
+    /// Submitting principal (key id) per job.
+    job_owner: HashMap<String, String>,
     job_order: VecDeque<String>,
     rate: HashMap<String, VecDeque<Instant>>,
 }
@@ -758,13 +760,28 @@ impl ProbeService {
         let id = uuid::Uuid::new_v4().to_string();
         let mut g = self.lock();
         g.jobs.insert(id.clone(), entries);
+        g.job_owner.insert(id.clone(), principal.to_owned());
         g.job_order.push_back(id.clone());
         while g.job_order.len() > MAX_STORED {
             if let Some(old) = g.job_order.pop_front() {
                 g.jobs.remove(&old);
+                g.job_owner.remove(&old);
             }
         }
         Ok(id)
+    }
+
+    /// The submitting principal and linked source ids of a job, or `None`
+    /// for an unknown id (for per-object authorization on read).
+    #[must_use]
+    pub fn job_access(&self, id: &str) -> Option<(String, Vec<String>)> {
+        let g = self.lock();
+        let entries = g.jobs.get(id)?;
+        let owner = g.job_owner.get(id).cloned().unwrap_or_default();
+        Some((
+            owner,
+            entries.iter().filter_map(|e| e.source_id.clone()).collect(),
+        ))
     }
 
     /// A batch job as the web reads it, or `None` for an unknown id.

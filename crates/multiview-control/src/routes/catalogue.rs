@@ -604,9 +604,25 @@ pub(crate) async fn get_probe(
         .catalogue_probe
         .as_ref()
         .ok_or_else(|| ControlError::Conflict("no probe service on this node".to_owned()))?;
-    svc.job(&id)
-        .map(Json)
-        .ok_or(ControlError::NotFound { kind: "probe", id })
+    let not_found = |id: String| ControlError::NotFound { kind: "probe", id };
+    // BOLA: a job is visible only to its submitter or an administer-role
+    // principal, and only while every linked source is still authorised and
+    // visible; every other case is indistinguishable from an unknown id.
+    let (owner, source_ids) = svc.job_access(&id).ok_or_else(|| not_found(id.clone()))?;
+    if owner != principal.key_id && !principal.role.can(Action::Administer) {
+        return Err(not_found(id));
+    }
+    if !source_ids.is_empty() {
+        let visible = super::sources::visible_sources(&state, &principal)?;
+        for sid in &source_ids {
+            if crate::auth::authorize_object(&principal, sid).is_err()
+                || !visible.iter().any(|s| &s.id == sid)
+            {
+                return Err(not_found(id));
+            }
+        }
+    }
+    svc.job(&id).map(Json).ok_or_else(|| not_found(id))
 }
 
 /// `POST /api/v1/sources/{id}/network` — the §3a network-path report for any
