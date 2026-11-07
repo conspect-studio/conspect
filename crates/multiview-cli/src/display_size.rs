@@ -477,15 +477,14 @@ impl<D: HandoverDecoder> Handover<D> {
         let Some(decoder) = self.decoder.as_mut() else {
             return;
         };
-        let anchor = match self.anchor {
-            Some(anchor) => anchor,
-            None => {
-                let Some(pts) = D::is_key(packet).then(|| D::packet_pts(packet)).flatten() else {
-                    return;
-                };
-                self.anchor = Some(pts);
-                pts
-            }
+        let anchor = if let Some(anchor) = self.anchor {
+            anchor
+        } else {
+            let Some(pts) = D::is_key(packet).then(|| D::packet_pts(packet)).flatten() else {
+                return;
+            };
+            self.anchor = Some(pts);
+            pts
         };
         if let Err(e) = decoder.send(packet) {
             self.failure = Some(e);

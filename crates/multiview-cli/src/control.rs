@@ -2985,10 +2985,10 @@ input_id = "in_b"
                 ))),
             })
             .expect("apply layout");
-        let published = slot.load();
+        let before_apply = slot.load();
         drain.apply(&mut drive);
         assert!(
-            !Arc::ptr_eq(&published, &slot.load()),
+            !Arc::ptr_eq(&before_apply, &slot.load()),
             "the drain must publish the applied layout"
         );
         assert_eq!(*slot.load(), *drive.layout());

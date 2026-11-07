@@ -83,7 +83,7 @@ use multiview_config::{lower_rist_url, RistOptions};
 use multiview_config::{MultiviewConfig, Output, Source, SourceKind, SrtBackend, SrtOptions};
 use multiview_control::EngineStateSnapshot;
 use multiview_core::frame::FrameMeta;
-#[cfg(test)]
+#[cfg(all(test, feature = "overlay"))]
 use multiview_core::layout::Cell;
 use multiview_core::layout::Layout;
 use multiview_core::pixel::PixelFormat;
@@ -10159,10 +10159,6 @@ fn youtube_url_slot_for(
 /// synthetic source with invalid parameters. (Opening/decoding errors surface on
 /// the ingest thread later — they must never fail the *build* of a never-ending
 /// live source.)
-// A flat, one-arm-per-`SourceKind` dispatch plus the single feature-gated
-// `IngestPlan` struct literal: inherently long and clearer kept whole than split
-// across helpers (adding the `player` field tipped it one line over the 100 bound).
-#[allow(clippy::too_many_lines)]
 /// Whether this kind's producer runs the [`open_and_stream`] pump, which resizes
 /// to follow the layout. Generators and the NDI/WHIP drives keep the size they
 /// were planned at for their whole life, so they must keep the larger fallback:
@@ -10255,6 +10251,10 @@ impl DecoderOpenArgs {
     }
 }
 
+// A flat, one-arm-per-`SourceKind` dispatch plus the single feature-gated
+// `IngestPlan` struct literal: inherently long and clearer kept whole than split
+// across helpers (adding the `player` field tipped it one line over the 100 bound).
+#[allow(clippy::too_many_lines)]
 fn ingest_plan_for(
     source: &Source,
     tile_w: u32,
@@ -12974,7 +12974,7 @@ fn open_and_stream(
         // Follow the live layout. Off the clock: this is the decode thread, and
         // the blocking decoder open runs on the driver's helper thread.
         if let Some(driver) = display.as_mut() {
-            let step = driver.poll(last_raw_pts, Instant::now(), |resize| {
+            let display_step = driver.poll(last_raw_pts, Instant::now(), |resize| {
                 let args = DecoderOpenArgs {
                     id: plan.id.clone(),
                     params: reopen_params.clone(),
@@ -12984,7 +12984,7 @@ fn open_and_stream(
                 };
                 move || args.open(resize)
             });
-            match step {
+            match display_step {
                 DisplayStep::Idle => {}
                 DisplayStep::Retarget((w, h)) => to_tile = TileScaler::new(w, h),
                 DisplayStep::Cutover {
@@ -20422,6 +20422,63 @@ segment_ms = 1000
                 }
                 Err(other) => panic!("read failed: {other}"),
             }
+        }
+    }
+
+    fn h264_clip(path: &Path, open_gop: bool, seconds: u32) {
+        let params = format!(
+            "keyint=12:min-keyint=12:scenecut=0:bframes=3:b-pyramid=normal:open-gop={}",
+            u8::from(open_gop)
+        );
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc=size=320x240:rate=25:duration={seconds}"))
+            .args(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-x264-params"])
+            .arg(params)
+            .args(["-f", "mpegts"])
+            .arg(path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_real_h264_closed_gop_handover_is_seamless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        h264_clip(&path, false, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80);
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_h264_open_gop_handover_is_seamless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        h264_clip(&path, true, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80);
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
         }
     }
 

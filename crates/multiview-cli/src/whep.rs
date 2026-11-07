@@ -981,6 +981,37 @@ mod tests {
 
     use super::pump_turn_relays;
 
+    /// A source's frames change size when its decode follows a layout change. A
+    /// live preview must reopen on the new size, not feed a stale encoder.
+    #[test]
+    fn a_frame_size_change_reopens_the_preview_encoder() {
+        use multiview_compositor::pipeline::Nv12Image;
+        use multiview_core::color::ColorInfo;
+
+        use super::{PreviewCodec, PreviewVideoEncoder};
+        multiview_ffmpeg::ensure_initialized().expect("libav");
+        let encoder = PreviewVideoEncoder::new(PreviewCodec::Vp8);
+        let frame =
+            |w, h| Nv12Image::solid(w, h, 16, 128, 128, ColorInfo::default()).expect("nv12");
+        let opened = || {
+            encoder
+                .inner
+                .lock()
+                .expect("encoder lock")
+                .as_ref()
+                .map(|(_, size)| *size)
+        };
+        let _first = encoder.encode(&frame(64, 48));
+        if opened().is_none() {
+            return; // This libav has no VP8 encoder.
+        }
+        assert_eq!(opened(), Some((64, 48)));
+        let _second = encoder.encode(&frame(64, 48));
+        assert_eq!(opened(), Some((64, 48)));
+        let _resized = encoder.encode(&frame(32, 24));
+        assert_eq!(opened(), Some((32, 24)));
+    }
+
     #[test]
     fn preview_shapes_fit_negotiated_level_31() {
         assert_eq!(
