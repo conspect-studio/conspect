@@ -3,7 +3,7 @@
 #![warn(missing_docs)]
 
 use chrono::{DateTime, FixedOffset, Utc};
-use quick_xml::{events::Event, Reader};
+use quick_xml::{events::Event, Reader, XmlVersion};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -161,7 +161,8 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
         return Err(ParseError::LimitExceeded("bytes"));
     }
     let mut r = Reader::from_reader(bytes);
-    r.config_mut().trim_text(true);
+    // Text arrives in fragments split around entity references, so trimming
+    // happens once per element (at its end), never per fragment.
     let mut buf = Vec::new();
     let mut stack: Vec<Node> = Vec::new();
     let mut root = None;
@@ -188,7 +189,7 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
                     let a = a.map_err(|e| ParseError::Xml(e.to_string()))?;
                     attrs.insert(
                         String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-                        a.decode_and_unescape_value(r.decoder())
+                        a.decoded_and_normalized_value(XmlVersion::Implicit1_0, r.decoder())
                             .map_err(|e| ParseError::Xml(e.to_string()))?
                             .into_owned(),
                     );
@@ -211,7 +212,7 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
                     let a = a.map_err(|e| ParseError::Xml(e.to_string()))?;
                     attrs.insert(
                         String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-                        a.decode_and_unescape_value(r.decoder())
+                        a.decoded_and_normalized_value(XmlVersion::Implicit1_0, r.decoder())
                             .map_err(|e| ParseError::Xml(e.to_string()))?
                             .into_owned(),
                     );
@@ -230,11 +231,31 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
             }
             Event::Text(t) => {
                 if let Some(n) = stack.last_mut() {
-                    let s = t.unescape().map_err(|e| ParseError::Xml(e.to_string()))?;
+                    let s = t.decode().map_err(|e| ParseError::Xml(e.to_string()))?;
                     if s.len() > l.max_text_bytes.saturating_sub(n.text.len()) {
                         return Err(ParseError::LimitExceeded("text"));
                     }
                     n.text.push_str(&s);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(n) = stack.last_mut() {
+                    let resolved = reference
+                        .resolve_char_ref()
+                        .map_err(|e| ParseError::Xml(e.to_string()))?;
+                    let ch = if let Some(ch) = resolved {
+                        ch
+                    } else {
+                        let name = reference
+                            .decode()
+                            .map_err(|e| ParseError::Xml(e.to_string()))?;
+                        predefined_entity(&name)
+                            .ok_or_else(|| ParseError::Xml(format!("undeclared entity &{name};")))?
+                    };
+                    if ch.len_utf8() > l.max_text_bytes.saturating_sub(n.text.len()) {
+                        return Err(ParseError::LimitExceeded("text"));
+                    }
+                    n.text.push(ch);
                 }
             }
             Event::CData(t) => {
@@ -248,9 +269,14 @@ fn tree(bytes: &[u8], l: Limits) -> Result<Node, ParseError> {
                 }
             }
             Event::End(_) => {
-                let n = stack
+                let mut n = stack
                     .pop()
                     .ok_or_else(|| ParseError::Xml("unmatched end".into()))?;
+                let trimmed = n.text.trim();
+                if trimmed.len() != n.text.len() {
+                    let trimmed = trimmed.to_owned();
+                    n.text = trimmed;
+                }
                 if let Some(p) = stack.last_mut() {
                     p.children.push(n);
                 } else if root.replace(n).is_some() {
@@ -516,3 +542,16 @@ pub fn parse_observations_with_limits(b: &[u8], l: Limits) -> Result<Observation
 }
 #[cfg(test)]
 mod tests;
+
+/// The five entities XML predefines; every other entity needs a DTD, which is
+/// rejected, so an unknown reference is an error rather than silently dropped.
+fn predefined_entity(name: &str) -> Option<char> {
+    match name {
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        "apos" => Some('\''),
+        "quot" => Some('"'),
+        _ => None,
+    }
+}

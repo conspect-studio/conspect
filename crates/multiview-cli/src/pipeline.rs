@@ -16885,6 +16885,7 @@ segment_ms = 1000
     }
 
     /// A same-id caption-off transition advances the lifecycle before new cues.
+    #[cfg(feature = "overlay")]
     #[test]
     fn caption_generation_survives_caption_off_and_rejects_old_frame() {
         use multiview_core::time::MediaTime;
