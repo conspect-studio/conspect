@@ -91,6 +91,25 @@ pub enum Error {
         expected: u64,
     },
 
+    /// A [`Sampler`](crate::usage::Sampler) was asked for another sample after
+    /// its scope's root was reported gone.
+    ///
+    /// Sampling a tree that has ended is not an error in itself — the caller
+    /// retires the scope and registers a new generation. Continuing to drive the
+    /// *same* sampler is, because the retained sweep state and the cumulative
+    /// CPU total belong to a process that no longer exists; carrying either into
+    /// a new generation would charge one browser's work to another. A new
+    /// generation gets a new [`Sampler`](crate::usage::Sampler).
+    #[error("sampler for owner {owner} generation {generation} is finished: {detail}")]
+    ScopeEnded {
+        /// The owner whose scope ended.
+        owner: String,
+        /// The generation that ended (as a raw counter).
+        generation: u64,
+        /// What happened, in the sampler's own words.
+        detail: String,
+    },
+
     /// A job id the queue already tracks was used for a second job.
     #[error("job id {job} is already tracked")]
     DuplicateJob {

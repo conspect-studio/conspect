@@ -164,6 +164,68 @@ impl MemorySource {
     }
 }
 
+/// The identity a scope was **registered** with: the root pid and the
+/// `starttime` the caller read right after spawning it.
+///
+/// A pid alone is not an identity: between registration and the first sample the
+/// kernel can reap the browser and hand its pid to an unrelated process, and a
+/// sampler that compares `starttime` only from the second sample on would charge
+/// that impostor's whole tree to the dead scope on the first one. Carrying the
+/// registered `starttime` into
+/// [`sample_process_tree`] closes that window: the comparison happens on
+/// **every** sample, the first included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpectedRoot {
+    /// The root pid the scope was registered for.
+    pub pid: Pid,
+    /// The root's `starttime` (field 22 of `/proc/<pid>/stat`) at registration.
+    pub starttime: u64,
+}
+
+impl ExpectedRoot {
+    /// The identity of `pid`, reading its `starttime` now.
+    ///
+    /// This is what a caller uses immediately after spawning the browser: the
+    /// window between the spawn and this read is the only one a pid could be
+    /// recycled in, and the kernel cannot recycle a pid whose process is still
+    /// running, so the read returns the spawned process's own identity.
+    ///
+    /// `None` when `/proc/<pid>/stat` cannot be read or its `starttime` does not
+    /// parse — a caller that cannot establish an identity must not silently fall
+    /// back to a bare pid, which is the bug this type exists to prevent. The
+    /// `Result`-shaped [`try_read`](Self::try_read) is preferred when the caller
+    /// wants the reason.
+    #[must_use]
+    pub fn read<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Option<Self> {
+        let starttime = read_starttime(fs, pid)?;
+        Some(Self { pid, starttime })
+    }
+
+    /// The identity of `pid`, reading its `starttime` now.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] or [`Error::Parse`] when the process's `stat` cannot be read
+    /// or its `starttime` field cannot be parsed.
+    pub fn try_read<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Result<Self> {
+        let path = format!("{PROC}/{pid}/stat");
+        let body = fs.read_to_string(&path)?;
+        let starttime = parse_stat_starttime(&body)
+            .ok_or_else(|| Error::parse(&path, "could not read starttime (field 22)"))?;
+        Ok(Self { pid, starttime })
+    }
+
+    /// Whether `root_stat` is still the process this identity was registered
+    /// for. A `0` registered `starttime` (a kernel that did not report the
+    /// field) degrades the check to the pid alone, exactly as
+    /// [`ProcRecord::starttime`] does for a descendant.
+    #[must_use]
+    pub const fn matches(&self, pid: Pid, root_stat: &RootStat) -> bool {
+        self.pid.as_u32() == pid.as_u32()
+            && (self.starttime == 0 || self.starttime == root_stat.starttime)
+    }
+}
+
 /// The root process's own identity and reading, taken from one `stat` read.
 ///
 /// Its `starttime` is what makes the root's identity checkable across sweeps: a
@@ -304,6 +366,20 @@ pub struct PreviousSweep {
 }
 
 impl PreviousSweep {
+    /// `(len, size_bytes)` of the retained per-pid map.
+    ///
+    /// The cost test's measurement: over a fixed tree, a sweep that only
+    /// **replaces** the previous state leaves both unchanged, while a sweep that
+    /// accumulates into the map grows them. (`BTreeMap` has no `capacity()`;
+    /// `size_of` is its allocation proxy, and the map's own node footprint
+    /// dominates it.) `by_type` needs no such accessor — it is a fixed-length
+    /// array, so its length is always [`TYPE_COUNT`] and it is inline, never
+    /// heap-allocated.
+    #[must_use]
+    pub fn live_map_size(&self) -> (usize, usize) {
+        (self.live.len(), std::mem::size_of::<Self>())
+    }
+
     /// Remember `sample` for the next sweep.
     #[must_use]
     pub fn from_sample(sample: &ProcessTreeSample) -> Self {
@@ -453,10 +529,16 @@ impl TreeSample {
 /// CPU time of processes that have exited since is retained so a total never
 /// goes backwards, and the published total is held at its high-water mark.
 ///
-/// The root's identity is checked **first**: when `previous` carries a root
-/// `starttime` and this sweep reads a different one, the kernel has reused the
-/// pid for a new process and the result is [`TreeSample::RootGone`] — the walk
-/// does not even run, let alone report the impostor's CPU as the old scope's.
+/// The root's identity is checked **first**, on **every** sweep. `expected` is
+/// the identity the scope was registered with (see [`ExpectedRoot`]); when the
+/// live root's `starttime` differs from it the result is
+/// [`TreeSample::RootGone`] — the walk does not even run, let alone report the
+/// impostor's CPU as the old scope's. That check is what makes the **first**
+/// sample safe too: with only `previous` to compare against, a pid recycled
+/// between registration and the first sweep had nothing to be caught by.
+///
+/// The `previous` sweep's root identity is checked as well, so a caller that has
+/// no registration-time identity still gets the cross-sweep guard.
 ///
 /// # Errors
 ///
@@ -466,9 +548,17 @@ impl TreeSample {
 pub fn sample_process_tree<F: FsRoot + ?Sized>(
     fs: &F,
     root: Pid,
+    expected: Option<&ExpectedRoot>,
     previous: Option<&PreviousSweep>,
 ) -> Result<TreeSample> {
     let root_stat = read_root_stat(fs, root)?;
+    if let Some(expected) = expected {
+        if !expected.matches(root, &root_stat) {
+            // The registered process is not this pid any more (or the pid now
+            // names a different process): the scope ended before this sweep.
+            return Ok(TreeSample::RootGone);
+        }
+    }
     if let Some((previous_root, previous_starttime)) = previous.and_then(|state| state.root) {
         if previous_root == root && previous_starttime != root_stat.starttime {
             // The pid is the same but the process is not: the scope ended.
@@ -781,6 +871,19 @@ pub fn parse_stat_ppid(body: &str) -> Option<Pid> {
 pub fn parse_stat_starttime(body: &str) -> Option<u64> {
     let (_, tail) = body.rsplit_once(')')?;
     tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Read `starttime` (field 22 of `/proc/<pid>/stat`) for `pid` through `fs`.
+///
+/// This is the helper a caller uses to build the [`ExpectedRoot`] identity a
+/// process-tree scope is registered with, immediately after spawning the
+/// browser. `None` when the `stat` cannot be read or its `starttime` does not
+/// parse — never `0`, which would silently degrade a real identity check to a
+/// pid-only one.
+#[must_use]
+pub fn read_starttime<F: FsRoot + ?Sized>(fs: &F, pid: Pid) -> Option<u64> {
+    let body = fs.read_to_string(&format!("{PROC}/{pid}/stat")).ok()?;
+    parse_stat_starttime(&body)
 }
 
 /// The `--type=` value from a process `cmdline`, if any.

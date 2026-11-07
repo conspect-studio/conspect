@@ -20,6 +20,13 @@
 //! precede the `cgroup.subtree_control` write. A failed step means Conspect
 //! stays where it is and uses process-tree accounting with the
 //! `CgroupDelegationUnavailable` warning.
+//!
+//! **The plan is forward-only.** [`plan_leaf_move`] names exactly the steps an
+//! executor runs, in order; the undo of each step is derived by
+//! [`rollback_for`], which walks every step *before* the failure and asks
+//! [`LeafMoveStep::undo`] for its inverse, in reverse order. Nothing in the
+//! forward plan is a rollback step, so an executor that walks the plan never
+//! confuses "a step to run" with "a step to run on failure".
 
 use std::io;
 use std::path::PathBuf;
@@ -405,6 +412,11 @@ pub fn delegation_status<F: CgroupFs + ?Sized>(fs: &F, root: &str) -> Result<Del
 /// One step of the boot-time leaf move. **Nothing here executes**: the plan is
 /// returned as data so `main` can run it before any thread or child exists, and
 /// so a test can assert the order.
+///
+/// The forward plan ([`plan_leaf_move`]) contains only the six forward variants;
+/// [`MoveSelfBack`](Self::MoveSelfBack), [`RemoveLeaf`](Self::RemoveLeaf) and
+/// [`DisableController`](Self::DisableController) are produced **only** by
+/// [`undo`](Self::undo) and appear only in a [`rollback_for`] sequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LeafMoveStep {
@@ -420,24 +432,23 @@ pub enum LeafMoveStep {
         pid: u32,
         /// The `cgroup.procs` file to write it to.
         path: PathBuf,
+        /// The **parent's** `cgroup.procs` file: carried so
+        /// [`undo`](Self::undo) can produce a [`MoveSelfBack`](Self::MoveSelfBack)
+        /// without having to un-merge the leaf path back out.
+        back_to: PathBuf,
     },
     /// Read the parent's `cgroup.procs` and require it to be empty: a domain
     /// controller cannot be enabled while the parent holds processes.
     ///
-    /// Runs **immediately after** the rollback step of the move
-    /// ([`MoveSelfBack`](Self::MoveSelfBack)) and before any controller enable:
-    /// this is correct only because the whole plan executes before any thread or
-    /// child exists (ADR-0099 decision 8), so nothing else can be added to the
-    /// parent between the move-back and this verify, and it normally passes.
-    ///
-    /// Failure here means the verify itself could not be satisfied even with
-    /// this process back in the parent: roll back what has been done (already
-    /// encoded as the preceding [`MoveSelfBack`](Self::MoveSelfBack) and
-    /// [`RemoveLeaf`](Self::RemoveLeaf), see [`plan_with_rollback`]), then
-    /// **abort and stay** — this process remains in its current cgroup, keeps
-    /// process-tree accounting, raises the `CgroupDelegationUnavailable`
-    /// warning, and **no controller is enabled**, because the enable steps
-    /// follow this one and a failed verify must not fall through to them (see
+    /// A verify has **no undo** ([`undo`](Self::undo) is `None`): it changed
+    /// nothing, so there is nothing to restore. A failure here is handled by
+    /// [`rollback_for`], which reverses the real mutations that preceded it —
+    /// [`MoveSelfBack`](Self::MoveSelfBack) then
+    /// [`RemoveLeaf`](Self::RemoveLeaf) — and then the executor **aborts and
+    /// stays**: this process remains in its current cgroup, keeps process-tree
+    /// accounting, raises the `CgroupDelegationUnavailable` warning, and **no
+    /// controller is enabled**, because the enable steps follow this one and a
+    /// failed verify must not fall through to them (see
     /// [`LeafMoveStep::on_failure`]).
     VerifyParentEmpty {
         /// The parent's `cgroup.procs` file.
@@ -445,33 +456,40 @@ pub enum LeafMoveStep {
     },
     /// Read `cgroup.subtree_control` in the parent and require the controllers to
     /// be absent, so a re-run does not fail on a controller already enabled.
+    ///
+    /// Like every verify this has no undo: it reads.
     VerifyDelegationInPlace {
         /// The parent's `cgroup.subtree_control` file.
         path: PathBuf,
     },
     /// Enable one controller in the parent's `cgroup.subtree_control` (`+cpu`,
     /// `+memory`, `+pids`), in that order.
+    ///
+    /// Its undo is [`DisableController`](Self::DisableController), which is why a
+    /// failure at a later enable can restore the earlier ones instead of leaving
+    /// them on under a parent that no longer delegates.
     EnableController {
         /// The controller name.
         controller: &'static str,
         /// The `cgroup.subtree_control` file.
         path: PathBuf,
     },
-    /// **Rollback step.** Write our pid back into `parent`'s `cgroup.procs`,
-    /// undoing a completed [`MoveSelf`](Self::MoveSelf).
+    /// **Undo only.** Write our pid back into `parent`'s `cgroup.procs`, undoing
+    /// a completed [`MoveSelf`](Self::MoveSelf).
     ///
-    /// Present in the plan immediately after the move, before
-    /// [`VerifyParentEmpty`](Self::VerifyParentEmpty) has run, because "abort and
-    /// stay" is not an undo: once the move has happened, aborting *without* this
-    /// step would leave the process in a leaf under a parent that still holds
-    /// processes — exactly the bad state the verify exists to catch.
+    /// "Abort and stay" is not an undo: once the move has happened, aborting
+    /// *without* this step would leave the process in a leaf under a parent that
+    /// still holds processes — exactly the bad state the verify exists to catch.
+    ///
+    /// In a rollback it comes **before** [`RemoveLeaf`](Self::RemoveLeaf),
+    /// because a cgroup that holds a process cannot be removed.
     MoveSelfBack {
         /// The pid to write back (the caller's own).
         pid: u32,
         /// The **parent's** `cgroup.procs` file.
         to: PathBuf,
     },
-    /// **Rollback step.** Remove the leaf directory created by a completed
+    /// **Undo only.** Remove the leaf directory created by a completed
     /// [`CreateLeaf`](Self::CreateLeaf).
     ///
     /// Only meaningful once nothing is left in the leaf (the
@@ -479,6 +497,21 @@ pub enum LeafMoveStep {
     /// holds a process cannot be removed.
     RemoveLeaf {
         /// The leaf's absolute path.
+        path: PathBuf,
+    },
+    /// **Undo only.** Disable one controller in the parent's
+    /// `cgroup.subtree_control` by writing `-cpu`, `-memory` or `-pids`,
+    /// undoing a completed [`EnableController`](Self::EnableController).
+    ///
+    /// A rollback disables **every** enabled controller before it moves the
+    /// process back: an enabled domain controller under a parent that holds this
+    /// process is the state the forward order exists to avoid, so leaving one on
+    /// would make the "abort and stay" position indistinguishable from a
+    /// half-applied plan.
+    DisableController {
+        /// The controller name to remove from the enable list.
+        controller: &'static str,
+        /// The `cgroup.subtree_control` file.
         path: PathBuf,
     },
 }
@@ -495,8 +528,8 @@ pub enum FailureAction {
     /// cannot be enabled while an ancestor holds processes, so continuing past a
     /// failed verify would be both wrong and futile.
     ///
-    /// The undo steps are **not** implied by this value — they are concrete
-    /// [`LeafMoveStep`]s already in the plan (see [`plan_with_rollback`]), so the
+    /// The undo steps are **not** implied by this value — they are the concrete
+    /// [`LeafMoveStep`]s [`rollback_for`] derives from the failed plan, so the
     /// executor runs no hidden logic and a test can assert the exact sequence.
     AbortAfterRollback,
 }
@@ -513,6 +546,7 @@ impl LeafMoveStep {
             Self::VerifyParentEmpty { .. } => "verify_parent_empty",
             Self::VerifyDelegationInPlace { .. } => "verify_delegation_in_place",
             Self::EnableController { .. } => "enable_controller",
+            Self::DisableController { .. } => "disable_controller",
         }
     }
 
@@ -521,138 +555,120 @@ impl LeafMoveStep {
     /// ADR-0099 decision 8: "if any step fails, Conspect stays where it is, uses
     /// process-tree accounting, and raises the warning." "Where it is" means
     /// where it was *before the plan*, so a step that has already changed
-    /// something must be undone first: the move is reversed by the
-    /// [`MoveSelfBack`](Self::MoveSelfBack) rollback step the plan carries, and
-    /// nothing after the failed step — in particular no controller enable —
-    /// runs. The rollback steps themselves only ever abort (there is nothing
-    /// further to undo), which is what makes the sequence terminate.
+    /// something must be undone first: [`rollback_for`] reverses the completed
+    /// mutations, and nothing after the failed step — in particular no further
+    /// controller enable — runs. The undo steps themselves only ever abort
+    /// (there is nothing further to undo), which is what makes the sequence
+    /// terminate.
     #[must_use]
     pub const fn on_failure(&self) -> FailureAction {
         FailureAction::AbortAfterRollback
     }
 
-    /// Whether this step is a rollback step (an undo, not a forward move).
+    /// The step that undoes **this** step, or `None` when it changed nothing.
+    ///
+    /// * [`CreateLeaf`](Self::CreateLeaf) → [`RemoveLeaf`](Self::RemoveLeaf);
+    /// * [`MoveSelf`](Self::MoveSelf) → [`MoveSelfBack`](Self::MoveSelfBack);
+    /// * [`EnableController`](Self::EnableController) →
+    ///   [`DisableController`](Self::DisableController);
+    /// * both verifies → `None` (a read has nothing to restore).
+    ///
+    /// The three undo variants themselves have no undo: running one is already
+    /// the rollback, so asking for its inverse would loop. [`rollback_for`] is
+    /// the only consumer, and it reverses the undos of the steps before the
+    /// failure to get an executable order.
+    ///
+    /// Not `const`: producing an undo clones the step's [`PathBuf`], which a
+    /// constant evaluation cannot do.
     #[must_use]
-    pub const fn is_rollback(&self) -> bool {
-        matches!(self, Self::MoveSelfBack { .. } | Self::RemoveLeaf { .. })
+    pub fn undo(&self) -> Option<Self> {
+        match self {
+            Self::CreateLeaf { path } => Some(Self::RemoveLeaf { path: path.clone() }),
+            Self::MoveSelf { pid, back_to, .. } => Some(Self::MoveSelfBack {
+                pid: *pid,
+                to: back_to.clone(),
+            }),
+            Self::EnableController { controller, path } => Some(Self::DisableController {
+                controller,
+                path: path.clone(),
+            }),
+            // A verify changed nothing, and the three undo steps have no undo.
+            Self::VerifyParentEmpty { .. }
+            | Self::VerifyDelegationInPlace { .. }
+            | Self::MoveSelfBack { .. }
+            | Self::RemoveLeaf { .. }
+            | Self::DisableController { .. } => None,
+        }
     }
 }
 
-/// The ordered steps of ADR-0099 decision 8's boot-time move into `engine/`,
-/// **including the rollback steps**.
+/// The undo sequence that runs when the step at `index` of `plan` fails, in the
+/// order it must run.
 ///
-/// This is the plan an executor should run: [`plan_leaf_move`] is the forward
-/// steps alone (kept for the plain ordered view), while this function
-/// interleaves each undo beside what it undoes, because
-/// [`MoveSelf`](LeafMoveStep::MoveSelf) precedes
-/// [`VerifyParentEmpty`](LeafMoveStep::VerifyParentEmpty) and "abort and stay"
-/// therefore cannot be the whole story: a failed verify would otherwise leave
-/// the process parked in a leaf under a parent that still holds processes.
+/// Walk every step **strictly before** `index` — a step that has not run yet has
+/// nothing to undo — ask each for its [`undo`](LeafMoveStep::undo), drop the
+/// verifies (which return `None`), and reverse the result. The result is exposed
+/// as data rather than prose so the sequence is testable at **every** step, and
+/// it is total: `index == plan.len()` is a plan that ran to the end, so it yields
+/// the undo of the whole plan; an `index` **past** the end is not a position in
+/// any plan and yields an empty vector; an empty plan yields an empty vector.
 ///
-/// The sequence is:
+/// The order is load-bearing in both directions:
 ///
-/// 1. `create_leaf`
-/// 2. `move_self`
-/// 3. **`move_self_back`** — undo of 2, run only if a later step fails
-/// 4. `verify_parent_empty`
-/// 5. `verify_delegation_in_place`
-/// 6. **`remove_leaf`** — undo of 1, run only if a later step fails
-/// 7. `enable_controller` x3
+/// * Reversing puts the *latest* mutation's undo first, so a failure at
+///   `enable_controller memory` disables `cpu` first, and only then moves the
+///   process back and removes the leaf. Disabling an enabled domain controller
+///   before the move restores the no-internal-process precondition the forward
+///   plan depended on.
+/// * [`MoveSelfBack`](LeafMoveStep::MoveSelfBack) therefore precedes
+///   [`RemoveLeaf`](LeafMoveStep::RemoveLeaf): a cgroup that still holds a
+///   process cannot be removed.
 ///
-/// A failed step runs the rollback steps that precede it, in order, then
-/// aborts: [`LeafMoveStep::on_failure`] is [`FailureAction::AbortAfterRollback`]
-/// for every step. Nothing after the failed step runs, so a failed verify never
-/// falls through to a controller enable, and no controller is ever enabled in
-/// the same plan that rolled the move back.
+/// A rollback never contains an
+/// [`EnableController`](LeafMoveStep::EnableController): nothing in the undo
+/// direction turns a controller back on.
 ///
-/// The whole plan runs **before any thread or child exists** (ADR-0099 decision
-/// 8), which is what makes the rollback safe and what makes
-/// `verify_parent_empty` normally pass: at that point the only process the move
-/// could have put in the parent is this one, and step 3 takes it back out.
-#[must_use]
-pub fn plan_with_rollback(parent: &str, pid: u32) -> Vec<LeafMoveStep> {
-    let leaf = merge_cgroup_path(parent, ENGINE_LEAF);
-    let leaf_procs = merge_cgroup_path(&leaf, CGROUP_PROCS);
-    let parent_procs = merge_cgroup_path(parent, CGROUP_PROCS);
-    let mut steps = vec![
-        LeafMoveStep::CreateLeaf {
-            path: PathBuf::from(&leaf),
-        },
-        LeafMoveStep::MoveSelf {
-            pid,
-            path: PathBuf::from(&leaf_procs),
-        },
-        // The undo of the move, ahead of the verify that may require it.
-        LeafMoveStep::MoveSelfBack {
-            pid,
-            to: PathBuf::from(&parent_procs),
-        },
-        LeafMoveStep::VerifyParentEmpty {
-            path: PathBuf::from(&parent_procs),
-        },
-        LeafMoveStep::VerifyDelegationInPlace {
-            path: PathBuf::from(merge_cgroup_path(parent, CGROUP_SUBTREE_CONTROL)),
-        },
-        // The undo of the leaf creation, ahead of the enables that may require
-        // it.
-        LeafMoveStep::RemoveLeaf {
-            path: PathBuf::from(&leaf),
-        },
-    ];
-    for controller in REQUIRED_CONTROLLERS {
-        steps.push(LeafMoveStep::EnableController {
-            controller,
-            path: PathBuf::from(merge_cgroup_path(parent, CGROUP_SUBTREE_CONTROL)),
-        });
-    }
-    steps
-}
-
-/// The rollback steps that run when the step at `index` of `plan` fails, in the
-/// order they must run.
-///
-/// The result is exactly the plan's rollback steps at positions **strictly
-/// before** `index`: a step that has not run yet has nothing to undo, and a
-/// rollback step never re-runs itself (so a failure *in* a rollback step yields
-/// only the undos before it). That is what "each step's `on_failure()` says what
-/// to undo" means concretely, and it is exposed as data rather than prose so the
-/// sequence is testable at **every** step. An `index` that is not a position in
-/// the plan yields an empty vector (`index == plan.len()` is a successful run of
-/// every step, whose rollback is nothing).
-///
-/// The intended executor loop, for reference — it runs nothing hidden: walk the
-/// plan with the index, skip the [`is_rollback`](LeafMoveStep::is_rollback) steps
-/// (they are conditional undos, not forward steps), and on the first forward-step
-/// failure run [`rollback_for`] for that index, then abort with "not delegated".
-/// Running `plan_leaf_move` for the forward pass and this function for the
-/// failure pass is equivalent.
+/// ```ignore
+/// // The executor loop, which runs nothing hidden:
+/// for (index, step) in plan.iter().enumerate() {
+///     if let Err(_) = run(step) {
+///         for undo in rollback_for(&plan, index) {
+///             let _ = run(&undo); // best effort; the sequence only aborts
+///         }
+///         return Err("not delegated");
+///     }
+/// }
+/// ```
 #[must_use]
 pub fn rollback_for(plan: &[LeafMoveStep], index: usize) -> Vec<LeafMoveStep> {
-    plan.get(..index)
+    let mut undo: Vec<LeafMoveStep> = plan
+        .get(..index)
         .unwrap_or_default()
         .iter()
-        .filter(|step| step.is_rollback())
-        .cloned()
-        .collect()
+        .filter_map(LeafMoveStep::undo)
+        .collect();
+    undo.reverse();
+    undo
 }
 
 /// The **forward** ordered steps of ADR-0099 decision 8's boot-time move into
 /// `engine/`.
 ///
 /// The order is the decision's, and it is load-bearing: create the leaf, move
-/// this pid into it, confirm the service cgroup no longer holds a process, then
-/// (and only then) enable `cpu memory pids` in the parent's
-/// `cgroup.subtree_control`.
+/// this pid into it, confirm the service cgroup no longer holds a process,
+/// confirm nothing is already enabled, then (and only then) enable
+/// `cpu memory pids` in the parent's `cgroup.subtree_control`.
 ///
-/// This is the forward view only. Use [`plan_with_rollback`] to get the same
-/// steps with the undos interleaved — the shape an executor needs, because the
-/// move precedes the verify and a failed verify must reverse the move rather
-/// than merely stop. `pid` is the caller's own pid: the later slice reads it in
-/// `main`, **before any thread or child exists**, which is what removes the
-/// migration race and what makes both the move and its rollback safe.
+/// This is the whole plan. There are no rollback steps in it: when a step fails,
+/// [`rollback_for`] derives the undo of every step that already ran, in reverse
+/// order. `pid` is the caller's own pid: the later slice reads it in `main`,
+/// **before any thread or child exists**, which is what removes the migration
+/// race and what makes both the move and its rollback safe.
 #[must_use]
 pub fn plan_leaf_move(parent: &str, pid: u32) -> Vec<LeafMoveStep> {
     let leaf = merge_cgroup_path(parent, ENGINE_LEAF);
+    let parent_procs = merge_cgroup_path(parent, CGROUP_PROCS);
+    let subtree_control = merge_cgroup_path(parent, CGROUP_SUBTREE_CONTROL);
     let mut steps = vec![
         LeafMoveStep::CreateLeaf {
             path: PathBuf::from(&leaf),
@@ -660,18 +676,19 @@ pub fn plan_leaf_move(parent: &str, pid: u32) -> Vec<LeafMoveStep> {
         LeafMoveStep::MoveSelf {
             pid,
             path: PathBuf::from(merge_cgroup_path(&leaf, CGROUP_PROCS)),
+            back_to: PathBuf::from(&parent_procs),
         },
         LeafMoveStep::VerifyParentEmpty {
-            path: PathBuf::from(merge_cgroup_path(parent, CGROUP_PROCS)),
+            path: PathBuf::from(&parent_procs),
         },
         LeafMoveStep::VerifyDelegationInPlace {
-            path: PathBuf::from(merge_cgroup_path(parent, CGROUP_SUBTREE_CONTROL)),
+            path: PathBuf::from(&subtree_control),
         },
     ];
     for controller in REQUIRED_CONTROLLERS {
         steps.push(LeafMoveStep::EnableController {
             controller,
-            path: PathBuf::from(merge_cgroup_path(parent, CGROUP_SUBTREE_CONTROL)),
+            path: PathBuf::from(&subtree_control),
         });
     }
     steps
@@ -743,6 +760,7 @@ mod tests {
             Some(&LeafMoveStep::MoveSelf {
                 pid: 4242,
                 path: PathBuf::from("/sys/fs/cgroup/conspect.service/engine/cgroup.procs"),
+                back_to: PathBuf::from("/sys/fs/cgroup/conspect.service/cgroup.procs"),
             })
         );
         let enabled: Vec<&str> = steps

@@ -28,9 +28,15 @@ use common::{kernel_stat_line, normalise, CountingRoot, FakeRoot, ProcSpec, Proc
 
 use multiview_webengine::{
     parse_stat_comm, parse_stat_cpu_ticks, parse_stat_ppid, parse_stat_starttime,
-    read_cgroup_usage, sample_process_tree, ChromiumProcessType, FsRoot, MemorySource, Pid,
-    ProcRecord, Sampler, CHROMIUM_PROCESS_TYPES,
+    read_cgroup_usage, sample_process_tree, ChromiumProcessType, ExpectedRoot, FsRoot,
+    MemorySource, Pid, ProcRecord, Sampler, CHROMIUM_PROCESS_TYPES,
 };
+
+/// The identity a sampler is handed for a fixture root: exactly what a caller
+/// reads right after spawning the browser.
+fn registered_root(root: &Path, pid: u32) -> ExpectedRoot {
+    ExpectedRoot::read(root, Pid::new(pid)).expect("the fixture root has a starttime")
+}
 
 /// The six-type Chromium tree used by the regression test.
 ///
@@ -135,7 +141,7 @@ fn record_for(sample: &multiview_webengine::ProcessTreeSample, pid: u32) -> &Pro
 fn the_whole_tree_sums_every_chromium_process_type() {
     // The regression test: all six types are present, and the sum covers them.
     let tree = chromium_tree();
-    let sample = sample_process_tree(tree.root(), Pid::new(100), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(100), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -203,7 +209,7 @@ fn a_process_tree_produces_a_cpu_cores_reading_from_two_readings() {
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
 
     let mut first = sampler
-        .sample_tree(tree.root(), Pid::new(100))
+        .sample_tree(tree.root(), registered_root(tree.root(), 100))
         .expect("first walk")
         .into_sample()
         .expect("a live root");
@@ -233,7 +239,7 @@ fn exited_child_time_is_retained_so_totals_never_go_backwards() {
 
     // Sample A: the full tree, 135 ticks.
     let first = sampler
-        .sample_tree(tree.root(), Pid::new(100))
+        .sample_tree(tree.root(), registered_root(tree.root(), 100))
         .expect("first walk")
         .into_sample()
         .expect("a live root");
@@ -243,7 +249,7 @@ fn exited_child_time_is_retained_so_totals_never_go_backwards() {
     // The renderer (30 ticks) exits before the next walk.
     tree.remove(101);
     let second = sampler
-        .sample_tree(tree.root(), Pid::new(100))
+        .sample_tree(tree.root(), registered_root(tree.root(), 100))
         .expect("second walk")
         .into_sample()
         .expect("a live root");
@@ -288,7 +294,7 @@ fn a_grandchild_exit_in_the_same_interval_is_retained() {
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
 
     let first = sampler
-        .sample_tree(tree.root(), Pid::new(300))
+        .sample_tree(tree.root(), registered_root(tree.root(), 300))
         .expect("first walk")
         .into_sample()
         .expect("a live root");
@@ -297,7 +303,7 @@ fn a_grandchild_exit_in_the_same_interval_is_retained() {
 
     tree.remove(302);
     let second = sampler
-        .sample_tree(tree.root(), Pid::new(300))
+        .sample_tree(tree.root(), registered_root(tree.root(), 300))
         .expect("second walk")
         .into_sample()
         .expect("a live root");
@@ -319,7 +325,7 @@ fn a_reused_pid_is_a_new_process_and_its_predecessors_time_is_retained() {
     ]);
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
     let first = sampler
-        .sample_tree(tree.root(), Pid::new(100))
+        .sample_tree(tree.root(), registered_root(tree.root(), 100))
         .expect("first walk")
         .into_sample()
         .expect("a live root");
@@ -334,7 +340,7 @@ fn a_reused_pid_is_a_new_process_and_its_predecessors_time_is_retained() {
             .with_starttime(999),
     );
     let second = sampler
-        .sample_tree(tree.root(), Pid::new(100))
+        .sample_tree(tree.root(), registered_root(tree.root(), 100))
         .expect("second walk")
         .into_sample()
         .expect("a live root");
@@ -367,7 +373,7 @@ fn a_live_process_whose_ticks_went_down_is_not_booked_as_exited() {
     ]);
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
     let first = sampler
-        .sample_tree(tree.root(), Pid::new(100))
+        .sample_tree(tree.root(), registered_root(tree.root(), 100))
         .expect("first walk")
         .into_sample()
         .expect("a live root");
@@ -377,7 +383,7 @@ fn a_live_process_whose_ticks_went_down_is_not_booked_as_exited() {
     // counter reset, not an exit.
     tree.update_stat(&ProcSpec::new(101, "chrome", 1, 1).with_parent(100));
     let second = sampler
-        .sample_tree(tree.root(), Pid::new(100))
+        .sample_tree(tree.root(), registered_root(tree.root(), 100))
         .expect("second walk")
         .into_sample()
         .expect("a live root");
@@ -402,7 +408,7 @@ fn a_comm_containing_parens_and_spaces_parses_from_the_last_paren() {
     let body = std::fs::read_to_string(fixture.join("proc/302/stat")).expect("the fixture");
     assert_eq!(parse_stat_comm(&body).as_deref(), Some("odd )( comm"));
 
-    let sample = sample_process_tree(fixture.as_path(), Pid::new(301), None)
+    let sample = sample_process_tree(fixture.as_path(), Pid::new(301), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -492,7 +498,7 @@ fn pss_is_preferred_and_the_rss_fallback_is_labelled() {
             .with_type("utility")
             .with_rss_only_kib(4096),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(200), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(200), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -525,7 +531,7 @@ fn memory_is_unavailable_not_zero_when_no_process_supplied_a_figure() {
             .with_parent(400)
             .with_type("renderer"),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(400), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(400), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -551,7 +557,7 @@ fn an_alive_root_with_no_descendants_still_reports_its_own_memory() {
     let tree = ProcTree::build(vec![ProcSpec::new(410, "chrome", 5, 5)
         .with_parent(1)
         .with_pss_kib(8192)]);
-    let sample = sample_process_tree(tree.root(), Pid::new(410), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(410), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -588,7 +594,7 @@ fn the_roots_own_memory_is_summed_into_the_tree_total() {
             .with_type("renderer")
             .with_pss_kib(2048),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(420), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(420), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -616,7 +622,7 @@ fn a_readable_root_with_unreadable_children_is_reported_as_the_weaker_source() {
             .with_parent(430)
             .with_type("renderer"),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(430), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(430), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -642,7 +648,7 @@ fn a_reused_root_pid_is_not_merged_into_the_old_scope() {
     ]);
     let mut sampler = Sampler::new(multiview_webengine::Accounting::Estimated);
     let first = sampler
-        .sample_tree(tree.root(), Pid::new(500))
+        .sample_tree(tree.root(), registered_root(tree.root(), 500))
         .expect("first walk")
         .into_sample()
         .expect("a live root");
@@ -658,7 +664,7 @@ fn a_reused_root_pid_is_not_merged_into_the_old_scope() {
     tree.update_stat(&reused_root);
 
     let second = sampler
-        .sample_tree(tree.root(), Pid::new(500))
+        .sample_tree(tree.root(), registered_root(tree.root(), 500))
         .expect("the second walk reads the root");
     assert_eq!(
         second,
@@ -673,15 +679,88 @@ fn a_reused_root_pid_is_not_merged_into_the_old_scope() {
         "no reading exists for a scope that ended, so nothing is folded in"
     );
 
-    // The retired scope's state was not replaced by the impostor: the sampler
-    // keeps reporting the ended scope until the caller registers a new
-    // generation.
+    // The retired scope's state was not replaced by the impostor, and the
+    // sampler is latched finished: the impostor is never adopted as the old
+    // scope, and the dead generation's retained state is not carried into a new
+    // one. The caller retires the scope and registers a new generation, which
+    // gets a new sampler.
     let third = sampler
-        .sample_tree(tree.root(), Pid::new(500))
-        .expect("a third walk");
+        .sample_tree(tree.root(), registered_root(tree.root(), 500))
+        .expect_err("a finished sampler is not reusable");
     assert!(
-        third.root_is_gone(),
-        "the impostor is never adopted as the old scope"
+        matches!(third, multiview_webengine::Error::ScopeEnded { .. }),
+        "the refusal is explicit and typed: {third}"
+    );
+    assert!(sampler.is_finished());
+}
+
+#[test]
+fn the_registered_starttime_is_checked_on_the_very_first_sample() {
+    // HIGH: `ScopeKind::ProcessTree` carried only the pid, so a pid the kernel
+    // recycled between registration and the first sample had nothing to be
+    // caught by — the impostor's whole tree was charged to the dead scope. The
+    // registered identity is compared on EVERY sample, the first included.
+    let tree = chromium_tree();
+    let live = tree.spec(100).starttime;
+
+    // The walk itself refuses, before it reads a single descendant.
+    let wrong = ExpectedRoot {
+        pid: Pid::new(100),
+        starttime: live + 1,
+    };
+    let first = sample_process_tree(tree.root(), Pid::new(100), Some(&wrong), None)
+        .expect("the first walk reads the root's stat");
+    assert_eq!(
+        first,
+        multiview_webengine::TreeSample::RootGone,
+        "the first sample is guarded too, not just the second"
+    );
+
+    // A pid that no longer exists at all is also not the registered root.
+    let gone = ExpectedRoot {
+        pid: Pid::new(999_999),
+        starttime: live,
+    };
+    assert_eq!(
+        sample_process_tree(tree.root(), Pid::new(100), Some(&gone), None)
+            .expect("the walk reads the root's stat"),
+        multiview_webengine::TreeSample::RootGone
+    );
+
+    // And the matching identity samples normally, so the guard is a guard and
+    // not a blanket refusal.
+    let right = ExpectedRoot {
+        pid: Pid::new(100),
+        starttime: live,
+    };
+    let sampled = sample_process_tree(tree.root(), Pid::new(100), Some(&right), None)
+        .expect("a walk")
+        .into_sample()
+        .expect("the registered root is the live root");
+    assert_eq!(sampled.process_count(), 5);
+}
+
+#[test]
+fn read_starttime_is_the_registration_helper_and_refuses_an_unknown_pid() {
+    let tree = chromium_tree();
+    assert_eq!(
+        multiview_webengine::read_starttime(tree.root(), Pid::new(100)),
+        Some(tree.spec(100).starttime),
+        "the caller reads field 22 right after spawning"
+    );
+    assert_eq!(
+        multiview_webengine::read_starttime(tree.root(), Pid::new(999_999)),
+        None,
+        "an unreadable root has no identity to register: never a fabricated 0"
+    );
+    assert_eq!(
+        ExpectedRoot::read(tree.root(), Pid::new(999_999)),
+        None,
+        "and the expected-identity helper refuses it the same way"
+    );
+    assert!(
+        ExpectedRoot::try_read(tree.root(), Pid::new(999_999)).is_err(),
+        "the fallible form names why"
     );
 }
 
@@ -690,7 +769,7 @@ fn a_first_sweep_of_a_new_root_records_its_starttime() {
     // The identity is recorded from the FIRST sample: without it there is
     // nothing to compare a later sweep against.
     let tree = chromium_tree();
-    let sample = sample_process_tree(tree.root(), Pid::new(100), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(100), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -711,12 +790,12 @@ fn a_first_sweep_of_a_new_root_records_its_starttime() {
 fn a_stable_root_starttime_does_not_end_the_scope() {
     // The guard must not fire on an ordinary sweep: same pid, same starttime.
     let tree = chromium_tree();
-    let first = sample_process_tree(tree.root(), Pid::new(100), None)
+    let first = sample_process_tree(tree.root(), Pid::new(100), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
     let previous = multiview_webengine::PreviousSweep::from_sample(&first);
-    let second = sample_process_tree(tree.root(), Pid::new(100), Some(&previous))
+    let second = sample_process_tree(tree.root(), Pid::new(100), None, Some(&previous))
         .expect("a walk")
         .into_sample()
         .expect("the same process is still the root");
@@ -730,7 +809,7 @@ fn a_stable_root_starttime_does_not_end_the_scope() {
 #[test]
 fn an_empty_tree_reports_memory_unavailable_rather_than_a_source() {
     let tree = ProcTree::build(vec![ProcSpec::new(700, "chrome", 4, 4)]);
-    let sample = sample_process_tree(tree.root(), Pid::new(700), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(700), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -760,7 +839,7 @@ fn every_documented_separator_and_source_is_read_through_a_root() {
         .with_file("proc/500/smaps_rollup", "Pss: 2 kB\n")
         .with_file("proc/501/cmdline", "/opt/chrome\0--type=gpu-process\0")
         .with_file("proc/501/smaps_rollup", "Pss: 1 kB\n");
-    let sample = sample_process_tree(&root, Pid::new(500), None)
+    let sample = sample_process_tree(&root, Pid::new(500), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -794,7 +873,7 @@ fn an_existing_but_empty_children_file_means_no_children_and_no_scan() {
         ProcSpec::new(801, "chrome", 1, 1).with_parent(800),
     ]);
     let root = CountingRoot::new(tree.root());
-    let sample = sample_process_tree(&root, Pid::new(800), None)
+    let sample = sample_process_tree(&root, Pid::new(800), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -821,7 +900,7 @@ fn a_missing_children_file_falls_back_per_node_not_only_when_the_union_is_empty(
         ProcSpec::new(901, "chrome", 3, 3).with_parent(900),
         ProcSpec::new(902, "chrome", 7, 2).with_parent(901),
     ]);
-    let sample = sample_process_tree(tree.root(), Pid::new(900), None)
+    let sample = sample_process_tree(tree.root(), Pid::new(900), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -847,7 +926,7 @@ fn a_two_hundred_process_sweep_reads_stat_once_per_process_and_scans_proc_once()
     let bare = wide_tree(SIZE, false);
     let bare_root = CountingRoot::new(bare.root());
     let started = Instant::now();
-    let bare_sample = sample_process_tree(&bare_root, Pid::new(1), None)
+    let bare_sample = sample_process_tree(&bare_root, Pid::new(1), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
@@ -875,7 +954,7 @@ fn a_two_hundred_process_sweep_reads_stat_once_per_process_and_scans_proc_once()
     let full = wide_tree(SIZE, true);
     let full_root = CountingRoot::new(full.root());
     let started = Instant::now();
-    let full_sample = sample_process_tree(&full_root, Pid::new(1), None)
+    let full_sample = sample_process_tree(&full_root, Pid::new(1), None, None)
         .expect("a walk")
         .into_sample()
         .expect("a live root");
