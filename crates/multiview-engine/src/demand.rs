@@ -408,6 +408,12 @@ pub struct DemandManager<T> {
     inner: Arc<Inner<T>>,
 }
 
+impl<T> std::fmt::Debug for DemandManager<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DemandManager").finish_non_exhaustive()
+    }
+}
+
 impl<T> Clone for DemandManager<T> {
     fn clone(&self) -> Self {
         Self {

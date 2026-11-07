@@ -8,7 +8,11 @@
 use std::collections::BTreeMap;
 
 use multiview_config::{MultiviewConfig, Source, SourceKind};
-use multiview_engine::{ConsumerClass, ConsumerTag, DemandConfig, RequestedSize, Rails, SetItem};
+use multiview_core::layout::{Cell, Layout};
+use multiview_engine::{
+    ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig, DemandManager, Rails, RequestedSize,
+    SetItem,
+};
 
 /// What one source must run at boot.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -85,6 +89,68 @@ pub fn audio_route_items(routing: Option<&multiview_config::AudioRouting>) -> Ve
             size: None,
         })
         .collect()
+}
+
+/// Convert a normalized fraction in `[0,1]` to a pixel count in `[0, extent]`,
+/// `as`-cast-free (the guardrails deny `as_conversions`).
+pub(crate) fn frac_to_px(frac: f32, extent: u32) -> u32 {
+    if !frac.is_finite() || frac <= 0.0 {
+        return 0;
+    }
+    let target = f64::from(frac) * f64::from(extent);
+    if target >= f64::from(extent) {
+        return extent;
+    }
+    // Largest u32 candidate whose lossless f64 widening is <= target.
+    let mut lo: u32 = 0;
+    let mut hi: u32 = extent;
+    while lo < hi {
+        let mid = lo.saturating_add((hi - lo).saturating_add(1) / 2);
+        if f64::from(mid) <= target {
+            lo = mid;
+        } else {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    lo
+}
+
+/// Convert a cell's normalized `w`/`h` into even pixel dimensions (NV12 needs
+/// even extents), clamped to at least 2x2.
+pub(crate) fn cell_dims(cell: &Cell, canvas_w: u32, canvas_h: u32) -> (u32, u32) {
+    let to_even_px = |frac: f32, extent: u32| -> u32 {
+        let raw = frac_to_px(frac, extent);
+        let even = raw & !1; // round down to even
+        even.max(2)
+    };
+    (to_even_px(cell.w, canvas_w), to_even_px(cell.h, canvas_h))
+}
+
+/// The layout consumers of `layout`: one per source-bound cell, sized to the
+/// cell so a shared decode is sized to its largest consumer.
+#[must_use]
+pub fn layout_items_for(layout: &Layout) -> Vec<SetItem> {
+    layout_items(layout.cells.iter().map(|cell| {
+        let (width, height) = cell_dims(cell, layout.canvas.width, layout.canvas.height);
+        (
+            cell.source.as_deref(),
+            Some(RequestedSize { width, height }),
+        )
+    }))
+}
+
+/// The command drain's demand seam: it republishes the layout consumers when
+/// the active layout's bindings change. Every call is wait-free.
+#[derive(Clone, Debug)]
+pub struct DrainDemand<T> {
+    /// The active layout's consumers.
+    pub layout: ConsumerSet<T>,
+    /// The subtitle routes' consumers.
+    pub subtitles: ConsumerSet<T>,
+    /// The manager, for restarting an edited source.
+    pub manager: DemandManager<T>,
+    /// The configured-source catalogue the rails read.
+    pub catalogue: crate::source_rails::Catalogue,
 }
 
 /// One consumer item per source-bound cell of `cells`, in order.

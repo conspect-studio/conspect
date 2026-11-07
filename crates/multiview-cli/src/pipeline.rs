@@ -8222,40 +8222,7 @@ fn cell_pixel_size(layout: &Layout, source_id: &str) -> Option<(u32, u32)> {
         .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
 }
 
-/// Convert a cell's normalized `w`/`h` into even pixel dimensions (NV12 needs
-/// even extents), clamped to at least 2x2.
-fn cell_dims(cell: &Cell, canvas_w: u32, canvas_h: u32) -> (u32, u32) {
-    let to_even_px = |frac: f32, extent: u32| -> u32 {
-        let raw = frac_to_px(frac, extent);
-        let even = raw & !1; // round down to even
-        even.max(2)
-    };
-    (to_even_px(cell.w, canvas_w), to_even_px(cell.h, canvas_h))
-}
-
-/// Convert a normalized fraction in `[0,1]` to a pixel count in `[0, extent]`,
-/// `as`-cast-free (the guardrails deny `as_conversions`).
-fn frac_to_px(frac: f32, extent: u32) -> u32 {
-    if !frac.is_finite() || frac <= 0.0 {
-        return 0;
-    }
-    let target = f64::from(frac) * f64::from(extent);
-    if target >= f64::from(extent) {
-        return extent;
-    }
-    // Largest u32 candidate whose lossless f64 widening is <= target.
-    let mut lo: u32 = 0;
-    let mut hi: u32 = extent;
-    while lo < hi {
-        let mid = lo.saturating_add((hi - lo).saturating_add(1) / 2);
-        if f64::from(mid) <= target {
-            lo = mid;
-        } else {
-            hi = mid.saturating_sub(1);
-        }
-    }
-    lo
-}
+use crate::source_demand::{cell_dims, frac_to_px};
 
 /// Resolve source-bound cells into canvas-space tile chrome, in cell order.
 #[cfg(feature = "overlay")]
