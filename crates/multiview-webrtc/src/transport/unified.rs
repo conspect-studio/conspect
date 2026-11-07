@@ -845,14 +845,14 @@ mod tests {
     struct FloodGuard {
         stop: Arc<AtomicBool>,
         flood_stop: Arc<AtomicBool>,
-        flooder: Option<std::thread::JoinHandle<()>>,
+        flooders: Vec<std::thread::JoinHandle<()>>,
     }
 
     impl Drop for FloodGuard {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
             self.flood_stop.store(true, Ordering::Release);
-            if let Some(flooder) = self.flooder.take() {
+            for flooder in self.flooders.drain(..) {
                 // A flooder panic must not double-panic during unwinding; the
                 // original failure is what the test reports.
                 let _ = flooder.join();
@@ -952,7 +952,7 @@ mod tests {
         // (see below); `FAIRNESS_EXHAUSTION_CAP` ends a window that never
         // finds one, which then fails the saturation precondition.
         const FAIRNESS_WINDOW_EXHAUSTIONS: u64 = 300;
-        const FAIRNESS_EXHAUSTION_CAP: u64 = 50_000;
+        const FAIRNESS_EXHAUSTION_CAP: u64 = 5_000;
         // Saturation proof (review PR193-06): within the measured window the
         // socket must stay continuously readable for this many consecutive
         // exhausted budgets — no drain reached `WouldBlock`, so the receive
@@ -960,16 +960,24 @@ mod tests {
         // observer can be scheduled is the production `yield_now` (the driver
         // runs `unconstrained`, so Tokio's coop budget cannot do it either);
         // without it the observer's gap is at least this run's length, which
-        // is over three times `MAX_TOLERATED_GAP`. This turns the no-yield
+        // is three times `MAX_TOLERATED_GAP`. This turns the no-yield
         // detection from a throughput assumption into a checked precondition.
-        const REQUIRED_DRY_FREE_RUN: u64 = 64;
+        // Kept modest because the kernel caps the receive queue (Linux
+        // `rmem_max` default ~208 KiB, about one budget of small datagrams);
+        // measured on 2 contended cores the longest run per window was 40-41.
+        const REQUIRED_DRY_FREE_RUN: u64 = 24;
+        // Several sender threads so a descheduled sender cannot let the
+        // (default ~200 KiB, about one budget) receive queue run dry on a
+        // contended 2-core runner. Bounded and joined by `FloodGuard`.
+        const FLOODER_THREADS: usize = 4;
         // The largest tolerated number of exhaustions between two consecutive
         // observer polls, as recorded by the observer itself. With the
-        // production `yield_now` on every exhausted budget the observer polls
-        // after every one or two (measured: 2); without it, the gap spans the
-        // whole dry-free run (measured: 52-84, and >= REQUIRED_DRY_FREE_RUN by
-        // construction).
-        const MAX_TOLERATED_GAP: u64 = 20;
+        // production `yield_now` on every exhausted budget the current-thread
+        // runtime polls the observer between consecutive exhaustions, so the
+        // gap is structurally 1-2 (measured 2, idle and on 2 contended cores);
+        // without it the gap spans the whole dry-free run (measured 52-84, and
+        // at least REQUIRED_DRY_FREE_RUN by construction).
+        const MAX_TOLERATED_GAP: u64 = 8;
         // Hang guard ONLY, never the pass/fail bound: every phase ends on a
         // count. The flooder itself stops sending at this deadline (it runs on
         // an OS thread, so this works even if a regression never lets the
@@ -1008,6 +1016,7 @@ mod tests {
         .expect("peer binds a v6 loopback");
         peer.set_nonblocking(true).expect("peer is non-blocking");
         let peer_addr = peer.local_addr().expect("peer addr");
+        let bound_v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, bound.port(), 0, 0));
 
         let probe = Arc::new(RunProbe::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -1021,11 +1030,11 @@ mod tests {
         let mut flood_guard = FloodGuard {
             stop: Arc::clone(&stop),
             flood_stop: Arc::clone(&flood_stop),
-            flooder: None,
+            flooders: Vec::with_capacity(FLOODER_THREADS),
         };
-        flood_guard.flooder = Some({
+        for _ in 0..FLOODER_THREADS {
             let flood_stop = Arc::clone(&flood_stop);
-            std::thread::spawn(move || {
+            flood_guard.flooders.push(std::thread::spawn(move || {
                 let s = UdpSocket::bind(SocketAddr::V6(SocketAddrV6::new(
                     Ipv6Addr::LOCALHOST,
                     0,
@@ -1042,8 +1051,8 @@ mod tests {
                         let _ = s.send_to(&junk, target);
                     }
                 }
-            })
-        });
+            }));
+        }
 
         // The INDEPENDENT fairness observer: a separate task on the SAME
         // single-threaded runtime, genuinely contending with the driver for
@@ -1240,6 +1249,10 @@ mod tests {
         let window_run = probe.max_dry_free_run.load(Ordering::Relaxed);
 
         stop.store(true, Ordering::Release);
+        // The idle tick is an hour away, so wake the driver with one datagram
+        // in case the flood has already ended: it must reach its top-of-loop
+        // stop check, not park on an empty socket.
+        let _ = peer.send_to(b"wake", bound_v6);
         let stopped = tokio::time::timeout(SAFETY_TIMEOUT, driver).await;
         // Hang guard only: the observer returns once it sees the driver stop.
         let (max_gap, observer_polls) = tokio::time::timeout(SAFETY_TIMEOUT, observer)
