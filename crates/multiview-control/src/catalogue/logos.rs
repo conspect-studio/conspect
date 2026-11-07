@@ -774,6 +774,8 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<LogoCache>>> {
 
 /// Install `cache` as the one serving `dir` (integration-test seam: lets a test
 /// drive the route over a scripted transport instead of the network).
+/// Compiled only with the `_test-seams` feature, never in a release preset.
+#[cfg(feature = "_test-seams")]
 #[doc(hidden)]
 pub fn register(dir: &Path, cache: Arc<LogoCache>) {
     lock(registry()).insert(dir.to_owned(), cache);
