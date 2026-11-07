@@ -687,7 +687,11 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
     });
     send(
         &h.router,
-        post_json("/api/v1/catalogues/iptv-org/import", ADMIN_TOKEN, &many_rows()),
+        post_json(
+            "/api/v1/catalogues/iptv-org/import",
+            ADMIN_TOKEN,
+            &many_rows(),
+        ),
     )
     .await;
     let idx = body_json(
