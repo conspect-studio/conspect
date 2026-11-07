@@ -370,6 +370,8 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::openapi_schemas::TimerOnTargetDoc,
         crate::openapi_schemas::TimerFormatDoc,
         crate::openapi_schemas::SourceWallClockDoc,
+        crate::openapi_schemas::SourceOriginDoc,
+        crate::openapi_schemas::OriginFollowDoc,
         crate::openapi_schemas::WallClockUseDoc,
         crate::openapi_schemas::EpgSourceDoc,
         crate::openapi_schemas::EpgModeDoc,

@@ -843,7 +843,7 @@ fn resolve_caption_plan(
 /// The HLS master URL for a source kind, if it is an HLS source.
 fn hls_url(kind: &multiview_config::SourceKind) -> Option<&str> {
     match kind {
-        multiview_config::SourceKind::Hls { url } => Some(url.as_str()),
+        multiview_config::SourceKind::Hls { url, .. } => Some(url.as_str()),
         _ => None,
     }
 }
@@ -1353,6 +1353,8 @@ mod tests {
         };
         let hls = SourceKind::Hls {
             url: "https://x/m.m3u8".to_owned(),
+            user_agent: None,
+            referrer: None,
         };
         assert!(dvbsub_selector(&ts, &CaptionSelector::Auto));
         assert!(dvbsub_selector(
@@ -1382,6 +1384,8 @@ mod tests {
         };
         let hls = SourceKind::Hls {
             url: "https://x/m.m3u8".to_owned(),
+            user_agent: None,
+            referrer: None,
         };
         assert!(incontainer_selector_active(&ts, &CaptionSelector::Auto));
         assert!(incontainer_selector_active(
@@ -1491,6 +1495,8 @@ mod tests {
         // Embedded CC rides the video, so it is offered for any video-decoded kind.
         let hls = SourceKind::Hls {
             url: "https://x/m.m3u8".to_owned(),
+            user_agent: None,
+            referrer: None,
         };
         assert_eq!(
             embedded_cc_channel(&hls, &field("cc1")),
@@ -1507,6 +1513,8 @@ mod tests {
         use multiview_config::SourceKind;
         let hls = SourceKind::Hls {
             url: "https://x/master.m3u8".to_owned(),
+            user_agent: None,
+            referrer: None,
         };
         assert_eq!(webvtt_language(&hls, &CaptionSelector::Auto), Some(None));
         assert_eq!(

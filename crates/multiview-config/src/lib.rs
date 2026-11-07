@@ -104,11 +104,11 @@ pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
     ColorOverride, DisplayModeSpec, EpgMode, EpgSource, Fps, Layout, MetadataCapability,
-    MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, Output,
-    OutputFlip, OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata,
+    MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, OriginFollow,
+    Output, OutputFlip, OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata,
     Overlay, PlaylistMetadata, Rect, RistAesBits, RistEncryption, RistOptions, RistPeer,
-    RistProfile, RistUrlError, Source, SourceAuth, SourceKind, SrtBackend, SrtEncryption,
-    SrtKeyLength, SrtMode, SrtOptions,
+    RistProfile, RistUrlError, Source, SourceAuth, SourceKind, SourceOrigin, SrtBackend,
+    SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -1465,6 +1465,21 @@ fn parse_fit(fit: Option<&str>) -> FitMode {
     }
 }
 
+/// Validate an HTTP header value carried in config: non-empty, printable
+/// (no control characters, so no CR/LF), at most 1 KiB.
+fn validate_header_value(v: &str) -> Result<(), String> {
+    if v.is_empty() {
+        return Err("must not be empty".to_owned());
+    }
+    if v.len() > 1024 {
+        return Err("must be at most 1024 bytes".to_owned());
+    }
+    if v.chars().any(char::is_control) {
+        return Err("must be printable (no CR/LF or control characters)".to_owned());
+    }
+    Ok(())
+}
+
 impl Source {
     /// Validate the optional `events.automation` rule bounds (ADR-0183).
     fn validate_automation(&self) -> Result<(), ConfigError> {
@@ -1472,6 +1487,33 @@ impl Source {
             rule.validate(&self.id).map_err(|e| {
                 ConfigError::Validation(format!("source {:?} events.automation: {e}", self.id))
             })?;
+        }
+        Ok(())
+    }
+
+    /// Provenance block and HLS request-header checks (IPTV-ORG, ADR-M015).
+    fn validate_origin_and_headers(&self) -> Result<(), ConfigError> {
+        if let Some(origin) = &self.origin {
+            if origin.provider.trim().is_empty() || origin.provider.len() > 64 {
+                return Err(ConfigError::Validation(format!(
+                    "source {:?} origin.provider must be 1..=64 characters",
+                    self.id
+                )));
+            }
+        }
+        if let SourceKind::Hls {
+            user_agent,
+            referrer,
+            ..
+        } = &self.kind
+        {
+            for (name, value) in [("user_agent", user_agent), ("referrer", referrer)] {
+                if let Some(v) = value {
+                    validate_header_value(v).map_err(|e| {
+                        ConfigError::Validation(format!("source {:?} {name}: {e}", self.id))
+                    })?;
+                }
+            }
         }
         Ok(())
     }
@@ -1500,6 +1542,7 @@ impl Source {
             })?;
         }
         self.validate_automation()?;
+        self.validate_origin_and_headers()?;
         match &self.kind {
             SourceKind::Solid { color } => {
                 if parse_hex_color(color).is_none() {
