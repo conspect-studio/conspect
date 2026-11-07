@@ -1827,6 +1827,14 @@ impl<T: Send + Sync + 'static> Inner<T> {
         {
             let mut book = lock(&self.book);
             let now = self.now();
+            // A start completing past its deadline is late whether or not the
+            // worker has expired it yet (review R2-04): account it once here.
+            if let Some(entry) = book.entries.get_mut(id) {
+                let overdue = entry.open_deadline.is_some_and(|deadline| now >= deadline);
+                if overdue && !entry.timed_out {
+                    self.expire_open(entry, now);
+                }
+            }
             // The worker is gone: nothing would ever stop these rails, so this
             // thread does (checked under the lock `stop_all` snapshots under).
             if self.stopping.load(Ordering::Acquire) {
@@ -3021,6 +3029,51 @@ mod tests {
             manager.inner.stuck_opens.load(Ordering::SeqCst) == 0
         });
         wait("deleted records retired", || manager.active_len() == 1);
+        manager.shutdown();
+    }
+
+    /// Review R2-04: a start that returns after its deadline, before the
+    /// worker's expiry pass, is still a dead attempt: counted as a timeout and
+    /// its rails stopped. The worker is parked for the whole (manual) start
+    /// timeout, so only the completion can see the deadline pass.
+    #[test]
+    fn a_start_completing_past_its_deadline_before_expiry_is_stale() {
+        let fake = Arc::new(Fake::default());
+        lock(&fake.wedged).insert("late".to_owned());
+        let offset = Arc::new(Mutex::new(Duration::ZERO));
+        let base = Instant::now();
+        let clock_offset = Arc::clone(&offset);
+        let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(&fake);
+        let manager = DemandManager::with_clock(
+            SourceRegistry::new(),
+            driver,
+            DemandConfig {
+                start_timeout: Duration::from_secs(600),
+                ..config(10)
+            },
+            Arc::new(move || base + *lock(&clock_offset)),
+        );
+        manager.start();
+        let lease = manager.acquire("late", Rails::VIDEO, tag("x"), None);
+        wait("opening", || fake.blocked.load(Ordering::SeqCst) == 1);
+        let generation = manager.status("late").generation;
+        *lock(&offset) = Duration::from_secs(601);
+        // Not expired: the worker is parked until the real deadline.
+        assert_eq!(
+            manager.status("late").starting,
+            Some(StartingPhase::Opening)
+        );
+        lock(&fake.wedged).clear();
+        wait("the late start is stopped", || {
+            *lock(&offset) += Duration::from_secs(1);
+            fake.video_stops.load(Ordering::SeqCst) == 1
+        });
+        wait("restarts as a new generation", || {
+            *lock(&offset) += Duration::from_secs(1);
+            let status = manager.status("late");
+            status.running.video && status.generation > generation
+        });
+        drop(lease);
         manager.shutdown();
     }
 
