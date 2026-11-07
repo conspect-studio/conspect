@@ -13,7 +13,7 @@ fn defaults_enabled_and_six_hours() {
 
 #[test]
 fn round_trips_and_rejects_short_intervals() {
-    let doc = "[iptv_org]\nenabled = false\ninterval = \"30m\"\nprobe_linked_every = \"1h\"\n";
+    let doc = "[iptv_org]\nenabled = false\ninterval = \"30m\"\nprobe_linked_every = \"60m\"\n";
     let c: CataloguesConfig = toml::from_str(doc).expect("parse");
     let i = c.iptv_org.as_ref().expect("iptv");
     assert!(!i.enabled);

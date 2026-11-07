@@ -216,7 +216,7 @@ headers). Probe jobs run on the control-plane runtime and a dedicated blocking p
 they never share a queue with the engine.
 
 Entry points: per-row **Probe**, **Probe all** for the visible results (capped at 50), and an
-optional schedule for linked sources (`[catalogues.iptv_org] probe_linked_every = "1h"`, off by
+optional schedule for linked sources (`[catalogues.iptv_org] probe_linked_every = "60m"`, off by
 default). A linked source that starts failing raises its link-health warning.
 
 Sample (120 random HLS streams, probed from a Dallas host, 2026-11-07): 86 returned a playlist,
@@ -375,5 +375,4 @@ Where the implementation made a concrete choice or deviates from §2–§3:
   directly (it carries the `user_agent`/`referer` AVOptions); the loopback segment
   fetcher and WebVTT variant pin do not carry them, so both are skipped for such a
   source. Sources without the fields are unchanged.
-- **Config.** `DurationString` now also accepts the `h` unit (`6h`); Display is unchanged
-  (a `6h` value re-serializes as `360m`).
+- **Config.** Durations use the existing `ms`/`s`/`m` units; there is no `h` unit (an existing test pins `30h` as rejected), so six hours is `360m`.

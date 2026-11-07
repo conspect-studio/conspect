@@ -75,11 +75,9 @@ impl FromStr for DurationString {
             (d, 1_000)
         } else if let Some(d) = trimmed.strip_suffix('m') {
             (d, 60_000)
-        } else if let Some(d) = trimmed.strip_suffix('h') {
-            (d, 3_600_000)
         } else {
             return Err(invalid(
-                "expected an explicit unit suffix: `ms`, `s`, `m`, or `h` (e.g. \"30s\")",
+                "expected an explicit unit suffix: `ms`, `s`, or `m` (e.g. \"30s\")",
             ));
         };
         if digits.is_empty() {

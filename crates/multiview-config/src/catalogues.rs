@@ -3,8 +3,8 @@
 //! ```toml
 //! [catalogues.iptv_org]
 //! enabled = true            # kill switch for sync + browse + probe (default true)
-//! interval = "6h"           # sync cadence (min 10m); jittered
-//! probe_linked_every = "1h" # optional: re-probe linked sources (off when absent)
+//! interval = "360m"         # sync cadence (min 10m); jittered
+//! probe_linked_every = "60m" # optional: re-probe linked sources (off when absent)
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ pub struct IptvOrgConfig {
     /// Master switch (default `true`). `false` disables sync, browse and probe.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Sync interval (explicit-unit string, default `6h` ⇒ `360m`; min 10 min).
+    /// Sync interval (explicit-unit string, default `360m` (6 h); min 10 min).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<crate::webrtc::DurationString>,
     /// Re-probe linked sources on this cadence (min 5 min). Absent ⇒ off.
