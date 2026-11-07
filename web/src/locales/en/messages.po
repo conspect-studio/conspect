@@ -699,7 +699,7 @@ msgid "Add and manage live ingest sources."
 msgstr "Add and manage live ingest sources."
 
 #: src/iptv/IptvOrgPage.tsx:889
-#: src/iptv/IptvOrgPage.tsx:1010
+#: src/iptv/IptvOrgPage.tsx:1022
 msgid "Add as source"
 msgstr "Add as source"
 
@@ -746,7 +746,7 @@ msgstr "Add selected ({0})"
 msgid "Add selected streams as sources"
 msgstr "Add selected streams as sources"
 
-#: src/iptv/IptvOrgPage.tsx:1005
+#: src/iptv/IptvOrgPage.tsx:1017
 msgid "Add stream {title} as source from details"
 msgstr "Add stream {title} as source from details"
 
@@ -4125,6 +4125,11 @@ msgstr "Guide (url-tvg): {0}"
 msgid "Guide feeds"
 msgstr "Guide feeds"
 
+#. placeholder {0}: s.guide.site
+#: src/iptv/IptvOrgPage.tsx:986
+msgid "Guide listed: {0}"
+msgstr "Guide listed: {0}"
+
 #: src/pages/IptvPage.tsx:141
 msgid "Guide URL"
 msgstr "Guide URL"
@@ -4584,6 +4589,10 @@ msgstr "iptv-org lists few local streams here: {localCount} in this city or with
 #: src/iptv/IptvOrgPage.tsx:539
 msgid "iptv-org lists few local streams here: none in this city or within {radius} km. Showing the state and national streams instead; many real stations are not in the catalogue."
 msgstr "iptv-org lists few local streams here: none in this city or within {radius} km. Showing the state and national streams instead; many real stations are not in the catalogue."
+
+#: src/iptv/IptvOrgPage.tsx:989
+msgid "iptv-org publishes no feed URL for it; supply the XMLTV URL yourself."
+msgstr "iptv-org publishes no feed URL for it; supply the XMLTV URL yourself."
 
 #: src/pages/DevicesPage.tsx:221
 msgid "IPv4 (legacy)"
@@ -6817,7 +6826,7 @@ msgid "Priority must be a whole number (higher is shed last)."
 msgstr "Priority must be a whole number (higher is shed last)."
 
 #: src/iptv/IptvOrgPage.tsx:880
-#: src/iptv/IptvOrgPage.tsx:999
+#: src/iptv/IptvOrgPage.tsx:1011
 #: src/iptv/SourceLinks.tsx:269
 msgid "Probe"
 msgstr "Probe"
@@ -6847,7 +6856,7 @@ msgstr "Probe requested"
 msgid "Probe result"
 msgstr "Probe result"
 
-#: src/iptv/IptvOrgPage.tsx:994
+#: src/iptv/IptvOrgPage.tsx:1006
 msgid "Probe stream {title} in details"
 msgstr "Probe stream {title} in details"
 

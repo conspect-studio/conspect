@@ -699,7 +699,7 @@ msgid "Add and manage live ingest sources."
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:889
-#: src/iptv/IptvOrgPage.tsx:1010
+#: src/iptv/IptvOrgPage.tsx:1022
 msgid "Add as source"
 msgstr ""
 
@@ -746,7 +746,7 @@ msgstr ""
 msgid "Add selected streams as sources"
 msgstr ""
 
-#: src/iptv/IptvOrgPage.tsx:1005
+#: src/iptv/IptvOrgPage.tsx:1017
 msgid "Add stream {title} as source from details"
 msgstr ""
 
@@ -4125,6 +4125,11 @@ msgstr ""
 msgid "Guide feeds"
 msgstr ""
 
+#. placeholder {0}: s.guide.site
+#: src/iptv/IptvOrgPage.tsx:986
+msgid "Guide listed: {0}"
+msgstr ""
+
 #: src/pages/IptvPage.tsx:141
 msgid "Guide URL"
 msgstr ""
@@ -4583,6 +4588,10 @@ msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:539
 msgid "iptv-org lists few local streams here: none in this city or within {radius} km. Showing the state and national streams instead; many real stations are not in the catalogue."
+msgstr ""
+
+#: src/iptv/IptvOrgPage.tsx:989
+msgid "iptv-org publishes no feed URL for it; supply the XMLTV URL yourself."
 msgstr ""
 
 #: src/pages/DevicesPage.tsx:221
@@ -6817,7 +6826,7 @@ msgid "Priority must be a whole number (higher is shed last)."
 msgstr ""
 
 #: src/iptv/IptvOrgPage.tsx:880
-#: src/iptv/IptvOrgPage.tsx:999
+#: src/iptv/IptvOrgPage.tsx:1011
 #: src/iptv/SourceLinks.tsx:269
 msgid "Probe"
 msgstr ""
@@ -6847,7 +6856,7 @@ msgstr ""
 msgid "Probe result"
 msgstr ""
 
-#: src/iptv/IptvOrgPage.tsx:994
+#: src/iptv/IptvOrgPage.tsx:1006
 msgid "Probe stream {title} in details"
 msgstr ""
 
