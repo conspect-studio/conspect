@@ -1361,7 +1361,9 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // Both input connection state AND elementary-stream inventory deltas ride
         // the existing `inputs` lane (RT-3: `input.streams` is a delta on
         // re-probe / PMT-version bump, not a new topic).
-        Event::InputConnection(_) | Event::InputStreams(_) => Topic::Inputs,
+        Event::InputConnection(_) | Event::InputStreams(_) | Event::InputLifecycle(_) => {
+            Topic::Inputs
+        }
         Event::JobProgress(_) => Topic::Jobs,
         // Broadcast monitoring/control events ride their own topics so a client
         // can subscribe to the alarm or tally firehose independently.

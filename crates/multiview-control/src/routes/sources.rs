@@ -602,11 +602,12 @@ pub(crate) async fn delete_source(
     Ok(with_apply(mode, StatusCode::NO_CONTENT.into_response()))
 }
 
-/// Every source's demand state (role: read; per-object row visibility).
+/// Every source's lifecycle state (role: read; per-object row visibility).
 ///
-/// `idle` means nothing consumes the source, so it costs nothing; it is not a
-/// fault. Consumers start it (`starting`), it then runs (`live`) or keeps
-/// retrying with backoff (`failed`).
+/// `idle` means the source is not started, so it costs nothing; it is not a
+/// fault. An `always_on` source (the default) is started at boot; an
+/// `on_demand` source starts when something consumes it. It reads `starting`,
+/// then `ready`, or `failed` while it retries with backoff.
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -625,13 +626,13 @@ pub(crate) async fn list_source_status(
     principal: Principal,
 ) -> ControlResult<Json<Vec<crate::source_demand::SourceDemandView>>> {
     principal.role.require(Action::Read)?;
-    let ids: Vec<String> = crate::boot_model::accepted_resources(&state, "sources")?
-        .map_or_else(|| state.sources.list(), Ok)?
-        .into_iter()
-        .map(|v| v.resource.id)
-        .filter(|id| crate::auth::authorize_object(&principal, id).is_ok())
-        .collect();
-    Ok(Json(source_status_views(&state, ids)))
+    let sources: Vec<(String, crate::source_demand::SourceActivationView)> =
+        accepted_sources(&state)?
+            .into_iter()
+            .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
+            .map(|v| (v.resource.id.clone(), activation_of(&v.resource)))
+            .collect();
+    Ok(Json(source_status_views(&state, sources)))
 }
 
 /// One source's demand state (role: read; per-object authz).
@@ -657,39 +658,193 @@ pub(crate) async fn get_source_status(
 ) -> ControlResult<Json<crate::source_demand::SourceDemandView>> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let _exists = accepted_source(&state, &id)?;
+    let source = accepted_source(&state, &id)?;
+    let activation = activation_of(&source.resource);
     Ok(Json(
-        source_status_views(&state, vec![id])
+        source_status_views(&state, vec![(id, activation)])
             .pop()
             .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle("")),
     ))
+}
+
+/// The activation a stored source document declares. Reads only the two
+/// keys, so a document that fails full parsing still reports its setting.
+fn activation_of(
+    resource: &crate::resource_store::Resource,
+) -> crate::source_demand::SourceActivationView {
+    #[derive(serde::Deserialize)]
+    struct Keys {
+        #[serde(default)]
+        activation: Option<multiview_config::SourceActivation>,
+        #[serde(default)]
+        demand: Option<LegacyDemand>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyDemand {
+        #[serde(default)]
+        always_on: Option<bool>,
+    }
+    let keys: Option<Keys> = serde_json::from_value(resource.body.clone()).ok();
+    match keys {
+        Some(Keys {
+            activation: Some(activation),
+            ..
+        }) => activation.into(),
+        Some(Keys {
+            demand: Some(LegacyDemand {
+                always_on: Some(false),
+            }),
+            ..
+        }) => crate::source_demand::SourceActivationView::OnDemand,
+        _ => crate::source_demand::SourceActivationView::AlwaysOn,
+    }
+}
+
+/// Start a source now (role: write; per-object authz; audited).
+///
+/// Holds the source `ready` until Stop, whatever its activation. Never waits
+/// for the source: the response is the state right after the request
+/// (normally `starting`).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/sources/{id}/start",
+        tag = "sources",
+        params(("id" = String, Path, description = "Source id.")),
+        responses(
+            (status = 202, description = "Start requested; the body is the source's state.", body = crate::source_demand::SourceDemandView),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to operate this source.", body = crate::problem::Problem),
+            (status = 404, description = "No such source.", body = crate::problem::Problem),
+            (status = 409, description = "This run cannot start sources.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn start_source(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let source = accepted_source(&state, &id)?;
+    let started = state
+        .source_demand
+        .as_ref()
+        .is_some_and(|demand| demand.start_source(&id));
+    if !started {
+        return Err(crate::error::ControlError::Conflict(
+            "this run cannot start sources on request".to_owned(),
+        ));
+    }
+    state.audit(
+        &principal.key_id,
+        AuditAction::Command,
+        SOURCE_KIND,
+        &id,
+        Some(serde_json::json!({"command": "start"})),
+    );
+    let activation = activation_of(&source.resource);
+    let view = source_status_views(&state, vec![(id, activation)])
+        .pop()
+        .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(""));
+    Ok((StatusCode::ACCEPTED, Json(view)).into_response())
+}
+
+/// Stop a source now (role: write; per-object authz; audited).
+///
+/// Refused with 409 while anything else uses the source; the problem detail
+/// names every consumer (an `always_on` setting counts). Set the source
+/// `on_demand` to let it stop.
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/sources/{id}/stop",
+        tag = "sources",
+        params(("id" = String, Path, description = "Source id.")),
+        responses(
+            (status = 202, description = "Stop requested; the body is the source's state.", body = crate::source_demand::SourceDemandView),
+            (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
+            (status = 403, description = "Not authorized to operate this source.", body = crate::problem::Problem),
+            (status = 404, description = "No such source.", body = crate::problem::Problem),
+            (status = 409, description = "Still in use; the detail names every consumer.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn stop_source(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Response> {
+    principal.role.require(Action::Write)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let source = accepted_source(&state, &id)?;
+    let outcome = state.source_demand.as_ref().map_or(
+        Err(crate::source_demand::StopRefusal::Unsupported),
+        |demand| demand.stop_source(&id),
+    );
+    match outcome {
+        Ok(()) => {}
+        Err(crate::source_demand::StopRefusal::InUse(consumers)) => {
+            let names: Vec<String> = consumers
+                .iter()
+                .map(|c| format!("{} {}", c.kind, c.label))
+                .collect();
+            return Err(crate::error::ControlError::Conflict(format!(
+                "source {id:?} is in use by: {}",
+                names.join(", ")
+            )));
+        }
+        Err(crate::source_demand::StopRefusal::Unsupported) => {
+            return Err(crate::error::ControlError::Conflict(
+                "this run cannot stop sources on request".to_owned(),
+            ));
+        }
+    }
+    state.audit(
+        &principal.key_id,
+        AuditAction::Command,
+        SOURCE_KIND,
+        &id,
+        Some(serde_json::json!({"command": "stop"})),
+    );
+    let activation = activation_of(&source.resource);
+    let view = source_status_views(&state, vec![(id, activation)])
+        .pop()
+        .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(""));
+    Ok((StatusCode::ACCEPTED, Json(view)).into_response())
 }
 
 /// The demand views of `ids`, in id order. Without a demand provider (a run
 /// path with no manager) the status is unknown, reported idle with no consumers.
 fn source_status_views(
     state: &AppState,
-    mut ids: Vec<String>,
+    mut sources: Vec<(String, crate::source_demand::SourceActivationView)>,
 ) -> Vec<crate::source_demand::SourceDemandView> {
-    ids.sort();
-    ids.dedup();
-    let Some(demand) = &state.source_demand else {
-        return ids
-            .iter()
-            .map(|id| crate::source_demand::SourceDemandView::idle(id))
-            .collect();
-    };
-    let active: std::collections::HashMap<String, crate::source_demand::SourceDemandView> = demand
-        .active()
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    sources.dedup_by(|a, b| a.0 == b.0);
+    let active: std::collections::HashMap<String, crate::source_demand::SourceDemandView> = state
+        .source_demand
+        .as_ref()
+        .map(|demand| {
+            demand
+                .active()
+                .into_iter()
+                .map(|view| (view.id.clone(), view))
+                .collect()
+        })
+        .unwrap_or_default();
+    sources
         .into_iter()
-        .map(|view| (view.id.clone(), view))
-        .collect();
-    ids.iter()
-        .map(|id| {
-            active
-                .get(id)
+        .map(|(id, activation)| {
+            let mut view = active
+                .get(&id)
                 .cloned()
-                .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(id))
+                .unwrap_or_else(|| crate::source_demand::SourceDemandView::idle(&id));
+            view.activation = activation;
+            view
         })
         .collect()
 }

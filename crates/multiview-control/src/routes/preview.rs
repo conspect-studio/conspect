@@ -105,7 +105,7 @@ pub(crate) async fn input_jpeg(
         let token = match phase {
             crate::source_demand::SourceDemandPhase::Idle
             | crate::source_demand::SourceDemandPhase::Starting => "starting",
-            crate::source_demand::SourceDemandPhase::Live => "live",
+            crate::source_demand::SourceDemandPhase::Ready => "ready",
             crate::source_demand::SourceDemandPhase::Failed => "failed",
         };
         response.headers_mut().insert(

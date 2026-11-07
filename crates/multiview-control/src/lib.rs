@@ -98,8 +98,8 @@ pub mod source_events;
 #[cfg(feature = "embed-web")]
 pub mod spa;
 pub use source_demand::{
-    SharedSourceDemand, SourceConsumerView, SourceDemandLease, SourceDemandPhase,
-    SourceDemandProvider, SourceDemandView,
+    SharedSourceDemand, SourceActivationView, SourceConsumerView, SourceDemandLease,
+    SourceDemandPhase, SourceDemandProvider, SourceDemandView, SourceStartingPhase, StopRefusal,
 };
 pub use source_events::{SharedSourceEvents, SourceEventProvider, SourceEventsDto};
 

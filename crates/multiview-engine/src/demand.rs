@@ -8,7 +8,7 @@
 //! lease from boot, so it is started whether or not anything else consumes it.
 //!
 //! States are `idle` / `starting` / `ready` / `failed` ([`DemandPhase`]). They
-//! are a separate axis from a tile's signal state (LIVE/STALE/NO_SIGNAL) and
+//! are a separate axis from a tile's signal state (`LIVE`/`STALE`/`NO_SIGNAL`) and
 //! from tally. Every phase change is reported as a [`TransitionEvent`]. Video rails are refcounted through the registry:
 //! each video lease holds a [`SourceHandle`], and the manager holds one more
 //! while the rail runs, so a registry entry exists exactly while a source is
@@ -434,6 +434,7 @@ struct LeaseRecord {
 }
 
 /// One active source. Removed once nothing wants it and nothing runs.
+#[allow(clippy::struct_excessive_bools)] // independent lifecycle flags, not a state enum
 struct Entry<T> {
     leases: HashMap<u64, LeaseRecord>,
     running: Rails,
@@ -1285,33 +1286,12 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 }
                 let starting = !entry.running.covers(target);
                 if starting {
-                    // The kind's retry cap: stay failed, no further attempts,
-                    // until a new consumer, an operator Start or an edit.
                     let cap = bounds.retry_cap.or(config.retry_cap);
-                    if cap.is_some_and(|cap| entry.failures >= cap) {
-                        if !entry.gave_up {
-                            entry.gave_up = true;
-                            entry.detail = Some(format!(
-                                "gave up after {} failed starts; press Start to retry",
-                                entry.failures
-                            ));
-                        }
+                    if !admit_start(entry, cap, &mut slots_used, config, now) {
                         continue;
                     }
-                    if slots_used >= config.max_concurrent_starts.max(1) {
-                        continue;
-                    }
-                    slots_used += 1;
-                    if entry.running.is_empty() {
-                        entry.generation = entry.generation.wrapping_add(1);
-                        entry.phase = DemandPhase::Starting;
-                        if entry.reason.is_empty() {
-                            entry.reason = "a consumer needs it".to_owned();
-                        }
-                    }
-                    entry.progress_at = now;
                 } else if target.is_empty() && entry.close_now {
-                    entry.reason = "stopped by an operator".to_owned();
+                    "stopped by an operator".clone_into(&mut entry.reason);
                 }
                 in_flight += 1;
                 entry.in_flight = true;
@@ -1359,7 +1339,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
             entry.progress = progress;
             entry.progress_at = now;
             if entry.phase != DemandPhase::Ready {
-                entry.reason = "media arrived".to_owned();
+                "media arrived".clone_into(&mut entry.reason);
             }
             entry.phase = DemandPhase::Ready;
             entry.detail = None;
@@ -1369,12 +1349,12 @@ impl<T: Send + Sync + 'static> Inner<T> {
         let silent = now.saturating_duration_since(entry.progress_at);
         match entry.phase {
             DemandPhase::Starting if silent >= self.start_timeout(id) => {
-                entry.reason = "start timeout".to_owned();
+                "start timeout".clone_into(&mut entry.reason);
                 entry.phase = DemandPhase::Failed;
                 entry.detail = Some("no media yet; still retrying".to_owned());
             }
             DemandPhase::Ready if silent >= self.config.stall_after && !self.driver.finite(id) => {
-                entry.reason = "no media received recently".to_owned();
+                "no media received recently".clone_into(&mut entry.reason);
                 entry.phase = DemandPhase::Failed;
                 entry.detail = Some("no media received recently; still retrying".to_owned());
             }
@@ -1500,7 +1480,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                     }
                 }
                 if running.is_empty() && entry.reason.is_empty() {
-                    entry.reason = "stopped".to_owned();
+                    "stopped".clone_into(&mut entry.reason);
                 }
                 self.note(id, entry, &mut events);
             }
@@ -1509,6 +1489,41 @@ impl<T: Send + Sync + 'static> Inner<T> {
         self.emit(&events);
         self.wake();
     }
+}
+
+/// Gate one start: the kind's retry cap (stay failed, no further attempts,
+/// until a new consumer, an operator Start or an edit), then a start slot.
+/// On admission, a start from nothing opens a new generation.
+fn admit_start<T>(
+    entry: &mut Entry<T>,
+    cap: Option<u32>,
+    slots_used: &mut usize,
+    config: DemandConfig,
+    now: Instant,
+) -> bool {
+    if cap.is_some_and(|cap| entry.failures >= cap) {
+        if !entry.gave_up {
+            entry.gave_up = true;
+            entry.detail = Some(format!(
+                "gave up after {} failed starts; press Start to retry",
+                entry.failures
+            ));
+        }
+        return false;
+    }
+    if *slots_used >= config.max_concurrent_starts.max(1) {
+        return false;
+    }
+    *slots_used += 1;
+    if entry.running.is_empty() {
+        entry.generation = entry.generation.wrapping_add(1);
+        entry.phase = DemandPhase::Starting;
+        if entry.reason.is_empty() {
+            "a consumer needs it".clone_into(&mut entry.reason);
+        }
+    }
+    entry.progress_at = now;
+    true
 }
 
 /// What a source's rails should do now.
@@ -2184,7 +2199,7 @@ mod tests {
             .all(|e| e.generation == 1 && e.source_id == "cam"));
         assert_eq!(&*events[0].lease_holders[0].label, "viewer");
         assert_eq!(events[1].reason, "media arrived");
-        assert!(events[2].lease_holders.is_empty());
+        assert_eq!(events[2].lease_holders, Vec::<ConsumerTag>::new());
     }
 
     #[test]
@@ -2256,9 +2271,10 @@ mod tests {
     #[test]
     fn a_starting_source_reports_its_phase_and_deadline() {
         let fake = Arc::new(Fake::default());
+        let driver: Arc<dyn RailDriver<u8>> = Arc::<Fake>::clone(&fake);
         let manager = DemandManager::new(
             SourceRegistry::new(),
-            Arc::<Fake>::clone(&fake) as Arc<dyn RailDriver<u8>>,
+            driver,
             DemandConfig {
                 start_timeout: Duration::from_secs(20),
                 ..config(10)

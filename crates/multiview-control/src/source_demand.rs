@@ -9,19 +9,53 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-/// A source's demand phase.
+/// A source's lifecycle state. A separate axis from the tile signal state
+/// (`LIVE` / `STALE` / `NO_SIGNAL`) and from tally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SourceDemandPhase {
-    /// No consumer and nothing running. Not a fault.
+    /// Not started; costs nothing. Not a fault.
     Idle,
-    /// A consumer needs it and its first media has not arrived yet.
+    /// Wanted, and its first media has not arrived yet.
     Starting,
-    /// Producing.
-    Live,
-    /// A consumer needs it but it is not producing. It keeps retrying.
+    /// Started and producing.
+    Ready,
+    /// Wanted but not producing. It retries with backoff.
     Failed,
+}
+
+/// Where a `starting` source is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStartingPhase {
+    /// Waiting for a start slot.
+    Queued,
+    /// Opening (connecting, launching).
+    Opening,
+    /// Started; waiting for its first media.
+    AwaitingMedia,
+}
+
+/// When a source starts (`sources[].activation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SourceActivationView {
+    /// Started at boot, whether or not anything consumes it (the default).
+    AlwaysOn,
+    /// Idle until something consumes it.
+    OnDemand,
+}
+
+impl From<multiview_config::SourceActivation> for SourceActivationView {
+    fn from(value: multiview_config::SourceActivation) -> Self {
+        match value {
+            multiview_config::SourceActivation::OnDemand => Self::OnDemand,
+            multiview_config::SourceActivation::AlwaysOn => Self::AlwaysOn,
+        }
+    }
 }
 
 /// One consumer of a source.
@@ -29,7 +63,7 @@ pub enum SourceDemandPhase {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SourceConsumerView {
     /// `layout_cell`, `audio_route`, `subtitle_route`, `preview`, `hls_session`,
-    /// `event_automation`, `event_journal` or `always_on`.
+    /// `event_automation`, `always_on` or `manual` (an operator Start).
     pub kind: String,
     /// The consumer's identity within its kind (a cell, a route target, ...).
     pub label: String,
@@ -58,6 +92,15 @@ pub struct SourceDemandView {
     /// Why it is failed. Operator-safe: never a URL or credential.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// While `starting`: where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_phase: Option<SourceStartingPhase>,
+    /// While `starting`: milliseconds left before the start timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_in_ms: Option<u64>,
+    /// The source's configured activation. Filled by the API from the
+    /// accepted document; providers may leave the default.
+    pub activation: SourceActivationView,
 }
 
 impl SourceDemandView {
@@ -73,8 +116,20 @@ impl SourceDemandView {
             audio_running: false,
             consumers: Vec::new(),
             detail: None,
+            starting_phase: None,
+            deadline_in_ms: None,
+            activation: SourceActivationView::AlwaysOn,
         }
     }
+}
+
+/// Why a manual Stop was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopRefusal {
+    /// These consumers still use the source.
+    InUse(Vec<SourceConsumerView>),
+    /// The run cannot start or stop sources (no demand manager).
+    Unsupported,
 }
 
 /// A held demand. Dropping it releases the demand.
@@ -105,6 +160,22 @@ pub trait SourceDemandProvider: Send + Sync {
     /// Returns the phase, or `None` when `id` is unknown or the bound on timed
     /// leases is reached.
     fn touch_preview(&self, id: &str) -> Option<SourceDemandPhase>;
+
+    /// Operator Start: hold `id` ready until Stop. `false` when `id` is not a
+    /// configured source or the run cannot start sources. Never blocks.
+    fn start_source(&self, id: &str) -> bool {
+        let _ = id;
+        false
+    }
+
+    /// Operator Stop. Refused while other consumers hold the source.
+    ///
+    /// # Errors
+    /// [`StopRefusal`] naming the consumers, or `Unsupported`.
+    fn stop_source(&self, id: &str) -> Result<(), StopRefusal> {
+        let _ = id;
+        Err(StopRefusal::Unsupported)
+    }
 }
 
 /// Shared provider handle.

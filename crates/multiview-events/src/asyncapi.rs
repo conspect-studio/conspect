@@ -241,6 +241,7 @@ fn build_messages() -> Value {
     map.extend(build_messages_envelope());
     // Data event messages.
     map.extend(build_messages_data_events());
+    map.insert("InputLifecycle".to_owned(), input_lifecycle_message());
     // Switcher realtime surface messages (ADR-RT008).
     map.extend(build_messages_switcher_events());
     // Devices realtime surface messages (ADR-RT007).
@@ -706,6 +707,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/HealthWarning" },
         { "$ref": "#/components/schemas/InputConnection" },
         { "$ref": "#/components/schemas/InputStreams" },
+        { "$ref": "#/components/schemas/InputLifecycle" },
         { "$ref": "#/components/schemas/JobProgress" },
         { "$ref": "#/components/schemas/AlarmTransition" },
         { "$ref": "#/components/schemas/TallyEvent" },
@@ -784,6 +786,7 @@ fn core_event_schemas() -> Value {
         "ShedLoad": shed_load_schema(),
         "InputConnection": input_connection_schema(),
         "InputStreams": input_streams_schema(),
+        "InputLifecycle": input_lifecycle_schema(),
         "JobProgress": job_progress_schema(),
         "AlarmTransition": alarm_transition_schema(),
         "TallyTarget": tally_target_schema(),
@@ -1340,6 +1343,41 @@ fn input_connection_schema() -> Value {
                 "type": "integer",
                 "format": "uint32",
                 "description": "Reconnect attempt counter, if reconnecting."
+            }
+        }
+    })
+}
+
+fn input_lifecycle_message() -> Value {
+    json!({
+        "name": "InputLifecycle",
+        "title": "Source lifecycle transition",
+        "summary": "A source moved between idle / starting / ready / failed (input.lifecycle on topic `inputs`). Not the tile signal state.",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/InputLifecycle" }
+    })
+}
+
+fn input_lifecycle_schema() -> Value {
+    let state = json!({ "type": "string", "enum": ["idle", "starting", "ready", "failed"] });
+    json!({
+        "type": "object",
+        "description": "Data body of the `input.lifecycle` event.",
+        "required": ["source_id", "generation", "from", "to", "reason", "at_ms"],
+        "properties": {
+            "source_id": { "type": "string", "description": "The source id (the authorization object)." },
+            "generation": { "type": "integer", "format": "uint64", "description": "Start generation; increments on every start from idle." },
+            "from": state,
+            "to": state,
+            "reason": { "type": "string", "description": "Operator-safe reason." },
+            "at_ms": { "type": "integer", "format": "int64", "description": "Unix milliseconds." },
+            "lease_holders": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "label"],
+                    "properties": { "kind": { "type": "string" }, "label": { "type": "string" } }
+                }
             }
         }
     })

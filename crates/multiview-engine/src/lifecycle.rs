@@ -200,8 +200,8 @@ impl<O: SourceOwner, T: Send + Sync + 'static> OwnerRails<O, T> {
         });
         let confirmed = match stopped {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(why)) => self.kill_owner(id, generation, why),
-            Err(_) => self.kill_owner(id, generation, "stop timed out".to_owned()),
+            Ok(Err(why)) => self.kill_owner(id, generation, &why),
+            Err(_) => self.kill_owner(id, generation, "stop timed out"),
         };
         if confirmed.is_ok() {
             self.scopes.remove(id, generation);
@@ -211,7 +211,7 @@ impl<O: SourceOwner, T: Send + Sync + 'static> OwnerRails<O, T> {
     }
 
     /// The kill path for a wedged owner. The scope stays registered on failure.
-    fn kill_owner(&self, id: &str, generation: u64, why: String) -> Result<(), String> {
+    fn kill_owner(&self, id: &str, generation: u64, why: &str) -> Result<(), String> {
         tracing::warn!(source = %id, %why, "source owner did not confirm stop; killing");
         self.runtime
             .block_on(async {

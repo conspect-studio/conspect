@@ -547,6 +547,77 @@ impl WarningCode {
     }
 }
 
+/// A source lifecycle state (`docs/architecture/demand-driven-sources.md`).
+/// A separate axis from the tile signal state and from tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLifecycle {
+    /// Not started; costs nothing. Not a fault.
+    Idle,
+    /// Wanted, waiting for its first media.
+    Starting,
+    /// Started and producing.
+    Ready,
+    /// Wanted, not producing.
+    Failed,
+}
+
+/// One holder of a source lease, as named in `input.lifecycle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseHolder {
+    /// `layout_cell`, `audio_route`, `subtitle_route`, `preview`,
+    /// `hls_session`, `event_automation`, `always_on` or `manual`.
+    pub kind: String,
+    /// The holder's identity within its kind.
+    pub label: String,
+}
+
+/// `input.lifecycle` (topic `inputs`): a source moved between idle /
+/// starting / ready / failed. Lossless (kept in the replay ring).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct InputLifecycle {
+    /// The source id; the object axis this event is authorized under.
+    pub source_id: String,
+    /// The start generation the transition belongs to.
+    pub generation: u64,
+    /// The previous state.
+    pub from: SourceLifecycle,
+    /// The new state.
+    pub to: SourceLifecycle,
+    /// Why, operator-safe (never a URL or credential).
+    pub reason: String,
+    /// When, Unix milliseconds.
+    pub at_ms: i64,
+    /// Who held a lease at the time.
+    #[serde(default)]
+    pub lease_holders: Vec<LeaseHolder>,
+}
+
+impl InputLifecycle {
+    /// Build an `input.lifecycle` body.
+    #[must_use]
+    pub fn new(
+        source_id: impl Into<String>,
+        generation: u64,
+        from: SourceLifecycle,
+        to: SourceLifecycle,
+        reason: impl Into<String>,
+        at_ms: i64,
+        lease_holders: Vec<LeaseHolder>,
+    ) -> Self {
+        Self {
+            source_id: source_id.into(),
+            generation,
+            from,
+            to,
+            reason: reason.into(),
+            at_ms,
+            lease_holders,
+        }
+    }
+}
+
 /// An input source connection-state change.
 ///
 /// `#[non_exhaustive]` (ADR-W026): construct via [`InputConnection::new`] plus
@@ -1677,6 +1748,9 @@ pub enum Event {
     /// (RT-3). Rides the same `inputs` lane as `input.connection`.
     #[serde(rename = "input.streams")]
     InputStreams(InputStreams),
+    /// A source's lifecycle state changed (topic `inputs`).
+    #[serde(rename = "input.lifecycle")]
+    InputLifecycle(InputLifecycle),
     /// Long-running job progress (topic `jobs`, correlated by `corr`).
     #[serde(rename = "job.progress")]
     JobProgress(JobProgress),
@@ -1794,6 +1868,7 @@ impl Event {
             Self::ShedLoad(_) => "shed.load",
             Self::InputConnection(_) => "input.connection",
             Self::InputStreams(_) => "input.streams",
+            Self::InputLifecycle(_) => "input.lifecycle",
             Self::JobProgress(_) => "job.progress",
             Self::AlarmRaised(_) => "alarm.raised",
             Self::AlarmUpdated(_) => "alarm.updated",
@@ -1891,6 +1966,7 @@ impl Event {
             // leak class to a cam1-scoped principal.
             Self::InputStreams(e) => AuthzScope::Object(&e.input_id),
             Self::InputConnection(e) => AuthzScope::Object(&e.input_id),
+            Self::InputLifecycle(e) => AuthzScope::Object(&e.source_id),
 
             // ---- Object+output-scoped salvo lane (ADR-W026) ----
             // The REST twin gates BOTH axes when a head is addressed

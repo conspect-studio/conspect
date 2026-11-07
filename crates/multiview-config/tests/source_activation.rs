@@ -1,4 +1,4 @@
-//! `sources[].activation`: default always_on, the legacy `demand.always_on`
+//! `sources[].activation`: default `always_on`, the legacy `demand.always_on`
 //! alias, and `[iptv] guide_refresh_minutes` validation.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
