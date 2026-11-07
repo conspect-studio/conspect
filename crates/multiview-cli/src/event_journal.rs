@@ -835,7 +835,20 @@ impl JournalWorker {
         let Some(record_id) = self.write(draft, key) else {
             return;
         };
-        if let Some(timing) = timing.filter(|_| is_event) {
+        if is_event {
+            // A cue on a playlist with no dates still shows, as time unknown.
+            let timing = timing.unwrap_or(JournalTiming {
+                class: JournalTimingClass::None,
+                splice_pts: None,
+                pre_roll_ms: None,
+                duration_ms: decoded.duration_ms,
+                clock_source: None,
+                uncertainty_ms: None,
+                start_at: None,
+                end_at: None,
+                airs_at: None,
+                airs_end_at: None,
+            });
             self.marker(source, record_id, name, received_ns, &timing, event_id, upid);
         }
     }
@@ -1232,6 +1245,21 @@ mod tests {
         let cue = rows[1].timing.as_ref().unwrap();
         assert_eq!(cue.start_at, Some(rfc3339_ns(utc + 6_000_000_000)));
         assert_eq!(cue.duration_ms, Some(30_000));
+    }
+
+    #[test]
+    fn a_cue_on_an_undated_playlist_is_a_marker_with_no_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = worker(dir.path());
+        w.handle(Observation::Playlist {
+            source: "cnn".into(),
+            text: Arc::from("#EXTM3U\n#EXT-X-CUE-OUT:30\n#EXTINF:6,\n1.ts\n"),
+            received_ns: NOW,
+        });
+        let summary = w.summary("cnn").unwrap();
+        assert_eq!(summary.markers[0].name, "HLS Cue Out");
+        assert_eq!(summary.markers[0].start_at, None);
+        assert_eq!(summary.markers[0].duration_ms, Some(30_000));
     }
 
     #[test]

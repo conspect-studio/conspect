@@ -199,3 +199,152 @@ fn pts_math_wraps_on_the_33_bit_circle() {
     assert_eq!(pts_delta(PTS_MODULUS - 10, 15), -25);
     assert_eq!(pts_delta(100, 100), 0);
 }
+
+/// Published vectors from the Comcast scte35-go conformance table, which include
+/// the SCTE-35 sample sections (14.x) and legacy encoder shapes seen in the field.
+mod published {
+    use super::*;
+
+    fn decoded(text: &str) -> multiview_input::scte::decode::DecodedSection {
+        let d = decode_section(&b64(text)).unwrap();
+        assert!(d.crc_ok, "fixture CRC {}", d.crc_32);
+        assert_eq!(d.parse_error, None);
+        d
+    }
+    fn type_ids(d: &multiview_input::scte::decode::DecodedSection) -> Vec<Option<u8>> {
+        d.segmentations().map(|s| s.segmentation_type_id).collect()
+    }
+
+    #[test]
+    fn sample_14_4_program_start_end_keeps_both_descriptors() {
+        let d = decoded("/DBIAAAAAAAA///wBQb+ek2ItgAyAhdDVUVJSAAAGH+fCAgAAAAALMvDRBEAAAIXQ1VFSUgAABl/nwgIAAAAACyk26AQAACZcuND");
+        assert_eq!(d.pts_time(), Some(0x07A4_D88B6));
+        assert_eq!(type_ids(&d), vec![Some(0x11), Some(0x10)]);
+    }
+
+    #[test]
+    fn sample_14_6_names_the_blackout_override() {
+        let d = decoded("/DBIAAAAAAAA///wBQb+ky44CwAyAhdDVUVJSAAACn+fCAgAAAAALKCh4xgAAAIXQ1VFSUgAAAl/nwgIAAAAACygoYoRAAC0IX6w");
+        assert_eq!(
+            d.primary_segmentation().unwrap().segmentation_type_name.as_deref(),
+            Some("Program Blackout Override")
+        );
+    }
+
+    #[test]
+    fn sample_14_8_three_descriptors_decode_in_order() {
+        let d = decoded("/DBhAAAAAAAA///wBQb+qM1E7QBLAhdDVUVJSAAArX+fCAgAAAAALLLXnTUCAAIXQ1VFSUgAACZ/nwgIAAAAACyy150RAAACF0NVRUlIAAAnf58ICAAAAAAsstezEAAAihiGnw==");
+        assert_eq!(type_ids(&d), vec![Some(0x35), Some(0x11), Some(0x10)]);
+    }
+
+    #[test]
+    fn a_33_bit_splice_time_above_32_bits_survives() {
+        let d = decoded("/DBIAAAAAAAAAP/wBQb/tB67hgAyAhdDVUVJQAABEn+fCAgAAAAALzE8BTUAAAIXQ1VFSUAAAEV/nwgIAAAAAC8xPN4jAAAfiOPE");
+        assert_eq!(d.pts_time(), Some(7_316_880_262));
+    }
+
+    #[test]
+    fn dtmf_descriptor_and_insert_fields_decode() {
+        let d = decoded("/DAxAAAAAAAAAP/wFAVAAIeuf+/+0AWRK/4AUmXAAC0AfwAMAQpDVUVJUJ81MTkqo5/+gA==");
+        let Command::SpliceInsert(insert) = &d.splice_command else { panic!("not an insert") };
+        assert_eq!(insert.splice_event_id, 1_073_776_558);
+        assert_eq!(insert.pts_time, Some(3_490_025_771));
+        assert_eq!(insert.break_duration.as_ref().unwrap().duration, 5_400_000);
+        assert_eq!(
+            (insert.unique_program_id, insert.avail_num, insert.avails_expected),
+            (Some(45), Some(0), Some(127))
+        );
+        assert_eq!(
+            d.descriptors[0].body,
+            DescriptorBody::Dtmf { preroll: 80, dtmf: "519*".to_owned() }
+        );
+    }
+
+    #[test]
+    fn mid_with_eidr_and_adi_decodes_each_identifier() {
+        let d = decoded("/DBrAAAAAAAAAP/wBQb/AAAAAABVAlNDVUVJAAAAAn+/DUQKDBR3i+Xj9gAAAAAAAAoMFHeL5eP2AAAAAAAACSZTSUdOQUw6THk5RU1HeEtSMGhGWlV0cE1IZENVVlpuUlVGblp6MTcBA6QTOe8=");
+        let s = d.primary_segmentation().unwrap();
+        let upid = s.upid.as_ref().unwrap();
+        assert_eq!(upid.nested.len(), 3);
+        assert!(upid.nested[0].value.starts_with("10.5239/8BE5-E3F6-0000-0000-0000"));
+        assert_eq!(upid.nested[2].value, "SIGNAL:Ly9EMGxKR0hFZUtpMHdCUVZnRUFnZz1");
+        assert_eq!((s.segment_num, s.segments_expected), (Some(1), Some(3)));
+    }
+
+    #[test]
+    fn legacy_unknown_command_length_finds_the_descriptor_loop() {
+        let d = decoded("/DA8AAAAAAAAAP///wb+06ACpQAmAiRDVUVJAACcHX//AACky4AMEERJU0NZTVdGMDQ1MjAwMEgxAQEMm4c0");
+        assert_eq!(d.splice_command_length, 0xFFF);
+        assert_eq!(d.pts_time(), Some(3_550_479_013));
+        let s = d.primary_segmentation().unwrap();
+        assert_eq!(s.segmentation_duration, Some(10_800_000));
+        assert!(s.upid.as_ref().unwrap().value.starts_with("format_identifier=DISC"));
+    }
+
+    #[test]
+    fn a_private_descriptor_stays_opaque_and_the_next_one_still_decodes() {
+        let d = decoded("/DBPAAAAAAAAAP/wBQb/Gq9LggA5AAVTQVBTCwIwQ1VFSf////9//wAAFI4PDxx1cm46bmJjdW5pLmNvbTpicmM6NDk5ODY2NDM0MQoBbM98zw==");
+        assert_eq!(d.descriptors[0].identifier, "SAPS");
+        assert!(matches!(d.descriptors[0].body, DescriptorBody::Opaque { .. }));
+        let s = d.primary_segmentation().unwrap();
+        assert_eq!(s.upid.as_ref().unwrap().value, "urn:nbcuni.com:brc:499866434");
+        assert_eq!(s.segmentation_event_id, 4_294_967_295);
+    }
+
+    #[test]
+    fn splice_null_heartbeat_decodes() {
+        let d = decoded("/DARAAAAAAAAAP/wAAAAAHpPv/8=");
+        assert!(matches!(d.splice_command, Command::SpliceNull));
+    }
+
+    #[test]
+    fn a_published_bad_crc_is_reported_with_its_decode() {
+        let d = decode_section(&b64("/DA4AAAAAAAAAP/wFAUABDEAf+//mWEhzP4Azf5gAQAAAAATAhFDVUVJAAAAAX+/AQIwNAEAAKeYO3Q=")).unwrap();
+        assert!(!d.crc_ok);
+        assert_eq!(d.splice_command_name, "splice_insert");
+    }
+
+    #[test]
+    fn an_immediate_insert_with_alignment_stuffing_decodes() {
+        let d = decoded("/DAeAAAAAAAAAP///wViAA/nf18ACQAAAAAskJv+YPtE");
+        assert!(d.is_immediate());
+        let Command::SpliceInsert(insert) = &d.splice_command else { panic!("not an insert") };
+        assert_eq!(insert.splice_event_id, 1_644_171_239);
+        assert_eq!(insert.unique_program_id, Some(9));
+    }
+
+    #[test]
+    fn a_nonzero_pts_adjustment_shifts_the_splice_point() {
+        let d = decoded("/DA0AABS2+YAAACgFAUALJGCf+/+MSwPcX4AUmXAAAAAAAAMAQpDVUVJRp8xMjEq3pnIPCi6lw==");
+        // Wire bytes 00 52 DB E6 00: one high bit, then four adjustment bytes.
+        assert_eq!(d.pts_adjustment, 0x52DB_E600);
+        assert_eq!(d.splice_pts(), d.pts_time().map(|t| pts_add(t, 0x52DB_E600)));
+    }
+
+    #[test]
+    fn sub_segment_fields_are_read_only_where_the_type_allows() {
+        let d = decoded("/DCRAAAAAAAAAP/wBQb/9peOEAB7AjhDVUVJAAAAnH+/DilhdmFpbGlkPTkxNDg2NjA2NSZiaXRtYXA9JmluYWN0aXZpdHk9MzEyMDEHCgI/Q1VFSQAAAJ1//wAANu6ADilhdmFpbGlkPTkxMDkwMTM4OSZiaXRtYXA9JmluYWN0aXZpdHk9MzEyMDAICgAAoJMeaA==");
+        let rows: Vec<_> = d.segmentations().collect();
+        assert_eq!(rows[0].sub_segment_num, None);
+        assert_eq!((rows[1].sub_segment_num, rows[1].sub_segments_expected), (Some(0), Some(0)));
+        assert_eq!(rows[1].upid.as_ref().unwrap().upid_type_name, "ADS Information");
+    }
+
+    #[test]
+    fn audio_descriptor_and_pts_adjustment_apply_to_the_splice_point() {
+        let d = decoded("/DAiAAAAABc0AP/wBQb/tVo+agAMBApDVUVJHwBlbmcRzvUPpQ==");
+        assert_eq!(d.pts_adjustment, 5940);
+        assert_eq!(d.splice_pts(), Some(7_337_557_610 + 5940));
+        let DescriptorBody::Audio { components } = &d.descriptors[0].body else {
+            panic!("not audio");
+        };
+        assert_eq!(components[0].iso_code, "eng");
+        assert_eq!((components[0].num_channels, components[0].full_srvc_audio), (8, true));
+    }
+
+    #[test]
+    fn a_non_section_is_refused_with_a_reason() {
+        let bytes = b64("FkC1lwP3uTQD0VvxHwVBEH89G6B7VjzaZ9eNuyUF9q8pYAIXsRM9");
+        assert!(decode_section(&bytes).unwrap_err().contains("0x16"));
+    }
+}

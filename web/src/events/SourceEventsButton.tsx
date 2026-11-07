@@ -184,7 +184,7 @@ export function SourceEventsButton({ id, name, eventObservation }: {
       <DialogContent className="max-h-[90vh] max-w-4xl overflow-auto">
         <DialogHeader>
           <DialogTitle><Trans>Source events</Trans> — {name}</DialogTitle>
-          <DialogDescription><Trans>Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Timing uses the source presentation clock, not browser receipt time.</Trans></DialogDescription>
+          <DialogDescription><Trans>Read-only server snapshot of source events, refreshed every second while open. Ad-break automation is configured below and must be armed explicitly. Lifecycle timers use the source presentation clock. Marker times are predictions from the clock each one names, and their countdowns run against this browser's clock.</Trans></DialogDescription>
         </DialogHeader>
         {open
           ? <Tabs defaultValue="events">

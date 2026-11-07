@@ -671,3 +671,33 @@ fn a_routing_change_is_reported() {
         diff.changed_sections
     );
 }
+
+#[test]
+fn the_events_section_is_optional_and_a_change_is_reported() {
+    let text = r##"
+schema_version = 1
+[canvas]
+width = 1920
+height = 1080
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+gap = 0
+areas = ["a"]
+"##;
+    let plain: MultiviewConfig = toml::from_str(text).expect("no [events]");
+    assert_eq!(plain.events, None);
+    assert!(!toml::to_string(&plain).expect("toml").contains("[events]"));
+    let tuned: MultiviewConfig =
+        toml::from_str(&format!("{text}\n[events]\njournal_retention_days = 3\n")).expect("tuned");
+    let events = tuned.events.expect("events");
+    assert_eq!(events.journal_retention_days, 3);
+    assert_eq!(events.journal_max_bytes, 256 * 1024 * 1024);
+    assert!(ConfigDiff::between(&plain, &tuned).changed_sections.contains("events"));
+}

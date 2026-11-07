@@ -257,6 +257,8 @@ pub struct Segmentation {
     pub segmentation_event_id: u32,
     /// `segmentation_event_cancel_indicator`.
     pub segmentation_event_cancel: bool,
+    /// Raw `segmentation_event_id_compliance_indicator` bit (0 means compliant).
+    pub segmentation_event_id_compliance_indicator: bool,
     /// `program_segmentation_flag`.
     pub program_segmentation: Option<bool>,
     /// `delivery_not_restricted_flag`.
@@ -482,18 +484,17 @@ pub const fn command_name(command_type: u8) -> &'static str {
     }
 }
 
-/// `segmentation_type_id` table name, including the identification and program
-/// runover/join rows the marker labels do not use.
+/// `segmentation_type_id` table name, including the identification, runover and
+/// override rows the marker labels do not use.
 #[must_use]
 pub fn segmentation_name(type_id: u8) -> Option<&'static str> {
     Some(match type_id {
         0x00 => "Not Indicated",
         0x01 => "Content Identification",
-        0x02 => "Private",
         0x15 => "Program Runover Planned",
         0x16 => "Program Runover Unplanned",
         0x18 => "Program Blackout Override",
-        0x19 => "Program Join",
+        0x19 => "Program Start - In Progress",
         other => return super::segmentation_type_name(other),
     })
 }
@@ -667,10 +668,12 @@ fn parse_segmentation(body: &[u8]) -> Option<Segmentation> {
     let mut bits = Bits::new(body);
     let segmentation_event_id = bits.u32(32)?;
     let segmentation_event_cancel = bits.flag()?;
-    bits.read(7)?;
+    let segmentation_event_id_compliance_indicator = bits.flag()?;
+    bits.read(6)?;
     let mut out = Segmentation {
         segmentation_event_id,
         segmentation_event_cancel,
+        segmentation_event_id_compliance_indicator,
         program_segmentation: None,
         delivery_not_restricted: None,
         delivery_restrictions: None,
