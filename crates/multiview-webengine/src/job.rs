@@ -292,6 +292,11 @@ pub enum Trigger {
     /// The fill already had a job queued or running, so the trigger coalesced
     /// onto it (ADR-0100 decision 4).
     Coalesced(JobId),
+    /// The fill's job is **running**, so the trigger coalesced onto it *and*
+    /// recorded the one pending rerun for the fill. Callers can report "will
+    /// run again". A further trigger while that rerun is pending is plain
+    /// [`Coalesced`](Self::Coalesced).
+    RerunQueued(JobId),
 }
 
 impl Trigger {
@@ -299,7 +304,7 @@ impl Trigger {
     #[must_use]
     pub fn job(&self) -> &JobId {
         match self {
-            Self::Queued(id) | Self::Coalesced(id) => id,
+            Self::Queued(id) | Self::Coalesced(id) | Self::RerunQueued(id) => id,
         }
     }
 
@@ -413,6 +418,11 @@ impl JobQueue {
     /// Otherwise a new job with `id` is queued, or the trigger is refused when
     /// the queue is at its bound.
     ///
+    /// Recording a rerun is **not** an admission: it never needs a free slot,
+    /// because the rerun takes the slot of the running job it follows (see
+    /// [`finish`](Self::finish)). It is reported as [`Trigger::RerunQueued`];
+    /// a repeat while one is already pending is [`Trigger::Coalesced`].
+    ///
     /// # Errors
     ///
     /// [`Error::DuplicateJob`] when a new job would reuse an id the queue
@@ -431,7 +441,10 @@ impl JobQueue {
                 }
                 // One pending rerun per fill: a repeat trigger overwrites, so
                 // the flag is bounded.
-                self.pending_rerun.insert(fill, id);
+                let newly_recorded = self.pending_rerun.insert(fill, id).is_none();
+                if newly_recorded {
+                    return Ok(Trigger::RerunQueued(existing));
+                }
             }
             return Ok(Trigger::Coalesced(existing));
         }
@@ -701,7 +714,7 @@ mod tests {
         let repeat = queue
             .trigger(fill("radar"), job_id("j3"))
             .expect("coalesces");
-        assert_eq!(repeat, Trigger::Coalesced(job_id("j1")));
+        assert_eq!(repeat, Trigger::RerunQueued(job_id("j1")));
         assert_eq!(queue.pending_len(), 0);
         assert_eq!(queue.running_len(), 1);
 
@@ -813,7 +826,7 @@ mod tests {
         let repeat = queue
             .trigger(fill("radar"), job_id("j2"))
             .expect("coalesces");
-        assert_eq!(repeat, Trigger::Coalesced(job_id("j1")));
+        assert_eq!(repeat, Trigger::RerunQueued(job_id("j1")));
         assert_eq!(queue.pending_rerun_for(&fill("radar")), Some(&job_id("j2")));
         assert_eq!(queue.pending_len(), 0, "nothing is queued yet");
 
@@ -834,12 +847,17 @@ mod tests {
         let mut queue = JobQueue::new(4, 1);
         queue.trigger(fill("radar"), job_id("j1")).expect("room");
         queue.start_next().expect("slot").expect("a job");
-        for name in ["j2", "j3", "j4"] {
+        for (n, name) in ["j2", "j3", "j4"].into_iter().enumerate() {
+            let want = if n == 0 {
+                Trigger::RerunQueued(job_id("j1"))
+            } else {
+                Trigger::Coalesced(job_id("j1"))
+            };
             assert_eq!(
                 queue
                     .trigger(fill("radar"), job_id(name))
                     .expect("coalesces"),
-                Trigger::Coalesced(job_id("j1"))
+                want
             );
         }
         queue
@@ -1039,5 +1057,62 @@ mod tests {
             .finish(&job_id("j1"), JobState::Succeeded)
             .expect("finish");
         assert_eq!(queue.pending_len(), 1);
+    }
+
+    #[test]
+    fn a_rerun_at_capacity_takes_the_finished_jobs_slot() {
+        let mut queue = JobQueue::new(1, 1);
+        queue.trigger(fill("radar"), job_id("j1")).expect("room");
+        queue.start_next().expect("slot").expect("a job");
+        assert_eq!(queue.tracked_len(), 1);
+        assert!(!queue.could_accept(), "the queue is full");
+
+        // Recording a rerun needs no free slot.
+        assert_eq!(
+            queue.trigger(fill("radar"), job_id("j2")).expect("rerun"),
+            Trigger::RerunQueued(job_id("j1"))
+        );
+        assert_eq!(queue.tracked_len(), 1, "a pending rerun is not a slot");
+
+        queue
+            .finish(&job_id("j1"), JobState::Succeeded)
+            .expect("finish");
+        assert_eq!(queue.tracked_len(), 1, "finish never grows the queue");
+        assert_eq!(queue.pending_len(), 1, "the rerun is pending");
+        assert_eq!(queue.running_len(), 0);
+        assert_eq!(queue.pending_rerun_for(&fill("radar")), None);
+        assert_eq!(queue.in_flight_for(&fill("radar")), Some(&job_id("j2")));
+    }
+
+    #[test]
+    fn n_running_jobs_that_all_rerun_never_exceed_capacity() {
+        const N: usize = 4;
+        let mut queue = JobQueue::new(N, N);
+        let fills: Vec<String> = (0..N).map(|n| format!("fill-{n}")).collect();
+        for (n, name) in fills.iter().enumerate() {
+            queue
+                .trigger(fill(name), job_id(&format!("a{n}")))
+                .expect("room");
+            queue.start_next().expect("slot").expect("a job");
+        }
+        assert_eq!(queue.tracked_len(), N);
+        for (n, name) in fills.iter().enumerate() {
+            assert_eq!(
+                queue
+                    .trigger(fill(name), job_id(&format!("b{n}")))
+                    .expect("coalesces"),
+                Trigger::RerunQueued(job_id(&format!("a{n}")))
+            );
+            assert_eq!(queue.tracked_len(), N);
+        }
+        for n in 0..N {
+            queue
+                .finish(&job_id(&format!("a{n}")), JobState::Succeeded)
+                .expect("finish");
+            assert!(queue.tracked_len() <= N, "finish {n} exceeded capacity");
+            assert_eq!(queue.tracked_len(), N);
+        }
+        assert_eq!(queue.pending_len(), N, "every rerun is pending");
+        assert_eq!(queue.running_len(), 0);
     }
 }
