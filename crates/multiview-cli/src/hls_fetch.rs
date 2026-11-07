@@ -597,9 +597,7 @@ impl HlsFetcher {
                     agent: &agent,
                     playlist: &base,
                     segments: &segment_base,
-                    journal: has_observer
-                        .then(crate::event_journal::feed)
-                        .flatten(),
+                    journal: has_observer.then(crate::event_journal::feed).flatten(),
                 };
                 coordinate(&origin, first, &coord_shared, &st, &observation_active);
             })

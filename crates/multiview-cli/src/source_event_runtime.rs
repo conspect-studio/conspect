@@ -808,6 +808,27 @@ mod tests {
         runtime.shutdown().expect("join");
     }
     #[test]
+    fn id3_clock_stamps_are_not_event_evidence() {
+        let runtime = Runtime::new().expect("worker");
+        let lease = runtime.activate("s", 1).expect("lease");
+        let mut native = NativeEvents::new("s".into(), &lease).expect("connection");
+        let mut payload = multiview_input::id3::ELEMENTAL_UTC_OWNER
+            .as_bytes()
+            .to_vec();
+        payload.push(0);
+        payload.extend_from_slice(b"2026-11-03T21:14:58Z");
+        let frame = u8::try_from(payload.len()).expect("frame");
+        let total = u8::try_from(payload.len() + 10).expect("tag");
+        let mut tag = b"ID3\x04\x00\x00\x00\x00\x00".to_vec();
+        tag.push(total);
+        tag.extend_from_slice(&[b'P', b'R', b'I', b'V', 0, 0, 0, frame, 0, 0]);
+        tag.extend_from_slice(&payload);
+        native.observe_id3(&tag);
+        assert_eq!(native.id3.len(), 0);
+        assert!(!native.loss.get());
+        runtime.shutdown().expect("join");
+    }
+    #[test]
     fn native_id3_is_deduplicated_presence_without_timing() {
         let runtime = Runtime::new().expect("worker");
         let lease = runtime.activate("s", 1).expect("lease");

@@ -739,7 +739,10 @@ fn parse_segmentation(body: &[u8]) -> Option<Segmentation> {
     out.segments_expected = Some(bits.u8(8)?);
     // Sub-segment fields exist only for these types, and are optional there
     // because older encoders omit them.
-    if matches!(type_id, 0x30 | 0x32 | 0x34 | 0x36 | 0x38 | 0x3A | 0x44 | 0x46) {
+    if matches!(
+        type_id,
+        0x30 | 0x32 | 0x34 | 0x36 | 0x38 | 0x3A | 0x44 | 0x46
+    ) {
         out.sub_segment_num = bits.u8(8);
         out.sub_segments_expected = bits.u8(8);
     }
@@ -827,6 +830,7 @@ fn parse_descriptors(mut loop_bytes: &[u8], parse_error: &mut Option<String>) ->
     out
 }
 
+#[allow(clippy::option_option)] // reason: outer None is truncation, inner None is "no time specified".
 fn parse_splice_time(bits: &mut Bits<'_>) -> Option<Option<u64>> {
     if bits.flag()? {
         bits.read(6)?;
@@ -1007,9 +1011,9 @@ pub fn decode_section(section: &[u8]) -> Result<DecodedSection, String> {
     let crc_bytes = section.get(crc_start..end).unwrap_or_default();
     let carried: Option<[u8; 4]> = crc_bytes.try_into().ok();
     let crc_ok = carried.is_some_and(|carried| {
-        section
-            .get(..crc_start)
-            .is_some_and(|body| crate::mpegts::crc::crc32_mpeg2(body) == u32::from_be_bytes(carried))
+        section.get(..crc_start).is_some_and(|body| {
+            crate::mpegts::crc::crc32_mpeg2(body) == u32::from_be_bytes(carried)
+        })
     });
     let crc_32 = format!("0x{}", hex(crc_bytes));
     let payload = section.get(body_start..crc_start).unwrap_or_default();
@@ -1018,36 +1022,28 @@ pub fn decode_section(section: &[u8]) -> Result<DecodedSection, String> {
     let splice_command = if encrypted_packet {
         Command::Opaque { raw: hex(payload) }
     } else {
-        let declared = (splice_command_length != 0xFFF).then_some(usize::from(splice_command_length));
-        let command_bytes = declared.map_or(payload, |len| {
-            payload.get(..len).unwrap_or(payload)
-        });
-        match parse_command(splice_command_type, command_bytes) {
-            Some((command, used)) => {
-                let after = declared.unwrap_or(used);
-                if let Some([high, low, tail @ ..]) = payload.get(after..) {
-                    let loop_length = usize::from(u16::from_be_bytes([*high, *low]));
-                    match tail.get(..loop_length) {
-                        Some(loop_bytes) => {
-                            descriptors = parse_descriptors(loop_bytes, &mut parse_error);
-                        }
-                        None => {
-                            parse_error =
-                                Some("descriptor_loop_length overruns the section".to_owned());
-                            descriptors = parse_descriptors(tail, &mut parse_error);
-                        }
-                    }
+        let declared =
+            (splice_command_length != 0xFFF).then_some(usize::from(splice_command_length));
+        let command_bytes = declared.map_or(payload, |len| payload.get(..len).unwrap_or(payload));
+        if let Some((command, used)) = parse_command(splice_command_type, command_bytes) {
+            let after = declared.unwrap_or(used);
+            if let Some([high, low, tail @ ..]) = payload.get(after..) {
+                let loop_length = usize::from(u16::from_be_bytes([*high, *low]));
+                if let Some(loop_bytes) = tail.get(..loop_length) {
+                    descriptors = parse_descriptors(loop_bytes, &mut parse_error);
+                } else {
+                    parse_error = Some("descriptor_loop_length overruns the section".to_owned());
+                    descriptors = parse_descriptors(tail, &mut parse_error);
                 }
-                command
             }
-            None => {
-                parse_error = Some(format!(
-                    "{} command is truncated",
-                    command_name(splice_command_type)
-                ));
-                Command::Opaque {
-                    raw: hex(command_bytes),
-                }
+            command
+        } else {
+            parse_error = Some(format!(
+                "{} command is truncated",
+                command_name(splice_command_type)
+            ));
+            Command::Opaque {
+                raw: hex(command_bytes),
             }
         }
     };

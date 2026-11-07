@@ -4471,8 +4471,8 @@ export interface components {
             source_id: string;
             /**
              * Format: int64
-             * @description 90 kHz PTS of the carrying packet. SCTE-35 sections have no PES header,
-             *     so the demuxer reports the last PCR for them.
+             * @description 90 kHz time of the carrying packet. SCTE-35 sections have no PES header, so
+             *     the demuxer reports the last PCR, which trails video PTS by the mux delay.
              */
             source_pts?: number | null;
             /** @description One-line decoded summary. */

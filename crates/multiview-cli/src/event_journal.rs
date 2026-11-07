@@ -161,8 +161,7 @@ pub fn output_anchor_now(
     output_now_ns: i64,
     wall_now_ns: i64,
 ) -> Option<OutputAnchor> {
-    let raw_now_ns =
-        i128::from(raw_pts0_ns) + i128::from(output_now_ns) - i128::from(out0_ns);
+    let raw_now_ns = i128::from(raw_pts0_ns) + i128::from(output_now_ns) - i128::from(out0_ns);
     let ticks = (raw_now_ns * 9).div_euclid(100_000);
     Some(OutputAnchor {
         raw_pts_90k: u64::try_from(ticks.rem_euclid(i128::from(PTS_MODULUS))).ok()?,
@@ -340,7 +339,11 @@ pub fn section_summary(section: &DecodedSection) -> String {
         }
     }
     if let Some(ticks) = section.duration_ticks() {
-        parts.push(format!("duration={}.{:03}s", ticks / 90_000, ticks / 90 % 1000));
+        parts.push(format!(
+            "duration={}.{:03}s",
+            ticks / 90_000,
+            ticks / 90 % 1000
+        ));
     }
     if !section.crc_ok {
         parts.push("CRC FAILED".to_owned());
@@ -407,9 +410,9 @@ impl SourceState {
     /// The segment carrying `pts`: the latest one starting at or before it.
     fn segment_at(&self, pts: u64) -> Option<&SegmentContext> {
         self.segments.iter().rev().find(|segment| {
-            segment
-                .first_pts
-                .is_some_and(|first| (0..MAX_ANCHOR_DISTANCE_TICKS).contains(&pts_delta(pts, first)))
+            segment.first_pts.is_some_and(|first| {
+                (0..MAX_ANCHOR_DISTANCE_TICKS).contains(&pts_delta(pts, first))
+            })
         })
     }
     /// The demuxer's PID when it has one, else the single PID the PMT declares.
@@ -418,12 +421,11 @@ impl SourceState {
             PacketKind::Scte35 => &self.pids.scte35,
             PacketKind::Id3 => &self.pids.id3,
         };
-        reported
-            .filter(|pid| *pid != 0)
-            .or_else(|| match declared.as_slice() {
-                [only] => Some(*only),
-                _ => None,
-            })
+        let single = match declared.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        };
+        reported.filter(|pid| *pid != 0).or(single)
     }
     fn transport(&self, pid: Option<u16>, pts: Option<u64>) -> JournalTransport {
         let segment = pts.and_then(|pts| self.segment_at(pts));
@@ -683,7 +685,15 @@ impl JournalWorker {
             return;
         }
         let (event_id, upid) = section_identity(&section);
-        self.marker(source, record_id, name, received_ns, &timing, event_id, upid);
+        self.marker(
+            source,
+            record_id,
+            name,
+            received_ns,
+            &timing,
+            event_id,
+            upid,
+        );
     }
 
     #[allow(clippy::too_many_arguments)] // reason: one flat row of independent display fields.
@@ -755,11 +765,13 @@ impl JournalWorker {
             Ok(tag) => {
                 let decoded = id3::decode_tag(&tag);
                 draft.clock_reference = id3::is_clock_only(&tag);
-                let frames: Vec<&str> = decoded.frames.iter().map(|f| f.frame_id.as_str()).collect();
+                let frames: Vec<&str> =
+                    decoded.frames.iter().map(|f| f.frame_id.as_str()).collect();
                 draft.summary = frames.join(" ");
                 draft.name = format!("ID3 {}", frames.first().copied().unwrap_or("tag"));
                 if let Some(clock) = id3::clock_reference(&tag) {
-                    draft.name = "Source clock (ID3 UTC)".to_owned();
+                    draft.name.clear();
+                    draft.name.push_str("Source clock (ID3 UTC)");
                     draft.summary = rfc3339_ns(clock.utc_ns);
                     state.clock = Some(SourceClockDto {
                         utc: rfc3339_ns(clock.utc_ns),
@@ -821,7 +833,11 @@ impl JournalWorker {
         let clocks = self.clocks(source);
         let start_ns = decoded.start_ns.or(tag.pdt_ns).map(|ns| {
             let elapsed = decoded.elapsed_ms.unwrap_or(0);
-            ns.saturating_sub(i64::try_from(elapsed).unwrap_or(0).saturating_mul(1_000_000))
+            ns.saturating_sub(
+                i64::try_from(elapsed)
+                    .unwrap_or(0)
+                    .saturating_mul(1_000_000),
+            )
         });
         let timing = start_ns.map(|ns| dated_timing(ns, decoded.duration_ms, &clocks));
         let section = decoded.scte35.iter().find_map(|s| s.section.as_ref());
@@ -866,7 +882,15 @@ impl JournalWorker {
                 airs_at: None,
                 airs_end_at: None,
             });
-            self.marker(source, record_id, name, received_ns, &timing, event_id, upid);
+            self.marker(
+                source,
+                record_id,
+                name,
+                received_ns,
+                &timing,
+                event_id,
+                upid,
+            );
         }
     }
 }
@@ -999,7 +1023,9 @@ mod tests {
     const NOW: i64 = 1_793_000_000_000_000_000;
 
     fn section() -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD.decode(POS).unwrap()
+        base64::engine::general_purpose::STANDARD
+            .decode(POS)
+            .unwrap()
     }
     fn decoded() -> DecodedSection {
         decode_section(&section()).unwrap()
@@ -1105,7 +1131,10 @@ mod tests {
             output: Some(now),
             ..Clocks::default()
         };
-        assert_eq!(clocks.airs(now.raw_pts_90k + 90_000), Some(NOW + 1_000_000_000));
+        assert_eq!(
+            clocks.airs(now.raw_pts_90k + 90_000),
+            Some(NOW + 1_000_000_000)
+        );
         // A frame still inside the jitter hold has not aired yet.
         let held = output_anchor_now(9_000_000_000, 5_000_000_000, 4_000_000_000, NOW).unwrap();
         assert_eq!(held.raw_pts_90k, 8 * 90_000);
@@ -1114,7 +1143,9 @@ mod tests {
     #[test]
     fn immediate_splices_stay_immediate_at_the_packet_pts() {
         // time_signal with time_specified_flag = 0.
-        let mut s = vec![0xFC, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xF0, 1, 6, 0x7F, 0, 0];
+        let mut s = vec![
+            0xFC, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xF0, 1, 6, 0x7F, 0, 0,
+        ];
         s[2] = u8::try_from(s.len() + 4 - 3).unwrap();
         let crc = multiview_input::mpegts::crc::crc32_mpeg2(&s);
         s.extend_from_slice(&crc.to_be_bytes());
@@ -1164,7 +1195,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = worker(dir.path());
         for n in 0..3 {
-            w.handle(packet(PacketKind::Scte35, section(), SPLICE - 360_000, NOW + n));
+            w.handle(packet(
+                PacketKind::Scte35,
+                section(),
+                SPLICE - 360_000,
+                NOW + n,
+            ));
         }
         w.flush(NOW + 10);
         let rows = records(dir.path());
@@ -1215,12 +1251,22 @@ mod tests {
         ]);
         tag.extend_from_slice(&payload);
         let utc = multiview_input::hls::parse_rfc3339_ns("2026-11-03T21:14:58Z").unwrap();
-        w.handle(packet(PacketKind::Id3, tag, SPLICE - 900_000, utc + 2_000_000_000));
+        w.handle(packet(
+            PacketKind::Id3,
+            tag,
+            SPLICE - 900_000,
+            utc + 2_000_000_000,
+        ));
         let summary = w.summary("cnn").unwrap();
         let clock = summary.clock.as_ref().unwrap();
         assert_eq!(clock.offset_ms, -2000);
-        assert!(summary.markers.is_empty());
-        w.handle(packet(PacketKind::Scte35, section(), SPLICE - 90_000, utc + 9_000_000_000));
+        assert_eq!(summary.markers.len(), 0);
+        w.handle(packet(
+            PacketKind::Scte35,
+            section(),
+            SPLICE - 90_000,
+            utc + 9_000_000_000,
+        ));
         let rows = records(dir.path());
         assert!(rows[1].clock_reference);
         let timing = rows[0].timing.as_ref().unwrap();
@@ -1263,7 +1309,12 @@ mod tests {
             pts_90k: Some(SPLICE - 450_000),
             received_ns: utc,
         });
-        w.handle(packet(PacketKind::Scte35, section(), SPLICE - 450_000, utc + 1));
+        w.handle(packet(
+            PacketKind::Scte35,
+            section(),
+            SPLICE - 450_000,
+            utc + 1,
+        ));
         let rows = records(dir.path());
         assert_eq!(rows.len(), 3, "the reloaded tag is a repeat");
         assert_eq!(rows[1].transport.pid, Some(0x1E3));
@@ -1305,7 +1356,12 @@ mod tests {
         for _ in 0..3 {
             feed.offer(Observation::Flush);
         }
-        feed.offer(packet(PacketKind::Id3, vec![0; MAX_PAYLOAD_BYTES + 1], 0, 0));
+        feed.offer(packet(
+            PacketKind::Id3,
+            vec![0; MAX_PAYLOAD_BYTES + 1],
+            0,
+            0,
+        ));
         assert_eq!(counters.snapshot().dropped, 3);
     }
 

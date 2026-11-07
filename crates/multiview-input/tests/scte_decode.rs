@@ -1,13 +1,20 @@
 //! Full SCTE-35 journal decode against spec-shaped sections. Each fixture
-//! carries a real CRC_32, so `crc_ok` proves the fixture bytes themselves.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+//! carries a real `CRC_32`, so `crc_ok` proves the fixture bytes themselves.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 use base64::Engine as _;
 use multiview_input::scte::decode::{
     decode_section, pts_add, pts_delta, Command, DescriptorBody, PTS_MODULUS,
 };
 
 fn b64(text: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD.decode(text).unwrap()
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .unwrap()
 }
 
 /// SCTE-35 2023r1 sample: `time_signal` Placement Opportunity Start.
@@ -25,7 +32,7 @@ fn time_signal_placement_opportunity_start_decodes_every_field() {
     assert!(d.crc_ok, "fixture CRC {}", d.crc_32);
     assert_eq!(d.parse_error, None);
     assert_eq!(d.splice_command_name, "time_signal");
-    assert_eq!(d.pts_time(), Some(0x0_72BD_0050));
+    assert_eq!(d.pts_time(), Some(0x72BD_0050));
     assert_eq!(d.tier, 0xFFF);
     let s = d.primary_segmentation().unwrap();
     assert_eq!(s.segmentation_event_id, 0x4800_008E);
@@ -34,14 +41,14 @@ fn time_signal_placement_opportunity_start_decodes_every_field() {
         s.segmentation_type_name.as_deref(),
         Some("Provider Placement Opportunity Start")
     );
-    assert_eq!(s.segmentation_duration, Some(0x0001_A599_B0));
+    assert_eq!(s.segmentation_duration, Some(0x01A5_99B0));
     assert_eq!(s.segmentation_duration_ms, Some(307_000));
     let upid = s.upid.as_ref().unwrap();
     assert_eq!(upid.upid_type_name, "AiringID");
     assert_eq!(upid.value, "0x000000002CA0A18A");
     assert_eq!((s.segment_num, s.segments_expected), (Some(2), Some(0)));
     assert_eq!(d.display_name(), "Provider Placement Opportunity Start");
-    assert_eq!(d.duration_ticks(), Some(0x0001_A599_B0));
+    assert_eq!(d.duration_ticks(), Some(0x01A5_99B0));
 }
 
 #[test]
@@ -70,7 +77,9 @@ fn splice_insert_decodes_break_duration_and_avail_descriptor() {
     assert_eq!(duration.duration, 0x0052_CCF5);
     assert!(matches!(
         d.descriptors[0].body,
-        DescriptorBody::Avail { provider_avail_id: 0x135 }
+        DescriptorBody::Avail {
+            provider_avail_id: 0x135
+        }
     ));
     assert_eq!(d.display_name(), "Splice Insert (Out of Network)");
 }
@@ -82,7 +91,10 @@ fn a_failed_crc_keeps_the_decode_and_says_so() {
     bytes[last] ^= 0xFF;
     let d = decode_section(&bytes).unwrap();
     assert!(!d.crc_ok);
-    assert_eq!(d.primary_segmentation().unwrap().segmentation_type_id, Some(0x34));
+    assert_eq!(
+        d.primary_segmentation().unwrap().segmentation_type_id,
+        Some(0x34)
+    );
 }
 
 #[test]
@@ -125,7 +137,12 @@ fn upid_of(upid_type: u8, upid: &[u8]) -> String {
     let d = decode_section(&bytes).unwrap();
     assert!(d.crc_ok);
     assert_eq!(d.parse_error, None);
-    d.primary_segmentation().unwrap().upid.clone().unwrap().value
+    d.primary_segmentation()
+        .unwrap()
+        .upid
+        .clone()
+        .unwrap()
+        .value
 }
 
 #[test]
@@ -133,11 +150,11 @@ fn upids_decode_per_type() {
     assert_eq!(upid_of(0x03, b"ABCD01234567"), "ABCD01234567");
     assert_eq!(upid_of(0x09, b"SIGNAL:abc"), "SIGNAL:abc");
     assert_eq!(upid_of(0x0F, b"urn:uuid:1"), "urn:uuid:1");
-    assert_eq!(upid_of(0x08, &[0, 0, 0, 0, 0x2C, 0xA0, 0xA1, 0x8A]), "0x000000002CA0A18A");
     assert_eq!(
-        upid_of(0x06, &[0xAB; 12]),
-        "ABAB-ABAB-ABAB-ABAB-ABAB-ABAB"
+        upid_of(0x08, &[0, 0, 0, 0, 0x2C, 0xA0, 0xA1, 0x8A]),
+        "0x000000002CA0A18A"
     );
+    assert_eq!(upid_of(0x06, &[0xAB; 12]), "ABAB-ABAB-ABAB-ABAB-ABAB-ABAB");
     assert_eq!(
         upid_of(0x04, &[0x11; 32]),
         "11111111.11111111.11111111.11111111.11111111.11111111.11111111.11111111"
@@ -155,7 +172,9 @@ fn upids_decode_per_type() {
 #[test]
 fn eidr_renders_as_a_doi_with_its_check_character() {
     // 10.5240/7791-8534-2C23-9030-8610-5, a published EIDR title identifier.
-    let eidr = [0x14, 0x78, 0x77, 0x91, 0x85, 0x34, 0x2C, 0x23, 0x90, 0x30, 0x86, 0x10];
+    let eidr = [
+        0x14, 0x78, 0x77, 0x91, 0x85, 0x34, 0x2C, 0x23, 0x90, 0x30, 0x86, 0x10,
+    ];
     assert_eq!(upid_of(0x0A, &eidr), "10.5240/7791-8534-2C23-9030-8610-5");
 }
 
@@ -172,10 +191,17 @@ fn null_bandwidth_private_and_immediate_commands_decode() {
     let d = decode_section(&section(0x07, &[], &[])).unwrap();
     assert!(matches!(d.splice_command, Command::BandwidthReservation));
     let d = decode_section(&section(0xFF, &[0x43, 0x55, 0x45, 0x49, 0xAA], &[])).unwrap();
-    let Command::PrivateCommand { identifier, private_bytes } = d.splice_command else {
+    let Command::PrivateCommand {
+        identifier,
+        private_bytes,
+    } = d.splice_command
+    else {
         panic!("not private");
     };
-    assert_eq!((identifier.as_str(), private_bytes.as_str()), ("43554549", "aa"));
+    assert_eq!(
+        (identifier.as_str(), private_bytes.as_str()),
+        ("43554549", "aa")
+    );
     let d = decode_section(&section(0x06, &[0x7F], &[])).unwrap();
     assert!(d.is_immediate());
     assert_eq!(d.splice_pts(), None);
@@ -218,7 +244,7 @@ mod published {
     #[test]
     fn sample_14_4_program_start_end_keeps_both_descriptors() {
         let d = decoded("/DBIAAAAAAAA///wBQb+ek2ItgAyAhdDVUVJSAAAGH+fCAgAAAAALMvDRBEAAAIXQ1VFSUgAABl/nwgIAAAAACyk26AQAACZcuND");
-        assert_eq!(d.pts_time(), Some(0x07A4_D88B6));
+        assert_eq!(d.pts_time(), Some(0x7A4D_88B6));
         assert_eq!(type_ids(&d), vec![Some(0x11), Some(0x10)]);
     }
 
@@ -226,7 +252,10 @@ mod published {
     fn sample_14_6_names_the_blackout_override() {
         let d = decoded("/DBIAAAAAAAA///wBQb+ky44CwAyAhdDVUVJSAAACn+fCAgAAAAALKCh4xgAAAIXQ1VFSUgAAAl/nwgIAAAAACygoYoRAAC0IX6w");
         assert_eq!(
-            d.primary_segmentation().unwrap().segmentation_type_name.as_deref(),
+            d.primary_segmentation()
+                .unwrap()
+                .segmentation_type_name
+                .as_deref(),
             Some("Program Blackout Override")
         );
     }
@@ -246,17 +275,26 @@ mod published {
     #[test]
     fn dtmf_descriptor_and_insert_fields_decode() {
         let d = decoded("/DAxAAAAAAAAAP/wFAVAAIeuf+/+0AWRK/4AUmXAAC0AfwAMAQpDVUVJUJ81MTkqo5/+gA==");
-        let Command::SpliceInsert(insert) = &d.splice_command else { panic!("not an insert") };
+        let Command::SpliceInsert(insert) = &d.splice_command else {
+            panic!("not an insert")
+        };
         assert_eq!(insert.splice_event_id, 1_073_776_558);
         assert_eq!(insert.pts_time, Some(3_490_025_771));
         assert_eq!(insert.break_duration.as_ref().unwrap().duration, 5_400_000);
         assert_eq!(
-            (insert.unique_program_id, insert.avail_num, insert.avails_expected),
+            (
+                insert.unique_program_id,
+                insert.avail_num,
+                insert.avails_expected
+            ),
             (Some(45), Some(0), Some(127))
         );
         assert_eq!(
             d.descriptors[0].body,
-            DescriptorBody::Dtmf { preroll: 80, dtmf: "519*".to_owned() }
+            DescriptorBody::Dtmf {
+                preroll: 80,
+                dtmf: "519*".to_owned()
+            }
         );
     }
 
@@ -266,28 +304,46 @@ mod published {
         let s = d.primary_segmentation().unwrap();
         let upid = s.upid.as_ref().unwrap();
         assert_eq!(upid.nested.len(), 3);
-        assert!(upid.nested[0].value.starts_with("10.5239/8BE5-E3F6-0000-0000-0000"));
-        assert_eq!(upid.nested[2].value, "SIGNAL:Ly9EMGxKR0hFZUtpMHdCUVZnRUFnZz1");
+        assert!(upid.nested[0]
+            .value
+            .starts_with("10.5239/8BE5-E3F6-0000-0000-0000"));
+        assert_eq!(
+            upid.nested[2].value,
+            "SIGNAL:Ly9EMGxKR0hFZUtpMHdCUVZnRUFnZz1"
+        );
         assert_eq!((s.segment_num, s.segments_expected), (Some(1), Some(3)));
     }
 
     #[test]
     fn legacy_unknown_command_length_finds_the_descriptor_loop() {
-        let d = decoded("/DA8AAAAAAAAAP///wb+06ACpQAmAiRDVUVJAACcHX//AACky4AMEERJU0NZTVdGMDQ1MjAwMEgxAQEMm4c0");
+        let d = decoded(
+            "/DA8AAAAAAAAAP///wb+06ACpQAmAiRDVUVJAACcHX//AACky4AMEERJU0NZTVdGMDQ1MjAwMEgxAQEMm4c0",
+        );
         assert_eq!(d.splice_command_length, 0xFFF);
         assert_eq!(d.pts_time(), Some(3_550_479_013));
         let s = d.primary_segmentation().unwrap();
         assert_eq!(s.segmentation_duration, Some(10_800_000));
-        assert!(s.upid.as_ref().unwrap().value.starts_with("format_identifier=DISC"));
+        assert!(s
+            .upid
+            .as_ref()
+            .unwrap()
+            .value
+            .starts_with("format_identifier=DISC"));
     }
 
     #[test]
     fn a_private_descriptor_stays_opaque_and_the_next_one_still_decodes() {
         let d = decoded("/DBPAAAAAAAAAP/wBQb/Gq9LggA5AAVTQVBTCwIwQ1VFSf////9//wAAFI4PDxx1cm46bmJjdW5pLmNvbTpicmM6NDk5ODY2NDM0MQoBbM98zw==");
         assert_eq!(d.descriptors[0].identifier, "SAPS");
-        assert!(matches!(d.descriptors[0].body, DescriptorBody::Opaque { .. }));
+        assert!(matches!(
+            d.descriptors[0].body,
+            DescriptorBody::Opaque { .. }
+        ));
         let s = d.primary_segmentation().unwrap();
-        assert_eq!(s.upid.as_ref().unwrap().value, "urn:nbcuni.com:brc:499866434");
+        assert_eq!(
+            s.upid.as_ref().unwrap().value,
+            "urn:nbcuni.com:brc:499866434"
+        );
         assert_eq!(s.segmentation_event_id, 4_294_967_295);
     }
 
@@ -299,7 +355,10 @@ mod published {
 
     #[test]
     fn a_published_bad_crc_is_reported_with_its_decode() {
-        let d = decode_section(&b64("/DA4AAAAAAAAAP/wFAUABDEAf+//mWEhzP4Azf5gAQAAAAATAhFDVUVJAAAAAX+/AQIwNAEAAKeYO3Q=")).unwrap();
+        let d = decode_section(&b64(
+            "/DA4AAAAAAAAAP/wFAUABDEAf+//mWEhzP4Azf5gAQAAAAATAhFDVUVJAAAAAX+/AQIwNAEAAKeYO3Q=",
+        ))
+        .unwrap();
         assert!(!d.crc_ok);
         assert_eq!(d.splice_command_name, "splice_insert");
     }
@@ -308,17 +367,23 @@ mod published {
     fn an_immediate_insert_with_alignment_stuffing_decodes() {
         let d = decoded("/DAeAAAAAAAAAP///wViAA/nf18ACQAAAAAskJv+YPtE");
         assert!(d.is_immediate());
-        let Command::SpliceInsert(insert) = &d.splice_command else { panic!("not an insert") };
+        let Command::SpliceInsert(insert) = &d.splice_command else {
+            panic!("not an insert")
+        };
         assert_eq!(insert.splice_event_id, 1_644_171_239);
         assert_eq!(insert.unique_program_id, Some(9));
     }
 
     #[test]
     fn a_nonzero_pts_adjustment_shifts_the_splice_point() {
-        let d = decoded("/DA0AABS2+YAAACgFAUALJGCf+/+MSwPcX4AUmXAAAAAAAAMAQpDVUVJRp8xMjEq3pnIPCi6lw==");
+        let d =
+            decoded("/DA0AABS2+YAAACgFAUALJGCf+/+MSwPcX4AUmXAAAAAAAAMAQpDVUVJRp8xMjEq3pnIPCi6lw==");
         // Wire bytes 00 52 DB E6 00: one high bit, then four adjustment bytes.
         assert_eq!(d.pts_adjustment, 0x52DB_E600);
-        assert_eq!(d.splice_pts(), d.pts_time().map(|t| pts_add(t, 0x52DB_E600)));
+        assert_eq!(
+            d.splice_pts(),
+            d.pts_time().map(|t| pts_add(t, 0x52DB_E600))
+        );
     }
 
     #[test]
@@ -326,8 +391,14 @@ mod published {
         let d = decoded("/DCRAAAAAAAAAP/wBQb/9peOEAB7AjhDVUVJAAAAnH+/DilhdmFpbGlkPTkxNDg2NjA2NSZiaXRtYXA9JmluYWN0aXZpdHk9MzEyMDEHCgI/Q1VFSQAAAJ1//wAANu6ADilhdmFpbGlkPTkxMDkwMTM4OSZiaXRtYXA9JmluYWN0aXZpdHk9MzEyMDAICgAAoJMeaA==");
         let rows: Vec<_> = d.segmentations().collect();
         assert_eq!(rows[0].sub_segment_num, None);
-        assert_eq!((rows[1].sub_segment_num, rows[1].sub_segments_expected), (Some(0), Some(0)));
-        assert_eq!(rows[1].upid.as_ref().unwrap().upid_type_name, "ADS Information");
+        assert_eq!(
+            (rows[1].sub_segment_num, rows[1].sub_segments_expected),
+            (Some(0), Some(0))
+        );
+        assert_eq!(
+            rows[1].upid.as_ref().unwrap().upid_type_name,
+            "ADS Information"
+        );
     }
 
     #[test]
@@ -339,7 +410,10 @@ mod published {
             panic!("not audio");
         };
         assert_eq!(components[0].iso_code, "eng");
-        assert_eq!((components[0].num_channels, components[0].full_srvc_audio), (8, true));
+        assert_eq!(
+            (components[0].num_channels, components[0].full_srvc_audio),
+            (8, true)
+        );
     }
 
     #[test]

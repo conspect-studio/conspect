@@ -14149,7 +14149,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "90 kHz PTS of the carrying packet. SCTE-35 sections have no PES header,\nso the demuxer reports the last PCR for them.",
+            "description": "90 kHz time of the carrying packet. SCTE-35 sections have no PES header, so\nthe demuxer reports the last PCR, which trails video PTS by the mux delay.",
             "minimum": 0
           },
           "summary": {

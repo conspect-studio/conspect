@@ -101,14 +101,13 @@ pub use routing::{
 };
 pub use salvo::{Salvo, SourceRecall, TallyRecall, UmdRecall};
 pub use schema::{
-    EventsConfig,
     lower_rist_url, Border, Canvas, CanvasColor, Cell, CellQos, CellSource, ClockFaceConfig,
-    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, Fps, Layout, MetadataCapability,
-    MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, Output,
-    OutputFlip, OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata,
-    Overlay, PlaylistMetadata, Rect, RistAesBits, RistEncryption, RistOptions, RistPeer,
-    RistProfile, RistUrlError, Source, SourceAuth, SourceKind, SrtBackend, SrtEncryption,
-    SrtKeyLength, SrtMode, SrtOptions,
+    ColorOverride, DisplayModeSpec, EpgMode, EpgSource, EventsConfig, Fps, Layout,
+    MetadataCapability, MetadataField, OrientationMechanism, OrientationMode,
+    OrientationTagCapability, Output, OutputFlip, OutputMetadata, OutputMetadataPlan,
+    OutputOrientation, OutputTimedMetadata, Overlay, PlaylistMetadata, Rect, RistAesBits,
+    RistEncryption, RistOptions, RistPeer, RistProfile, RistUrlError, Source, SourceAuth,
+    SourceKind, SrtBackend, SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};

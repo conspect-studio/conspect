@@ -231,8 +231,7 @@ impl JournalCounters {
 /// RFC 3339 UTC text with nanoseconds.
 #[must_use]
 pub fn rfc3339_ns(ns: i64) -> String {
-    chrono::DateTime::from_timestamp_nanos(ns)
-        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
 fn day_of(ns: i64) -> String {
@@ -263,10 +262,13 @@ pub fn source_dir_name(id: &str) -> String {
 fn is_day_file(name: &str) -> bool {
     name.strip_suffix(".jsonl").is_some_and(|day| {
         day.len() == 10
-            && day
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() })
+            && day.bytes().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            })
     })
 }
 
@@ -715,13 +717,12 @@ impl JournalReader {
         query: &JournalQuery,
         sink: &mut dyn FnMut(String) -> bool,
     ) -> io::Result<()> {
-        let mut files = match source {
-            Some(id) => self.files_newest_first(id, query),
-            None => {
-                let mut all = day_files_under(&self.root);
-                all.retain(|(day, _, _)| query.admits_day(day));
-                all
-            }
+        let mut files = if let Some(id) = source {
+            self.files_newest_first(id, query)
+        } else {
+            let mut all = day_files_under(&self.root);
+            all.retain(|(day, _, _)| query.admits_day(day));
+            all
         };
         files.sort();
         for (_, path, _) in files {

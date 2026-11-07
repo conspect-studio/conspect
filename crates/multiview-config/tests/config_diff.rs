@@ -699,5 +699,7 @@ areas = ["a"]
     let events = tuned.events.expect("events");
     assert_eq!(events.journal_retention_days, 3);
     assert_eq!(events.journal_max_bytes, 256 * 1024 * 1024);
-    assert!(ConfigDiff::between(&plain, &tuned).changed_sections.contains("events"));
+    assert!(ConfigDiff::between(&plain, &tuned)
+        .changed_sections
+        .contains("events"));
 }

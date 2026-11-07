@@ -204,13 +204,23 @@ fn priv_tag(frames: &[(&str, &[u8])]) -> Vec<u8> {
         payload.extend_from_slice(data);
         body.extend_from_slice(b"PRIV");
         let size = u32::try_from(payload.len()).unwrap();
-        body.extend_from_slice(&[0, 0, u8::try_from(size >> 7).unwrap(), u8::try_from(size & 0x7f).unwrap()]);
+        body.extend_from_slice(&[
+            0,
+            0,
+            u8::try_from(size >> 7).unwrap(),
+            u8::try_from(size & 0x7f).unwrap(),
+        ]);
         body.extend_from_slice(&[0, 0]);
         body.extend_from_slice(&payload);
     }
     let size = u32::try_from(body.len()).unwrap();
     let mut tag = b"ID3\x04\x00\x00".to_vec();
-    tag.extend_from_slice(&[0, 0, u8::try_from(size >> 7).unwrap(), u8::try_from(size & 0x7f).unwrap()]);
+    tag.extend_from_slice(&[
+        0,
+        0,
+        u8::try_from(size >> 7).unwrap(),
+        u8::try_from(size & 0x7f).unwrap(),
+    ]);
     tag.extend_from_slice(&body);
     tag
 }
@@ -218,8 +228,14 @@ fn priv_tag(frames: &[(&str, &[u8])]) -> Vec<u8> {
 #[test]
 fn elemental_utc_priv_is_a_clock_reference_paired_with_the_apple_pts() {
     let bytes = priv_tag(&[
-        (multiview_input::id3::APPLE_TS_OWNER, &900_000_u64.to_be_bytes()),
-        (multiview_input::id3::ELEMENTAL_UTC_OWNER, b"2024-03-21T10:02:11Z"),
+        (
+            multiview_input::id3::APPLE_TS_OWNER,
+            &900_000_u64.to_be_bytes(),
+        ),
+        (
+            multiview_input::id3::ELEMENTAL_UTC_OWNER,
+            b"2024-03-21T10:02:11Z",
+        ),
     ]);
     let tag = multiview_input::id3::parse(&bytes).unwrap();
     assert!(multiview_input::id3::is_clock_only(&tag));
@@ -228,7 +244,10 @@ fn elemental_utc_priv_is_a_clock_reference_paired_with_the_apple_pts() {
     assert_eq!(clock.pts_90khz, Some(900_000));
     assert_eq!(clock.resolution_ms, 1000);
     let decoded = multiview_input::id3::decode_tag(&tag);
-    assert_eq!(decoded.frames[1].owner.as_deref(), Some(multiview_input::id3::ELEMENTAL_UTC_OWNER));
+    assert_eq!(
+        decoded.frames[1].owner.as_deref(),
+        Some(multiview_input::id3::ELEMENTAL_UTC_OWNER)
+    );
     assert_eq!(decoded.frames[1].utc_ns, Some(1_711_015_331_000_000_000));
     assert_eq!(decoded.frames[0].transport_timestamp_90khz, Some(900_000));
 }
@@ -239,5 +258,10 @@ fn other_priv_owners_are_events_not_clocks() {
     let tag = multiview_input::id3::parse(&bytes).unwrap();
     assert!(!multiview_input::id3::is_clock_only(&tag));
     assert!(multiview_input::id3::clock_reference(&tag).is_none());
-    assert_eq!(multiview_input::id3::decode_tag(&tag).frames[0].data_hex.as_deref(), Some("0102"));
+    assert_eq!(
+        multiview_input::id3::decode_tag(&tag).frames[0]
+            .data_hex
+            .as_deref(),
+        Some("0102")
+    );
 }

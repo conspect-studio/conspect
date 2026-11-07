@@ -45,8 +45,13 @@ fn reader(root: &Path) -> JournalReader {
 fn seed(root: &Path, source: &str, count: i64) {
     let mut s = store(root, JournalLimits::default());
     for n in 0..count {
-        let origin = if n % 2 == 0 { JournalOrigin::Scte35 } else { JournalOrigin::Hls };
-        s.append(&mut record(source, origin, T0 + n), None, T0 + n).unwrap();
+        let origin = if n % 2 == 0 {
+            JournalOrigin::Scte35
+        } else {
+            JournalOrigin::Hls
+        };
+        s.append(&mut record(source, origin, T0 + n), None, T0 + n)
+            .unwrap();
     }
 }
 
@@ -60,11 +65,15 @@ fn files_rotate_per_utc_day_and_pages_cross_them_newest_first() {
     let mut s = store(dir.path(), JournalLimits::default());
     for n in 0..3 {
         let at = T0 + n * DAY;
-        s.append(&mut record("a", JournalOrigin::Scte35, at), None, at).unwrap();
+        s.append(&mut record("a", JournalOrigin::Scte35, at), None, at)
+            .unwrap();
     }
     assert_eq!(days(dir.path(), "a"), 3);
     let r = reader(dir.path());
-    let mut query = JournalQuery { limit: 2, ..JournalQuery::default() };
+    let mut query = JournalQuery {
+        limit: 2,
+        ..JournalQuery::default()
+    };
     let first = r.page("a", &query).unwrap();
     assert_eq!(first.records.len(), 2);
     assert_eq!(first.records[0].received_ns, (T0 + 2 * DAY).to_string());
@@ -81,12 +90,19 @@ fn repeats_inside_the_window_fold_into_one_record_and_expire_after_it() {
     let mut s = store(dir.path(), JournalLimits::default());
     let key = dedupe_key("a", JournalOrigin::Scte35, 0, b"section");
     assert!(!s.repeat(&key, T0));
-    s.append(&mut record("a", JournalOrigin::Scte35, T0), Some(key), T0).unwrap();
+    s.append(&mut record("a", JournalOrigin::Scte35, T0), Some(key), T0)
+        .unwrap();
     assert!(s.repeat(&key, T0 + 1));
     assert!(s.repeat(&key, T0 + 2));
     s.flush(T0 + 3);
     let page = reader(dir.path())
-        .page("a", &JournalQuery { limit: 10, ..JournalQuery::default() })
+        .page(
+            "a",
+            &JournalQuery {
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
         .unwrap();
     assert_eq!(page.records.len(), 1);
     assert_eq!(page.records[0].repeats, 2);
@@ -97,34 +113,49 @@ fn repeats_inside_the_window_fold_into_one_record_and_expire_after_it() {
 #[test]
 fn the_same_payload_at_a_new_position_is_a_new_event() {
     let first = dedupe_key("a", JournalOrigin::Hls, 7, b"#EXT-X-CUE-IN");
-    assert_ne!(first, dedupe_key("a", JournalOrigin::Hls, 8, b"#EXT-X-CUE-IN"));
-    assert_ne!(first, dedupe_key("b", JournalOrigin::Hls, 7, b"#EXT-X-CUE-IN"));
+    assert_ne!(
+        first,
+        dedupe_key("a", JournalOrigin::Hls, 8, b"#EXT-X-CUE-IN")
+    );
+    assert_ne!(
+        first,
+        dedupe_key("b", JournalOrigin::Hls, 7, b"#EXT-X-CUE-IN")
+    );
 }
 
 #[test]
 fn retention_removes_expired_days_and_then_the_oldest_over_the_cap() {
     let dir = tempfile::tempdir().unwrap();
-    let limits = JournalLimits { retention_days: 2, max_bytes: u64::MAX };
+    let limits = JournalLimits {
+        retention_days: 2,
+        max_bytes: u64::MAX,
+    };
     let mut s = store(dir.path(), limits);
     for n in 0..5 {
         let at = T0 + n * DAY;
-        s.append(&mut record("a", JournalOrigin::Id3, at), None, at).unwrap();
+        s.append(&mut record("a", JournalOrigin::Id3, at), None, at)
+            .unwrap();
     }
     s.apply_retention(T0 + 4 * DAY);
     assert_eq!(days(dir.path(), "a"), 3);
 
     let dir = tempfile::tempdir().unwrap();
-    let limits = JournalLimits { retention_days: 365, max_bytes: 1 };
+    let limits = JournalLimits {
+        retention_days: 365,
+        max_bytes: 1,
+    };
     let mut s = store(dir.path(), limits);
     for n in 0..3 {
         let at = T0 + n * DAY;
-        s.append(&mut record("a", JournalOrigin::Id3, at), None, at).unwrap();
+        s.append(&mut record("a", JournalOrigin::Id3, at), None, at)
+            .unwrap();
     }
     s.apply_retention(T0 + 2 * DAY);
     assert_eq!(days(dir.path(), "a"), 0);
     // A later write reopens rather than appending to an unlinked file.
     let at = T0 + 2 * DAY + 1;
-    s.append(&mut record("a", JournalOrigin::Id3, at), None, at).unwrap();
+    s.append(&mut record("a", JournalOrigin::Id3, at), None, at)
+        .unwrap();
     assert_eq!(days(dir.path(), "a"), 1);
 }
 
@@ -134,11 +165,22 @@ fn a_torn_tail_is_skipped_and_a_failed_write_is_counted() {
     let dir = tempfile::tempdir().unwrap();
     seed(dir.path(), "a", 1);
     let source = dir.path().join("a");
-    let file = std::fs::read_dir(&source).unwrap().next().unwrap().unwrap().path();
+    let file = std::fs::read_dir(&source)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let mut handle = std::fs::OpenOptions::new().append(true).open(file).unwrap();
     handle.write_all(b"{\"record_id\":\"torn").unwrap();
     let page = reader(dir.path())
-        .page("a", &JournalQuery { limit: 10, ..JournalQuery::default() })
+        .page(
+            "a",
+            &JournalQuery {
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
         .unwrap();
     assert_eq!(page.records.len(), 1);
 
@@ -146,7 +188,9 @@ fn a_torn_tail_is_skipped_and_a_failed_write_is_counted() {
     std::fs::write(&blocked, b"a file where the root directory should be").unwrap();
     let counters = Arc::new(JournalCounters::default());
     let mut s = JournalStore::new(blocked, JournalLimits::default(), Arc::clone(&counters));
-    assert!(s.append(&mut record("a", JournalOrigin::Id3, T0), None, T0).is_err());
+    assert!(s
+        .append(&mut record("a", JournalOrigin::Id3, T0), None, T0)
+        .is_err());
     assert_eq!(counters.snapshot().write_errors, 1);
 }
 
@@ -216,7 +260,7 @@ async fn downloads_stream_jsonl_and_the_export_is_admin_only() {
     seed(dir.path(), "cam", 3);
     seed(dir.path(), "other", 2);
     let h = app(dir.path());
-    let lines = |bytes: &[u8]| bytes.iter().filter(|b| **b == b'\n').count();
+    let lines = |bytes: &[u8]| bytes.split(|b| *b == b'\n').count() - 1;
     let response = send(
         &h.router,
         get("/api/v1/inputs/cam/events/journal.jsonl", VIEWER_TOKEN),
@@ -228,20 +272,28 @@ async fn downloads_stream_jsonl_and_the_export_is_admin_only() {
         .to_str()
         .unwrap()
         .contains("cam-events.jsonl"));
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(lines(&body), 3);
     let url = "/api/v1/events/journal.jsonl";
     let response = send(&h.router, get(url, VIEWER_TOKEN)).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let response = send(&h.router, get(url, ADMIN_TOKEN)).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(lines(&body), 5);
 }
 
 #[tokio::test]
 async fn a_build_without_a_journal_says_so() {
     let h = harness_with(|s| s);
-    let response = send(&h.router, get("/api/v1/inputs/cam/events/journal", VIEWER_TOKEN)).await;
+    let response = send(
+        &h.router,
+        get("/api/v1/inputs/cam/events/journal", VIEWER_TOKEN),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

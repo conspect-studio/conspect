@@ -74,7 +74,11 @@ fn extinf_ns(line: &str) -> Option<i64> {
     let value = line.strip_prefix("#EXTINF:")?.split(',').next()?.trim();
     let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
     let seconds: i64 = whole.parse().ok()?;
-    let digits: String = fraction.chars().chain("000000000".chars()).take(9).collect();
+    let digits: String = fraction
+        .chars()
+        .chain("000000000".chars())
+        .take(9)
+        .collect();
     seconds
         .checked_mul(1_000_000_000)?
         .checked_add(digits.parse().ok()?)
@@ -166,12 +170,18 @@ fn parse_attributes(list: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut quoted = false;
     let mut start = 0;
-    for (index, c) in list.char_indices().chain(std::iter::once((list.len(), ','))) {
+    for (index, c) in list
+        .char_indices()
+        .chain(std::iter::once((list.len(), ',')))
+    {
         if c == '"' {
             quoted = !quoted;
         } else if c == ',' && !quoted {
             if let Some((key, value)) = list.get(start..index).and_then(|p| p.split_once('=')) {
-                out.insert(key.trim().to_owned(), value.trim().trim_matches('"').to_owned());
+                out.insert(
+                    key.trim().to_owned(),
+                    value.trim().trim_matches('"').to_owned(),
+                );
             }
             start = index.saturating_add(1);
         }
@@ -342,8 +352,8 @@ pub fn metadata_pids(segment: &[u8]) -> MetadataPids {
         return out;
     };
     for program in pat.programs.iter().filter(|p| !p.is_network()) {
-        let Some(pmt) = psi_section(segment, program.pid)
-            .and_then(|s| crate::mpegts::pmt::Pmt::parse(s).ok())
+        let Some(pmt) =
+            psi_section(segment, program.pid).and_then(|s| crate::mpegts::pmt::Pmt::parse(s).ok())
         else {
             continue;
         };
@@ -419,11 +429,20 @@ mod tests {
     #[test]
     fn cue_tags_decode_durations() {
         assert_eq!(decode_tag("#EXT-X-CUE-OUT:30.5").duration_ms, Some(30_500));
-        assert_eq!(decode_tag("#EXT-X-CUE-OUT:DURATION=12").duration_ms, Some(12_000));
+        assert_eq!(
+            decode_tag("#EXT-X-CUE-OUT:DURATION=12").duration_ms,
+            Some(12_000)
+        );
         let cont = decode_tag("#EXT-X-CUE-OUT-CONT:6.5/30");
-        assert_eq!((cont.elapsed_ms, cont.duration_ms), (Some(6500), Some(30_000)));
+        assert_eq!(
+            (cont.elapsed_ms, cont.duration_ms),
+            (Some(6500), Some(30_000))
+        );
         let cont = decode_tag("#EXT-X-CUE-OUT-CONT:ElapsedTime=4,Duration=30,SCTE35=/DAvAAAA");
-        assert_eq!((cont.elapsed_ms, cont.duration_ms), (Some(4000), Some(30_000)));
+        assert_eq!(
+            (cont.elapsed_ms, cont.duration_ms),
+            (Some(4000), Some(30_000))
+        );
         assert_eq!(decode_tag("#EXT-X-CUE-IN").tag, "EXT-X-CUE-IN");
     }
 
@@ -438,11 +457,16 @@ PLANNED-DURATION=30,SCTE35-OUT=0xFC302F000000000000FFFFF0140548000\
         let section = tag.scte35[0].section.as_ref().unwrap();
         assert!(section.crc_ok);
         assert_eq!(section.splice_command_name, "splice_insert");
-        assert_eq!(decode_tag("#EXT-X-DATERANGE:ID=\"b\",SCTE35-IN=0xZZ").scte35[0].section, None);
+        assert_eq!(
+            decode_tag("#EXT-X-DATERANGE:ID=\"b\",SCTE35-IN=0xZZ").scte35[0].section,
+            None
+        );
     }
 
     fn ts_packet(stream_id: u8, pts: u64) -> Vec<u8> {
-        let mut p = vec![0x47, 0x41, 0x00, 0x10, 0, 0, 1, stream_id, 0, 0, 0x80, 0x80, 5];
+        let mut p = vec![
+            0x47, 0x41, 0x00, 0x10, 0, 0, 1, stream_id, 0, 0, 0x80, 0x80, 5,
+        ];
         p.push(0x21 | (u8::try_from((pts >> 30) & 7).unwrap() << 1));
         p.push(u8::try_from((pts >> 22) & 0xFF).unwrap());
         p.push(1 | (u8::try_from((pts >> 15) & 0x7F).unwrap() << 1));
