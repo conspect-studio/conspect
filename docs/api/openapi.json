@@ -1025,7 +1025,7 @@
         "operationId": "get_catalogue_index",
         "responses": {
           "200": {
-            "description": "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; `already_added` flagged per caller.",
+            "description": "`{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; identical for every caller (`already_added` is computed by the web).",
             "content": {
               "application/json": {
                 "schema": {}
@@ -1033,7 +1033,7 @@
             }
           },
           "304": {
-            "description": "If-None-Match matched (and the caller has no linked sources)."
+            "description": "If-None-Match matched ."
           },
           "401": {
             "description": "Missing or invalid credentials.",
@@ -1102,7 +1102,7 @@
         "tags": [
           "catalogue"
         ],
-        "summary": "`GET /api/v1/catalogues/iptv-org/logos/{k}` — bounded server-side logo cache.",
+        "summary": "`GET /api/v1/catalogues/iptv-org/logos/{k}` — persistent server-side logo cache.",
         "operationId": "get_catalogue_logo",
         "parameters": [
           {
@@ -1117,23 +1117,19 @@
         ],
         "responses": {
           "200": {
-            "description": "The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, fetched server-side.",
+            "description": "The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, cached on disk for 30 days. `Cache-Control: private, max-age=2592000, immutable` and a strong `ETag`.",
             "content": {
               "image/*": {}
             }
           },
-          "404": {
-            "description": "Unknown logo key.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
+          "204": {
+            "description": "No logo: unknown key, upstream missing/failing, oversized or not an image (`Cache-Control: private, max-age=86400`), or the upstream fetch queue was busy (`Cache-Control: no-store`; retry later). Never an error status."
           },
-          "502": {
-            "description": "Upstream logo unavailable or not an image.",
+          "304": {
+            "description": "`If-None-Match` matched the logo's `ETag`."
+          },
+          "409": {
+            "description": "Catalogue not configured.",
             "content": {
               "application/json": {
                 "schema": {

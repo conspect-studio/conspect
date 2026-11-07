@@ -112,6 +112,30 @@ iptv-org.github.io/api ──(fixed host, If-None-Match)──► catalogue::syn
   compile-time constant. Kill switch: `[catalogues.iptv_org] enabled = false`.
 - Snapshot written atomically (`tmp` + rename) with its source ETags and a schema version.
 
+### 2.1a Logo cache
+
+`GET …/logos/{k}` is a persistent, bounded disk cache under
+`<config-dir>/.multiview/catalogues/iptv-org/logos/` (a derived cache, not configuration).
+
+- **Store.** Key `sha256(url)`: `<key>.bin` (image bytes) + `<key>.json` sidecar (content type,
+  `fetched_at`, upstream `ETag`/`Last-Modified`, status, consecutive failures, retry time). Writes are
+  temp + rename. Bounded at **256 MiB and 20,000 files** (sidecars count); least-recently-used
+  entries are evicted (recency in memory, recovered from sidecar mtimes at startup). A small
+  in-memory hot set serves repeats. Image types only, ≤ 512 KiB.
+- **TTL.** A cached copy is served for **30 days**; after that it is revalidated in the background
+  (`If-None-Match` / `If-Modified-Since`) while the old copy keeps being served. A failed upstream
+  never evicts a good copy.
+- **Negative cache** (in the sidecar). 404/410/other 4xx, DNS failure, oversized, wrong type: **7
+  days**. 429/5xx/timeout: **15 minutes, doubling per consecutive failure, up to 24 h**.
+- **Politeness.** `User-Agent` names the software and links
+  `https://github.com/conspect-studio/conspect` (Wikimedia's robot policy); at most **2 concurrent
+  fetches per host, 8 globally**; every dial goes through the screened `iptv::fetch`.
+- **Responses.** `200` with `Cache-Control: private, max-age=2592000, immutable` and a strong `ETag`;
+  `304` on a matching `If-None-Match`; `204` with `Cache-Control: private, max-age=86400` for a
+  known-missing logo (negative cached, oversized, wrong type, unknown key); `204` with
+  `Cache-Control: no-store` when no fetch slot freed within 5 s (the browser retries later). Never an
+  error status for a missing logo. The web UI shows a neutral initials placeholder for any of these.
+
 ### 2.2 Index
 
 The joined index row is one **stream**, carrying everything the UI filters on:
@@ -401,6 +425,7 @@ release build is smaller and faster; host checks on mda001 are listed at the end
 | Sync bandwidth, first or changed | 6.5 MB gzip on the wire for all files | `guides.json` is the largest at 2.6 MB. |
 | Sync bandwidth, unchanged | 0 B body per file (HTTP 304 via `If-None-Match`) | A forced refresh with nothing changed took 2.5 s wall. |
 | Disk | 8.4 MB under `.multiview/catalogues/iptv-org/` | gzip files plus manifest. |
+| Disk: logo cache | **≤ 256 MiB and ≤ 20,000 files** (bound, not a measurement) under `…/iptv-org/logos/` | Median logo 21 KB, p90 108 KB, cap 512 KiB; ~9,900 distinct URLs ≈ 200–300 MB if all were fetched, hence the LRU bound. |
 | `GET …/index` | 2.2 MB gzip; served from a cached gzip body | ETag 304 when unchanged. |
 | `GET …/places` | 203 KB gzip | |
 | Probe limits | 4 concurrent, queue 64 (then 429), 20 s, 16 MiB, 60/min per principal, 15 min cache | Decode runs on the blocking pool, never the engine. |

@@ -309,7 +309,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** `GET /api/v1/catalogues/iptv-org/logos/{k}` — bounded server-side logo cache. */
+        /** `GET /api/v1/catalogues/iptv-org/logos/{k}` — persistent server-side logo cache. */
         get: operations["get_catalogue_logo"];
         put?: never;
         post?: never;
@@ -7835,7 +7835,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description `{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; `already_added` flagged per caller. */
+            /** @description `{schema, generated_at, categories[], languages[], streams[]}`; gzip when accepted; identical for every caller (`already_added` is computed by the web). */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -7844,7 +7844,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description If-None-Match matched (and the caller has no linked sources). */
+            /** @description If-None-Match matched . */
             304: {
                 headers: {
                     [name: string]: unknown;
@@ -7921,7 +7921,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, fetched server-side. */
+            /** @description The logo image (PNG/JPEG/WebP/GIF/SVG), size-capped, cached on disk for 30 days. `Cache-Control: private, max-age=2592000, immutable` and a strong `ETag`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -7930,17 +7930,22 @@ export interface operations {
                     "image/*": unknown;
                 };
             };
-            /** @description Unknown logo key. */
-            404: {
+            /** @description No logo: unknown key, upstream missing/failing, oversized or not an image (`Cache-Control: private, max-age=86400`), or the upstream fetch queue was busy (`Cache-Control: no-store`; retry later). Never an error status. */
+            204: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["Problem"];
-                };
+                content?: never;
             };
-            /** @description Upstream logo unavailable or not an image. */
-            502: {
+            /** @description `If-None-Match` matched the logo's `ETag`. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalogue not configured. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
