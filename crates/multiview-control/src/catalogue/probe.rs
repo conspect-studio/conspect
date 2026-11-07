@@ -530,12 +530,21 @@ impl ProbeService {
     /// Reserve one admission slot atomically; `None` when the queue is full.
     fn try_reserve(&self) -> Option<AdmissionSlot> {
         use std::sync::atomic::Ordering;
-        self.admitted
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_CONCURRENT + MAX_QUEUED).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| AdmissionSlot(Arc::clone(&self.admitted)))
+        // A compare-exchange loop: `AtomicUsize::try_update` needs Rust 1.95 and
+        // the workspace MSRV is 1.85.
+        let mut n = self.admitted.load(Ordering::Acquire);
+        loop {
+            if n >= MAX_CONCURRENT + MAX_QUEUED {
+                return None;
+            }
+            match self
+                .admitted
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(AdmissionSlot(Arc::clone(&self.admitted))),
+                Err(current) => n = current,
+            }
+        }
     }
 
     /// Acquire a probe permit (the same semaphore the probes use) for work that
