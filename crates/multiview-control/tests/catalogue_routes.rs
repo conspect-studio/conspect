@@ -624,7 +624,7 @@ async fn disabled_catalogue_answers_conflict_and_probe_needs_write() {
             post_json(
                 "/api/v1/catalogues/iptv-org/probes",
                 VIEWER_TOKEN,
-                &json!({"url":"https://x/y.m3u8"})
+                &json!({"keys":["s:x"]})
             )
         )
         .await
@@ -659,6 +659,21 @@ impl probe::ProbeRunner for Canned {
     }
 }
 
+/// `bundle()` with 80 extra distinct stream rows (probe rate-limit test).
+fn many_rows() -> Value {
+    let mut b = bundle();
+    let first = b["streams"][0].clone();
+    let extra: Vec<Value> = (0..80)
+        .map(|i| {
+            let mut r = first.clone();
+            r["url"] = Value::String(format!("https://example.com/many/{i}.m3u8"));
+            r["title"] = Value::String(format!("Many {i}"));
+            r
+        })
+        .collect();
+    b["streams"].as_array_mut().unwrap().extend(extra);
+    b
+}
 #[tokio::test]
 async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
     let dir = tempfile::tempdir().unwrap();
@@ -672,7 +687,7 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
     });
     send(
         &h.router,
-        post_json("/api/v1/catalogues/iptv-org/import", ADMIN_TOKEN, &bundle()),
+        post_json("/api/v1/catalogues/iptv-org/import", ADMIN_TOKEN, &many_rows()),
     )
     .await;
     let idx = body_json(
@@ -691,7 +706,7 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
         .expect("a header-gated row");
 
     // viewer cannot start a probe; operator can.
-    let by_k = json!({ "k": row["k"] });
+    let by_k = json!({ "keys": [row["k"]] });
     assert_eq!(
         send(
             &h.router,
@@ -715,7 +730,7 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
         .unwrap()
         .contains("/probes/"));
     let job = body_json(resp).await;
-    assert_eq!(job["url"], row["url"]);
+    assert!(job["results"].is_array(), "ProbeJob carries results[]");
     let id = job["id"].as_str().unwrap().to_owned();
 
     // Poll until done (any authenticated reader).
@@ -738,8 +753,10 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    assert_eq!(done["verdict"], "live");
-    assert_eq!(done["probed_from"], "route-host");
+    let res = &done["results"][0];
+    assert_eq!(res["k"], row["k"]);
+    assert_eq!(res["verdict"], "live");
+    assert_eq!(res["probed_from"], "route-host");
     assert_eq!(
         send(
             &h.router,
@@ -753,12 +770,14 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
         StatusCode::NOT_FOUND
     );
 
-    // Validation: neither k nor url, unknown k, non-http url, CR/LF header.
+    // Validation: empty body, unknown key, unknown source, > 50 entries.
+    let too_many: Vec<String> = (0..51).map(|i| format!("s:{i}")).collect();
     for bad in [
         json!({}),
-        json!({"k": "s:nope"}),
-        json!({"url": "file:///etc/passwd"}),
-        json!({"url": "https://x/y.m3u8", "user_agent": "a\r\nb"}),
+        json!({"keys": []}),
+        json!({"keys": ["s:nope"]}),
+        json!({"source_ids": ["no-such-source"]}),
+        json!({"keys": too_many}),
     ] {
         let st = send(
             &h.router,
@@ -767,20 +786,31 @@ async fn probe_routes_enforce_roles_resolve_rows_and_poll_jobs() {
         .await
         .status();
         assert!(
-            matches!(st, StatusCode::UNPROCESSABLE_ENTITY | StatusCode::NOT_FOUND),
+            matches!(
+                st,
+                StatusCode::UNPROCESSABLE_ENTITY | StatusCode::NOT_FOUND | StatusCode::FORBIDDEN
+            ),
             "{bad} -> {st}"
         );
     }
 
     // The 60/min per-principal limit surfaces as 429 problem+json.
+    // Distinct rows (a cache hit is not charged against the budget).
+    let keys: Vec<Value> = idx["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["k"].clone())
+        .collect();
+    assert!(keys.len() >= 70, "{} rows", keys.len());
     let mut limited = None;
-    for i in 0..70 {
+    for (i, k) in keys.iter().enumerate().take(70) {
         let r = send(
             &h.router,
             post_json(
                 "/api/v1/catalogues/iptv-org/probes",
                 OPERATOR_TOKEN,
-                &json!({"url": format!("https://example.com/{i}.m3u8")}),
+                &json!({"keys": [k], "n": i}),
             ),
         )
         .await;

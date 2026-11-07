@@ -159,7 +159,7 @@ pub fn source_url(source: &Source) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn source_headers(source: &Source) -> (Option<String>, Option<String>) {
+pub(crate) fn source_headers(source: &Source) -> (Option<String>, Option<String>) {
     let v = serde_json::to_value(source).unwrap_or_default();
     let g = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
     (g("user_agent"), g("referrer"))

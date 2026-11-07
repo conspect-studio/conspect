@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
 use crate::catalogue::links;
-use crate::catalogue::probe::{ProbeRequest, ProbeResult};
+use crate::catalogue::probe::wire::ProbeJob;
+use crate::catalogue::probe::{JobTarget, ProbeRequest};
 use crate::catalogue::service::{index_body, StatusBody};
 use crate::catalogue::sync::SyncOutcome;
 use crate::error::{ControlError, ControlResult};
@@ -459,32 +460,25 @@ pub(crate) async fn get_links(
     Ok(Json(serde_json::json!({ "links": infos })))
 }
 
-/// Request body of `POST .../probes`.
-#[derive(Debug, Clone, Deserialize)]
+/// Request body of `POST .../probes` (the web contract's `ProbeRequest`).
+///
+/// The browser never supplies a URL: it names index rows (`keys`) and/or linked
+/// sources (`source_ids`); the server resolves URL, headers and quality.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct ProbeBody {
-    /// Index row key (`s:<hex>`) — the server resolves URL + headers + quality.
+    /// Index row keys (`s:<hex>`).
     #[serde(default)]
-    pub k: Option<String>,
-    /// Or an explicit URL (e.g. a linked source); headers/quality optional.
+    pub keys: Vec<String>,
+    /// Linked source ids (per-object authorised).
     #[serde(default)]
-    pub url: Option<String>,
-    /// `User-Agent` to replay (explicit-URL form only).
-    #[serde(default)]
-    pub user_agent: Option<String>,
-    /// `Referer` to replay (explicit-URL form only).
-    #[serde(default)]
-    pub referrer: Option<String>,
-    /// Advertised quality (explicit-URL form only).
-    #[serde(default)]
-    pub quality: Option<String>,
+    pub source_ids: Vec<String>,
 }
 
-fn header_ok(v: &str) -> bool {
-    !v.is_empty() && v.len() <= 1024 && !v.chars().any(char::is_control)
-}
+/// Largest batch one `POST /probes` may carry.
+const MAX_PROBE_BATCH: usize = 50;
 
-/// `POST /api/v1/catalogues/iptv-org/probes` — start a deep probe (operate).
+/// `POST /api/v1/catalogues/iptv-org/probes` — start a probe job (operate).
 #[cfg_attr(
     feature = "openapi",
     utoipa::path(
@@ -493,9 +487,10 @@ fn header_ok(v: &str) -> bool {
         tag = "catalogue",
         request_body = ProbeBody,
         responses(
-            (status = 202, description = "The probe job (`state: queued|running|done`; a 15-minute cache hit returns `done` + `cached: true`). Poll `GET probes/{id}`.", body = serde_json::Value),
-            (status = 403, description = "Requires operate (write).", body = crate::problem::Problem),
-            (status = 422, description = "Neither/invalid `k`/`url`.", body = crate::problem::Problem),
+            (status = 202, description = "The probe job `{id, state: queued|running|done|failed, results[], error}`; poll `GET probes/{id}`. A 15-minute cache hit completes immediately.", body = serde_json::Value),
+            (status = 403, description = "Requires operate (write), or a `source_ids` entry the caller may not use.", body = crate::problem::Problem),
+            (status = 404, description = "Unknown key or source id.", body = crate::problem::Problem),
+            (status = 422, description = "`keys` + `source_ids` must hold 1..=50 entries.", body = crate::problem::Problem),
             (status = 429, description = "Per-principal rate (60/min) or the global queue (64) is exhausted.", body = crate::problem::Problem),
             (status = 503, description = "No probe service on this node.", body = crate::problem::Problem),
         ),
@@ -512,43 +507,65 @@ pub(crate) async fn post_probe(
         .catalogue_probe
         .as_ref()
         .ok_or_else(|| ControlError::Conflict("no probe service on this node".to_owned()))?;
-    let req = if let Some(k) = &body.k {
+    let total = body.keys.len() + body.source_ids.len();
+    if total == 0 || total > MAX_PROBE_BATCH {
+        return Err(ControlError::Validation(format!(
+            "`keys` + `source_ids` must hold 1..={MAX_PROBE_BATCH} entries (got {total})"
+        )));
+    }
+    let mut targets = Vec::with_capacity(total);
+    if !body.keys.is_empty() {
         let snap = cat
             .snapshot()
             .ok_or_else(|| ControlError::Conflict("no catalogue snapshot yet".to_owned()))?;
-        let row = snap.row(k).ok_or_else(|| ControlError::NotFound {
-            kind: "index-row",
-            id: k.clone(),
+        for k in &body.keys {
+            let row = snap.row(k).ok_or_else(|| ControlError::NotFound {
+                kind: "index-row",
+                id: k.clone(),
+            })?;
+            targets.push(JobTarget {
+                k: Some(k.clone()),
+                source_id: None,
+                request: ProbeRequest {
+                    url: row.url.clone(),
+                    user_agent: row.ua.clone(),
+                    referrer: row.referrer.clone(),
+                    quality: row.q.clone(),
+                },
+            });
+        }
+    }
+    for id in &body.source_ids {
+        // BOLA: authorise the object before revealing whether it exists.
+        crate::auth::authorize_object(&principal, id)?;
+        let source = super::sources::visible_sources(&state, &principal)?
+            .into_iter()
+            .find(|s| &s.id == id)
+            .ok_or_else(|| ControlError::NotFound {
+                kind: "source",
+                id: id.clone(),
+            })?;
+        let url = links::source_url(&source).ok_or_else(|| {
+            ControlError::Validation(format!("source {id:?} has no probeable URL"))
         })?;
-        ProbeRequest {
-            url: row.url.clone(),
-            user_agent: row.ua.clone(),
-            referrer: row.referrer.clone(),
-            quality: row.q.clone(),
-        }
-    } else if let Some(url) = body.url.clone() {
-        for v in [&body.user_agent, &body.referrer].into_iter().flatten() {
-            if !header_ok(v) {
-                return Err(ControlError::Validation(
-                    "user_agent/referrer must be printable, no CR/LF, <= 1 KiB".to_owned(),
-                ));
-            }
-        }
-        ProbeRequest {
-            url,
-            user_agent: body.user_agent.clone(),
-            referrer: body.referrer.clone(),
-            quality: body.quality.clone(),
-        }
-    } else {
-        return Err(ControlError::Validation(
-            "provide `k` (index row key) or `url`".to_owned(),
-        ));
-    };
-    let job = svc.submit(&principal.key_id, req)?;
-    let mut r = (StatusCode::ACCEPTED, Json(job.clone())).into_response();
-    if let Ok(v) = HeaderValue::from_str(&format!("/api/v1/catalogues/iptv-org/probes/{}", job.id))
-    {
+        let (user_agent, referrer) = links::source_headers(&source);
+        targets.push(JobTarget {
+            k: None,
+            source_id: Some(id.clone()),
+            request: ProbeRequest {
+                url,
+                user_agent,
+                referrer,
+                quality: None,
+            },
+        });
+    }
+    let job_id = svc.submit_job(&principal.key_id, targets)?;
+    let job = svc
+        .job(&job_id)
+        .ok_or_else(|| ControlError::Conflict("probe job vanished".to_owned()))?;
+    let mut r = (StatusCode::ACCEPTED, Json(job)).into_response();
+    if let Ok(v) = HeaderValue::from_str(&format!("/api/v1/catalogues/iptv-org/probes/{job_id}")) {
         r.headers_mut().insert(header::LOCATION, v);
     }
     Ok(r)
@@ -563,7 +580,7 @@ pub(crate) async fn post_probe(
         tag = "catalogue",
         params(("id" = String, Path, description = "Probe job id.")),
         responses(
-            (status = 200, description = "The probe job and, when `done`, verdict, stages, facts, events.", body = serde_json::Value),
+            (status = 200, description = "The probe job and its finished results (verdict, facts, events).", body = serde_json::Value),
             (status = 404, description = "Unknown job.", body = crate::problem::Problem),
         ),
     )
@@ -572,13 +589,13 @@ pub(crate) async fn get_probe(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<String>,
-) -> ControlResult<Json<ProbeResult>> {
+) -> ControlResult<Json<ProbeJob>> {
     principal.role.require(Action::Read)?;
     let svc = state
         .catalogue_probe
         .as_ref()
         .ok_or_else(|| ControlError::Conflict("no probe service on this node".to_owned()))?;
-    svc.get(&id)
+    svc.job(&id)
         .map(Json)
         .ok_or(ControlError::NotFound { kind: "probe", id })
 }
