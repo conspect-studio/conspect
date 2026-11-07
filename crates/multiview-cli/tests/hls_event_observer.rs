@@ -139,10 +139,10 @@ fn asset_marker_is_named_with_the_decoded_label_present_only_on_observed() {
     observer.observe(&snapshot(&[])); // withdrawal
     let data = sink.0.lock().unwrap();
     assert_eq!(data.0.len(), 2);
-    let observed = data.0[0].descriptor.as_ref().expect("observed descriptor");
-    assert_eq!(observed.name, "Asset AD-1");
-    assert_eq!(observed.type_id.as_deref(), Some("asset"));
-    assert_eq!(observed.detail, None);
+    let asset_descriptor = data.0[0].descriptor.as_ref().expect("observed descriptor");
+    assert_eq!(asset_descriptor.name, "Asset AD-1");
+    assert_eq!(asset_descriptor.type_id.as_deref(), Some("asset"));
+    assert_eq!(asset_descriptor.detail, None);
     // Withdrawal (MarkerAbsent) names nothing new — there is no fresh
     // evidence to describe, only the prior presence going away.
     assert_eq!(data.0[1].boundary, EventBoundary::MarkerAbsent);

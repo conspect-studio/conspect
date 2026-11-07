@@ -1252,7 +1252,7 @@ fn timer_meaning(kind: multiview_core::event_overlay::OverlayTimerKind) -> &'sta
 }
 
 /// Compact badge text: the marker's own name/detail when evidence named it
-/// (SCTE-35 segmentation type, splice_insert direction, HLS asset, ID3 frame),
+/// (SCTE-35 segmentation type, `splice_insert` direction, HLS asset, ID3 frame),
 /// e.g. `"Provider Ad Start · 01:23 remaining"`, `"Program End"`,
 /// `"Chapter Start 2/4"`, `"Ad break (60s) · 00:42 remaining"`,
 /// `"Return from break"`. The lifecycle is kept as a prefix/suffix only where
