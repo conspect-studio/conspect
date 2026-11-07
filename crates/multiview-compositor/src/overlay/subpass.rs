@@ -1395,7 +1395,13 @@ fn apply_overlays_with_limit(
 
 /// Below this many pixels a rect's thread-spawn overhead outweighs the win, so
 /// it bakes on the calling thread (also covers tiny/test rects).
-const PARALLEL_RECT_PIXEL_THRESHOLD: u64 = 64 * 64;
+///
+/// Measured with the exact colour memos (`color_memo`): per-pixel work is then
+/// a few table lookups, so scoped-thread spawn + join dominates for meter-lane
+/// and caption-sized rects (8×444, 684×74). On `matched_bake`, 64×64 cost
+/// ~14 ms/bake vs ~7.5 ms at 256×256; 512×512 measured the same as 256×256.
+/// Large cards (≥ 256×256) still fan out across bands.
+const PARALLEL_RECT_PIXEL_THRESHOLD: u64 = 256 * 256;
 
 /// The number of worker threads to fan a large dirty rect's bands across: the
 /// machine's available parallelism minus 2 (reserve headroom for the encoder
