@@ -254,16 +254,20 @@ pub type AcceptedInputs = (Option<IptvConfig>, Vec<Source>, Vec<(String, Output)
 /// A corrupt accepted record or store failure.
 pub fn accepted_inputs(state: &AppState) -> ControlResult<AcceptedInputs> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) =
-            crate::boot_model::load_desired(model.boot_path()).map_err(ControlError::Repository)?
-        {
+        // The in-memory accepted snapshot (review R3-03): playlist, guide
+        // and `GET /api/v1/iptv` never re-read `desired.json`.
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
             let outputs = desired
                 .output_ids
                 .iter()
                 .cloned()
                 .zip(desired.config.outputs.iter().cloned())
                 .collect();
-            return Ok((desired.config.iptv, desired.config.sources, outputs));
+            return Ok((
+                desired.config.iptv.clone(),
+                desired.config.sources.clone(),
+                outputs,
+            ));
         }
     }
     let sources = state

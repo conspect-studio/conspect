@@ -124,9 +124,7 @@ pub(crate) async fn list_profiles(
     // object-scoped by its OWN id (`get_profile` 403s an out-of-scope id), so
     // the list must drop rows outside the allowlist — by the same parity as
     // `list_devices`/`list_overlays`. A no-op for an unscoped principal.
-    let profiles = state
-        .tally_profiles
-        .list()?
+    let profiles = crate::boot_model::accepted_profiles(&state)?
         .into_iter()
         .map(|v| v.profile)
         .filter(|profile| crate::auth::authorize_object(&principal, &profile.id).is_ok())
@@ -145,7 +143,7 @@ pub(crate) async fn get_profile(
     // Per-object authz BEFORE the lookup (BOLA, ADR-W005): a refused id must
     // give no existence information.
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.tally_profiles.get(&id)?;
+    let versioned = crate::boot_model::accepted_profile(&state, &id)?;
     Ok(profile_response(StatusCode::OK, &versioned))
 }
 
@@ -199,7 +197,7 @@ pub(crate) async fn put_profile(
     // commit the desired envelope before the store projection changes.
     let _mutation = state.lock_config_mutation().await;
     let durable = crate::boot_model::config_value(&profile)?;
-    match state.tally_profiles.get(&id) {
+    match crate::boot_model::accepted_profile(&state, &id) {
         Ok(current) => {
             if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
             crate::boot_model::commit_resource(
@@ -210,10 +208,9 @@ pub(crate) async fn put_profile(
                 None,
             )
             .await?;
-            let versioned = state
-                .tally_profiles
-                .put(profile)
-                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+            let versioned = crate::boot_model::project_profile(&state, &id, || {
+                state.tally_profiles.put(profile)
+            })?;
             // ADR-W024 round 6: a tally profile is runtime-mutable running state
             // composed into active.toml; audit (the ONE persist choke point) so
             // the persister captures the edit. A pure store edit (no engine
@@ -236,10 +233,9 @@ pub(crate) async fn put_profile(
                 None,
             )
             .await?;
-            let versioned = state
-                .tally_profiles
-                .put(profile)
-                .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+            let versioned = crate::boot_model::project_profile(&state, &id, || {
+                state.tally_profiles.put(profile)
+            })?;
             state.audit(
                 &principal.key_id,
                 AuditAction::Create,
@@ -268,13 +264,10 @@ pub(crate) async fn delete_profile(
     // Review H1: serialize with every other durable config mutation and
     // commit the desired envelope before the store projection changes.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.tally_profiles.get(&id)?;
+    let current = crate::boot_model::accepted_profile(&state, &id)?;
     if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
     crate::boot_model::commit_resource(&state, "tally_profiles", &id, None, None).await?;
-    state
-        .tally_profiles
-        .delete(&id)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    crate::boot_model::project_profile_delete(&state, &id)?;
     // ADR-W024 round 6: removing a runtime-mutable tally profile changes the
     // composed running state — audit so the persister rewrites active.toml.
     state.audit(

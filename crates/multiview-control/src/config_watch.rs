@@ -1206,17 +1206,12 @@ async fn commit_watched_desired(
     state: &AppState,
     next: &MultiviewConfig,
 ) -> crate::ControlResult<()> {
-    let Some(model) = state.boot_model.as_ref() else {
+    if state.boot_model.is_none() {
         return Ok(());
-    };
+    }
     let layouts = crate::boot_model::layout_library(state)?;
     let output_ids = crate::boot_model::output_ids_for_config(state, next)?;
-    let selected = crate::boot_model::load_desired(model.boot_path())
-        .map_err(crate::ControlError::Repository)?
-        .map(|desired| desired.selected_layout_id)
-        .or_else(|| model.selected_layout_id())
-        .or_else(|| state.working_layout_id.clone())
-        .ok_or_else(|| crate::ControlError::Validation("no selected working layout".into()))?;
+    let selected = crate::boot_model::selected_layout_id(state, next, &layouts)?;
     crate::boot_model::commit_desired_document(state, next.clone(), layouts, selected, output_ids)
         .await?;
     // A file commit replaces the whole envelope, including graphics the file
@@ -1773,6 +1768,11 @@ fn working_layout_body(config: &MultiviewConfig) -> Option<serde_json::Value> {
 /// Update (or recreate) the working layout in the layouts repository so the
 /// UI layout editor reflects the file immediately.
 fn reseed_working_layout(state: &AppState, actor: &str, id: &str, body: &serde_json::Value) {
+    // A modeled run commits before it applies, so the library is the envelope's.
+    // A row written here would be a projection drift, not an accepted layout.
+    if state.boot_model.is_some() {
+        return;
+    }
     let input = LayoutInput {
         name: id.to_owned(),
         body: body.clone(),
@@ -1816,16 +1816,40 @@ fn resync_store(
     store: &Arc<dyn ResourceRepository>,
     desired: &[(String, ResourceInput)],
 ) {
-    let existing: Vec<String> = match store.list() {
-        Ok(list) => list.into_iter().map(|v| v.resource.id).collect(),
+    let entries = match store.list() {
+        Ok(list) => list,
         Err(error) => {
             tracing::warn!(kind = store.kind(), error = %error, "config-file resync: list failed");
             return;
         }
     };
+    let existing: Vec<String> = entries.iter().map(|v| v.resource.id.clone()).collect();
     for (id, input) in desired {
-        let result = if existing.iter().any(|e| e == id) {
-            store.update(id, input.clone()).map(|_| AuditAction::Update)
+        // An unchanged item keeps its version and API name. A write here would
+        // raise the store above the envelope with no matching commit, and a
+        // restart would hand that tag out again for a different body.
+        let current = entries.iter().find(|entry| entry.resource.id == *id);
+        if current.is_some_and(|entry| {
+            crate::boot_model::same_resource_body(store.kind(), &entry.resource.body, &input.body)
+        }) {
+            continue;
+        }
+        let result = if let Some(entry) = current {
+            // A name set over REST lives only in the envelope, so a file edit
+            // keeps it unless the file changed its own display name.
+            let authored = |body: &serde_json::Value| body.get("display_name").cloned();
+            let keep = state.boot_model.is_some()
+                && authored(&entry.resource.body) == authored(&input.body);
+            let name = if keep {
+                entry.resource.name.clone()
+            } else {
+                input.name.clone()
+            };
+            let input = ResourceInput {
+                name,
+                body: input.body.clone(),
+            };
+            store.update(id, input).map(|_| AuditAction::Update)
         } else {
             store.create(id, input.clone()).map(|_| AuditAction::Create)
         };
@@ -1859,6 +1883,9 @@ fn resync_audio(state: &AppState, actor: &str, next: &MultiviewConfig) {
         );
         return;
     };
+    if state.audio_routing.snapshot().0.as_ref() == Some(&routing) {
+        return;
+    }
     let mut version = state.audio_routing.version();
     for _ in 0_u8..4 {
         match state.audio_routing.replace_if(version, routing.clone()) {
@@ -1888,15 +1915,19 @@ fn resync_audio(state: &AppState, actor: &str, next: &MultiviewConfig) {
 /// restart-pending set, but the durable definition follows the file at once.
 fn resync_salvos(state: &AppState, actor: &str, next: &MultiviewConfig) {
     use crate::salvo_store::SALVO_KIND;
-    let existing: Vec<String> = match state.salvos.list() {
-        Ok(list) => list.into_iter().map(|v| v.salvo.id).collect(),
+    let entries = match state.salvos.list() {
+        Ok(list) => list,
         Err(error) => {
             tracing::warn!(error = %error, "config-file resync: listing salvos failed");
             return;
         }
     };
+    let existing: Vec<String> = entries.iter().map(|v| v.salvo.id.clone()).collect();
     for salvo in &next.salvos {
         let id = salvo.id.clone();
+        if entries.iter().any(|entry| entry.salvo == *salvo) {
+            continue;
+        }
         let result = if existing.iter().any(|e| e == &id) {
             state.salvos.update(&id, salvo.clone())
         } else {
@@ -1933,15 +1964,19 @@ fn resync_salvos(state: &AppState, actor: &str, next: &MultiviewConfig) {
 /// command), so the store IS the adopted state composed into `active.toml`.
 fn resync_tally_profiles(state: &AppState, actor: &str, next: &MultiviewConfig) {
     use crate::tally_state::TALLY_PROFILE_KIND;
-    let existing: Vec<String> = match state.tally_profiles.list() {
-        Ok(list) => list.into_iter().map(|v| v.profile.id).collect(),
+    let entries = match state.tally_profiles.list() {
+        Ok(list) => list,
         Err(error) => {
             tracing::warn!(error = %error, "config-file resync: listing tally profiles failed");
             return;
         }
     };
+    let existing: Vec<String> = entries.iter().map(|v| v.profile.id.clone()).collect();
     for profile in &next.tally_profiles {
         let id = profile.id.clone();
+        if entries.iter().any(|entry| entry.profile == *profile) {
+            continue;
+        }
         match state.tally_profiles.put(profile.clone()) {
             Ok(versioned) => state.audit(
                 actor,

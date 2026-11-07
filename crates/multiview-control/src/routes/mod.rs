@@ -131,13 +131,15 @@ fn layout_response(status: StatusCode, versioned: &VersionedLayout) -> Response 
 }
 
 /// Read the accepted layout library, not its replaceable SQLite projection.
+/// Review R3-03: the in-memory accepted snapshot, not a fresh
+/// `desired.json` read-parse-validate on every layout list/GET.
 fn authoritative_layouts(
     state: &AppState,
-) -> ControlResult<Option<crate::boot_model::DesiredState>> {
+) -> ControlResult<Option<std::sync::Arc<crate::boot_model::DesiredState>>> {
     let Some(model) = &state.boot_model else {
         return Ok(None);
     };
-    crate::boot_model::load_desired(model.boot_path()).map_err(ControlError::Repository)
+    model.accepted().map_err(ControlError::Repository)
 }
 
 /// Return a layout with the envelope-owned version. Older envelopes without
@@ -159,43 +161,6 @@ fn authoritative_layout(
         version: Version::new(desired.layout_versions.get(id).copied().unwrap_or(1)),
         layout,
     })
-}
-
-/// Reconcile SQLite or in-memory projection after the durable commit. A
-/// projection fault must never change the accepted API result or its `ETag`.
-fn reconcile_layout_projection(state: &AppState, desired: &crate::boot_model::DesiredState) {
-    let result = (|| -> ControlResult<()> {
-        let projected = state.repository.list_layouts()?;
-        for entry in projected {
-            if !desired
-                .layouts
-                .iter()
-                .any(|layout| layout.id == entry.layout.id)
-            {
-                state.repository.delete_layout(&entry.layout.id)?;
-            }
-        }
-        for layout in &desired.layouts {
-            let input = LayoutInput {
-                name: layout.name.clone(),
-                body: layout.body.clone(),
-            };
-            match state.repository.get_layout(&layout.id) {
-                Ok(entry) if entry.layout == *layout => {}
-                Ok(_) => {
-                    state.repository.update_layout(&layout.id, input)?;
-                }
-                Err(ControlError::NotFound { .. }) => {
-                    state.repository.create_layout(&layout.id, input)?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        tracing::warn!(%error, "layout projection reconciliation failed; desired envelope remains authoritative");
-    }
 }
 
 /// `GET /api/v1/layouts` — list all layouts (role: read).
@@ -223,7 +188,7 @@ async fn list_layouts(
     // carries no embedded device_ref, so the row filter alone is complete; it is
     // a no-op for an unscoped principal.
     let mut layouts = if let Some(desired) = authoritative_layouts(&state)? {
-        desired.layouts
+        desired.layouts.clone()
     } else {
         state
             .repository
@@ -322,7 +287,6 @@ async fn create_layout(
     let desired = authoritative_layouts(&state)?
         .ok_or_else(|| ControlError::Repository("desired envelope was not published".into()))?;
     let versioned = authoritative_layout(&desired, &id)?;
-    reconcile_layout_projection(&state, &desired);
     // Audit only after the mutation succeeded (who/what/when).
     state.audit(
         &principal.key_id,
@@ -388,9 +352,7 @@ async fn update_layout(
         crate::boot_model::commit_desired(&state, config, layouts).await?;
         let desired = authoritative_layouts(&state)?
             .ok_or_else(|| ControlError::Repository("desired envelope was not published".into()))?;
-        let versioned = authoritative_layout(&desired, &id)?;
-        reconcile_layout_projection(&state, &desired);
-        versioned
+        authoritative_layout(&desired, &id)?
     } else {
         state.repository.update_layout(&id, input)?
     };
@@ -439,21 +401,12 @@ async fn delete_layout(
     if_match.require(LAYOUT_KIND, &id, current.version)?;
     if state.boot_model.is_some() {
         let mut layouts = crate::boot_model::layout_library(&state)?;
-        layouts.retain(|layout| layout.id != id);
         let config: multiview_config::MultiviewConfig =
             serde_json::from_value(crate::boot_model::current_desired_config(&state)?)
                 .map_err(|e| ControlError::Validation(format!("desired configuration: {e}")))?;
-        let selected = desired.as_ref().map_or_else(
-            || {
-                state
-                    .boot_model
-                    .as_ref()
-                    .and_then(|model| model.selected_layout_id())
-                    .or_else(|| state.working_layout_id.clone())
-            },
-            |desired| Some(desired.selected_layout_id.clone()),
-        );
-        if selected.as_deref() == Some(id.as_str()) {
+        let selected = crate::boot_model::selected_layout_id(&state, &config, &layouts)?;
+        layouts.retain(|layout| layout.id != id);
+        if selected == id {
             let replacement = layouts.first().ok_or_else(|| {
                 ControlError::Validation("cannot delete the last selected layout".into())
             })?;
@@ -465,11 +418,9 @@ async fn delete_layout(
             )
             .await?;
         } else {
-            crate::boot_model::commit_desired(&state, config, layouts).await?;
+            crate::boot_model::commit_desired_with_selection(&state, config, layouts, selected)
+                .await?;
         }
-        let desired = authoritative_layouts(&state)?
-            .ok_or_else(|| ControlError::Repository("desired envelope was not published".into()))?;
-        reconcile_layout_projection(&state, &desired);
     } else {
         state.repository.delete_layout(&id)?;
     }

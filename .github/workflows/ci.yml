@@ -170,6 +170,55 @@ jobs:
         # SCALING correctness is covered unconditionally by
         # tile_driven_scales_with_coverage_not_tile_count.
         run: cargo test --locked --workspace -- --skip tile_driven_meets_budget
+      - name: test multiview-control --features sqlite (desired-state projection)
+        # The default build carries no SQLite (its licence is outside the
+        # cargo-deny allowlist), so the layouts.db projection never ran in CI.
+        # Scoped to the desired-state tests: the injected SQLite fault after an
+        # envelope commit (layout_projection_fault), the first commit continuing
+        # a SQLite layout version (desired_first_commit_versions), and the
+        # repository itself (sqlite_repo). Ubuntu only: the code is
+        # platform-neutral and the macOS leg is already the long pole.
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: >
+          cargo test
+          --locked
+          -p multiview-control
+          --features sqlite
+          --test layout_projection_fault
+          --test desired_first_commit_versions
+          --test layout_durable
+          --test desired_all_collections
+          --test source_output_durable
+          --test boot_config_model
+          --test sqlite_repo
+      - name: test multiview-cli --features sqlite (boot migration + rebind)
+        # The real boot path over a real layouts.db: first-boot migration of an
+        # active.toml + layouts.db install with no desired.json, layout rebind,
+        # identical restarts, stale If-Match, and a corrupt desired.json stopping
+        # the real binary. Name no test filter here: a trailing filter applies
+        # to every --test target and would silently run zero tests in them.
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features sqlite
+          --test desired_migration
+          --test boot_resume
+      - name: test multiview-cli --features sqlite (bind_and_serve restore)
+        # The `control` module lib tests under the same feature: restoring
+        # accepted names and versions through bind_and_serve. A separate step
+        # because its `control::` filter must not reach the targets above.
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        run: >
+          cargo test
+          --locked
+          -p multiview-cli
+          --features sqlite
+          --lib control::
 
   # ── feature-gated clippy + test matrix (IN-7) ────────────────────────────────
   # The default `lint` and `test` jobs run with default features only (pure-Rust,
@@ -515,12 +564,26 @@ jobs:
         # gnutls + libdrm are preinstalled on ubuntu-latest; NO x264/x265 (GPL-gated,
         # absent from the -lgpl build). The `ldd` completeness guard below fails fast
         # if this list ever drifts, naming the exact missing soname.
+        #
+        # `ffmpeg` is the distro CLI, a fixture generator only: the audio lib
+        # tests shell out to it for lavfi clips, which the pinned
+        # --disable-everything build cannot make. Nothing links it. It shares
+        # the libavcodec62 soname with the pinned build, so the LD_LIBRARY_PATH
+        # exported below would load the pinned libraries into it, and they have
+        # no lavfi. The wrapper on PATH runs it with that variable cleared; the
+        # test binaries still load the pinned libraries.
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev nasm \
-            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2
+            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 \
+            ffmpeg
+          shim="${RUNNER_TEMP}/fixture-bin"
+          mkdir -p "${shim}"
+          printf '#!/bin/sh\nexec env -u LD_LIBRARY_PATH /usr/bin/ffmpeg "$@"\n' > "${shim}/ffmpeg"
+          chmod 0755 "${shim}/ffmpeg"
+          echo "${shim}" >> "$GITHUB_PATH"
       - name: Extract pinned FFmpeg 8.1.1 from the base image
         # The base is `FROM scratch` (only /opt/multiview-ffmpeg), so we create a
         # (never-run) container from it and `docker cp` the prefix out — the same
@@ -663,6 +726,7 @@ jobs:
           --features ffmpeg,aes67
           --lib aes67
       - name: test multiview-cli --features ffmpeg,aes67 (audio lib tests)
+        id: audio-lib-tests
         # The ffmpeg-linked `audio`-module lib unit tests (route-seam crossfade +
         # mailbox backpressure, player/vamp-window looping, shared-URL fetcher wait,
         # loudness telemetry on real decoded audio) never ran in CI before this step:
@@ -682,7 +746,9 @@ jobs:
         # tests (live/VOD playlist parsing, byte-range scheduling, 403/429 backoff,
         # gzip decoding, dispatch/retirement lifecycle fencing). Deliberately scoped
         # to `--lib hls_fetch` only — NOT the full ffmpeg suite (issue #163:
-        # `streaming_encode` hangs there).
+        # `streaming_encode` hangs there). Independent of the audio step, so it
+        # runs (and reports) even when that step fails; the job still fails.
+        if: ${{ success() || steps.audio-lib-tests.outcome == 'failure' }}
         timeout-minutes: 10
         run: >
           cargo test

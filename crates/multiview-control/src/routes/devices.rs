@@ -96,9 +96,7 @@ pub(crate) async fn list_devices(
     // read the address/config of) devices it cannot fetch. The same
     // `authorize_object` predicate the per-object handlers use; an unscoped
     // principal (admin/unrestricted operator) keeps every row.
-    let devices = state
-        .devices
-        .list()?
+    let devices = crate::boot_model::accepted_family(&state, "devices", &state.devices)?
         .into_iter()
         .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
         .map(|v| v.resource)
@@ -129,7 +127,7 @@ pub(crate) async fn get_device(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.devices.get(&id)?;
+    let versioned = crate::boot_model::accepted_item(&state, "devices", &state.devices, &id)?;
     Ok(device_response(StatusCode::OK, &versioned))
 }
 
@@ -172,7 +170,11 @@ pub(crate) async fn create_device(
     };
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    crate::boot_model::require_absent(state.devices.get(&id), DEVICE_KIND, &id)?;
+    crate::boot_model::require_absent(
+        crate::boot_model::accepted_item(&state, "devices", &state.devices, &id),
+        DEVICE_KIND,
+        &id,
+    )?;
     crate::boot_model::commit_resource(
         &state,
         "devices",
@@ -185,10 +187,10 @@ pub(crate) async fn create_device(
     // lock. A delete holds that lock across its store delete and poller stop,
     // so its tombstone is already set here and cannot land after this clear.
     state.device_pollers.clear_tombstone(&id);
-    let versioned = state
-        .devices
-        .create(&id, input)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "devices", &state.devices, &id, || {
+            state.devices.create(&id, input)
+        })?;
     // Seed the runtime status in ADOPTING (idempotent), so the read-only status
     // snapshot answers before any driver probe — the conflated status lane's
     // backing store (invariant #10: control-plane-only, never the engine).
@@ -245,7 +247,7 @@ pub(crate) async fn update_device(
     // missing resource) is reported even when the submitted body is invalid.
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.devices.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "devices", &state.devices, &id)?;
     if_match.require(DEVICE_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
@@ -259,10 +261,10 @@ pub(crate) async fn update_device(
         Some(input.name.clone()),
     )
     .await?;
-    let versioned = state
-        .devices
-        .update(&id, input)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "devices", &state.devices, &id, || {
+            state.devices.update(&id, input)
+        })?;
     // Restart the supervised poller on an edit (DEV-A4): the address/credential/
     // desired-mode may have changed, so the registry replaces the running task
     // (the old one is aborted) and the fresh poller re-adopts + re-converges. A
@@ -314,7 +316,7 @@ pub(crate) async fn delete_device(
     crate::auth::authorize_object(&principal, &id)?;
     // Review H1: serialize with every other durable config mutation.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.devices.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "devices", &state.devices, &id)?;
     if_match.require(DEVICE_KIND, &id, current.version)?;
     // Refuse the delete while a Source/Output binds this device (ADR-M009): a
     // dangling `device_ref` would orphan the bound stream. Reads the resource
@@ -327,10 +329,7 @@ pub(crate) async fn delete_device(
         )));
     }
     crate::boot_model::commit_resource(&state, "devices", &id, None, None).await?;
-    state
-        .devices
-        .delete(&id)
-        .map_err(|e| crate::boot_model::after_commit(&state, e))?;
+    crate::boot_model::project_delete(&state, "devices", &state.devices, &id)?;
     // Stop the supervised driver poller (DEV-A4): the device is gone, so its
     // poller must not keep probing — the registry tombstones the id (a racing
     // adopt's late `start` is rejected, never a ghost poller), aborts the task,
@@ -370,11 +369,19 @@ fn first_device_ref_binding(
     state: &AppState,
     device_id: &str,
 ) -> ControlResult<Option<DeviceRefBinding>> {
-    for (store, kind) in [
-        (&state.sources, crate::resource_store::SOURCE_KIND),
-        (&state.outputs, crate::resource_store::OUTPUT_KIND),
+    for (store, key, kind) in [
+        (
+            &state.sources,
+            "sources",
+            crate::resource_store::SOURCE_KIND,
+        ),
+        (
+            &state.outputs,
+            "outputs",
+            crate::resource_store::OUTPUT_KIND,
+        ),
     ] {
-        for versioned in store.list()? {
+        for versioned in crate::boot_model::accepted_family(state, key, store)? {
             if versioned
                 .resource
                 .body
@@ -456,7 +463,7 @@ pub(crate) async fn get_device_status(
 /// Confirm a device exists (so an action/projection on an unknown id is a clean
 /// `404`), returning its current versioned resource.
 fn require_device(state: &AppState, id: &str) -> ControlResult<VersionedResource> {
-    state.devices.get(id)
+    crate::boot_model::accepted_item(state, "devices", &state.devices, id)
 }
 
 /// `POST /api/v1/devices/{id}/probe` — re-probe the device now (role: write).

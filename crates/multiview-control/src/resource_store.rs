@@ -195,6 +195,18 @@ pub trait ResourceRepository: Send + Sync + 'static {
     /// [`ControlError::NotFound`] if no resource has that id;
     /// [`ControlError::Repository`] on a backing-store fault.
     fn delete(&self, id: &str) -> ControlResult<()>;
+
+    /// Insert or replace a resource at an exact, already-committed version.
+    ///
+    /// The durable desired envelope allocates versions; a store-served family
+    /// projects the committed entry verbatim, so a recreated identity keeps
+    /// its durable counter instead of restarting at [`Version::INITIAL`]
+    /// (review R2-02).
+    ///
+    /// # Errors
+    ///
+    /// [`ControlError::Repository`] on a backing-store fault.
+    fn put_versioned(&self, entry: VersionedResource) -> ControlResult<VersionedResource>;
 }
 
 /// An in-memory [`ResourceRepository`] backed by a `Mutex<HashMap>`, generic
@@ -334,6 +346,11 @@ impl<K: ResourceKind> ResourceRepository for InMemoryResourceStore<K> {
                 id: id.to_owned(),
             })
         }
+    }
+
+    fn put_versioned(&self, entry: VersionedResource) -> ControlResult<VersionedResource> {
+        self.lock().insert(entry.resource.id.clone(), entry.clone());
+        Ok(entry)
     }
 }
 

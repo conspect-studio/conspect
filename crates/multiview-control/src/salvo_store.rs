@@ -83,6 +83,14 @@ pub trait SalvoRepository: Send + Sync + 'static {
     /// [`ControlError::NotFound`] if no salvo has that id;
     /// [`ControlError::Repository`] on a backing-store fault.
     fn delete(&self, id: &str) -> ControlResult<()>;
+
+    /// Insert or replace a salvo at an exact, already-committed version (the
+    /// durable envelope allocates it; review R2-02).
+    ///
+    /// # Errors
+    ///
+    /// [`ControlError::Repository`] on a backing-store fault.
+    fn put_versioned(&self, entry: VersionedSalvo) -> ControlResult<VersionedSalvo>;
 }
 
 /// An in-memory [`SalvoRepository`] backed by a `Mutex<HashMap>`.
@@ -182,6 +190,11 @@ impl SalvoRepository for InMemorySalvoStore {
                 id: id.to_owned(),
             })
         }
+    }
+
+    fn put_versioned(&self, entry: VersionedSalvo) -> ControlResult<VersionedSalvo> {
+        self.lock().insert(entry.salvo.id.clone(), entry.clone());
+        Ok(entry)
     }
 }
 
