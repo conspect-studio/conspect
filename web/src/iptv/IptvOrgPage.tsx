@@ -980,6 +980,18 @@ function DetailPanel({
               <code className="block break-all text-xs text-muted-foreground" lang="" dir="ltr">
                 {s.url}
               </code>
+              {s.guide != null ? (
+                <p className="text-xs" data-testid="iptv-guide">
+                  <Badge variant="outline">
+                    <Trans>Guide listed: {s.guide.site}</Trans>
+                  </Badge>{' '}
+                  <span className="text-muted-foreground">
+                    <Trans>
+                      iptv-org publishes no feed URL for it; supply the XMLTV URL yourself.
+                    </Trans>
+                  </span>
+                </p>
+              ) : null}
               <p className="flex flex-wrap gap-1">
                 {flags.map((f) => (
                   <FlagBadge key={f} flag={f} />

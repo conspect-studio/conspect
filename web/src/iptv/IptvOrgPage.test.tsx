@@ -13,6 +13,7 @@ import index from '../test/fixtures/iptv-org/index.json';
 import places from '../test/fixtures/iptv-org/places.json';
 import { renderWithProviders } from '../test/render';
 import { SourcesPage } from '../pages/SourcesPage';
+import type { IndexStream } from '../api/catalogue';
 import { IptvOrgPage } from './IptvOrgPage';
 
 vi.mock('./MapView', () => ({
@@ -230,6 +231,39 @@ describe('IptvOrgPage', () => {
         origin: { provider: 'iptv-org', channel: 'AXNBlack.us', follow: 'notify' },
       },
     });
+  });
+
+  it('Add as source sends the upstream logo_url, never the page origin', async () => {
+    renderPage();
+    await ready();
+    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'axn black');
+    await userEvent.click(await screen.findByRole('button', { name: /show streams of axn black/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /add axn black romania as source/i }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: /^create$/i }));
+    await waitFor(() => { expect(created).toHaveLength(1); });
+    const body = (created[0]?.payload as { body: { playlist_metadata: { logo?: string }; epg?: unknown } }).body;
+    expect(body.playlist_metadata.logo).toBe('https://i.imgur.com/Peo1QiZ.png');
+    expect(body.epg ?? null).toBeNull();
+    expect(JSON.stringify(created[0]?.payload)).not.toContain(window.location.origin);
+  });
+
+  it('a null logo_url gives no playlist logo', async () => {
+    const { toSourceForm } = await import('./toSource');
+    const s = (index.streams as unknown as IndexStream[]).find((x) => x.logo_url === null);
+    expect(s).toBeDefined();
+    expect(toSourceForm({ ...(s as IndexStream), logo: 'l:abc' }, new Set()).metaLogo).toBe('');
+  });
+
+  it('shows a "Guide listed" badge with the XMLTV note in the detail', async () => {
+    renderPage();
+    await ready();
+    await userEvent.type(screen.getByRole('searchbox', { name: /search channels/i }), 'axn black');
+    await userEvent.click(await screen.findByRole('button', { name: /show streams of axn black/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /details for axn black/i }));
+    const detail = await screen.findByTestId('iptv-detail');
+    expect(within(detail).getByText('Guide listed: tvtv.us')).toBeInTheDocument();
+    expect(within(detail).getByText(/supply the XMLTV URL/i)).toBeInTheDocument();
   });
 
   it('bulk add reports per-item results including a partial failure', async () => {
