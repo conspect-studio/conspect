@@ -458,6 +458,7 @@ pub struct ProbeService {
     admitted: Arc<std::sync::atomic::AtomicUsize>,
     shared: Arc<Mutex<Shared>>,
     host: String,
+    collector: Option<Arc<dyn super::netdiag::NetworkCollector>>,
 }
 
 impl std::fmt::Debug for ProbeService {
@@ -485,7 +486,55 @@ impl ProbeService {
             admitted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shared: Arc::new(Mutex::new(Shared::default())),
             host,
+            collector: None,
         })
+    }
+
+    /// A service whose finished results also carry the §3a `network` block,
+    /// collected under the same permit (so the same bounds) after the probe.
+    #[must_use]
+    pub fn with_network(
+        runner: Arc<dyn ProbeRunner>,
+        host: String,
+        collector: Arc<dyn super::netdiag::NetworkCollector>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            runner,
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)),
+            admitted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shared: Arc::new(Mutex::new(Shared::default())),
+            host,
+            collector: Some(collector),
+        })
+    }
+
+    /// Acquire a probe permit (the same semaphore the probes use) for work that
+    /// must obey the probe bounds, such as an on-demand network report.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlError::TooManyRequests`] when the probe queue is full.
+    pub async fn acquire_for_diagnostics(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ControlError> {
+        if self.permits.available_permits() == 0
+            && self.admitted.load(std::sync::atomic::Ordering::Acquire)
+                >= MAX_CONCURRENT + MAX_QUEUED
+        {
+            return Err(ControlError::TooManyRequests(
+                "probe queue is full; retry shortly".to_owned(),
+            ));
+        }
+        Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| ControlError::Conflict("probe service closed".to_owned()))
+    }
+
+    /// The network collector, when diagnostics are enabled.
+    #[must_use]
+    pub fn collector(&self) -> Option<&Arc<dyn super::netdiag::NetworkCollector>> {
+        self.collector.as_ref()
     }
 
     /// The reported probing host.
@@ -605,11 +654,16 @@ impl ProbeService {
                     r.state = "running";
                 }
             }
+            let net_req = req.clone();
             let fut = me.runner.run(id.clone(), req);
             let mut result = match tokio::time::timeout(WALL_CLOCK, fut).await {
                 Ok(r) => r,
                 Err(_) => timeout_result(&id, &me.host),
             };
+            if let Some(c) = &me.collector {
+                // Own 15 s budget inside the collector; still under this permit.
+                result.network = Some(c.collect(net_req, None).await);
+            }
             result.id.clone_from(&id);
             result.state = "done";
             result.probed_from.clone_from(&me.host);

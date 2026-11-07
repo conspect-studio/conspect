@@ -380,6 +380,10 @@ where
             .unwrap_or_default(),
         catalogue_boot_path.as_deref(),
         std::env::var("HOSTNAME").unwrap_or_else(|_| "this-server".to_owned()),
+        config
+            .network_diagnostics
+            .as_ref()
+            .is_none_or(|n| n.egress_lookup),
     );
 
     // Install the real mDNS browser when the `discovery` feature is built, so

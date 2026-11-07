@@ -107,6 +107,7 @@ pub fn install(
     cfg: &multiview_config::IptvOrgConfig,
     boot_path: Option<&std::path::Path>,
     host: String,
+    egress_lookup: bool,
 ) -> AppState {
     use std::sync::Arc;
     let dir =
@@ -120,6 +121,8 @@ pub fn install(
     };
     let catalogue = Catalogue::new(dir, cfg, fetcher);
     let guard = guard::DialGuard::new(Arc::clone(&state.dial_policy));
+    let collector: Arc<dyn netdiag::NetworkCollector> =
+        Arc::new(netdiag::collect::Collector::new(guard.clone(), egress_lookup));
     let runner: Arc<dyn probe::ProbeRunner> = match probe::engine::HttpProbeRunner::new(guard) {
         Ok(r) => Arc::new(r),
         Err(e) => {
@@ -127,7 +130,7 @@ pub fn install(
             Arc::new(probe::UnavailableRunner)
         }
     };
-    let probes = probe::ProbeService::new(runner, host);
+    let probes = probe::ProbeService::with_network(runner, host, collector);
     let state = state.with_catalogue(Arc::clone(&catalogue), probes);
     if catalogue.enabled() {
         spawn_sync_loop(state.clone(), catalogue);

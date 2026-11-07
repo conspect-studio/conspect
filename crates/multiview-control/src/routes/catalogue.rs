@@ -599,3 +599,76 @@ pub(crate) async fn get_probe(
         .map(Json)
         .ok_or(ControlError::NotFound { kind: "probe", id })
 }
+
+/// `POST /api/v1/sources/{id}/network` — the §3a network-path report for any
+/// existing source (operate; per-object authorization).
+#[cfg_attr(
+    feature = "openapi",
+    utoipa::path(
+        post,
+        path = "/api/v1/sources/{id}/network",
+        tag = "catalogue",
+        params(("id" = String, Path, description = "Source id.")),
+        responses(
+            (status = 200, description = "`NetworkReport {egress, hosts, hops, request_headers, assessment, curl}`; userinfo and query strings are redacted.", body = serde_json::Value),
+            (status = 403, description = "Requires operate (write), or the source is outside the caller's scope.", body = crate::problem::Problem),
+            (status = 404, description = "Unknown source.", body = crate::problem::Problem),
+            (status = 409, description = "Diagnostics are not available on this node.", body = crate::problem::Problem),
+            (status = 422, description = "The source has no http(s) URL.", body = crate::problem::Problem),
+            (status = 429, description = "The probe queue is full.", body = crate::problem::Problem),
+        ),
+    )
+)]
+pub(crate) async fn post_source_network(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> ControlResult<Json<crate::catalogue::netdiag::NetworkReport>> {
+    principal.role.require(Action::Write)?;
+    crate::auth::authorize_object(&principal, &id)?;
+    let svc = state
+        .catalogue_probe
+        .as_ref()
+        .ok_or_else(|| ControlError::Conflict("no diagnostics service on this node".to_owned()))?;
+    let collector = svc.collector().ok_or_else(|| {
+        ControlError::Conflict("network diagnostics are not available on this node".to_owned())
+    })?;
+    let source = super::sources::visible_sources(&state, &principal)?
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or(ControlError::NotFound {
+            kind: "source",
+            id: id.clone(),
+        })?;
+    let url = links::source_url(&source)
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .ok_or_else(|| ControlError::Validation("the source has no http(s) URL".to_owned()))?;
+    let (user_agent, referrer) = links::source_headers(&source);
+    let channel = serde_json::to_value(&source)
+        .ok()
+        .and_then(|v| v.pointer("/origin/channel")?.as_str().map(str::to_owned));
+    let country = channel.and_then(|ch| {
+        state
+            .catalogue
+            .as_ref()?
+            .snapshot()?
+            .rows
+            .iter()
+            .find(|r| r.ch.as_deref() == Some(ch.as_str()))
+            .and_then(|r| r.country.clone())
+    });
+    // The same permit pool as the probes: the diagnostics obey the probe bounds.
+    let _permit = svc.acquire_for_diagnostics().await?;
+    let report = collector
+        .collect(
+            ProbeRequest {
+                url,
+                user_agent,
+                referrer,
+                quality: None,
+            },
+            country,
+        )
+        .await;
+    Ok(Json(report))
+}

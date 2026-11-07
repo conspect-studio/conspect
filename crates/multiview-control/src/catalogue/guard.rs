@@ -65,6 +65,15 @@ impl DialGuard {
         }
     }
 
+    /// Screen one resolved address before dialling it.
+    ///
+    /// # Errors
+    ///
+    /// A message when the address falls in a blocked range.
+    pub fn screen_addr(&self, ip: IpAddr, port: u16) -> Result<(), String> {
+        self.screen_ip(ip, port)
+    }
+
     fn screen_ip(&self, ip: IpAddr, port: u16) -> Result<(), String> {
         if ip.is_loopback() && self.loopback_ports.contains(&port) {
             return Ok(());

@@ -188,6 +188,11 @@ multiview-ffmpeg = { workspace = true, optional = true }
 # graph (`deny.toml [graph] all-features = false`).
 url = { version = "2", optional = true }
 
+# Certificate facts (subject / issuer / expiry) for the network-path diagnostics
+# (docs/io/iptv-org.md §3a). Pure Rust, already in the lock via rcgen; only built
+# with the `catalogue` feature.
+x509-parser = { version = "0.18", optional = true }
+
 # The live CASTV2 wire layer for the `cast` managed-device driver: OFF by
 # default (`cast` / `devices-net`). The typed protocol payloads, the media-URL
 # rules, the session actor, and the registry wiring are ALWAYS compiled and
@@ -341,7 +346,7 @@ tokio-rustls = "0.26"
 # pure Rust and ALWAYS compiled (so the OpenAPI document lists them in every build
 # and `xtask` needs no TLS stack); without this feature refresh/probe answer an
 # honest 503. Pure Rust (reqwest + rustls, no native lib).
-"catalogue" = ["dep:reqwest", "dep:url"]
+"catalogue" = ["dep:reqwest", "dep:url", "dep:x509-parser"]
 # The probe's stage-4 media check (demux + decode via the safe `multiview-ffmpeg`
 # wrappers). Without it the probe honestly reports stage 4 as `skipped`.
 "catalogue-ffmpeg" = ["catalogue", "dep:multiview-ffmpeg", "multiview-ffmpeg/ffmpeg"]

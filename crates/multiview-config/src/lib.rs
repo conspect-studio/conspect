@@ -32,6 +32,7 @@
 pub mod api;
 pub mod audio;
 pub mod catalogues;
+pub mod network_diagnostics;
 pub mod device;
 pub mod diff;
 pub mod discovery;
@@ -75,6 +76,7 @@ pub use audio::{
     TrackDelivery, PROGRAM_TRACK,
 };
 pub use catalogues::{CataloguesConfig, IptvOrgConfig};
+pub use network_diagnostics::NetworkDiagnosticsConfig;
 pub use device::{Device, DeviceAuth, DeviceDisplay, DeviceDriver, DisplayAssign, ReconnectPolicy};
 pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
@@ -341,6 +343,9 @@ pub struct MultiviewConfig {
     /// External source catalogues (`[catalogues.iptv_org]`, ADR-M015).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalogues: Option<CataloguesConfig>,
+    /// Network-path diagnostics (`[network_diagnostics]`, docs/io/iptv-org.md §3a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_diagnostics: Option<NetworkDiagnosticsConfig>,
     /// The management control-plane listener. When present, `multiview run`
     /// serves the API + docs (+ web UI) alongside the engine; absent ⇒ headless.
     #[serde(default, skip_serializing_if = "Option::is_none")]

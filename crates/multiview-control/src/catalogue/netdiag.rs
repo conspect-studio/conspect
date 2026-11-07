@@ -10,6 +10,23 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use super::probe::ProbeRequest;
+use super::sync::BoxFuture;
+
+#[cfg(feature = "catalogue")]
+pub mod collect;
+
+/// Collects a [`NetworkReport`] for one stream request. The control plane holds it
+/// as a trait object so the routes compile without the `catalogue` feature.
+pub trait NetworkCollector: Send + Sync {
+    /// Collect the report; `channel_country` (ISO alpha-2) feeds the geo hint.
+    fn collect(
+        &self,
+        req: ProbeRequest,
+        channel_country: Option<String>,
+    ) -> BoxFuture<'_, NetworkReport>;
+}
+
 /// How the internet sees this server.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct NetworkEgress {
@@ -160,6 +177,26 @@ pub fn curl_for(url: &str, headers: &NetworkRequestHeaders) -> String {
     s.push(' ');
     s.push_str(&shell_quote(&redact_url(url)));
     s
+}
+
+/// `curl` for one hop pinned to the address the server really used
+/// (`-4`/`-6` and `--resolve host:port:ip`), so it reproduces the same path.
+#[must_use]
+pub fn curl_for_addr(
+    url: &str,
+    headers: &NetworkRequestHeaders,
+    used: Option<(std::net::IpAddr, u16)>,
+) -> String {
+    let base = curl_for(url, headers);
+    let Some((ip, port)) = used else { return base };
+    let Some(host) = host_of(url) else { return base };
+    let fam = if ip.is_ipv6() { "-6" } else { "-4" };
+    let host = host.trim_matches(['[', ']']);
+    base.replacen(
+        "curl -sS -I",
+        &format!("curl -sS -I {fam} --resolve {host}:{port}:{ip}"),
+        1,
+    )
 }
 
 fn shell_quote(v: &str) -> String {

@@ -3090,6 +3090,7 @@ dependencies = [
  "utoipa-axum",
  "utoipa-scalar",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

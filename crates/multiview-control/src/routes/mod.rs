@@ -1093,6 +1093,7 @@ fn resource_router() -> Router<AppState> {
                 .put(sources::update_source)
                 .delete(sources::delete_source),
         )
+        .route("/sources/{id}/network", post(catalogue::post_source_network))
         // Graphics (CG): data sources, templates, items, playout channels.
         .route("/graphics/data-sources", get(graphics::list_data_sources))
         .route(
