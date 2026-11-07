@@ -564,12 +564,19 @@ jobs:
         # gnutls + libdrm are preinstalled on ubuntu-latest; NO x264/x265 (GPL-gated,
         # absent from the -lgpl build). The `ldd` completeness guard below fails fast
         # if this list ever drifts, naming the exact missing soname.
+        #
+        # `ffmpeg` is the distro CLI, a fixture generator only: the audio lib
+        # tests shell out to it for lavfi clips, which the pinned
+        # --disable-everything build cannot make. Nothing links it. Its libav
+        # sonames differ from the pinned ones, so the tests still load the
+        # pinned libraries through LD_LIBRARY_PATH.
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev nasm \
-            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2
+            libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 \
+            ffmpeg
       - name: Extract pinned FFmpeg 8.1.1 from the base image
         # The base is `FROM scratch` (only /opt/multiview-ffmpeg), so we create a
         # (never-run) container from it and `docker cp` the prefix out — the same
