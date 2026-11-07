@@ -5398,15 +5398,26 @@ enum SinkSendPolicy {
 }
 
 /// Non-blocking send for a resilient push sink: `try_send` once; a full queue
-/// drops the packet into `link`'s counter and requests a keyframe resync.
-/// Returns `false` only when the receiver hung up (the sink ended).
+/// drops the packet into `link`'s counter and closes the producer-side gate,
+/// so nothing after the loss is queued until a post-loss video keyframe is
+/// (review SRT-04: the resync boundary is the real loss point, never an older
+/// keyframe still in the queue). Returns `false` only when the receiver hung up
+/// (the sink ended).
 fn send_or_drop(
     tx: &SyncSender<EncodedPacket>,
     packet: EncodedPacket,
     link: &multiview_output::push_link::PushLinkStatus,
 ) -> bool {
+    let video_keyframe =
+        matches!(packet.kind(), multiview_ffmpeg::StreamKind::Video) && packet.is_keyframe();
+    if !link.admit_upstream(video_keyframe) {
+        return true;
+    }
     match tx.try_send(packet) {
-        Ok(()) => true,
+        Ok(()) => {
+            link.queued_upstream(video_keyframe);
+            true
+        }
         Err(TrySendError::Full(_)) => {
             link.shed_upstream();
             true
@@ -20313,6 +20324,70 @@ mod push_send_policy_tests {
         // Draining the queue lets later packets through again.
         while rx.try_recv().is_ok() {}
         drop(rx);
+    }
+
+    fn video(key: bool, pts: i64) -> EncodedPacket {
+        let mut packet = ffmpeg_next::codec::packet::Packet::new(16);
+        packet.set_pts(Some(pts));
+        if key {
+            packet.set_flags(ffmpeg_next::codec::packet::Flags::KEY);
+        }
+        EncodedPacket::from_packet(packet)
+    }
+
+    fn audio(pts: i64) -> EncodedPacket {
+        let mut packet = ffmpeg_next::codec::packet::Packet::new(16);
+        packet.set_pts(Some(pts));
+        packet.set_flags(ffmpeg_next::codec::packet::Flags::KEY);
+        EncodedPacket::from_audio_packet(packet)
+    }
+
+    /// SRT-04: a keyframe queued BEFORE an upstream drop must not release the
+    /// post-loss dependent frames. Nothing after the loss (video or audio)
+    /// enters the push queue until a post-loss video keyframe does, so the
+    /// distributor can never pass a P frame whose reference was shed.
+    #[test]
+    fn a_keyframe_queued_before_a_drop_never_releases_post_loss_frames() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(2);
+        let link = Arc::new(PushLinkStatus::new("srt", true, "srt://[::]:9000"));
+        let policies = [SinkSendPolicy::DropWhenFull(Arc::clone(&link))];
+        let mut live = vec![true];
+        let send = |live: &mut Vec<bool>, packets: Vec<EncodedPacket>| {
+            fan_packets(std::slice::from_ref(&tx), live, &policies, packets);
+        };
+        // K1 and P2 fill the queue; P3 (P4's reference) is shed.
+        send(
+            &mut live,
+            vec![video(true, 1), video(false, 2), video(false, 3)],
+        );
+        assert_eq!(link.dropped(), 1);
+        // The distributor drains the backlog, old keyframe included.
+        let drained: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            drained.iter().map(|p| p.pts()).collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+        // Post-loss: P4 and its audio must not get through; K5 resyncs.
+        send(
+            &mut live,
+            vec![video(false, 4), audio(4), video(true, 5), audio(5)],
+        );
+        let after: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|p| {
+                (
+                    p.pts(),
+                    p.is_keyframe(),
+                    matches!(p.kind(), multiview_ffmpeg::StreamKind::Video),
+                )
+            })
+            .collect();
+        assert_eq!(
+            after,
+            [(Some(5), true, true), (Some(5), true, false)],
+            "only the post-loss keyframe and what follows it"
+        );
+        assert_eq!(link.dropped(), 3);
+        assert_eq!(live, vec![true]);
     }
 
     #[test]

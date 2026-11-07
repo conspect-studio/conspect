@@ -247,12 +247,11 @@ fn distribute<P: PacketSource>(
 ) -> Result<()> {
     while let Some(packet) = source.next_packet()? {
         report.received = report.received.saturating_add(1);
+        // An upstream shed needs no re-gate here: the producer queues nothing
+        // after a loss until a post-loss video keyframe (review SRT-04), so
+        // every packet in this queue is either before the hole or starts on
+        // that keyframe.
         let mut clients = shared.clients();
-        if shared.link.take_resync() {
-            for client in clients.iter_mut() {
-                client.gated = true;
-            }
-        }
         if clients.is_empty() {
             shared.link.add_dropped(1);
             continue;

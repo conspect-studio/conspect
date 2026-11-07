@@ -92,9 +92,14 @@ pub struct PushLinkStatus {
     dropped: AtomicU64,
     /// Packets written to peers. Monotonic.
     written: AtomicU64,
-    /// The consumer shed a packet before the distributor saw it, so every
-    /// session must resync on the next keyframe.
+    /// The consumer shed a packet before the distributor saw it (observable
+    /// once through [`PushLinkStatus::take_resync`]).
     resync: AtomicBool,
+    /// Producer-side gate after an upstream shed: nothing more is queued until
+    /// a post-loss video keyframe is, so the loss boundary is enforced where
+    /// it happens rather than against older queued packets (review SRT-04).
+    /// Touched only by the one bake consumer thread.
+    upstream_gated: AtomicBool,
     /// The most recent connect/listen/write error (cleared on connect).
     last_error: SwapCell<Option<Arc<String>>>,
     /// Attached peer addresses, published for lock-free reads by the snapshot.
@@ -144,6 +149,7 @@ impl PushLinkStatus {
             dropped: AtomicU64::new(0),
             written: AtomicU64::new(0),
             resync: AtomicBool::new(false),
+            upstream_gated: AtomicBool::new(false),
             last_error: SwapCell::new(None),
             peers: SwapCell::new(Arc::new(Vec::new())),
             peers_edit: Mutex::new(Vec::new()),
@@ -223,7 +229,27 @@ impl PushLinkStatus {
     /// resync (wait-free; called from the bake consumer).
     pub fn shed_upstream(&self) {
         self.add_dropped(1);
+        self.upstream_gated.store(true, Ordering::Release);
         self.resync.store(true, Ordering::Release);
+    }
+
+    /// Whether the producer may queue a packet now. After
+    /// [`shed_upstream`](Self::shed_upstream) only a video keyframe is
+    /// admitted; anything else is counted as dropped. Wait-free.
+    pub fn admit_upstream(&self, video_keyframe: bool) -> bool {
+        if !self.upstream_gated.load(Ordering::Acquire) || video_keyframe {
+            return true;
+        }
+        self.add_dropped(1);
+        false
+    }
+
+    /// The producer queued a packet: a queued video keyframe ends the
+    /// post-loss gate.
+    pub fn queued_upstream(&self, video_keyframe: bool) {
+        if video_keyframe {
+            self.upstream_gated.store(false, Ordering::Release);
+        }
     }
 
     /// Take a pending keyframe-resync request.
