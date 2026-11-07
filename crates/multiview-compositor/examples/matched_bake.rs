@@ -94,6 +94,17 @@ fn image(n: usize) -> Nv12Image {
     )
     .unwrap()
 }
+/// Process user+system CPU milliseconds (all threads) from `/proc/self/stat`
+/// (0 where unavailable): the bake fans bands out across threads, so wall time
+/// alone hides the total CPU it burns.
+fn cpu_ms() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ticks: f64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+        + f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    ticks * 10.0
+}
 fn report(name: &str, images: &[Nv12Image], lists: &[OverlayDrawList], repeats: usize) {
     let canvas = CanvasColor::default();
     for i in 0..8 {
@@ -103,6 +114,7 @@ fn report(name: &str, images: &[Nv12Image], lists: &[OverlayDrawList], repeats: 
         );
     }
     let mut samples = Vec::with_capacity(repeats);
+    let cpu0 = cpu_ms();
     for i in 0..repeats {
         let start = Instant::now();
         std::hint::black_box(
@@ -111,9 +123,10 @@ fn report(name: &str, images: &[Nv12Image], lists: &[OverlayDrawList], repeats: 
         );
         samples.push(start.elapsed().as_secs_f64() * 1000.);
     }
+    let cpu_per = (cpu_ms() - cpu0) / repeats as f64;
     samples.sort_by(f64::total_cmp);
     println!(
-        "{name} reps={repeats} median_ms={:.4} p95_ms={:.4} mean_ms={:.4}",
+        "{name} reps={repeats} median_ms={:.4} p95_ms={:.4} mean_ms={:.4} cpu_ms_per_bake={cpu_per:.2}",
         samples[repeats / 2],
         samples[(repeats * 95 / 100).min(repeats - 1)],
         samples.iter().sum::<f64>() / repeats as f64
@@ -153,10 +166,15 @@ fn main() {
     );
     let image0 = image(0);
     let list0 = fixture(0);
-    report("static_reused_input_and_caption", &[image0], &[list0], 32);
+    report("static_reused_input_and_caption", &[image0], &[list0], 300);
     let frames: Vec<_> = (0..32).map(image).collect();
     let lists: Vec<_> = (0..32).map(fixture).collect();
-    report("distinct_frame_and_caption_every_bake", &frames, &lists, 32);
+    report(
+        "distinct_frame_and_caption_every_bake",
+        &frames,
+        &lists,
+        300,
+    );
     report_all_fresh();
     println!("geometry 1920x1080; six 640x540 tiles, stereo lanes 8x444 each, caption clipped 684x74; source/list preparation excluded from bake timing");
 }

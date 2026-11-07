@@ -175,9 +175,10 @@ pub use log_bridge::install as install_log_bridge;
 pub use idr::{is_idr, CodecKind, NalFraming};
 
 pub use hwdecode::{
-    cuvid_decoder, decode_surface_pool, nvdec_disabled, plan_decode_resize, want_hw_decode,
-    DecodeResizeStrategy, DecodeSurfacePool, HwBitDepth, HwDecodePlan, HwDeviceKind, HwInputCodec,
-    PoolInputs, ResizeInputs, TileSize, NVDEC_DISABLE_ENV,
+    cuvid_decoder, cuvid_resize_option, decode_surface_pool, nvdec_disabled, nvdec_resize_target,
+    plan_decode_resize, want_hw_decode, DecodeResizeStrategy, DecodeSurfacePool, HwBitDepth,
+    HwDecodePlan, HwDeviceKind, HwInputCodec, PoolInputs, ResizeInputs, TileSize,
+    NVDEC_DISABLE_ENV, NVDEC_RESIZE_DISABLE_ENV,
 };
 
 #[cfg(feature = "ffmpeg")]

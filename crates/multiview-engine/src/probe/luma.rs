@@ -253,18 +253,19 @@ impl<'a> LumaView<'a> {
     #[must_use]
     pub fn mean_luma(&self, zone: DetectionZone) -> f64 {
         let (x0, y0, x1, y1) = zone.pixel_bounds(self.width, self.height);
-        // Accumulate directly in f64: `f64::from(u8)` and `+ 1.0` are exact for
-        // every count a real frame can produce, so no `u64 -> f64` cast (banned
-        // by `as_conversions`) is needed and no precision is lost.
+        // Row-slice walk with integer accumulation: one bounds check per row,
+        // not per sample. A row sum is at most `255 * width` (< 2^32) and every
+        // partial total stays an integer far below 2^53, so the f64 result is
+        // bit-identical to the former per-sample `f64` accumulation.
         let mut sum = 0.0_f64;
         let mut count = 0.0_f64;
         for y in y0..y1 {
-            for x in x0..x1 {
-                if let Some(v) = self.sample(x, y) {
-                    sum += f64::from(v);
-                    count += 1.0;
-                }
-            }
+            let Some(row) = self.row(y, x0, x1) else {
+                continue;
+            };
+            let row_sum: u32 = row.iter().map(|&v| u32::from(v)).sum();
+            sum += f64::from(row_sum);
+            count += f64::from(u32::try_from(row.len()).unwrap_or(u32::MAX));
         }
         if count == 0.0 {
             // Unreachable for a valid zone (bounds are non-empty), but stays
@@ -272,6 +273,18 @@ impl<'a> LumaView<'a> {
             return 0.0;
         }
         sum / count
+    }
+
+    /// The `[x0, x1)` samples of row `y`, or [`None`] when out of range (the
+    /// zone bounds are already clamped to the plane, so this is total).
+    fn row(&self, y: u32, x0: u32, x1: u32) -> Option<&'a [u8]> {
+        let stride = usize::try_from(self.stride).ok()?;
+        let start = usize::try_from(y)
+            .ok()?
+            .checked_mul(stride)?
+            .checked_add(usize::try_from(x0).ok()?)?;
+        let end = start.checked_add(usize::try_from(x1.checked_sub(x0)?).ok()?)?;
+        self.samples.get(start..end)
     }
 
     /// The fraction of samples in `zone` that differ from `previous` by more than
@@ -293,23 +306,27 @@ impl<'a> LumaView<'a> {
             return 1.0;
         }
         let (x0, y0, x1, y1) = zone.pixel_bounds(self.width, self.height);
-        // Accumulate in f64 (each `+= 1.0` is exact within a frame's pixel
-        // count) so no `u64 -> f64` cast is required.
+        // Row-slice walk with integer counts (bit-identical to the former
+        // per-sample f64 `+= 1.0`: every count is an integer below 2^53).
+        let row_len = f64::from(x1.saturating_sub(x0));
         let mut changed = 0.0_f64;
         let mut count = 0.0_f64;
         for y in y0..y1 {
-            for x in x0..x1 {
-                if let (Some(cur), Some(prev)) = (self.sample(x, y), previous.sample(x, y)) {
-                    if cur.abs_diff(prev) > tolerance {
-                        changed += 1.0;
-                    }
-                } else {
-                    // A missing sample on either side counts as changed: fail
-                    // safe toward "not frozen".
-                    changed += 1.0;
+            match (self.row(y, x0, x1), previous.row(y, x0, x1)) {
+                (Some(cur), Some(prev)) => {
+                    // Branchless per-sample count so the row vectorises.
+                    let row_changed: u32 = cur
+                        .iter()
+                        .zip(prev)
+                        .map(|(&c, &p)| u32::from(c.abs_diff(p) > tolerance))
+                        .sum();
+                    changed += f64::from(row_changed);
                 }
-                count += 1.0;
+                // A missing row on either side counts as changed: fail safe
+                // toward "not frozen".
+                _ => changed += row_len,
             }
+            count += row_len;
         }
         if count == 0.0 {
             return 1.0;
