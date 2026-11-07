@@ -7281,6 +7281,33 @@ mod live_edit_audio_regression_tests {
         }
     }
 
+    /// Review R3-04: `AudioControlHandle::set_source_audio` publishes its
+    /// membership map (what `test_source_store` reads) BEFORE it enqueues the
+    /// change `apply_pending` drains (`push_member`) — so a single
+    /// `apply_pending` call right after the map becomes visible can race an
+    /// as-yet-undrained enqueue and silently apply nothing this tick. Retry
+    /// `apply_pending` until the bus's delivered membership (`live_strip_count`)
+    /// actually reaches `want`, rather than asserting on one undetermined call.
+    fn apply_pending_until_delivered(
+        audio: &crate::audio::AudioControlHandle,
+        bus: &mut ProgramBus,
+        want: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            audio.apply_pending(bus);
+            if bus.live_strip_count() == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bus membership did not reach {want} strip(s); got {}",
+                bus.live_strip_count()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn source(path: &std::path::Path) -> Source {
         serde_json::from_value(serde_json::json!({
             "id": "edited", "kind": "file", "path": path.display().to_string()
@@ -7771,7 +7798,7 @@ segment_ms = 1000
             .expect("A audio worker")
             .stop
             .clone();
-        audio.apply_pending(&mut bus);
+        apply_pending_until_delivered(&audio, &mut bus, 1);
         bus.set_program_gain_ramped(
             audio.test_source_point("edited-http").expect("route"),
             1.0,
@@ -7811,17 +7838,31 @@ segment_ms = 1000
             "B segments fetched over HTTP"
         );
         assert!(old_stop.load(Ordering::Acquire), "A audio worker stopped");
-        let new_stop = registry
-            .lock()
-            .expect("registry")
-            .get("edited-http/audio")
-            .expect("B audio worker")
-            .stop
-            .clone();
-        assert!(
-            !Arc::ptr_eq(&old_stop, &new_stop),
-            "B owns a new audio worker"
-        );
+        // Review R3-04: B's shared-URL publication is NOT proof B's audio
+        // registry entry exists — production spawns video (which the fetcher
+        // belongs to) before it registers/spawns audio, so the URL can become
+        // visible while the registry still lacks B's `edited-http/audio`
+        // entry (teardown already removed A's). Synchronize on B's registry
+        // identity SEPARATELY and explicitly, rather than reading it
+        // immediately on the strength of the URL condition alone.
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let new_stop = loop {
+            let candidate = registry
+                .lock()
+                .expect("registry")
+                .get("edited-http/audio")
+                .map(|producer| producer.stop.clone());
+            match candidate {
+                Some(stop) if !Arc::ptr_eq(&old_stop, &stop) => break stop,
+                _ => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "B audio worker must register in the stop registry"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
         assert!(!new_stop.load(Ordering::Acquire), "B audio worker runs");
         wait_until(|| {
             audio
@@ -7854,8 +7895,7 @@ segment_ms = 1000
             new_anchor.raw_pts0_ns.is_some(),
             "B video has a usable PTS anchor"
         );
-        audio.apply_pending(&mut bus);
-        assert_eq!(bus.live_strip_count(), 2, "A crossfades into B");
+        apply_pending_until_delivered(&audio, &mut bus, 2);
         // A live HLS producer stays paced; the bus reads the B store after the
         // source edit, rather than seeking a finite file back from EOF.
         // The video anchor includes the two-second jitter hold. Drive the bus
@@ -7912,6 +7952,7 @@ segment_ms = 1000
     #[test]
     #[allow(clippy::too_many_lines)]
     fn same_id_file_edit_replaces_audio_worker_and_running_program_store() {
+        const READ_SPAN_FRAMES: usize = 11_520;
         let dir = tempfile::tempdir().expect("fixture directory");
         let a = dir.path().join("a.ts");
         let b = dir.path().join("b.ts");
@@ -7981,8 +8022,7 @@ segment_ms = 1000
         wait_until(|| audio.test_source_store("edited").is_some());
         let old = audio.test_source_store("edited").expect("A store");
         wait_until(|| old.buffered_frames() > 4_800);
-        audio.apply_pending(&mut bus);
-        assert_eq!(bus.live_strip_count(), 1, "A joins the real bus");
+        apply_pending_until_delivered(&audio, &mut bus, 1);
         bus.set_program_gain_ramped(audio.test_source_point("edited").expect("A route"), 1.0, 0)
             .expect("route A at unity");
         let first = registry
@@ -8001,7 +8041,21 @@ segment_ms = 1000
                 .is_some_and(|s| !Arc::ptr_eq(&s, &old))
         });
         let new = audio.test_source_store("edited").expect("B store");
-        wait_until(|| new.buffered_frames() > 4_800);
+        // Review R3-04: `buffered_frames() > 4_800` only proved SOME of the
+        // span had arrived — the paced decoder (2 s look-ahead) keeps
+        // publishing concurrently with the later unpaced 11_520-frame read
+        // below, so that read could land partway into not-yet-published
+        // (silence-filled) frames. Wait for `measure_pcm` to report the EXACT
+        // span the test reads as fully, stably covered before touching it —
+        // a `Measured` result (not `Unknown`) proves every frame in
+        // `[0, READ_SPAN_FRAMES)` was actually published, not inferred from a
+        // partial threshold.
+        wait_until(|| {
+            matches!(
+                new.measure_pcm(0, READ_SPAN_FRAMES),
+                multiview_audio::store::PcmMeasurement::Measured { .. }
+            )
+        });
         let second = registry
             .lock()
             .expect("registry")
@@ -8018,27 +8072,29 @@ segment_ms = 1000
             "B has a fresh worker stop flag"
         );
         assert!(!second.load(Ordering::Acquire), "B worker runs after edit");
-        audio.apply_pending(&mut bus); // B repoints the existing bus strip.
-        assert_eq!(
-            bus.live_strip_count(),
-            2,
-            "crossfade briefly retains A until its 10 ms ramp ends"
-        );
+        // B repoints the existing bus strip (crossfade briefly retains A
+        // until its 10 ms ramp ends).
+        apply_pending_until_delivered(&audio, &mut bus, 2);
         assert!(Arc::ptr_eq(
             &new,
             &audio.test_source_store("edited").expect("bus source is B")
         ));
         // The finite FILE decoder may finish all 12 seconds before the bus first
-        // ticks. Park its cursor inside the decoded tail, not past EOF; the
-        // production bus still reads the actual B decode store after its ramp.
-        let decoded_head = new.read_cursor();
-        new.seek_to(decoded_head.saturating_sub(19_200));
+        // ticks. Park its cursor at the start of the span the `measure_pcm`
+        // wait above just proved is fully, stably published — never past EOF;
+        // the production bus still reads the actual B decode store after its
+        // ramp.
+        new.seek_to(0);
         // A 440 Hz tone and B 880 Hz tone have different zero-crossing counts.
         // The bus output (not a direct store read) must carry B after its ramp.
+        // Exactly `READ_SPAN_FRAMES` (6 ticks x 1_920 frames/tick at 25 fps):
+        // the `measure_pcm` wait above proved every one of these frames is
+        // real decoded PCM, not a still-filling live edge.
         let mut samples = Vec::new();
         for tick in 1..=6 {
             samples.extend(bus.tick_to(tick).interleaved().iter().step_by(2).copied());
         }
+        debug_assert_eq!(samples.len(), READ_SPAN_FRAMES, "one channel per frame");
         assert_eq!(
             bus.live_strip_count(),
             1,

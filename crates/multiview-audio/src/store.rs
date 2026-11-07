@@ -3041,6 +3041,156 @@ mod resync_tests {
     }
 }
 
+/// Review R3-04: a `buffered_frames() > threshold` readiness check (the
+/// pattern `same_id_file_edit_replaces_audio_worker_and_running_program_store`
+/// used before this review) only proves SOME frames arrived — a concurrent,
+/// still-publishing producer (the real paced decode loop) can keep writing
+/// past that threshold while a test reads a LARGER span right after, landing
+/// partway into not-yet-published, silence-filled frames. `measure_pcm`
+/// reports exactly this: `Unknown` for a partially covered span, `Measured`
+/// only once the WHOLE span is actually published. This is a deterministic,
+/// `ffmpeg`-free reproduction of the readiness gap the two named pipeline
+/// tests had (they are fixed by waiting on `measure_pcm`/the registry
+/// identity directly, not on a partial-arrival threshold).
+#[cfg(test)]
+mod readiness_threshold_vs_full_coverage_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::format::{AudioFormat, ChannelLayout};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Barrier;
+
+    /// A background "decoder" that publishes `total_frames` in `chunks` equal
+    /// pieces, pausing `pause` between each — the same shape as the real
+    /// paced file decode loop: frames arrive incrementally, not all at once.
+    fn spawn_chunked_producer(
+        store: Arc<AudioStore>,
+        format: AudioFormat,
+        total_frames: usize,
+        chunks: usize,
+        pause: std::time::Duration,
+        start: Arc<Barrier>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            start.wait();
+            let channels = format.channel_count();
+            let per_chunk = total_frames / chunks;
+            for _ in 0..chunks {
+                let block =
+                    AudioBlock::from_interleaved(format, vec![0.5f32; per_chunk * channels])
+                        .unwrap();
+                store.publish(&block).unwrap();
+                std::thread::sleep(pause);
+            }
+        })
+    }
+
+    /// The exact readiness gap: a `buffered_frames() > threshold` check can
+    /// pass while the producer is still mid-flight, and a subsequent read of
+    /// a LARGER span than what is actually published lands partly in
+    /// silence — `measure_pcm` over that same larger span correctly reports
+    /// `Unknown` at that moment, not `Measured`.
+    #[test]
+    fn buffered_frames_threshold_passes_before_a_larger_span_is_fully_published() {
+        // 11_520 total frames (the real test's read span) in 6 chunks of
+        // 1_920, paced 40ms apart — slow enough that the threshold below
+        // (4_800, the real test's old check) is crossed well before the
+        // whole 11_520-frame span finishes publishing.
+        const TOTAL: usize = 11_520;
+        const THRESHOLD: usize = 4_800;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = Arc::new(AudioStore::finite_file(format, 96_000));
+        let start = Arc::new(Barrier::new(2));
+        let producer = spawn_chunked_producer(
+            Arc::clone(&store),
+            format,
+            TOTAL,
+            6,
+            std::time::Duration::from_millis(40),
+            Arc::clone(&start),
+        );
+        start.wait();
+        // The OLD readiness check: wait only for SOME frames.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store.buffered_frames() <= THRESHOLD {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "producer made no progress"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // At THIS moment, the full TOTAL-frame span is demonstrably NOT yet
+        // fully published — proving the old check's threshold is not a proxy
+        // for "the span I am about to read is fully there".
+        assert!(
+            matches!(store.measure_pcm(0, TOTAL), PcmMeasurement::Unknown),
+            "the old threshold check must NOT already guarantee full coverage \
+             of the larger span a subsequent read would consume"
+        );
+        producer.join().unwrap();
+        // Once the producer finishes, the same span IS fully covered — this
+        // is the condition the fixed pipeline tests wait on instead.
+        assert!(matches!(
+            store.measure_pcm(0, TOTAL),
+            PcmMeasurement::Measured { .. }
+        ));
+    }
+
+    /// The fixed pattern: waiting on `measure_pcm` for the EXACT span never
+    /// observes a partial span as ready, however the producer paces its
+    /// chunks, and always exactly matches "fully published".
+    #[test]
+    fn waiting_on_measure_pcm_never_observes_a_partial_span_as_ready() {
+        const TOTAL: usize = 11_520;
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo);
+        let store = Arc::new(AudioStore::finite_file(format, 96_000));
+        let seen_partial = Arc::new(AtomicBool::new(false));
+        // 3 waiters: this thread, the producer thread, and the checker thread.
+        let start = Arc::new(Barrier::new(3));
+        let producer = spawn_chunked_producer(
+            Arc::clone(&store),
+            format,
+            TOTAL,
+            6,
+            std::time::Duration::from_millis(10),
+            Arc::clone(&start),
+        );
+        let checker_store = Arc::clone(&store);
+        let checker_seen_partial = Arc::clone(&seen_partial);
+        let checker_start = Arc::clone(&start);
+        let checker = std::thread::spawn(move || {
+            checker_start.wait();
+            loop {
+                match checker_store.measure_pcm(0, TOTAL) {
+                    PcmMeasurement::Measured { .. } => break,
+                    PcmMeasurement::Unknown => {
+                        if checker_store.buffered_frames() > 0
+                            && checker_store.buffered_frames() < TOTAL
+                        {
+                            checker_seen_partial.store(true, AtomicOrdering::Relaxed);
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        start.wait();
+        producer.join().unwrap();
+        checker.join().unwrap();
+        // The checker DID observe partial buffering (proving the race window
+        // is real, not merely instantaneous) yet never treated it as ready —
+        // `measure_pcm` only returned `Measured` once the whole span landed.
+        assert!(
+            seen_partial.load(AtomicOrdering::Relaxed),
+            "the test setup must actually exercise the partial-buffering window"
+        );
+        assert!(matches!(
+            store.measure_pcm(0, TOTAL),
+            PcmMeasurement::Measured { .. }
+        ));
+    }
+}
+
 #[cfg(test)]
 mod timeline_capacity_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
