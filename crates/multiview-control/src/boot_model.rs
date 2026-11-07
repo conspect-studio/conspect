@@ -476,14 +476,36 @@ async fn commit_desired_document_named(
         .map_or_else(std::collections::BTreeMap::new, |prior| {
             prior.layout_versions.clone()
         });
+    // Review H2: before the first envelope exists, the legacy repository is
+    // the accepted state. Import its exact bodies and versions so the first
+    // commit advances existing counters instead of restarting them at 1 (a
+    // reset would hand a stale `If-Match` the same tag as the new body).
+    let legacy_layouts: std::collections::BTreeMap<String, crate::repository::VersionedLayout> =
+        if previous.is_none() {
+            state
+                .repository
+                .list_layouts()?
+                .into_iter()
+                .map(|entry| (entry.layout.id.clone(), entry))
+                .collect()
+        } else {
+            std::collections::BTreeMap::new()
+        };
     for layout in &layouts {
+        let legacy = legacy_layouts.get(&layout.id);
         let prior_layout = previous
             .as_ref()
-            .and_then(|prior| prior.layouts.iter().find(|item| item.id == layout.id));
+            .and_then(|prior| prior.layouts.iter().find(|item| item.id == layout.id))
+            .or_else(|| legacy.map(|entry| &entry.layout));
         let prior_version = layout_versions.get(&layout.id).copied().unwrap_or_else(|| {
-            prior_layout
-                .and_then(|_| state.repository.get_layout(&layout.id).ok())
-                .map_or(0, |entry| entry.version.get())
+            legacy.map_or_else(
+                || {
+                    prior_layout
+                        .and_then(|_| state.repository.get_layout(&layout.id).ok())
+                        .map_or(0, |entry| entry.version.get())
+                },
+                |entry| entry.version.get(),
+            )
         });
         if prior_layout == Some(layout) {
             layout_versions.insert(layout.id.clone(), prior_version.max(1));
@@ -501,14 +523,32 @@ async fn commit_desired_document_named(
         .map_or_else(std::collections::BTreeMap::new, |prior| {
             prior.resource_versions.clone()
         });
+    let legacy = if previous.is_none() {
+        Some(legacy_resources(state)?)
+    } else {
+        None
+    };
     for key in ["sources", "outputs", "audio"] {
         let new_bodies = resource_bodies(&config, &output_ids, key)?;
-        let old_bodies = previous
-            .as_ref()
-            .map(|prior| resource_bodies(&prior.config, &prior.output_ids, key))
-            .transpose()?
-            .unwrap_or_default();
+        let old_bodies = match (&previous, &legacy) {
+            (Some(prior), _) => resource_bodies(&prior.config, &prior.output_ids, key)?,
+            (None, Some(legacy)) => legacy
+                .get(key)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(id, (body, _))| (id.clone(), body.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            (None, None) => std::collections::BTreeMap::new(),
+        };
         let counters = resource_versions.entry(key.to_owned()).or_default();
+        if let Some(entries) = legacy.as_ref().and_then(|legacy| legacy.get(key)) {
+            for (id, (_, version)) in entries {
+                counters.entry(id.clone()).or_insert(*version);
+            }
+        }
         for (id, body) in &new_bodies {
             let base = counters
                 .get(id)
@@ -575,6 +615,49 @@ async fn commit_desired_document_named(
         },
     )
     .await
+}
+
+/// Legacy (pre-envelope) accepted bodies and exact versions, per key.
+type LegacyResources = std::collections::BTreeMap<
+    &'static str,
+    std::collections::BTreeMap<String, (serde_json::Value, u64)>,
+>;
+
+/// Import the accepted source/output/audio state from the legacy stores
+/// (review H2): the first durable transaction continues their counters.
+fn legacy_resources(state: &AppState) -> ControlResult<LegacyResources> {
+    let mut legacy = LegacyResources::new();
+    for (key, store) in [("sources", &state.sources), ("outputs", &state.outputs)] {
+        let entries = legacy.entry(key).or_default();
+        for entry in store.list()? {
+            // Canonicalise through the typed schema so an unchanged item
+            // compares equal to its config serialization (no spurious bump).
+            let body = match key {
+                "sources" => {
+                    serde_json::from_value::<multiview_config::Source>(entry.resource.body.clone())
+                        .ok()
+                        .map(|typed| config_value(&typed))
+                        .transpose()?
+                }
+                _ => {
+                    serde_json::from_value::<multiview_config::Output>(entry.resource.body.clone())
+                        .ok()
+                        .map(|typed| config_value(&typed))
+                        .transpose()?
+                }
+            }
+            .unwrap_or(entry.resource.body);
+            entries.insert(entry.resource.id, (body, entry.version.get()));
+        }
+    }
+    let (routing, version) = state.audio_routing.snapshot();
+    if let Some(routing) = routing {
+        legacy.entry("audio").or_default().insert(
+            "singleton".to_owned(),
+            (config_value(&routing)?, version.get()),
+        );
+    }
+    Ok(legacy)
 }
 
 fn resource_bodies(
