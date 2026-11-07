@@ -178,6 +178,7 @@ impl ConfigDiff {
             system: running_system,
             media_library: running_media_library,
             media_players: running_media_players,
+            media_fills: running_media_fills,
             weather: running_weather,
             iptv: running_iptv,
             graphics: running_graphics,
@@ -207,6 +208,7 @@ impl ConfigDiff {
             system: next_system,
             media_library: next_media_library,
             media_players: next_media_players,
+            media_fills: next_media_fills,
             weather: next_weather,
             iptv: next_iptv,
             graphics: next_graphics,
@@ -225,12 +227,15 @@ impl ConfigDiff {
         let canvas_signal_changed = running_signal != next_signal;
         let canvas_cosmetic_changed = !canvas_signal_changed && running_canvas != next_canvas;
 
-        // Media library + player channels (ADR-0057): a restart-class section.
-        // The live load/cue/play/vamp verbs are command-bus actions (ADR-0097),
-        // not a document-diff apply, so a change to the declared set is a
-        // controlled reset, never a silent hot-swap.
+        // Media library + player channels (ADR-0057) and the declarative VT
+        // clip fills bound to them (ADR-0100 Decision 1): a restart-class
+        // section. The live load/cue/play/vamp verbs are command-bus actions
+        // (ADR-0097) and a fill edit is job intent, but neither is applied by
+        // the config-file diff, so a change to the declared set is a controlled
+        // reset, never a silent hot-swap.
         let media_changed = running_media_library != next_media_library
-            || running_media_players != next_media_players;
+            || running_media_players != next_media_players
+            || running_media_fills != next_media_fills;
         let mut changed_sections = BTreeSet::new();
         let sectioned: [(&'static str, bool); 22] = [
             (

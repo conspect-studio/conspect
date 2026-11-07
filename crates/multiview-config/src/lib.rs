@@ -42,6 +42,7 @@ pub mod iptv;
 pub mod layout_doc;
 pub mod limits;
 pub mod media;
+pub mod media_fill;
 pub mod multicast;
 pub mod origin;
 pub mod placement;
@@ -87,6 +88,10 @@ pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
     MediaPlayerAudio,
+};
+pub use media_fill::{
+    CaptureMode, DuringRefresh, FillRefresh, FrameTiming, MediaFill, MediaFillKind, ParamValue,
+    SlotStorage, TermsAcceptance, ViewBackground, WebCaptureView,
 };
 pub use multicast::{
     classify, MulticastClass, MulticastGroup, MulticastIface, PacketCount, RejectReason,
@@ -397,6 +402,15 @@ pub struct MultiviewConfig {
     /// Bound onto the canvas by [`SourceKind::MediaPlayer`].
     #[serde(default)]
     pub media_players: Vec<MediaPlayer>,
+    /// Declarative VT clip fills (ADR-0100 Decision 1, authored as
+    /// `[[media_fill]]`): the desired state for how a media player's clip is
+    /// produced — a `web_capture` of a site template or a `url_fetch`. Each fill
+    /// binds exactly one declared [`MediaPlayer`]; a change is part of the
+    /// restart-class media section in [`ConfigDiff`]. Absent ⇒ no fills (the key
+    /// is not emitted). The job runner, clip manifest and API surface live
+    /// outside this crate.
+    #[serde(default, rename = "media_fill", skip_serializing_if = "Vec::is_empty")]
+    pub media_fills: Vec<MediaFill>,
     /// BOM weather locations (`[weather]`): the forecast/observation products
     /// the management-plane poller fetches and `weather` sources render.
     /// Absent ⇒ no locations (nothing is fetched).
@@ -731,7 +745,10 @@ impl MultiviewConfig {
     /// - every player `default` resolves to a declared asset, and every
     ///   [`SourceKind::Still`] / [`SourceKind::MediaPlayer`] binding resolves to a
     ///   declared asset / player;
-    /// - the MVP bound of **at most two** media players is respected.
+    /// - the MVP bound of **at most two** media players is respected;
+    /// - every [`MediaFill`] id is unique, its `player` is a declared player,
+    ///   at most one fill targets each player, and the fill itself passes
+    ///   [`MediaFill::validate`] (ADR-0100 Decision 1).
     fn validate_media(&self) -> Result<(), ConfigError> {
         // Asset ids (also the resolution set for `Still`/player `default` refs).
         let mut asset_ids: HashSet<&str> = HashSet::new();
@@ -772,6 +789,36 @@ impl MultiviewConfig {
                         player.id
                     )));
                 }
+            }
+        }
+
+        // Declarative VT clip fills (ADR-0100 Decision 1): ids are unique, the
+        // bound `player` is a declared player, and at most one fill targets each
+        // player (two fills would fight over one slot). Per-fill rules (kind,
+        // durations, URL, terms, alpha) live in `MediaFill::validate`.
+        let mut fill_ids: HashSet<&str> = HashSet::with_capacity(self.media_fills.len());
+        let mut filled_players: HashMap<&str, &str> =
+            HashMap::with_capacity(self.media_fills.len());
+        for fill in &self.media_fills {
+            fill.validate()?;
+            if !fill_ids.insert(fill.id.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate media fill id {:?}",
+                    fill.id
+                )));
+            }
+            if !player_ids.contains(fill.player.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "media fill {:?} references unknown media player {:?}",
+                    fill.id, fill.player
+                )));
+            }
+            if let Some(previous) = filled_players.insert(fill.player.as_str(), fill.id.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "media player {:?} is targeted by media fills {previous:?} and {:?}: at most \
+                     one fill per player (ADR-0100 decision 1)",
+                    fill.player, fill.id
+                )));
             }
         }
 
