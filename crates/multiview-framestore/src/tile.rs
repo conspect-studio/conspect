@@ -427,14 +427,24 @@ impl<T> TileStore<T> {
     /// A cheap, lock-free, wait-free read of the last-frame atomic — no ring
     /// snapshot, no allocation. `false` until the first
     /// [`publish`](TileStore::publish)/[`publish_arc`](TileStore::publish_arc),
-    /// `true` forever after (the store is newest-wins, never cleared back to
-    /// empty). The startup *prime-wait* uses this to tell a tile that has decoded
-    /// its first frame from one that is still cold, so the output clock can hold
+    /// `true` until [`clear`](Self::clear). The startup *prime-wait* uses this
+    /// to tell a tile that has decoded its first frame from one that is still cold, so the output clock can hold
     /// its very first tick until inputs are primed-or-timed-out (without ever
     /// blocking on a dead source — the caller bounds the wait).
     #[must_use]
     pub fn is_primed(&self) -> bool {
         self.last_frame_at_ns.load(Ordering::Acquire) != NEVER_PUBLISHED
+    }
+
+    /// Return to the never-published state, dropping every retained frame. For
+    /// a producer that has stopped for good: an idle source must not keep up to
+    /// [`RING_CAPACITY`](Self::RING_CAPACITY) frames alive. The sequence stays
+    /// monotonic, so a later producer's frames are never pruned by the old latch.
+    pub fn clear(&self) {
+        drop(self.slot.take());
+        self.ring.store(Arc::new(Vec::new()));
+        self.last_frame_at_ns
+            .store(NEVER_PUBLISHED, Ordering::Release);
     }
 
     /// The tile's **producer-liveness** [`SourceState`] as of `now`.

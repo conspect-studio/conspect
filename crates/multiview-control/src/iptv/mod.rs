@@ -557,9 +557,20 @@ fn now_unix() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-fn jitter() -> i64 {
+/// The base refresh interval for `config` in seconds (`[iptv]
+/// guide_refresh_minutes`, default 30 min).
+#[must_use]
+pub fn refresh_secs(config: &IptvConfig) -> i64 {
+    i64::from(config.guide_refresh_minutes()).saturating_mul(60)
+}
+
+/// Random jitter for a `base`-second interval: up to [`REFRESH_JITTER_SECS`],
+/// and never more than a sixth of the interval, so a short interval stays
+/// close to what the operator set.
+fn jitter(base: i64) -> i64 {
+    let span = REFRESH_JITTER_SECS.min(base / 6).max(1);
     let random = uuid::Uuid::new_v4().as_u128();
-    i64::try_from(random % u128::try_from(REFRESH_JITTER_SECS).unwrap_or(1)).unwrap_or(0)
+    i64::try_from(random % u128::try_from(span).unwrap_or(1)).unwrap_or(0)
 }
 
 impl IptvService {
@@ -857,7 +868,8 @@ impl IptvService {
                 continue;
             };
             cache.status.last_attempt = Some(now);
-            cache.next_due = now + REFRESH_SECS + jitter();
+            let base = refresh_secs(&publication.config);
+            cache.next_due = now + base + jitter(base);
             cache.status.next_attempt = Some(cache.next_due);
             match result {
                 Ok(None) => {
@@ -1105,6 +1117,32 @@ mod tests {
 <programme start="20261027070000 +0000" stop="20261027080000 +0000" channel="464857"><title>Live</title></programme>
 <programme start="20261027070000 +0000" stop="20261027080000 +0000" channel="1"><title>Other</title></programme></tv>"#
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_background_refresh_follows_guide_refresh_minutes() {
+        let (mut config, sources, outputs) = sample();
+        config.guide_refresh_minutes = Some(10);
+        let publication = resolve(config, &sources, &outputs);
+        let fake = Arc::new(FakeFetcher {
+            body: Mutex::new(Ok(guide_xml())),
+            calls: Mutex::new(Vec::new()),
+        });
+        let service = IptvService::new(fake.clone());
+        let policy = Arc::new(DialPolicy::allow_lan());
+        // Fetched without any guide request: the refresher runs while enabled.
+        assert_eq!(service.refresh_once(&publication, &policy, NOW).await, 1);
+        let due = service.status(&publication)[0].next_attempt.unwrap();
+        // 10 min plus at most a sixth of it as jitter.
+        assert!((NOW + 600..=NOW + 700).contains(&due), "{}", due - NOW);
+        assert_eq!(
+            service.refresh_once(&publication, &policy, NOW + 599).await,
+            0
+        );
+        assert_eq!(
+            service.refresh_once(&publication, &policy, NOW + 701).await,
+            1
+        );
     }
 
     #[tokio::test]

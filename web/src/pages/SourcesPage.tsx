@@ -47,6 +47,7 @@ import type {
   TimerFormat,
   TimerOnTarget,
   TimerTargetType,
+  SourceActivationChoice,
   WallClockChoice,
 } from '../resources/forms';
 import { CrudPage, KindCell, NameCell, RowActions } from '../resources/CrudPage';
@@ -68,6 +69,10 @@ import { tileForSource, useLiveTiles } from '../resources/useLiveTiles';
 import type { LiveTile } from '../realtime/useEngineEvents';
 import { HelpLink } from '../components/HelpLink';
 import { TileStateBadge } from '../components/TileStateBadge';
+import { SourceDemandBadge } from '../components/SourceDemandBadge';
+import { SourceLifecycleActions } from '../components/SourceLifecycleActions';
+import { useSourceStatus } from '../api/sourceStatus';
+import type { SourceDemand } from '../api/sourceStatus';
 import { useSystemCapabilities } from '../api/systemQueries';
 import { Info, TriangleAlert } from 'lucide-react';
 
@@ -89,28 +94,33 @@ function fromTransportChoice(value: RtspTransportChoice): RtspTransport {
   return value === 'auto' ? '' : value;
 }
 const WALLCLOCK_CHOICES: readonly WallClockChoice[] = ['default', 'use', 'discard'];
+const ACTIVATION_CHOICES: readonly SourceActivationChoice[] = ['always_on', 'on_demand'];
 
-/** The realtime status cell: the tile badge, or an honest "not running" dash. */
-function SourceStatusCell({ tile }: { readonly tile: LiveTile | undefined }): JSX.Element {
-  const { t } = useLingui();
-  if (tile === undefined) {
-    return (
-      <span
-        className="text-sm text-muted-foreground"
-        title={t`This source is not part of the running engine, so it has no live state. Synthetic sources join live once a tile binds them; other kinds join after a config export + restart.`}
-      >
-        <span aria-hidden="true">—</span>
-        <span className="sr-only">
-          <Trans>
-            Not in the running engine — no live state. Synthetic sources join
-            live once a tile binds them; other kinds join after a config export
-            + restart.
-          </Trans>
-        </span>
-      </span>
-    );
-  }
-  return <TileStateBadge state={tile.state} />;
+/**
+ * The status cell: the lifecycle state (idle / starting / ready / failed, with
+ * who uses the source), the tile signal state while it runs (a separate axis),
+ * and manual Start / Stop. Idle is normal: an idle source is not started and
+ * costs nothing.
+ */
+function SourceStatusCell({
+  id,
+  name,
+  tile,
+  demand,
+}: {
+  readonly id: string;
+  readonly name: string;
+  readonly tile: LiveTile | undefined;
+  readonly demand: SourceDemand | undefined;
+}): JSX.Element {
+  const running = demand !== undefined && (demand.video_running || demand.audio_running);
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1.5">
+      <SourceDemandBadge demand={demand} />
+      {running && tile !== undefined ? <TileStateBadge state={tile.state} /> : null}
+      <SourceLifecycleActions id={id} name={name} demand={demand} />
+    </span>
+  );
 }
 
 /**
@@ -695,6 +705,14 @@ function SourceAdvancedFields({
         return <Trans>Stored sidecar (not decoded per source)</Trans>;
     }
   };
+  const activationLabel = (choice: SourceActivationChoice): JSX.Element => {
+    switch (choice) {
+      case 'always_on':
+        return <Trans>Always on (started at boot)</Trans>;
+      case 'on_demand':
+        return <Trans>On demand (idle until something uses it)</Trans>;
+    }
+  };
   const wallclockLabel = (choice: WallClockChoice): JSX.Element => {
     switch (choice) {
       case 'default':
@@ -850,6 +868,16 @@ function SourceAdvancedFields({
         </div>
       ) : null}
 
+      <SelectField<SourceActivationChoice>
+        label={t`Start`}
+        value={form.activation}
+        options={ACTIVATION_CHOICES}
+        optionLabel={activationLabel}
+        onChange={(next): void => {
+          setForm({ ...form, activation: next });
+        }}
+      />
+
       <SelectField<WallClockChoice>
         label={t`Wall-clock handling`}
         value={form.wallclock}
@@ -983,6 +1011,7 @@ export function SourcesPage(): JSX.Element {
   const { t } = useLingui();
   const sources = useSources();
   const tiles = useLiveTiles();
+  const demand = useSourceStatus();
 
   const columns = (
     onEdit: (row: SourceView) => void,
@@ -1011,7 +1040,7 @@ export function SourcesPage(): JSX.Element {
       id: 'status',
       header: (): JSX.Element => (
         <span className="inline-flex items-center gap-1.5">
-          <Trans>Live status</Trans>
+          <Trans>Status</Trans>
           <HelpLink
             to="/help/concepts/resilience#tile-lifecycle"
             label={t`About tile lifecycle states`}
@@ -1020,7 +1049,12 @@ export function SourcesPage(): JSX.Element {
         </span>
       ),
       cell: (ctx): JSX.Element => (
-        <SourceStatusCell tile={tileForSource(tiles, ctx.row.original.id)} />
+        <SourceStatusCell
+          id={ctx.row.original.id}
+          name={ctx.row.original.name}
+          tile={tileForSource(tiles, ctx.row.original.id)}
+          demand={demand.data?.get(ctx.row.original.id)}
+        />
       ),
     },
     {

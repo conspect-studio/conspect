@@ -90,10 +90,30 @@ pub(crate) async fn input_jpeg(
     if let Err(err) = crate::auth::authorize_object(&principal, id) {
         return err.into_response();
     }
-    match state.preview.input_jpeg(id, PREVIEW_QUALITY) {
-        Some(bytes) => jpeg_response(bytes),
-        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    // Polling a preview is a consumer: a short lease, extended by each poll,
+    // starts an idle source off-clock. Until its first frame this answers 503
+    // with `X-Multiview-Source-State: starting` so the UI can say so.
+    let phase = state
+        .source_demand
+        .as_ref()
+        .and_then(|demand| demand.touch_preview(id));
+    if let Some(bytes) = state.preview.input_jpeg(id, PREVIEW_QUALITY) {
+        return jpeg_response(bytes);
     }
+    let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+    if let Some(phase) = phase {
+        let token = match phase {
+            crate::source_demand::SourceDemandPhase::Idle
+            | crate::source_demand::SourceDemandPhase::Starting => "starting",
+            crate::source_demand::SourceDemandPhase::Ready => "ready",
+            crate::source_demand::SourceDemandPhase::Failed => "failed",
+        };
+        response.headers_mut().insert(
+            "x-multiview-source-state",
+            header::HeaderValue::from_static(token),
+        );
+    }
+    response
 }
 
 /// `GET /api/v1/preview/inputs` — the ids of inputs that can be previewed

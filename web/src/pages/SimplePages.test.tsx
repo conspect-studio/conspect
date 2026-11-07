@@ -124,13 +124,17 @@ describe("SourcesPage honest surfaces", () => {
     );
   });
 
-  it("shows an honest dash when a source is not in the running engine", async () => {
+  it("shows an honest idle state when nothing consumes a source", async () => {
     renderSources();
     expect(await screen.findByText("Camera 1")).toBeInTheDocument();
-    // No realtime tile cache entries exist in this test, so both rows show the
-    // explained placeholder (text, not colour).
-    const dashes = screen.getAllByText("Not in the running engine", { exact: false });
-    expect(dashes.length).toBeGreaterThanOrEqual(2);
+    // Demand-driven sources: with no status yet, every row reads Idle with its
+    // explanation in text (not colour), and nothing reads as a fault.
+    const idle = screen.getAllByText("Idle");
+    expect(idle.length).toBeGreaterThanOrEqual(2);
+    expect(
+      screen.getAllByText(/not running and costs nothing/, { exact: false }).length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText(/No signal/i)).toBeNull();
   });
 
   it("renders an unknown-kind row as authored but refuses to edit it", async () => {

@@ -105,6 +105,9 @@ impl CompositedFrame {
 pub struct CompositorDrive<T> {
     /// Per-source last-good-frame stores, keyed by source id.
     stores: HashMap<String, Arc<TileStore<T>>>,
+    /// Bumped whenever any cell's binding may have changed. One integer compare
+    /// per tick tells the run its consumers changed.
+    layout_generation: u64,
     /// The active layout (hot-swappable via [`CompositorDrive::set_layout`]).
     layout: Arc<Layout>,
     /// Cell-id → layout cell index, populated via
@@ -185,6 +188,7 @@ impl<T> CompositorDrive<T> {
             .map_err(|e| Error::InvalidLayout(e.to_string()))?;
         Ok(Self {
             stores,
+            layout_generation: 0,
             layout,
             cell_index: HashMap::new(),
             canvas_color,
@@ -278,6 +282,12 @@ impl<T> CompositorDrive<T> {
         self.slate_cache.borrow().builds
     }
 
+    /// A counter that changes whenever a cell's binding may have changed.
+    #[must_use]
+    pub const fn layout_generation(&self) -> u64 {
+        self.layout_generation
+    }
+
     /// The source id currently bound to the cell named `cell_id`, if that cell is
     /// addressable and bound. Reflects any [`CompositorDrive::rebind_cell`] applied
     /// so far (introspection / control-plane echo).
@@ -329,6 +339,7 @@ impl<T> CompositorDrive<T> {
             .validate()
             .map_err(|e| Error::InvalidLayout(e.to_string()))?;
         self.layout = layout;
+        self.layout_generation = self.layout_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -407,6 +418,7 @@ impl<T> CompositorDrive<T> {
             )));
         };
         cell.source = Some(source_id.to_owned());
+        self.layout_generation = self.layout_generation.wrapping_add(1);
         Ok(())
     }
 }

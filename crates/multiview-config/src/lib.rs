@@ -83,7 +83,10 @@ pub use graphics::{
     DataKind, DataProviderKind, GraphicsBus, GraphicsChannel, GraphicsConfig, GraphicsDataSource,
     GraphicsItem, GraphicsStyle, TemplateSpec, Transition, TransitionKind,
 };
-pub use iptv::{IptvConfig, IptvEntry, IptvEntryKind, MAX_IPTV_ENTRIES};
+pub use iptv::{
+    IptvConfig, IptvEntry, IptvEntryKind, DEFAULT_GUIDE_REFRESH_MINUTES, MAX_GUIDE_REFRESH_MINUTES,
+    MAX_IPTV_ENTRIES, MIN_GUIDE_REFRESH_MINUTES,
+};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
@@ -112,8 +115,8 @@ pub use schema::{
     MetadataField, OrientationMechanism, OrientationMode, OrientationTagCapability, Output,
     OutputFlip, OutputMetadata, OutputMetadataPlan, OutputOrientation, OutputTimedMetadata,
     Overlay, PlaylistMetadata, Rect, RistAesBits, RistEncryption, RistOptions, RistPeer,
-    RistProfile, RistUrlError, Source, SourceAuth, SourceKind, SrtBackend, SrtEncryption,
-    SrtKeyLength, SrtMode, SrtOptions,
+    RistProfile, RistUrlError, Source, SourceActivation, SourceAuth, SourceKind, SrtBackend,
+    SrtEncryption, SrtKeyLength, SrtMode, SrtOptions,
 };
 pub use sync_group::{SyncGroup, SyncGroupMode, SyncMember};
 pub use tally::{BitColor, IndexCell, TallyProfile};
@@ -267,6 +270,9 @@ pub struct ControlConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemConfig {
+    /// Source demand lifecycle tuning. Absent means the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demand: Option<DemandSettings>,
     /// The NDI® SDK runtime license-acceptance gate. Absent ⇒ NDI I/O is refused
     /// (`ndi_unlicensed`) and never started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -293,6 +299,32 @@ pub struct YoutubeSystemConfig {
     /// `"yt-dlp"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yt_dlp_path: Option<String>,
+}
+
+/// `[system.demand]`: how `on_demand` sources start and stop around their
+/// consumers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandSettings {
+    /// "Close after": seconds an `on_demand` source keeps running after its
+    /// last consumer leaves. Default 30. (`linger_secs` is read as an alias.)
+    #[serde(
+        default,
+        alias = "linger_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub close_after_secs: Option<u32>,
+    /// "Start timeout": seconds a start may take to its first media before the
+    /// source reads `failed`. Default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_timeout_secs: Option<u32>,
+    /// How many sources may start at once. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_starts: Option<u32>,
+    /// How many timed-out source opens may still hold a thread before new
+    /// starts are refused. Default 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stuck_opens: Option<u32>,
 }
 
 /// The operator's NDI® SDK runtime license acceptance (ADR-0008 §7.5).

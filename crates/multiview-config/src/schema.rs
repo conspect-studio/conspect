@@ -992,7 +992,12 @@ impl SourceKind {
 
 /// A managed input: a stable `id`, a display name, the kind-specific payload,
 /// and optional auth/color overrides.
+///
+/// Serialisation is canonical: a legacy `demand = { always_on = .. }` alias is
+/// written back as the `activation` it means (review DMD-10), so a read/write
+/// round trip never changes what starts at boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 #[non_exhaustive]
 pub struct Source {
     /// Stable input id (referenced by `cells.source.input_id`).
@@ -1043,6 +1048,16 @@ pub struct Source {
     /// `multiview_control::event_automation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<SourceEventsConfig>,
+    /// When the source starts (`docs/architecture/demand-driven-sources.md`).
+    /// Absent means [`SourceActivation::AlwaysOn`]: it starts at boot whether
+    /// or not anything consumes it, exactly as before this setting existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<SourceActivation>,
+    /// Deserialise-only alias for documents written while this setting was
+    /// `demand = { always_on = bool }`. Folded into [`Source::activation`] by
+    /// [`Source::effective_activation`]; never written back.
+    #[serde(default, skip_serializing)]
+    pub demand: Option<SourceDemandPolicy>,
     /// Optional per-source **EPG** (XMLTV) acquisition block.
     ///
     /// Absent means no EPG is configured for this source (the existing,
@@ -1081,6 +1096,124 @@ impl Default for SourceEventsConfig {
             observe: true,
             automation: None,
         }
+    }
+}
+
+/// When a source starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceActivation {
+    /// Started at boot and kept running whether or not anything consumes it.
+    /// The default: every existing source behaves as it always has.
+    #[default]
+    AlwaysOn,
+    /// Idle (zero cost: no connection, decoder or thread) until something
+    /// consumes it, and stopped again `close after` its last consumer leaves.
+    OnDemand,
+}
+
+impl SourceActivation {
+    /// The stable wire token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlwaysOn => "always_on",
+            Self::OnDemand => "on_demand",
+        }
+    }
+}
+
+/// Legacy `demand = { always_on = bool }` block, accepted on read only.
+///
+/// `journal_events` is accepted and ignored: event observation now runs
+/// whenever the source is ready, so an `always_on` source keeps its history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SourceDemandPolicy {
+    /// `true` meant always on; `false` meant on demand.
+    #[serde(default)]
+    pub always_on: Option<bool>,
+    /// Ignored (see the type docs).
+    #[serde(default)]
+    pub journal_events: Option<bool>,
+}
+
+impl Serialize for Source {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.activation.is_none() && self.demand.and_then(|d| d.always_on).is_some() {
+            let mut canonical = self.clone();
+            canonical.activation = Some(self.effective_activation());
+            return Source::serialize(&canonical, serializer);
+        }
+        Source::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Source::deserialize(deserializer)
+    }
+}
+
+impl Source {
+    /// The source's activation, folding in the legacy `demand.always_on`
+    /// alias. An explicit `activation` wins.
+    #[must_use]
+    pub fn effective_activation(&self) -> SourceActivation {
+        if let Some(activation) = self.activation {
+            return activation;
+        }
+        match self.demand.and_then(|d| d.always_on) {
+            Some(false) => SourceActivation::OnDemand,
+            _ => SourceActivation::AlwaysOn,
+        }
+    }
+
+    /// Whether the source idles until consumed.
+    #[must_use]
+    pub fn is_on_demand(&self) -> bool {
+        self.effective_activation() == SourceActivation::OnDemand
+    }
+
+    /// Whether `self` and `other` define the same **media**: they differ at
+    /// most in the fields that never touch the producer —
+    /// presentation (`epg`, `playlist_metadata`) and standing policy
+    /// (`events.automation`, `activation` and its legacy `demand` alias).
+    /// This is the one definition of "media-affecting" that the control plane
+    /// (guide-only edits), the engine drain and the demand hub all share
+    /// (reviews DMD-09, R2-02, R3-02). `events.observe` stays media.
+    #[must_use]
+    pub fn same_media(&self, other: &Self) -> bool {
+        // Compare field by field; no clone of either document.
+        let observe = |s: &Self| s.events.as_ref().is_none_or(|events| events.observe);
+        let Self {
+            id,
+            display_name,
+            kind,
+            auth,
+            color_override,
+            captions,
+            gpu_pin,
+            wallclock,
+            // Presentation and policy: never media.
+            events: _,
+            activation: _,
+            demand: _,
+            epg: _,
+            playlist_metadata: _,
+        } = self;
+        *id == other.id
+            && *display_name == other.display_name
+            && *kind == other.kind
+            && *auth == other.auth
+            && *color_override == other.color_override
+            && *captions == other.captions
+            && *gpu_pin == other.gpu_pin
+            && *wallclock == other.wallclock
+            // An absent events block and a default one observe the same way;
+            // `automation` is policy (review R2-02).
+            && observe(self) == observe(other)
     }
 }
 

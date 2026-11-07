@@ -464,6 +464,7 @@ async fn serve_control_plane(
             program_audio,
             webrtc_registry,
             &egress_registry,
+            multiview_cli::source_demand::installed_control_demand(),
         );
         (unified.whep, unified.whip, unified.whep_output)
     };
@@ -569,8 +570,7 @@ async fn run_pipeline_until_ctrl_c(
     // below calls `pipeline.set_program_audio_preview`). Without that feature the
     // binding is never mutated, so the `mut` is conditional to stay
     // `unused_mut`-clean on the `ffmpeg`/`rist`-only feature legs.
-    #[cfg(feature = "webrtc-native")] mut pipeline: multiview_cli::pipeline::Pipeline,
-    #[cfg(not(feature = "webrtc-native"))] pipeline: multiview_cli::pipeline::Pipeline,
+    mut pipeline: multiview_cli::pipeline::Pipeline,
     start: &multiview_cli::boot::StartConfig,
     plane: &multiview_cli::licence::EntitlementPlane,
     config_path: &Path,
@@ -641,6 +641,22 @@ async fn run_pipeline_until_ctrl_c(
         let live_apply = live_apply.with_audio_routing(
             multiview_cli::audio::routing_live_capability(pipeline.audio_route_slot()),
         );
+        // Demand (docs/architecture/demand-driven-sources.md): build the manager
+        // before the hub and drain so live edits catalogue instead of spawning,
+        // and every consumer below takes leases from the same manager.
+        let demand = pipeline.demand();
+        // Every source lifecycle transition rides the existing event path as
+        // `input.lifecycle` (topic `inputs`). The publisher is a bounded
+        // drop-oldest ring, so a slow subscriber never stalls the manager.
+        {
+            let events = Arc::clone(&publisher);
+            demand.set_transition_sink(Arc::new(move |event| {
+                events.publish_event(multiview_cli::source_demand::lifecycle_event(event));
+            }));
+        }
+        multiview_cli::source_demand::install_control_demand(Some(Arc::new(
+            multiview_cli::source_demand::ControlDemand::new(demand, pipeline.catalogue()),
+        )));
         let (handle, command_rx, hub, watch, persist) = serve_control_plane(
             &cfg.listen,
             start,
@@ -679,7 +695,7 @@ async fn run_pipeline_until_ctrl_c(
         // The live overlay seam (ADR-W022) rides the same variant; the
         // live-source seam (ADR-W018) rides both.
         #[cfg(feature = "overlay")]
-        let drain: ControlDrain = Box::new(control::command_drain_with_seams(
+        let drain: ControlDrain = Box::new(control::command_drain_with_demand(
             command_rx,
             config.clone(),
             Arc::clone(&publisher),
@@ -691,9 +707,10 @@ async fn run_pipeline_until_ctrl_c(
             hub.handle(),
             pipeline.player_mailboxes(),
             pipeline.display_layout_slot(),
+            pipeline.drain_demand(),
         ));
         #[cfg(not(feature = "overlay"))]
-        let drain: ControlDrain = Box::new(control::command_drain_with_audio_and_players(
+        let drain: ControlDrain = Box::new(control::command_drain_with_audio_players_and_demand(
             command_rx,
             config.clone(),
             Arc::clone(&publisher),
@@ -701,6 +718,7 @@ async fn run_pipeline_until_ctrl_c(
             hub.handle(),
             pipeline.player_mailboxes(),
             pipeline.display_layout_slot(),
+            pipeline.drain_demand(),
         ));
         (Some(handle), drain, Some(hub), Some(watch), Some(persist))
     } else {

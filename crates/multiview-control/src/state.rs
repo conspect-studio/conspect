@@ -729,6 +729,9 @@ pub struct AppState {
     pub preview: crate::preview::SharedPreview,
     /// Optional read-only source-event adapter; absent until wired by the binary.
     pub source_events: Option<crate::source_events::SharedSourceEvents>,
+    /// Source demand status and preview leases. `None` on run paths with no
+    /// demand manager: every source then reports as running at boot did.
+    pub source_demand: Option<crate::source_demand::SharedSourceDemand>,
     /// Optional operator test-injection adapter (ADR-0183 item 5); absent
     /// until wired by the binary. Administer-only; never a general evidence
     /// submission surface.
@@ -1026,6 +1029,7 @@ impl AppState {
             ack_clock: Arc::new(system_ack_clock),
             preview: crate::preview::no_preview(),
             source_events: None,
+            source_demand: None,
             source_event_test_injector: None,
             automation: None,
             whep: crate::preview::no_whep(),
@@ -1312,6 +1316,16 @@ impl AppState {
         provider: crate::source_events::SharedSourceEvents,
     ) -> Self {
         self.source_events = Some(provider);
+        self
+    }
+
+    /// Attach the source demand provider.
+    #[must_use]
+    pub fn with_source_demand(
+        mut self,
+        provider: crate::source_demand::SharedSourceDemand,
+    ) -> Self {
+        self.source_demand = Some(provider);
         self
     }
 

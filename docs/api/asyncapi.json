@@ -233,6 +233,9 @@
                   "$ref": "#/components/schemas/InputStreams"
                 },
                 {
+                  "$ref": "#/components/schemas/InputLifecycle"
+                },
+                {
                   "$ref": "#/components/schemas/JobProgress"
                 },
                 {
@@ -409,6 +412,15 @@
         },
         "summary": "An input source transitioned connection state (input.connection on topic `inputs`).",
         "title": "Input source connection state change"
+      },
+      "InputLifecycle": {
+        "contentType": "application/json",
+        "name": "InputLifecycle",
+        "payload": {
+          "$ref": "#/components/schemas/InputLifecycle"
+        },
+        "summary": "A source moved between idle / starting / ready / failed (input.lifecycle on topic `inputs`). Not the tile signal state.",
+        "title": "Source lifecycle transition"
       },
       "InputStreams": {
         "contentType": "application/json",
@@ -1323,6 +1335,74 @@
         "required": [
           "input_id",
           "state"
+        ],
+        "type": "object"
+      },
+      "InputLifecycle": {
+        "description": "Data body of the `input.lifecycle` event.",
+        "properties": {
+          "at_ms": {
+            "description": "Unix milliseconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "from": {
+            "enum": [
+              "idle",
+              "starting",
+              "ready",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "generation": {
+            "description": "Start generation; increments on every start from idle.",
+            "format": "uint64",
+            "type": "integer"
+          },
+          "lease_holders": {
+            "items": {
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "label"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Operator-safe reason.",
+            "type": "string"
+          },
+          "source_id": {
+            "description": "The source id (the authorization object).",
+            "type": "string"
+          },
+          "to": {
+            "enum": [
+              "idle",
+              "starting",
+              "ready",
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "generation",
+          "from",
+          "to",
+          "reason",
+          "at_ms"
         ],
         "type": "object"
       },

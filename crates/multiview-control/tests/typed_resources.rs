@@ -1050,3 +1050,64 @@ async fn epg_edit_combined_with_a_media_change_still_requires_restart() {
         "a media-identity change must not be masked by an accompanying epg edit"
     );
 }
+
+/// Review R2-01: a generic PUT that changes only `events.automation` must
+/// reach the engine as an `UpsertSource` (the hub applies it as pins only),
+/// not be swallowed as a guide-only edit; a guide edit still enqueues nothing.
+#[tokio::test]
+async fn an_automation_only_put_reaches_the_engine_as_a_policy_update() {
+    let mut h = harness();
+    let resp = send(
+        &h.router,
+        post_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            &json!({ "name": "Bars", "body": { "id": "cam1", "kind": "bars" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let _ = h.commands.try_drain();
+    let armed = json!({ "id": "cam1", "kind": "bars", "events": { "automation": {
+        "armed": true, "on_break_start": { "action": "swap_cell", "target": "slate" } } } });
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            Some("W/\"1\""),
+            &json!({ "name": "Bars", "body": armed }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(apply_header(&resp), "live");
+    let drained = h.commands.try_drain();
+    assert!(
+        drained.iter().any(|c| matches!(
+            c,
+            multiview_control::Command::UpsertSource { source, .. }
+                if source.events.as_ref().and_then(|e| e.automation.as_ref()).is_some_and(|r| r.armed)
+        )),
+        "an automation edit must submit the new policy, got {drained:?}"
+    );
+    // A guide-only edit on top still submits nothing.
+    let mut guided = armed.clone();
+    guided["playlist_metadata"] = json!({ "name": "Bars" });
+    let resp = send(
+        &h.router,
+        put_json(
+            "/api/v1/sources/cam1",
+            OPERATOR_TOKEN,
+            Some("W/\"2\""),
+            &json!({ "name": "Bars", "body": guided }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        h.commands.try_drain().len(),
+        0,
+        "guide edits submit nothing"
+    );
+}

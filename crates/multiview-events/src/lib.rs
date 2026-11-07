@@ -46,11 +46,11 @@ pub use event::{
     DeviceCapabilities, DeviceDiscovered, DeviceError, DeviceMode, DeviceRemoved, DeviceState,
     DeviceStatus, DeviceStreamRole, DeviceStreamStatus, DeviceSync, DeviceSyncSummary, Event,
     FailureStage, GpuMetrics, GpuVendor, GraphicsChannelEvent, HealthWarning, ImpactClass,
-    InputConnection, InputStreams, JobProgress, LifecycleState, MediaPlayerEvent, MediaPlayerState,
-    ModePhase, OutputRunState, OutputStatus, RistLinkRole, RistLinkStats, SalvoEvent, SalvoPhase,
-    ShedLoad, ShedReason, ShedScope, SyncCapability, SyncChange, SyncGroupSkew, SystemMetrics,
-    TallyEvent, TallyTarget, TileSnapshotEntry, TileState, TilesSnapshot, TimingStatus,
-    WarningCode, WarningSeverity,
+    InputConnection, InputLifecycle, InputStreams, JobProgress, LeaseHolder, LifecycleState,
+    MediaPlayerEvent, MediaPlayerState, ModePhase, OutputRunState, OutputStatus, RistLinkRole,
+    RistLinkStats, SalvoEvent, SalvoPhase, ShedLoad, ShedReason, ShedScope, SourceLifecycle,
+    SyncCapability, SyncChange, SyncGroupSkew, SystemMetrics, TallyEvent, TallyTarget,
+    TileSnapshotEntry, TileState, TilesSnapshot, TimingStatus, WarningCode, WarningSeverity,
 };
 pub use ordering::{Accepted, TopicCursor};
 pub use seq::{Seq, SeqCounter};

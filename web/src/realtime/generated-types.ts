@@ -313,6 +313,24 @@ export interface InputConnection {
   readonly state: LifecycleState;
 }
 
+/** Data body of the `input.lifecycle` event. */
+export interface InputLifecycle {
+  /** Unix milliseconds. */
+  readonly at_ms: number;
+  readonly from: "idle" | "starting" | "ready" | "failed";
+  /** Start generation; increments on every start from idle. */
+  readonly generation: number;
+  readonly lease_holders?: readonly {
+    readonly kind: string;
+    readonly label: string;
+  }[];
+  /** Operator-safe reason. */
+  readonly reason: string;
+  /** The source id (the authorization object). */
+  readonly source_id: string;
+  readonly to: "idle" | "starting" | "ready" | "failed";
+}
+
 /** Data body of the `input.streams` event: an input's full elementary-stream inventory (RT-3). */
 export interface InputStreams {
   /** The owning input's configured source id. */

@@ -25,6 +25,10 @@ import { ConnectionStatus } from '../components/ConnectionStatus';
 import { HelpLink } from '../components/HelpLink';
 import { PageHeader } from '../components/PageHeader';
 import { TileStateBadge } from '../components/TileStateBadge';
+import { SourceDemandBadge } from '../components/SourceDemandBadge';
+import { SourceStartingNotice } from '../preview/SourceStartingNotice';
+import { useSourceStatus } from '../api/sourceStatus';
+import type { SourceDemand } from '../api/sourceStatus';
 import { Button } from '../components/ui/button';
 import { Card, CardContent } from '../components/ui/card';
 import {
@@ -145,6 +149,7 @@ export function MonitoringPage(): JSX.Element {
   const capabilities = usePreviewCapabilities();
   const inputIds = usePreviewInputIds();
   const tiles = useLiveTiles();
+  const demand = useSourceStatus();
   const outputs = useOutputs();
   const fidelity = programFidelity(capabilities.data);
   const playbackPaths = hlsPlaybackPaths(outputs.data ?? []);
@@ -246,6 +251,8 @@ export function MonitoringPage(): JSX.Element {
                 key={id}
                 id={id}
                 tile={tiles.get(id)}
+                demand={demand.data?.get(id)}
+                demandKnown={demand.data !== undefined}
                 capabilities={capabilities.data}
                 open={focusedInput === id}
                 focusReady={readyInput === id}
@@ -291,6 +298,8 @@ export function MonitoringPage(): JSX.Element {
 function InputThumbnail(props: {
   readonly id: string;
   readonly tile: LiveTile | undefined;
+  readonly demand: SourceDemand | undefined;
+  readonly demandKnown: boolean;
   readonly capabilities: ReturnType<typeof usePreviewCapabilities>['data'];
   readonly open: boolean;
   readonly focusReady: boolean;
@@ -299,16 +308,35 @@ function InputThumbnail(props: {
   readonly onOpenChange: (open: boolean) => void;
 }): JSX.Element {
   const { t } = useLingui();
-  const src = useJpegPreview(`/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`, 1000, !props.open);
+  // A thumbnail is a viewer, not a consumer: it polls only while something
+  // else already runs the source, so opening Monitoring never starts 500
+  // sources. Opening the preview dialog is the explicit consumer.
+  const running =
+    !props.demandKnown ||
+    (props.demand !== undefined && props.demand.video_running && props.demand.consumers.length > 0);
+  const src = useJpegPreview(
+    `/api/v1/preview/inputs/${encodeURIComponent(props.id)}.jpg`,
+    1000,
+    !props.open && running,
+  );
   return (
     <li>
       <Card className="overflow-hidden">
         <div className="relative">
-          <PreviewImage
-            src={src}
-            alt={t`Preview of input ${props.id}`}
-            className="aspect-video w-full bg-black object-contain"
-          />
+          {running ? (
+            <PreviewImage
+              src={src}
+              alt={t`Preview of input ${props.id}`}
+              className="aspect-video w-full bg-black object-contain"
+            />
+          ) : (
+            <div
+              className="flex aspect-video w-full items-center justify-center bg-muted p-2 text-center text-xs text-muted-foreground"
+              data-testid="input-idle"
+            >
+              <Trans>Idle: not running because nothing consumes it. Open the preview to start it.</Trans>
+            </div>
+          )}
           <Button
             type="button"
             variant="secondary"
@@ -327,7 +355,8 @@ function InputThumbnail(props: {
             {props.id}
           </code>
           <div className="flex items-center gap-2">
-            {props.tile !== undefined ? <TileStateBadge state={props.tile.state} /> : null}
+            {props.demandKnown ? <SourceDemandBadge demand={props.demand} /> : null}
+            {props.tile !== undefined && running ? <TileStateBadge state={props.tile.state} /> : null}
             <SourceEventsButton id={props.id} name={props.id} />
           </div>
         </CardContent>
@@ -340,6 +369,7 @@ function InputThumbnail(props: {
               <Trans>Preview — input {props.id}</Trans>
             </DialogTitle>
           </DialogHeader>
+          {props.open ? <SourceStartingNotice id={props.id} /> : null}
           {props.open && props.focusReady ? (
             <PreviewSurface
               scope="input"

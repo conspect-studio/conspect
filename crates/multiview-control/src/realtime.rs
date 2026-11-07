@@ -1178,7 +1178,8 @@ impl SessionStream {
             return None;
         }
         let seq = self.issue_seq();
-        let event = (*seq_event.event).clone();
+        let mut event = (*seq_event.event).clone();
+        self.redact_embedded_objects(&mut event);
         let topic = topic_for_event(&event);
         // Resource scope (the tile/input/output id) the client keys this delta
         // by — read before the event is moved into the envelope.
@@ -1229,6 +1230,25 @@ impl SessionStream {
     /// allocation, never touches the engine publish path (invariant #10).
     fn event_in_scope(&self, event: &Event) -> bool {
         scope_permits(&self.scopes(), event.authz_scope())
+    }
+
+    /// Hide identities an event names besides the object it is authorized
+    /// under (review DMD-04): an `input.lifecycle` holder can name another
+    /// source (an automation pin's owner), redacted unless that source is in
+    /// scope. Live and replayed deltas both pass through here.
+    fn redact_embedded_objects(&self, event: &mut Event) {
+        if let Event::InputLifecycle(lifecycle) = event {
+            for holder in &mut lifecycle.lease_holders {
+                if holder
+                    .object_id
+                    .as_deref()
+                    .is_some_and(|object| !self.id_in_object_scope(object))
+                {
+                    crate::source_demand::RESTRICTED_LABEL.clone_into(&mut holder.label);
+                    holder.object_id = None;
+                }
+            }
+        }
     }
 
     /// Whether an object `id` is visible to this session's principal (BOLA
@@ -1361,7 +1381,9 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // Both input connection state AND elementary-stream inventory deltas ride
         // the existing `inputs` lane (RT-3: `input.streams` is a delta on
         // re-probe / PMT-version bump, not a new topic).
-        Event::InputConnection(_) | Event::InputStreams(_) => Topic::Inputs,
+        Event::InputConnection(_) | Event::InputStreams(_) | Event::InputLifecycle(_) => {
+            Topic::Inputs
+        }
         Event::JobProgress(_) => Topic::Jobs,
         // Broadcast monitoring/control events ride their own topics so a client
         // can subscribe to the alarm or tally firehose independently.

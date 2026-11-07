@@ -401,6 +401,8 @@ impl PreviewMediaSource for SlotMediaSource {
 /// A live WHEP egress session's media sources, kept alive by the driver so its
 /// `pump_once` runs each tick and its feeds are drained by the transport.
 struct LiveSession {
+    /// Holds the source's demand while the session lives. Dropped with it.
+    _demand: Option<Box<dyn multiview_control::SourceDemandLease>>,
     media: Arc<SlotMediaSource>,
     scope_label: String,
     /// The session's **own** program-PCM ring (when it negotiated Opus AND this
@@ -426,6 +428,8 @@ pub struct CliWhepProvider {
     state: Arc<Mutex<DriverState>>,
     program: ProgramSlot,
     stores: SharedStores,
+    /// Leases a source's demand for an input session.
+    demand: Option<multiview_control::SharedSourceDemand>,
     /// The shared **program-audio preview tap** (ADR-P006 audio): the single drop-
     /// oldest ring the bake consumer pushes post-loudnorm program PCM into. The
     /// driver drains it once per tick and fans each block to every live audio
@@ -476,6 +480,7 @@ impl CliWhepProvider {
             Err(err) => {
                 tracing::warn!(%err, "WHEP egress endpoint bind failed; preview sheds to JPEG");
                 return Self {
+                    demand: None,
                     egress: Arc::new(WhepEgress::new()),
                     state,
                     program,
@@ -518,6 +523,7 @@ impl CliWhepProvider {
             state,
             program,
             stores,
+            demand: None,
             program_audio,
             available: true,
         }
@@ -538,15 +544,27 @@ impl CliWhepProvider {
         program_audio: Option<crate::preview::ProgramAudioSlot>,
     ) -> Self {
         let state = Arc::new(Mutex::new(DriverState::default()));
-        spawn_encode_pump(Arc::clone(&state), program_audio.clone());
+        spawn_encode_pump(
+            Arc::clone(&state),
+            program_audio.clone(),
+            Arc::clone(&egress),
+        );
         Self {
             egress,
             state,
             program,
             stores,
+            demand: None,
             program_audio,
             available: true,
         }
+    }
+
+    /// Take a source demand lease for each input session.
+    #[must_use]
+    pub fn with_demand(mut self, demand: Option<multiview_control::SharedSourceDemand>) -> Self {
+        self.demand = demand;
+        self
     }
 
     /// The native egress transport this provider negotiates against — handed to the
@@ -622,9 +640,17 @@ impl WhepProvider for CliWhepProvider {
         let session_id = answer.transport.session_id.as_str().to_owned();
         // Keep the media source alive + pumped by the driver for the session's life.
         if let Ok(mut state) = self.state.lock() {
+            let demand = match scope {
+                WhepScope::Input(id) => self
+                    .demand
+                    .as_ref()
+                    .and_then(|demand| demand.preview_lease(id, &session_id)),
+                _ => None,
+            };
             state.sessions.insert(
                 session_id.clone(),
                 LiveSession {
+                    _demand: demand,
                     media,
                     scope_label: scope.label(),
                     audio_tap,
@@ -667,10 +693,34 @@ impl WhepProvider for CliWhepProvider {
 fn spawn_encode_pump(
     state: Arc<Mutex<DriverState>>,
     program_audio: Option<crate::preview::ProgramAudioSlot>,
+    egress: Arc<WhepEgress>,
 ) {
     std::thread::Builder::new()
         .name("whep-encode-pump".to_owned())
         .spawn(move || loop {
+            // Reap sessions whose peer is gone, releasing the source they held
+            // (a closed tab that sent no DELETE must not pin a decode forever).
+            let reaped: Vec<LiveSession> = state.lock().map_or_else(
+                |_| Vec::new(),
+                |mut state| {
+                    let dead: Vec<String> = state
+                        .sessions
+                        .keys()
+                        .filter(|id| {
+                            egress
+                                .session_state(&SessionId::new(id.as_str()))
+                                .is_none_or(|s| {
+                                    s == multiview_preview::whep::transport::SessionState::Closed
+                                })
+                        })
+                        .cloned()
+                        .collect();
+                    dead.iter()
+                        .filter_map(|id| state.sessions.remove(id))
+                        .collect()
+                },
+            );
+            drop(reaped);
             if let Ok(state) = state.lock() {
                 fan_program_audio(program_audio.as_ref(), state.sessions.values());
                 for session in state.sessions.values() {
@@ -1048,6 +1098,7 @@ mod tests {
         use multiview_control::{WhepProvider, WhepReject, WhepScope};
         use std::sync::{Arc, Mutex};
         let provider = super::CliWhepProvider {
+            demand: None,
             egress: Arc::new(WhepEgress::new()),
             state: Arc::new(Mutex::new(super::DriverState::default())),
             program: Arc::new(multiview_framestore::SwapCell::new(None)),
@@ -1329,6 +1380,7 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
 
     fn audio_session(tap: ProgramAudioSlot) -> LiveSession {
         LiveSession {
+            _demand: None,
             media: std::sync::Arc::new(program_media(true, Some(tap.clone()))),
             scope_label: "program".to_owned(),
             audio_tap: Some(tap),
@@ -1337,6 +1389,7 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
 
     fn video_only_session() -> LiveSession {
         LiveSession {
+            _demand: None,
             media: std::sync::Arc::new(program_media(false, None)),
             scope_label: "program".to_owned(),
             audio_tap: None,

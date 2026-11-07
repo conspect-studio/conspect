@@ -92,12 +92,14 @@ pub mod alarm;
 pub mod clock;
 pub mod cycle;
 pub mod degrade;
+pub mod demand;
 pub mod drive;
 pub mod epoch;
 pub mod error;
 pub mod ha;
 pub mod heads;
 pub mod isolation;
+pub mod lifecycle;
 pub mod migration;
 pub mod placement;
 pub mod probe;
@@ -122,6 +124,13 @@ pub use alarm::{
 pub use clock::{ManualTimeSource, MonotonicTimeSource, OutputClock, Tick, TimeSource};
 pub use cycle::{FreezeTile, RoundRobin};
 pub use degrade::{ControlLoop, ControlStep};
+pub use demand::{
+    ActivityMap, ActivityReader, ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig,
+    DemandLease, DemandManager, DemandPhase, DemandStatus, KindBounds, PinKind, RailDriver,
+    RailFailure, Rails, SetItem, SourceActivity, StartingPhase, TransitionEvent, TransitionSink,
+    DEFAULT_CLOSE_AFTER, DEFAULT_MAX_CONCURRENT_STARTS, DEFAULT_START_TIMEOUT,
+    MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
+};
 pub use drive::{CompositedFrame, CompositorDrive};
 pub use epoch::{
     clock_quality_of, clock_source_of, EpochAnchor, EpochPolicy, EpochSampler, EpochSamplerConfig,
@@ -137,6 +146,9 @@ pub use heads::{HeadBinding, HeadPlacement, WallComposition};
 pub use isolation::{
     event_stream, EnginePublisher, EventStream, EventSubscription, LatestState, RecvError,
     SeqEvent, TryRecvError,
+};
+pub use lifecycle::{
+    OwnerFuture, OwnerRails, ResourceScope, ScopeKind, ScopeRegistry, SourceOwner,
 };
 pub use migration::{
     drain_stop, validate_migration, KeepaliveSink, LoadSnapshot, MigrationOutcome,

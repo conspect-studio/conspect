@@ -46,6 +46,9 @@ use crate::pipeline::{next_reconnect_attempt, reconnect_backoff, sleep_interrupt
 /// drop, never grow" rule). Mirrors the `96_000` the program-bus unit tests use.
 const STORE_CAPACITY_FRAMES: usize = 96_000;
 
+/// Half a second of cushion for a live source with no video to lock to.
+const AUDIO_ONLY_PREBUFFER_FRAMES: usize = 24_000;
+
 /// The canonical program audio format every per-source store is built at: 48 kHz
 /// stereo `f32`. Every source's decode resamples to this BEFORE publishing, so
 /// the [`ProgramBus`](multiview_audio::ProgramBus) mixes a single uniform format
@@ -89,6 +92,17 @@ pub(crate) fn new_live_store() -> Arc<AudioStore> {
     Arc::new(AudioStore::timeline(
         canonical_format(),
         multiview_audio::store::TIMELINE_CAPACITY,
+    ))
+}
+
+/// A store for a live source running **audio only**. No video stamps a timeline
+/// for a [`timeline`](AudioStore::timeline) store, and that store plays nothing
+/// without an anchor, so this one buffers on its own clock instead.
+pub(crate) fn new_audio_only_store() -> Arc<AudioStore> {
+    Arc::new(AudioStore::live(
+        canonical_format(),
+        STORE_CAPACITY_FRAMES,
+        AUDIO_ONLY_PREBUFFER_FRAMES,
     ))
 }
 
@@ -181,6 +195,9 @@ pub struct AudioControlHandle {
     /// the bake consumer (after it changed the bus); read by the control side.
     channels:
         Arc<std::sync::RwLock<std::collections::HashMap<String, multiview_audio::RoutePoint>>>,
+    /// Publishes the audio-route consumers whenever a routing document applies
+    /// live, so a newly routed source starts and an unrouted one stops.
+    route_demand: Option<multiview_engine::ConsumerSet<multiview_compositor::pipeline::Nv12Image>>,
     /// Every source id that exists on this run, with or without audio: what a
     /// routing document may name and still apply live (an audio-free source
     /// mixes as silence — a restart would not change that).
@@ -188,6 +205,9 @@ pub struct AudioControlHandle {
     /// The latest routing document, so a source joining later rides its gain.
     routing: Arc<multiview_framestore::SwapCell<Option<Arc<multiview_config::AudioRouting>>>>,
     sample_rate: u32,
+    /// Sources demand started on a run with no audio routes. Such a run mixes
+    /// every source at unity, so these join at unity rather than zero.
+    unrouted_unity: Arc<multiview_framestore::SwapCell<Arc<std::collections::HashSet<String>>>>,
     /// Output tracks are pinned to source ids at startup until the discrete
     /// encoder's route table accepts live updates.
     declared_tracks: std::collections::HashMap<String, usize>,
@@ -270,7 +290,11 @@ impl AudioControlHandle {
             sources: shared_map(sources),
             channels: Arc::new(std::sync::RwLock::new(channels)),
             known: shared_map(known),
+            route_demand: None,
             routing: Arc::new(multiview_framestore::SwapCell::empty()),
+            unrouted_unity: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             sample_rate: AudioFormat::CANONICAL_RATE,
             declared_tracks: std::collections::HashMap::new(),
             live_track_inputs: None,
@@ -304,6 +328,17 @@ impl AudioControlHandle {
             }
             next
         });
+        self
+    }
+
+    /// Publish the audio-route consumers through `set` on every live routing
+    /// change.
+    #[must_use]
+    pub fn with_route_demand(
+        mut self,
+        set: Option<multiview_engine::ConsumerSet<multiview_compositor::pipeline::Nv12Image>>,
+    ) -> Self {
+        self.route_demand = set;
         self
     }
 
@@ -505,12 +540,34 @@ impl AudioControlHandle {
             ));
         }
         self.pending_gains.store(Some(Arc::new(gains)));
+        if let Some(set) = &self.route_demand {
+            set.publish(crate::source_demand::audio_route_items(Some(routing)));
+        }
         true
+    }
+
+    /// Let `id` join at unity while no routing is declared, matching what a
+    /// source bound at startup gets.
+    pub(crate) fn allow_unrouted_unity(&self, id: &str) {
+        if !self.unrouted_unity.load().contains(id) {
+            self.unrouted_unity.rcu(|current| {
+                let mut next = current.as_ref().clone();
+                next.insert(id.to_owned());
+                next
+            });
+        }
     }
 
     /// The gain a source joining the bus now rides: the latest routing's, or
     /// zero when no routing mixes it (never put unrouted audio on air).
     fn joining_gain(&self, id: &str) -> f64 {
+        let routed = self
+            .routing
+            .load()
+            .is_some_and(|routing| !routing.routes.is_empty());
+        if !routed && self.unrouted_unity.load().contains(id) {
+            return 1.0;
+        }
         self.routing
             .load()
             .filter(|routing| !routing.routes.is_empty())
@@ -1023,6 +1080,8 @@ pub(crate) struct AudioIngestPlan {
     pub(crate) lifecycle: u64,
     /// Startup audio is not gated by a live-edit replacement marker.
     pub(crate) anchor_floor: u64,
+    /// No video rail runs: never wait for a video fetcher or anchor.
+    pub(crate) audio_only: bool,
 }
 
 /// How long [`await_shared_url`] waits for the video's fetcher.
@@ -1091,6 +1150,9 @@ fn await_shared_url(
 /// pace nor stall the output clock (invariant #1) nor back-pressure the engine
 /// (invariant #10); a wedged libav network call is bounded by the supervisor's
 /// detach-on-grace teardown, exactly as for video.
+#[allow(clippy::too_many_lines)]
+// reason: one supervised reconnect bracket; the audio-only branch added here
+// keeps the decode choice next to the loop that owns it.
 pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop: &AtomicBool) {
     // Name this source on every line the audio thread emits: our own (the span)
     // and libav's synchronous lines (the thread-local resource context the log
@@ -1128,30 +1190,32 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // Prefer the video's fetched copy (one fetch per source: audio and video
         // read the same segments). Fall back to opening the origin when video is
         // not on the fetcher.
-        let shared =
-            if plan.live && is_hls && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none() {
-                // Review R3-02: a non-allocating, lifecycle-checked lookup. A
-                // worker whose lifecycle has already been retired (a race with
-                // `remove_live_lifecycle` between the loop-top check above and
-                // this lookup) must never recreate the slot that removal just
-                // dropped — `None` here means "already gone", not "not yet
-                // created", so it is read as no video anchor, never allocated.
-                let slot =
-                    crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle);
-                await_shared_url(
-                    || crate::hls_fetch::shared_url(&plan.id, plan.lifecycle),
-                    || {
-                        slot.as_ref()
-                            .and_then(|slot| slot.load())
-                            .filter(|a| a.raw_pts0_ns.is_some() && a.generation > plan.anchor_floor)
-                            .map(|a| a.generation)
-                    },
-                    stop,
-                    SharedUrlWait::DEFAULT,
-                )
-            } else {
-                None
-            };
+        let shared = if plan.live
+            && is_hls
+            && !plan.audio_only
+            && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none()
+        {
+            // Review R3-02: a non-allocating, lifecycle-checked lookup. A
+            // worker whose lifecycle has already been retired (a race with
+            // `remove_live_lifecycle` between the loop-top check above and
+            // this lookup) must never recreate the slot that removal just
+            // dropped — `None` here means "already gone", not "not yet
+            // created", so it is read as no video anchor, never allocated.
+            let slot = crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle);
+            await_shared_url(
+                || crate::hls_fetch::shared_url(&plan.id, plan.lifecycle),
+                || {
+                    slot.as_ref()
+                        .and_then(|slot| slot.load())
+                        .filter(|a| a.raw_pts0_ns.is_some() && a.generation > plan.anchor_floor)
+                        .map(|a| a.generation)
+                },
+                stop,
+                SharedUrlWait::DEFAULT,
+            )
+        } else {
+            None
+        };
         let shared_fetch = shared.is_some();
         let pinned = if shared.is_some() {
             shared
@@ -1201,6 +1265,13 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
                     &plan.id,
                 );
             }
+        } else if plan.live {
+            multiview_audio::store::audio_decode_loop_live(
+                location,
+                ChannelLayout::Stereo,
+                store,
+                stop,
+            );
         } else {
             audio_decode_loop(location, ChannelLayout::Stereo, store, stop);
         }

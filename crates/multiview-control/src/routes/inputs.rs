@@ -82,7 +82,8 @@ fn inventory_from_snapshot(
             (status = 200, description = "The input's elementary-stream inventory.", body = crate::openapi_schemas::StreamInventoryDoc),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to read this input.", body = crate::problem::Problem),
-            (status = 404, description = "No such input, or it has not been probed yet.", body = crate::problem::Problem),
+            (status = 404, description = "No such input.", body = crate::problem::Problem),
+            (status = 409, description = "Not probed yet: the input is idle (nothing consumes it) or still starting. Its streams are read when a consumer starts it; preview it to start it.", body = crate::problem::Problem),
         ),
     )
 )]
@@ -96,16 +97,39 @@ pub(crate) async fn get_input_streams(
     // Read the latest cached snapshot the engine published (wait-free, off the
     // output-clock thread). An absent snapshot means the engine has not begun
     // publishing — the input is simply not-yet-probed, a `404`, never a panic.
-    let snapshot = state
+    let inventory = state
         .engine
         .state
         .latest()
         .ok_or_else(|| ControlError::NotFound {
             kind: INPUT_KIND,
             id: id.clone(),
-        })?;
-    let inventory = inventory_from_snapshot(&snapshot, &id)?;
-    Ok((StatusCode::OK, Json(inventory)).into_response())
+        })
+        .and_then(|snapshot| inventory_from_snapshot(&snapshot, &id));
+    match inventory {
+        Ok(inventory) => Ok((StatusCode::OK, Json(inventory)).into_response()),
+        // A demand-managed source that is not running has never been probed:
+        // say so, rather than an empty or stale inventory posing as real.
+        Err(ControlError::NotFound { .. }) if not_probed(&state, &id) => Ok(
+            crate::problem::Problem::new(409, "not-probed", "Input not probed yet")
+                .with_detail(
+                    "This input is not running because nothing consumes it, so its streams have \
+                     not been read. Preview it (or bind it) to start it; the inventory is read \
+                     once it is running.",
+                )
+                .into_response(),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `id` is a demand-managed source with no running video rail.
+fn not_probed(state: &AppState, id: &str) -> bool {
+    state
+        .source_demand
+        .as_ref()
+        .is_some_and(|demand| !demand.status(id).video_running)
+        && crate::routes::sources::accepted_source_exists(state, id)
 }
 
 #[cfg(test)]
