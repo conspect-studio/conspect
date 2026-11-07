@@ -757,6 +757,13 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<LogoCache>>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Install `cache` as the one serving `dir` (integration-test seam: lets a test
+/// drive the route over a scripted transport instead of the network).
+#[doc(hidden)]
+pub fn register(dir: &Path, cache: Arc<LogoCache>) {
+    lock(registry()).insert(dir.to_owned(), cache);
+}
+
 /// Serve the logo at `url` from the cache rooted at `dir` (the catalogue's
 /// `logos/` directory), over the shared screened fetcher.
 pub async fn serve(state: &AppState, dir: &Path, url: &str) -> Logo {
