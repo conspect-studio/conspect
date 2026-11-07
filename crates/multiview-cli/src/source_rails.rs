@@ -363,8 +363,14 @@ impl RailDriver<Nv12Image> for SourceRails {
     }
 
     fn finite(&self, id: &str) -> bool {
-        self.entry(id)
-            .is_some_and(|entry| matches!(entry.source().kind, SourceKind::File { .. }))
+        // A file ends by itself, and a static generator (bars, solid, a still
+        // graphic) publishes once and holds: silence after the first frame is
+        // not a stall for either.
+        self.entry(id).is_some_and(|entry| {
+            matches!(entry.source().kind, SourceKind::File { .. })
+                || crate::synth::SyntheticKind::from_source_kind(&entry.source().kind)
+                    .is_some_and(|kind| !kind.animated())
+        })
     }
 }
 
