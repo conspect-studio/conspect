@@ -690,6 +690,7 @@ async fn run_pipeline_until_ctrl_c(
             pipeline.audio_free_sources_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
+            pipeline.display_layout_slot(),
         ));
         #[cfg(not(feature = "overlay"))]
         let drain: ControlDrain = Box::new(control::command_drain_with_audio_and_players(
@@ -699,6 +700,7 @@ async fn run_pipeline_until_ctrl_c(
             pipeline.audio_route_slot(),
             hub.handle(),
             pipeline.player_mailboxes(),
+            pipeline.display_layout_slot(),
         ));
         (Some(handle), drain, Some(hub), Some(watch), Some(persist))
     } else {
