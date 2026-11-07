@@ -3195,6 +3195,7 @@ dependencies = [
 name = "multiview-input"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "miniz_oxide",
  "multiview-core",
  "multiview-ffmpeg",

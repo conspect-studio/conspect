@@ -18,6 +18,7 @@
 //! Both are **pure** byte-slice → value codecs: no sockets, bounded allocation,
 //! panic-free. A malformed message surfaces as a typed [`ScteError`].
 
+pub mod decode;
 pub mod scte104;
 pub mod splice35;
 

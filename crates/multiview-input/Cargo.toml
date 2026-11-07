@@ -45,12 +45,11 @@ socket2 = { version = "0.6", optional = true }
 # libav directly (it forbids `unsafe`); it only calls multiview-ffmpeg's safe API.
 multiview-ffmpeg = { workspace = true }
 
-# JSON info-dict parser + derive for the YouTube resolver (the `youtube`
-# feature). Pulled in only behind that off-by-default feature; the default build
-# stays without them. Pure-Rust, no native deps — the crate stays
-# `unsafe_code = forbid`.
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+# Serialize derive for the full SCTE-35 / ID3 journal decode, plus the JSON
+# info-dict parser for the YouTube resolver. Pure-Rust, no native deps — the
+# crate stays `unsafe_code = forbid`.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # NDI® ingest (the off-by-default `ndi` feature, ADR-0008 / IN-3). This is the
 # OUT-3 runtime-load FFI leaf crate: it resolves the operator-provided NDI runtime
@@ -63,6 +62,7 @@ serde_json = { workspace = true, optional = true }
 multiview-ndi-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
+base64 = "0.22"
 proptest = "1.11.0"
 # Generate adversarial `C=1` (zlib) bombs at test time to *verify* — not merely
 # assert — the SAP inflate cap (ADR-0041 Decision 8): the deflate side of the
@@ -146,7 +146,7 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # script (no libavutil.pc) on that runner. `serde_json` parses the `yt-dlp -J`
 # output; `tokio/process` spawns the binary with a hard timeout. No native deps in
 # THIS crate, no FFI — it stays `unsafe_code = forbid`.
-"youtube" = ["dep:serde", "dep:serde_json", "tokio/process", "tokio/io-util"]
+"youtube" = ["tokio/process", "tokio/io-util"]
 
 [lints]
 workspace = true
