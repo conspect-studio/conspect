@@ -567,9 +567,11 @@ jobs:
         #
         # `ffmpeg` is the distro CLI, a fixture generator only: the audio lib
         # tests shell out to it for lavfi clips, which the pinned
-        # --disable-everything build cannot make. Nothing links it. Its libav
-        # sonames differ from the pinned ones, so the tests still load the
-        # pinned libraries through LD_LIBRARY_PATH.
+        # --disable-everything build cannot make. Nothing links it. It shares
+        # the libavcodec62 soname with the pinned build, so the LD_LIBRARY_PATH
+        # exported below would load the pinned libraries into it, and they have
+        # no lavfi. The wrapper on PATH runs it with that variable cleared; the
+        # test binaries still load the pinned libraries.
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -577,6 +579,11 @@ jobs:
             pkg-config clang libclang-dev nasm \
             libva2 libva-drm2 libopus0 libsrt1.5-openssl libvpl2 \
             ffmpeg
+          shim="${RUNNER_TEMP}/fixture-bin"
+          mkdir -p "${shim}"
+          printf '#!/bin/sh\nexec env -u LD_LIBRARY_PATH /usr/bin/ffmpeg "$@"\n' > "${shim}/ffmpeg"
+          chmod 0755 "${shim}/ffmpeg"
+          echo "${shim}" >> "$GITHUB_PATH"
       - name: Extract pinned FFmpeg 8.1.1 from the base image
         # The base is `FROM scratch` (only /opt/multiview-ffmpeg), so we create a
         # (never-run) container from it and `docker cp` the prefix out — the same
