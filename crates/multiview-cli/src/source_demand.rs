@@ -64,7 +64,7 @@ pub fn standing_pins(source: &Source) -> Vec<(String, Rails, ConsumerTag)> {
         let target = ConsumerTag::new(ConsumerClass::EventAutomation, source.id.as_str());
         let rails = match rule.on_break_start.action {
             multiview_config::schema::BreakActionKind::SwapCell => Rails::VIDEO,
-            _ => Rails::ALL,
+            multiview_config::schema::BreakActionKind::RouteProgram => Rails::ALL,
         };
         pins.push((rule.on_break_start.target.clone(), rails, target));
     }
@@ -192,145 +192,6 @@ pub fn startup_demand<'a>(
         }
     }
     demand
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn config(extra_sources: &str, tail: &str) -> MultiviewConfig {
-        let doc = format!(
-            r##"schema_version = 1
-[canvas]
-width = 640
-height = 360
-fps = "25/1"
-pixel_format = "nv12"
-background = "#000000"
-[canvas.color]
-profile = "sdr-bt709-limited"
-[layout]
-kind = "grid"
-columns = ["1fr"]
-rows = ["1fr"]
-areas = ["a"]
-[[sources]]
-id = "bound"
-kind = "bars"
-[[sources]]
-id = "unused"
-kind = "hls"
-url = "https://example.test/u.m3u8"
-{extra_sources}
-[[cells]]
-id = "cell"
-area = "a"
-[cells.source]
-input_id = "bound"
-{tail}
-"##
-        );
-        MultiviewConfig::load_from_toml(&doc).expect("fixture")
-    }
-
-    fn demand(config: &MultiviewConfig) -> BTreeMap<String, StartupDemand> {
-        startup_demand(config, std::iter::once("bound"))
-    }
-
-    #[test]
-    fn an_unconsumed_source_has_no_demand_and_a_bound_one_gets_both_rails() {
-        let demand = demand(&config("", ""));
-        assert_eq!(demand["bound"].rails, Rails::ALL);
-        assert!(!demand.contains_key("unused"));
-    }
-
-    #[test]
-    fn a_routed_unbound_source_runs_audio_only() {
-        // The production shape: msnow's audio is routed while its video is unbound.
-        let tail = r#"[audio]
-sample_rate_hz = 48000
-[[audio.routes]]
-input_id = "msnow"
-channels = { kind = "stereo" }
-include_in_program_bus = true
-"#;
-        let extra =
-            "[[sources]]\nid = \"msnow\"\nkind = \"hls\"\nurl = \"https://example.test/m.m3u8\"";
-        let demand = demand(&config(extra, tail));
-        assert_eq!(demand["msnow"].rails, Rails::AUDIO);
-        assert!(!demand.contains_key("unused"));
-    }
-
-    #[test]
-    fn always_on_and_journaling_are_explicit_consumers() {
-        let extra = r#"[[sources]]
-id = "pinned"
-kind = "hls"
-url = "https://example.test/p.m3u8"
-demand = { always_on = true }
-[[sources]]
-id = "logged"
-kind = "hls"
-url = "https://example.test/l.m3u8"
-demand = { journal_events = true }"#;
-        let demand = demand(&config(extra, ""));
-        assert_eq!(demand["pinned"].rails, Rails::ALL);
-        assert_eq!(demand["logged"].rails, Rails::VIDEO);
-    }
-
-    #[test]
-    fn observation_alone_is_not_a_consumer_but_armed_automation_is() {
-        let observed = r#"[[sources]]
-id = "watched"
-kind = "hls"
-url = "https://example.test/w.m3u8"
-events = { observe = true }"#;
-        assert!(!demand(&config(observed, "")).contains_key("watched"));
-        let armed = |armed: bool| {
-            format!(
-                r#"[[sources]]
-id = "slate"
-kind = "hls"
-url = "https://example.test/s.m3u8"
-[[sources]]
-id = "watched"
-kind = "hls"
-url = "https://example.test/w.m3u8"
-[sources.events.automation]
-armed = {armed}
-restore_on_end = true
-max_duration_s = 60
-[sources.events.automation.on_break_start]
-action = "swap_cell"
-target = "slate""#
-            )
-        };
-        let disarmed = demand(&config(&armed(false), ""));
-        assert!(!disarmed.contains_key("watched"));
-        assert!(!disarmed.contains_key("slate"));
-        let live = demand(&config(&armed(true), ""));
-        assert_eq!(live["watched"].rails, Rails::VIDEO);
-        assert_eq!(live["slate"].rails, Rails::VIDEO);
-    }
-
-    #[test]
-    fn linger_and_start_concurrency_come_from_system_demand() {
-        let tuned = demand_config(&config(
-            "",
-            "[system.demand]\nlinger_secs = 5\nmax_concurrent_starts = 2\n",
-        ));
-        assert_eq!(tuned.linger, std::time::Duration::from_secs(5));
-        assert_eq!(tuned.max_concurrent_starts, 2);
-        let default = demand_config(&config("", ""));
-        assert_eq!(default.linger, multiview_engine::DEFAULT_LINGER);
-    }
-
-    #[test]
-    fn layout_items_skip_unbound_cells_and_label_by_position() {
-        let items = layout_items([(Some("a"), None), (None, None), (Some("a"), None)].into_iter());
-        assert_eq!(items.len(), 2);
-        assert_eq!(&*items[1].label, "cell-3");
-    }
 }
 
 /// The control plane's view of a run's demand manager.
@@ -495,4 +356,143 @@ pub fn install_drain_demand(
 #[must_use]
 pub fn installed_drain_demand() -> Option<DrainDemand<multiview_compositor::pipeline::Nv12Image>> {
     drain_demand_slot().load().map(|demand| (*demand).clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(extra_sources: &str, tail: &str) -> MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 640
+height = 360
+fps = "25/1"
+pixel_format = "nv12"
+background = "#000000"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["a"]
+[[sources]]
+id = "bound"
+kind = "bars"
+[[sources]]
+id = "unused"
+kind = "hls"
+url = "https://example.test/u.m3u8"
+{extra_sources}
+[[cells]]
+id = "cell"
+area = "a"
+[cells.source]
+input_id = "bound"
+{tail}
+"##
+        );
+        MultiviewConfig::load_from_toml(&doc).expect("fixture")
+    }
+
+    fn demand(config: &MultiviewConfig) -> BTreeMap<String, StartupDemand> {
+        startup_demand(config, std::iter::once("bound"))
+    }
+
+    #[test]
+    fn an_unconsumed_source_has_no_demand_and_a_bound_one_gets_both_rails() {
+        let demand = demand(&config("", ""));
+        assert_eq!(demand["bound"].rails, Rails::ALL);
+        assert!(!demand.contains_key("unused"));
+    }
+
+    #[test]
+    fn a_routed_unbound_source_runs_audio_only() {
+        // The production shape: msnow's audio is routed while its video is unbound.
+        let tail = r#"[audio]
+sample_rate_hz = 48000
+[[audio.routes]]
+input_id = "msnow"
+channels = { kind = "stereo" }
+include_in_program_bus = true
+"#;
+        let extra =
+            "[[sources]]\nid = \"msnow\"\nkind = \"hls\"\nurl = \"https://example.test/m.m3u8\"";
+        let demand = demand(&config(extra, tail));
+        assert_eq!(demand["msnow"].rails, Rails::AUDIO);
+        assert!(!demand.contains_key("unused"));
+    }
+
+    #[test]
+    fn always_on_and_journaling_are_explicit_consumers() {
+        let extra = r#"[[sources]]
+id = "pinned"
+kind = "hls"
+url = "https://example.test/p.m3u8"
+demand = { always_on = true }
+[[sources]]
+id = "logged"
+kind = "hls"
+url = "https://example.test/l.m3u8"
+demand = { journal_events = true }"#;
+        let demand = demand(&config(extra, ""));
+        assert_eq!(demand["pinned"].rails, Rails::ALL);
+        assert_eq!(demand["logged"].rails, Rails::VIDEO);
+    }
+
+    #[test]
+    fn observation_alone_is_not_a_consumer_but_armed_automation_is() {
+        let observed = r#"[[sources]]
+id = "watched"
+kind = "hls"
+url = "https://example.test/w.m3u8"
+events = { observe = true }"#;
+        assert!(!demand(&config(observed, "")).contains_key("watched"));
+        let armed = |armed: bool| {
+            format!(
+                r#"[[sources]]
+id = "slate"
+kind = "hls"
+url = "https://example.test/s.m3u8"
+[[sources]]
+id = "watched"
+kind = "hls"
+url = "https://example.test/w.m3u8"
+[sources.events.automation]
+armed = {armed}
+restore_on_end = true
+max_duration_s = 60
+[sources.events.automation.on_break_start]
+action = "swap_cell"
+target = "slate""#
+            )
+        };
+        let disarmed = demand(&config(&armed(false), ""));
+        assert!(!disarmed.contains_key("watched"));
+        assert!(!disarmed.contains_key("slate"));
+        let live = demand(&config(&armed(true), ""));
+        assert_eq!(live["watched"].rails, Rails::VIDEO);
+        assert_eq!(live["slate"].rails, Rails::VIDEO);
+    }
+
+    #[test]
+    fn linger_and_start_concurrency_come_from_system_demand() {
+        let tuned = demand_config(&config(
+            "",
+            "[system.demand]\nlinger_secs = 5\nmax_concurrent_starts = 2\n",
+        ));
+        assert_eq!(tuned.linger, std::time::Duration::from_secs(5));
+        assert_eq!(tuned.max_concurrent_starts, 2);
+        let default = demand_config(&config("", ""));
+        assert_eq!(default.linger, multiview_engine::DEFAULT_LINGER);
+    }
+
+    #[test]
+    fn layout_items_skip_unbound_cells_and_label_by_position() {
+        let items = layout_items([(Some("a"), None), (None, None), (Some("a"), None)].into_iter());
+        assert_eq!(items.len(), 2);
+        assert_eq!(&*items[1].label, "cell-3");
+    }
 }

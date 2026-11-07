@@ -1513,7 +1513,7 @@ pub struct CommandDrain {
     #[cfg(feature = "ffmpeg")]
     demand_generation: Option<u64>,
     /// The subtitle routes applied so far (layer → source), for demand.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
     subtitle_routes: std::collections::BTreeMap<String, String>,
     /// Test-only spy counting how many times this drain calls `solve_layout`.
     #[cfg(test)]
@@ -1552,7 +1552,7 @@ impl CommandDrain {
             demand: None,
             #[cfg(feature = "ffmpeg")]
             demand_generation: None,
-            #[cfg(feature = "ffmpeg")]
+            #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             subtitle_routes: std::collections::BTreeMap::new(),
             #[cfg(test)]
             resolve_spy: None,

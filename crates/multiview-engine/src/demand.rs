@@ -650,6 +650,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     /// Take or extend a lease that lapses `ttl` from now, for a consumer with no
     /// close event (JPEG polling). Returns the source's phase, or `None` when
     /// [`MAX_TIMED_LEASES`] are already held.
+    #[must_use = "`None` means the lease was refused"]
     pub fn touch(
         &self,
         id: &str,
@@ -1014,7 +1015,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
         }
         drop(released);
         for (id, from, to, restarting) in launches {
-            self.launch(id, from, to, restarting);
+            self.launch(&id, from, to, restarting);
         }
         wake
     }
@@ -1046,10 +1047,10 @@ impl<T: Send + Sync + 'static> Inner<T> {
 
     /// Run one transition on a transient thread. The caller holds a start slot
     /// for it, so the thread count is bounded.
-    fn launch(self: &Arc<Self>, id: Arc<str>, from: Rails, to: Rails, restarting: bool) {
+    fn launch(self: &Arc<Self>, id: &Arc<str>, from: Rails, to: Rails, restarting: bool) {
         self.transitions.fetch_add(1, Ordering::Relaxed);
         let inner = Arc::clone(self);
-        let thread_id = Arc::clone(&id);
+        let thread_id = Arc::clone(id);
         let spawned = std::thread::Builder::new()
             .name("multiview-demand-rail".to_owned())
             .spawn(move || {
@@ -1085,7 +1086,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 running: from,
                 reason: "could not start a worker thread".to_owned(),
             };
-            self.finish(&id, from, to, Err(failure));
+            self.finish(id, from, to, Err(failure));
         }
     }
 

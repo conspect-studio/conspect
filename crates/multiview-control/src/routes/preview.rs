@@ -97,25 +97,23 @@ pub(crate) async fn input_jpeg(
         .source_demand
         .as_ref()
         .and_then(|demand| demand.touch_preview(id));
-    match state.preview.input_jpeg(id, PREVIEW_QUALITY) {
-        Some(bytes) => jpeg_response(bytes),
-        None => {
-            let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
-            if let Some(phase) = phase {
-                let token = match phase {
-                    crate::source_demand::SourceDemandPhase::Idle
-                    | crate::source_demand::SourceDemandPhase::Starting => "starting",
-                    crate::source_demand::SourceDemandPhase::Live => "live",
-                    crate::source_demand::SourceDemandPhase::Failed => "failed",
-                };
-                response.headers_mut().insert(
-                    "x-multiview-source-state",
-                    header::HeaderValue::from_static(token),
-                );
-            }
-            response
-        }
+    if let Some(bytes) = state.preview.input_jpeg(id, PREVIEW_QUALITY) {
+        return jpeg_response(bytes);
     }
+    let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+    if let Some(phase) = phase {
+        let token = match phase {
+            crate::source_demand::SourceDemandPhase::Idle
+            | crate::source_demand::SourceDemandPhase::Starting => "starting",
+            crate::source_demand::SourceDemandPhase::Live => "live",
+            crate::source_demand::SourceDemandPhase::Failed => "failed",
+        };
+        response.headers_mut().insert(
+            "x-multiview-source-state",
+            header::HeaderValue::from_static(token),
+        );
+    }
+    response
 }
 
 /// `GET /api/v1/preview/inputs` — the ids of inputs that can be previewed

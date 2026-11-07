@@ -1,5 +1,5 @@
 //! Demand lifecycle in a real run (`docs/architecture/demand-driven-sources.md`):
-//! a cell re-pointed to an idle source starts it off-clock (NO_SIGNAL until its
+//! a cell re-pointed to an idle source starts it off-clock (`NO_SIGNAL` until its
 //! first frame), re-pointing away stops it after the linger, a shared source
 //! never restarts across a swap, and lease churn during live output never
 //! slips the output clock.
@@ -81,6 +81,15 @@ segment_ms = 1000
     config
 }
 
+/// Ends a run when dropped, so a failed assertion never leaves it serving.
+struct StopOnDrop(StopSignal);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// The run installs its demand seam process-wide (one run per process), so
 /// these tests take turns.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -101,7 +110,7 @@ async fn eventually(what: &str, within: Duration, mut done: impl FnMut() -> bool
     }
 }
 
-/// Re-point cell_b dark -> bright -> dark. `bright` starts on demand, `dark`
+/// Re-point `cell_b` dark -> bright -> dark. `bright` starts on demand, `dark`
 /// lingers then stops, `shared` (bound throughout) never restarts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linger() {
@@ -132,13 +141,6 @@ async fn a_route_starts_an_idle_source_and_routing_away_stops_it_after_the_linge
 
     let watcher = demand.clone();
     let relay_stop = stop.clone();
-    // A failed assertion must end the run, never leave it serving forever.
-    struct StopOnDrop(StopSignal);
-    impl Drop for StopOnDrop {
-        fn drop(&mut self) {
-            self.0.stop();
-        }
-    }
     let relay = tokio::spawn(async move {
         let _guard = StopOnDrop(relay_stop.clone());
         eventually("shared is live", Duration::from_secs(30), || {

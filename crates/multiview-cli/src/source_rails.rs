@@ -56,9 +56,9 @@ pub fn empty_store(id: &str) -> Arc<TileStore<Nv12Image>> {
 
 /// Build the catalogue for `sources`, reusing `stores` where one exists.
 #[must_use]
-pub fn catalogue<'a>(
+pub fn catalogue<'a, S: std::hash::BuildHasher>(
     sources: impl Iterator<Item = &'a Source>,
-    stores: &HashMap<String, Arc<TileStore<Nv12Image>>>,
+    stores: &HashMap<String, Arc<TileStore<Nv12Image>>, S>,
 ) -> Catalogue {
     let entries = sources
         .map(|source| {

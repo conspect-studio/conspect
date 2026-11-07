@@ -207,7 +207,7 @@ pub struct AudioControlHandle {
     sample_rate: u32,
     /// Sources demand started on a run with no audio routes. Such a run mixes
     /// every source at unity, so these join at unity rather than zero.
-    unrouted_unity: SharedMap<()>,
+    unrouted_unity: Arc<multiview_framestore::SwapCell<Arc<std::collections::HashSet<String>>>>,
     /// Output tracks are pinned to source ids at startup until the discrete
     /// encoder's route table accepts live updates.
     declared_tracks: std::collections::HashMap<String, usize>,
@@ -285,7 +285,9 @@ impl AudioControlHandle {
             known: shared_map(known),
             route_demand: None,
             routing: Arc::new(multiview_framestore::SwapCell::empty()),
-            unrouted_unity: shared_map(std::collections::HashMap::new()),
+            unrouted_unity: Arc::new(multiview_framestore::SwapCell::from_pointee(
+                std::collections::HashSet::new(),
+            )),
             sample_rate: AudioFormat::CANONICAL_RATE,
             declared_tracks: std::collections::HashMap::new(),
             live_track_inputs: None,
@@ -508,7 +510,13 @@ impl AudioControlHandle {
     /// Let `id` join at unity while no routing is declared, matching what a
     /// source bound at startup gets.
     pub(crate) fn allow_unrouted_unity(&self, id: &str) {
-        map_insert(&self.unrouted_unity, id, ());
+        if !self.unrouted_unity.load().contains(id) {
+            self.unrouted_unity.rcu(|current| {
+                let mut next = current.as_ref().clone();
+                next.insert(id.to_owned());
+                next
+            });
+        }
     }
 
     /// The gain a source joining the bus now rides: the latest routing's, or
@@ -518,7 +526,7 @@ impl AudioControlHandle {
             .routing
             .load()
             .is_some_and(|routing| !routing.routes.is_empty());
-        if !routed && self.unrouted_unity.load().contains_key(id) {
+        if !routed && self.unrouted_unity.load().contains(id) {
             return 1.0;
         }
         self.routing
@@ -1066,6 +1074,9 @@ fn await_shared_url(
 /// pace nor stall the output clock (invariant #1) nor back-pressure the engine
 /// (invariant #10); a wedged libav network call is bounded by the supervisor's
 /// detach-on-grace teardown, exactly as for video.
+#[allow(clippy::too_many_lines)]
+// reason: one supervised reconnect bracket; the audio-only branch added here
+// keeps the decode choice next to the loop that owns it.
 pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop: &AtomicBool) {
     // Name this source on every line the audio thread emits: our own (the span)
     // and libav's synchronous lines (the thread-local resource context the log

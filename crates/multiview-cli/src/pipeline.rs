@@ -3713,7 +3713,7 @@ impl Pipeline {
 
         // Boot audio rails report progress to the demand manager like on-demand ones.
         for (id, store) in &self.audio_stores {
-            set_audio_progress_store(id, Some(Arc::clone(store)));
+            set_audio_progress_store(id, Some(store));
         }
 
         // Prime the first frame per tile BEFORE constructing the runtime (whose
@@ -4043,7 +4043,7 @@ impl Pipeline {
         // Boot inventories seed the live map; a source started on demand adds
         // its own when its rail starts (it was never probed while idle).
         for (id, inventory) in &self.inventories {
-            set_live_inventory(id, Some(inventory.clone()));
+            set_live_inventory(id, Some(inventory));
         }
         let inventory_cell = live_inventories();
         let mut inventory_seen = Arc::clone(&inventory_cell.load());
@@ -7544,7 +7544,7 @@ impl crate::source_rails::RailSpawner for DemandSpawner {
                 drop(stop.exit);
             })
             .map_err(|_| "could not start the audio thread".to_owned())?;
-        set_audio_progress_store(&source.id, Some(Arc::clone(&store)));
+        set_audio_progress_store(&source.id, Some(&store));
         route.allow_unrouted_unity(&source.id);
         if !route.set_source_audio(&source.id, Some(store)) {
             return Err("the program bus is closed".to_owned());
@@ -8624,7 +8624,9 @@ fn cell_pixel_size(layout: &Layout, source_id: &str) -> Option<(u32, u32)> {
         .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
 }
 
-use crate::source_demand::{cell_dims, frac_to_px};
+use crate::source_demand::cell_dims;
+#[cfg(feature = "overlay")]
+use crate::source_demand::frac_to_px;
 
 /// Resolve source-bound cells into canvas-space tile chrome, in cell order.
 #[cfg(feature = "overlay")]
@@ -14409,13 +14411,13 @@ fn live_inventories() -> &'static multiview_framestore::SwapCell<InventoryMap> {
 /// Record (or with `None` forget) `id`'s inventory.
 pub(crate) fn set_live_inventory(
     id: &str,
-    inventory: Option<multiview_core::stream::StreamInventory>,
+    inventory: Option<&multiview_core::stream::StreamInventory>,
 ) {
     live_inventories().rcu(|current| {
         let mut next = current.as_ref().clone();
         match &inventory {
             Some(inventory) => {
-                next.insert(id.to_owned(), inventory.clone());
+                next.insert(id.to_owned(), (*inventory).clone());
             }
             None => {
                 next.remove(id);
@@ -14432,7 +14434,7 @@ fn probe_on_start(source: &Source) {
         match multiview_ffmpeg::Demuxer::open(std::path::Path::new(path)) {
             Ok(demux) => set_live_inventory(
                 &source.id,
-                Some(demux.inventory().with_input_id(source.id.clone())),
+                Some(&demux.inventory().with_input_id(source.id.clone())),
             ),
             Err(error) => {
                 tracing::warn!(source = %source.id, %error, "could not probe stream inventory on start");
@@ -14443,14 +14445,12 @@ fn probe_on_start(source: &Source) {
 
 /// The audio stores each running audio rail publishes into, for the demand
 /// manager's progress check. Written when a rail starts or stops, read wait-free.
-fn audio_progress_slots() -> &'static multiview_framestore::SwapCell<
-    Arc<std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>>,
-> {
-    static SLOTS: std::sync::OnceLock<
-        multiview_framestore::SwapCell<
-            Arc<std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>>,
-        >,
-    > = std::sync::OnceLock::new();
+type AudioProgressMap =
+    Arc<std::collections::HashMap<String, Arc<multiview_audio::store::AudioStore>>>;
+
+fn audio_progress_slots() -> &'static multiview_framestore::SwapCell<AudioProgressMap> {
+    static SLOTS: std::sync::OnceLock<multiview_framestore::SwapCell<AudioProgressMap>> =
+        std::sync::OnceLock::new();
     SLOTS.get_or_init(|| {
         multiview_framestore::SwapCell::from_pointee(std::collections::HashMap::new())
     })
@@ -14459,13 +14459,13 @@ fn audio_progress_slots() -> &'static multiview_framestore::SwapCell<
 /// Record (or with `None` forget) the store `id`'s audio rail publishes into.
 pub(crate) fn set_audio_progress_store(
     id: &str,
-    store: Option<Arc<multiview_audio::store::AudioStore>>,
+    store: Option<&Arc<multiview_audio::store::AudioStore>>,
 ) {
     audio_progress_slots().rcu(|current| {
         let mut next = current.as_ref().clone();
         match &store {
             Some(store) => {
-                next.insert(id.to_owned(), Arc::clone(store));
+                next.insert(id.to_owned(), Arc::clone(*store));
             }
             None => {
                 next.remove(id);

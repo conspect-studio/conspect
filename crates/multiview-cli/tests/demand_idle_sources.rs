@@ -57,7 +57,7 @@ fn proc_status(field: &str) -> u64 {
         .and_then(|status| {
             status.lines().find_map(|line| {
                 line.strip_prefix(field)
-                    .and_then(|rest| rest.trim().split_whitespace().next()?.parse().ok())
+                    .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
             })
         })
         .unwrap_or(0)
@@ -189,9 +189,9 @@ async fn five_hundred_unconsumed_sources_cost_no_connection_probe_or_thread() {
 
     // Reported, not asserted: hosts differ. The design note quotes a run.
     eprintln!(
-        "demand idle-cost: 500 idle sources -> build {:?} (0 idle: {:?}), threads after a run \
-         {} (0 idle: {}), RSS after a run {} kB (0 idle: {} kB)",
-        build_time, small_build, threads_after, threads_before, rss_after, rss_before
+        "demand idle-cost: 500 idle sources -> build {build_time:?} (0 idle: {small_build:?}), \
+         threads after a run {threads_after} (0 idle: {threads_before}), RSS after a run \
+         {rss_after} kB (0 idle: {rss_before} kB)"
     );
     assert!(
         threads_after <= threads_before + 2,

@@ -35,7 +35,9 @@ pub struct SourceConsumerView {
     pub label: String,
 }
 
-/// One source's demand state.
+/// One source's demand state. Flat booleans keep the wire shape simple for
+/// the SPA (one per rail per direction).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SourceDemandView {
