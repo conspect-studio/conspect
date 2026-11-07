@@ -125,6 +125,11 @@ pub(crate) async fn create_probe(
         name: input.name,
         body: validated_body(TypedCollection::Probes, &id, &input.body)?,
     };
+    // Review H1: serialize with every other durable config mutation.
+    let _mutation = state.lock_config_mutation().await;
+    crate::boot_model::require_absent(state.probes.get(&id), PROBE_KIND, &id)?;
+    crate::boot_model::commit_resource(&state, "probes", &id, Some(input.body.clone()), None)
+        .await?;
     let versioned = state.probes.create(&id, input)?;
     state.audit(
         &principal.key_id,
@@ -170,12 +175,16 @@ pub(crate) async fn update_probe(
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
+    // Review H1: serialize with every other durable config mutation.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.probes.get(&id)?;
     if_match.require(PROBE_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
         body: validated_body(TypedCollection::Probes, &id, &input.body)?,
     };
+    crate::boot_model::commit_resource(&state, "probes", &id, Some(input.body.clone()), None)
+        .await?;
     let versioned = state.probes.update(&id, input)?;
     state.audit(
         &principal.key_id,
@@ -215,8 +224,11 @@ pub(crate) async fn delete_probe(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
+    // Review H1: serialize with every other durable config mutation.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.probes.get(&id)?;
     if_match.require(PROBE_KIND, &id, current.version)?;
+    crate::boot_model::commit_resource(&state, "probes", &id, None, None).await?;
     state.probes.delete(&id)?;
     state.audit(
         &principal.key_id,

@@ -176,6 +176,11 @@ pub(crate) async fn create_device(
     // below, so this clear can never erase that delete's tombstone — see
     // `DevicePollerRegistry::clear_tombstone`).
     state.device_pollers.clear_tombstone(&id);
+    // Review H1: serialize with every other durable config mutation.
+    let _mutation = state.lock_config_mutation().await;
+    crate::boot_model::require_absent(state.devices.get(&id), DEVICE_KIND, &id)?;
+    crate::boot_model::commit_resource(&state, "devices", &id, Some(input.body.clone()), None)
+        .await?;
     let versioned = state.devices.create(&id, input)?;
     // Seed the runtime status in ADOPTING (idempotent), so the read-only status
     // snapshot answers before any driver probe — the conflated status lane's
@@ -231,12 +236,16 @@ pub(crate) async fn update_device(
     crate::auth::authorize_object(&principal, &id)?;
     // Preconditions before content (RFC 9110 §13.2.2): a stale `If-Match` (or a
     // missing resource) is reported even when the submitted body is invalid.
+    // Review H1: serialize with every other durable config mutation.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.devices.get(&id)?;
     if_match.require(DEVICE_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
         body: validated_body(TypedCollection::Devices, &id, &input.body)?,
     };
+    crate::boot_model::commit_resource(&state, "devices", &id, Some(input.body.clone()), None)
+        .await?;
     let versioned = state.devices.update(&id, input)?;
     // Restart the supervised poller on an edit (DEV-A4): the address/credential/
     // desired-mode may have changed, so the registry replaces the running task
@@ -287,6 +296,8 @@ pub(crate) async fn delete_device(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
+    // Review H1: serialize with every other durable config mutation.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.devices.get(&id)?;
     if_match.require(DEVICE_KIND, &id, current.version)?;
     // Refuse the delete while a Source/Output binds this device (ADR-M009): a
@@ -299,6 +310,7 @@ pub(crate) async fn delete_device(
             blocker.kind, blocker.resource_id
         )));
     }
+    crate::boot_model::commit_resource(&state, "devices", &id, None, None).await?;
     state.devices.delete(&id)?;
     // Stop the supervised driver poller (DEV-A4): the device is gone, so its
     // poller must not keep probing — the registry tombstones the id (a racing

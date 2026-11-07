@@ -164,9 +164,21 @@ pub(crate) async fn put_profile(
         .map_err(|e| ControlError::Validation(e.to_string()))?;
 
     // On a replace, require a matching If-Match against the live version.
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
+    let durable = crate::boot_model::config_value(&profile)?;
     match state.tally_profiles.get(&id) {
         Ok(current) => {
             if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
+            crate::boot_model::commit_resource(
+                &state,
+                "tally_profiles",
+                &id,
+                Some(durable.clone()),
+                None,
+            )
+            .await?;
             let versioned = state.tally_profiles.put(profile)?;
             // ADR-W024 round 6: a tally profile is runtime-mutable running state
             // composed into active.toml; audit (the ONE persist choke point) so
@@ -182,6 +194,14 @@ pub(crate) async fn put_profile(
             Ok(profile_response(StatusCode::OK, &versioned))
         }
         Err(ControlError::NotFound { .. }) => {
+            crate::boot_model::commit_resource(
+                &state,
+                "tally_profiles",
+                &id,
+                Some(durable.clone()),
+                None,
+            )
+            .await?;
             let versioned = state.tally_profiles.put(profile)?;
             state.audit(
                 &principal.key_id,
@@ -204,8 +224,12 @@ pub(crate) async fn delete_profile(
     Path(id): Path<String>,
 ) -> ControlResult<StatusCode> {
     principal.role.require(Action::Administer)?;
+    // Review H1: serialize with every other durable config mutation and
+    // commit the desired envelope before the store projection changes.
+    let _mutation = state.lock_config_mutation().await;
     let current = state.tally_profiles.get(&id)?;
     if_match.require(TALLY_PROFILE_KIND, &id, current.version)?;
+    crate::boot_model::commit_resource(&state, "tally_profiles", &id, None, None).await?;
     state.tally_profiles.delete(&id)?;
     // ADR-W024 round 6: removing a runtime-mutable tally profile changes the
     // composed running state — audit so the persister rewrites active.toml.

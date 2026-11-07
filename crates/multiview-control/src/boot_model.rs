@@ -257,7 +257,37 @@ pub fn prospective_config(
     })
 }
 
+/// Serialize a typed config item into its durable desired-document form.
+///
+/// # Errors
+/// A serialization fault is a repository error (never a panic).
+pub fn config_value<T: serde::Serialize>(item: &T) -> ControlResult<serde_json::Value> {
+    serde_json::to_value(item)
+        .map_err(|e| ControlError::Repository(format!("serializing a config item: {e}")))
+}
+
+/// Fail a create whose id already exists in the store projection, BEFORE the
+/// desired envelope is committed (review H1: no durable write for a request
+/// that the store would then refuse).
+///
+/// # Errors
+/// An existing id is a validation error; any non-`NotFound` read fault propagates.
+pub fn require_absent<T>(lookup: ControlResult<T>, kind: &str, id: &str) -> ControlResult<()> {
+    match lookup {
+        Ok(_) => Err(ControlError::Validation(format!(
+            "{kind} {id:?} already exists"
+        ))),
+        Err(ControlError::NotFound { .. }) => Ok(()),
+        Err(other) => Err(other),
+    }
+}
+
 /// Persist a prospective resource collection before its store changes.
+///
+/// Every runtime-mutable config collection (sources, outputs, overlays,
+/// probes, devices, sync groups, salvos, tally profiles) commits through here
+/// (review H1), so `desired.json` is the single source of truth for accepted
+/// configuration and an unrelated later commit can never revert an edit.
 ///
 /// # Errors
 /// Invalid cross-references or failed atomic I/O reject the mutation.
@@ -312,9 +342,22 @@ pub async fn commit_resource(
             });
         }
     } else {
-        entries.retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(id));
-        if let Some(body) = replacement {
-            entries.push(body);
+        // Replace in place so an edit never reorders draw/recall order; a
+        // create appends and a delete removes (review H1).
+        let position = entries
+            .iter()
+            .position(|entry| entry.get("id").and_then(serde_json::Value::as_str) == Some(id));
+        match (position, replacement) {
+            (Some(index), Some(body)) => {
+                if let Some(slot) = entries.get_mut(index) {
+                    *slot = body;
+                }
+            }
+            (Some(index), None) => {
+                entries.remove(index);
+            }
+            (None, Some(body)) => entries.push(body),
+            (None, None) => {}
         }
     }
     let config: MultiviewConfig = serde_path_to_error::deserialize(document).map_err(|e| {
