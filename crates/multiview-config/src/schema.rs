@@ -869,6 +869,22 @@ pub enum SourceKind {
         #[serde(default)]
         background: crate::weather::WeatherBackground,
     },
+    /// One prepared graphics item (`[[graphics.items]]`) rendered full-time —
+    /// re-rendered only when the item or its bound data changes.
+    Graphic {
+        /// The `[[graphics.items]]` id.
+        item: String,
+    },
+    /// A graphics playout channel's output: whatever is on its program bus
+    /// (transparent when clear), or its preview bus for monitoring. Layer it
+    /// in a cell above video; TAKE/CLEAR/MIX drive it live.
+    GraphicsChannel {
+        /// The `[[graphics.channels]]` id.
+        channel: String,
+        /// `program` (default) or `preview`.
+        #[serde(default)]
+        bus: crate::graphics::GraphicsBus,
+    },
     /// AES67 / SMPTE ST 2110-30 PCM-audio RTP input (open-audio over IP).
     ///
     /// Tier 0 binding is a static SDP session (RFC 4566/8866) pasted or fetched
@@ -936,6 +952,8 @@ impl SourceKind {
                 | Self::Clock { .. }
                 | Self::Timer { .. }
                 | Self::Weather { .. }
+                | Self::Graphic { .. }
+                | Self::GraphicsChannel { .. }
         )
     }
 

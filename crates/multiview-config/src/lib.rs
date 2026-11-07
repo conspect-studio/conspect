@@ -36,6 +36,7 @@ pub mod diff;
 pub mod discovery;
 pub mod error;
 pub mod failover;
+pub mod graphics;
 pub mod grid;
 pub mod layout_doc;
 pub mod limits;
@@ -75,6 +76,10 @@ pub use diff::{ConfigDiff, OverlayChange, SourceChange};
 pub use discovery::DiscoveryConfig;
 pub use error::ConfigError;
 pub use failover::{default_failover_slate, FailoverSlate};
+pub use graphics::{
+    DataKind, DataProviderKind, GraphicsBus, GraphicsChannel, GraphicsConfig, GraphicsDataSource,
+    GraphicsItem, GraphicsStyle, TemplateSpec, Transition, TransitionKind,
+};
 pub use layout_doc::{LayoutCanvas, LayoutDocument};
 pub use media::{
     frames_for_ms, EofPolicy, MediaAsset, MediaAssetKind, MediaLibrary, MediaPlayer,
@@ -393,6 +398,11 @@ pub struct MultiviewConfig {
     /// Absent ⇒ no locations (nothing is fetched).
     #[serde(default, skip_serializing_if = "WeatherConfig::is_empty")]
     pub weather: WeatherConfig,
+    /// The Graphics (CG) module (`[graphics]`): typed data sources, prepared
+    /// items and playout channels. Absent ⇒ empty. Legacy `[weather]`
+    /// locations remain effective `bom_weather` data sources.
+    #[serde(default, skip_serializing_if = "GraphicsConfig::is_empty")]
+    pub graphics: GraphicsConfig,
 }
 
 /// Parse a `#RGB` / `#RRGGBB` hex color into its `(r, g, b)` bytes.
@@ -534,6 +544,7 @@ impl MultiviewConfig {
         self.validate_routing()?;
         self.validate_media()?;
         self.weather.validate()?;
+        self.graphics.validate(&self.weather)?;
         if let Some(timing) = &self.timing {
             timing.validate()?;
         }
@@ -1546,6 +1557,10 @@ impl Source {
             // URL's reachability is a runtime concern.
             SourceKind::Srt { srt: Some(opts), .. } => validate_srt_options(&self.id, opts)?,
             SourceKind::Weather { location, .. } => weather::validate_source_ref(&self.id, location)?,
+            SourceKind::Graphic { item } => graphics::validate_source_ref(&self.id, "item", item)?,
+            SourceKind::GraphicsChannel { channel, .. } => {
+                graphics::validate_source_ref(&self.id, "channel", channel)?;
+            }
             // Network/synthetic kinds carry no kind-specific field that can be
             // validated structurally here (a URL's reachability is a runtime
             // concern, not a config one). The `youtube` URL is resolved at

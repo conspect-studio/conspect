@@ -2962,6 +2962,7 @@ dependencies = [
  "multiview-events",
  "multiview-ffmpeg",
  "multiview-framestore",
+ "multiview-graphics",
  "multiview-hal",
  "multiview-input",
  "multiview-licence",
@@ -3050,6 +3051,7 @@ dependencies = [
  "multiview-core",
  "multiview-engine",
  "multiview-events",
+ "multiview-graphics",
  "multiview-licence",
  "multiview-mesh",
  "multiview-preview",
@@ -3156,6 +3158,15 @@ dependencies = [
  "multiview-core",
  "proptest",
  "proptest-state-machine",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "multiview-graphics"
+version = "0.1.0"
+dependencies = [
+ "multiview-config",
+ "serde",
  "thiserror 2.0.18",
 ]
 
