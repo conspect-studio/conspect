@@ -12,3 +12,10 @@ describe('primary navigation', () => {
     expect(devices).toBeLessThan(paths.indexOf('/monitoring'));
   });
 });
+
+describe('IPTV-ORG browser', () => {
+  it('is a sub-page of Sources, not a separate nav item', () => {
+    expect(NAV_ITEMS.map((item) => item.path)).not.toContain('/sources/iptv-org');
+    expect(NAV_ITEMS.map((item) => item.path)).toContain('/sources');
+  });
+});

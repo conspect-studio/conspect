@@ -487,6 +487,7 @@ export type EpgModeChoice = 'automatic' | 'manual' | 'disabled';
 
 /** The `epg.mode` choices offered in the UI, in display order. */
 export const EPG_MODES: readonly EpgModeChoice[] = ['automatic', 'manual', 'disabled'];
+
 /** How a linked source follows upstream catalogue changes (§2.4). */
 export type OriginFollow = 'manual' | 'notify' | 'auto';
 
@@ -1238,6 +1239,7 @@ export function validateSourceForm(
   }
   if (form.metaLogo.trim() !== '' && !isValidUrl(form.metaLogo, ['http', 'https'])) {
     errors.metaLogo = 'scheme-http';
+  }
   if (form.kind === 'hls') {
     if (!isValidHeaderValue(form.userAgent)) {
       errors.userAgent = 'header-invalid';
