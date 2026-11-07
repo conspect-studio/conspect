@@ -548,6 +548,9 @@ pub struct AppState {
     pub commands: CommandSender,
     /// The resource repository (CRUD persistence).
     pub repository: Arc<dyn Repository>,
+    /// Health and repair of [`repository`](Self::repository) as a projection of
+    /// the desired envelope (see [`crate::layout_projection`]).
+    pub layout_projection: Arc<crate::layout_projection::LayoutProjection>,
     /// The sources store (versioned CRUD over config-as-code managed inputs).
     pub sources: Arc<dyn ResourceRepository>,
     /// The outputs store (versioned CRUD over config-as-code managed sinks).
@@ -935,6 +938,7 @@ impl AppState {
             engine,
             commands,
             repository,
+            layout_projection: Arc::default(),
             base_document: None,
             working_layout_id: None,
             running_canvas: None,

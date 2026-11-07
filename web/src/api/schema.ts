@@ -2732,6 +2732,8 @@ export interface components {
              *     snapshot (exact, computed by the pure `ConfigDiff`). Empty ⇒ in sync.
              */
             diverged_from_loaded: string[];
+            /** @description Health of the saved-layout projection of the accepted envelope. */
+            layout_projection?: components["schemas"]["LayoutProjectionStatus"];
             /**
              * @description Whether this run carries a boot model (started from a config file with
              *     a control plane). `false` ⇒ every other field is its honest empty
@@ -3654,6 +3656,40 @@ export interface components {
             body: unknown;
             /** @description Human-friendly name. */
             name: string;
+        };
+        /** @description The projection's health as reported on `GET /api/v1/config/boot-model`. */
+        LayoutProjectionStatus: {
+            /**
+             * Format: int32
+             * @description Failed attempts since the projection was last healthy.
+             */
+            consecutive_failures: number;
+            /**
+             * @description Whether the projection differs from the accepted envelope because a
+             *     write failed. Layout reads stay correct either way: they use the envelope.
+             */
+            degraded: boolean;
+            /**
+             * Format: int64
+             * @description Unix milliseconds of the first failure of the current fault.
+             */
+            degraded_since_ms?: number | null;
+            /**
+             * @description The most recent failure, while degraded. Withheld from a scoped principal,
+             *     because a repository error can name any layout.
+             */
+            last_error?: string | null;
+            /**
+             * Format: int64
+             * @description Unix milliseconds of the last repair that cleared a fault.
+             */
+            repaired_at_ms?: number | null;
+            /**
+             * @description Whether a repair is running or waiting for its next attempt. `degraded`
+             *     with `retrying: false` means the retry budget is spent, and the next
+             *     commit or restart repairs the projection.
+             */
+            retrying: boolean;
         };
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::Lease`] (the dated entitlement

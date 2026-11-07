@@ -9441,6 +9441,10 @@
             },
             "description": "The section names where Running diverges from the **Loaded** startup\nsnapshot (exact, computed by the pure `ConfigDiff`). Empty ⇒ in sync."
           },
+          "layout_projection": {
+            "$ref": "#/components/schemas/LayoutProjectionStatus",
+            "description": "Health of the saved-layout projection of the accepted envelope."
+          },
           "modeled": {
             "type": "boolean",
             "description": "Whether this run carries a boot model (started from a config file with\na control plane). `false` ⇒ every other field is its honest empty\ndefault and the revert/promote actions refuse with `409`."
@@ -11093,6 +11097,54 @@
           "name": {
             "type": "string",
             "description": "Human-friendly name."
+          }
+        }
+      },
+      "LayoutProjectionStatus": {
+        "type": "object",
+        "description": "The projection's health as reported on `GET /api/v1/config/boot-model`.",
+        "required": [
+          "degraded",
+          "retrying",
+          "consecutive_failures"
+        ],
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Failed attempts since the projection was last healthy.",
+            "minimum": 0
+          },
+          "degraded": {
+            "type": "boolean",
+            "description": "Whether the projection differs from the accepted envelope because a\nwrite failed. Layout reads stay correct either way: they use the envelope."
+          },
+          "degraded_since_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix milliseconds of the first failure of the current fault."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The most recent failure, while degraded. Withheld from a scoped principal,\nbecause a repository error can name any layout."
+          },
+          "repaired_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix milliseconds of the last repair that cleared a fault."
+          },
+          "retrying": {
+            "type": "boolean",
+            "description": "Whether a repair is running or waiting for its next attempt. `degraded`\nwith `retrying: false` means the retry budget is spent, and the next\ncommit or restart repairs the projection."
           }
         }
       },

@@ -185,15 +185,10 @@ pub async fn commit_desired(
     config: MultiviewConfig,
     layouts: Vec<crate::repository::Layout>,
 ) -> ControlResult<()> {
-    let Some(model) = &state.boot_model else {
+    if state.boot_model.is_none() {
         return Ok(());
-    };
-    let selected_layout_id = load_desired(model.boot_path())
-        .map_err(ControlError::Repository)?
-        .map(|desired| desired.selected_layout_id)
-        .or_else(|| model.selected_layout_id())
-        .or_else(|| state.working_layout_id.clone())
-        .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
+    }
+    let selected_layout_id = selected_layout_id(state, &config, &layouts)?;
     commit_desired_with_selection(state, config, layouts, selected_layout_id).await
 }
 
@@ -240,19 +235,96 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
     })
 }
 
-/// Read the accepted config, or compose the initial config on migration.
+/// Read the accepted config. Before the first commit (migration of an existing
+/// install) the accepted config is the document this run started from: every
+/// modeled mutation commits first, so nothing can have changed it yet. The
+/// stores are not composed here. They list id-sorted, which reorders outputs
+/// against their positional identities, and a retained `SQLite` definition of
+/// the working layout would silently replace the running canvas and cells.
 ///
 /// # Errors
 /// An invalid record or a failed store composition returns an error.
 pub fn current_desired_config(state: &AppState) -> ControlResult<serde_json::Value> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
-            return serde_json::to_value(desired.config).map_err(|e| {
-                ControlError::Repository(format!("serializing accepted config: {e}"))
-            });
-        }
+        let config = load_desired(model.boot_path())
+            .map_err(ControlError::Repository)?
+            .map_or_else(|| model.adopted_config(), |desired| desired.config);
+        return serde_json::to_value(config)
+            .map_err(|e| ControlError::Repository(format!("serializing accepted config: {e}")));
     }
     crate::routes::config::compose_document_unredacted(state)
+}
+
+/// The selected layout identity for a commit. An envelope owns it; before the
+/// first commit it rebinds to the library entry the run is actually showing, so
+/// a legacy install that applied a saved layout keeps that selection.
+///
+/// # Errors
+/// A corrupt record, a failed legacy read, or no usable identity returns an error.
+pub fn selected_layout_id(
+    state: &AppState,
+    config: &MultiviewConfig,
+    layouts: &[crate::repository::Layout],
+) -> ControlResult<String> {
+    let model = state
+        .boot_model
+        .as_ref()
+        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+    if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+        return Ok(desired.selected_layout_id);
+    }
+    if let Some(selected) = model.selected_layout_id() {
+        return Ok(selected);
+    }
+    let working = state.working_layout_id.as_deref();
+    // The repository, not `layouts`: the first commit may itself be an edit of
+    // the very definition being matched.
+    let legacy = state.repository.list_layouts()?;
+    let matching = |entry: &&crate::repository::VersionedLayout| {
+        layouts.iter().any(|layout| layout.id == entry.layout.id)
+            && layout_body_is_running(&entry.layout.body, config)
+    };
+    // The working entry is seeded from the running config, so it matches
+    // trivially. A single matching saved definition is the operator's applied
+    // choice; several are ambiguous, so the working entry wins.
+    let mut saved = legacy
+        .iter()
+        .filter(matching)
+        .filter(|entry| Some(entry.layout.id.as_str()) != working);
+    match (saved.next(), saved.next()) {
+        (Some(only), None) => Ok(only.layout.id.clone()),
+        _ => working
+            .map(str::to_owned)
+            .or_else(|| {
+                legacy
+                    .iter()
+                    .find(matching)
+                    .map(|entry| entry.layout.id.clone())
+            })
+            .ok_or_else(|| ControlError::Validation("no selected working layout".into())),
+    }
+}
+
+/// Whether a saved body, applied over `config`, is what `config` already shows.
+/// The comparison is typed because an authored body omits defaulted fields, and
+/// a saved canvas may be partial (apply-layout merges it over the running one).
+fn layout_body_is_running(body: &serde_json::Value, config: &MultiviewConfig) -> bool {
+    let Ok(mut canvas) = serde_json::to_value(&config.canvas) else {
+        return false;
+    };
+    let (Some(fields), Some(saved)) = (
+        canvas.as_object_mut(),
+        body.get("canvas").and_then(serde_json::Value::as_object),
+    ) else {
+        return false;
+    };
+    fields.extend(saved.clone());
+    let parsed = |key: &str| body.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::from_value::<multiview_config::Canvas>(canvas).is_ok_and(|c| c == config.canvas)
+        && serde_json::from_value::<multiview_config::Layout>(parsed("layout"))
+            .is_ok_and(|layout| layout == config.layout)
+        && serde_json::from_value::<Vec<multiview_config::Cell>>(parsed("cells"))
+            .is_ok_and(|cells| cells == config.cells)
 }
 
 /// Compose a prospective config by replacing the owned section of the settled
@@ -437,24 +509,16 @@ async fn commit_desired_with_output_ids(
     output_ids: Vec<String>,
     name_change: Option<(&str, &str, Option<String>)>,
 ) -> ControlResult<()> {
-    let model = state
-        .boot_model
-        .as_ref()
-        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    let selected_layout_id = load_desired(model.boot_path())
-        .map_err(ControlError::Repository)?
-        .map(|desired| desired.selected_layout_id)
-        .or_else(|| model.selected_layout_id())
-        .or_else(|| state.working_layout_id.clone())
-        .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
-    commit_desired_document_named(
+    let selected_layout_id = selected_layout_id(state, &config, &layouts)?;
+    // Boxed: the transaction future is large, and every route awaits it.
+    Box::pin(commit_desired_document_named(
         state,
         config,
         layouts,
         selected_layout_id,
         output_ids,
         name_change,
-    )
+    ))
     .await
 }
 
@@ -471,8 +535,15 @@ pub async fn commit_desired_document(
     selected_layout_id: String,
     output_ids: Vec<String>,
 ) -> ControlResult<()> {
-    commit_desired_document_named(state, config, layouts, selected_layout_id, output_ids, None)
-        .await
+    Box::pin(commit_desired_document_named(
+        state,
+        config,
+        layouts,
+        selected_layout_id,
+        output_ids,
+        None,
+    ))
+    .await
 }
 
 #[allow(
@@ -492,7 +563,7 @@ async fn commit_desired_document_named(
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
     let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
-    if previous.is_none() && layouts.is_empty() {
+    if previous.is_none() && !layouts.iter().any(|layout| layout.id == selected_layout_id) {
         layouts.push(crate::repository::Layout {
             id: selected_layout_id.clone(),
             name: selected_layout_id.clone(),
@@ -534,12 +605,11 @@ async fn commit_desired_document_named(
             .and_then(|prior| prior.layouts.iter().find(|item| item.id == layout.id))
             .or_else(|| legacy.map(|entry| &entry.layout));
         let prior_version = layout_versions.get(&layout.id).copied().unwrap_or_else(|| {
+            // An envelope without a counter for this id serves it at version
+            // one (see `routes::authoritative_layout`); the projection's own
+            // counter is never consulted.
             legacy.map_or_else(
-                || {
-                    prior_layout
-                        .and_then(|_| state.repository.get_layout(&layout.id).ok())
-                        .map_or(0, |entry| entry.version.get())
-                },
+                || u64::from(prior_layout.is_some()),
                 |entry| entry.version.get(),
             )
         });
@@ -639,6 +709,34 @@ async fn commit_desired_document_named(
             }
         }
     }
+    // The file carries a display name for these families only, and a watched
+    // edit of it renames the resource exactly as a REST rename does.
+    for key in ["sources", "devices"] {
+        let before = match (&previous, &legacy) {
+            (Some(prior), _) => resource_bodies(&prior.config, &prior.output_ids, key)?,
+            (None, Some(legacy)) => legacy
+                .get(key)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(id, (body, _))| (id.clone(), body.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            (None, None) => std::collections::BTreeMap::new(),
+        };
+        let names = resource_names.entry(key.to_owned()).or_default();
+        for (id, body) in resource_bodies(&config, &output_ids, key)? {
+            let authored = body.get("display_name");
+            if before
+                .get(&id)
+                .is_some_and(|old| old.get("display_name") != authored)
+            {
+                let name = authored.and_then(serde_json::Value::as_str);
+                names.insert(id.clone(), name.unwrap_or(&id).to_owned());
+            }
+        }
+    }
     if let Some((key, id, name)) = name_change {
         let names = resource_names.entry(key.to_owned()).or_default();
         if let Some(name) = name {
@@ -647,7 +745,7 @@ async fn commit_desired_document_named(
             names.remove(id);
         }
     }
-    write_desired(
+    let written = write_desired(
         state,
         DesiredState {
             version: 1,
@@ -661,7 +759,13 @@ async fn commit_desired_document_named(
             resource_names,
         },
     )
-    .await
+    .await;
+    // Every commit is also the repair point for an earlier projection fault. An
+    // indeterminate commit is already the visible envelope, so it projects too.
+    if matches!(written, Ok(()) | Err(ControlError::CommitIndeterminate(_))) {
+        crate::layout_projection::after_commit(state).await;
+    }
+    written
 }
 
 /// Legacy (pre-envelope) accepted bodies and exact versions, per key.
@@ -681,6 +785,41 @@ where
         Ok(typed) => config_value(&typed),
         Err(_) => Ok(body),
     }
+}
+
+/// Whether two stored bodies of a resource kind are the same document. A body
+/// accepted over REST may omit defaulted fields that a config-derived body
+/// spells out, so a raw mismatch is settled through the typed schema.
+pub(crate) fn same_resource_body(
+    kind: &str,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> bool {
+    use crate::resource_store::{
+        DEVICE_KIND, OUTPUT_KIND, OVERLAY_KIND, PROBE_KIND, SOURCE_KIND, SYNC_GROUP_KIND,
+    };
+    fn typed<T>(left: &serde_json::Value, right: &serde_json::Value) -> bool
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        match (
+            canonical_body::<T>(left.clone()),
+            canonical_body::<T>(right.clone()),
+        ) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+    left == right
+        || match kind {
+            SOURCE_KIND => typed::<multiview_config::Source>(left, right),
+            OUTPUT_KIND => typed::<multiview_config::Output>(left, right),
+            OVERLAY_KIND => typed::<multiview_config::Overlay>(left, right),
+            PROBE_KIND => typed::<multiview_config::Probe>(left, right),
+            DEVICE_KIND => typed::<multiview_config::Device>(left, right),
+            SYNC_GROUP_KIND => typed::<multiview_config::SyncGroup>(left, right),
+            _ => false,
+        }
 }
 
 /// The resource-repository families, keyed as in the config document.
@@ -1244,6 +1383,12 @@ impl BootModel {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// The whole adopted configuration: what the engine is running.
+    #[must_use]
+    pub fn adopted_config(&self) -> MultiviewConfig {
+        self.lock_adopted().clone()
     }
 
     /// Apply an ADOPTED source upsert to the adopted snapshot (MAJOR-B round 4):

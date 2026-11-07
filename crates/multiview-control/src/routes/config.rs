@@ -285,20 +285,24 @@ fn compose_export_document(state: &AppState) -> ControlResult<serde_json::Value>
     ))
 }
 
-/// Compose the running JSON document from `base_document` + the live stores,
-/// **without** redaction and **without** validation. The shared composition
-/// behind the redacted export ([`compose_export_document`]), the secrets-intact
-/// Running snapshot ([`compose_running_config`]), and the adopted-state persist
-/// (`boot_model::persist_running_now`, which overrides sources/overlays with the
-/// adopted snapshot BEFORE validating — the live store can transiently fail
-/// whole-document validation, e.g. a cell referencing a just-deleted but still
-/// running source).
-pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<serde_json::Value> {
-    // The working layout carries { canvas, layout, cells }. Prefer the
-    // designated working layout (set at seed time); fall back to the id-sorted
-    // first layout document that declares a canvas (store-only deployments).
+/// The `{ canvas, layout, cells }` document the running config carries. On a
+/// modeled run that is accepted intent, or the adopted config before the first
+/// commit, so a failed or legacy layout repository can neither fail nor stale
+/// this composition. A store-only run prefers its designated working layout (set
+/// at seed time), then the id-sorted first layout document that declares a canvas.
+fn working_document(state: &AppState) -> ControlResult<serde_json::Value> {
+    if let Some(model) = &state.boot_model {
+        let desired = crate::boot_model::load_desired(model.boot_path())
+            .map_err(crate::error::ControlError::Repository)?;
+        let config = desired.map_or_else(|| model.adopted_config(), |desired| desired.config);
+        return Ok(serde_json::json!({
+            "canvas": config.canvas,
+            "layout": config.layout,
+            "cells": config.cells,
+        }));
+    }
     let layouts = state.repository.list_layouts()?;
-    let working = state
+    state
         .working_layout_id
         .as_deref()
         .and_then(|id| {
@@ -313,11 +317,24 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
                 .map(|v| &v.layout)
                 .find(|layout| layout.body.get("canvas").is_some())
         })
+        .map(|layout| layout.body.clone())
         .ok_or_else(|| {
             crate::error::ControlError::Validation(
                 "no working layout (a layout body carrying `canvas`) to export".to_owned(),
             )
-        })?;
+        })
+}
+
+/// Compose the running JSON document from `base_document` + the live stores,
+/// **without** redaction and **without** validation. The shared composition
+/// behind the redacted export ([`compose_export_document`]), the secrets-intact
+/// Running snapshot ([`compose_running_config`]), and the adopted-state persist
+/// (`boot_model::persist_running_now`, which overrides sources/overlays with the
+/// adopted snapshot BEFORE validating — the live store can transiently fail
+/// whole-document validation, e.g. a cell referencing a just-deleted but still
+/// running source).
+pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<serde_json::Value> {
+    let working = working_document(state)?;
 
     let collect = |repo: &std::sync::Arc<dyn crate::resource_store::ResourceRepository>|
      -> ControlResult<Vec<serde_json::Value>> {
@@ -347,7 +364,6 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     doc.insert(
         "canvas".to_owned(),
         working
-            .body
             .get("canvas")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
@@ -355,7 +371,6 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     doc.insert(
         "layout".to_owned(),
         working
-            .body
             .get("layout")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
@@ -363,7 +378,6 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     doc.insert(
         "cells".to_owned(),
         working
-            .body
             .get("cells")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
@@ -540,6 +554,9 @@ pub struct BootModelBody {
     pub active_path: Option<String>,
     /// Unix milliseconds of the last successful `active.toml` write this run.
     pub active_written_at_ms: Option<i64>,
+    /// Health of the saved-layout projection of the accepted envelope.
+    #[serde(default)]
+    pub layout_projection: crate::layout_projection::LayoutProjectionStatus,
 }
 
 impl BootModelBody {
@@ -556,6 +573,7 @@ impl BootModelBody {
             boot_file_error: None,
             active_path: None,
             active_written_at_ms: None,
+            layout_projection: crate::layout_projection::LayoutProjectionStatus::default(),
         }
     }
 }
@@ -637,6 +655,12 @@ pub(crate) async fn boot_model_status(
         }
         Err(reason) => (None, Some(reason)),
     };
+    // A repository error can name any layout, so only a global principal reads
+    // it (BOLA). The flag itself discloses no object.
+    let mut layout_projection = state.layout_projection.status();
+    if !principal.is_global() {
+        layout_projection.last_error = None;
+    }
     Ok(Json(BootModelBody {
         modeled: true,
         boot_path: Some(model.boot_path().display().to_string()),
@@ -648,6 +672,7 @@ pub(crate) async fn boot_model_status(
         boot_file_error,
         active_path: Some(model.active_path().display().to_string()),
         active_written_at_ms: model.active_written_ms(),
+        layout_projection,
     }))
 }
 
@@ -773,7 +798,7 @@ pub(crate) async fn revert_to_start(
     // promote must never commit a document a concurrent revert has already
     // replaced). Compose AFTER acquiring it.
     let _mutation = state.lock_config_mutation().await;
-    let (_document, running) = match compose_running_config(&state) {
+    let (_document, mut running) = match compose_running_config(&state) {
         Ok(composed) => composed,
         Err(refusal) => {
             // Nothing was applied: release the reservation so a corrected
@@ -782,6 +807,9 @@ pub(crate) async fn revert_to_start(
             return Err(refusal);
         }
     };
+    // The engine, not accepted intent, decides what a revert must still apply: a
+    // shed revert has already committed Loaded, yet its layout never landed.
+    (running.canvas, running.layout, running.cells) = model.adopted_layout();
     let diff = multiview_config::ConfigDiff::between(&running, model.loaded());
     let before_outputs = match state.outputs.list() {
         Ok(entries) => entries
@@ -808,12 +836,7 @@ pub(crate) async fn revert_to_start(
     let desired_commit = (|| {
         let layouts = crate::boot_model::layout_library(&state)?;
         let output_ids = crate::boot_model::output_ids_for_config(&state, model.loaded())?;
-        let selected = crate::boot_model::load_desired(model.boot_path())
-            .map_err(ControlError::Repository)?
-            .map(|desired| desired.selected_layout_id)
-            .or_else(|| model.selected_layout_id())
-            .or_else(|| state.working_layout_id.clone())
-            .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
+        let selected = crate::boot_model::selected_layout_id(&state, model.loaded(), &layouts)?;
         Ok::<_, ControlError>((layouts, output_ids, selected))
     })();
     let (layouts, output_ids, selected) = match desired_commit {

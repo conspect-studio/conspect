@@ -408,6 +408,8 @@ where
     // handle — promote there correctly skips suppression (nothing to suppress).
     if state.boot_model.is_some() {
         state.install_watch_handle(multiview_control::config_watch::ConfigWatchHandle::new());
+        // Boot is a repair point: a fault that outlived the last run heals here.
+        multiview_control::layout_projection::request(&state);
     }
     let mut app = multiview_control::router(state.clone());
     for mount in hls_mounts(config) {
@@ -2455,19 +2457,14 @@ fn restore_desired_layouts(
 /// The stored-layout repository for this run.
 ///
 /// With the `sqlite` feature and a config-file run (a boot model), layouts are
-/// persisted to `<config-dir>/.multiview/layouts.db`, so they survive a restart
-/// beside the persisted Running state (`active.toml`). Otherwise — or if the
-/// database cannot be opened — layouts live in memory for the life of the
-/// process (logged, never fatal: the control plane must still come up).
+/// persisted to `<config-dir>/.multiview/layouts.db`. Before the first desired
+/// commit that database is the legacy library; afterwards it is a projection of
+/// the envelope. Otherwise — or if the database cannot be opened — layouts live
+/// in memory for the life of the process (logged, never fatal: the control
+/// plane must still come up).
 #[cfg_attr(
     not(feature = "sqlite"),
     allow(clippy::unused_async, reason = "awaits only the sqlite open")
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one sqlite-vs-in-memory boot reconciliation path carries every \
-              layout-restore/seed/prune case; splitting it would scatter the \
-              single early-return control flow across helpers"
 )]
 async fn persist_layouts(
     seeded: &Arc<dyn multiview_control::repository::Repository>,
@@ -2483,59 +2480,29 @@ async fn persist_layouts(
             let url = format!("sqlite://{}?mode=rwc", path.display());
             match multiview_control::sqlite::SqliteRepository::connect(&url).await {
                 Ok(repo) => {
-                    // The desired envelope is authoritative; seed ONLY absent
-                    // ids in an older SQLite library. Never overwrite an
+                    tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
+                    // Once an envelope exists the database is only its
+                    // projection: it stays the live repository, and the repair
+                    // task `bind_and_serve` starts reconciles it. A corrupt
+                    // envelope fails startup in the caller.
+                    if !matches!(
+                        multiview_control::boot_model::load_desired(model.boot_path()),
+                        Ok(None)
+                    ) {
+                        return Arc::new(repo);
+                    }
+                    // A legacy library: seed ONLY absent ids. Never overwrite an
                     // operator-authored saved definition at boot.
-                    let desired = multiview_control::boot_model::load_desired(model.boot_path())
-                        .map_err(std::io::Error::other);
-                    let desired = match desired {
-                        Ok(desired) => desired,
-                        Err(error) => {
-                            tracing::error!(%error, "cannot restore accepted layouts");
-                            return Arc::clone(seeded);
-                        }
-                    };
-                    let from_desired = desired.is_some();
-                    let desired_ids = desired.as_ref().map(|record| {
-                        record
-                            .layouts
-                            .iter()
-                            .map(|layout| layout.id.clone())
-                            .collect::<std::collections::HashSet<_>>()
-                    });
-                    let library = desired.map_or_else(
-                        || {
-                            seeded
-                                .list_layouts()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|v| v.layout)
-                                .collect()
-                        },
-                        |record| record.layouts,
-                    );
-                    for layout in library {
-                        let id = layout.id.clone();
+                    for entry in seeded.list_layouts().unwrap_or_default() {
+                        let id = entry.layout.id;
                         let input = multiview_control::repository::LayoutInput {
-                            name: layout.name,
-                            body: layout.body,
+                            name: entry.layout.name,
+                            body: entry.layout.body,
                         };
                         let result =
                             match multiview_control::repository::Repository::get_layout(&repo, &id)
                             {
-                                Ok(existing)
-                                    if existing.layout.name == input.name
-                                        && existing.layout.body == input.body =>
-                                {
-                                    Ok(())
-                                }
-                                Ok(_) if from_desired => {
-                                    multiview_control::repository::Repository::update_layout(
-                                        &repo, &id, input,
-                                    )
-                                    .map(|_| ())
-                                }
-                                Ok(_) => Ok(()), // Legacy SQLite definition wins over boot seeding.
+                                Ok(_) => Ok(()),
                                 Err(multiview_control::ControlError::NotFound { .. }) => {
                                     multiview_control::repository::Repository::create_layout(
                                         &repo, &id, input,
@@ -2545,33 +2512,8 @@ async fn persist_layouts(
                                 Err(error) => Err(error),
                             };
                         if let Err(error) = result {
-                            tracing::error!(%error, layout = %id, "cannot restore accepted layout");
+                            tracing::error!(%error, layout = %id, "cannot seed the working layout");
                         }
-                    }
-                    if let Some(ids) = desired_ids {
-                        match multiview_control::repository::Repository::list_layouts(&repo) {
-                            Ok(entries) => {
-                                for entry in entries {
-                                    if !ids.contains(&entry.layout.id) {
-                                        if let Err(error) =
-                                            multiview_control::repository::Repository::delete_layout(
-                                                &repo,
-                                                &entry.layout.id,
-                                            )
-                                        {
-                                            tracing::error!(%error, layout = %entry.layout.id, "cannot remove stale derived layout");
-                                        }
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, "cannot inspect derived layout projection")
-                            }
-                        }
-                    }
-                    tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
-                    if from_desired {
-                        return restore_desired_layouts(model).unwrap_or_else(|| Arc::new(repo));
                     }
                     return Arc::new(repo);
                 }

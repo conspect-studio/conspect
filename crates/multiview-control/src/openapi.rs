@@ -293,6 +293,7 @@ const ASYNCAPI_JSON: &str = include_str!("../../../docs/api/asyncapi.json");
         crate::routes::config::CommitRequest,
         crate::routes::config::RollbackRequest,
         crate::routes::config::BootModelBody,
+        crate::layout_projection::LayoutProjectionStatus,
         crate::routes::config::RevertToStartBody,
         crate::routes::config::PromoteBody,
         crate::watch_status::WatchStatusBody,

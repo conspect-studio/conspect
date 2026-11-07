@@ -138,6 +138,28 @@ async fn committed_layout_survives_projection_failure() {
     let observed = send(&router, get(&resource, OPERATOR_TOKEN)).await;
     assert_eq!(observed.status(), StatusCode::OK);
     assert_eq!(support::etag(&observed), Some(next_etag));
+    // Composition reads accepted intent too: a dead projection fails neither the
+    // running document nor the status that reports it.
+    let export = send(&router, get("/api/v1/config/export", OPERATOR_TOKEN)).await;
+    assert_eq!(export.status(), StatusCode::OK);
+    let status = send(&router, get("/api/v1/config/boot-model", OPERATOR_TOKEN)).await;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status = support::body_json(status).await;
+    assert_eq!(status["layout_projection"]["degraded"], true, "{status}");
+    assert!(status["layout_projection"]["last_error"].is_string());
+    // A repository error can name any layout, so a scoped key sees only the flag.
+    let scoped = send(
+        &router,
+        get("/api/v1/config/boot-model", support::SCOPED_TOKEN),
+    )
+    .await;
+    assert_eq!(scoped.status(), StatusCode::OK);
+    let scoped = support::body_json(scoped).await;
+    assert_eq!(scoped["layout_projection"]["degraded"], true, "{scoped}");
+    assert!(
+        scoped["layout_projection"]["last_error"].is_null(),
+        "{scoped}"
+    );
 }
 
 /// A stored layout authored with only canvas geometry (the shape the web UI
