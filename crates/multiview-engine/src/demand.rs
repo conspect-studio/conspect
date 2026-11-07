@@ -966,13 +966,21 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         let handle = handle.flatten();
         let lease_id = self.inner.next_lease.fetch_add(1, Ordering::Relaxed);
         let key: Arc<str> = Arc::from(id);
+        let cap = self
+            .inner
+            .driver
+            .bounds(id)
+            .retry_cap
+            .or(self.inner.config.retry_cap);
         {
             let mut book = lock(&self.inner.book);
             let now = self.inner.now();
             let entry = book.entry(&key, now);
             entry.leases.insert(lease_id, LeaseRecord { rails, tag });
             entry.close_now = false;
-            if entry.gave_up {
+            // A new consumer retries a capped kind even before the worker has
+            // noticed the cap was reached.
+            if entry.gave_up || cap.is_some_and(|cap| entry.failures >= cap) {
                 entry.gave_up = false;
                 entry.failures = 0;
                 entry.not_before = None;
@@ -1571,15 +1579,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
             let thread_limit = config.max_concurrent_starts.max(1).saturating_mul(2);
             // Timed-out opens keep their thread and cannot be cancelled: past
             // the cap no new start may add another (review R2-03).
-            let stuck = self.stuck_opens.load(Ordering::Acquire);
-            // Opens still inside their deadline may become stuck too, so they
-            // share the bound: stuck plus opening never exceeds it.
-            let mut opening = book
-                .entries
-                .values()
-                .filter(|e| e.in_flight && !e.timed_out && e.open_deadline.is_some())
-                .count();
-            let stuck_cap = config.max_stuck_opens.max(1);
+            let mut opens = self.open_budget(&book);
             for (id, entry) in &mut book.entries {
                 let asked = entry.wanted();
                 let wanted = self.driver.resolve(id, asked);
@@ -1596,24 +1596,14 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 } else {
                     bounds.close_after.unwrap_or(config.close_after)
                 };
-                if (entry.restart || entry.stale) && entry.running.is_empty() {
-                    // Nothing runs to stop: no thread for a no-op transition.
-                    entry.restart = false;
-                    entry.stale = false;
-                    entry.close_now = false;
-                }
-                let target = if entry.restart || entry.stale {
-                    Rails::NONE
-                } else {
-                    match desired_rails(entry, wanted, now, close_after) {
-                        Desired::Hold(deadline) => {
-                            if let Some(deadline) = deadline {
-                                sooner(deadline);
-                            }
-                            continue;
+                let target = match move_target(entry, wanted, now, close_after) {
+                    Desired::Hold(deadline) => {
+                        if let Some(deadline) = deadline {
+                            sooner(deadline);
                         }
-                        Desired::Move(target) => target,
+                        continue;
                     }
+                    Desired::Move(target) => target,
                 };
                 // Backoff gates every move: a failed stop must not spin either.
                 if let Some(at) = entry.not_before.filter(|at| *at > now) {
@@ -1627,21 +1617,14 @@ impl<T: Send + Sync + 'static> Inner<T> {
                 }
                 let starting = !entry.running.covers(target);
                 if starting {
-                    if stuck >= stuck_cap {
-                        refuse_start(id, entry, stuck);
-                        continue;
-                    }
-                    // Waits (bounded: one record per wanted source) until an
-                    // open returns or times out.
-                    if stuck + opening >= stuck_cap {
-                        continue;
-                    }
                     let cap = bounds.retry_cap.or(config.retry_cap);
-                    if !admit_start(entry, cap, &mut slots_used, config, now) {
+                    if !opens.admit(id, entry)
+                        || !admit_start(entry, cap, &mut slots_used, config, now)
+                    {
                         continue;
                     }
                     entry.refused = false;
-                    opening += 1;
+                    opens.opening += 1;
                 } else if target.is_empty() && entry.close_now {
                     "stopped by an operator".clone_into(&mut entry.reason);
                 }
@@ -1677,6 +1660,33 @@ impl<T: Send + Sync + 'static> Inner<T> {
             self.launch(launch);
         }
         wake
+    }
+
+    /// How many opens may still be launched: timed-out opens keep their thread
+    /// and cannot be cancelled, and opens inside their deadline may become
+    /// stuck too, so both share one bound (review R2-03). Book lock held.
+    fn open_budget(&self, book: &Book<T>) -> OpenBudget {
+        OpenBudget {
+            stuck: self.stuck_opens.load(Ordering::Acquire),
+            opening: book
+                .entries
+                .values()
+                .filter(|e| e.in_flight && !e.timed_out && e.open_deadline.is_some())
+                .count(),
+            cap: self.config.max_stuck_opens.max(1),
+        }
+    }
+
+    /// Expire `id`'s start if it completes at or past its deadline before the
+    /// worker noticed, so lateness never depends on worker scheduling
+    /// (review R2-04). Book lock held.
+    fn expire_if_overdue(&self, book: &mut Book<T>, id: &str, now: Instant) {
+        if let Some(entry) = book.entries.get_mut(id) {
+            let overdue = entry.open_deadline.is_some_and(|deadline| now >= deadline);
+            if overdue && !entry.timed_out {
+                self.expire_open(entry, now);
+            }
+        }
     }
 
     /// Expire every overdue in-flight start; returns the next start deadline.
@@ -1827,14 +1837,7 @@ impl<T: Send + Sync + 'static> Inner<T> {
         {
             let mut book = lock(&self.book);
             let now = self.now();
-            // A start completing past its deadline is late whether or not the
-            // worker has expired it yet (review R2-04): account it once here.
-            if let Some(entry) = book.entries.get_mut(id) {
-                let overdue = entry.open_deadline.is_some_and(|deadline| now >= deadline);
-                if overdue && !entry.timed_out {
-                    self.expire_open(entry, now);
-                }
-            }
+            self.expire_if_overdue(&mut book, id, now);
             // The worker is gone: nothing would ever stop these rails, so this
             // thread does (checked under the lock `stop_all` snapshots under).
             if self.stopping.load(Ordering::Acquire) {
@@ -1958,6 +1961,25 @@ fn admit_start<T>(
     true
 }
 
+/// The stuck-open bound for one worker pass.
+struct OpenBudget {
+    stuck: usize,
+    opening: usize,
+    cap: usize,
+}
+
+impl OpenBudget {
+    /// Whether `id` may open now. At the cap of stuck opens the start is
+    /// refused (failed); while opens in progress fill the rest it waits.
+    fn admit<T>(&self, id: &str, entry: &mut Entry<T>) -> bool {
+        if self.stuck >= self.cap {
+            refuse_start(id, entry, self.stuck);
+            return false;
+        }
+        self.stuck + self.opening < self.cap
+    }
+}
+
 /// Refuse a start because `stuck` opens already hold threads that cannot be
 /// cancelled. The source reads failed, with one log line per refusal; it is
 /// retried, never queued, when a stuck open returns and wakes the worker.
@@ -1980,6 +2002,26 @@ enum Desired {
     Hold(Option<Instant>),
     /// Move to these rails.
     Move(Rails),
+}
+
+/// Where `entry` should move this pass: to nothing for a pending restart or
+/// stale rails, else toward what is wanted.
+fn move_target<T>(
+    entry: &mut Entry<T>,
+    wanted: Rails,
+    now: Instant,
+    close_after: Duration,
+) -> Desired {
+    if (entry.restart || entry.stale) && entry.running.is_empty() {
+        // Nothing runs to stop: no thread for a no-op transition.
+        entry.restart = false;
+        entry.stale = false;
+        entry.close_now = false;
+    }
+    if entry.restart || entry.stale {
+        return Desired::Move(Rails::NONE);
+    }
+    desired_rails(entry, wanted, now, close_after)
 }
 
 /// Added rails start at once. Surplus rails stop only `close_after` later, so a
@@ -2999,7 +3041,7 @@ mod tests {
                 manager.status(&id).phase == DemandPhase::Failed
             });
             assert!(fake.blocked.load(Ordering::SeqCst) <= CAP);
-            assert!(manager.inner.pending.load(Ordering::SeqCst) <= CAP as u64);
+            assert!(manager.inner.pending.load(Ordering::SeqCst) <= u64::try_from(CAP).unwrap());
             manager.remove_source(&id);
         }
         // A fresh source is refused while the cap is held, with a clear reason.
