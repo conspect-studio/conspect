@@ -569,7 +569,9 @@ struct Timed<T> {
 struct Book<T> {
     entries: HashMap<Arc<str>, Entry<T>>,
     timed: HashMap<(Arc<str>, ConsumerTag), Timed<T>>,
-    pins: BTreeMap<String, Vec<DemandLease<T>>>,
+    /// Standing leases keyed by `(owner, kind)`: an owner (a source id) holds
+    /// one independently replaceable set per kind (review DMD-01).
+    pins: BTreeMap<(String, PinKind), Vec<DemandLease<T>>>,
     /// The last generation of each source whose record was retired, so a
     /// later start continues from it (review DMD-02). Bounded by
     /// [`MAX_RETIRED_GENERATIONS`]: past it the map folds into
@@ -621,6 +623,16 @@ impl<T> Book<T> {
         }
         Some(entry)
     }
+}
+
+/// Which of an owner's standing lease sets a pin belongs to. Each kind is
+/// replaced on its own, so arming automation never drops an `always_on` pin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+pub enum PinKind {
+    /// Leases implied by the owner's own settings (activation, automation).
+    Standing,
+    /// An operator Start on the owner.
+    Manual,
 }
 
 /// One published set member: a source a group of consumers wants.
@@ -976,19 +988,33 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
         }
     }
 
-    /// Replace the standing leases owned by `owner` (a source's armed automation
-    /// or journaling). New leases are taken before the old ones drop.
+    /// Replace the standing leases owned by `owner`: every lease its own
+    /// settings imply (its `always_on` activation, its armed automation's
+    /// watched and replacement sources), as one complete set. New leases are
+    /// taken before the old ones drop.
     pub fn set_pins(&self, owner: &str, pins: Vec<(String, Rails, ConsumerTag)>) {
+        self.set_owned_pins(owner, PinKind::Standing, pins);
+    }
+
+    /// Replace `owner`'s `kind` set of standing leases; other kinds and other
+    /// owners are untouched. New before old.
+    pub fn set_owned_pins(
+        &self,
+        owner: &str,
+        kind: PinKind,
+        pins: Vec<(String, Rails, ConsumerTag)>,
+    ) {
         let leases: Vec<DemandLease<T>> = pins
             .into_iter()
             .map(|(id, rails, tag)| self.acquire(&id, rails, tag, None))
             .collect();
+        let key = (owner.to_owned(), kind);
         let previous = {
             let mut book = lock(&self.inner.book);
             if leases.is_empty() {
-                book.pins.remove(owner)
+                book.pins.remove(&key)
             } else {
-                book.pins.insert(owner.to_owned(), leases)
+                book.pins.insert(key, leases)
             }
         };
         drop(previous);
@@ -1132,7 +1158,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
     /// given-up retry. Never blocks on the source.
     pub fn start_source(&self, id: &str) {
         let tag = ConsumerTag::new(ConsumerClass::Manual, "operator");
-        self.set_pins(&manual_key(id), vec![(id.to_owned(), Rails::ALL, tag)]);
+        self.set_owned_pins(id, PinKind::Manual, vec![(id.to_owned(), Rails::ALL, tag)]);
     }
 
     /// Operator Stop. Refused, naming them, while any consumer other than an
@@ -1162,7 +1188,7 @@ impl<T: Send + Sync + 'static> DemandManager<T> {
                 entry.close_now = true;
                 entry.surplus_since = None;
             }
-            book.pins.remove(&manual_key(id))
+            book.pins.remove(&(id.to_owned(), PinKind::Manual))
         };
         drop(previous);
         self.inner.wake();
@@ -1197,11 +1223,6 @@ impl ActivityReader {
     pub fn load(&self) -> Option<Arc<ActivityMap>> {
         self.0.upgrade().map(|source| source.load_activity())
     }
-}
-
-/// The pin owner key for an operator Start. NUL cannot appear in a source id.
-fn manual_key(id: &str) -> String {
-    format!("\u{0}manual\u{0}{id}")
 }
 
 /// The phase operators see: an entry with nothing running and nothing it can

@@ -21,6 +21,9 @@ pub struct StartupDemand {
     pub rails: Rails,
 }
 
+/// One standing lease: the leased source, its rails and its tag.
+pub type StandingPin = (String, Rails, ConsumerTag);
+
 /// The manager tuning for `config`.
 #[must_use]
 pub fn demand_config(config: &MultiviewConfig) -> DemandConfig {
@@ -47,7 +50,7 @@ pub fn demand_config(config: &MultiviewConfig) -> DemandConfig {
 /// rail, so it runs whenever the source is ready. An `always_on` source is
 /// always ready, which keeps its event history.
 #[must_use]
-pub fn standing_pins(source: &Source) -> Vec<(String, Rails, ConsumerTag)> {
+pub fn standing_pins(source: &Source) -> Vec<StandingPin> {
     let mut pins = Vec::new();
     if matches!(source.kind, multiview_config::SourceKind::Aes67 { .. }) {
         // AES67 is a local multicast join outside demand; it always runs.

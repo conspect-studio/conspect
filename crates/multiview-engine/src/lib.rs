@@ -126,8 +126,8 @@ pub use cycle::{FreezeTile, RoundRobin};
 pub use degrade::{ControlLoop, ControlStep};
 pub use demand::{
     ActivityMap, ActivityReader, ConsumerClass, ConsumerSet, ConsumerTag, DemandConfig,
-    DemandLease, DemandManager, DemandPhase, DemandStatus, KindBounds, RailDriver, RailFailure,
-    Rails, SetItem, SourceActivity, StartingPhase, TransitionEvent, TransitionSink,
+    DemandLease, DemandManager, DemandPhase, DemandStatus, KindBounds, PinKind, RailDriver,
+    RailFailure, Rails, SetItem, SourceActivity, StartingPhase, TransitionEvent, TransitionSink,
     DEFAULT_CLOSE_AFTER, DEFAULT_MAX_CONCURRENT_STARTS, DEFAULT_START_TIMEOUT,
     MAX_PENDING_RESTARTS, MAX_TIMED_LEASES,
 };

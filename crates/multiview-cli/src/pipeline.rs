@@ -1572,9 +1572,9 @@ pub struct Pipeline {
     demand_config: multiview_engine::DemandConfig,
     /// What each booted source runs, for the manager to adopt.
     boot_rails: std::collections::BTreeMap<String, Rails>,
-    /// Standing leases from source settings (always-on, journaling, armed
-    /// automation).
-    boot_pins: Vec<(String, Rails, multiview_engine::ConsumerTag)>,
+    /// Standing leases from source settings (always-on, armed automation),
+    /// as one complete set per owning source (review DMD-01).
+    boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)>,
     /// The boot audio routes' consumers.
     boot_audio_routes: Vec<multiview_engine::SetItem>,
     /// The layout and audio-route consumer sets, once the manager exists.
@@ -2699,10 +2699,16 @@ impl Pipeline {
             &stores,
         );
         let demand_config = crate::source_demand::demand_config(config);
-        let boot_pins: Vec<(String, Rails, multiview_engine::ConsumerTag)> = config
+        let boot_pins: Vec<(String, Vec<crate::source_demand::StandingPin>)> = config
             .sources
             .iter()
-            .flat_map(crate::source_demand::standing_pins)
+            .map(|source| {
+                (
+                    source.id.clone(),
+                    crate::source_demand::standing_pins(source),
+                )
+            })
+            .filter(|(_, pins)| !pins.is_empty())
             .collect();
         let boot_audio_routes = crate::source_demand::audio_route_items(config.audio.as_ref());
         Ok(Self {
@@ -3016,8 +3022,10 @@ impl Pipeline {
         layout.seed(crate::source_demand::layout_items_for(&self.layout));
         let audio = manager.consumer_set(multiview_engine::ConsumerClass::AudioRoute, Rails::AUDIO);
         audio.seed(self.boot_audio_routes.clone());
-        for (id, rails, tag) in std::mem::take(&mut self.boot_pins) {
-            manager.set_pins(&id, vec![(id.clone(), rails, tag.clone())]);
+        // Keyed by the owning source, exactly as a runtime upsert keys them,
+        // so a later edit or removal replaces this very set.
+        for (owner, pins) in std::mem::take(&mut self.boot_pins) {
+            manager.set_pins(&owner, pins);
         }
         // Boot audio threads run only on a run with a program bus.
         let bus = self.encode_cfg.audio.is_some();
