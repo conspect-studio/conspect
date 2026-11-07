@@ -10617,7 +10617,7 @@ fn source_events_enabled(source: &Source) -> bool {
         source.kind,
         SourceKind::Hls { .. } | SourceKind::Youtube { .. }
     );
-    hls_like && source.events.is_none_or(|events| events.observe)
+    hls_like && source.events.as_ref().is_none_or(|events| events.observe)
 }
 
 /// Resolve a `bars` synthetic source's **line-up tone** plan (AUD-5): the source
