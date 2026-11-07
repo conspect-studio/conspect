@@ -389,6 +389,12 @@ export function useEngineEvents(): EngineEvents {
             applyMediaPlayerState(queryClient, envelope);
             return;
           }
+          case "graphics.channel_state": {
+            // A graphics channel's PVW/PGM changed (any operator): refetch
+            // the channel list the Graphics playout view renders.
+            void queryClient.invalidateQueries({ queryKey: ["graphics", "channels"] });
+            return;
+          }
           case "device.adopted":
           case "device.removed":
           case "device.mode":

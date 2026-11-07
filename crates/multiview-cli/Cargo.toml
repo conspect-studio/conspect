@@ -24,6 +24,7 @@ multiview-core = { workspace = true }
 multiview-engine = { workspace = true }
 multiview-control = { workspace = true }
 multiview-weather = { workspace = true }
+multiview-graphics = { workspace = true }
 multiview-config = { workspace = true }
 multiview-events = { workspace = true }
 # The local entitlement plane (Conspect, ADR-0050): the cli reads the published

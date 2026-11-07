@@ -2412,6 +2412,926 @@
         }
       }
     },
+    "/api/v1/graphics/channels": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/channels` (role: read; scoped rows only).",
+        "operationId": "list_channels",
+        "responses": {
+          "200": {
+            "description": "In-scope channels with PVW/PGM.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ChannelView"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/channels/{id}` — status (role: read; per-object).",
+        "operationId": "get_channel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The channel with PVW/PGM.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Out of scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/clear": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/clear` — program off air (role:\nwrite; per-object).",
+        "operationId": "clear",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayoutInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the clear.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/cue": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/cue` (role: write; per-object on the\nchannel and the item).",
+        "operationId": "cue",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CueInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the cue.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel or item.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/next": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/next` — cue the next rundown entry\n(role: write; per-object).",
+        "operationId": "next",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayoutInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the cue.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "End of rundown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/rundown": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/channels/{id}/rundown` (same as the channel status).",
+        "operationId": "get_rundown",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The channel with its rundown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`PUT /api/v1/graphics/channels/{id}/rundown` — replace the rundown (and\noptionally the transition preset / name); creates the channel when new\n(role: write; per-object on the channel and every listed item).",
+        "operationId": "put_rundown",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RundownInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unknown item / invalid preset.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/channels/{id}/take": {
+      "post": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`POST /api/v1/graphics/channels/{id}/take` — preview to air (role: write;\nper-object).",
+        "operationId": "take",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Channel id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayoutInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The channel after the take.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown channel.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Nothing cued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/data-sources": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/data-sources` (role: read; scoped rows only).",
+        "operationId": "list_data_sources",
+        "responses": {
+          "200": {
+            "description": "In-scope data sources with status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DataSourceView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/data-sources/{id}": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/data-sources/{id}` (role: read; per-object).",
+        "operationId": "get_data_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Data source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The data source.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataSourceView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Out of scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`PUT /api/v1/graphics/data-sources/{id}` (role: write; per-object).",
+        "operationId": "put_data_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Data source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DataSourceInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataSourceView"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataSourceView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`DELETE /api/v1/graphics/data-sources/{id}` (role: administer; per-object).",
+        "operationId": "delete_data_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Data source id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Still bound by an item.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/items": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/items` (role: read; scoped rows only).",
+        "operationId": "list_items",
+        "responses": {
+          "200": {
+            "description": "In-scope items.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ItemDoc"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/items/{id}": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/items/{id}` (role: read; per-object).",
+        "operationId": "get_item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The item.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemDoc"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Out of scope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`PUT /api/v1/graphics/items/{id}` (role: write; per-object on the item and\nits data source).",
+        "operationId": "put_item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ItemInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemDoc"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ItemDoc"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`DELETE /api/v1/graphics/items/{id}` (role: administer; per-object). The\nitem leaves every rundown; if it is on air it is cut to clear.",
+        "operationId": "delete_item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "403": {
+            "description": "Not authorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/items/{id}/thumbnail.jpg": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/items/{id}/thumbnail.jpg` (role: read; per-object).",
+        "operationId": "item_thumbnail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Item id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JPEG thumbnail.",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "404": {
+            "description": "Unknown id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Rendering unavailable in this build."
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/templates": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/templates` (role: read).",
+        "operationId": "list_templates",
+        "responses": {
+          "200": {
+            "description": "Built-in templates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TemplateDoc"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/graphics/templates/{id}/sample.jpg": {
+      "get": {
+        "tags": [
+          "graphics"
+        ],
+        "summary": "`GET /api/v1/graphics/templates/{id}/sample.jpg` — a sample render bound\nto the first in-scope data source of the right kind (role: read).",
+        "operationId": "template_sample",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Template id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "JPEG sample.",
+            "content": {
+              "image/jpeg": {}
+            }
+          },
+          "404": {
+            "description": "Unknown template.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Rendering unavailable in this build."
+          }
+        }
+      }
+    },
     "/api/v1/health": {
       "get": {
         "tags": [
@@ -10998,6 +11918,68 @@
           }
         }
       },
+      "ChannelView": {
+        "type": "object",
+        "description": "A channel with its live PVW/PGM state.",
+        "required": [
+          "id",
+          "name",
+          "rundown",
+          "transition",
+          "seq",
+          "program_source",
+          "preview_source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Channel id."
+          },
+          "name": {
+            "type": "string",
+            "description": "Operator-facing name."
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cued item id."
+          },
+          "preview_source": {
+            "type": "string",
+            "description": "Suggested source id carrying the preview bus (`<channel>-preview`)."
+          },
+          "program": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On-air item id."
+          },
+          "program_source": {
+            "type": "string",
+            "description": "Suggested source id carrying the program bus (`<channel>`)."
+          },
+          "rundown": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered item ids."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Increments on every program change.",
+            "minimum": 0
+          },
+          "transition": {
+            "$ref": "#/components/schemas/TransitionDoc",
+            "description": "Transition preset."
+          }
+        }
+      },
       "ClearOverrideRequestDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of [`crate::routes::tally::ClearOverrideRequest`].",
@@ -11277,6 +12259,20 @@
         },
         "additionalProperties": false
       },
+      "CueInput": {
+        "type": "object",
+        "description": "`POST cue` body.",
+        "required": [
+          "item"
+        ],
+        "properties": {
+          "item": {
+            "type": "string",
+            "description": "The item to put on preview."
+          }
+        },
+        "additionalProperties": false
+      },
       "DataKindDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_core::stream::DataKind`].",
@@ -11339,6 +12335,141 @@
           "denied",
           "expired"
         ]
+      },
+      "DataSourceDoc": {
+        "type": "object",
+        "description": "A data source document (`[[graphics.data_sources]]`).",
+        "required": [
+          "id",
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "aac": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast area code (`bom_weather`)."
+          },
+          "forecast_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast product id (`bom_weather`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Data source id."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Provider kind (`bom_weather`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id (`bom_weather`)."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id (`bom_weather`)."
+          }
+        }
+      },
+      "DataSourceInput": {
+        "type": "object",
+        "description": "`PUT` body for a data source.",
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "aac": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast area code."
+          },
+          "forecast_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM forecast product id."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Provider kind (`bom_weather`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "DataSourceView": {
+        "type": "object",
+        "description": "A data source with its live status.",
+        "required": [
+          "source",
+          "status",
+          "used_by"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/DataSourceDoc",
+            "description": "The configured source."
+          },
+          "status": {
+            "type": "string",
+            "description": "`ok` | `pending` | `error` | `expired`."
+          },
+          "used_by": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Item ids bound to this source."
+          },
+          "weather": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WeatherLocationView",
+                "description": "Weather data + freshness (`bom_weather` only)."
+              }
+            ]
+          }
+        }
       },
       "DetectionZoneDoc": {
         "type": "object",
@@ -12095,6 +13226,14 @@
         ],
         "description": "`OpenAPI` mirror of [`multiview_licence::GpuLimit`].\n\nSerde-equivalent: adjacently tagged on `kind`, value under `value`,\n`snake_case` tags (`{\"kind\":\"unlimited\"}` / `{\"kind\":\"limited\",\"value\":2}`)."
       },
+      "GraphicsBusDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::GraphicsBus`.",
+        "enum": [
+          "program",
+          "preview"
+        ]
+      },
       "HardwareClassDoc": {
         "type": "string",
         "description": "`OpenAPI` mirror of [`multiview_licence::HardwareClass`].\n\nSerde-equivalent: a unit enum rendered `snake_case`.",
@@ -12416,6 +13555,91 @@
             "description": "The NMOS per-API access grant — `x-nmos-api`."
           }
         }
+      },
+      "ItemDoc": {
+        "type": "object",
+        "description": "A graphics item.",
+        "required": [
+          "id",
+          "name",
+          "template"
+        ],
+        "properties": {
+          "data_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bound data source id."
+          },
+          "id": {
+            "type": "string",
+            "description": "Item id."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-specific key."
+          },
+          "name": {
+            "type": "string",
+            "description": "Operator-facing name."
+          },
+          "style": {
+            "$ref": "#/components/schemas/StyleDoc",
+            "description": "Style options."
+          },
+          "template": {
+            "type": "string",
+            "description": "Template id."
+          }
+        }
+      },
+      "ItemInput": {
+        "type": "object",
+        "description": "`PUT` body for an item.",
+        "required": [
+          "name",
+          "template"
+        ],
+        "properties": {
+          "data_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bound data source id."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-specific key."
+          },
+          "name": {
+            "type": "string",
+            "description": "Operator-facing name."
+          },
+          "style": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StyleDoc",
+                "description": "Style options."
+              }
+            ]
+          },
+          "template": {
+            "type": "string",
+            "description": "Template id."
+          }
+        },
+        "additionalProperties": false
       },
       "LadderStateDoc": {
         "type": "string",
@@ -14182,6 +15406,24 @@
         },
         "additionalProperties": false
       },
+      "PlayoutInput": {
+        "type": "object",
+        "description": "`POST take|clear|next` body (all fields optional; send `{}`).",
+        "properties": {
+          "transition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TransitionDoc",
+                "description": "One-shot transition override (the channel preset otherwise)."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "PreviewCapabilities": {
         "type": "object",
         "description": "The `GET /api/v1/preview/capabilities` response (ADR-P006 move 6): what preview\ntransports this build can serve, so the SPA picks WHEP vs the JPEG ladder\n(ADR-W020) **before** issuing an offer.",
@@ -15131,6 +16373,41 @@
         ],
         "description": "`OpenAPI` mirror of [`multiview_control::routing::RouteTarget`] (RT-11).\n\nThe destination a crosspoint take re-points — internally tagged on `kind`,\n`snake_case`, never `untagged`."
       },
+      "RundownInput": {
+        "type": "object",
+        "description": "`PUT /channels/{id}/rundown` body.",
+        "required": [
+          "rundown"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New channel name (unchanged when absent; required to create)."
+          },
+          "rundown": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered item ids (full replacement)."
+          },
+          "transition": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TransitionDoc",
+                "description": "New transition preset (unchanged when absent)."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "SalvoDoc": {
         "type": "object",
         "description": "`OpenAPI` mirror of [`multiview_config::Salvo`].\n\nSerde-equivalent field-for-field; the optional fields skip when empty/absent\nexactly as the config type does.",
@@ -15927,6 +17204,50 @@
           },
           {
             "type": "object",
+            "description": "One prepared graphics item rendered full-time.",
+            "required": [
+              "item",
+              "kind"
+            ],
+            "properties": {
+              "item": {
+                "type": "string",
+                "description": "The `[[graphics.items]]` id."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "graphic"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A graphics playout channel output (program or preview bus).",
+            "required": [
+              "channel",
+              "kind"
+            ],
+            "properties": {
+              "bus": {
+                "$ref": "#/components/schemas/GraphicsBusDoc",
+                "description": "`program` (default) or `preview`."
+              },
+              "channel": {
+                "type": "string",
+                "description": "The `[[graphics.channels]]` id."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "graphics_channel"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "RTSP pull.",
             "required": [
               "url",
@@ -16677,6 +17998,30 @@
         ],
         "description": "`OpenAPI` mirror of [`multiview_config::routing::StreamSelector`] (RT-4).\n\nSerde-equivalent: internally tagged on `by`, `snake_case` tags — never\n`untagged` (ADR-0010). Picks **which** elementary stream of a kind a\n[`StreamRefDoc`] addresses."
       },
+      "StyleDoc": {
+        "type": "object",
+        "description": "Item style.",
+        "properties": {
+          "accent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Accent colour `#RRGGBB`."
+          },
+          "background": {
+            "type": "string",
+            "description": "`gradient` (opaque) or `transparent`."
+          },
+          "theme": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Theme name (reserved)."
+          }
+        }
+      },
       "SupportEntitlement": {
         "type": "object",
         "description": "The full entitlement-routing answer the `GET /support/entitlement` endpoint\nreturns: whether the machine is eligible for entitled support, the route, and\nthe SLA token (a quiet line for the free tier).",
@@ -17058,6 +18403,57 @@
           }
         }
       },
+      "TemplateDoc": {
+        "type": "object",
+        "description": "A built-in template.",
+        "required": [
+          "id",
+          "family",
+          "name",
+          "description",
+          "fields",
+          "style_options"
+        ],
+        "properties": {
+          "data_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The data kind it binds (`weather`), or null."
+          },
+          "description": {
+            "type": "string",
+            "description": "What it draws."
+          },
+          "family": {
+            "type": "string",
+            "description": "Template family (`weather`)."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Data fields it reads."
+          },
+          "id": {
+            "type": "string",
+            "description": "Template id (`family.variant`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "style_options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Style options it honours."
+          }
+        }
+      },
       "TestEventRequest": {
         "type": "object",
         "description": "Request body for the operator test-injection aid.",
@@ -17372,6 +18768,26 @@
           }
         ],
         "description": "`OpenAPI` mirror of `multiview_config::timer::TimerTarget` (tagged by\n`target`; flattened into the `Timer` source variant alongside `kind`)."
+      },
+      "TransitionDoc": {
+        "type": "object",
+        "description": "A transition preset.",
+        "required": [
+          "kind",
+          "frames"
+        ],
+        "properties": {
+          "frames": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Mix duration in output frames (1–600).",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "description": "`cut` or `mix`."
+          }
+        }
       },
       "TransportBody": {
         "type": "object",
@@ -17758,6 +19174,10 @@
     {
       "name": "iptv",
       "description": "Managed IPTV playlist + XMLTV guide publication"
+    },
+    {
+      "name": "graphics",
+      "description": "Graphics (CG): data sources, templates, items and playout channels (cue / take / clear / next)"
     },
     {
       "name": "inputs",

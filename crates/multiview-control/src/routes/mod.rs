@@ -30,6 +30,7 @@ pub mod cast_sessions;
 pub mod config;
 pub mod devices;
 pub mod discovery;
+pub mod graphics;
 pub mod health;
 pub mod inputs;
 pub mod iptv;
@@ -1071,6 +1072,40 @@ fn resource_router() -> Router<AppState> {
                 .put(sources::update_source)
                 .delete(sources::delete_source),
         )
+        // Graphics (CG): data sources, templates, items, playout channels.
+        .route("/graphics/data-sources", get(graphics::list_data_sources))
+        .route(
+            "/graphics/data-sources/{id}",
+            get(graphics::get_data_source)
+                .put(graphics::put_data_source)
+                .delete(graphics::delete_data_source),
+        )
+        .route("/graphics/templates", get(graphics::list_templates))
+        .route(
+            "/graphics/templates/{id}/sample.jpg",
+            get(graphics::template_sample),
+        )
+        .route("/graphics/items", get(graphics::list_items))
+        .route(
+            "/graphics/items/{id}",
+            get(graphics::get_item)
+                .put(graphics::put_item)
+                .delete(graphics::delete_item),
+        )
+        .route(
+            "/graphics/items/{id}/thumbnail.jpg",
+            get(graphics::item_thumbnail),
+        )
+        .route("/graphics/channels", get(graphics::list_channels))
+        .route("/graphics/channels/{id}", get(graphics::get_channel))
+        .route(
+            "/graphics/channels/{id}/rundown",
+            get(graphics::get_rundown).put(graphics::put_rundown),
+        )
+        .route("/graphics/channels/{id}/cue", post(graphics::cue))
+        .route("/graphics/channels/{id}/take", post(graphics::take))
+        .route("/graphics/channels/{id}/clear", post(graphics::clear))
+        .route("/graphics/channels/{id}/next", post(graphics::next))
         // BOM weather locations (management-plane poller + normalized data).
         .route("/weather/locations", get(weather::list_locations))
         .route(

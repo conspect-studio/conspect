@@ -158,6 +158,8 @@ fn init_tracing() -> anyhow::Result<()> {
 async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Validate(args) => run_validate(&args),
+        // Heap-pinned once at startup: the run future owns the whole engine
+        // + control-plane state and exceeds clippy's large-future bound.
         Command::Run(args) => Box::pin(run_run(args)).await,
         Command::Node(args) => run_node(&args),
     }

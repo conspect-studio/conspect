@@ -328,7 +328,12 @@ where
     // BOM weather: the management-plane poller (a tokio task, never an engine
     // thread) publishing into the process-global snapshot store the weather
     // source workers read. Idle until a location is configured.
-    .with_weather(crate::weather_source::spawn_weather_service(config));
+    .with_weather(crate::weather_source::spawn_weather_service(config))
+    // Graphics (CG): the process-global hub the graphics generators read,
+    // seeded with the effective `[graphics]` (legacy `[weather]` locations
+    // folded in as bom_weather data sources), plus the off-clock thumbnailer.
+    .with_graphics(crate::graphics_source::seed_global_hub(config))
+    .with_graphics_thumbnails(std::sync::Arc::new(crate::graphics_source::CliThumbnailer));
     // The Boot/Loaded/Running model (ADR-W024): installed for a config-file
     // run so the boot-model/revert/promote routes are live; absent ⇒ those
     // routes honestly report `modeled: false`.
@@ -2171,6 +2176,8 @@ impl CommandDrain {
                 multiview_config::SourceKind::Clock { .. }
                     | multiview_config::SourceKind::Timer { .. }
                     | multiview_config::SourceKind::Weather { .. }
+                    | multiview_config::SourceKind::Graphic { .. }
+                    | multiview_config::SourceKind::GraphicsChannel { .. }
                     | multiview_config::SourceKind::Solid { .. }
             ) {
                 audio_free.insert(id);

@@ -6034,6 +6034,8 @@ fn is_intentionally_audio_free(kind: &SourceKind) -> bool {
             | SourceKind::Timer { .. }
             | SourceKind::Solid { .. }
             | SourceKind::Weather { .. }
+            | SourceKind::Graphic { .. }
+            | SourceKind::GraphicsChannel { .. }
     )
 }
 
@@ -10181,7 +10183,9 @@ fn ingest_plan_for(
         | SourceKind::Solid { .. }
         | SourceKind::Clock { .. }
         | SourceKind::Timer { .. }
-        | SourceKind::Weather { .. } => {
+        | SourceKind::Weather { .. }
+        | SourceKind::Graphic { .. }
+        | SourceKind::GraphicsChannel { .. } => {
             let kind =
                 crate::synth::SyntheticKind::from_source_kind(&source.kind).ok_or_else(|| {
                     PipelineError::Ingest {
@@ -10573,7 +10577,9 @@ fn audio_ingest_plan_for(source: &Source) -> Option<crate::audio::AudioIngestPla
         | SourceKind::Solid { .. }
         | SourceKind::Clock { .. }
         | SourceKind::Timer { .. }
-        | SourceKind::Weather { .. } => return None,
+        | SourceKind::Weather { .. }
+        | SourceKind::Graphic { .. }
+        | SourceKind::GraphicsChannel { .. } => return None,
         SourceKind::File { path } => (path.clone(), false),
         SourceKind::Rtsp { url, .. }
         | SourceKind::Hls { url }

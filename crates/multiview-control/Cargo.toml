@@ -38,6 +38,7 @@ multiview-mesh = { workspace = true }
 multiview-preview = { workspace = true }
 # BOM weather: product poller + normalized snapshot store (management plane).
 multiview-weather = { workspace = true }
+multiview-graphics = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # `net` adds `tokio::net::TcpListener` for `serve` (the real-socket bind that lets

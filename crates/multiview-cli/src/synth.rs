@@ -111,6 +111,10 @@ pub enum SyntheticKind {
         /// Opaque gradient or transparent (alpha) background.
         background: multiview_config::WeatherBackground,
     },
+    /// A Graphics (CG) item or playout channel bus. Driven by a per-tick
+    /// [`crate::graphics_source::GraphicsGen`] (prepared images + opacity
+    /// ramps from the tick counter), not by `render_key`.
+    Graphics(crate::graphics_source::GraphicsTarget),
 }
 
 impl SyntheticKind {
@@ -176,6 +180,9 @@ impl SyntheticKind {
                 template: *template,
                 background: *background,
             }),
+            SourceKind::Graphic { .. } | SourceKind::GraphicsChannel { .. } => {
+                crate::graphics_source::GraphicsTarget::from_source_kind(kind).map(Self::Graphics)
+            }
             _ => None,
         }
     }
@@ -186,7 +193,7 @@ impl SyntheticKind {
     pub const fn animated(&self) -> bool {
         matches!(
             self,
-            Self::Clock { .. } | Self::Timer { .. } | Self::Weather { .. }
+            Self::Clock { .. } | Self::Timer { .. } | Self::Weather { .. } | Self::Graphics(_)
         )
     }
 
@@ -359,6 +366,22 @@ pub fn render_at(
             height,
             canvas,
         ),
+        // One-shot render (thumbnails / tests): an item renders its template; a
+        // channel bus starts clear. Live sources use `graphics_loop`.
+        SyntheticKind::Graphics(target) => match target {
+            crate::graphics_source::GraphicsTarget::Item(id) => {
+                let config = multiview_graphics::GraphicsHub::global().config();
+                match config.item(id) {
+                    Some(item) => crate::graphics_source::render_item(item, width, height, canvas),
+                    None => Nv12Image::solid_rgb(width, height, 0, 0, 0, canvas)
+                        .map_err(|e| SynthError::Compositor(e.to_string())),
+                }
+            }
+            crate::graphics_source::GraphicsTarget::Channel { .. } => {
+                Nv12Image::solid_rgb(width, height, 0, 0, 0, canvas)
+                    .map_err(|e| SynthError::Compositor(e.to_string()))
+            }
+        },
         // Without the `overlay` feature a clock/timer cannot be baked; the caller
         // falls back honestly (ADR-0027) rather than panicking.
         #[cfg(not(feature = "overlay"))]
@@ -1031,6 +1054,16 @@ pub(crate) fn generator_loop_fenced(
     lifecycle: Option<(&str, u64)>,
 ) {
     let interval = tick_interval(cadence);
+    if let SyntheticKind::Graphics(target) = &kind {
+        graphics_loop(
+            crate::graphics_source::GraphicsGen::production(target.clone(), width, height, canvas),
+            store,
+            interval,
+            stop,
+            lifecycle,
+        );
+        return;
+    }
     let start = Instant::now();
     // (render-key, frame) so a clock re-renders once a second and statics once.
     let mut cached: Option<(i64, Arc<Nv12Image>)> = None;
@@ -1072,6 +1105,43 @@ pub(crate) fn generator_loop_fenced(
             let _ = lifecycle;
             store.publish_arc(frame, at);
         }
+        sleep_until(interval, stop);
+    }
+}
+
+/// The graphics generator loop: one [`GraphicsGen::frame`] per tick from the
+/// loop's own tick counter (opacity ramps are a pure function of it), the
+/// prepared frame republished otherwise. Never blocks on the hub.
+///
+/// [`GraphicsGen::frame`]: crate::graphics_source::GraphicsGen::frame
+fn graphics_loop(
+    mut generator: crate::graphics_source::GraphicsGen,
+    store: &TileStore<Nv12Image>,
+    interval: Duration,
+    stop: &AtomicBool,
+    lifecycle: Option<(&str, u64)>,
+) {
+    let start = Instant::now();
+    let mut tick: u64 = 0;
+    while !stop.load(Ordering::Acquire) {
+        if let Some(frame) = generator.frame(tick) {
+            let elapsed = Instant::now().saturating_duration_since(start);
+            let at = MediaTime::from_nanos(i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX));
+            #[cfg(feature = "ffmpeg")]
+            if let Some((id, epoch)) = lifecycle {
+                if !crate::pipeline::publish_live_synth_frame_for(id, epoch, store, frame, at) {
+                    return;
+                }
+            } else {
+                store.publish_arc(frame, at);
+            }
+            #[cfg(not(feature = "ffmpeg"))]
+            {
+                let _ = lifecycle;
+                store.publish_arc(frame, at);
+            }
+        }
+        tick = tick.wrapping_add(1);
         sleep_until(interval, stop);
     }
 }

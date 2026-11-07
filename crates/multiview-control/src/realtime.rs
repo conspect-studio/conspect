@@ -1282,6 +1282,7 @@ pub fn event_scope_id(event: &Event) -> Option<String> {
         // A media-player lifecycle event scopes by the player id (ADR-RT008), so
         // the `ids` filter narrows the coarse `switcher` topic to one player.
         Event::MediaPlayerState(e) => Some(e.player.clone()),
+        Event::GraphicsChannelState(e) => Some(e.channel.clone()),
         // A discovery row has no registry id yet (untrusted inventory): it is
         // correlated to its scan operation via `corr`, never a fabricated id.
         _ => None,
@@ -1389,7 +1390,7 @@ pub fn topic_for_event(event: &Event) -> Topic {
         // The broadcast-switcher lifecycle lane (ADR-RT008): a media player's
         // discrete transport-state transition rides the lossless `switcher`
         // topic (scoped finer by the player `id`), NOT the `$control` catch-all.
-        Event::MediaPlayerState(_) => Topic::Switcher,
+        Event::MediaPlayerState(_) | Event::GraphicsChannelState(_) => Topic::Switcher,
         _ => Topic::Control,
     }
 }

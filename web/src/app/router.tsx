@@ -1,6 +1,6 @@
 // The client-side route table (react-router v7). The shell (AppLayout) is the
 // layout route; screens render into its <Outlet>.
-import { createBrowserRouter } from "react-router-dom";
+import { createBrowserRouter, Navigate } from "react-router-dom";
 
 import { AppLayout } from "./AppLayout";
 import { RequireAuth } from "../auth/RequireAuth";
@@ -22,7 +22,7 @@ import { DeviceDetailPage } from "../pages/DeviceDetailPage";
 import { DevicesPage } from "../pages/DevicesPage";
 import { ProbesPage } from "../pages/ProbesPage";
 import { SyncGroupsPage } from "../pages/SyncGroupsPage";
-import { WeatherPage } from "../pages/WeatherPage";
+import { GraphicsPage } from "../pages/GraphicsPage";
 import { AuditPage } from "../pages/AuditPage";
 import { SystemPage } from "../pages/SystemPage";
 import { CapabilitiesPage } from "../pages/CapabilitiesPage";
@@ -71,7 +71,10 @@ export const router = createBrowserRouter([
       { path: "cast", element: <CastPage /> },
       { path: "routing", element: <RoutingPage /> },
       { path: "sync-groups", element: <SyncGroupsPage /> },
-      { path: "weather", element: <WeatherPage /> },
+      { path: "graphics", element: <GraphicsPage /> },
+      { path: "graphics/:view", element: <GraphicsPage /> },
+      // The former Weather page now lives in Graphics → Data.
+      { path: "weather", element: <Navigate to="/graphics/data" replace /> },
       { path: "probes", element: <ProbesPage /> },
       { path: "monitoring", element: <MonitoringPage /> },
       { path: "tally", element: <TallyPage /> },

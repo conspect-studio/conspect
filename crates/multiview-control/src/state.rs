@@ -909,6 +909,12 @@ pub struct AppState {
     /// and the shared snapshot store out). Defaults to an unspawned service
     /// over a private store; the binary installs the global one.
     pub weather: multiview_weather::service::WeatherService,
+    /// The Graphics (CG) runtime: effective `[graphics]` config + per-channel
+    /// PVW/PGM playout state. Defaults to a private hub; the binary installs
+    /// the process-global one its graphics generators read.
+    pub graphics: multiview_graphics::GraphicsHub,
+    /// Off-clock item/template thumbnail renderer (none by default).
+    pub graphics_thumbnails: crate::routes::graphics::SharedThumbnailer,
     /// The static system capability + licence snapshot served by
     /// `GET /api/v1/system/capabilities` (ADR-W030): which codec/compositor
     /// backends are available, the compositor class, the effective build-profile
@@ -1068,6 +1074,8 @@ impl AppState {
             // (`with_live_sources`) — the header never over-claims.
             live_sources: LiveSourceCapability::synthetic_only(),
             weather: multiview_weather::service::WeatherService::default(),
+            graphics: multiview_graphics::GraphicsHub::default(),
+            graphics_thumbnails: std::sync::Arc::new(crate::routes::graphics::NoThumbnails),
             // The coarse honest software-only capability surface until the binary
             // maps the real HAL probe + compiled features (`with_capabilities`,
             // ADR-W030). A static snapshot (inv #10).
@@ -1203,6 +1211,23 @@ impl AppState {
     #[must_use]
     pub fn with_live_apply(mut self, live_apply: crate::live_apply::LiveApplyCaps) -> Self {
         self.live_apply = live_apply;
+        self
+    }
+
+    /// Install the graphics hub (seeded with the effective `[graphics]`).
+    #[must_use]
+    pub fn with_graphics(mut self, graphics: multiview_graphics::GraphicsHub) -> Self {
+        self.graphics = graphics;
+        self
+    }
+
+    /// Install the off-clock graphics thumbnail renderer.
+    #[must_use]
+    pub fn with_graphics_thumbnails(
+        mut self,
+        thumbs: crate::routes::graphics::SharedThumbnailer,
+    ) -> Self {
+        self.graphics_thumbnails = thumbs;
         self
     }
 

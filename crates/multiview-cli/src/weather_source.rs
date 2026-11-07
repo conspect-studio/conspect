@@ -33,8 +33,8 @@ pub fn spawn_weather_service(
     let service = multiview_weather::service::WeatherService::new(std::sync::Arc::clone(
         WeatherStore::global(),
     ));
-    service.set_locations(multiview_control::routes::weather::location_specs(
-        &config.weather,
+    service.set_locations(multiview_control::routes::graphics::weather_specs(
+        &multiview_control::routes::graphics::effective_graphics(config),
     ));
     // The task lives for the process (the control plane lives as long).
     let _task = service.spawn(
@@ -68,7 +68,7 @@ pub fn snapshot(location: &str) -> Option<std::sync::Arc<LocationWeather>> {
 }
 
 #[cfg(feature = "overlay")]
-pub use render::render_weather;
+pub use render::{render_weather, render_weather_styled};
 
 /// Without the `overlay` feature the weather graphic cannot be drawn.
 ///
@@ -899,13 +899,33 @@ mod render {
         height: u32,
         canvas: CanvasColor,
     ) -> R<Nv12Image> {
+        render_weather_styled(data, template, bg, None, width, height, canvas)
+    }
+
+    /// [`render_weather`] with an optional accent colour (`0xRRGGBB`) that
+    /// replaces the default highlight (graphics item style).
+    ///
+    /// # Errors
+    /// [`SynthError::Compositor`] on a geometry / colour / font failure.
+    pub fn render_weather_styled(
+        data: Option<&LocationWeather>,
+        template: WeatherTemplate,
+        bg: WeatherBackground,
+        accent: Option<u32>,
+        width: u32,
+        height: u32,
+        canvas: CanvasColor,
+    ) -> R<Nv12Image> {
         let mut c = Ctx {
             engine: TextEngine::new().map_err(cc)?,
             list: OverlayDrawList::new(),
             w: f32_of(width),
             h: f32_of(height),
         };
-        let t = theme(bg);
+        let mut t = theme(bg);
+        if let Some(hex) = accent {
+            t.accent = rgb(hex, 1.0);
+        }
         background(&mut c, bg);
         match (data, template) {
             (Some(d), WeatherTemplate::Today) => today(&mut c, &t, d)?,

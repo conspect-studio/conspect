@@ -892,6 +892,17 @@ pub enum WeatherBackgroundDoc {
     Transparent,
 }
 
+/// `OpenAPI` mirror of `multiview_config::GraphicsBus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphicsBusDoc {
+    /// What is on air (transparent when clear).
+    #[default]
+    Program,
+    /// What is cued.
+    Preview,
+}
+
 /// `OpenAPI` mirror of `multiview_config::SourceKind` (tagged by `kind`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -968,6 +979,19 @@ pub enum SourceKindDoc {
         /// `gradient` (default, opaque) or `transparent` (alpha panels).
         #[serde(default)]
         background: WeatherBackgroundDoc,
+    },
+    /// One prepared graphics item rendered full-time.
+    Graphic {
+        /// The `[[graphics.items]]` id.
+        item: String,
+    },
+    /// A graphics playout channel output (program or preview bus).
+    GraphicsChannel {
+        /// The `[[graphics.channels]]` id.
+        channel: String,
+        /// `program` (default) or `preview`.
+        #[serde(default)]
+        bus: GraphicsBusDoc,
     },
     /// RTSP pull.
     Rtsp {

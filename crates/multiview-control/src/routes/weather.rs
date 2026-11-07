@@ -8,6 +8,11 @@
 //! per-product freshness straight from the poller's snapshot store.
 //! Authorization: role gates plus per-object (`authorize_object`) on every id,
 //! and the list drops out-of-scope rows (BOLA).
+//!
+//! Since the Graphics module, this API is a thin compatibility alias over the
+//! `bom_weather` data sources of `/api/v1/graphics/data-sources`: the truth is
+//! the graphics hub, and mutations go through `graphics::commit_graphics`
+//! (which migrates legacy `[weather] locations` into `[graphics]`).
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -137,7 +142,7 @@ fn doc_of(spec: &multiview_weather::service::LocationSpec) -> WeatherLocationDoc
     }
 }
 
-fn view_of(
+pub(crate) fn view_of(
     state: &AppState,
     spec: &multiview_weather::service::LocationSpec,
 ) -> WeatherLocationView {
@@ -200,7 +205,7 @@ pub(crate) async fn list_locations(
     principal: Principal,
 ) -> ControlResult<Json<Vec<WeatherLocationView>>> {
     principal.role.require(Action::Read)?;
-    let mut specs = state.weather.locations();
+    let mut specs = current_specs(&state);
     specs.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Json(
         specs
@@ -235,9 +240,7 @@ pub(crate) async fn get_location(
 ) -> ControlResult<Json<WeatherLocationView>> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let spec = state
-        .weather
-        .locations()
+    let spec = current_specs(&state)
         .into_iter()
         .find(|s| s.id == id)
         .ok_or_else(|| ControlError::NotFound {
@@ -247,51 +250,9 @@ pub(crate) async fn get_location(
     Ok(Json(view_of(&state, &spec)))
 }
 
-/// Persist `next` as the `[weather]` section through the canonical desired
-/// commit (no-op without a boot model), then hand it to the poller.
-async fn commit_locations(
-    state: &AppState,
-    next: Vec<multiview_config::WeatherLocation>,
-) -> ControlResult<()> {
-    let mut config = multiview_config::WeatherConfig::default();
-    config.locations = next;
-    config
-        .validate()
-        .map_err(|e| ControlError::Validation(e.to_string()))?;
-    if state.boot_model.is_some() {
-        let value = serde_json::to_value(&config)
-            .map_err(|e| ControlError::Repository(format!("weather serialization: {e}")))?;
-        let prospective = crate::boot_model::prospective_config(state, "weather", value)?;
-        crate::boot_model::commit_desired(
-            state,
-            prospective,
-            crate::boot_model::layout_library(state)?,
-        )
-        .await?;
-    }
-    state.weather.set_locations(location_specs(&config));
-    Ok(())
-}
-
-fn current_locations(state: &AppState) -> Vec<multiview_config::WeatherLocation> {
-    state
-        .weather
-        .locations()
-        .iter()
-        .map(|s| {
-            let doc = doc_of(s);
-            let mut l = multiview_config::WeatherLocation::new(
-                doc.id,
-                doc.name,
-                doc.forecast_product,
-                doc.aac,
-            );
-            if let (Some(p), Some(w)) = (doc.observation_product, doc.station_wmo) {
-                l = l.with_observation(p, w);
-            }
-            l
-        })
-        .collect()
+/// The `bom_weather` data sources as poller specs (the alias's truth).
+fn current_specs(state: &AppState) -> Vec<multiview_weather::service::LocationSpec> {
+    super::graphics::weather_specs(&state.graphics.config())
 }
 
 /// `PUT /api/v1/weather/locations/{id}` — create or replace a location
@@ -334,15 +295,11 @@ pub(crate) async fn put_location(
         .validate()
         .map_err(|e| ControlError::Validation(e.to_string()))?;
     let _mutation = state.lock_config_mutation().await;
-    let mut all = current_locations(&state);
-    let created = if let Some(slot) = all.iter_mut().find(|l| l.id == id) {
-        *slot = location.clone();
-        false
-    } else {
-        all.push(location.clone());
-        true
-    };
-    commit_locations(&state, all).await?;
+    let created = super::graphics::upsert_data_source(
+        &state,
+        multiview_config::GraphicsDataSource::from_weather_location(&location),
+    )
+    .await?;
     state.audit(
         &principal.key_id,
         if created {
@@ -389,16 +346,13 @@ pub(crate) async fn delete_location(
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
     let _mutation = state.lock_config_mutation().await;
-    let mut all = current_locations(&state);
-    let before = all.len();
-    all.retain(|l| l.id != id);
-    if all.len() == before {
+    if !current_specs(&state).iter().any(|s| s.id == id) {
         return Err(ControlError::NotFound {
             kind: WEATHER_LOCATION_KIND,
             id,
         });
     }
-    commit_locations(&state, all).await?;
+    super::graphics::remove_data_source(&state, &id).await?;
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

@@ -812,6 +812,26 @@ pub struct MediaPlayerEvent {
     pub position_frames: u64,
 }
 
+/// A graphics (CG) playout channel's PVW/PGM state changed (topic
+/// [`crate::topic::Topic::Switcher`]): emitted on cue / take / clear / next.
+/// Lossless lifecycle event, scoped by the channel id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphicsChannelEvent {
+    /// The graphics channel id (matches the envelope `id`).
+    pub channel: String,
+    /// The cued (preview) item id, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// The on-air (program) item id, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// Increments on every program change.
+    pub seq: u64,
+    /// The verb that produced this state (`cue`, `take`, `clear`, `next`,
+    /// `rundown`).
+    pub action: String,
+}
+
 impl MediaPlayerEvent {
     /// Construct a media-player state event for `player` entering `state` at
     /// `position_frames`, with no asset scope.
@@ -1697,6 +1717,9 @@ pub enum Event {
     /// stream.
     #[serde(rename = "media.player_state")]
     MediaPlayerState(MediaPlayerEvent),
+    /// A graphics playout channel's PVW/PGM state changed (topic `switcher`).
+    #[serde(rename = "graphics.channel_state")]
+    GraphicsChannelState(GraphicsChannelEvent),
 
     // ---- Devices realtime surface (topic `devices`, ADR-RT007) ----
     /// Conflated latest-wins per-device runtime snapshot (envelope `id` =
@@ -1781,6 +1804,7 @@ impl Event {
             Self::SalvoTaken(_) => "salvo.taken",
             Self::SalvoCancelled(_) => "salvo.cancelled",
             Self::MediaPlayerState(_) => "media.player_state",
+            Self::GraphicsChannelState(_) => "graphics.channel_state",
             Self::DeviceStatus(_) => "device.status",
             Self::DeviceAdopted(_) => "device.adopted",
             Self::DeviceRemoved(_) => "device.removed",
@@ -1833,6 +1857,7 @@ impl Event {
             Self::CastSessionStarted(e) => AuthzScope::Object(&e.session_id),
             Self::CastSessionRemoved(e) => AuthzScope::Object(&e.session_id),
             Self::MediaPlayerState(e) => AuthzScope::Object(&e.player),
+            Self::GraphicsChannelState(e) => AuthzScope::Object(&e.channel),
             // A tile bound to an input is object-scoped by that input id; a
             // placeholder/no-signal tile (`input: None`) has no authorizable
             // object and stays public (structurally id-less).
