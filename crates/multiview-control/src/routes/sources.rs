@@ -68,6 +68,43 @@ fn automation_changed(previous: &serde_json::Value, next: &serde_json::Value) ->
     automation(previous) != automation(next)
 }
 
+/// The automation rule a stored or submitted source body carries, if any.
+fn automation_rule(
+    body: &serde_json::Value,
+) -> ControlResult<Option<multiview_config::schema::EventAutomationRule>> {
+    body.get("events")
+        .and_then(|events| events.get("automation"))
+        .filter(|rule| !rule.is_null())
+        .map(|rule| {
+            serde_json::from_value(rule.clone()).map_err(|error| {
+                crate::error::ControlError::Validation(format!("events.automation: {error}"))
+            })
+        })
+        .transpose()
+}
+
+/// Per-object authorization of the automation a generic source mutation
+/// writes (review R3-01): a rule that is new or changed (including arming it)
+/// must name only a target and cells the principal may act on — the same guard
+/// the dedicated automation routes apply. Runs before anything is committed
+/// or submitted. An unchanged rule (an edit of other fields) re-asserts what
+/// an authorized principal configured and is not re-checked.
+fn authorize_written_automation(
+    principal: &Principal,
+    previous: Option<&serde_json::Value>,
+    next: &serde_json::Value,
+) -> ControlResult<()> {
+    let Some(rule) = automation_rule(next)? else {
+        return Ok(());
+    };
+    if let Some(previous) = previous {
+        if !automation_changed(previous, next) {
+            return Ok(());
+        }
+    }
+    crate::routes::source_events::authorize_rule_targets(principal, &rule)
+}
+
 /// Tell the running engine a source's standing policy (armed automation)
 /// changed. On a demand-managed run the hub re-reads the owner's complete pin
 /// set and leaves the producer alone. A kind the run cannot apply live, or a
@@ -452,6 +489,7 @@ pub(crate) async fn create_source(
         name: input.name,
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
+    authorize_written_automation(&principal, None, &input.body)?;
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // store-write → submit → adopt-snapshot sequence, so the persister (which
     // takes the same lock) can never compose mid-mutation and the adopted
@@ -544,6 +582,7 @@ pub(crate) async fn update_source(
         name: input.name,
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
+    authorize_written_automation(&principal, Some(&current.resource.body), &input.body)?;
     let previous = parse_stored_source(&current.resource.body);
     crate::boot_model::commit_resource(
         &state,

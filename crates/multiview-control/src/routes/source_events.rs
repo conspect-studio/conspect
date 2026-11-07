@@ -256,7 +256,11 @@ pub(crate) async fn get_automation(
     Ok(response)
 }
 
-fn authorize_rule_targets(
+/// Authorize `principal` over every object an automation rule acts on: its
+/// replacement target (unless a built-in bars target) and each named cell.
+/// Shared by the dedicated automation routes and the generic source
+/// create/replace, so neither path can pin an out-of-scope source (R3-01).
+pub(crate) fn authorize_rule_targets(
     principal: &Principal,
     rule: &multiview_config::schema::EventAutomationRule,
 ) -> crate::error::ControlResult<()> {

@@ -184,3 +184,96 @@ async fn per_object_authorization_and_roles() {
         StatusCode::UNPROCESSABLE_ENTITY
     );
 }
+
+/// Review R3-01: the GENERIC source create/replace authorizes the automation
+/// it writes exactly as the dedicated route does. A scoped key that owns the
+/// source but not the replacement target (or a named cell) gets 403, and
+/// nothing is stored or submitted to the engine (so nothing is pinned).
+#[tokio::test]
+async fn generic_source_writes_authorize_the_rule_target_and_cells() {
+    let mut h = harness();
+    seed(&h.router).await;
+    let _ = h.commands.try_drain();
+    let owned = "/api/v1/sources/scoped-layout";
+    let rule = |target: &str, cells: Option<Vec<&str>>| {
+        let mut on = json!({ "action": "swap_cell", "target": target });
+        if let Some(cells) = cells {
+            on["cells"] = json!(cells);
+        }
+        json!({ "id": "scoped-layout", "kind": "bars",
+            "events": { "automation": { "armed": true, "on_break_start": on } } })
+    };
+    // Create cannot bypass the guard either.
+    let resp = send(
+        &h.router,
+        post_json(
+            owned,
+            SCOPED_TOKEN,
+            &json!({ "name": "s", "body": rule("lineup", None) }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "create, foreign target"
+    );
+    assert_eq!(
+        send(&h.router, get(owned, OPERATOR_TOKEN)).await.status(),
+        StatusCode::NOT_FOUND,
+        "a refused create stores nothing"
+    );
+    assert!(h.commands.try_drain().is_empty(), "nothing submitted");
+    // The owner creates its source without a rule.
+    let resp = send(
+        &h.router,
+        post_json(
+            owned,
+            SCOPED_TOKEN,
+            &json!({ "name": "s", "body": { "id": "scoped-layout", "kind": "bars" } }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let _ = h.commands.try_drain();
+    for (body, why) in [
+        (rule("lineup", None), "foreign replacement target"),
+        (
+            rule("bars", Some(vec!["scoped-layout", "cell-elsewhere"])),
+            "foreign cell",
+        ),
+    ] {
+        let resp = send(
+            &h.router,
+            put_json(
+                owned,
+                SCOPED_TOKEN,
+                Some("W/\"1\""),
+                &json!({ "name": "s", "body": body }),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{why}");
+        let stored = send(&h.router, get(owned, OPERATOR_TOKEN)).await;
+        assert_eq!(
+            stored.headers()["etag"],
+            "W/\"1\"",
+            "{why}: nothing committed"
+        );
+        assert!(body_json(stored).await["body"]["events"].is_null(), "{why}");
+        assert!(h.commands.try_drain().is_empty(), "{why}: nothing pinned");
+    }
+    // A rule naming only objects the key may act on (the built-in bars
+    // target and its own id as a cell) is accepted.
+    let resp = send(
+        &h.router,
+        put_json(
+            owned,
+            SCOPED_TOKEN,
+            Some("W/\"1\""),
+            &json!({ "name": "s", "body": rule("bars", Some(vec!["scoped-layout"])) }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
