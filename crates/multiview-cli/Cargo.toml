@@ -183,6 +183,15 @@ serde_json = { workspace = true }
 # and output-anchored stamp monotonicity across loop laps. Matches the
 # workspace proptest pin used by multiview-core/config/etc.
 proptest = "1.5.0"
+# Test-only zlib/DEFLATE for the in-process PNG artifact the full-timer-readout
+# overlay test writes (crates/multiview-cli/src/synth.rs). The `overlay`
+# feature-gated clippy/test leg runs on a bare runner with NO `ffmpeg` binary
+# (docs: .github/workflows/ci.yml "feature-gated clippy" matrix), so the test
+# must encode its PNG itself rather than shelling out to `ffmpeg`. `flate2` is
+# already allowlisted (MIT/Apache-2.0, deny.toml) and already in the workspace
+# graph transitively via `xtask`'s `ureq`; pulling it here as a direct dev-dep
+# adds no new license/advisory surface.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).
@@ -607,6 +616,13 @@ nvidia = [
     # shipped deploy image takes/delivers `rist://` feeds (the deployed FFmpeg is
     # built `--enable-librist`). LGPL-clean (librist is BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): the shipped deploy image can resolve + ride
+    # a `youtube` source via the runtime-discovered `yt-dlp` resolver. The build
+    # still stays LGPL-clean (yt-dlp runs out-of-process; see the standalone
+    # `youtube` feature docs above for the full rationale) — before this, the web
+    # UI advertised a `youtube` source kind that no shipped build could actually
+    # run (every shipped build must carry whatever the UI advertises).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6): the shipped deploy image
     # runs the real mDNS announce/browse loop.
     "mesh-mdns",
@@ -641,6 +657,8 @@ apple = [
     "webrtc-native",
     # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): LGPL-clean (yt-dlp runs out-of-process).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6).
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
@@ -685,6 +703,8 @@ linux-vaapi = [
     "webrtc-native",
     # RIST ingest + egress (ADR-0095): LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): LGPL-clean (yt-dlp runs out-of-process).
+    "youtube",
     # Live local-mesh discovery (Conspect, ADR-0051 §6).
     "mesh-mdns",
     # Conspect device-licensing heartbeat client (CONSPECT-3, ADR-0096).
@@ -731,6 +751,10 @@ full = [
     # named explicitly so the everything-non-GPL build keeps it on a refactor.
     # LGPL-clean (librist BSD-2-Clause).
     "rist",
+    # YouTube live ingest (ADR-0015): comes transitively via the presets above;
+    # named explicitly so the everything-non-GPL build keeps it on a refactor.
+    # LGPL-clean (yt-dlp runs out-of-process, never vendored/linked).
+    "youtube",
     # Control-plane HTTPS (TLS-0, ADR-W029): comes transitively via `nvidia` +
     # `linux-vaapi`; named explicitly so `full` keeps it on a preset refactor.
     "tls",

@@ -2,7 +2,7 @@
 //!
 //! A location (`[[weather.locations]]`) names a BOM forecast product + area
 //! code and optionally an observation product + station. Mutations persist
-//! through the canonical desired-state commit (ADR-W024: `commit_desired`),
+//! through the canonical desired-state commit (ADR-W024: `commit_resource`),
 //! then hand the new location set to the management-plane poller. Reads
 //! return the normalized latest data (forecast days + latest observation) and
 //! per-product freshness straight from the poller's snapshot store.
@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
+use crate::boot_model::GRAPHICS_DATA_SOURCES_KEY;
+use crate::concurrency::IfMatch;
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
 
@@ -237,9 +239,11 @@ pub(crate) async fn get_location(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<String>,
-) -> ControlResult<Json<WeatherLocationView>> {
+) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
+    // Pair body and tag under the mutation lock (see `graphics::get_item`).
+    let _snapshot = state.lock_config_mutation().await;
     let spec = current_specs(&state)
         .into_iter()
         .find(|s| s.id == id)
@@ -247,7 +251,13 @@ pub(crate) async fn get_location(
             kind: WEATHER_LOCATION_KIND,
             id: id.clone(),
         })?;
-    Ok(Json(view_of(&state, &spec)))
+    let view = Json(view_of(&state, &spec)).into_response();
+    Ok(super::graphics::with_version(
+        &state,
+        GRAPHICS_DATA_SOURCES_KEY,
+        &id,
+        view,
+    ))
 }
 
 /// The `bom_weather` data sources as poller specs (the alias's truth).
@@ -270,6 +280,7 @@ fn current_specs(state: &AppState) -> Vec<multiview_weather::service::LocationSp
             (status = 201, description = "The location was created.", body = WeatherLocationView),
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to write this location.", body = crate::problem::Problem),
+            (status = 412, description = "A sent If-Match is stale.", body = crate::problem::Problem),
             (status = 422, description = "The body is not a valid location (detail names the field).", body = crate::problem::Problem),
         ),
     )
@@ -277,6 +288,7 @@ fn current_specs(state: &AppState) -> Vec<multiview_weather::service::LocationSp
 pub(crate) async fn put_location(
     State(state): State<AppState>,
     principal: Principal,
+    if_match: IfMatch,
     Path(id): Path<String>,
     Json(input): Json<WeatherLocationInput>,
 ) -> ControlResult<Response> {
@@ -295,6 +307,19 @@ pub(crate) async fn put_location(
         .validate()
         .map_err(|e| ControlError::Validation(e.to_string()))?;
     let _mutation = state.lock_config_mutation().await;
+    let exists = state
+        .graphics
+        .config()
+        .data_sources
+        .iter()
+        .any(|d| d.id == id);
+    super::graphics::check_if_match(
+        &state,
+        &if_match,
+        (GRAPHICS_DATA_SOURCES_KEY, WEATHER_LOCATION_KIND),
+        &id,
+        exists,
+    )?;
     let created = super::graphics::upsert_data_source(
         &state,
         multiview_config::GraphicsDataSource::from_weather_location(&location),
@@ -317,7 +342,12 @@ pub(crate) async fn put_location(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(view)).into_response())
+    Ok(super::graphics::with_version(
+        &state,
+        GRAPHICS_DATA_SOURCES_KEY,
+        &id,
+        (status, Json(view)).into_response(),
+    ))
 }
 
 /// `DELETE /api/v1/weather/locations/{id}` — remove a location (role:
@@ -335,12 +365,14 @@ pub(crate) async fn put_location(
             (status = 401, description = "Missing or invalid credentials.", body = crate::problem::Problem),
             (status = 403, description = "Not authorized to administer this location.", body = crate::problem::Problem),
             (status = 404, description = "No location with that id.", body = crate::problem::Problem),
+            (status = 412, description = "A sent If-Match is stale.", body = crate::problem::Problem),
         ),
     )
 )]
 pub(crate) async fn delete_location(
     State(state): State<AppState>,
     principal: Principal,
+    if_match: IfMatch,
     Path(id): Path<String>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
@@ -352,6 +384,13 @@ pub(crate) async fn delete_location(
             id,
         });
     }
+    super::graphics::check_if_match(
+        &state,
+        &if_match,
+        (GRAPHICS_DATA_SOURCES_KEY, WEATHER_LOCATION_KIND),
+        &id,
+        true,
+    )?;
     super::graphics::remove_data_source(&state, &id).await?;
     state.audit(
         &principal.key_id,

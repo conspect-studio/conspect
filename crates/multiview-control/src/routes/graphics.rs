@@ -8,7 +8,9 @@
 //!   `cue` / `take` / `clear` / `next`, with PVW/PGM status.
 //!
 //! Definitions persist through the canonical desired-state commit
-//! (`boot_model::commit_desired`) as the `[graphics]` section; the first
+//! (`boot_model::commit_resource`) as the `[graphics]` section, and every data
+//! source, item and channel carries a durable `ETag` from the envelope.
+//! `If-Match` is enforced when sent (`412`) and optional otherwise; the first
 //! mutation migrates legacy `[weather] locations` into
 //! `[graphics.data_sources]`; `bom_weather` sources are also mirrored into
 //! `[weather] locations` so a rollback to a pre-graphics build keeps them. Playout state is
@@ -27,6 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditAction;
 use crate::auth::{Action, Principal};
+use crate::boot_model::{GRAPHICS_CHANNELS_KEY, GRAPHICS_DATA_SOURCES_KEY, GRAPHICS_ITEMS_KEY};
+use crate::concurrency::IfMatch;
 use crate::error::{ControlError, ControlResult};
 use crate::state::AppState;
 
@@ -357,48 +361,74 @@ pub fn effective_graphics(config: &MultiviewConfig) -> GraphicsConfig {
 pub async fn commit_graphics(state: &AppState, next: GraphicsConfig) -> ControlResult<()> {
     next.validate(&WeatherConfig::default())
         .map_err(validation)?;
-    if state.boot_model.is_some() {
-        let mut document = crate::boot_model::current_desired_config(state)?;
-        let obj = document
-            .as_object_mut()
-            .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?;
-        obj.insert(
-            "graphics".into(),
-            serde_json::to_value(&next)
-                .map_err(|e| ControlError::Repository(format!("graphics serialization: {e}")))?,
-        );
-        // Mirror the bom_weather sources into the legacy `[weather]`
-        // section so a rollback to a pre-graphics build still loads them.
-        let mut legacy = WeatherConfig::default();
-        legacy.locations = next
-            .data_sources
-            .iter()
-            .filter_map(multiview_config::GraphicsDataSource::as_weather_location)
-            .collect();
-        obj.insert(
-            "weather".into(),
-            serde_json::to_value(&legacy)
-                .map_err(|e| ControlError::Repository(format!("weather serialization: {e}")))?,
-        );
-        let prospective: MultiviewConfig =
-            serde_path_to_error::deserialize(document).map_err(|e| {
-                ControlError::Validation(format!(
-                    "prospective config at `{}`: {}",
-                    e.path(),
-                    e.inner()
-                ))
-            })?;
-        prospective.validate().map_err(validation)?;
-        crate::boot_model::commit_desired(
-            state,
-            prospective,
-            crate::boot_model::layout_library(state)?,
-        )
-        .await?;
+    let body = serde_json::to_value(&next)
+        .map_err(|e| ControlError::Repository(format!("graphics serialization: {e}")))?;
+    let committed = crate::boot_model::commit_resource(
+        state,
+        crate::boot_model::GRAPHICS_KEY,
+        "section",
+        Some(body),
+        None,
+    )
+    .await;
+    // An indeterminate commit is already visible on disk, so the hub (the base
+    // of the next mutation) must follow it even though the request reports it.
+    if matches!(
+        committed,
+        Ok(()) | Err(ControlError::CommitIndeterminate(_))
+    ) {
+        state.weather.set_locations(weather_specs(&next));
+        state.graphics.set_config(next);
     }
-    state.weather.set_locations(weather_specs(&next));
-    state.graphics.set_config(next);
-    Ok(())
+    committed
+}
+
+/// Attach the durable `ETag` of one graphics resource. A run without a boot
+/// model has no durable version, and a failed reread omits the header rather
+/// than failing an already committed write.
+pub(crate) fn with_version(
+    state: &AppState,
+    key: &str,
+    id: &str,
+    mut response: Response,
+) -> Response {
+    if let Ok(Some(version)) = crate::boot_model::accepted_version(state, key, id) {
+        if let Ok(value) = header::HeaderValue::from_str(&version.to_etag()) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+    }
+    response
+}
+
+/// Enforce an `If-Match` the client sent. It is optional here: these routes
+/// predate `ETags`, and existing clients write without one. Call with the
+/// config-mutation lock held.
+///
+/// # Errors
+/// A stale tag, or any tag for a resource that does not exist, is `412`.
+pub(crate) fn check_if_match(
+    state: &AppState,
+    if_match: &IfMatch,
+    target: (&str, &'static str),
+    id: &str,
+    exists: bool,
+) -> ControlResult<()> {
+    let (key, kind) = target;
+    let Some(raw) = &if_match.raw else {
+        return Ok(());
+    };
+    if !exists {
+        return Err(ControlError::VersionConflict {
+            kind,
+            id: id.to_owned(),
+            expected: raw.clone(),
+            actual: "absent".to_owned(),
+        });
+    }
+    match crate::boot_model::accepted_version(state, key, id)? {
+        Some(current) => if_match.require(kind, id, current),
+        None => Ok(()),
+    }
 }
 
 fn current(state: &AppState) -> GraphicsConfig {
@@ -517,9 +547,12 @@ pub(crate) async fn get_data_source(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<String>,
-) -> ControlResult<Json<DataSourceView>> {
+) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
+    // The envelope commits before the hub follows, so pair body and tag under
+    // the mutation lock: a new tag on an old body would defeat `If-Match`.
+    let _snapshot = state.lock_config_mutation().await;
     let config = state.graphics.config();
     let d = config
         .data_sources
@@ -529,7 +562,8 @@ pub(crate) async fn get_data_source(
             kind: DATA_SOURCE_KIND,
             id: id.clone(),
         })?;
-    Ok(Json(data_source_view(&state, &config, d)?))
+    let view = Json(data_source_view(&state, &config, d)?).into_response();
+    Ok(with_version(&state, GRAPHICS_DATA_SOURCES_KEY, &id, view))
 }
 
 /// Normalize + validate a data-source body into its config form.
@@ -580,10 +614,12 @@ pub(crate) async fn upsert_data_source(
     responses((status = 200, description = "Replaced.", body = DataSourceView),
         (status = 201, description = "Created.", body = DataSourceView),
         (status = 403, description = "Not authorized.", body = crate::problem::Problem),
+        (status = 412, description = "A sent If-Match is stale.", body = crate::problem::Problem),
         (status = 422, description = "Invalid body.", body = crate::problem::Problem))))]
 pub(crate) async fn put_data_source(
     State(state): State<AppState>,
     principal: Principal,
+    if_match: IfMatch,
     Path(id): Path<String>,
     Json(input): Json<DataSourceInput>,
 ) -> ControlResult<Response> {
@@ -591,6 +627,19 @@ pub(crate) async fn put_data_source(
     crate::auth::authorize_object(&principal, &id)?;
     let d = data_source_of(&id, input)?;
     let _mutation = state.lock_config_mutation().await;
+    let exists = state
+        .graphics
+        .config()
+        .data_sources
+        .iter()
+        .any(|x| x.id == id);
+    check_if_match(
+        &state,
+        &if_match,
+        (GRAPHICS_DATA_SOURCES_KEY, DATA_SOURCE_KIND),
+        &id,
+        exists,
+    )?;
     let created = upsert_data_source(&state, d.clone()).await?;
     state.audit(
         &principal.key_id,
@@ -610,7 +659,12 @@ pub(crate) async fn put_data_source(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(view)).into_response())
+    Ok(with_version(
+        &state,
+        GRAPHICS_DATA_SOURCES_KEY,
+        &id,
+        (status, Json(view)).into_response(),
+    ))
 }
 
 /// Remove a data source; `409` while an item is bound to it.
@@ -647,15 +701,32 @@ pub(crate) async fn remove_data_source(state: &AppState, id: &str) -> ControlRes
     responses((status = 204, description = "Deleted."),
         (status = 403, description = "Not authorized.", body = crate::problem::Problem),
         (status = 404, description = "Unknown id.", body = crate::problem::Problem),
+        (status = 412, description = "A sent If-Match is stale.", body = crate::problem::Problem),
         (status = 409, description = "Still bound by an item.", body = crate::problem::Problem))))]
 pub(crate) async fn delete_data_source(
     State(state): State<AppState>,
     principal: Principal,
+    if_match: IfMatch,
     Path(id): Path<String>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
     let _mutation = state.lock_config_mutation().await;
+    if state
+        .graphics
+        .config()
+        .data_sources
+        .iter()
+        .any(|x| x.id == id)
+    {
+        check_if_match(
+            &state,
+            &if_match,
+            (GRAPHICS_DATA_SOURCES_KEY, DATA_SOURCE_KIND),
+            &id,
+            true,
+        )?;
+    }
     remove_data_source(&state, &id).await?;
     state.audit(
         &principal.key_id,
@@ -771,10 +842,14 @@ pub(crate) async fn get_item(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<String>,
-) -> ControlResult<Json<ItemDoc>> {
+) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    Ok(Json(item_doc(&find_item(&state, &id)?)?))
+    // The envelope commits before the hub follows, so pair body and tag under
+    // the mutation lock: a new tag on an old body would defeat `If-Match`.
+    let _snapshot = state.lock_config_mutation().await;
+    let doc = Json(item_doc(&find_item(&state, &id)?)?).into_response();
+    Ok(with_version(&state, GRAPHICS_ITEMS_KEY, &id, doc))
 }
 
 /// `PUT /api/v1/graphics/items/{id}` (role: write; per-object on the item and
@@ -784,10 +859,12 @@ pub(crate) async fn get_item(
     responses((status = 200, description = "Replaced.", body = ItemDoc),
         (status = 201, description = "Created.", body = ItemDoc),
         (status = 403, description = "Not authorized.", body = crate::problem::Problem),
+        (status = 412, description = "A sent If-Match is stale.", body = crate::problem::Problem),
         (status = 422, description = "Invalid body.", body = crate::problem::Problem))))]
 pub(crate) async fn put_item(
     State(state): State<AppState>,
     principal: Principal,
+    if_match: IfMatch,
     Path(id): Path<String>,
     Json(input): Json<ItemInput>,
 ) -> ControlResult<Response> {
@@ -813,6 +890,14 @@ pub(crate) async fn put_item(
         .map_err(|e| ControlError::Validation(format!("graphics item {id:?}: {e}")))?;
     let _mutation = state.lock_config_mutation().await;
     let mut next = current(&state);
+    let exists = next.items.iter().any(|x| x.id == id);
+    check_if_match(
+        &state,
+        &if_match,
+        (GRAPHICS_ITEMS_KEY, ITEM_KIND),
+        &id,
+        exists,
+    )?;
     let created = if let Some(slot) = next.items.iter_mut().find(|x| x.id == id) {
         *slot = item.clone();
         false
@@ -837,7 +922,8 @@ pub(crate) async fn put_item(
     } else {
         StatusCode::OK
     };
-    Ok((status, Json(item_doc(&item)?)).into_response())
+    let doc = (status, Json(item_doc(&item)?)).into_response();
+    Ok(with_version(&state, GRAPHICS_ITEMS_KEY, &id, doc))
 }
 
 /// `DELETE /api/v1/graphics/items/{id}` (role: administer; per-object). The
@@ -846,10 +932,12 @@ pub(crate) async fn put_item(
     params(("id" = String, Path, description = "Item id.")),
     responses((status = 204, description = "Deleted."),
         (status = 403, description = "Not authorized.", body = crate::problem::Problem),
+        (status = 412, description = "A sent If-Match is stale.", body = crate::problem::Problem),
         (status = 404, description = "Unknown id.", body = crate::problem::Problem))))]
 pub(crate) async fn delete_item(
     State(state): State<AppState>,
     principal: Principal,
+    if_match: IfMatch,
     Path(id): Path<String>,
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
@@ -864,6 +952,13 @@ pub(crate) async fn delete_item(
             id,
         });
     }
+    check_if_match(
+        &state,
+        &if_match,
+        (GRAPHICS_ITEMS_KEY, ITEM_KIND),
+        &id,
+        true,
+    )?;
     let affected: Vec<String> = next
         .channels
         .iter()
@@ -947,10 +1042,14 @@ pub(crate) async fn get_channel(
     State(state): State<AppState>,
     principal: Principal,
     Path(id): Path<String>,
-) -> ControlResult<Json<ChannelView>> {
+) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    Ok(Json(channel_view(&state, &find_channel(&state, &id)?)))
+    // The envelope commits before the hub follows, so pair body and tag under
+    // the mutation lock: a new tag on an old body would defeat `If-Match`.
+    let _snapshot = state.lock_config_mutation().await;
+    let view = Json(channel_view(&state, &find_channel(&state, &id)?)).into_response();
+    Ok(with_version(&state, GRAPHICS_CHANNELS_KEY, &id, view))
 }
 
 /// `PUT /api/v1/graphics/channels/{id}/rundown` — replace the rundown (and
@@ -960,13 +1059,15 @@ pub(crate) async fn get_channel(
     params(("id" = String, Path, description = "Channel id.")), request_body = RundownInput,
     responses((status = 200, description = "The channel.", body = ChannelView),
         (status = 403, description = "Not authorized.", body = crate::problem::Problem),
+        (status = 412, description = "A sent If-Match is stale.", body = crate::problem::Problem),
         (status = 422, description = "Unknown item / invalid preset.", body = crate::problem::Problem))))]
 pub(crate) async fn put_rundown(
     State(state): State<AppState>,
     principal: Principal,
+    if_match: IfMatch,
     Path(id): Path<String>,
     Json(input): Json<RundownInput>,
-) -> ControlResult<Json<ChannelView>> {
+) -> ControlResult<Response> {
     principal.role.require(Action::Write)?;
     crate::auth::authorize_object(&principal, &id)?;
     for item in &input.rundown {
@@ -975,6 +1076,13 @@ pub(crate) async fn put_rundown(
     let _mutation = state.lock_config_mutation().await;
     let mut next = current(&state);
     let created = !next.channels.iter().any(|c| c.id == id);
+    check_if_match(
+        &state,
+        &if_match,
+        (GRAPHICS_CHANNELS_KEY, CHANNEL_KIND),
+        &id,
+        !created,
+    )?;
     if created {
         next.channels.push(multiview_config::GraphicsChannel::new(
             id.clone(),
@@ -1009,7 +1117,8 @@ pub(crate) async fn put_rundown(
     if let Some(snap) = state.graphics.channel(&id) {
         publish(&state, &snap, "rundown");
     }
-    Ok(Json(channel_view(&state, &ch)))
+    let view = Json(channel_view(&state, &ch)).into_response();
+    Ok(with_version(&state, GRAPHICS_CHANNELS_KEY, &id, view))
 }
 
 /// `GET /api/v1/graphics/channels/{id}/rundown` (same as the channel status).
@@ -1021,7 +1130,7 @@ pub(crate) async fn get_rundown(
     state: State<AppState>,
     principal: Principal,
     id: Path<String>,
-) -> ControlResult<Json<ChannelView>> {
+) -> ControlResult<Response> {
     get_channel(state, principal, id).await
 }
 

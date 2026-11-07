@@ -307,14 +307,11 @@ impl DevicePollerRegistry {
         }
     }
 
-    /// Clear the tombstone for `device_id` — a **fresh legitimate create** is
-    /// beginning. The create route calls this **before** its resource-store
-    /// insert; that ordering is what keeps the tombstone sound: any delete's
-    /// tombstone is set *after* its store delete, which required some create's
-    /// store insert, which this clear *precedes* — so a clear can never erase
-    /// the tombstone of a delete that raced the same create, and only a create
-    /// that starts entirely after the delete (a real re-adopt) starts with a
-    /// clean slate. A no-op when the id is not tombstoned.
+    /// Clear the tombstone for `device_id`: a fresh legitimate create is
+    /// beginning. Create routes call this while holding the config-mutation
+    /// lock, immediately before their store insert. A delete holds that same
+    /// lock across its store delete and its [`stop`](Self::stop), so any
+    /// delete's tombstone is set before this runs and cannot land after it.
     pub fn clear_tombstone(&self, device_id: &str) {
         let _was_tombstoned = self.lock().tombstones.remove(device_id);
     }

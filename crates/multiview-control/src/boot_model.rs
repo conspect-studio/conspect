@@ -31,6 +31,7 @@ use std::time::Duration;
 use multiview_config::{MultiviewConfig, StartMode};
 
 use crate::error::{ControlError, ControlResult};
+use crate::resource_store::ResourceRepository;
 use crate::state::AppState;
 
 /// The state directory name under the boot config file's directory.
@@ -41,6 +42,54 @@ const LOADED_FILE: &str = "loaded.toml";
 const ACTIVE_FILE: &str = "active.toml";
 /// Atomic, authoritative write-ahead record of accepted operator intent.
 const DESIRED_FILE: &str = "desired.json";
+/// Families served from their store, whose versions the envelope must follow.
+const STORE_SERVED_KEYS: [&str; 6] = [
+    "overlays",
+    "probes",
+    "devices",
+    "sync_groups",
+    "salvos",
+    "tally_profiles",
+];
+/// The section-level families (rc3 additions) whose bodies live inside the
+/// config document rather than a resource store: the IPTV publication
+/// singleton and the three graphics collections. Their versions advance on
+/// every accepted body change, survive restart and never repeat.
+pub const IPTV_KEY: &str = "iptv";
+/// Graphics data sources (`[[graphics.data_sources]]`).
+pub const GRAPHICS_DATA_SOURCES_KEY: &str = "graphics_data_sources";
+/// Graphics items (`[[graphics.items]]`).
+pub const GRAPHICS_ITEMS_KEY: &str = "graphics_items";
+/// Graphics channels (`[[graphics.channels]]`).
+pub const GRAPHICS_CHANNELS_KEY: &str = "graphics_channels";
+/// The whole `[graphics]` section as one commit unit: a single edit can touch
+/// several graphics collections (deleting an item also edits rundowns) and the
+/// `[weather]` mirror, so they land atomically. Per-collection versions are
+/// derived from the body changes.
+pub const GRAPHICS_KEY: &str = "graphics";
+/// The families whose bodies live in a config section, not a resource store.
+const SECTION_KEYS: [&str; 4] = [
+    IPTV_KEY,
+    GRAPHICS_DATA_SOURCES_KEY,
+    GRAPHICS_ITEMS_KEY,
+    GRAPHICS_CHANNELS_KEY,
+];
+/// Every family with a durable per-resource version in the envelope.
+const VERSIONED_KEYS: [&str; 13] = [
+    "sources",
+    "outputs",
+    "audio",
+    "overlays",
+    "probes",
+    "devices",
+    "sync_groups",
+    "salvos",
+    "tally_profiles",
+    IPTV_KEY,
+    GRAPHICS_DATA_SOURCES_KEY,
+    GRAPHICS_ITEMS_KEY,
+    GRAPHICS_CHANNELS_KEY,
+];
 
 /// The complete accepted intent. A library edit and its selected working layout
 /// share one atomic commit with the configuration, rather than racing SQLite
@@ -163,15 +212,10 @@ pub async fn commit_desired(
     config: MultiviewConfig,
     layouts: Vec<crate::repository::Layout>,
 ) -> ControlResult<()> {
-    let Some(model) = &state.boot_model else {
+    if state.boot_model.is_none() {
         return Ok(());
-    };
-    let selected_layout_id = load_desired(model.boot_path())
-        .map_err(ControlError::Repository)?
-        .map(|desired| desired.selected_layout_id)
-        .or_else(|| model.selected_layout_id())
-        .or_else(|| state.working_layout_id.clone())
-        .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
+    }
+    let selected_layout_id = selected_layout_id(state, &config, &layouts)?;
     commit_desired_with_selection(state, config, layouts, selected_layout_id).await
 }
 
@@ -201,10 +245,13 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
     let json = serde_json::to_string(&desired)
         .map_err(|e| ControlError::Repository(format!("serializing desired state: {e}")))?;
     let model = Arc::clone(model);
-    tokio::task::spawn_blocking(move || {
-        let _serial = model.lock_writes();
-        create_state_dir(&model.state_dir()).map_err(AtomicWriteError::BeforeRename)?;
-        write_atomic_commit(&model.state_dir().join(DESIRED_FILE), &json)
+    let result = tokio::task::spawn_blocking({
+        let model = Arc::clone(&model);
+        move || {
+            let _serial = model.lock_writes();
+            create_state_dir(&model.state_dir()).map_err(AtomicWriteError::BeforeRename)?;
+            write_atomic_commit(&model.state_dir().join(DESIRED_FILE), &json)
+        }
     })
     .await
     .map_err(|e| ControlError::Repository(format!("desired-state write task failed: {e}")))?
@@ -215,22 +262,110 @@ async fn write_desired(state: &AppState, desired: DesiredState) -> ControlResult
         AtomicWriteError::AfterRename(e) => ControlError::CommitIndeterminate(format!(
             "desired-state rename is visible but directory sync failed: {e}"
         )),
-    })
+    });
+    // Review R3-03: the rename is visible on disk in BOTH outcomes below (a
+    // plain success, or the indeterminate "renamed but directory sync
+    // failed" case every caller already treats as committed) — swap the
+    // in-memory snapshot to match what a fresh `load_desired` would now
+    // return, under the SAME `lock_config_mutation` every commit serializes
+    // under, so a concurrent reader's lazy load can never race this.
+    if matches!(result, Ok(()) | Err(ControlError::CommitIndeterminate(_))) {
+        model.set_accepted(desired);
+    }
+    result
 }
 
-/// Read the accepted config, or compose the initial config on migration.
+/// Read the accepted config. Before the first commit (migration of an existing
+/// install) the accepted config is the document this run started from: every
+/// modeled mutation commits first, so nothing can have changed it yet. The
+/// stores are not composed here. They list id-sorted, which reorders outputs
+/// against their positional identities, and a retained `SQLite` definition of
+/// the working layout would silently replace the running canvas and cells.
 ///
 /// # Errors
 /// An invalid record or a failed store composition returns an error.
 pub fn current_desired_config(state: &AppState) -> ControlResult<serde_json::Value> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
-            return serde_json::to_value(desired.config).map_err(|e| {
-                ControlError::Repository(format!("serializing accepted config: {e}"))
-            });
-        }
+        let config = model
+            .accepted()
+            .map_err(ControlError::Repository)?
+            .map_or_else(|| model.adopted_config(), |desired| desired.config.clone());
+        return serde_json::to_value(config)
+            .map_err(|e| ControlError::Repository(format!("serializing accepted config: {e}")));
     }
     crate::routes::config::compose_document_unredacted(state)
+}
+
+/// The selected layout identity for a commit. An envelope owns it; before the
+/// first commit it rebinds to the library entry the run is actually showing, so
+/// a legacy install that applied a saved layout keeps that selection.
+///
+/// # Errors
+/// A corrupt record, a failed legacy read, or no usable identity returns an error.
+pub fn selected_layout_id(
+    state: &AppState,
+    config: &MultiviewConfig,
+    layouts: &[crate::repository::Layout],
+) -> ControlResult<String> {
+    let model = state
+        .boot_model
+        .as_ref()
+        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+    if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
+        return Ok(desired.selected_layout_id.clone());
+    }
+    if let Some(selected) = model.selected_layout_id() {
+        return Ok(selected);
+    }
+    let working = state.working_layout_id.as_deref();
+    // The repository, not `layouts`: the first commit may itself be an edit of
+    // the very definition being matched.
+    let legacy = state.repository.list_layouts()?;
+    let matching = |entry: &&crate::repository::VersionedLayout| {
+        layouts.iter().any(|layout| layout.id == entry.layout.id)
+            && layout_body_is_running(&entry.layout.body, config)
+    };
+    // The working entry is seeded from the running config, so it matches
+    // trivially. A single matching saved definition is the operator's applied
+    // choice; several are ambiguous, so the working entry wins.
+    let mut saved = legacy
+        .iter()
+        .filter(matching)
+        .filter(|entry| Some(entry.layout.id.as_str()) != working);
+    match (saved.next(), saved.next()) {
+        (Some(only), None) => Ok(only.layout.id.clone()),
+        _ => working
+            .map(str::to_owned)
+            .or_else(|| {
+                legacy
+                    .iter()
+                    .find(matching)
+                    .map(|entry| entry.layout.id.clone())
+            })
+            .ok_or_else(|| ControlError::Validation("no selected working layout".into())),
+    }
+}
+
+/// Whether a saved body, applied over `config`, is what `config` already shows.
+/// The comparison is typed because an authored body omits defaulted fields, and
+/// a saved canvas may be partial (apply-layout merges it over the running one).
+fn layout_body_is_running(body: &serde_json::Value, config: &MultiviewConfig) -> bool {
+    let Ok(mut canvas) = serde_json::to_value(&config.canvas) else {
+        return false;
+    };
+    let (Some(fields), Some(saved)) = (
+        canvas.as_object_mut(),
+        body.get("canvas").and_then(serde_json::Value::as_object),
+    ) else {
+        return false;
+    };
+    fields.extend(saved.clone());
+    let parsed = |key: &str| body.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::from_value::<multiview_config::Canvas>(canvas).is_ok_and(|c| c == config.canvas)
+        && serde_json::from_value::<multiview_config::Layout>(parsed("layout"))
+            .is_ok_and(|layout| layout == config.layout)
+        && serde_json::from_value::<Vec<multiview_config::Cell>>(parsed("cells"))
+            .is_ok_and(|cells| cells == config.cells)
 }
 
 /// Compose a prospective config by replacing the owned section of the settled
@@ -257,7 +392,51 @@ pub fn prospective_config(
     })
 }
 
+/// Serialize a typed config item into its durable desired-document form.
+///
+/// # Errors
+/// A serialization fault is a repository error (never a panic).
+pub fn config_value<T: serde::Serialize>(item: &T) -> ControlResult<serde_json::Value> {
+    serde_json::to_value(item)
+        .map_err(|e| ControlError::Repository(format!("serializing a config item: {e}")))
+}
+
+/// Fail a create whose id already exists in the store projection, BEFORE the
+/// desired envelope is committed (review H1: no durable write for a request
+/// that the store would then refuse).
+///
+/// # Errors
+/// An existing id is a validation error; any non-`NotFound` read fault propagates.
+pub fn require_absent<T>(lookup: ControlResult<T>, kind: &str, id: &str) -> ControlResult<()> {
+    match lookup {
+        Ok(_) => Err(ControlError::Validation(format!(
+            "{kind} {id:?} already exists"
+        ))),
+        Err(ControlError::NotFound { .. }) => Ok(()),
+        Err(other) => Err(other),
+    }
+}
+
+/// Report a store write that failed AFTER its durable commit. The edit is
+/// accepted, so a plain failure would tell the client to retry something that
+/// already landed. Without a boot model nothing was committed and the store
+/// error stands.
+#[must_use]
+pub fn after_commit(state: &AppState, error: ControlError) -> ControlError {
+    if state.boot_model.is_none() || matches!(error, ControlError::CommitIndeterminate(_)) {
+        return error;
+    }
+    ControlError::CommitIndeterminate(format!(
+        "the change was committed, but its store projection failed; GET before retrying: {error}"
+    ))
+}
+
 /// Persist a prospective resource collection before its store changes.
+///
+/// Every runtime-mutable config collection (sources, outputs, overlays,
+/// probes, devices, sync groups, salvos, tally profiles) and section (`iptv`,
+/// `graphics` with its `weather` mirror) commits through here (review H1), so `desired.json` is the single source of truth for accepted
+/// configuration and an unrelated later commit can never revert an edit.
 ///
 /// # Errors
 /// Invalid cross-references or failed atomic I/O reject the mutation.
@@ -270,6 +449,9 @@ pub async fn commit_resource(
 ) -> ControlResult<()> {
     if state.boot_model.is_none() {
         return Ok(());
+    }
+    if key == IPTV_KEY || key == GRAPHICS_KEY {
+        return commit_section(state, key, replacement).await;
     }
     let mut document = current_desired_config(state)?;
     let object = document
@@ -285,14 +467,14 @@ pub async fn commit_resource(
             .boot_model
             .as_ref()
             .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-        let prior = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
+        let prior = model.accepted().map_err(ControlError::Repository)?;
         let ids = prior.map_or_else(
             || {
                 (0..entries.len())
                     .map(|index| format!("output-{index}"))
                     .collect::<Vec<_>>()
             },
-            |desired| desired.output_ids,
+            |desired| desired.output_ids.clone(),
         );
         if let Some(index) = ids.iter().position(|existing| existing == id) {
             if let Some(body) = replacement.clone() {
@@ -312,9 +494,22 @@ pub async fn commit_resource(
             });
         }
     } else {
-        entries.retain(|entry| entry.get("id").and_then(serde_json::Value::as_str) != Some(id));
-        if let Some(body) = replacement {
-            entries.push(body);
+        // Replace in place so an edit never reorders draw/recall order; a
+        // create appends and a delete removes (review H1).
+        let position = entries
+            .iter()
+            .position(|entry| entry.get("id").and_then(serde_json::Value::as_str) == Some(id));
+        match (position, replacement) {
+            (Some(index), Some(body)) => {
+                if let Some(slot) = entries.get_mut(index) {
+                    *slot = body;
+                }
+            }
+            (Some(index), None) => {
+                entries.remove(index);
+            }
+            (None, Some(body)) => entries.push(body),
+            (None, None) => {}
         }
     }
     let config: MultiviewConfig = serde_path_to_error::deserialize(document).map_err(|e| {
@@ -329,15 +524,7 @@ pub async fn commit_resource(
         .boot_model
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
-    let mut output_ids = previous.map_or_else(
-        || {
-            (0..state.outputs.list().map_or(0, |items| items.len()))
-                .map(|index| format!("output-{index}"))
-                .collect::<Vec<_>>()
-        },
-        |desired| desired.output_ids,
-    );
+    let mut output_ids = current_output_ids(state, model)?;
     if key == "outputs" {
         if !output_ids.iter().any(|existing| existing == id) {
             if is_create {
@@ -350,6 +537,106 @@ pub async fn commit_resource(
     commit_desired_with_output_ids(state, config, layouts, output_ids, Some((key, id, name))).await
 }
 
+/// The accepted output identity map, or the seeded positional ids before the
+/// first envelope. An edit that keeps the output list must carry this map
+/// forward: re-deriving identities from bodies refuses id-less outputs whose
+/// body changed, or that are equal to one another.
+///
+/// Served from the in-memory accepted snapshot (review R3-03), the same
+/// source every accepted read uses, so no edit re-reads `desired.json`.
+fn current_output_ids(state: &AppState, model: &BootModel) -> ControlResult<Vec<String>> {
+    Ok(model
+        .accepted()
+        .map_err(ControlError::Repository)?
+        .map_or_else(
+            || {
+                (0..state.outputs.list().map_or(0, |items| items.len()))
+                    .map(|index| format!("output-{index}"))
+                    .collect::<Vec<_>>()
+            },
+            |desired| desired.output_ids.clone(),
+        ))
+}
+
+/// Commit a section-level family (`[iptv]`, `[graphics]`) through the same
+/// transaction as every collection. A `[graphics]` commit also rewrites its
+/// `[weather]` mirror, so a rollback to a pre-graphics build keeps the
+/// `bom_weather` sources.
+async fn commit_section(
+    state: &AppState,
+    key: &str,
+    replacement: Option<serde_json::Value>,
+) -> ControlResult<()> {
+    let model = state
+        .boot_model
+        .as_ref()
+        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
+    let mut document = current_desired_config(state)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| ControlError::Repository("config base is not an object".into()))?;
+    if key == GRAPHICS_KEY {
+        let graphics: multiview_config::GraphicsConfig = replacement
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| ControlError::Validation(format!("graphics document: {e}")))?
+            .unwrap_or_default();
+        let mut legacy = multiview_config::WeatherConfig::default();
+        legacy.locations = graphics
+            .data_sources
+            .iter()
+            .filter_map(multiview_config::GraphicsDataSource::as_weather_location)
+            .collect();
+        object.insert("weather".into(), config_value(&legacy)?);
+    }
+    match replacement {
+        Some(body) => object.insert(key.to_owned(), body),
+        None => object.remove(key),
+    };
+    let config: MultiviewConfig = serde_path_to_error::deserialize(document).map_err(|e| {
+        ControlError::Validation(format!(
+            "prospective configuration at `{}`: {}",
+            e.path(),
+            e.inner()
+        ))
+    })?;
+    let layouts = layout_library(state)?;
+    let output_ids = current_output_ids(state, model)?;
+    commit_desired_with_output_ids(state, config, layouts, output_ids, None).await
+}
+
+/// Commit a multi-resource edit that keeps the accepted output identities: the
+/// audio-routing singleton plus the output selections its rename/removal
+/// propagation rewrote land in one transaction.
+///
+/// # Errors
+/// Invalid intent or failed atomic I/O prevents publication.
+pub async fn commit_keeping_output_ids(
+    state: &AppState,
+    config: MultiviewConfig,
+) -> ControlResult<()> {
+    let Some(model) = state.boot_model.as_ref() else {
+        return Ok(());
+    };
+    let layouts = layout_library(state)?;
+    let output_ids = current_output_ids(state, model)?;
+    commit_desired_with_output_ids(state, config, layouts, output_ids, None).await
+}
+
+/// The accepted output identities, aligned with the prospective `outputs`.
+/// `None` without a boot model.
+///
+/// # Errors
+/// A corrupt accepted record fails closed.
+pub fn accepted_output_ids(state: &AppState) -> ControlResult<Option<Vec<String>>> {
+    state
+        .boot_model
+        .as_ref()
+        .map(|model| current_output_ids(state, model))
+        .transpose()
+}
+
 /// Commit a prospective output identity map alongside the full config.
 async fn commit_desired_with_output_ids(
     state: &AppState,
@@ -358,24 +645,16 @@ async fn commit_desired_with_output_ids(
     output_ids: Vec<String>,
     name_change: Option<(&str, &str, Option<String>)>,
 ) -> ControlResult<()> {
-    let model = state
-        .boot_model
-        .as_ref()
-        .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    let selected_layout_id = load_desired(model.boot_path())
-        .map_err(ControlError::Repository)?
-        .map(|desired| desired.selected_layout_id)
-        .or_else(|| model.selected_layout_id())
-        .or_else(|| state.working_layout_id.clone())
-        .ok_or_else(|| ControlError::Validation("no selected working layout".into()))?;
-    commit_desired_document_named(
+    let selected_layout_id = selected_layout_id(state, &config, &layouts)?;
+    // Boxed: the transaction future is large, and every route awaits it.
+    Box::pin(commit_desired_document_named(
         state,
         config,
         layouts,
         selected_layout_id,
         output_ids,
         name_change,
-    )
+    ))
     .await
 }
 
@@ -392,8 +671,15 @@ pub async fn commit_desired_document(
     selected_layout_id: String,
     output_ids: Vec<String>,
 ) -> ControlResult<()> {
-    commit_desired_document_named(state, config, layouts, selected_layout_id, output_ids, None)
-        .await
+    Box::pin(commit_desired_document_named(
+        state,
+        config,
+        layouts,
+        selected_layout_id,
+        output_ids,
+        None,
+    ))
+    .await
 }
 
 #[allow(
@@ -412,8 +698,8 @@ async fn commit_desired_document_named(
         .boot_model
         .as_ref()
         .ok_or_else(|| ControlError::Repository("missing boot model".into()))?;
-    let previous = load_desired(model.boot_path()).map_err(ControlError::Repository)?;
-    if previous.is_none() && layouts.is_empty() {
+    let previous = model.accepted().map_err(ControlError::Repository)?;
+    if previous.is_none() && !layouts.iter().any(|layout| layout.id == selected_layout_id) {
         layouts.push(crate::repository::Layout {
             id: selected_layout_id.clone(),
             name: selected_layout_id.clone(),
@@ -433,14 +719,35 @@ async fn commit_desired_document_named(
         .map_or_else(std::collections::BTreeMap::new, |prior| {
             prior.layout_versions.clone()
         });
+    // Review H2: before the first envelope exists, the legacy repository is
+    // the accepted state. Import its exact bodies and versions so the first
+    // commit advances existing counters instead of restarting them at 1 (a
+    // reset would hand a stale `If-Match` the same tag as the new body).
+    let legacy_layouts: std::collections::BTreeMap<String, crate::repository::VersionedLayout> =
+        if previous.is_none() {
+            state
+                .repository
+                .list_layouts()?
+                .into_iter()
+                .map(|entry| (entry.layout.id.clone(), entry))
+                .collect()
+        } else {
+            std::collections::BTreeMap::new()
+        };
     for layout in &layouts {
+        let legacy = legacy_layouts.get(&layout.id);
         let prior_layout = previous
             .as_ref()
-            .and_then(|prior| prior.layouts.iter().find(|item| item.id == layout.id));
+            .and_then(|prior| prior.layouts.iter().find(|item| item.id == layout.id))
+            .or_else(|| legacy.map(|entry| &entry.layout));
         let prior_version = layout_versions.get(&layout.id).copied().unwrap_or_else(|| {
-            prior_layout
-                .and_then(|_| state.repository.get_layout(&layout.id).ok())
-                .map_or(0, |entry| entry.version.get())
+            // An envelope without a counter for this id serves it at version
+            // one (see `routes::authoritative_layout`); the projection's own
+            // counter is never consulted.
+            legacy.map_or_else(
+                || u64::from(prior_layout.is_some()),
+                |entry| entry.version.get(),
+            )
         });
         if prior_layout == Some(layout) {
             layout_versions.insert(layout.id.clone(), prior_version.max(1));
@@ -458,19 +765,58 @@ async fn commit_desired_document_named(
         .map_or_else(std::collections::BTreeMap::new, |prior| {
             prior.resource_versions.clone()
         });
-    for key in ["sources", "outputs", "audio"] {
+    let legacy = if previous.is_none() {
+        Some(legacy_resources(state)?)
+    } else {
+        None
+    };
+    for key in VERSIONED_KEYS {
         let new_bodies = resource_bodies(&config, &output_ids, key)?;
-        let old_bodies = previous
-            .as_ref()
-            .map(|prior| resource_bodies(&prior.config, &prior.output_ids, key))
-            .transpose()?
-            .unwrap_or_default();
+        let live = store_versions(state, key);
+        let old_bodies = match (&previous, &legacy) {
+            (Some(prior), _) => resource_bodies(&prior.config, &prior.output_ids, key)?,
+            (None, Some(legacy)) => legacy
+                .get(key)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(id, (body, _))| (id.clone(), body.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            (None, None) => std::collections::BTreeMap::new(),
+        };
         let counters = resource_versions.entry(key.to_owned()).or_default();
+        if let Some(entries) = legacy.as_ref().and_then(|legacy| legacy.get(key)) {
+            for (id, (_, version)) in entries {
+                counters.entry(id.clone()).or_insert(*version);
+            }
+        }
         for (id, body) in &new_bodies {
+            // Store-served families bump their store on every accepted write,
+            // so the envelope follows the higher of the two: a restart must
+            // never hand back a tag older than one a client already saw.
             let base = counters
                 .get(id)
                 .copied()
-                .unwrap_or_else(|| u64::from(old_bodies.contains_key(id) || key == "audio"));
+                .unwrap_or_else(|| {
+                    // Section families have a pre-envelope tag of 1 for state
+                    // the prior config did not carry: the IPTV default, the
+                    // hub's default channel and legacy `[weather]` sources.
+                    // Starting at 1 makes their first edit advance past it.
+                    u64::from(
+                        old_bodies.contains_key(id)
+                            || key == "audio"
+                            || SECTION_KEYS.contains(&key),
+                    )
+                })
+                .max(live.get(id).copied().unwrap_or(0));
+            let touched = STORE_SERVED_KEYS.contains(&key)
+                && name_change
+                    .as_ref()
+                    .is_some_and(|(changed_key, changed_id, _)| {
+                        *changed_key == key && *changed_id == id
+                    });
             let name_changed =
                 name_change
                     .as_ref()
@@ -486,7 +832,7 @@ async fn commit_desired_document_named(
                                     != name
                             })
                     });
-            let version = if old_bodies.get(id) == Some(body) && !name_changed {
+            let version = if old_bodies.get(id) == Some(body) && !name_changed && !touched {
                 base.max(1)
             } else {
                 base.checked_add(1)
@@ -502,10 +848,38 @@ async fn commit_desired_document_named(
             prior.resource_names.clone()
         });
     if previous.is_none() {
-        for (key, store) in [("sources", &state.sources), ("outputs", &state.outputs)] {
+        for (key, store) in named_stores(state) {
             let names = resource_names.entry(key.to_owned()).or_default();
             for entry in store.list()? {
                 names.insert(entry.resource.id, entry.resource.name);
+            }
+        }
+    }
+    // The file carries a display name for these families only, and a watched
+    // edit of it renames the resource exactly as a REST rename does.
+    for key in ["sources", "devices"] {
+        let before = match (&previous, &legacy) {
+            (Some(prior), _) => resource_bodies(&prior.config, &prior.output_ids, key)?,
+            (None, Some(legacy)) => legacy
+                .get(key)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(id, (body, _))| (id.clone(), body.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            (None, None) => std::collections::BTreeMap::new(),
+        };
+        let names = resource_names.entry(key.to_owned()).or_default();
+        for (id, body) in resource_bodies(&config, &output_ids, key)? {
+            let authored = body.get("display_name");
+            if before
+                .get(&id)
+                .is_some_and(|old| old.get("display_name") != authored)
+            {
+                let name = authored.and_then(serde_json::Value::as_str);
+                names.insert(id.clone(), name.unwrap_or(&id).to_owned());
             }
         }
     }
@@ -517,7 +891,7 @@ async fn commit_desired_document_named(
             names.remove(id);
         }
     }
-    write_desired(
+    let written = write_desired(
         state,
         DesiredState {
             version: 1,
@@ -531,7 +905,292 @@ async fn commit_desired_document_named(
             resource_names,
         },
     )
-    .await
+    .await;
+    // Every commit is also the repair point for an earlier projection fault. An
+    // indeterminate commit is already the visible envelope, so it projects too.
+    if matches!(written, Ok(()) | Err(ControlError::CommitIndeterminate(_))) {
+        crate::layout_projection::after_commit(state).await;
+    }
+    written
+}
+
+/// Legacy (pre-envelope) accepted bodies and exact versions, per key.
+type LegacyResources = std::collections::BTreeMap<
+    &'static str,
+    std::collections::BTreeMap<String, (serde_json::Value, u64)>,
+>;
+
+/// Re-serialize a stored body through its typed schema so an unchanged item
+/// compares equal to its config form (no spurious version bump). A body that
+/// does not parse is kept as stored.
+fn canonical_body<T>(body: serde_json::Value) -> ControlResult<serde_json::Value>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    match serde_json::from_value::<T>(body.clone()) {
+        Ok(typed) => config_value(&typed),
+        Err(_) => Ok(body),
+    }
+}
+
+/// Whether two stored bodies of a resource kind are the same document. A body
+/// accepted over REST may omit defaulted fields that a config-derived body
+/// spells out, so a raw mismatch is settled through the typed schema.
+pub(crate) fn same_resource_body(
+    kind: &str,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> bool {
+    use crate::resource_store::{
+        DEVICE_KIND, OUTPUT_KIND, OVERLAY_KIND, PROBE_KIND, SOURCE_KIND, SYNC_GROUP_KIND,
+    };
+    fn typed<T>(left: &serde_json::Value, right: &serde_json::Value) -> bool
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        match (
+            canonical_body::<T>(left.clone()),
+            canonical_body::<T>(right.clone()),
+        ) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+    left == right
+        || match kind {
+            SOURCE_KIND => typed::<multiview_config::Source>(left, right),
+            OUTPUT_KIND => typed::<multiview_config::Output>(left, right),
+            OVERLAY_KIND => typed::<multiview_config::Overlay>(left, right),
+            PROBE_KIND => typed::<multiview_config::Probe>(left, right),
+            DEVICE_KIND => typed::<multiview_config::Device>(left, right),
+            SYNC_GROUP_KIND => typed::<multiview_config::SyncGroup>(left, right),
+            _ => false,
+        }
+}
+
+/// The resource-repository families, keyed as in the config document.
+fn named_stores(state: &AppState) -> [(&'static str, &Arc<dyn ResourceRepository>); 6] {
+    [
+        ("sources", &state.sources),
+        ("outputs", &state.outputs),
+        ("overlays", &state.overlays),
+        ("probes", &state.probes),
+        ("devices", &state.devices),
+        ("sync_groups", &state.sync_groups),
+    ]
+}
+
+/// Current store versions for a store-served family. A failed read only loses
+/// the version floor for this commit; it must not reject accepted intent.
+fn store_versions(state: &AppState, key: &str) -> std::collections::BTreeMap<String, u64> {
+    if !STORE_SERVED_KEYS.contains(&key) {
+        return std::collections::BTreeMap::new();
+    }
+    let listed = match key {
+        "salvos" => state.salvos.list().map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.salvo.id, entry.version.get()))
+                .collect()
+        }),
+        "tally_profiles" => state.tally_profiles.list().map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| (entry.profile.id, entry.version.get()))
+                .collect()
+        }),
+        _ => named_stores(state)
+            .into_iter()
+            .find(|(name, _)| *name == key)
+            .map_or_else(
+                || Ok(std::collections::BTreeMap::new()),
+                |(_, store)| {
+                    store.list().map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| (entry.resource.id, entry.version.get()))
+                            .collect()
+                    })
+                },
+            ),
+    };
+    listed.unwrap_or_else(|error| {
+        tracing::warn!(key, %error, "desired commit: store version read failed");
+        std::collections::BTreeMap::new()
+    })
+}
+
+/// Import accepted state from the legacy stores (review H2): the first durable
+/// transaction continues their counters for every versioned family.
+fn legacy_resources(state: &AppState) -> ControlResult<LegacyResources> {
+    let mut legacy = LegacyResources::new();
+    for (key, store) in named_stores(state) {
+        let entries = legacy.entry(key).or_default();
+        for entry in store.list()? {
+            let stored = entry.resource.body;
+            let body = match key {
+                "sources" => canonical_body::<multiview_config::Source>(stored)?,
+                "outputs" => canonical_body::<multiview_config::Output>(stored)?,
+                "overlays" => canonical_body::<multiview_config::Overlay>(stored)?,
+                "probes" => canonical_body::<multiview_config::Probe>(stored)?,
+                "devices" => canonical_body::<multiview_config::Device>(stored)?,
+                _ => canonical_body::<multiview_config::SyncGroup>(stored)?,
+            };
+            entries.insert(entry.resource.id, (body, entry.version.get()));
+        }
+    }
+    let salvos = legacy.entry("salvos").or_default();
+    for entry in state.salvos.list()? {
+        let body = config_value(&entry.salvo)?;
+        salvos.insert(entry.salvo.id, (body, entry.version.get()));
+    }
+    let profiles = legacy.entry("tally_profiles").or_default();
+    for entry in state.tally_profiles.list()? {
+        let body = config_value(&entry.profile)?;
+        profiles.insert(entry.profile.id, (body, entry.version.get()));
+    }
+    // Section-level families (rc3): before the first envelope the effective
+    // runtime state is accepted at version 1, so the first change advances it
+    // to 2 instead of handing a pre-envelope tag back (review H2 class).
+    let (iptv, _, _) = crate::iptv::accepted_inputs(state)?;
+    if let Some(iptv) = iptv {
+        legacy
+            .entry(IPTV_KEY)
+            .or_default()
+            .insert("singleton".to_owned(), (config_value(&iptv)?, 1));
+    }
+    let graphics = state.graphics.config();
+    for (key, bodies) in [
+        (
+            GRAPHICS_DATA_SOURCES_KEY,
+            identified_bodies(&graphics.data_sources, |item| &item.id),
+        ),
+        (
+            GRAPHICS_ITEMS_KEY,
+            identified_bodies(&graphics.items, |item| &item.id),
+        ),
+        (
+            GRAPHICS_CHANNELS_KEY,
+            identified_bodies(&graphics.channels, |item| &item.id),
+        ),
+    ] {
+        let entries = legacy.entry(key).or_default();
+        for (id, body) in bodies.map_err(|error| {
+            ControlError::Repository(format!("serializing graphics resource: {error}"))
+        })? {
+            entries.insert(id, (body, 1));
+        }
+    }
+    let (routing, version) = state.audio_routing.snapshot();
+    if let Some(routing) = routing {
+        legacy.entry("audio").or_default().insert(
+            "singleton".to_owned(),
+            (config_value(&routing)?, version.get()),
+        );
+    }
+    Ok(legacy)
+}
+
+/// One family's accepted resources with their durable versions and names.
+/// An envelope written before this family was tracked falls back to the seeded
+/// store's name, then the id.
+fn accepted_entries(
+    desired: &DesiredState,
+    key: &str,
+    seeded: &Arc<dyn ResourceRepository>,
+) -> ControlResult<Vec<crate::resource_store::VersionedResource>> {
+    let seeded_names: std::collections::BTreeMap<String, String> = seeded
+        .list()?
+        .into_iter()
+        .map(|entry| (entry.resource.id, entry.resource.name))
+        .collect();
+    let versions = desired.resource_versions.get(key);
+    let names = desired.resource_names.get(key);
+    Ok(resource_bodies(&desired.config, &desired.output_ids, key)?
+        .into_iter()
+        .map(|(id, body)| {
+            let version = versions.and_then(|map| map.get(&id)).copied().unwrap_or(1);
+            let name = names
+                .and_then(|map| map.get(&id))
+                .or_else(|| seeded_names.get(&id))
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            crate::resource_store::VersionedResource {
+                version: crate::concurrency::Version::new(version.max(1)),
+                resource: crate::resource_store::Resource { id, name, body },
+            }
+        })
+        .collect())
+}
+
+/// Rebuild every config-backed store from the accepted envelope at startup, so
+/// names and `ETags` continue across a restart instead of being reseeded at 1.
+/// A pre-restart tag must stay stale, never match again (review H1/H2).
+///
+/// # Errors
+/// A store read or serialization fault fails startup rather than serving
+/// state that disagrees with accepted intent.
+pub fn restore_accepted_stores(
+    mut state: AppState,
+    desired: &DesiredState,
+) -> ControlResult<AppState> {
+    use crate::resource_store::{
+        InMemoryDeviceStore, InMemoryOutputStore, InMemoryOverlayStore, InMemoryProbeStore,
+        InMemorySourceStore, InMemorySyncGroupStore,
+    };
+    let sources = accepted_entries(desired, "sources", &state.sources)?;
+    let outputs = accepted_entries(desired, "outputs", &state.outputs)?;
+    let overlays = accepted_entries(desired, "overlays", &state.overlays)?;
+    let probes = accepted_entries(desired, "probes", &state.probes)?;
+    let devices = accepted_entries(desired, "devices", &state.devices)?;
+    let sync_groups = accepted_entries(desired, "sync_groups", &state.sync_groups)?;
+    state.sources = Arc::new(InMemorySourceStore::from_versioned(sources));
+    state.outputs = Arc::new(InMemoryOutputStore::from_versioned(outputs));
+    state.overlays = Arc::new(InMemoryOverlayStore::from_versioned(overlays));
+    state.probes = Arc::new(InMemoryProbeStore::from_versioned(probes));
+    state.devices = Arc::new(InMemoryDeviceStore::from_versioned(devices));
+    state.sync_groups = Arc::new(InMemorySyncGroupStore::from_versioned(sync_groups));
+    let version_of = |key: &str, id: &str| {
+        crate::concurrency::Version::new(
+            desired
+                .resource_versions
+                .get(key)
+                .and_then(|map| map.get(id))
+                .copied()
+                .unwrap_or(1)
+                .max(1),
+        )
+    };
+    state.salvos = Arc::new(crate::salvo_store::InMemorySalvoStore::from_versioned(
+        desired
+            .config
+            .salvos
+            .iter()
+            .map(|salvo| crate::salvo_store::VersionedSalvo {
+                version: version_of("salvos", &salvo.id),
+                salvo: salvo.clone(),
+            }),
+    ));
+    state.tally_profiles =
+        Arc::new(crate::tally_state::InMemoryProfileStore::from_versioned(
+            desired.config.tally_profiles.iter().map(|profile| {
+                crate::tally_state::VersionedProfile {
+                    version: version_of("tally_profiles", &profile.id),
+                    profile: profile.clone(),
+                }
+            }),
+        ));
+    Ok(state)
+}
+
+fn identified_bodies<T: serde::Serialize>(
+    items: &[T],
+    id: impl Fn(&T) -> &String,
+) -> Result<Vec<(String, serde_json::Value)>, serde_json::Error> {
+    items
+        .iter()
+        .map(|item| serde_json::to_value(item).map(|body| (id(item).clone(), body)))
+        .collect()
 }
 
 fn resource_bodies(
@@ -557,6 +1216,23 @@ fn resource_bodies(
             .zip(output_ids)
             .map(|(output, id)| serde_json::to_value(output).map(|body| (id.clone(), body)))
             .collect::<Result<Vec<_>, _>>(),
+        "overlays" => identified_bodies(&config.overlays, |item| &item.id),
+        "probes" => identified_bodies(&config.probes, |item| &item.id),
+        "devices" => identified_bodies(&config.devices, |item| &item.id),
+        "sync_groups" => identified_bodies(&config.sync_groups, |item| &item.id),
+        "salvos" => identified_bodies(&config.salvos, |item| &item.id),
+        "tally_profiles" => identified_bodies(&config.tally_profiles, |item| &item.id),
+        IPTV_KEY => config
+            .iptv
+            .as_ref()
+            .map(|iptv| serde_json::to_value(iptv).map(|body| ("singleton".to_owned(), body)))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>(),
+        GRAPHICS_DATA_SOURCES_KEY => {
+            identified_bodies(&config.graphics.data_sources, |item| &item.id)
+        }
+        GRAPHICS_ITEMS_KEY => identified_bodies(&config.graphics.items, |item| &item.id),
+        GRAPHICS_CHANNELS_KEY => identified_bodies(&config.graphics.channels, |item| &item.id),
         _ => {
             return Err(ControlError::Validation(format!(
                 "unsupported authoritative resource {key}"
@@ -579,7 +1255,7 @@ pub fn accepted_resources(
     let Some(model) = &state.boot_model else {
         return Ok(None);
     };
-    let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? else {
+    let Some(desired) = model.accepted().map_err(ControlError::Repository)? else {
         return Ok(None);
     };
     let bodies = resource_bodies(&desired.config, &desired.output_ids, key)?;
@@ -604,6 +1280,303 @@ pub fn accepted_resources(
     ))
 }
 
+/// The durable version of one accepted resource of a section-level family
+/// (`IPTV_KEY`, the graphics keys), read from the envelope. `None` when this
+/// run has no boot model (nothing is durable, so no version is promised);
+/// `Some(1)` before the first envelope commit (the legacy import starts every
+/// existing resource at 1 and its first change advances it to 2).
+///
+/// # Errors
+/// A corrupt accepted record fails closed.
+pub fn accepted_version(
+    state: &AppState,
+    key: &str,
+    id: &str,
+) -> ControlResult<Option<crate::concurrency::Version>> {
+    let Some(model) = &state.boot_model else {
+        return Ok(None);
+    };
+    // The in-memory accepted snapshot (review R3-03): no disk read per GET.
+    Ok(Some(
+        model
+            .accepted()
+            .map_err(ControlError::Repository)?
+            .map_or_else(
+                || crate::concurrency::Version::new(1),
+                |desired| durable_version(&desired, key, id),
+            ),
+    ))
+}
+
+/// Accepted resources of a store-served family (review R2-01): the envelope
+/// once it exists, else the legacy store. Reads, existence checks and
+/// `If-Match` preconditions of every modeled family use this, so a store
+/// projection that failed after a commit can never authorize a stale tag.
+///
+/// # Errors
+/// A corrupt accepted record or a store fault fails closed.
+pub fn accepted_family(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+) -> ControlResult<Vec<crate::resource_store::VersionedResource>> {
+    accepted_resources(state, key)?.map_or_else(|| store.list(), Ok)
+}
+
+/// One accepted resource of a store-served family; see [`accepted_family`].
+///
+/// # Errors
+/// An absent id is `NotFound`; a corrupt record or store fault propagates.
+pub fn accepted_item(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+    id: &str,
+) -> ControlResult<crate::resource_store::VersionedResource> {
+    match accepted_resources(state, key)? {
+        Some(entries) => entries
+            .into_iter()
+            .find(|entry| entry.resource.id == id)
+            .ok_or_else(|| ControlError::NotFound {
+                kind: store.kind(),
+                id: id.to_owned(),
+            }),
+        None => store.get(id),
+    }
+}
+
+/// Whether a modeled run has an authoritative envelope to serve from.
+fn has_envelope(state: &AppState) -> ControlResult<bool> {
+    match &state.boot_model {
+        Some(model) => Ok(model
+            .accepted()
+            .map_err(ControlError::Repository)?
+            .is_some()),
+        None => Ok(false),
+    }
+}
+
+/// Project a just-committed upsert into its store at the exact durable
+/// version (review R2-01/R2-02) and return the accepted entry. A recreated
+/// identity therefore keeps its tombstoned counter, and a failed store write
+/// is logged only: every read already answers from the envelope, and the next
+/// boot rebuilds the store from it. Without an envelope (a store-only run) the
+/// legacy `write` runs and its result stands.
+///
+/// # Errors
+/// A legacy store fault, or an accepted entry that cannot be reread.
+pub fn project_upsert(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+    id: &str,
+    write: impl FnOnce() -> ControlResult<crate::resource_store::VersionedResource>,
+) -> ControlResult<crate::resource_store::VersionedResource> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return write();
+    }
+    let accepted = accepted_item(state, key, store, id).map_err(|e| after_commit(state, e))?;
+    if let Err(error) = store.put_versioned(accepted.clone()) {
+        tracing::warn!(key, id, %error, "accepted change committed; store projection failed");
+    }
+    Ok(accepted)
+}
+
+/// Project a just-committed delete into its store; see [`project_upsert`].
+///
+/// # Errors
+/// A legacy store fault.
+pub fn project_delete(
+    state: &AppState,
+    key: &str,
+    store: &Arc<dyn ResourceRepository>,
+    id: &str,
+) -> ControlResult<()> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return store.delete(id);
+    }
+    match store.delete(id) {
+        Ok(()) | Err(ControlError::NotFound { .. }) => {}
+        Err(error) => {
+            tracing::warn!(key, id, %error, "accepted delete committed; store projection failed");
+        }
+    }
+    Ok(())
+}
+
+fn durable_version(desired: &DesiredState, key: &str, id: &str) -> crate::concurrency::Version {
+    crate::concurrency::Version::new(
+        desired
+            .resource_versions
+            .get(key)
+            .and_then(|map| map.get(id))
+            .copied()
+            .unwrap_or(1)
+            .max(1),
+    )
+}
+
+/// Accepted salvo definitions with durable versions; the store before the first
+/// envelope exists (review R2-01).
+///
+/// # Errors
+/// A corrupt accepted record or a store fault fails closed.
+pub fn accepted_salvos(state: &AppState) -> ControlResult<Vec<crate::salvo_store::VersionedSalvo>> {
+    if let Some(model) = &state.boot_model {
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
+            let mut out: Vec<_> = desired
+                .config
+                .salvos
+                .iter()
+                .map(|salvo| crate::salvo_store::VersionedSalvo {
+                    version: durable_version(&desired, "salvos", &salvo.id),
+                    salvo: salvo.clone(),
+                })
+                .collect();
+            out.sort_by(|a, b| a.salvo.id.cmp(&b.salvo.id));
+            return Ok(out);
+        }
+    }
+    state.salvos.list()
+}
+
+/// One accepted salvo; see [`accepted_salvos`].
+///
+/// # Errors
+/// An absent id is `NotFound`.
+pub fn accepted_salvo(
+    state: &AppState,
+    id: &str,
+) -> ControlResult<crate::salvo_store::VersionedSalvo> {
+    if !has_envelope(state)? {
+        return state.salvos.get(id);
+    }
+    accepted_salvos(state)?
+        .into_iter()
+        .find(|entry| entry.salvo.id == id)
+        .ok_or_else(|| ControlError::NotFound {
+            kind: crate::salvo_store::SALVO_KIND,
+            id: id.to_owned(),
+        })
+}
+
+/// Project a committed salvo upsert at its durable version; see [`project_upsert`].
+///
+/// # Errors
+/// A legacy store fault, or an accepted entry that cannot be reread.
+pub fn project_salvo(
+    state: &AppState,
+    id: &str,
+    write: impl FnOnce() -> ControlResult<crate::salvo_store::VersionedSalvo>,
+) -> ControlResult<crate::salvo_store::VersionedSalvo> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return write();
+    }
+    let accepted = accepted_salvo(state, id).map_err(|e| after_commit(state, e))?;
+    if let Err(error) = state.salvos.put_versioned(accepted.clone()) {
+        tracing::warn!(id, %error, "accepted salvo committed; store projection failed");
+    }
+    Ok(accepted)
+}
+
+/// Project a committed salvo delete; see [`project_delete`].
+///
+/// # Errors
+/// A legacy store fault.
+pub fn project_salvo_delete(state: &AppState, id: &str) -> ControlResult<()> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return state.salvos.delete(id);
+    }
+    match state.salvos.delete(id) {
+        Ok(()) | Err(ControlError::NotFound { .. }) => {}
+        Err(error) => {
+            tracing::warn!(id, %error, "accepted salvo delete committed; store projection failed");
+        }
+    }
+    Ok(())
+}
+
+/// Accepted tally profiles with durable versions (review R2-01).
+///
+/// # Errors
+/// A corrupt accepted record or a store fault fails closed.
+pub fn accepted_profiles(
+    state: &AppState,
+) -> ControlResult<Vec<crate::tally_state::VersionedProfile>> {
+    if let Some(model) = &state.boot_model {
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
+            let mut out: Vec<_> = desired
+                .config
+                .tally_profiles
+                .iter()
+                .map(|profile| crate::tally_state::VersionedProfile {
+                    version: durable_version(&desired, "tally_profiles", &profile.id),
+                    profile: profile.clone(),
+                })
+                .collect();
+            out.sort_by(|a, b| a.profile.id.cmp(&b.profile.id));
+            return Ok(out);
+        }
+    }
+    state.tally_profiles.list()
+}
+
+/// One accepted tally profile; see [`accepted_profiles`].
+///
+/// # Errors
+/// An absent id is `NotFound`.
+pub fn accepted_profile(
+    state: &AppState,
+    id: &str,
+) -> ControlResult<crate::tally_state::VersionedProfile> {
+    if !has_envelope(state)? {
+        return state.tally_profiles.get(id);
+    }
+    accepted_profiles(state)?
+        .into_iter()
+        .find(|entry| entry.profile.id == id)
+        .ok_or_else(|| ControlError::NotFound {
+            kind: crate::tally_state::TALLY_PROFILE_KIND,
+            id: id.to_owned(),
+        })
+}
+
+/// Project a committed tally-profile upsert at its durable version.
+///
+/// # Errors
+/// A legacy store fault, or an accepted entry that cannot be reread.
+pub fn project_profile(
+    state: &AppState,
+    id: &str,
+    write: impl FnOnce() -> ControlResult<crate::tally_state::VersionedProfile>,
+) -> ControlResult<crate::tally_state::VersionedProfile> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return write();
+    }
+    let accepted = accepted_profile(state, id).map_err(|e| after_commit(state, e))?;
+    if let Err(error) = state.tally_profiles.put_versioned(accepted.clone()) {
+        tracing::warn!(id, %error, "accepted tally profile committed; store projection failed");
+    }
+    Ok(accepted)
+}
+
+/// Project a committed tally-profile delete.
+///
+/// # Errors
+/// A legacy store fault.
+pub fn project_profile_delete(state: &AppState, id: &str) -> ControlResult<()> {
+    if !has_envelope(state).map_err(|e| after_commit(state, e))? {
+        return state.tally_profiles.delete(id);
+    }
+    match state.tally_profiles.delete(id) {
+        Ok(()) | Err(ControlError::NotFound { .. }) => {}
+        Err(error) => {
+            tracing::warn!(id, %error, "accepted tally-profile delete committed; store projection failed");
+        }
+    }
+    Ok(())
+}
+
 /// Read the accepted audio singleton with a durable version, or use the
 /// legacy in-memory slot before the first accepted envelope exists.
 ///
@@ -616,7 +1589,7 @@ pub fn accepted_audio(
     crate::concurrency::Version,
 )> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
             let version = desired
                 .resource_versions
                 .get("audio")
@@ -624,7 +1597,7 @@ pub fn accepted_audio(
                 .copied()
                 .unwrap_or(1);
             return Ok((
-                desired.config.audio,
+                desired.config.audio.clone(),
                 crate::concurrency::Version::new(version),
             ));
         }
@@ -645,7 +1618,7 @@ pub fn output_ids_for_config(
     let prior = state
         .boot_model
         .as_ref()
-        .map(|model| load_desired(model.boot_path()))
+        .map(|model| model.accepted())
         .transpose()
         .map_err(ControlError::Repository)?
         .flatten();
@@ -721,8 +1694,8 @@ pub fn output_ids_for_config(
 /// A corrupt desired record or failed repository read returns an error.
 pub fn layout_library(state: &AppState) -> ControlResult<Vec<crate::repository::Layout>> {
     if let Some(model) = &state.boot_model {
-        if let Some(desired) = load_desired(model.boot_path()).map_err(ControlError::Repository)? {
-            return Ok(desired.layouts);
+        if let Some(desired) = model.accepted().map_err(ControlError::Repository)? {
+            return Ok(desired.layouts.clone());
         }
     }
     Ok(state
@@ -779,6 +1752,30 @@ pub struct BootModel {
     /// interior mutability (the async lock provides the ordering, not this).
     last_adopted: std::sync::Mutex<MultiviewConfig>,
     selected_layout: std::sync::Mutex<Option<String>>,
+    /// Review R3-03: the accepted envelope, held as one immutable `Arc`
+    /// snapshot instead of being re-read, re-parsed and re-validated from
+    /// `desired.json` on every GET/list/item/precondition. Lazily loaded from
+    /// disk on the FIRST call to [`Self::accepted`] (not at construction, so
+    /// `Self::new` stays infallible and a corrupt record still surfaces
+    /// through the same caller that would have seen it under the old
+    /// always-read behavior) and then swapped atomically by
+    /// [`write_desired`] immediately after each successful durable commit —
+    /// always under [`crate::AppState::lock_config_mutation`] (the same lock
+    /// that serializes every commit), so a reader never observes a partially
+    /// updated snapshot. A restart still loads straight from disk: this
+    /// cache holds nothing durable itself.
+    accepted_cache: std::sync::RwLock<AcceptedCache>,
+}
+
+/// [`BootModel::accepted_cache`]'s three states: not yet loaded from disk,
+/// loaded and confirmed absent (no envelope), or loaded and present.
+/// Distinguishing "not yet loaded" from "loaded, absent" is why this is not
+/// simply `Option<Arc<DesiredState>>`.
+#[derive(Debug, Clone)]
+enum AcceptedCache {
+    Unloaded,
+    Empty,
+    Loaded(Arc<DesiredState>),
 }
 
 impl BootModel {
@@ -809,6 +1806,7 @@ impl BootModel {
             write_tickets: AtomicU64::new(0),
             last_adopted: std::sync::Mutex::new(running),
             selected_layout: std::sync::Mutex::new(None),
+            accepted_cache: std::sync::RwLock::new(AcceptedCache::Unloaded),
         }
     }
 
@@ -816,6 +1814,67 @@ impl BootModel {
     #[must_use]
     pub fn boot_path(&self) -> &Path {
         &self.boot_path
+    }
+
+    /// The accepted envelope (review R3-03): an `Arc` clone of the in-memory
+    /// snapshot, lazily loaded from disk on first use and thereafter served
+    /// with NO filesystem read, no re-parse and no re-validation. `Ok(None)`
+    /// means no envelope exists yet (store-only run, or before the first
+    /// commit) — exactly [`load_desired`]'s meaning.
+    ///
+    /// # Errors
+    /// A corrupt on-disk record fails closed on the first (lazy) load; once
+    /// loaded, this never fails again until the next [`Self::set_accepted`].
+    pub fn accepted(&self) -> Result<Option<Arc<DesiredState>>, String> {
+        // Each read/write guard below is bound to its own statement and
+        // dropped at the end of that statement (NOT kept alive by an
+        // `if let`'s temporary-lifetime extension) — a held read guard must
+        // never still be live when a later statement in this function takes
+        // the write lock, or the write would deadlock against its own
+        // reader.
+        let is_unloaded = matches!(
+            *self
+                .accepted_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            AcceptedCache::Unloaded
+        );
+        if is_unloaded {
+            // Load outside any lock (disk I/O), then settle the race: only
+            // the first writer's load wins, matching `load_desired`'s result
+            // either way (both re-read the identical file).
+            let loaded = load_desired(&self.boot_path)?;
+            let mut cache = self
+                .accepted_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(*cache, AcceptedCache::Unloaded) {
+                *cache = loaded.map_or(AcceptedCache::Empty, |desired| {
+                    AcceptedCache::Loaded(Arc::new(desired))
+                });
+            }
+        }
+        let snapshot = match &*self
+            .accepted_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            AcceptedCache::Loaded(desired) => Some(Arc::clone(desired)),
+            AcceptedCache::Empty | AcceptedCache::Unloaded => None,
+        };
+        Ok(snapshot)
+    }
+
+    /// Swap the in-memory accepted snapshot right after a durable commit
+    /// (review R3-03). Call ONLY under [`crate::AppState::lock_config_mutation`]
+    /// — the same lock [`write_desired`] is always called under — so this can
+    /// never race a concurrent commit or lazy load.
+    fn set_accepted(&self, desired: DesiredState) {
+        *self
+            .accepted_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            AcceptedCache::Loaded(Arc::new(desired));
     }
 
     /// The immutable Loaded snapshot (the revert-to-start target).
@@ -898,6 +1957,12 @@ impl BootModel {
         }
     }
 
+    /// The whole adopted configuration: what the engine is running.
+    #[must_use]
+    pub fn adopted_config(&self) -> MultiviewConfig {
+        self.lock_adopted().clone()
+    }
+
     /// Apply an ADOPTED source upsert to the adopted snapshot (MAJOR-B round 4):
     /// the engine landed an `UpsertSource`, so the running config now carries
     /// this source. Replaces an existing source of the same id, else appends.
@@ -962,8 +2027,8 @@ impl BootModel {
     /// # Errors
     /// A corrupt or unreadable desired record prevents startup selection.
     pub fn restore_desired_layout_id(&self) -> Result<(), String> {
-        if let Some(desired) = load_desired(&self.boot_path)? {
-            self.select_layout(desired.selected_layout_id);
+        if let Some(desired) = self.accepted()? {
+            self.select_layout(desired.selected_layout_id.clone());
         }
         Ok(())
     }

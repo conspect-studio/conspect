@@ -58,6 +58,7 @@ pub mod event_automation;
 pub mod iptv;
 pub mod is07;
 pub mod jwt;
+pub mod layout_projection;
 /// Management-plane rate limiting (SEC-14): the keyed token-bucket + the
 /// request-concurrency + rate middleware backing the control-plane `DoS` floor.
 pub(crate) mod limits;

@@ -145,8 +145,15 @@ export function PreviewSurface({
   const canWhep = whepAvailable(capabilities, scope);
 
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
+  // This applies to every scope, including `input`: a build with no WebRTC at
+  // all (the LGPL-clean/GPU-free default, `webrtc: false`) must still offer
+  // the always-available ~1 fps still preview, not an "unavailable" dead end
+  // (capabilities.ts's `whepAvailable` doc, and the module header above, both
+  // say this is the deployment's honest primary — not a degradation). Only
+  // the `degraded` branch below (a WHEP attempt that was actually made and
+  // failed/was busy) keeps the explicit "Live input preview failed" state for
+  // `input`, per the real WHEP-failure case this distinction exists for.
   if (!canWhep) {
-    if (scope === 'input') return <div role="status" data-testid="input-preview-unavailable"><Trans>Live input video is unavailable on this server.</Trans></div>;
     return <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />;
   }
 

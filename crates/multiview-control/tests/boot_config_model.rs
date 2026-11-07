@@ -238,10 +238,21 @@ async fn failed_desired_write_does_not_publish_source_or_command() {
         response.status().is_server_error(),
         "a failed disk write is not acknowledged"
     );
+    // The failed atomic write must not have replaced the obstruction: it is
+    // still a directory at this exact path. `canonicalize()` resolves the
+    // platform temp root's symlinks (e.g. macOS's `/var` -> `/private/var`),
+    // so comparing its canonicalized form against the un-canonicalized
+    // `desired_obstruction` is wrong on any such host — it previously failed
+    // CI on `macos-latest` for that reason, not because the obstruction had
+    // moved. `symlink_metadata` (no canonicalization) + `is_dir()` verifies
+    // the same "still a directory here" fact without that false mismatch.
     let desired_obstruction = state_dir.join("desired.json");
-    assert_eq!(
-        desired_obstruction.canonicalize().unwrap(),
+    assert!(
         desired_obstruction
+            .symlink_metadata()
+            .expect("obstruction still exists")
+            .is_dir(),
+        "a failed atomic rename must not replace the obstruction"
     );
     std::fs::remove_dir(&desired_obstruction).expect("remove the test obstruction");
     let after = send(&r.router, get("/api/v1/sources/in_a", OPERATOR_TOKEN)).await;
@@ -3799,4 +3810,51 @@ async fn a_file_watch_source_reorder_is_reported_restart_pending() {
         drained.is_empty(),
         "a source reorder submits NO engine command, got {drained:?}"
     );
+}
+
+/// A watcher resync moves a store version only for an item whose content
+/// changed, so every served tag is one the envelope holds: a restart at any
+/// point returns the same tags, and an unrelated edit cannot make a tag repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_resync_never_raises_a_version_the_envelope_lacks() {
+    let overlays = "\n[[overlays]]\nid = \"ov_edit\"\nkind = \"clock\"\ntarget = \"canvas\"\n\
+                    z = 0\n[[overlays]]\nid = \"ov_keep\"\nkind = \"clock\"\n\
+                    target = \"canvas\"\nz = 1\n";
+    let doc = format!("{BOOT_DOC}{overlays}");
+    let r = rig(&doc);
+    let layouts = multiview_control::boot_model::layout_library(&r.state).unwrap();
+    multiview_control::boot_model::commit_desired(&r.state, r.config.clone(), layouts)
+        .await
+        .unwrap();
+    let (options, mut poll) = WatchOptions::default()
+        .with_poll_interval(TEST_POLL)
+        .with_manual_poll();
+    let watch = spawn_watch(
+        r.boot_path.clone(),
+        r.config.clone(),
+        r.state.clone(),
+        options,
+    );
+    settle_initial(&mut poll, &r.state).await;
+    let edited = doc.replace(
+        "id = \"ov_edit\"\nkind = \"clock\"\ntarget = \"canvas\"\nz = 0",
+        "id = \"ov_edit\"\nkind = \"clock\"\ntarget = \"canvas\"\nz = 5",
+    );
+    assert_ne!(edited, doc);
+    external_edit(&r.boot_path, &edited);
+    drive_polls(&mut poll, 2).await;
+    assert_eq!(r.state.config_watch.snapshot().applied_count, 1);
+
+    let versions = |id: &str| r.state.overlays.get(id).unwrap().version.get();
+    assert_eq!(versions("ov_keep"), 1, "an unchanged item was rewritten");
+    assert_eq!(versions("ov_edit"), 2);
+    assert_eq!(r.state.sources.get("in_a").unwrap().version.get(), 1);
+    assert_eq!(r.state.outputs.list().unwrap()[0].version.get(), 1);
+
+    // The restart view: the envelope's counters equal every served store tag.
+    let desired = load_desired(&r.boot_path).unwrap().unwrap();
+    let counters = &desired.resource_versions["overlays"];
+    assert_eq!(counters["ov_keep"], versions("ov_keep"));
+    assert_eq!(counters["ov_edit"], versions("ov_edit"));
+    watch.stop();
 }

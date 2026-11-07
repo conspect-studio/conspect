@@ -193,7 +193,14 @@ pub struct AudioControlHandle {
     declared_tracks: std::collections::HashMap<String, usize>,
     /// Shared stable-index source list read by the bake consumer each tick.
     live_track_inputs: Option<Arc<multiview_framestore::SwapCell<Arc<Vec<String>>>>>,
+    /// Test-only interleaving point inside [`Self::request_routing`], after the
+    /// channel snapshot and before the gain table is published.
+    #[cfg(test)]
+    routing_gap_hook: RoutingGapHook,
 }
+
+#[cfg(test)]
+type RoutingGapHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 /// The consumer owns this guard from thread spawn through normal or panic exit.
 pub struct AudioConsumerGuard(AudioControlHandle);
@@ -267,6 +274,8 @@ impl AudioControlHandle {
             sample_rate: AudioFormat::CANONICAL_RATE,
             declared_tracks: std::collections::HashMap::new(),
             live_track_inputs: None,
+            #[cfg(test)]
+            routing_gap_hook: Arc::default(),
         }
     }
 
@@ -373,6 +382,26 @@ impl AudioControlHandle {
     }
 
     #[cfg(test)]
+    fn set_routing_gap_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .routing_gap_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_routing_gap_hook(&self) {
+        let hook = self
+            .routing_gap_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_source_point(&self, id: &str) -> Option<multiview_audio::RoutePoint> {
         self.channels
             .read()
@@ -449,6 +478,15 @@ impl AudioControlHandle {
         {
             return false;
         }
+        // Review H3 publication protocol: publish the routing document BEFORE
+        // taking the channel snapshot. A live join inserts its channel under the
+        // `channels` write lock and only then re-reads the routing. The lock
+        // totally orders the two: either this snapshot is taken after the
+        // join's insert (the gain table covers the new channel), or the join's
+        // write lock is acquired after this read lock is released — which is
+        // after the store below — so its re-read sees this routing. A joining
+        // source can therefore never keep a superseded gain.
+        self.routing.store(Some(Arc::new(routing.clone())));
         let channels = self
             .channels
             .read()
@@ -456,7 +494,8 @@ impl AudioControlHandle {
         let gains =
             crate::pipeline::program_bus_gains(channels.keys().map(String::as_str), Some(routing));
         drop(channels);
-        self.routing.store(Some(Arc::new(routing.clone())));
+        #[cfg(test)]
+        self.run_routing_gap_hook();
         if let Some(live) = &self.live_track_inputs {
             live.store(Arc::new(
                 requested
@@ -708,6 +747,43 @@ mod route_seam_tests {
             .expect("small test sample budget")
         );
         assert_eq!(handle.apply_pending(&mut bus), 0);
+    }
+
+    /// Review H3: a source joining the live bus between a routing PUT's channel
+    /// snapshot and its gain publication must not keep the superseded gain.
+    /// The join is driven deterministically from inside that window.
+    #[test]
+    fn a_join_racing_a_routing_exclusion_is_not_left_audible() {
+        let routing = |late_included: bool| {
+            let doc = format!("schema_version = 1\n[canvas]\nwidth = 640\nheight = 360\nfps = \"25/1\"\npixel_format = \"nv12\"\nbackground = \"#000000\"\n[canvas.color]\nprofile = \"sdr-bt709-limited\"\n[layout]\nkind = \"grid\"\ncolumns = [\"1fr\"]\nrows = [\"1fr\"]\nareas = [\"a\"]\n[[sources]]\nid = \"main\"\nkind = \"bars\"\n[[sources]]\nid = \"late\"\nkind = \"bars\"\n[[cells]]\nid = \"cell\"\narea = \"a\"\n[cells.source]\ninput_id = \"main\"\n[audio]\nsample_rate_hz = 48000\n[[audio.routes]]\ninput_id = \"main\"\nchannels = {{ kind = \"stereo\" }}\n[[audio.routes]]\ninput_id = \"late\"\nchannels = {{ kind = \"stereo\" }}\ninclude_in_program_bus = {late_included}\n");
+            multiview_config::MultiviewConfig::load_from_toml(&doc)
+                .expect("route fixture")
+                .audio
+                .expect("audio routing")
+        };
+        let handle = AudioControlHandle::new()
+            .with_startup(Some(&routing(true)), ["main".to_owned(), "late".to_owned()]);
+        let bus = Arc::new(std::sync::Mutex::new(ProgramBus::new(
+            canonical_format(),
+            Rational::new(25, 1),
+        )));
+        assert!(handle.set_source_audio("main", Some(new_store())));
+        handle.apply_pending(&mut bus.lock().unwrap());
+        // `late` is admitted now; the bake consumer joins it INSIDE the window.
+        assert!(handle.set_source_audio("late", Some(new_store())));
+        let (racer, racing_bus) = (handle.clone(), Arc::clone(&bus));
+        handle.set_routing_gap_hook(move || {
+            racer.apply_pending(&mut racing_bus.lock().unwrap());
+        });
+        assert!(handle.request_routing(&routing(false)));
+        let mut bus = bus.lock().unwrap();
+        handle.apply_pending(&mut bus);
+        let point = handle.test_source_point("late").expect("late joined");
+        assert_eq!(
+            bus.program_gain(point),
+            Some(0.0),
+            "the excluded joining source stayed audible at the superseded gain"
+        );
     }
 
     #[test]
@@ -1059,11 +1135,19 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // not on the fetcher.
         let shared =
             if plan.live && is_hls && std::env::var_os(crate::hls_fetch::DISABLE_ENV).is_none() {
-                let slot = crate::pipeline::live_anchor_slot(&plan.id);
+                // Review R3-02: a non-allocating, lifecycle-checked lookup. A
+                // worker whose lifecycle has already been retired (a race with
+                // `remove_live_lifecycle` between the loop-top check above and
+                // this lookup) must never recreate the slot that removal just
+                // dropped — `None` here means "already gone", not "not yet
+                // created", so it is read as no video anchor, never allocated.
+                let slot =
+                    crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle);
                 await_shared_url(
                     || crate::hls_fetch::shared_url(&plan.id, plan.lifecycle),
                     || {
-                        slot.load()
+                        slot.as_ref()
+                            .and_then(|slot| slot.load())
                             .filter(|a| a.raw_pts0_ns.is_some() && a.generation > plan.anchor_floor)
                             .map(|a| a.generation)
                     },
@@ -1103,25 +1187,34 @@ pub(crate) fn audio_ingest_loop(plan: &AudioIngestPlan, store: &AudioStore, stop
         // stream); its tile then simply rides silence.
         if plan.live && store.is_timeline() {
             // Locked to vision: place by the video's PTS → output mapping.
-            let slot = crate::pipeline::live_anchor_slot(&plan.id);
-            multiview_audio::store::audio_decode_loop_anchored(
-                location,
-                ChannelLayout::Stereo,
-                store,
-                stop,
-                &|| {
-                    if plan.lifecycle == 0
-                        || crate::pipeline::live_lifecycle(&plan.id) == plan.lifecycle
-                    {
-                        video_anchor(&slot, plan.anchor_floor)
-                    } else {
-                        None
-                    }
-                },
-                Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
-                &plan.id,
-                &open_headers,
-            );
+            // Review R3-02: the same non-allocating, lifecycle-checked lookup
+            // as above. `None` here means THIS worker's lifecycle has already
+            // been retired (raced with `remove_live_lifecycle` between the
+            // loop-top check and here) — skip the decode connection entirely
+            // rather than recreate the dropped slot; the loop-top check on the
+            // next iteration returns.
+            if let Some(slot) =
+                crate::pipeline::live_anchor_slot_for_lifecycle(&plan.id, plan.lifecycle)
+            {
+                multiview_audio::store::audio_decode_loop_anchored(
+                    location,
+                    ChannelLayout::Stereo,
+                    store,
+                    stop,
+                    &|| {
+                        if plan.lifecycle == 0
+                            || crate::pipeline::live_lifecycle(&plan.id) == plan.lifecycle
+                        {
+                            video_anchor(&slot, plan.anchor_floor)
+                        } else {
+                            None
+                        }
+                    },
+                    Some(Arc::clone(&crate::av_sync::probe(&plan.id).audio)),
+                    &plan.id,
+                    &open_headers,
+                );
+            }
         } else {
             multiview_audio::store::audio_decode_loop_with_headers(
                 location,

@@ -1857,6 +1857,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/outputs/{id}/playback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/outputs/{id}/playback` — derive this output's viewer
+         *     playback URL(s) (ADR-0101: "a link to copy the actual URL to paste into a
+         *     tool like VLC"). Role: read; per-object authz (BOLA) identical to
+         *     `get_output`.
+         * @description Never returns a secret: an SRT/RIST pre-shared key is never read here (it
+         *     is a `secret_ref`, resolved only at the engine's run path) — an encrypted
+         *     listener instead carries an operator-facing note that a passphrase is
+         *     required out-of-band.
+         */
+        get: operations["get_output_playback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/overlays": {
         parameters: {
             query?: never;
@@ -3419,6 +3445,8 @@ export interface components {
              *     snapshot (exact, computed by the pure `ConfigDiff`). Empty ⇒ in sync.
              */
             diverged_from_loaded: string[];
+            /** @description Health of the saved-layout projection of the accepted envelope. */
+            layout_projection?: components["schemas"]["LayoutProjectionStatus"];
             /**
              * @description Whether this run carries a boot model (started from a config file with
              *     a control plane). `false` ⇒ every other field is its honest empty
@@ -4580,6 +4608,40 @@ export interface components {
             /** @description Human-friendly name. */
             name: string;
         };
+        /** @description The projection's health as reported on `GET /api/v1/config/boot-model`. */
+        LayoutProjectionStatus: {
+            /**
+             * Format: int32
+             * @description Failed attempts since the projection was last healthy.
+             */
+            consecutive_failures: number;
+            /**
+             * @description Whether the projection differs from the accepted envelope because a
+             *     write failed. Layout reads stay correct either way: they use the envelope.
+             */
+            degraded: boolean;
+            /**
+             * Format: int64
+             * @description Unix milliseconds of the first failure of the current fault.
+             */
+            degraded_since_ms?: number | null;
+            /**
+             * @description The most recent failure, while degraded. Withheld from a scoped principal,
+             *     because a repository error can name any layout.
+             */
+            last_error?: string | null;
+            /**
+             * Format: int64
+             * @description Unix milliseconds of the last repair that cleared a fault.
+             */
+            repaired_at_ms?: number | null;
+            /**
+             * @description Whether a repair is running or waiting for its next attempt. `degraded`
+             *     with `retrying: false` means the retry budget is spent, and the next
+             *     commit or restart repairs the projection.
+             */
+            retrying: boolean;
+        };
         /**
          * @description `OpenAPI` mirror of [`multiview_licence::Lease`] (the dated entitlement
          *     bounds, ADR-0050 §4).
@@ -5127,6 +5189,14 @@ export interface components {
             /** @description The clockwise quarter-turn. Defaults to `none`. */
             turn?: components["schemas"]["QuarterTurnDoc"];
         };
+        /** @description `OpenAPI` mirror of the `GET /api/v1/outputs/{id}/playback` response body. */
+        OutputPlaybackResponseDoc: {
+            /**
+             * @description This output's viewer playback URL(s) (one or more; a push-only
+             *     transport returns a single no-URL entry with an explanatory note).
+             */
+            urls: components["schemas"]["PlaybackUrlDoc"][];
+        };
         /** @description The request envelope for `POST`/`PUT /api/v1/outputs/{id}` (`name` + body). */
         OutputResourceInputDoc: {
             /** @description The output document. */
@@ -5271,6 +5341,34 @@ export interface components {
          * @enum {string}
          */
         PipelineStage: "decode" | "composite" | "encode";
+        /**
+         * @description `OpenAPI` mirror of [`multiview_config::playback::PlaybackUrl`] — one
+         *     viewer playback URL (or no-URL note) for an output
+         *     (`GET /api/v1/outputs/{id}/playback`, ADR-0101).
+         */
+        PlaybackUrlDoc: {
+            /** @description Short human label, e.g. `"SRT (caller)"` or `"HLS playlist"`. */
+            label: string;
+            /**
+             * @description Extra operator-facing notes: an encryption-passphrase reminder, a
+             *     redacted push destination, a missing-host explanation. Never a secret.
+             */
+            notes?: string[];
+            /**
+             * @description The URL a viewer pastes into VLC/ffplay/a browser. Absent when this
+             *     output has no viewer-reachable address — see `notes` for why.
+             */
+            url?: string | null;
+            /**
+             * @description The exact shell command an operator pastes to open this URL in VLC
+             *     (`None` when [`url`](Self::url) is `None`). For an SRT row this is
+             *     VLC's own `vlc --srt-latency=<ms> srt://host:port` form — NOT
+             *     `vlc <url>` — because VLC's `srt://` access does not read the
+             *     ffmpeg-style `latency=`/`streamid=` URL query options; every other
+             *     kind uses `vlc <url>`.
+             */
+            vlc_command?: string | null;
+        };
         /**
          * @description `OpenAPI` mirror of `multiview_config::PlaylistMetadata` (epg-playlist):
          *     optional IPTV playlist presentation metadata for a source.
@@ -6564,6 +6662,7 @@ export interface components {
             /** @description The compositor's resolved acceleration tier. */
             compositor: components["schemas"]["CompositorCapability"];
             ndi_attribution?: null | components["schemas"]["NdiAttribution"];
+            youtube?: null | components["schemas"]["YoutubeCapability"];
         };
         /** @description The `200` body of a hot (Class-1 / Reset-lite) `/routing/{kind}/take`. */
         TakeApplied: {
@@ -7033,6 +7132,29 @@ export interface components {
              *     `expires_in_secs`; it is consumed on the first WS/SSE upgrade.
              */
             ticket: string;
+        };
+        /**
+         * @description The `youtube` source kind's resolve capability (ADR-0015): whether this
+         *     build can actually resolve a live `YouTube` URL right now.
+         */
+        YoutubeCapability: {
+            /**
+             * @description Whether a `yt-dlp` binary was found and successfully probed
+             *     (`yt-dlp --version`) at startup. Always `false` when
+             *     [`compiled`](Self::compiled) is `false`.
+             */
+            available: boolean;
+            /**
+             * @description Whether the `youtube` Cargo feature is compiled into this binary. A
+             *     `false` here means the build simply cannot run the resolver at all,
+             *     regardless of whether `yt-dlp` is installed.
+             */
+            compiled: boolean;
+            /**
+             * @description The probed `yt-dlp --version` output — present only when
+             *     [`available`](Self::available) is `true`.
+             */
+            version?: string | null;
         };
     };
     responses: never;
@@ -9639,6 +9761,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Unknown item / invalid preset. */
             422: {
                 headers: {
@@ -9808,6 +9939,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body. */
             422: {
                 headers: {
@@ -9858,6 +9998,15 @@ export interface operations {
             };
             /** @description Still bound by an item. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A sent If-Match is stale. */
+            412: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9971,6 +10120,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description Invalid body. */
             422: {
                 headers: {
@@ -10012,6 +10170,15 @@ export interface operations {
             };
             /** @description Unknown id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A sent If-Match is stale. */
+            412: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -12251,6 +12418,56 @@ export interface operations {
             };
             /** @description If-Match precondition failed. */
             412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+        };
+    };
+    get_output_playback: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Output id. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This output's viewer playback URL(s). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OutputPlaybackResponseDoc"];
+                };
+            };
+            /** @description Missing or invalid credentials. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description Not authorized to read this output. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description No output with that id. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -15394,6 +15611,15 @@ export interface operations {
                     "application/json": components["schemas"]["Problem"];
                 };
             };
+            /** @description A sent If-Match is stale. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
             /** @description The body is not a valid location (detail names the field). */
             422: {
                 headers: {
@@ -15444,6 +15670,15 @@ export interface operations {
             };
             /** @description No location with that id. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Problem"];
+                };
+            };
+            /** @description A sent If-Match is stale. */
+            412: {
                 headers: {
                     [name: string]: unknown;
                 };

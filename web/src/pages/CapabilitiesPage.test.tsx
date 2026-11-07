@@ -95,4 +95,46 @@ describe('CapabilitiesPage', () => {
       await screen.findByText('NDI® is a registered trademark of Vizrt NDI AB'),
     ).toBeInTheDocument();
   });
+
+  it('renders the YouTube capability panel when yt-dlp was found', async () => {
+    server.use(
+      http.get('http://localhost:3000/api/v1/system/capabilities', () =>
+        HttpResponse.json({
+          ...REPORT,
+          build: { ...REPORT.build, features: ['software', 'youtube'] },
+          youtube: { compiled: true, available: true, version: 'yt-dlp 2026.01.01' },
+        }),
+      ),
+    );
+    renderCapabilities();
+
+    expect(await screen.findByText('YouTube live ingest')).toBeInTheDocument();
+    expect(screen.getByText('yt-dlp 2026.01.01')).toBeInTheDocument();
+  });
+
+  it('renders the YouTube capability panel as unavailable when yt-dlp was not found', async () => {
+    server.use(
+      http.get('http://localhost:3000/api/v1/system/capabilities', () =>
+        HttpResponse.json({
+          ...REPORT,
+          build: { ...REPORT.build, features: ['software', 'youtube'] },
+          youtube: { compiled: true, available: false },
+        }),
+      ),
+    );
+    renderCapabilities();
+
+    expect(await screen.findByText('YouTube live ingest')).toBeInTheDocument();
+    // "yt-dlp resolver found: No" renders within the panel row.
+    const label = screen.getByText('yt-dlp resolver found');
+    const row = label.closest('div');
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByText('No')).toBeInTheDocument();
+  });
+
+  it('omits the YouTube panel entirely on a build without the youtube feature', async () => {
+    renderCapabilities();
+    await screen.findByText('LGPL-clean');
+    expect(screen.queryByText('YouTube live ingest')).not.toBeInTheDocument();
+  });
 });

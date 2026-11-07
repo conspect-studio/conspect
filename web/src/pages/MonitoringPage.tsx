@@ -38,6 +38,8 @@ import { SourceEventsButton } from '../events/SourceEventsButton';
 import { programFidelity, usePreviewCapabilities } from '../preview/capabilities';
 import type { ProgramFidelity } from '../preview/capabilities';
 import { useJpegPreview } from '../preview/useJpegPreview';
+import { PlaybackUrlRow } from '../resources/FormControls';
+import { useOutputPlayback } from '../resources/outputPlayback';
 import { useOutputs } from '../resources/queries';
 import { useLiveTiles } from '../resources/useLiveTiles';
 import { useEngineEvents } from '../realtime/useEngineEvents';
@@ -89,6 +91,33 @@ function PreviewImage(props: {
 function ProgramStillPreview({ label }: { readonly label: string }): JSX.Element {
   const src = useJpegPreview('/api/v1/preview/program.jpg', 1000);
   return <PreviewImage src={src} alt={label} className="aspect-video w-full bg-black object-contain" />;
+}
+
+/**
+ * The viewer playback URL(s) for the output currently selected as the
+ * program "Playback transport" (ADR-0101 — "a link to copy the actual URL to
+ * paste into a tool like VLC"). Renders nothing while no output is selected
+ * (the default WebRTC/still preview has no VLC-pasteable URL).
+ */
+function ProgramPlaybackUrls({ outputId }: { readonly outputId: string }): JSX.Element | null {
+  const playback = useOutputPlayback(outputId === '' ? undefined : outputId);
+  if (outputId === '' || playback.data === undefined || playback.data.length === 0) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      {playback.data.map((entry, index) => (
+        <PlaybackUrlRow
+          key={`${entry.label}-${String(index)}`}
+          idPrefix={`monitoring-program-playback-${outputId}-${String(index)}`}
+          label={entry.label}
+          url={entry.url ?? undefined}
+          vlcCommand={entry.vlc_command ?? undefined}
+          notes={entry.notes ?? []}
+        />
+      ))}
+    </div>
+  );
 }
 
 /** The honest program fidelity label (ADR-P006), shown when WHEP is live. */
@@ -191,6 +220,7 @@ export function MonitoringPage(): JSX.Element {
                 {(outputs.data ?? []).filter((output) => playbackPaths.has(output.id)).map((output) => <option key={output.id} value={output.id}>{t`HLS video (buffered)`}: {output.name}</option>)}
               </select>
             </label> : null}
+            <ProgramPlaybackUrls outputId={hlsOutput} />
             <div className="flex flex-wrap gap-3 text-sm underline"><Link to="/layouts"><Trans>Manage layouts</Trans></Link><Link to="/sources"><Trans>Manage sources</Trans></Link><Link to="/outputs"><Trans>Manage outputs</Trans></Link></div>
           </CardContent>
         </Card>

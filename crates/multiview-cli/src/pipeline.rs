@@ -72,6 +72,10 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg_next::format::Pixel;
 use ffmpeg_next::util::frame::Video;
 
+use crate::display_size::{
+    cell_pixel_size, display_size, DecoderState, DisplayDriver, DisplayFollow, DisplayLayoutSlot,
+    DisplayStep, HandoverDecoder, SkipThrough,
+};
 use multiview_compositor::blend::LinearRgba;
 use multiview_compositor::pipeline::{CanvasColor, Nv12Image};
 #[cfg(feature = "rist")]
@@ -79,7 +83,9 @@ use multiview_config::{lower_rist_url, RistOptions};
 use multiview_config::{MultiviewConfig, Output, Source, SourceKind, SrtBackend, SrtOptions};
 use multiview_control::EngineStateSnapshot;
 use multiview_core::frame::FrameMeta;
-use multiview_core::layout::{Cell, Layout};
+#[cfg(all(test, feature = "overlay"))]
+use multiview_core::layout::Cell;
+use multiview_core::layout::Layout;
 use multiview_core::pixel::PixelFormat;
 use multiview_core::time::{MediaTime, Rational};
 use multiview_core::traits::SourceState;
@@ -1181,6 +1187,12 @@ segment_ms = 1000
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
             source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
+            display: DisplayFollow::new(
+                std::sync::Arc::new(multiview_framestore::SwapCell::new(std::sync::Arc::new(
+                    layout.clone(),
+                ))),
+                None,
+            ),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1274,6 +1286,12 @@ segment_ms = 1000
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let spawner = LiveIngestSpawner {
             source_events: Arc::new(crate::source_event_runtime::Runtime::new().expect("events")),
+            display: DisplayFollow::new(
+                std::sync::Arc::new(multiview_framestore::SwapCell::new(std::sync::Arc::new(
+                    layout.clone(),
+                ))),
+                None,
+            ),
             layout: std::sync::Arc::new(layout),
             canvas_color: CanvasColor::default(),
             cadence: Rational::new(25, 1),
@@ -1547,6 +1565,9 @@ pub struct Pipeline {
     source_events: Arc<crate::source_event_runtime::Runtime>,
     /// The solved layout (canvas + normalized cells).
     layout: Arc<Layout>,
+    /// The live layout the decodes size themselves from; the control drain
+    /// publishes every applied change here.
+    display_layout: DisplayLayoutSlot,
     /// The fixed output cadence (exact rational).
     cadence: Rational,
     /// The single program this pipeline runs (ADR-0030 MP-0). The legacy
@@ -1916,6 +1937,10 @@ struct IngestPlan {
     tile_w: u32,
     /// The destination tile height.
     tile_h: u32,
+    /// When `Some`, the decode follows the live layout and `tile_w`/`tile_h` are
+    /// only the size at plan time. `None` for producers with a fixed output
+    /// size (see [`decode_follows_layout`]).
+    display: Option<DisplayFollow>,
     /// The store to publish decoded frames into (shared with the drive loop).
     store: Arc<TileStore<Nv12Image>>,
     /// The run's output-clock origin (time source + tick-0 seed), published
@@ -2013,6 +2038,12 @@ struct IngestPlan {
     /// [`IngestSupervisor::start`].
     #[cfg(feature = "youtube")]
     youtube_url_slot: Option<Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>>,
+    /// An explicit `yt-dlp` binary path for this run (ADR-0015 §6), stamped
+    /// from the `MULTIVIEW_YOUTUBE_YT_DLP_PATH` environment variable or else
+    /// `[system.youtube] yt_dlp_path` after build (like `ndi_accept_license`).
+    /// `None` ⇒ `yt-dlp` is resolved on `PATH` (the resolver's default).
+    #[cfg(feature = "youtube")]
+    youtube_yt_dlp_path: Option<String>,
 }
 
 /// Everything one AES67 / ST 2110-30 audio source needs to be received on its own
@@ -2276,6 +2307,8 @@ impl Pipeline {
         // (no decode actor to own yet). Holding each handle keeps its entry alive for
         // the pipeline's lifetime (the program's reference); dropping it releases.
         let source_registry = SourceRegistry::<Nv12Image>::new();
+        let display_layout: DisplayLayoutSlot =
+            Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&layout)));
         let mut source_handles: Vec<SourceHandle<Nv12Image>> =
             Vec::with_capacity(config.sources.len());
 
@@ -2304,8 +2337,7 @@ impl Pipeline {
                 });
                 continue;
             }
-            let (tile_w, tile_h) = cell_pixel_size(&layout, &source.id)
-                .unwrap_or((config.canvas.width, config.canvas.height));
+            let (tile_w, tile_h) = planned_tile_size(&layout, source);
             // The registry owns the shared store, sized to the per-axis supremum;
             // `stores` + the ingest plan below hold Arc clones (lock-free readers).
             let source_handle = source_registry.acquire_store(
@@ -2324,7 +2356,6 @@ impl Pipeline {
             )?;
             let store = Arc::clone(source_handle.store());
             source_handles.push(source_handle);
-            #[cfg_attr(not(feature = "overlay"), allow(unused_mut))]
             let mut plan = ingest_plan_for(
                 source,
                 tile_w,
@@ -2333,6 +2364,12 @@ impl Pipeline {
                 canvas_color,
                 cadence,
             )?;
+            plan.display = decode_follows_layout(&source.kind).then(|| {
+                DisplayFollow::new(
+                    Arc::clone(&display_layout),
+                    Some(Arc::clone(&source_registry)),
+                )
+            });
             // Reserve the authoritative epoch before either startup rail starts.
             // Old detached publishers from a previous run retain their old token.
             plan.lifecycle = begin_live_lifecycle(&source.id);
@@ -2352,6 +2389,18 @@ impl Pipeline {
                     accepted_by: ndi.accepted_by.clone().unwrap_or_default(),
                     accepted_at: ndi.accepted_at.clone().unwrap_or_default(),
                 };
+            }
+
+            // Stamp this source's explicit `yt-dlp` path (ADR-0015 §6), like
+            // `ndi_accept_license` above: the service user's `PATH` may not
+            // include where an operator installed it (e.g. `~/.local/bin`), so
+            // an explicit override is read from `MULTIVIEW_YOUTUBE_YT_DLP_PATH`
+            // (takes precedence, matching the existing `MULTIVIEW_*` override
+            // pattern) or else `[system.youtube] yt_dlp_path`. `None` ⇒ resolve
+            // on `PATH` (the resolver's own default).
+            #[cfg(feature = "youtube")]
+            {
+                plan.youtube_yt_dlp_path = crate::youtube_resolver_path(config);
             }
 
             // Wire this source's native captions (HLS WebVTT rendition thread +/or
@@ -2578,6 +2627,7 @@ impl Pipeline {
         Ok(Self {
             source_events,
             layout,
+            display_layout,
             cadence,
             program_spec,
             stores,
@@ -2820,6 +2870,10 @@ impl Pipeline {
         Arc::new(LiveIngestSpawner {
             source_events: Arc::clone(&self.source_events),
             layout: Arc::clone(&self.layout),
+            display: DisplayFollow::new(
+                Arc::clone(&self.display_layout),
+                Some(Arc::clone(&self.source_registry)),
+            ),
             canvas_color: self.canvas_color,
             cadence: self.cadence,
             output_origin: Arc::clone(&self.epoch_anchor),
@@ -2835,6 +2889,13 @@ impl Pipeline {
             #[cfg(feature = "gpu")]
             load_source: crate::system_metrics::default_load_source(),
         })
+    }
+
+    /// The slot the control drain publishes the live layout into, for
+    /// [`command_drain_with_seams`](crate::control::command_drain_with_seams).
+    #[must_use]
+    pub fn display_layout_slot(&self) -> DisplayLayoutSlot {
+        Arc::clone(&self.display_layout)
     }
 
     /// Lock-free selected-frame event reader for the control plane.
@@ -6601,6 +6662,7 @@ impl IngestSupervisor {
                 if let Some(slot) = plan.youtube_url_slot.clone() {
                     let id = plan.id.clone();
                     let watch_url = watch_url.clone();
+                    let yt_dlp_path = plan.youtube_yt_dlp_path.clone();
                     let rr_stop = Arc::new(AtomicBool::new(false));
                     let rr_exited = crate::live_sources::register_stop(
                         registry,
@@ -6617,7 +6679,12 @@ impl IngestSupervisor {
                         std::thread::Builder::new().name(format!("multiview-yt-reresolve-{id}"));
                     match rr_builder.spawn(move || {
                         let _exit = rr_exit_guard;
-                        youtube_reresolve_thread(&watch_url, &slot, &rr_thread_stop);
+                        youtube_reresolve_thread(
+                            &watch_url,
+                            yt_dlp_path.as_deref(),
+                            &slot,
+                            &rr_thread_stop,
+                        );
                     }) {
                         Ok(handle) => producers.push((rr_stop, handle)),
                         Err(e) => {
@@ -6903,12 +6970,13 @@ fn spawn_ingest_producer(
 /// only — heavy/blocking work never touches the output clock (inv #1).
 struct LiveIngestSpawner {
     source_events: Arc<crate::source_event_runtime::Runtime>,
-    /// The solved startup layout: tile geometry for a bound cell, the canvas
-    /// fallback for an unbound one — the same sizing rule the startup build
-    /// applies (a freshly added source is typically unbound until the
-    /// follow-up route, so it decodes at canvas size, exactly like an unbound
-    /// startup source).
+    /// The solved startup layout: the pinned canvas, which a live layout swap
+    /// cannot change. Tile sizes come from `display`. Read by the GPU
+    /// placement consult only.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     layout: Arc<Layout>,
+    /// The live layout, so a respawned producer starts at the active size.
+    display: DisplayFollow,
     /// The canvas colour the source's frames are tagged in.
     canvas_color: CanvasColor,
     /// The output cadence (generator pacing / plan metadata).
@@ -7013,7 +7081,7 @@ impl crate::live_sources::IngestSpawner for LiveIngestSpawner {
     }
 
     fn source_removed(&self, id: &str) {
-        let lifecycle = begin_live_lifecycle(id);
+        let lifecycle = remove_live_lifecycle(id);
         if let Some(lease) = self.source_events.activate(id, lifecycle) {
             lease.retire();
         }
@@ -7086,8 +7154,11 @@ impl LiveIngestSpawner {
         lifecycle: u64,
     ) -> Option<crate::live_sources::SpawnedProducer> {
         let source = source.clone();
-        let (tile_w, tile_h) = cell_pixel_size(&self.layout, &source.id)
-            .unwrap_or((self.layout.canvas.width, self.layout.canvas.height));
+        let (tile_w, tile_h) = if decode_follows_layout(&source.kind) {
+            self.display.size_for(&source.id)
+        } else {
+            self.display.fixed_size_for(&source.id)
+        };
         let mut plan = match ingest_plan_for(
             &source,
             tile_w,
@@ -7108,6 +7179,7 @@ impl LiveIngestSpawner {
             }
         };
         plan.output_origin = Arc::clone(&self.output_origin);
+        plan.display = decode_follows_layout(&source.kind).then(|| self.display.clone());
         plan.lifecycle = lifecycle;
         plan.source_events = source_events_enabled(&source)
             .then(|| self.source_events.activate(&source.id, lifecycle))
@@ -7289,6 +7361,33 @@ mod live_edit_audio_regression_tests {
         let deadline = Instant::now() + Duration::from_secs(8);
         while !condition() {
             assert!(Instant::now() < deadline, "live edit did not make progress");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Review R3-04: `AudioControlHandle::set_source_audio` publishes its
+    /// membership map (what `test_source_store` reads) BEFORE it enqueues the
+    /// change `apply_pending` drains (`push_member`) — so a single
+    /// `apply_pending` call right after the map becomes visible can race an
+    /// as-yet-undrained enqueue and silently apply nothing this tick. Retry
+    /// `apply_pending` until the bus's delivered membership (`live_strip_count`)
+    /// actually reaches `want`, rather than asserting on one undetermined call.
+    fn apply_pending_until_delivered(
+        audio: &crate::audio::AudioControlHandle,
+        bus: &mut ProgramBus,
+        want: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            audio.apply_pending(bus);
+            if bus.live_strip_count() == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bus membership did not reach {want} strip(s); got {}",
+                bus.live_strip_count()
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -7783,7 +7882,7 @@ segment_ms = 1000
             .expect("A audio worker")
             .stop
             .clone();
-        audio.apply_pending(&mut bus);
+        apply_pending_until_delivered(&audio, &mut bus, 1);
         bus.set_program_gain_ramped(
             audio.test_source_point("edited-http").expect("route"),
             1.0,
@@ -7823,17 +7922,31 @@ segment_ms = 1000
             "B segments fetched over HTTP"
         );
         assert!(old_stop.load(Ordering::Acquire), "A audio worker stopped");
-        let new_stop = registry
-            .lock()
-            .expect("registry")
-            .get("edited-http/audio")
-            .expect("B audio worker")
-            .stop
-            .clone();
-        assert!(
-            !Arc::ptr_eq(&old_stop, &new_stop),
-            "B owns a new audio worker"
-        );
+        // Review R3-04: B's shared-URL publication is NOT proof B's audio
+        // registry entry exists — production spawns video (which the fetcher
+        // belongs to) before it registers/spawns audio, so the URL can become
+        // visible while the registry still lacks B's `edited-http/audio`
+        // entry (teardown already removed A's). Synchronize on B's registry
+        // identity SEPARATELY and explicitly, rather than reading it
+        // immediately on the strength of the URL condition alone.
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let new_stop = loop {
+            let candidate = registry
+                .lock()
+                .expect("registry")
+                .get("edited-http/audio")
+                .map(|producer| producer.stop.clone());
+            match candidate {
+                Some(stop) if !Arc::ptr_eq(&old_stop, &stop) => break stop,
+                _ => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "B audio worker must register in the stop registry"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
         assert!(!new_stop.load(Ordering::Acquire), "B audio worker runs");
         wait_until(|| {
             audio
@@ -7866,8 +7979,7 @@ segment_ms = 1000
             new_anchor.raw_pts0_ns.is_some(),
             "B video has a usable PTS anchor"
         );
-        audio.apply_pending(&mut bus);
-        assert_eq!(bus.live_strip_count(), 2, "A crossfades into B");
+        apply_pending_until_delivered(&audio, &mut bus, 2);
         // A live HLS producer stays paced; the bus reads the B store after the
         // source edit, rather than seeking a finite file back from EOF.
         // The video anchor includes the two-second jitter hold. Drive the bus
@@ -7900,9 +8012,19 @@ segment_ms = 1000
             }
             std::thread::sleep(Duration::from_millis(40));
         }
+        let final_anchor = live_anchor_slot("edited-http").load();
         assert!(
             (25..=45).contains(&crossings),
-            "program B tone: crossings={crossings}"
+            "program B tone: crossings={crossings}; bus tick {first_tick}..{tick}; B store \
+             cursor={} buffered={}; anchor gen={:?} out0_ns={:?} raw_pts0_ns={:?}; \
+             lifecycle now={} (B {b_lifecycle}); B segment hits={}",
+            new_store.read_cursor(),
+            new_store.buffered_frames(),
+            final_anchor.as_ref().map(|a| a.generation),
+            final_anchor.as_ref().map(|a| a.out0.as_nanos()),
+            final_anchor.as_ref().and_then(|a| a.raw_pts0_ns),
+            live_lifecycle("edited-http"),
+            b_hits.load(Ordering::Acquire),
         );
         hub.shutdown();
         origin_stop.store(true, Ordering::Release);
@@ -7914,6 +8036,7 @@ segment_ms = 1000
     #[test]
     #[allow(clippy::too_many_lines)]
     fn same_id_file_edit_replaces_audio_worker_and_running_program_store() {
+        const READ_SPAN_FRAMES: usize = 11_520;
         let dir = tempfile::tempdir().expect("fixture directory");
         let a = dir.path().join("a.ts");
         let b = dir.path().join("b.ts");
@@ -7983,8 +8106,7 @@ segment_ms = 1000
         wait_until(|| audio.test_source_store("edited").is_some());
         let old = audio.test_source_store("edited").expect("A store");
         wait_until(|| old.buffered_frames() > 4_800);
-        audio.apply_pending(&mut bus);
-        assert_eq!(bus.live_strip_count(), 1, "A joins the real bus");
+        apply_pending_until_delivered(&audio, &mut bus, 1);
         bus.set_program_gain_ramped(audio.test_source_point("edited").expect("A route"), 1.0, 0)
             .expect("route A at unity");
         let first = registry
@@ -8003,7 +8125,21 @@ segment_ms = 1000
                 .is_some_and(|s| !Arc::ptr_eq(&s, &old))
         });
         let new = audio.test_source_store("edited").expect("B store");
-        wait_until(|| new.buffered_frames() > 4_800);
+        // Review R3-04: `buffered_frames() > 4_800` only proved SOME of the
+        // span had arrived — the paced decoder (2 s look-ahead) keeps
+        // publishing concurrently with the later unpaced 11_520-frame read
+        // below, so that read could land partway into not-yet-published
+        // (silence-filled) frames. Wait for `measure_pcm` to report the EXACT
+        // span the test reads as fully, stably covered before touching it —
+        // a `Measured` result (not `Unknown`) proves every frame in
+        // `[0, READ_SPAN_FRAMES)` was actually published, not inferred from a
+        // partial threshold.
+        wait_until(|| {
+            matches!(
+                new.measure_pcm(0, READ_SPAN_FRAMES),
+                multiview_audio::store::PcmMeasurement::Measured { .. }
+            )
+        });
         let second = registry
             .lock()
             .expect("registry")
@@ -8020,27 +8156,29 @@ segment_ms = 1000
             "B has a fresh worker stop flag"
         );
         assert!(!second.load(Ordering::Acquire), "B worker runs after edit");
-        audio.apply_pending(&mut bus); // B repoints the existing bus strip.
-        assert_eq!(
-            bus.live_strip_count(),
-            2,
-            "crossfade briefly retains A until its 10 ms ramp ends"
-        );
+        // B repoints the existing bus strip (crossfade briefly retains A
+        // until its 10 ms ramp ends).
+        apply_pending_until_delivered(&audio, &mut bus, 2);
         assert!(Arc::ptr_eq(
             &new,
             &audio.test_source_store("edited").expect("bus source is B")
         ));
         // The finite FILE decoder may finish all 12 seconds before the bus first
-        // ticks. Park its cursor inside the decoded tail, not past EOF; the
-        // production bus still reads the actual B decode store after its ramp.
-        let decoded_head = new.read_cursor();
-        new.seek_to(decoded_head.saturating_sub(19_200));
+        // ticks. Park its cursor at the start of the span the `measure_pcm`
+        // wait above just proved is fully, stably published — never past EOF;
+        // the production bus still reads the actual B decode store after its
+        // ramp.
+        new.seek_to(0);
         // A 440 Hz tone and B 880 Hz tone have different zero-crossing counts.
         // The bus output (not a direct store read) must carry B after its ramp.
+        // Exactly `READ_SPAN_FRAMES` (6 ticks x 1_920 frames/tick at 25 fps):
+        // the `measure_pcm` wait above proved every one of these frames is
+        // real decoded PCM, not a still-filling live edge.
         let mut samples = Vec::new();
         for tick in 1..=6 {
             samples.extend(bus.tick_to(tick).interleaved().iter().step_by(2).copied());
         }
+        debug_assert_eq!(samples.len(), READ_SPAN_FRAMES, "one channel per frame");
         assert_eq!(
             bus.live_strip_count(),
             1,
@@ -8208,58 +8346,6 @@ fn duration_from_nanos(nanos: i64) -> Duration {
     Duration::from_nanos(u64::try_from(nanos.max(0)).unwrap_or(u64::MAX))
 }
 
-/// The decode size for `source_id`: the **per-axis supremum** of the pixel sizes
-/// of every cell that binds it, or [`None`] if no cell binds it.
-///
-/// A source can tile into several cells of different sizes (e.g. a big PGM cell
-/// plus a small PIP). Decoding once at the per-axis max satisfies the largest
-/// consumer on each axis (ADR-0030 §3); each cell then scales down at composite.
-/// Taking the FIRST binding cell would under-decode every larger tile bound to
-/// the same source.
-fn cell_pixel_size(layout: &Layout, source_id: &str) -> Option<(u32, u32)> {
-    layout
-        .cells
-        .iter()
-        .filter(|c| c.source.as_deref() == Some(source_id))
-        .map(|c| cell_dims(c, layout.canvas.width, layout.canvas.height))
-        .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)))
-}
-
-/// Convert a cell's normalized `w`/`h` into even pixel dimensions (NV12 needs
-/// even extents), clamped to at least 2x2.
-fn cell_dims(cell: &Cell, canvas_w: u32, canvas_h: u32) -> (u32, u32) {
-    let to_even_px = |frac: f32, extent: u32| -> u32 {
-        let raw = frac_to_px(frac, extent);
-        let even = raw & !1; // round down to even
-        even.max(2)
-    };
-    (to_even_px(cell.w, canvas_w), to_even_px(cell.h, canvas_h))
-}
-
-/// Convert a normalized fraction in `[0,1]` to a pixel count in `[0, extent]`,
-/// `as`-cast-free (the guardrails deny `as_conversions`).
-fn frac_to_px(frac: f32, extent: u32) -> u32 {
-    if !frac.is_finite() || frac <= 0.0 {
-        return 0;
-    }
-    let target = f64::from(frac) * f64::from(extent);
-    if target >= f64::from(extent) {
-        return extent;
-    }
-    // Largest u32 candidate whose lossless f64 widening is <= target.
-    let mut lo: u32 = 0;
-    let mut hi: u32 = extent;
-    while lo < hi {
-        let mid = lo.saturating_add((hi - lo).saturating_add(1) / 2);
-        if f64::from(mid) <= target {
-            lo = mid;
-        } else {
-            hi = mid.saturating_sub(1);
-        }
-    }
-    lo
-}
-
 /// Resolve source-bound cells into canvas-space tile chrome, in cell order.
 #[cfg(feature = "overlay")]
 pub(crate) fn tile_specs_for_layout(
@@ -8296,11 +8382,11 @@ pub(crate) fn tile_specs_for_layout(
 
 /// Convert a normalized fraction in `[0,1]` to a pixel coordinate `f32` against
 /// `extent`, `as`-cast-free, for placing the per-tile overlay surface. Reuses the
-/// exact integer [`frac_to_px`] then widens losslessly (overlay sizes are well
+/// exact integer [`crate::display_size::frac_to_px`] then widens losslessly (overlay sizes are well
 /// under 2^24).
 #[cfg(feature = "overlay")]
 fn norm_to_px_f32(frac: f32, extent: u32) -> f32 {
-    let px = frac_to_px(frac, extent);
+    let px = crate::display_size::frac_to_px(frac, extent);
     let high = u16::try_from(px >> 16).unwrap_or(u16::MAX);
     let low = u16::try_from(px & 0xFFFF).unwrap_or(u16::MAX);
     f32::from(high) * 65_536.0 + f32::from(low)
@@ -8529,7 +8615,7 @@ fn i32_to_f32(value: i32) -> f32 {
 
 /// Round a finite `f64` config measure to the nearest `i32` (saturating to the
 /// `i32` range), no `as` cast: handle the sign, then a bounded binary search over
-/// the unsigned magnitude (mirrors [`frac_to_px`]'s `u64`-bounded search).
+/// the unsigned magnitude (mirrors [`crate::display_size::frac_to_px`]'s `u64`-bounded search).
 #[cfg(feature = "overlay")]
 fn round_f64_to_i32(v: f64) -> i32 {
     if !v.is_finite() {
@@ -10166,6 +10252,105 @@ fn youtube_url_slot_for(
 /// synthetic source with invalid parameters. (Opening/decoding errors surface on
 /// the ingest thread later — they must never fail the *build* of a never-ending
 /// live source.)
+/// Whether this kind's producer runs the [`open_and_stream`] pump, which resizes
+/// to follow the layout. Generators and the NDI/WHIP drives keep the size they
+/// were planned at for their whole life, so they must keep the larger fallback:
+/// a small unbound size would leave them soft once routed to a big tile.
+fn decode_follows_layout(kind: &SourceKind) -> bool {
+    !matches!(
+        kind,
+        SourceKind::Bars
+            | SourceKind::Solid { .. }
+            | SourceKind::Clock { .. }
+            | SourceKind::Timer { .. }
+            | SourceKind::Weather { .. }
+            | SourceKind::Graphic { .. }
+            | SourceKind::GraphicsChannel { .. }
+            | SourceKind::Ndi { .. }
+            | SourceKind::Webrtc { .. }
+    )
+}
+
+/// The size `source` is planned at under `layout`.
+fn planned_tile_size(layout: &Layout, source: &Source) -> (u32, u32) {
+    if decode_follows_layout(&source.kind) {
+        display_size(layout, &source.id)
+    } else {
+        crate::display_size::fixed_size(layout, &source.id)
+    }
+}
+
+/// The height to pick an HLS variant for on this connection.
+fn variant_height(plan: &IngestPlan) -> u32 {
+    plan.display
+        .as_ref()
+        .map_or(plan.tile_h, |display| display.variant_height(&plan.id))
+}
+
+impl HandoverDecoder for StreamVideoDecoder {
+    type Packet = ffmpeg::codec::packet::Packet;
+    type Frame = DecodedVideoFrame;
+
+    fn send(&mut self, packet: &Self::Packet) -> Result<(), String> {
+        self.send_packet(packet).map_err(|e| e.to_string())
+    }
+
+    fn receive(&mut self) -> Result<Option<Self::Frame>, String> {
+        self.receive_frame().map_err(|e| e.to_string())
+    }
+
+    fn is_key(packet: &Self::Packet) -> bool {
+        packet.is_key()
+    }
+
+    fn packet_pts(packet: &Self::Packet) -> Option<i64> {
+        packet.pts()
+    }
+
+    fn frame_pts(frame: &Self::Frame) -> Option<i64> {
+        frame.raw_pts
+    }
+}
+
+/// Everything needed to open a replacement decoder off the decode thread.
+struct DecoderOpenArgs {
+    id: String,
+    params: ffmpeg::codec::Parameters,
+    time_base: Rational,
+    declared_fps: Rational,
+    cuda_ordinal: Option<String>,
+    /// Open in software: only a test rehearsal of the reopen path sets this.
+    rehearsal: bool,
+}
+
+impl DecoderOpenArgs {
+    /// Open NVDEC at `resize`. Unlike a connection open this refuses to degrade:
+    /// a software or unresized replacement is worse than the running decoder.
+    fn open(
+        self,
+        resize: Option<multiview_ffmpeg::TileSize>,
+    ) -> Result<StreamVideoDecoder, String> {
+        let _resource = ingest_resource_scope(&self.id);
+        if self.rehearsal {
+            return StreamVideoDecoder::new(self.params, self.time_base)
+                .map(|decoder| decoder.with_declared_fps(Some(self.declared_fps)))
+                .map_err(|e| e.to_string());
+        }
+        let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
+            self.params,
+            self.time_base,
+            true,
+            self.cuda_ordinal.as_deref(),
+            resize,
+        )
+        .map_err(|e| e.to_string())?;
+        if !used_hw || decoder.hw_resize() != resize {
+            return Err("NVDEC refused the new resize".to_owned());
+        }
+        Ok(decoder.with_declared_fps(Some(self.declared_fps)))
+    }
+}
+
 // A flat, one-arm-per-`SourceKind` dispatch plus the single feature-gated
 // `IngestPlan` struct literal: inherently long and clearer kept whole than split
 // across helpers (adding the `player` field tipped it one line over the 100 bound).
@@ -10316,6 +10501,7 @@ fn ingest_plan_for(
         player: None,
         tile_w,
         tile_h,
+        display: None,
         store,
         output_origin: crate::timing_status::anchor_slot(),
         live_anchor: live_anchor_slot(&source.id),
@@ -10351,6 +10537,8 @@ fn ingest_plan_for(
         },
         #[cfg(feature = "youtube")]
         youtube_url_slot,
+        #[cfg(feature = "youtube")]
+        youtube_yt_dlp_path: None,
     })
 }
 
@@ -10523,6 +10711,7 @@ fn build_media_player_boot(
             player: Some(handle),
             tile_w,
             tile_h,
+            display: None,
             store,
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -10551,6 +10740,8 @@ fn build_media_player_boot(
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         });
         tracing::info!(
             player = %player.id, asset = %asset_id,
@@ -12320,12 +12511,31 @@ fn timeline_pts(
     normalizer.normalize(raw_pts, 0).unwrap_or(fallback)
 }
 
+/// Build the [`ResolverConfig`](multiview_input::youtube::ResolverConfig) this
+/// run's `yt-dlp` invocations use: an explicit `yt_dlp_path` (from
+/// [`IngestPlan::youtube_yt_dlp_path`], itself stamped from the
+/// `MULTIVIEW_YOUTUBE_YT_DLP_PATH` environment variable or else `[system.youtube]
+/// yt_dlp_path`, ADR-0015 §6) when configured, else the default (`"yt-dlp"` on
+/// `PATH`) — because the service user's `PATH` may not include where an operator
+/// installed it (e.g. `~/.local/bin`).
+#[cfg(feature = "youtube")]
+fn youtube_resolver_config(yt_dlp_path: Option<&str>) -> multiview_input::youtube::ResolverConfig {
+    match yt_dlp_path {
+        Some(path) if !path.is_empty() => multiview_input::youtube::ResolverConfig::new(
+            path,
+            multiview_input::youtube::ResolverConfig::default().timeout,
+        ),
+        _ => multiview_input::youtube::ResolverConfig::default(),
+    }
+}
+
 /// Resolve a `YouTube` **watch** URL to a fresh live HLS master URL (ADR-0015),
 /// for opening by the standard HLS ingest path.
 ///
 /// This is the CLI's wiring seam onto [`multiview_input::youtube`]: it spawns the
-/// runtime-discovered `yt-dlp` resolver under its hard timeout and returns the
-/// resolved `*.googlevideo.com` manifest URL ([`ingest_url`](multiview_input::youtube::reresolve::ingest_url)).
+/// runtime-discovered `yt-dlp` resolver (at `yt_dlp_path`, see
+/// [`youtube_resolver_config`]) under its hard timeout and returns the resolved
+/// `*.googlevideo.com` manifest URL ([`ingest_url`](multiview_input::youtube::reresolve::ingest_url)).
 /// It runs on the calling **ingest thread** (a `std::thread`, the control/IO
 /// plane), so it spins up a small current-thread Tokio runtime to drive the async
 /// resolver; the output data plane is never involved (invariants #1/#10). A
@@ -12333,20 +12543,21 @@ fn timeline_pts(
 /// live) is returned as a `String` error — the caller's reconnect bracket backs
 /// off and retries while the tile degrades; it is never a panic.
 #[cfg(feature = "youtube")]
-fn resolve_youtube_master(watch_url: &str) -> Result<String, String> {
+fn resolve_youtube_master(watch_url: &str, yt_dlp_path: Option<&str>) -> Result<String, String> {
     use multiview_input::youtube::reresolve::{ingest_url, ProcessResolver, Resolver};
 
     // A dedicated current-thread runtime for this one resolve. `yt-dlp`'s own hard
-    // timeout (ResolverConfig::default) bounds the await, so this never blocks the
-    // ingest thread indefinitely; the reconnect backoff bounds retry frequency.
+    // timeout (within `youtube_resolver_config`) bounds the await, so this never
+    // blocks the ingest thread indefinitely; the reconnect backoff bounds retry
+    // frequency.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("youtube resolver runtime: {e}"))?;
-    let process = ProcessResolver::default();
+    let process = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let master = runtime
         .block_on(process.resolve(watch_url))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.operator_message())?;
     Ok(ingest_url(&master).to_owned())
 }
 
@@ -12406,6 +12617,7 @@ where
 #[cfg(feature = "youtube")]
 fn youtube_reresolve_thread(
     watch_url: &str,
+    yt_dlp_path: Option<&str>,
     slot: &Arc<multiview_framestore::SwapCell<Option<Arc<String>>>>,
     stop: &AtomicBool,
 ) {
@@ -12432,7 +12644,7 @@ fn youtube_reresolve_thread(
         }
     };
 
-    let resolver = ProcessResolver::default();
+    let resolver = ProcessResolver::new(youtube_resolver_config(yt_dlp_path));
     let clock = SystemUnixClock;
     let swap_slot = Arc::clone(slot);
     let outcome = runtime.block_on(run_reresolve_loop(
@@ -12492,9 +12704,11 @@ fn open_and_stream(
     #[cfg(feature = "youtube")]
     let resolved_youtube_url = match &plan.location {
         SourceLocation::Youtube { watch_url } => {
-            Some(youtube_open_url(plan.youtube_url_slot.as_deref(), || {
-                resolve_youtube_master(watch_url)
-            })?)
+            let resolved = youtube_open_url(plan.youtube_url_slot.as_deref(), || {
+                resolve_youtube_master(watch_url, plan.youtube_yt_dlp_path.as_deref())
+            });
+            crate::youtube_status::record(&plan.id, resolved.as_ref().err().map(String::as_str));
+            Some(resolved?)
         }
         _ => None,
     };
@@ -12522,8 +12736,12 @@ fn open_and_stream(
             // (invariants #1/#10). A non-master / non-HLS URL is unchanged.
             // Operator `user_agent`/`referrer` headers ride the variant-pin
             // request and the loopback fetcher (and libav's own opts).
-            let open_url =
-                main_demuxer_open_url(u.as_str(), &plan.location, plan.tile_h, &plan.http_headers);
+            let open_url = main_demuxer_open_url(
+                u.as_str(),
+                &plan.location,
+                variant_height(plan),
+                &plan.http_headers,
+            );
             // A live HLS media playlist is fetched by our parallel-range segment
             // fetcher and read by libav from loopback memory (see `hls_fetch`);
             // anything it cannot serve (VOD, encrypted, fMP4) opens directly.
@@ -12591,7 +12809,7 @@ fn open_and_stream(
                 return Err("youtube source did not resolve a manifest url".to_owned());
             };
             let open_url =
-                main_demuxer_open_url(url, &plan.location, plan.tile_h, &plan.http_headers);
+                main_demuxer_open_url(url, &plan.location, variant_height(plan), &plan.http_headers);
             ffmpeg::format::input_with_dictionary(&open_url.as_str(), opts)
                 .map_err(|e| e.to_string())?
         }
@@ -12641,17 +12859,25 @@ fn open_and_stream(
     let (want_hw, cuda_ordinal) = decoder_open_args(&plan.decode_placement, nvdec_env.as_deref());
     // Inv #6 (decode near display size): on NVDEC, ask the ASIC to emit at the
     // tile size (`*_cuvid -resize`) so the host download and the CPU tile scale
-    // shrink from the source to the tile. A pure downscale only; the tile size is
-    // fixed for this plan (a layout change respawns the producer, which reopens).
-    let display_resize = {
-        let (src_w, src_h) = StreamVideoDecoder::coded_size(&params);
-        let resize_env = std::env::var(multiview_ffmpeg::NVDEC_RESIZE_DISABLE_ENV).ok();
-        multiview_ffmpeg::nvdec_resize_target(
-            multiview_ffmpeg::TileSize::new(src_w, src_h),
-            multiview_ffmpeg::TileSize::new(plan.tile_w, plan.tile_h),
-            resize_env.as_deref(),
-        )
-    };
+    // shrink from the source to the tile. A pure downscale only. Every connection
+    // opens at the live size; a layout change on a running connection goes through
+    // the `DisplayDriver` below, because cuvid fixes its resize at open.
+    let tile = plan
+        .display
+        .as_ref()
+        .map_or((plan.tile_w, plan.tile_h), |display| {
+            display.size_for(&plan.id)
+        });
+    let (src_w, src_h) = StreamVideoDecoder::coded_size(&params);
+    let source_size = multiview_ffmpeg::TileSize::new(src_w, src_h);
+    let resize_env = std::env::var(multiview_ffmpeg::NVDEC_RESIZE_DISABLE_ENV).ok();
+    let display_resize = multiview_ffmpeg::nvdec_resize_target(
+        source_size,
+        multiview_ffmpeg::TileSize::new(tile.0, tile.1),
+        resize_env.as_deref(),
+    );
+    let reopen_params = params.clone();
+    let reopen_ordinal = cuda_ordinal.map(str::to_owned);
     let (decoder, used_hw) = StreamVideoDecoder::new_preferring_hw_at(
         params,
         time_base,
@@ -12671,7 +12897,15 @@ fn open_and_stream(
         nvdec_resize = ?decoder.hw_resize(),
         "opened video decoder"
     );
-    let mut to_tile = TileScaler::new(plan.tile_w, plan.tile_h);
+    let mut to_tile = TileScaler::new(tile.0, tile.1);
+    let mut display = plan.display.clone().map(|follow| {
+        let state = DecoderState {
+            source: source_size,
+            hardware: used_hw || follow.rehearses_reopen(),
+            resize: decoder.hw_resize(),
+        };
+        DisplayDriver::<StreamVideoDecoder>::new(follow, &plan.id, tile, state, resize_env)
+    });
 
     // Per-input PTS normalizer (invariant #3, the unified timing model): unwrap a
     // 33-bit MPEG-TS wrap, synthesize a genpts fallback from the declared cadence
@@ -12849,11 +13083,23 @@ fn open_and_stream(
 
     // Pump packets, publishing each decoded+scaled frame into the store.
     let mut drained = false;
+    // A decoder handover: warm-up frames to publish first, the time the new
+    // decoder must pass before its frames count, and the old decoder's position.
+    let mut carried = std::collections::VecDeque::new();
+    let mut skip = SkipThrough::default();
+    let mut last_raw_pts: Option<i64> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        while let Some(decoded) = decoder.receive_frame().map_err(|e| e.to_string())? {
+        while let Some(decoded) = match carried.pop_front() {
+            Some(frame) => Some(frame),
+            None => decoder.receive_frame().map_err(|e| e.to_string())?,
+        } {
+            if skip.drops(decoded.raw_pts) {
+                continue;
+            }
+            last_raw_pts = decoded.raw_pts.or(last_raw_pts);
             // Embedded CEA-608: feed this frame's A53 cc-data side data (extracted
             // off the RAW decoded frame before NV12 conversion) to `cc_dec`,
             // anchored at the frame's raw stream PTS. Most frames carry none (a
@@ -12963,6 +13209,49 @@ fn open_and_stream(
         if drained {
             return Ok(());
         }
+        // Follow the live layout. Off the clock: this is the decode thread, and
+        // the blocking decoder open runs on the driver's helper thread.
+        if let Some(driver) = display.as_mut() {
+            let display_step = driver.poll(last_raw_pts, Instant::now(), |resize| {
+                let args = DecoderOpenArgs {
+                    id: plan.id.clone(),
+                    params: reopen_params.clone(),
+                    time_base,
+                    declared_fps,
+                    cuda_ordinal: reopen_ordinal.clone(),
+                    rehearsal: plan
+                        .display
+                        .as_ref()
+                        .is_some_and(DisplayFollow::rehearses_reopen),
+                };
+                let counted = plan.display.clone();
+                move || {
+                    if let Some(follow) = &counted {
+                        follow.note_open();
+                    }
+                    args.open(resize)
+                }
+            });
+            match display_step {
+                DisplayStep::Idle => {}
+                DisplayStep::Retarget((w, h)) => to_tile = TileScaler::new(w, h),
+                DisplayStep::Cutover {
+                    decoder: replacement,
+                    frames,
+                    skip_through,
+                    tile: (w, h),
+                } => {
+                    decoder = replacement;
+                    carried = frames;
+                    skip.arm(skip_through);
+                    to_tile = TileScaler::new(w, h);
+                    if let Some(follow) = &plan.display {
+                        follow.note_cutover();
+                    }
+                    continue;
+                }
+            }
+        }
         // Wait in short slices so `stop` stays responsive while the origin is
         // slow; a dead read still surfaces within `rw_timeout` as an error.
         let Some(item) = pending
@@ -12976,6 +13265,9 @@ fn open_and_stream(
                 if packet.stream() == stream_index {
                     packet_gate.submitted(fence, packet.pts());
                     decoder.send_packet(&packet).map_err(|e| e.to_string())?;
+                    if let Some(driver) = display.as_mut() {
+                        driver.on_packet(&packet);
+                    }
                 } else {
                     // A non-video packet: route it to the in-container subtitle
                     // decoder (DVB-sub bitmap or text) if it belongs to that
@@ -14128,17 +14420,52 @@ pub type LiveAnchorSlot = Arc<multiview_framestore::SwapCell<Option<Arc<LiveAnch
 /// Takes a mutex only to find/create the entry (plan build, control plane);
 /// never on a per-frame path.
 pub fn live_anchor_slot(id: &str) -> LiveAnchorSlot {
-    static SLOTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>>,
-    > = std::sync::OnceLock::new();
-    let map = SLOTS.get_or_init(Default::default);
-    let mut map = map
+    let mut map = anchor_slots()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(
         map.entry(id.to_owned())
             .or_insert_with(|| Arc::new(multiview_framestore::SwapCell::empty())),
     )
+}
+
+/// A non-allocating, lifecycle-checked lookup for a LIVE AUDIO WORKER (review
+/// R3-02): unlike [`live_anchor_slot`], this never recreates a removed entry.
+///
+/// `lifecycle == 0` is the sole non-worker caller's convention (plan-build
+/// time, before any lifecycle is assigned): it always matches and allocates
+/// exactly as `live_anchor_slot` does. A worker's nonzero `lifecycle` is
+/// checked against the CURRENT token for `id` *and* the slot is looked up,
+/// both under the SAME `anchor_lifecycle()` lock [`remove_live_lifecycle`]
+/// takes (same lock order: tokens, then slots) — so a worker that already
+/// passed its own loop-top lifecycle check can never recreate a slot a
+/// concurrent `remove_live_lifecycle` has just dropped: either this call
+/// observes the removal (token mismatch/absent ⇒ `None`, no allocation) or it
+/// completes entirely before the removal starts (serialized by the lock).
+pub(crate) fn live_anchor_slot_for_lifecycle(id: &str, lifecycle: u64) -> Option<LiveAnchorSlot> {
+    if lifecycle == 0 {
+        return Some(live_anchor_slot(id));
+    }
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tokens.get(id).copied() != Some(lifecycle) {
+        return None;
+    }
+    anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .cloned()
+}
+
+/// The process-wide anchor slots, keyed by live source id. A removed source's
+/// entry is dropped (review R2-04), so the map tracks live sources only.
+fn anchor_slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>> {
+    static SLOTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LiveAnchorSlot>>,
+    > = std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
 }
 
 /// A detached writer and a replacement synchronize publication under one lock.
@@ -14166,10 +14493,15 @@ pub(crate) fn begin_live_lifecycle(id: &str) -> u64 {
 
 #[allow(clippy::expect_used)] // 2^64 lifecycle replacements cannot safely reuse a token; fail closed before ABA.
 fn advance_live_lifecycle(id: &str, tokens: &mut std::collections::HashMap<String, u64>) -> u64 {
+    // Review R2-04: tokens come from one process-wide counter, so no id ever
+    // sees a token twice. A removed id can then drop its entry: a stale worker
+    // holds a token that no later lifecycle of any id can equal. Allocated
+    // under the lifecycle lock, so per-id tokens stay strictly increasing.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(next != u64::MAX, "source lifecycle epoch exhausted");
     let token = tokens.entry(id.to_owned()).or_default();
-    *token = token
-        .checked_add(1)
-        .expect("source lifecycle epoch exhausted");
+    *token = next;
     let slot = live_anchor_slot(id);
     let generation = slot
         .load()
@@ -14181,8 +14513,47 @@ fn advance_live_lifecycle(id: &str, tokens: &mut std::collections::HashMap<Strin
         pts0: MediaTime::ZERO,
         raw_pts0_ns: None,
     })));
-    crate::hls_fetch::begin_generation(id);
+    crate::hls_fetch::begin_generation_at(id, *token);
     *token
+}
+
+/// End a removed source's lifecycle and release every per-id registry entry:
+/// the lifecycle token, the anchor slot and the fetch registration (review
+/// R2-04). Tokens are globally unique, so dropping the entry cannot unfence a
+/// stale worker: its token never matches an absent entry (read as `0`) or any
+/// later lifecycle. A detached worker keeps its own `Arc` of the old slot; a
+/// re-add gets a fresh slot that the old worker cannot reach.
+pub(crate) fn remove_live_lifecycle(id: &str) -> u64 {
+    let mut tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lifecycle = advance_live_lifecycle(id, &mut tokens);
+    crate::hls_fetch::forget_source(id, lifecycle);
+    tokens.remove(id);
+    anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(id);
+    lifecycle
+}
+
+/// Live entries retained by the lifecycle and anchor registries whose id
+/// starts with `prefix` (churn-bound tests).
+#[cfg(test)]
+pub(crate) fn retained_lifecycle_ids(prefix: &str) -> (usize, usize) {
+    let tokens = anchor_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .count();
+    let slots = anchor_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .count();
+    (tokens, slots)
 }
 
 /// Invalidate an ending run only if its startup producer still owns this id.
@@ -16362,13 +16733,18 @@ mod youtube_tests {
     }
 
     impl multiview_input::youtube::reresolve::Resolver for FakeResolver {
-        async fn resolve(&self, _url: &str) -> Result<ResolvedHls, YoutubeError> {
+        fn resolve(
+            &self,
+            _url: &str,
+        ) -> impl std::future::Future<Output = Result<ResolvedHls, YoutubeError>> + Send {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.results
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned())))
+            std::future::ready(
+                self.results
+                    .lock()
+                    .expect("lock")
+                    .pop_front()
+                    .unwrap_or(Err(YoutubeError::Unavailable("exhausted".to_owned()))),
+            )
         }
     }
 
@@ -18150,6 +18526,7 @@ mod media_player_loop_tests {
             player: Some(handle),
             tile_w,
             tile_h,
+            display: None,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -18175,6 +18552,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // A recorder thread snapshots the published tile's (stamp, fingerprint)
@@ -18319,6 +18698,7 @@ mod media_player_loop_tests {
             player: Some(handle),
             tile_w: 160,
             tile_h: 120,
+            display: None,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -18344,6 +18724,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // Drive the player WITHOUT ever setting `stop`: the fail-safe must end the
@@ -18432,6 +18814,7 @@ mod media_player_loop_tests {
             player: Some(handle),
             tile_w,
             tile_h,
+            display: None,
             store: Arc::clone(&store),
             output_origin: crate::timing_status::anchor_slot(),
             live_anchor: Arc::new(multiview_framestore::SwapCell::empty()),
@@ -18457,6 +18840,8 @@ mod media_player_loop_tests {
             },
             #[cfg(feature = "youtube")]
             youtube_url_slot: None,
+            #[cfg(feature = "youtube")]
+            youtube_yt_dlp_path: None,
         };
 
         // Capture every distinct published frame fingerprint across the run.
@@ -18759,6 +19144,7 @@ mod mp2_slice2_registry_adoption {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use crate::display_size::cell_dims;
 
     /// A 2x2 grid where source `cam1` is bound by two cells of DIFFERENT sizes:
     /// area `a` = 400x480 and area `d` = 800x240 on a 1200x720 canvas. The
@@ -18834,6 +19220,86 @@ segment_ms = 1000
             "cell_pixel_size must decode at the per-axis supremum across ALL binding \
              cells (ADR-0030 §3), not the first-found cell {first:?}"
         );
+    }
+
+    /// A network source the boot layout does not bind is planned at the small
+    /// unbound size, not the full canvas, and its plan follows the live layout.
+    /// A generator, which cannot resize later, keeps the canvas fallback.
+    #[test]
+    fn an_unbound_network_source_is_not_planned_at_the_full_canvas() {
+        let doc = r##"schema_version = 1
+[canvas]
+width = 1920
+height = 1080
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "grid"
+columns = ["1fr"]
+rows = ["1fr"]
+areas = ["main"]
+[[sources]]
+id = "boot"
+kind = "bars"
+[[sources]]
+id = "news"
+kind = "hls"
+url = "http://[::1]:9/news.m3u8"
+[[sources]]
+id = "spare"
+kind = "bars"
+[[cells]]
+id = "main"
+area = "main"
+[cells.source]
+input_id = "boot"
+[[outputs]]
+kind = "hls"
+path = "/tmp/nvdec-unbound.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##;
+        let config = multiview_config::MultiviewConfig::load_from_toml(doc).expect("parses");
+        let pipeline = Pipeline::build(&config).expect("pipeline builds");
+        let size = |id: &str| {
+            pipeline
+                .source_registry
+                .requested_supremum(&multiview_engine::SourceKey::from_canonical(id))
+        };
+        let req = |(width, height): (u32, u32)| multiview_engine::RequestedSize { width, height };
+        assert_eq!(
+            size("news"),
+            Some(req(crate::display_size::UNBOUND_DISPLAY_SIZE))
+        );
+        assert_eq!(size("spare"), Some(req((1920, 1080))));
+        let news = pipeline
+            .ingest_plans
+            .iter()
+            .find(|plan| plan.id == "news")
+            .expect("news plan");
+        assert_eq!((news.tile_w, news.tile_h), (640, 360));
+        let follow = news
+            .display
+            .as_ref()
+            .expect("a network decode follows the layout");
+        assert_eq!(
+            follow.variant_height("news"),
+            1080,
+            "an unbound HLS source still pins a canvas-height variant"
+        );
+        let spare = pipeline
+            .ingest_plans
+            .iter()
+            .find(|plan| plan.id == "spare")
+            .expect("spare plan");
+        assert!(spare.display.is_none());
+
+        // Following a live layout swap updates the registry record downwards.
+        follow.record("news", (320, 180));
+        assert_eq!(size("news"), Some(req((320, 180))));
     }
 
     #[test]
@@ -20185,5 +20651,379 @@ mod http_headers_tests {
         assert_eq!(opts.get("referer"), Some("https://r/"));
         let none = http_headers_for(&SourceKind::Bars);
         assert!(none.is_empty());
+    }
+}
+
+/// The follow-the-layout path over real libav decoders and a real demux. There
+/// is no GPU here, so these prove the wiring and the timestamp contract the
+/// handover relies on; `*_cuvid` itself needs the host.
+#[cfg(all(test, feature = "ffmpeg"))]
+mod display_follow_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::time::{Duration, Instant};
+
+    use multiview_ffmpeg::StreamVideoDecoder;
+    use multiview_framestore::{NoSignalPolicy, SwapCell, TileStore, TileThresholds};
+
+    use super::*;
+    use crate::display_size::{Handover, HandoverPermit, HandoverPoll};
+
+    /// An MPEG-2 clip with B-frames and open GOPs: the leading pictures after a
+    /// keyframe are what a mid-stream start cannot decode.
+    fn clip(path: &Path, seconds: u32) {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc=size=320x240:rate=25:duration={seconds}"))
+            .args(["-pix_fmt", "yuv420p", "-c:v", "mpeg2video"])
+            .args(["-bf", "2", "-g", "12", "-f", "mpegts"])
+            .arg(path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+    }
+
+    fn config(path: &Path, cell_w: f32) -> multiview_config::MultiviewConfig {
+        let doc = format!(
+            r##"schema_version = 1
+[canvas]
+width = 320
+height = 240
+fps = "25/1"
+pixel_format = "nv12"
+background = "#101014"
+[canvas.color]
+profile = "sdr-bt709-limited"
+[layout]
+kind = "absolute"
+[[sources]]
+id = "clip"
+kind = "file"
+path = "{}"
+[[cells]]
+id = "main"
+rect = {{ x = 0.0, y = 0.0, w = {cell_w}, h = {cell_w} }}
+[cells.source]
+input_id = "clip"
+[[outputs]]
+kind = "hls"
+path = "/tmp/display-follow.m3u8"
+codec = "mpeg2video"
+segment_ms = 1000
+"##,
+            path.display()
+        );
+        multiview_config::MultiviewConfig::load_from_toml(&doc).expect("config parses")
+    }
+
+    #[test]
+    fn a_running_ingest_follows_a_published_layout_without_a_respawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        clip(&path, 10);
+        let boot = config(&path, 1.0);
+        let layout = boot.solve_layout().unwrap();
+        let slot: DisplayLayoutSlot = Arc::new(SwapCell::new(Arc::new(layout)));
+        let store = Arc::new(TileStore::new(
+            "clip",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let mut plan = ingest_plan_for(
+            &boot.sources[0],
+            320,
+            240,
+            Arc::clone(&store),
+            CanvasColor::default(),
+            Rational::new(25, 1),
+        )
+        .unwrap();
+        plan.display = Some(DisplayFollow::new(Arc::clone(&slot), None));
+        let stop = AtomicBool::new(false);
+        let width = || {
+            store
+                .read_at(MediaTime::from_nanos(i64::MAX))
+                .frame()
+                .map(|frame| (frame.width(), frame.height()))
+        };
+        let wait_for = |want: (u32, u32)| {
+            let end = Instant::now() + Duration::from_secs(6);
+            while Instant::now() < end {
+                if width() == Some(want) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| ingest_loop(&plan, &stop));
+            let started = wait_for((320, 240));
+            slot.store(Arc::new(config(&path, 0.25).solve_layout().unwrap()));
+            let followed = wait_for((80, 60));
+            stop.store(true, Ordering::Release);
+            assert!(started, "the decode must start at the boot tile size");
+            assert!(followed, "the running decode must follow the new layout");
+        });
+    }
+
+    /// The production decode loop itself takes the reopen: a helper-thread open,
+    /// a cutover in `open_and_stream`, and frames still flowing afterwards.
+    #[test]
+    fn the_decode_loop_cuts_over_to_a_reopened_decoder_and_keeps_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        clip(&path, 12);
+        let boot = config(&path, 1.0);
+        let slot: DisplayLayoutSlot =
+            Arc::new(SwapCell::new(Arc::new(boot.solve_layout().unwrap())));
+        let store = Arc::new(TileStore::new(
+            "clip",
+            TileThresholds::default(),
+            NoSignalPolicy::HoldForever,
+        ));
+        let mut plan = ingest_plan_for(
+            &boot.sources[0],
+            320,
+            240,
+            Arc::clone(&store),
+            CanvasColor::default(),
+            Rational::new(25, 1),
+        )
+        .unwrap();
+        let rehearsal = Arc::new(crate::display_size::Rehearsal::default());
+        plan.display =
+            Some(DisplayFollow::new(Arc::clone(&slot), None).rehearsing(Arc::clone(&rehearsal)));
+        let stop = AtomicBool::new(false);
+        let count = |counter: &AtomicUsize| counter.load(Ordering::Acquire);
+        let wait = |done: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < end {
+                if done() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| ingest_loop(&plan, &stop));
+            let started = wait(&|| store.sequence() > 0);
+            slot.store(Arc::new(config(&path, 0.25).solve_layout().unwrap()));
+            let cut = wait(&|| count(&rehearsal.cutovers) == 1);
+            let at_cut = store.sequence();
+            let flowing = wait(&|| store.sequence() >= at_cut + 10);
+            let size = store
+                .read_at(MediaTime::from_nanos(i64::MAX))
+                .frame()
+                .map(|frame| (frame.width(), frame.height()));
+            stop.store(true, Ordering::Release);
+            assert!(started, "the decode must start");
+            assert!(
+                cut,
+                "the loop must cut over, not fall back to the host scaler"
+            );
+            assert_eq!(
+                count(&rehearsal.opens),
+                1,
+                "one reopen for one layout change"
+            );
+            assert!(flowing, "frames must keep flowing after the cutover");
+            assert_eq!(size, Some((80, 60)));
+        });
+    }
+
+    /// FNV-1a over the visible luma, so a frame with the right timestamp but a
+    /// damaged picture fails the comparison.
+    fn picture_hash(frame: &Video) -> u64 {
+        let width = usize::try_from(frame.width()).unwrap();
+        let height = usize::try_from(frame.height()).unwrap();
+        let stride = frame.stride(0);
+        let plane = frame.data(0);
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for row in 0..height {
+            for &byte in &plane[row * stride..row * stride + width] {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    /// Decode `path`, handing over to a fresh decoder after `cut` packets when
+    /// given, with the decode loop's ordering. Returns the frames taken, in order.
+    fn decode(path: &Path, cut: Option<usize>) -> Vec<(i64, u64)> {
+        multiview_ffmpeg::ensure_initialized().unwrap();
+        let mut input = ffmpeg::format::input(&path).unwrap();
+        let (stream_index, params, time_base, _fps) = best_video_stream_params(&input).unwrap();
+        let mut decoder = StreamVideoDecoder::new(params.clone(), time_base).unwrap();
+        let mut handover: Option<Handover<StreamVideoDecoder>> = None;
+        let mut carried = std::collections::VecDeque::new();
+        let mut skip = SkipThrough::default();
+        let mut seen = Vec::new();
+        let mut cut_over = false;
+        let mut sent = 0_usize;
+        let mut eof = false;
+        loop {
+            while let Some(frame) = match carried.pop_front() {
+                Some(frame) => Some(frame),
+                None => decoder.receive_frame().unwrap(),
+            } {
+                if !skip.drops(frame.raw_pts) {
+                    let pts = frame.raw_pts.expect("clip frames carry a timestamp");
+                    seen.push((pts, picture_hash(&frame.frame)));
+                }
+            }
+            if eof {
+                assert_eq!(cut.is_some(), cut_over, "the handover must have completed");
+                return seen;
+            }
+            if let Some(running) = handover.as_mut() {
+                match running.poll(seen.last().map(|(pts, _)| *pts), Instant::now()) {
+                    HandoverPoll::Pending => {}
+                    HandoverPoll::Abandoned(reason) => panic!("handover abandoned: {reason}"),
+                    HandoverPoll::Ready {
+                        decoder: replacement,
+                        frames,
+                        skip_through,
+                    } => {
+                        decoder = replacement;
+                        carried = frames;
+                        skip.arm(skip_through);
+                        handover = None;
+                        cut_over = true;
+                        continue;
+                    }
+                }
+            }
+            let mut packet = ffmpeg::codec::packet::Packet::empty();
+            match packet.read(&mut input) {
+                Ok(()) if packet.stream() == stream_index => {
+                    decoder.send_packet(&packet).unwrap();
+                    if let Some(running) = handover.as_mut() {
+                        running.on_packet(&packet);
+                    }
+                    sent += 1;
+                    if Some(sent) == cut {
+                        let permit = loop {
+                            if let Some(permit) = HandoverPermit::try_acquire() {
+                                break permit;
+                            }
+                            std::thread::yield_now();
+                        };
+                        let fresh = params.clone();
+                        let open = move || {
+                            StreamVideoDecoder::new(fresh, time_base).map_err(|e| e.to_string())
+                        };
+                        let mut started =
+                            Handover::spawn("test".to_owned(), permit, Instant::now(), open)
+                                .unwrap();
+                        // The open is asynchronous; wait so the cut point is exact.
+                        while matches!(started.poll(None, Instant::now()), HandoverPoll::Pending)
+                            && !started.is_open()
+                        {
+                            std::thread::yield_now();
+                        }
+                        handover = Some(started);
+                    }
+                }
+                Ok(()) => {}
+                Err(ffmpeg::Error::Eof) => {
+                    decoder.send_eof().unwrap();
+                    eof = true;
+                }
+                Err(other) => panic!("read failed: {other}"),
+            }
+        }
+    }
+
+    fn h264_clip(path: &Path, open_gop: bool, seconds: u32) {
+        let params = format!(
+            "keyint=12:min-keyint=12:scenecut=0:bframes=3:b-pyramid=normal:open-gop={}",
+            u8::from(open_gop)
+        );
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg(format!("testsrc=size=320x240:rate=25:duration={seconds}"))
+            .args(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-x264-params"])
+            .arg(params)
+            .args(["-f", "mpegts"])
+            .arg(path)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_real_h264_closed_gop_handover_is_seamless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        h264_clip(&path, false, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80);
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_h264_open_gop_handover_is_seamless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        h264_clip(&path, true, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80);
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_handover_shows_every_frame_exactly_once_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.ts");
+        clip(&path, 4);
+        let reference = decode(&path, None);
+        assert!(reference.len() > 80, "the clip must decode");
+        // Every phase of the GOP, so cuts land on I, P and B positions.
+        for cut in 20..33 {
+            assert_eq!(
+                decode(&path, Some(cut)),
+                reference,
+                "a cutover after packet {cut} must not drop, repeat or reorder a frame"
+            );
+        }
     }
 }

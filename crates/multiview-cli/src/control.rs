@@ -221,6 +221,44 @@ where
     #[cfg(not(feature = "gpu"))]
     let compositor_adapter: Option<multiview_hal::AdapterReport> = None;
 
+    // Probe `yt-dlp --version` once at startup for the `youtube` capability
+    // report (ADR-0015 §6 / ADR-W030): the SAME explicit path precedence
+    // (`MULTIVIEW_YOUTUBE_YT_DLP_PATH` else `[system.youtube] yt_dlp_path`) the
+    // per-source resolver uses. Logged at INFO on success so an operator can
+    // confirm the discovered path/version without reading the capability API.
+    // Absent/failed ⇒ `None` — the capability honestly reports unavailable
+    // (mirrors the NDI runtime-probe posture), never a startup failure.
+    #[cfg(feature = "youtube")]
+    let youtube_probe = {
+        let resolver_config = match crate::youtube_resolver_path(config) {
+            Some(path) => multiview_input::youtube::ResolverConfig::new(
+                path,
+                multiview_input::youtube::ResolverConfig::default().timeout,
+            ),
+            None => multiview_input::youtube::ResolverConfig::default(),
+        };
+        match multiview_input::youtube::probe_version(&resolver_config).await {
+            Ok(version) => {
+                tracing::info!(
+                    yt_dlp_path = %resolver_config.yt_dlp_path,
+                    yt_dlp_version = %version,
+                    "discovered yt-dlp for youtube live ingest (ADR-0015)"
+                );
+                Some(version)
+            }
+            Err(e) => {
+                tracing::info!(
+                    yt_dlp_path = %resolver_config.yt_dlp_path,
+                    error = %e,
+                    "yt-dlp not found/usable; youtube sources will report unavailable until it is installed"
+                );
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "youtube"))]
+    let youtube_probe: Option<String> = None;
+
     let mut state = AppState::new(
         publisher,
         commands,
@@ -251,25 +289,13 @@ where
     // the persistent store (if any) and serve from it.
     state.repository = persist_layouts(&state.repository, boot_model.as_deref()).await;
     if let Some(model) = boot_model.as_ref() {
-        if let Some(desired) = multiview_control::boot_model::load_desired(model.boot_path())
-            .map_err(std::io::Error::other)?
-        {
-            let mapped = multiview_control::resource_store::InMemoryOutputStore::new();
-            for (id, output) in desired.output_ids.iter().zip(desired.config.outputs.iter()) {
-                let body = serde_json::to_value(output).map_err(std::io::Error::other)?;
-                let name = body
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("output")
-                    .to_owned();
-                multiview_control::resource_store::ResourceRepository::create(
-                    &mapped,
-                    id,
-                    multiview_control::resource_store::ResourceInput { name, body },
-                )
-                .map_err(std::io::Error::other)?;
-            }
-            state = state.with_outputs_store(Arc::new(mapped));
+        // `accepted()` loads the envelope once and keeps it as the in-memory
+        // snapshot every later read serves (review R3-03).
+        if let Some(desired) = model.accepted().map_err(std::io::Error::other)? {
+            // Names and ETags continue from accepted intent; reseeding would
+            // restart every counter at 1 and let a stale tag match again.
+            state = multiview_control::boot_model::restore_accepted_stores(state, &desired)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
         }
         model
             .restore_desired_layout_id()
@@ -308,6 +334,23 @@ where
     // map `[webrtc].cors_allow_origins` (default `["*"]`) onto the control plane
     // so a browser served from a web origin can WHIP-publish / WHEP-play.
     .with_cors_allow_origins(config.webrtc.cors_allow_origins.clone())
+    // Viewer playback URL derivation (ADR-0101): map `control.public_host`
+    // (absent ⇒ the route falls back to the request Host header) through.
+    .with_public_host(
+        config
+            .control
+            .as_ref()
+            .and_then(|control| control.public_host.clone()),
+    )
+    // The `[control] public_scheme` override (ADR-0101 scheme derivation):
+    // only needed when a front end does NOT set `X-Forwarded-Proto` (the
+    // production nginx config does).
+    .with_public_scheme(
+        config
+            .control
+            .as_ref()
+            .and_then(|control| control.public_scheme.clone()),
+    )
     .with_live_apply(live_apply)
     // The run-path live-apply capability (ADR-W018): which source kinds the
     // running engine can take live — synthetic always, network/file only when
@@ -320,6 +363,7 @@ where
     // engine channel (invariant #10).
     .with_capabilities(crate::system_capabilities::resolve_system_capabilities(
         compositor_adapter.as_ref(),
+        youtube_probe,
     ))
     // The `[discovery]` browse configuration: the operator-configured
     // zowietek-control service type (the vendor's type is unverified — only a
@@ -460,6 +504,8 @@ where
     // handle — promote there correctly skips suppression (nothing to suppress).
     if state.boot_model.is_some() {
         state.install_watch_handle(multiview_control::config_watch::ConfigWatchHandle::new());
+        // Boot is a repair point: a fault that outlived the last run heals here.
+        multiview_control::layout_projection::request(&state);
     }
     // ADR-0183 ad-break automation executor: a management-plane tokio task that
     // polls the source-event service and issues ordinary bounded bus commands.
@@ -782,44 +828,48 @@ pub struct HlsMount {
 /// usable becomes `out`). Distinct resolved ids that collide *after*
 /// sanitisation are deduplicated with a deterministic `-2`, `-3`, … suffix in
 /// declaration order, so every configured output stays reachable.
+///
+/// Delegates the segment/dedup/playlist resolution to
+/// [`multiview_config::playback::resolve_hls_mounts`] — the SAME function the
+/// control-plane's `GET /api/v1/outputs/{id}/playback` route uses (ADR-0101),
+/// so a viewer playback URL can never name a mount this router does not
+/// actually serve.
 #[must_use]
 pub fn hls_mounts(config: &MultiviewConfig) -> Vec<HlsMount> {
     use multiview_config::Output;
-    let mut taken = std::collections::HashSet::new();
-    let mut mounts = Vec::new();
-    for output in &config.outputs {
-        let (Output::Hls { path, .. } | Output::LlHls { path, .. }) = output else {
-            continue;
-        };
-        let dir = match std::path::Path::new(path).parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-            // A bare filename (or a root path): serve the process working dir
-            // (where such a playlist would be written).
-            _ => std::path::PathBuf::from("."),
-        };
-        let mut segment = sanitize_mount_segment(&output.id());
-        if !taken.insert(segment.clone()) {
-            // Deterministic suffix dedupe; bounded by the output count.
-            let mut n: u32 = 2;
-            segment = loop {
-                let candidate = format!("{segment}-{n}");
-                if taken.insert(candidate.clone()) {
-                    break candidate;
-                }
-                n = n.saturating_add(1);
+    let hls_outputs: Vec<(String, &str)> = config
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            Output::Hls { path, .. } | Output::LlHls { path, .. } => {
+                Some((output.id(), path.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = hls_outputs
+        .iter()
+        .map(|(id, path)| (id.as_str(), *path))
+        .collect();
+    let resolved = multiview_config::playback::resolve_hls_mounts(&refs);
+    hls_outputs
+        .into_iter()
+        .filter_map(|(output_id, path)| {
+            let route = resolved.get(&output_id)?;
+            let dir = match std::path::Path::new(path).parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                // A bare filename (or a root path): serve the process working dir
+                // (where such a playlist would be written).
+                _ => std::path::PathBuf::from("."),
             };
-        }
-        let playlist = std::path::Path::new(path)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        mounts.push(HlsMount {
-            route: format!("/hls/{segment}"),
-            dir,
-            output_id: output.id(),
-            playlist,
-        });
-    }
-    mounts
+            Some(HlsMount {
+                route: route.route.clone(),
+                dir,
+                output_id,
+                playlist: route.playlist.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Build the Cast **delivery map** (DEV-D2, ADR-M011): the validated
@@ -895,26 +945,6 @@ pub fn cast_delivery(
         );
     }
     Some(std::sync::Arc::new(delivery))
-}
-
-/// Map an output id to a URL-segment-safe mount name (see [`hls_mounts`]).
-fn sanitize_mount_segment(id: &str) -> String {
-    let segment: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    // `.`/`..`/empty are not usable URL path segments.
-    if segment.is_empty() || segment.chars().all(|c| c == '.') {
-        "out".to_owned()
-    } else {
-        segment
-    }
 }
 
 /// Project a composited program frame into the compact JSON snapshot the control
@@ -1037,6 +1067,10 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
         .collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let offsets = crate::av_sync::offsets();
+    // The last `youtube` resolve-failure reason per source (ADR-0015), empty on
+    // a build without the `youtube` feature or when nothing has ever failed.
+    #[cfg(feature = "youtube")]
+    let youtube_reasons = crate::youtube_status::last_errors();
     let tiles: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(id, state)| {
@@ -1052,6 +1086,16 @@ pub fn fold_tile_states<S: std::hash::BuildHasher>(
             // measured.
             if let (Some(o), Some(obj)) = (offsets.get(id), tile.as_object_mut()) {
                 obj.insert("av_offset_ms".to_owned(), serde_json::json!(o));
+            }
+            // The honest `youtube` resolve-failure reason (e.g. "not a live
+            // stream (status: upcoming)", "yt-dlp not found on the server"),
+            // under the documented `reason` field (realtime-api.md §3's tiles
+            // `$snapshot`) — the same field name a client already defensively
+            // parses. Absent for every non-`youtube` source and for a healthy
+            // one.
+            #[cfg(feature = "youtube")]
+            if let (Some(reason), Some(obj)) = (youtube_reasons.get(id), tile.as_object_mut()) {
+                obj.insert("reason".to_owned(), serde_json::json!(reason));
             }
             tile
         })
@@ -1263,8 +1307,10 @@ pub fn command_drain_with_audio_and_players(
     audio_route: Arc<multiview_framestore::SwapCell<Option<Arc<crate::audio::AudioControlHandle>>>>,
     live: crate::live_sources::LiveSourceHandle,
     player_mailboxes: std::collections::HashMap<String, Arc<crate::player::TransportMailbox>>,
+    display_layout: crate::display_size::DisplayLayoutSlot,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
         .with_audio_route(audio_route)
         .with_live_sources(live)
         .with_player_mailboxes(player_mailboxes);
@@ -1335,8 +1381,10 @@ pub fn command_drain_with_seams(
         String,
         std::sync::Arc<crate::player::TransportMailbox>,
     >,
+    display_layout: crate::display_size::DisplayLayoutSlot,
 ) -> impl FnMut(&mut CompositorDrive<Nv12Image>) {
     let mut drain = CommandDrain::new(commands, config, publisher)
+        .with_display_layout(display_layout)
         .with_subtitle_route(subtitle_route)
         .with_audio_route(audio_route)
         .with_live_overlays(overlays)
@@ -1466,6 +1514,9 @@ pub struct CommandDrain {
     /// commands are surfaced held (warned), never a silent drop.
     player_mailboxes:
         std::collections::HashMap<String, std::sync::Arc<crate::player::TransportMailbox>>,
+    /// Where the live layout is published for the decode threads to follow.
+    /// `None` on runs with no decoders.
+    display_layout: Option<crate::display_size::DisplayLayoutSlot>,
     /// One-shot: the drive's cell-id → index map is established the first tick.
     cell_ids_set: bool,
     /// Test-only spy counting how many times this drain calls `solve_layout`.
@@ -1500,6 +1551,7 @@ impl CommandDrain {
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             audio_free_sources: None,
             player_mailboxes: std::collections::HashMap::new(),
+            display_layout: None,
             cell_ids_set: false,
             #[cfg(test)]
             resolve_spy: None,
@@ -1520,6 +1572,14 @@ impl CommandDrain {
         >,
     ) -> Self {
         self.player_mailboxes = mailboxes;
+        self
+    }
+
+    /// Publish every applied layout change to `slot` for the decode threads.
+    #[cfg(any(feature = "ffmpeg", test))]
+    #[must_use]
+    fn with_display_layout(mut self, slot: crate::display_size::DisplayLayoutSlot) -> Self {
+        self.display_layout = Some(slot);
         self
     }
 
@@ -1629,7 +1689,9 @@ impl CommandDrain {
         // bounded); every other command is applied immediately as before.
         #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
         let mut tile_binding_changed = false;
+        let mut layout_applied = false;
         for command in self.commands.try_drain() {
+            layout_applied |= matches!(&command, Command::ApplyLayout { .. });
             #[cfg(all(feature = "ffmpeg", feature = "overlay"))]
             {
                 tile_binding_changed |= matches!(
@@ -1668,7 +1730,21 @@ impl CommandDrain {
         if tile_binding_changed || applied != 0 {
             self.publish_tile_specs(drive);
         }
+        if layout_applied || applied != 0 {
+            self.publish_display_layout(drive);
+        }
         applied
+    }
+
+    /// Hand the active layout to the decode threads. Only runs after a layout
+    /// or route command: O(cells) plus one wait-free store, and the decoders do
+    /// all the resulting work on their own threads (inv #1/#10).
+    fn publish_display_layout(&self, drive: &CompositorDrive<Nv12Image>) {
+        if let Some(slot) = &self.display_layout {
+            if *slot.load() != *drive.layout() {
+                slot.store(Arc::new(drive.layout().clone()));
+            }
+        }
     }
 
     /// Publish only when the active placements differ from the baker's snapshot.
@@ -2553,19 +2629,14 @@ fn restore_desired_layouts(
 /// The stored-layout repository for this run.
 ///
 /// With the `sqlite` feature and a config-file run (a boot model), layouts are
-/// persisted to `<config-dir>/.multiview/layouts.db`, so they survive a restart
-/// beside the persisted Running state (`active.toml`). Otherwise — or if the
-/// database cannot be opened — layouts live in memory for the life of the
-/// process (logged, never fatal: the control plane must still come up).
+/// persisted to `<config-dir>/.multiview/layouts.db`. Before the first desired
+/// commit that database is the legacy library; afterwards it is a projection of
+/// the envelope. Otherwise — or if the database cannot be opened — layouts live
+/// in memory for the life of the process (logged, never fatal: the control
+/// plane must still come up).
 #[cfg_attr(
     not(feature = "sqlite"),
     allow(clippy::unused_async, reason = "awaits only the sqlite open")
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one sqlite-vs-in-memory boot reconciliation path carries every \
-              layout-restore/seed/prune case; splitting it would scatter the \
-              single early-return control flow across helpers"
 )]
 async fn persist_layouts(
     seeded: &Arc<dyn multiview_control::repository::Repository>,
@@ -2581,59 +2652,29 @@ async fn persist_layouts(
             let url = format!("sqlite://{}?mode=rwc", path.display());
             match multiview_control::sqlite::SqliteRepository::connect(&url).await {
                 Ok(repo) => {
-                    // The desired envelope is authoritative; seed ONLY absent
-                    // ids in an older SQLite library. Never overwrite an
+                    tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
+                    // Once an envelope exists the database is only its
+                    // projection: it stays the live repository, and the repair
+                    // task `bind_and_serve` starts reconciles it. A corrupt
+                    // envelope fails startup in the caller.
+                    if !matches!(
+                        multiview_control::boot_model::load_desired(model.boot_path()),
+                        Ok(None)
+                    ) {
+                        return Arc::new(repo);
+                    }
+                    // A legacy library: seed ONLY absent ids. Never overwrite an
                     // operator-authored saved definition at boot.
-                    let desired = multiview_control::boot_model::load_desired(model.boot_path())
-                        .map_err(std::io::Error::other);
-                    let desired = match desired {
-                        Ok(desired) => desired,
-                        Err(error) => {
-                            tracing::error!(%error, "cannot restore accepted layouts");
-                            return Arc::clone(seeded);
-                        }
-                    };
-                    let from_desired = desired.is_some();
-                    let desired_ids = desired.as_ref().map(|record| {
-                        record
-                            .layouts
-                            .iter()
-                            .map(|layout| layout.id.clone())
-                            .collect::<std::collections::HashSet<_>>()
-                    });
-                    let library = desired.map_or_else(
-                        || {
-                            seeded
-                                .list_layouts()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|v| v.layout)
-                                .collect()
-                        },
-                        |record| record.layouts,
-                    );
-                    for layout in library {
-                        let id = layout.id.clone();
+                    for entry in seeded.list_layouts().unwrap_or_default() {
+                        let id = entry.layout.id;
                         let input = multiview_control::repository::LayoutInput {
-                            name: layout.name,
-                            body: layout.body,
+                            name: entry.layout.name,
+                            body: entry.layout.body,
                         };
                         let result =
                             match multiview_control::repository::Repository::get_layout(&repo, &id)
                             {
-                                Ok(existing)
-                                    if existing.layout.name == input.name
-                                        && existing.layout.body == input.body =>
-                                {
-                                    Ok(())
-                                }
-                                Ok(_) if from_desired => {
-                                    multiview_control::repository::Repository::update_layout(
-                                        &repo, &id, input,
-                                    )
-                                    .map(|_| ())
-                                }
-                                Ok(_) => Ok(()), // Legacy SQLite definition wins over boot seeding.
+                                Ok(_) => Ok(()),
                                 Err(multiview_control::ControlError::NotFound { .. }) => {
                                     multiview_control::repository::Repository::create_layout(
                                         &repo, &id, input,
@@ -2643,33 +2684,8 @@ async fn persist_layouts(
                                 Err(error) => Err(error),
                             };
                         if let Err(error) = result {
-                            tracing::error!(%error, layout = %id, "cannot restore accepted layout");
+                            tracing::error!(%error, layout = %id, "cannot seed the working layout");
                         }
-                    }
-                    if let Some(ids) = desired_ids {
-                        match multiview_control::repository::Repository::list_layouts(&repo) {
-                            Ok(entries) => {
-                                for entry in entries {
-                                    if !ids.contains(&entry.layout.id) {
-                                        if let Err(error) =
-                                            multiview_control::repository::Repository::delete_layout(
-                                                &repo,
-                                                &entry.layout.id,
-                                            )
-                                        {
-                                            tracing::error!(%error, layout = %entry.layout.id, "cannot remove stale derived layout");
-                                        }
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, "cannot inspect derived layout projection")
-                            }
-                        }
-                    }
-                    tracing::info!(path = %path.display(), "stored layouts persisted to SQLite");
-                    if from_desired {
-                        return restore_desired_layouts(model).unwrap_or_else(|| Arc::new(repo));
                     }
                     return Arc::new(repo);
                 }
@@ -2905,6 +2921,134 @@ input_id = "in_b"
     /// The matching canvas for `TWO_CELL_DOC` (64x64 @ 25/1).
     fn matching_canvas() -> serde_json::Value {
         serde_json::json!({ "width": 64, "height": 64, "fps": "25/1" })
+    }
+
+    /// The production fault: a boot layout that binds only some sources, then a
+    /// stored layout applied live. The drain must hand the active layout to the
+    /// decoders, and a decoder bound to a smaller cell must plan an NVDEC reopen
+    /// at the new tile size, while a source the layout drops goes to the small
+    /// unbound size, never the full canvas.
+    #[test]
+    fn applying_a_smaller_layout_makes_the_decoders_reopen_at_the_new_size() {
+        use crate::display_size::{
+            display_size, plan_display_change, DecoderState, DisplayChange, DisplayFollow,
+            DisplayFollower, DISPLAY_SETTLE, UNBOUND_DISPLAY_SIZE,
+        };
+        use multiview_ffmpeg::TileSize;
+
+        let config = test_config();
+        let boot = Arc::new(config.solve_layout().expect("boot layout"));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(Arc::clone(&boot)));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_display_layout(Arc::clone(&slot));
+        let mut drive = test_drive(&test_config());
+
+        // Both sources decode at their 32x64 boot cells.
+        let boot_size = display_size(&boot, "in_a");
+        assert_eq!(boot_size, (32, 64));
+        let source = TileSize::new(1920, 1080);
+        let opened = DecoderState {
+            source,
+            hardware: true,
+            resize: multiview_ffmpeg::nvdec_resize_target(
+                source,
+                TileSize::new(boot_size.0, boot_size.1),
+                None,
+            ),
+        };
+        let mut follower_a = DisplayFollower::new(
+            DisplayFollow::new(Arc::clone(&slot), None),
+            "in_a",
+            boot_size,
+        );
+        let mut follower_b = DisplayFollower::new(
+            DisplayFollow::new(Arc::clone(&slot), None),
+            "in_b",
+            boot_size,
+        );
+        let t0 = std::time::Instant::now();
+        assert_eq!(follower_a.due(t0), None, "the boot layout needs no change");
+
+        // A stored layout with in_a in a quarter cell and in_b dropped.
+        let body = serde_json::json!({
+            "canvas": matching_canvas(),
+            "layout": { "kind": "absolute" },
+            "cells": [
+                { "id": "small", "rect": { "x": 0.0, "y": 0.0, "w": 0.25, "h": 0.25 },
+                  "source": { "input_id": "in_a" } }
+            ]
+        });
+        let document = multiview_config::LayoutDocument::from_body(&body).expect("stored doc");
+        let solved = document.solve_named("small").expect("stored layout");
+        sender
+            .try_submit(Command::ApplyLayout {
+                op: OperationId::new(),
+                layout: "small".to_owned(),
+                document: Some(Box::new(multiview_control::ResolvedLayout::new(
+                    solved, document,
+                ))),
+            })
+            .expect("apply layout");
+        let before_apply = slot.load();
+        drain.apply(&mut drive);
+        assert!(
+            !Arc::ptr_eq(&before_apply, &slot.load()),
+            "the drain must publish the applied layout"
+        );
+        assert_eq!(*slot.load(), *drive.layout());
+
+        // Debounced, then due at the new sizes.
+        assert_eq!(follower_a.due(t0), None);
+        let settled = t0 + DISPLAY_SETTLE;
+        let to_a = follower_a.due(settled).expect("in_a must resize");
+        assert_eq!(to_a, (16, 16));
+        assert_eq!(
+            plan_display_change(opened, boot_size, to_a, None),
+            DisplayChange::Reopen {
+                resize: Some(TileSize::new(16, 16))
+            },
+            "a running NVDEC decode must reopen at the new resize target"
+        );
+        let unbound = (
+            UNBOUND_DISPLAY_SIZE.0.min(64) & !1,
+            UNBOUND_DISPLAY_SIZE.1.min(64) & !1,
+        );
+        let _first = follower_b.due(t0);
+        assert_eq!(follower_b.due(settled), Some(unbound));
+
+        // A frame boundary with no layout change publishes nothing.
+        let current = slot.load();
+        drain.apply(&mut drive);
+        assert!(Arc::ptr_eq(&current, &slot.load()));
+    }
+
+    /// A video route moves a source between cells without a layout command;
+    /// the decoders must still see the new binding.
+    #[test]
+    fn a_video_route_republishes_the_active_layout() {
+        let config = test_config();
+        let boot = Arc::new(config.solve_layout().expect("boot layout"));
+        let slot = Arc::new(multiview_framestore::SwapCell::new(boot));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(16));
+        let (sender, receiver) = command_bus(8);
+        let mut drain =
+            CommandDrain::new(receiver, config, publisher).with_display_layout(Arc::clone(&slot));
+        let mut drive = test_drive(&test_config());
+        sender
+            .try_submit(Command::SwapSource {
+                op: OperationId::new(),
+                tile: "cell_b".to_owned(),
+                source: "in_a".to_owned(),
+            })
+            .expect("route");
+        drain.apply(&mut drive);
+        assert_eq!(
+            crate::display_size::cell_pixel_size(&slot.load(), "in_b"),
+            None,
+            "in_b is no longer bound anywhere"
+        );
     }
 
     /// A stored NewsOne-like layout replaces the boot tile chrome, not just the
@@ -3515,6 +3659,35 @@ input_id = "in_b"
         assert_eq!(snap["tick"], 7);
     }
 
+    /// A `youtube` source's recorded resolve-failure reason (ADR-0015) rides
+    /// the same `reason` field a client already defensively parses
+    /// (realtime-api.md §3), and clears once the source resolves again.
+    #[cfg(feature = "youtube")]
+    #[test]
+    fn fold_tile_states_carries_the_youtube_resolve_failure_reason() {
+        let id = "control-test-youtube-reason-tile";
+        crate::youtube_status::record(id, Some("not a live stream (status: upcoming)"));
+
+        let mut states = std::collections::HashMap::new();
+        states.insert(id.to_owned(), multiview_core::traits::SourceState::NoSignal);
+        let mut snap = state_snapshot(1, 0, 64, 64);
+        fold_tile_states(&mut snap, &states);
+
+        let tiles = snap["tiles"].as_array().expect("tiles array");
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(
+            tiles[0]["reason"],
+            serde_json::json!("not a live stream (status: upcoming)")
+        );
+
+        // A later successful resolve clears the stored reason, so a fresh fold
+        // never carries a stale one forward.
+        crate::youtube_status::record(id, None);
+        let mut snap2 = state_snapshot(2, 0, 64, 64);
+        fold_tile_states(&mut snap2, &states);
+        assert!(snap2["tiles"][0].get("reason").is_none());
+    }
+
     #[test]
     fn fold_tile_states_empty_map_yields_an_empty_tiles_array() {
         // A run with no sources still publishes `tiles: []` so a connected
@@ -3773,6 +3946,97 @@ input_id = "in_b"
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
 
+    /// Review H1/H2: the real boot path restores accepted names and versions.
+    /// Reseeding here would restart every `ETag` at 1, so a stale tag could match.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_and_serve_restores_accepted_names_and_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let boot_path = dir.path().join("multiview.toml");
+        let mut config = config_with_hls_outputs(&[("out-a", "/tmp/restore-accepted.m3u8")]);
+        std::fs::write(&boot_path, config.to_toml().expect("render boot")).expect("boot file");
+        config.overlays = vec![serde_json::from_value(serde_json::json!({
+            "id": "ov_clock", "kind": "clock", "target": "canvas"
+        }))
+        .expect("overlay")];
+        let body = serde_json::json!({
+            "canvas": config.canvas, "layout": config.layout, "cells": config.cells,
+        });
+        let desired = multiview_control::boot_model::DesiredState {
+            version: 1,
+            selected_layout_id: "working".to_owned(),
+            layouts: vec![multiview_control::Layout {
+                id: "working".to_owned(),
+                name: "working".to_owned(),
+                body: body.clone(),
+            }],
+            selected_body: body,
+            output_ids: (0..config.outputs.len())
+                .map(|index| format!("output-{index}"))
+                .collect(),
+            layout_versions: std::collections::BTreeMap::new(),
+            resource_versions: [(
+                "overlays".to_owned(),
+                [("ov_clock".to_owned(), 7_u64)].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            resource_names: [(
+                "overlays".to_owned(),
+                [("ov_clock".to_owned(), "Studio clock".to_owned())]
+                    .into_iter()
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+            config: config.clone(),
+        };
+        desired.validate().expect("valid envelope");
+        let state_dir = dir.path().join(".multiview");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::write(
+            state_dir.join("desired.json"),
+            serde_json::to_vec(&desired).expect("serialize"),
+        )
+        .expect("write desired");
+        let boot_model = Arc::new(multiview_control::boot_model::BootModel::new(
+            boot_path,
+            config.clone(),
+            config.clone(),
+            multiview_config::StartMode::Resume,
+            true,
+            None,
+        ));
+        let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
+        let (commands, _rx) = multiview_control::command_bus(8);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_addr, handle, state) = bind_and_serve(
+            "[::1]:0",
+            &config,
+            publisher,
+            commands,
+            multiview_control::no_preview(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            multiview_control::LiveApplyCaps::default(),
+            multiview_control::LiveSourceCapability::synthetic_only(),
+            Some(boot_model),
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+        .expect("bind + serve should start");
+        let overlay = state.overlays.get("ov_clock").expect("restored overlay");
+        assert_eq!(overlay.version.get(), 7);
+        assert_eq!(overlay.resource.name, "Studio clock");
+        shutdown_tx.send(()).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
+
     /// Build a config carrying one HLS output per `(id, path)` pair (the rest of
     /// the canvas/layout/source/cell scaffolding is fixed and valid).
     fn config_with_hls_outputs(outputs: &[(&str, &str)]) -> MultiviewConfig {
@@ -3887,7 +4151,7 @@ input_id = "in_a"
     fn unusable_ids_fall_back_to_out() {
         for id in ["..", "", "..."] {
             assert_eq!(
-                sanitize_mount_segment(id),
+                multiview_config::hls_mount_segment(id),
                 "out",
                 "id {id:?} must map to the `out` fallback"
             );
@@ -3911,7 +4175,7 @@ input_id = "in_a"
     #[test]
     fn already_safe_ids_pass_through_unchanged() {
         for id in ["program", "low-latency_1.0~alt", "ABC123"] {
-            assert_eq!(sanitize_mount_segment(id), id);
+            assert_eq!(multiview_config::hls_mount_segment(id), id);
         }
     }
 }

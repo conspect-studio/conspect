@@ -242,7 +242,7 @@ pub(crate) async fn fire_salvo(
         return err.into_response();
     }
     // The named salvo must exist — a clean 404 rather than an engine no-op.
-    if state.salvos.get(&name).is_err() {
+    if crate::boot_model::accepted_salvo(&state, &name).is_err() {
         return Problem::new(404, "salvo_unknown", "Unknown salvo")
             .with_detail(format!("no salvo named {name:?} is defined"))
             .into_response();
