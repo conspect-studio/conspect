@@ -1373,6 +1373,15 @@ pub fn apply_document_diff(
             // `active.toml` composes it straight from the store.
             "salvos" => resync_salvos(state, actor, next),
             "tally_profiles" => resync_tally_profiles(state, actor, next),
+            // Graphics/weather definitions are management-plane data: the
+            // hub + poller follow the file (generators pick it up live).
+            "graphics" | "weather" => {
+                let g = crate::routes::graphics::effective_graphics(next);
+                state
+                    .weather
+                    .set_locations(crate::routes::graphics::weather_specs(&g));
+                state.graphics.set_config(g);
+            }
             // No store is boot-seeded for these; the file itself is the
             // durable truth and the restart warning names them.
             _ => {}

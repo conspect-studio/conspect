@@ -472,6 +472,14 @@ fn build_messages_switcher_events() -> serde_json::Map<String, Value> {
         "contentType": "application/json",
         "payload": { "$ref": "#/components/schemas/MediaPlayerEvent" }
     }));
+    map.insert("GraphicsChannelEvent".to_owned(), json!({
+        "name": "GraphicsChannelEvent",
+        "title": "Graphics playout channel state",
+        "summary": "A graphics channel's preview/program changed (graphics.channel_state on topic `switcher`).",
+        "description": "Emitted on topic `switcher` with envelope `id` = graphics channel id on cue / take / clear / next. Lossless lifecycle event.",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/GraphicsChannelEvent" }
+    }));
     map
 }
 
@@ -703,6 +711,7 @@ fn event_payload_one_of() -> Value {
         { "$ref": "#/components/schemas/TallyEvent" },
         { "$ref": "#/components/schemas/SalvoEvent" },
         { "$ref": "#/components/schemas/MediaPlayerEvent" },
+        { "$ref": "#/components/schemas/GraphicsChannelEvent" },
         { "$ref": "#/components/schemas/DeviceStatus" },
         { "$ref": "#/components/schemas/DeviceAdopted" },
         { "$ref": "#/components/schemas/DeviceRemoved" },
@@ -1488,7 +1497,23 @@ fn salvo_event_schema() -> Value {
 fn switcher_event_schemas() -> Value {
     json!({
         "MediaPlayerState": media_player_state_schema(),
-        "MediaPlayerEvent": media_player_event_schema()
+        "MediaPlayerEvent": media_player_event_schema(),
+        "GraphicsChannelEvent": graphics_channel_event_schema()
+    })
+}
+
+fn graphics_channel_event_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Data body of `graphics.channel_state`: a graphics playout channel's preview/program after a cue / take / clear / next. Envelope `id` = channel id.",
+        "required": ["channel", "seq", "action"],
+        "properties": {
+            "channel": { "type": "string", "description": "Graphics channel id (matches the envelope `id`)." },
+            "preview": { "type": "string", "description": "Cued (preview) item id, if any." },
+            "program": { "type": "string", "description": "On-air (program) item id, if any." },
+            "seq": { "type": "integer", "format": "uint64", "description": "Increments on every program change." },
+            "action": { "type": "string", "description": "The verb that produced this state: cue, take, clear, next or rundown." }
+        }
     })
 }
 
