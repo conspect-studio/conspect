@@ -8008,6 +8008,245 @@
         }
       }
     },
+    "/api/v1/weather/locations": {
+      "get": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`GET /api/v1/weather/locations` — every in-scope location with its latest\ndata (role: read).",
+        "operationId": "list_locations",
+        "responses": {
+          "200": {
+            "description": "All in-scope locations with freshness, id-sorted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WeatherLocationView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/weather/locations/{id}": {
+      "get": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`GET /api/v1/weather/locations/{id}` — one location (role: read;\nper-object authz).",
+        "operationId": "get_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Location id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The location with normalized forecast days, latest observation and freshness.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeatherLocationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to read this location.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No location with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`PUT /api/v1/weather/locations/{id}` — create or replace a location\n(role: write; per-object authz).",
+        "operationId": "put_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Location id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WeatherLocationInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The location was replaced.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeatherLocationView"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The location was created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WeatherLocationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to write this location.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is not a valid location (detail names the field).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "weather"
+        ],
+        "summary": "`DELETE /api/v1/weather/locations/{id}` — remove a location (role:\nadminister; per-object authz). Weather sources bound to it then render an\nhonest \"unavailable\" card.",
+        "operationId": "delete_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Location id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The location was deleted."
+          },
+          "401": {
+            "description": "Missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not authorized to administer this location.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No location with that id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/whep/{output_id}": {
       "post": {
         "tags": [
@@ -10808,6 +11047,33 @@
           "conspect",
           "community"
         ]
+      },
+      "FreshnessDoc": {
+        "type": "object",
+        "description": "Fetch freshness of one product.",
+        "properties": {
+          "attempted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last attempt, good or bad (RFC 3339 UTC)."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last error (cleared on success)."
+          },
+          "fetched_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last successful fetch (RFC 3339 UTC)."
+          }
+        }
       },
       "GpuLimitDoc": {
         "oneOf": [
@@ -14273,6 +14539,34 @@
           },
           {
             "type": "object",
+            "description": "A BOM weather graphic for one `[weather]` location.",
+            "required": [
+              "location",
+              "kind"
+            ],
+            "properties": {
+              "background": {
+                "$ref": "#/components/schemas/WeatherBackgroundDoc",
+                "description": "`gradient` (default, opaque) or `transparent` (alpha panels)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "weather"
+                ]
+              },
+              "location": {
+                "type": "string",
+                "description": "The weather location id."
+              },
+              "template": {
+                "$ref": "#/components/schemas/WeatherTemplateDoc",
+                "description": "`seven_day` (default) or `today`."
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "RTSP pull.",
             "required": [
               "url",
@@ -15884,6 +16178,155 @@
             "description": "Section names changed on disk that only apply on restart (sorted,\ndeduplicated; latched until restart — ADR-W020)."
           }
         }
+      },
+      "WeatherBackgroundDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::WeatherBackground`.",
+        "enum": [
+          "gradient",
+          "transparent"
+        ]
+      },
+      "WeatherLocationDoc": {
+        "type": "object",
+        "description": "A configured location (the `[[weather.locations]]` document).",
+        "required": [
+          "id",
+          "name",
+          "forecast_product",
+          "aac"
+        ],
+        "properties": {
+          "aac": {
+            "type": "string",
+            "description": "BOM forecast area code (e.g. `NSW_PT131`)."
+          },
+          "forecast_product": {
+            "type": "string",
+            "description": "BOM forecast product id (e.g. `IDN11060`)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Location id (`[A-Za-z0-9_-]`, 1–64)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name drawn on the graphic."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id (e.g. `IDN60920`)."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id (e.g. `94768`)."
+          }
+        }
+      },
+      "WeatherLocationInput": {
+        "type": "object",
+        "description": "The `PUT` body: the location without its id (the id is the path).",
+        "required": [
+          "name",
+          "forecast_product",
+          "aac"
+        ],
+        "properties": {
+          "aac": {
+            "type": "string",
+            "description": "BOM forecast area code."
+          },
+          "forecast_product": {
+            "type": "string",
+            "description": "BOM forecast product id."
+          },
+          "name": {
+            "type": "string",
+            "description": "Display name."
+          },
+          "observation_product": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BOM observation product id."
+          },
+          "station_wmo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Observation station WMO id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "WeatherLocationView": {
+        "type": "object",
+        "description": "One location with its latest data and freshness.",
+        "required": [
+          "location",
+          "status",
+          "forecast_freshness",
+          "attribution"
+        ],
+        "properties": {
+          "attribution": {
+            "type": "string",
+            "description": "Required on-screen attribution."
+          },
+          "forecast": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Normalized forecast: `{product, aac, area_name, issued_utc,\nissued_local, expires_utc, days: [{date, weekday, icon_code, max_c,\nmin_c, precis, rain_chance, rain_range, start_local}]}` or `null`."
+          },
+          "forecast_freshness": {
+            "$ref": "#/components/schemas/FreshnessDoc",
+            "description": "Forecast product freshness."
+          },
+          "location": {
+            "$ref": "#/components/schemas/WeatherLocationDoc",
+            "description": "The configured location."
+          },
+          "observation": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Latest observation: `{station_name, wmo_id, time_local, time_display,\nair_temp_c, apparent_temp_c, rel_humidity_pct, wind_dir, wind_kmh,\ngust_kmh, pressure_hpa, rain_since_9am_mm}` or `null`."
+          },
+          "observation_freshness": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FreshnessDoc",
+                "description": "Observation product freshness (`null` when not configured)."
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "`ok` | `pending` (no data yet) | `error` (last fetch failed, may still\nhold last-good data) | `expired` (forecast past its expiry)."
+          }
+        }
+      },
+      "WeatherTemplateDoc": {
+        "type": "string",
+        "description": "`OpenAPI` mirror of `multiview_config::WeatherTemplate`.",
+        "enum": [
+          "seven_day",
+          "today"
+        ]
       },
       "WsTicketResponse": {
         "type": "object",

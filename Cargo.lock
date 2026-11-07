@@ -2970,6 +2970,7 @@ dependencies = [
  "multiview-overlay",
  "multiview-preview",
  "multiview-telemetry",
+ "multiview-weather",
  "multiview-webrtc",
  "p256",
  "proptest",
@@ -3053,6 +3054,7 @@ dependencies = [
  "multiview-mesh",
  "multiview-preview",
  "multiview-telemetry",
+ "multiview-weather",
  "proptest",
  "prost",
  "rcgen",
@@ -3346,7 +3348,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "quick-xml",
+ "serde",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

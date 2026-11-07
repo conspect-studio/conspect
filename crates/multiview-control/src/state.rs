@@ -895,6 +895,10 @@ pub struct AppState {
     /// software-engine truth); the full-pipeline run upgrades to
     /// [`LiveSourceCapability::synthetic_and_network`].
     pub live_sources: LiveSourceCapability,
+    /// The management-plane BOM weather poller handle (locations in, freshness
+    /// and the shared snapshot store out). Defaults to an unspawned service
+    /// over a private store; the binary installs the global one.
+    pub weather: multiview_weather::service::WeatherService,
     /// The static system capability + licence snapshot served by
     /// `GET /api/v1/system/capabilities` (ADR-W030): which codec/compositor
     /// backends are available, the compositor class, the effective build-profile
@@ -1050,6 +1054,7 @@ impl AppState {
             // kinds live-apply. The binary upgrades this per run path
             // (`with_live_sources`) — the header never over-claims.
             live_sources: LiveSourceCapability::synthetic_only(),
+            weather: multiview_weather::service::WeatherService::default(),
             // The coarse honest software-only capability surface until the binary
             // maps the real HAL probe + compiled features (`with_capabilities`,
             // ADR-W030). A static snapshot (inv #10).
@@ -1185,6 +1190,13 @@ impl AppState {
     #[must_use]
     pub fn with_live_apply(mut self, live_apply: crate::live_apply::LiveApplyCaps) -> Self {
         self.live_apply = live_apply;
+        self
+    }
+
+    /// Install the BOM weather poller handle (locations + snapshot store).
+    #[must_use]
+    pub fn with_weather(mut self, weather: multiview_weather::service::WeatherService) -> Self {
+        self.weather = weather;
         self
     }
 

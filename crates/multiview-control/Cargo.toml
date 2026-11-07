@@ -36,6 +36,8 @@ multiview-mesh = { workspace = true }
 # its codec-free `WhepProvider` seam with the gate; both Tier-A control-plane
 # crates, an acyclic edge (preview never depends on control).
 multiview-preview = { workspace = true }
+# BOM weather: product poller + normalized snapshot store (management plane).
+multiview-weather = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # `net` adds `tokio::net::TcpListener` for `serve` (the real-socket bind that lets

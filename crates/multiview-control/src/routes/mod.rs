@@ -49,6 +49,7 @@ pub mod sync_groups;
 pub mod system;
 pub mod tally;
 pub mod telemetry;
+pub mod weather;
 pub mod whep_output;
 pub mod whip;
 
@@ -1065,6 +1066,14 @@ fn resource_router() -> Router<AppState> {
                 .post(sources::create_source)
                 .put(sources::update_source)
                 .delete(sources::delete_source),
+        )
+        // BOM weather locations (management-plane poller + normalized data).
+        .route("/weather/locations", get(weather::list_locations))
+        .route(
+            "/weather/locations/{id}",
+            get(weather::get_location)
+                .put(weather::put_location)
+                .delete(weather::delete_location),
         )
         // Read-only input elementary-stream inventory (RT-3): every stream an
         // input offers, projected from the off-engine cached snapshot (inv #10).

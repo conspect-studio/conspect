@@ -506,3 +506,68 @@ fn timer_recur_requires_a_recurring_time_of_day_target() {
     let cfg3 = MultiviewConfig::load_from_toml(&ok).expect("parse");
     cfg3.validate().expect("recur with recur_daily is valid");
 }
+
+#[test]
+fn weather_source_and_locations_round_trip_toml_and_json() {
+    let doc = config_with_source(
+        "kind = \"weather\"\nlocation = \"sydney\"\ntemplate = \"today\"\nbackground = \"transparent\"",
+    ) + r#"
+[[weather.locations]]
+id = "sydney"
+name = "Sydney"
+forecast_product = "IDN11060"
+aac = "NSW_PT131"
+observation_product = "IDN60920"
+station_wmo = "94768"
+"#;
+    let cfg = MultiviewConfig::load_from_toml(&doc).unwrap();
+    cfg.validate().unwrap();
+    assert!(matches!(
+        &cfg.sources[0].kind,
+        SourceKind::Weather {
+            location,
+            template: multiview_config::WeatherTemplate::Today,
+            background: multiview_config::WeatherBackground::Transparent,
+        } if location == "sydney"
+    ));
+    assert!(cfg.sources[0].kind.is_synthetic());
+    assert_eq!(
+        cfg.weather.locations[0].station_wmo.as_deref(),
+        Some("94768")
+    );
+    let again = MultiviewConfig::load_from_toml(&cfg.to_toml().unwrap()).unwrap();
+    assert_eq!(again, cfg);
+    let json: MultiviewConfig =
+        serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+    assert_eq!(json, cfg);
+
+    // Defaults: template seven_day, background gradient; no [weather] section
+    // still loads (and is not serialized back).
+    let plain = MultiviewConfig::load_from_toml(&config_with_source(
+        "kind = \"weather\"\nlocation = \"sydney\"",
+    ))
+    .unwrap();
+    plain.validate().unwrap();
+    assert!(matches!(
+        &plain.sources[0].kind,
+        SourceKind::Weather {
+            template: multiview_config::WeatherTemplate::SevenDay,
+            background: multiview_config::WeatherBackground::Gradient,
+            ..
+        }
+    ));
+    assert!(!plain.to_toml().unwrap().contains("[weather"));
+}
+
+#[test]
+fn weather_rejects_bad_location_id_and_bad_product() {
+    let bad = MultiviewConfig::load_from_toml(&config_with_source(
+        "kind = \"weather\"\nlocation = \"../x\"",
+    ))
+    .unwrap();
+    assert!(bad.validate().is_err());
+    let doc = config_with_source("kind = \"bars\"")
+        + "\n[[weather.locations]]\nid = \"x\"\nname = \"X\"\nforecast_product = \"http://evil\"\naac = \"NSW_PT131\"\n";
+    let cfg = MultiviewConfig::load_from_toml(&doc).unwrap();
+    assert!(cfg.validate().is_err());
+}

@@ -7,6 +7,15 @@ use quick_xml::{events::Event, Reader};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+pub use chrono;
+pub mod ftp;
+pub mod model;
+pub mod service;
+pub use model::{
+    icon_for_code, normalize_forecast, normalize_observation, DayForecast, ForecastSummary,
+    Freshness, LocationWeather, Observation, Published, WeatherIcon, WeatherStore,
+};
+
 /// Resource ceilings applied before and during XML parsing.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {

@@ -193,3 +193,55 @@ fn parser_enforces_each_resource_limit() {
         ));
     }
 }
+
+#[test]
+fn icon_codes_map_to_families_and_unknown_is_none() {
+    use crate::{icon_for_code, WeatherIcon as I};
+    let expect = [
+        (1, Some(I::Sun)),
+        (2, Some(I::Night)),
+        (3, Some(I::PartCloud)),
+        (4, Some(I::Cloud)),
+        (5, None),
+        (6, Some(I::Fog)),
+        (7, None),
+        (8, Some(I::Rain)),
+        (9, Some(I::Wind)),
+        (10, Some(I::Fog)),
+        (11, Some(I::Showers)),
+        (12, Some(I::Rain)),
+        (13, Some(I::Wind)),
+        (14, Some(I::Sun)),
+        (15, Some(I::Showers)),
+        (16, Some(I::Storm)),
+        (17, Some(I::Showers)),
+        (0, None),
+        (18, None),
+        (255, None),
+    ];
+    for (code, want) in expect {
+        assert_eq!(icon_for_code(code), want, "code {code}");
+    }
+}
+
+#[test]
+#[allow(clippy::many_single_char_names)]
+fn normalized_forecast_keeps_absent_values_absent() {
+    let f = parse_forecast(FORECAST.as_bytes()).unwrap();
+    let s = crate::normalize_forecast(&f, "NSW_PT131").unwrap();
+    assert_eq!(s.days.len(), 1);
+    let d = &s.days[0];
+    assert_eq!(d.weekday, "Thu");
+    assert_eq!(d.label, "Thu 1 Jan");
+    assert_eq!(d.max_c, Some(25.0));
+    assert_eq!(d.min_c, None);
+    assert_eq!(d.rain_chance, None);
+    assert_eq!(d.icon_code, None, "998 does not fit a u8 code");
+    assert_eq!(s.issued_local.as_deref(), Some("11:00 am Thu 1 Jan"));
+    assert!(crate::normalize_forecast(&f, "NSW_PT999").is_none());
+    let o = parse_observations(OBS.as_bytes()).unwrap();
+    let n = crate::normalize_observation(&o, "94768").unwrap();
+    assert_eq!(n.air_temp_c, Some(22.6));
+    assert_eq!(n.rel_humidity_pct, None);
+    assert_eq!(n.time_display, "11:00 am");
+}

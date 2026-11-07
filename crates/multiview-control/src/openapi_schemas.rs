@@ -870,6 +870,28 @@ pub enum TimerTargetDoc {
     },
 }
 
+/// `OpenAPI` mirror of `multiview_config::WeatherTemplate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherTemplateDoc {
+    /// Seven daily columns.
+    #[default]
+    SevenDay,
+    /// Today's detail + latest observation.
+    Today,
+}
+
+/// `OpenAPI` mirror of `multiview_config::WeatherBackground`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherBackgroundDoc {
+    /// Opaque dark gradient.
+    #[default]
+    Gradient,
+    /// Transparent background, translucent panels (NV12 + alpha).
+    Transparent,
+}
+
 /// `OpenAPI` mirror of `multiview_config::SourceKind` (tagged by `kind`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -935,6 +957,17 @@ pub enum SourceKindDoc {
         /// Draw the overrun a11y badge (`OVER` / `ELAPSED`) past the target.
         #[serde(default = "default_true")]
         overrun_badge: bool,
+    },
+    /// A BOM weather graphic for one `[weather]` location.
+    Weather {
+        /// The weather location id.
+        location: String,
+        /// `seven_day` (default) or `today`.
+        #[serde(default)]
+        template: WeatherTemplateDoc,
+        /// `gradient` (default, opaque) or `transparent` (alpha panels).
+        #[serde(default)]
+        background: WeatherBackgroundDoc,
     },
     /// RTSP pull.
     Rtsp {
