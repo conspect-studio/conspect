@@ -216,11 +216,12 @@ impl ManagedCloudflare {
                         record.relay = remote;
                         record.health = multiview_cloudflare::lifecycle::Health::Reachable;
                     }
-                    Err(multiview_cloudflare::Error::Api(404))
-                        if record.ownership
-                            == multiview_cloudflare::lifecycle::Ownership::Managed =>
-                    {
-                        continue
+                    Err(multiview_cloudflare::Error::Api(404)) => {
+                        record.health = multiview_cloudflare::lifecycle::Health::Unavailable;
+                        state.pending.insert(
+                            key.clone(),
+                            "remote missing: explicit repair required".into(),
+                        );
                     }
                     Err(_) => record.health = multiview_cloudflare::lifecycle::Health::Unavailable,
                 }
@@ -268,8 +269,49 @@ impl ManagedCloudflare {
                 data: serde_json::json!({"remote_relays":relays,"pending":state.pending.get(&key)}),
             });
         }
+        if action == "adopt-recovery" {
+            let id = r.relay_id.as_deref().ok_or("relay")?;
+            for (other, records) in &state.records {
+                let (_, account): (String, String) =
+                    serde_json::from_str(other).map_err(|_| "owner")?;
+                if other != &key
+                    && account == r.account_id
+                    && records.iter().any(|record| record.relay.uid == id)
+                {
+                    return Err("relay already allocated");
+                }
+            }
+            let remote = client.get(id).await.map_err(|_| "verify recovery relay")?;
+            let records = state.records.entry(key.clone()).or_default();
+            if records.len() >= 32 || records.iter().any(|record| record.relay.uid == remote.uid) {
+                return Err("duplicate or quota");
+            }
+            records.push(multiview_cloudflare::lifecycle::Record {
+                relay: remote,
+                ownership: multiview_cloudflare::lifecycle::Ownership::Imported,
+                auth_domain: r.auth_domain.clone().unwrap_or_else(|| owner.into()),
+                health: multiview_cloudflare::lifecycle::Health::Reachable,
+                pending_revoke: None,
+            });
+            self.persist(&state)?;
+            return Ok(CloudflareResult {
+                data: serde_json::json!({"adopted":true,"ownership":"Imported"}),
+            });
+        }
         if action == "acknowledge-recovery" {
             // Explicit operator acknowledgement; this does not recreate/delete anything.
+            let id = r
+                .relay_id
+                .as_deref()
+                .ok_or("known relay required for recovery")?;
+            let remote = client.get(id).await.map_err(|_| "verify recovery relay")?;
+            if state
+                .records
+                .get(&key)
+                .is_none_or(|records| !records.iter().any(|record| record.relay.uid == remote.uid))
+            {
+                return Err("relay must be adopted before acknowledgement");
+            }
             state.pending.remove(&key);
             self.persist(&state)?;
             return Ok(CloudflareResult {

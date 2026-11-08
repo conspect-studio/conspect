@@ -236,10 +236,60 @@ impl Client {
     /// # Errors
     /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
     pub async fn list(&self) -> Result<Vec<Relay>, Error> {
-        parse(
-            self.call(reqwest::Method::GET, self.url(None, None, false)?, None)
-                .await?,
-        )
+        #[derive(Deserialize)]
+        struct Listed {
+            uid: String,
+            name: String,
+            created: String,
+        }
+        let mut all = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let mut url =
+                reqwest::Url::parse(&self.url(None, None, false)?).map_err(|_| Error::Invalid)?;
+            {
+                let mut query = url.query_pairs_mut();
+                query
+                    .append_pair("asc", "false")
+                    .append_pair("per_page", "100");
+                if let Some(c) = &cursor {
+                    query.append_pair("created_before", c);
+                }
+            }
+            let envelope = self
+                .call_envelope(reqwest::Method::GET, url.into(), None)
+                .await?;
+            let page: Vec<Listed> = parse(envelope.result)?;
+            let info = envelope.result_info.ok_or(Error::Response)?;
+            let count = info.count.ok_or(Error::Response)?;
+            let total = info.total.ok_or(Error::Response)?;
+            if count != page.len() || count > 100 || total < count {
+                return Err(Error::Response);
+            }
+            let next = page.last().map(|r| r.created.clone());
+            for item in page {
+                if !seen.insert(item.uid.clone()) {
+                    return Err(Error::Response);
+                }
+                all.push(Relay {
+                    uid: item.uid,
+                    name: item.name,
+                    config: RelayConfig::default(),
+                    status: None,
+                    issuers: vec![],
+                });
+            }
+            if count == total {
+                return Ok(all);
+            }
+            let next = next.ok_or(Error::Response)?;
+            if cursor.as_ref().is_some_and(|c| next >= *c) {
+                return Err(Error::Response);
+            }
+            cursor = Some(next);
+        }
+        Err(Error::Response)
     }
     /// # Errors
     /// Returns a sanitized error for invalid input, ownership conflicts, or API failure.
@@ -452,23 +502,17 @@ mod tests {
         origin
     }
     async fn client(origin: String) -> Client {
-        let mut c = Client::new(
-            "account".into(),
-            Credential::Bearer {
-                token: "t".into(),
-            },
-        )
-        .unwrap();
+        let mut c =
+            Client::new("account".into(), Credential::Bearer { token: "t".into() }).unwrap();
         c.test_origin = Some(origin);
         c
     }
     #[tokio::test]
     async fn documented_list_shape_and_create_secret_roundtrip() {
         let list_body = r#"{"success":true,"result":[{"created":"2019-12-27T18:11:19.117Z","modified":"2019-12-27T18:11:19.117Z","name":"name","uid":"a1b2c3d4e5f67890a1b2c3d4e5f67890"}],"result_info":{"count":1,"total":1}}"#;
-        match client(origin_server(list_body)).await.list().await {
-            Ok(v) => panic!("LIST_OK count={}", v.len()),
-            Err(e) => eprintln!("LIST_ERR {e:?}"),
-        }
+        let listed=client(origin_server(list_body)).await.list().await.expect("documented abbreviated list succeeds");
+        assert_eq!(listed.len(),1);
+        assert_eq!(listed[0].uid,"a1b2c3d4e5f67890a1b2c3d4e5f67890");
         let create_body = r#"{"success":true,"result":{"uid":"relayuid","name":"demo","config":{"upstreams":{"enabled":false,"upstreams":[]}},"issuers":[{"type":"cloudflare_jwt","issuer":"cloudflare","cloudflare_tokens":[{"jti":"abc","operations":["subscribe"],"expires":"2030-01-01T00:00:00Z","secret":"ONCE-SECRET-JWT"}]}]}}"#;
         let relay = client(origin_server(create_body))
             .await
@@ -516,10 +560,9 @@ mod tests {
             .await
             .expect("audit");
         let dumped = serde_json::to_string(&audit).unwrap();
-        eprintln!(
-            "AUDIT serialized_contains_value={} dumped={dumped}",
-            dumped.contains("SHOULD-NOT-LEAK")
+        assert!(
+            !dumped.contains("SHOULD-NOT-LEAK"),
+            "audit serialization leaked token value"
         );
-        panic!("probe-complete");
     }
 }

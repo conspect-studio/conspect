@@ -3,8 +3,12 @@ use crate::{parse, Client, Error, Secret};
 use serde::{Deserialize, Serialize};
 #[derive(Deserialize)]
 pub(crate) struct PageInfo {
+    #[serde(default)]
     pub page: u32,
+    #[serde(default)]
     pub total_count: u32,
+    pub count: Option<usize>,
+    pub total: Option<usize>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserToken {
@@ -28,6 +32,23 @@ pub struct PermissionGroup {
     pub is_selectable: Option<bool>,
     #[serde(default)]
     pub scopes: Vec<String>,
+}
+fn check_capacity(complete: bool, count: usize) -> Result<(), Error> {
+    if !complete || count >= 50 {
+        Err(Error::Invalid)
+    } else {
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn quota_requires_complete_audit_and_fewer_than_fifty() {
+        assert!(check_capacity(true, 49).is_ok());
+        assert_eq!(check_capacity(true, 50), Err(Error::Invalid));
+        assert_eq!(check_capacity(false, 0), Err(Error::Invalid));
+    }
 }
 impl Client {
     /// Hard cap bounds both memory and management traffic. Incomplete audits never
@@ -90,9 +111,7 @@ impl Client {
             return Err(Error::Invalid);
         }
         let audit = self.audit_user_tokens().await?;
-        if !audit.all_pages_loaded || audit.tokens.len() >= 50 {
-            return Err(Error::Invalid);
-        }
+        check_capacity(audit.all_pages_loaded, audit.tokens.len())?;
         let groups = self.permission_groups().await?;
         let group = groups
             .iter()
