@@ -32,8 +32,23 @@ The reusable `VideoAdapter` accepts immutable encoded-time windows with binding
 configuration generation, shared `Bytes`, microsecond timestamps and upstream
 verified RAP flags. It validates the complete window (60 packets, 4MiB, 2 seconds)
 before writes. Rejection or discontinuity requires RAP recovery; revocation
-rejects further windows. The fixture uses this same adapter. This is video-only;
-atomic audio/video publication and production source-demand fencing remain gaps.
+rejects further windows. The fixture uses this same video adapter.
+`av::AvAdapter` additionally prevalidates every configured audio track before any
+video write, applies one generation/gap recovery boundary, and caps combined
+packets/bytes/timestamp span. Network writes are not atomic: a downstream error
+can expose a prefix, explicitly forcing discontinuity. Upstream atomic admission,
+source-demand fencing and global retained allocation budgets remain external.
+The executable and browser evidence are video-only; audio decode is not proven.
+
+## Measured local evidence (2026-11-08)
+
+Browser owner ran the real Chromium headless shell against both explicit drafts.
+Final draft16: 30 painted VP8 VideoFrames, timestamps 255000000..256466666us.
+Final draft18: 30 painted VP8 VideoFrames, advancing timestamps, negotiated
+`moq-transport-18`. Both used the pinned one-shot @moq/net client, WebTransport,
+certificate hashes, no WebSocket fallback. Probe/log artifacts are maintained by
+the browser owner. This evidence does not cover Cloudflare, audio, encryption,
+production authorization or production feed integration.
 
 Sessions are capped at eight and expire after 60 seconds. Input is capped at
 16MiB and individual frames at 1MiB. This fixture has no production admission,

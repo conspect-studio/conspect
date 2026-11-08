@@ -1,5 +1,6 @@
 //! Encoded-video adapter seam. Call only from an off-clock bounded consumer task.
 //! Admission, global retained-allocation accounting and authorization are external.
+pub mod av;
 use bytes::Bytes;
 use std::time::Duration;
 
