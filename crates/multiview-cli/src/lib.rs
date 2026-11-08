@@ -206,6 +206,12 @@ pub mod preview;
 /// encoder and reserves no session; the `Pipeline::build` wiring is the next
 /// serial unit.
 pub mod rendition_plan;
+/// The independently bounded per-rendition encode workers (broadcast output
+/// contract, slice 2): one worker per distinct video rendition key, each with
+/// its own bounded admission queue, emitting typed events with a *proven* DTS
+/// completeness watermark so a window assembler never closes early on a
+/// reordered/delayed encoder.
+pub mod rendition_workers;
 pub mod run;
 #[cfg(test)]
 mod source_event_automation_e2e;
