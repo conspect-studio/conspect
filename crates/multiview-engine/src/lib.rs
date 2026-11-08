@@ -114,6 +114,8 @@ pub mod scheduler;
 pub mod slate;
 pub mod supervisor;
 pub mod switcher;
+pub mod switcher_control;
+pub mod switcher_plan;
 pub mod sysref;
 pub mod tally;
 
