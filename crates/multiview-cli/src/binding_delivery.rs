@@ -29,33 +29,33 @@ use std::time::{Duration, Instant};
 use multiview_core::time::Rational;
 use multiview_ffmpeg::{EncodedPacket, StreamKind};
 use multiview_output::batch::{
-    BatchLease, BoundedBatchQueue, EmissionError, OfferError, MAX_QUEUE_AGE, MAX_QUEUE_BYTES,
-    MAX_QUEUE_PACKETS,
+    BatchLease, BoundedBatchQueue, Discontinuity, EmissionError, OfferError, MAX_QUEUE_AGE,
+    MAX_QUEUE_BYTES, MAX_QUEUE_PACKETS,
 };
 use multiview_output::push_link::PushLinkStatus;
 
 /// Grace a binding pump gives a sink that has stopped draining before it
 /// abandons that binding. Bounded: a wedged sink can never pin a pump thread or
 /// its in-flight lease forever.
-pub const PUMP_WEDGE_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const PUMP_WEDGE_GRACE: Duration = Duration::from_secs(2);
 
 /// Depth (in packets) of the pump → sink handoff. One packet: the pump blocks
 /// on the sink instead of buffering a second copy of a potentially huge IDR.
-pub const HANDOFF_PACKETS: usize = 1;
+pub(crate) const HANDOFF_PACKETS: usize = 1;
 
 /// Depth (in leases) of the consumer → pump handoff. A lease owns its batch's
 /// reservation until the mux drops it, so this is a bounded in-flight window,
 /// not a second unbounded queue.
-pub const HANDOFF_LEASES: usize = 2;
+pub(crate) const HANDOFF_LEASES: usize = 2;
 
 /// Total trailer deadline for draining already-admitted windows at
 /// [`BindingDelivery::finish`]. Bounded, per the contract's 2 s sink
 /// lifecycle/flush limit.
-pub const FINISH_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+pub(crate) const FINISH_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How a binding's delivery treats a full or stale batch queue.
 #[derive(Clone)]
-pub enum BindingPolicy {
+pub(crate) enum BindingPolicy {
     /// A local artifact sink (file/HLS): a lost batch fails this binding
     /// visibly; it is never silently dropped and never delays another binding.
     Bounded,
@@ -66,7 +66,7 @@ pub enum BindingPolicy {
 
 /// Why a batch was not admitted, for status/telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RejectionReason {
+pub(crate) enum RejectionReason {
     /// The complete window breached a per-window limit (count/bytes/span).
     InvalidWindow,
     /// Existing queued + in-flight reservations leave no room: overload.
@@ -98,7 +98,7 @@ impl RejectionReason {
 
     /// A short, stable label for logs and status payloads.
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::InvalidWindow => "invalid-window",
             Self::Occupied => "queue-occupied",
@@ -114,44 +114,44 @@ impl RejectionReason {
 /// Per-binding delivery truth: admitted and rejected windows/packets/bytes,
 /// discontinuity generation and the current retained reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BindingStatus {
+pub(crate) struct BindingStatus {
     /// Windows admitted atomically.
-    pub admitted_batches: u64,
+    pub(crate) admitted_batches: u64,
     /// Packets inside admitted windows.
-    pub admitted_packets: u64,
+    pub(crate) admitted_packets: u64,
     /// Referenced coded bytes inside admitted windows.
-    pub admitted_bytes: u64,
+    pub(crate) admitted_bytes: u64,
     /// Windows rejected atomically (whole-window loss).
-    pub rejected_batches: u64,
+    pub(crate) rejected_batches: u64,
     /// Packets lost with those rejected windows.
-    pub rejected_packets: u64,
+    pub(crate) rejected_packets: u64,
     /// Bytes lost with those rejected windows.
-    pub rejected_bytes: u64,
+    pub(crate) rejected_bytes: u64,
     /// The last rejection reason.
-    pub last_rejection: Option<RejectionReason>,
+    pub(crate) last_rejection: Option<RejectionReason>,
     /// Carrier discontinuity generation (bumped on every loss).
-    pub generation: u64,
+    pub(crate) generation: u64,
     /// Windows still queued (not in-flight leases).
-    pub queued_windows: usize,
+    pub(crate) queued_windows: usize,
     /// Packet reservations owned by the queue **including** in-flight leases.
-    pub reserved_packets: usize,
+    pub(crate) reserved_packets: usize,
     /// Byte reservations owned by the queue **including** in-flight leases.
-    pub reserved_bytes: usize,
+    pub(crate) reserved_bytes: usize,
     /// The sink wedged past the grace (or hung up) and this binding was
     /// abandoned; the run's other bindings continue.
-    pub failed: bool,
+    pub(crate) failed: bool,
 }
 
 /// Admission limits. Defaults are the carrier's broadcast ceilings; tests and
 /// capacity measurement may tighten them, never to paper over overload.
 #[derive(Debug, Clone, Copy)]
-pub struct DeliveryLimits {
+pub(crate) struct DeliveryLimits {
     /// Maximum packets owned by one binding, including in-flight leases.
-    pub max_packets: usize,
+    pub(crate) max_packets: usize,
     /// Maximum referenced coded bytes owned by one binding.
-    pub max_bytes: usize,
+    pub(crate) max_bytes: usize,
     /// Maximum time since admission for a queued, unconsumed window.
-    pub max_age: Duration,
+    pub(crate) max_age: Duration,
 }
 
 impl Default for DeliveryLimits {
@@ -169,7 +169,7 @@ impl Default for DeliveryLimits {
 /// Exact integer arithmetic from the rational cadence: a float fps would drift,
 /// and this value bounds every batch's encoded-time span.
 #[must_use]
-pub fn tick_span(cadence: Rational) -> Duration {
+pub(crate) fn tick_span(cadence: Rational) -> Duration {
     if cadence.num <= 0 || cadence.den <= 0 {
         return Duration::ZERO;
     }
@@ -179,6 +179,151 @@ pub fn tick_span(cadence: Rational) -> Duration {
     );
     let nanos = den.saturating_mul(1_000_000_000) / num;
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// One assembled, immutable A/V window for exactly one binding.
+///
+/// The window assembler (DTS watermarking + which packets belong to which
+/// encoded interval) owns this; delivery owns the queue it is admitted into.
+#[allow(dead_code)] // reason: constructed by the window assembler (rendition_dispatch); delivery owns the admission it feeds.
+pub(crate) struct DeliveryWindow {
+    /// Index into the configured output order.
+    pub(crate) output_index: usize,
+    /// Video-key packets first, then this binding's selected audio, in stable
+    /// stream order. Built with `clone_shared_ref`: independent headers, one
+    /// coded payload allocation.
+    pub(crate) packets: Vec<EncodedPacket>,
+    /// The assembler's measured collection span for this window (≤ 250 ms).
+    pub(crate) media_span: Duration,
+}
+
+/// Receipt for an atomically admitted window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Admission {
+    /// The binding the window was admitted to.
+    pub(crate) output_index: usize,
+    /// The queue generation it was admitted into.
+    pub(crate) generation: u64,
+}
+
+/// A window rejected **whole**: none of its packets were queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowRejection {
+    /// The binding that rejected the window.
+    pub(crate) output_index: usize,
+    /// The post-loss queue generation (also the signal to reset mux continuity).
+    pub(crate) generation: u64,
+    /// Stable rejection reason for status.
+    pub(crate) reason: RejectionReason,
+    /// Packets lost with the rejected window.
+    pub(crate) packets: usize,
+    /// Referenced coded bytes lost with the rejected window.
+    pub(crate) bytes: usize,
+}
+
+/// The only crossing point between a window assembler and delivery.
+///
+/// The assembler never owns a queue, generation or lease: it decides *what*
+/// belongs in a window and calls [`Self::offer_window`]; delivery owns the one
+/// bounded queue per binding, the atomic admission, the generation/loss truth
+/// and the mux lease lifetime.
+#[allow(dead_code)] // reason: the published assembler seam; `offer_window` is used by the pipeline's direct path and the rest is called by `rendition_dispatch`.
+pub(crate) trait WindowDelivery {
+    /// Atomically admit one complete window for one binding. Never waits, never
+    /// partially admits. `generation` is the assembler's view; the queue's own
+    /// generation is authoritative and is what the receipt/loss reports.
+    ///
+    /// # Errors
+    /// Returns the whole-window rejection (nothing was delivered).
+    fn offer_window(
+        &mut self,
+        output_index: usize,
+        generation: u64,
+        packets: Vec<EncodedPacket>,
+        media_span: Duration,
+        now: Instant,
+    ) -> Result<(), EmissionError>;
+
+    /// Declare real encoded media lost before admission (an invalid window the
+    /// assembler discarded), so the binding requires a fresh RAP.
+    fn report_loss(&mut self, output_index: usize, reason: OfferError);
+
+    /// Consume this binding's loss event (generation + flushed counters) so the
+    /// mux can reset continuity. Exactly one consumer.
+    fn take_discontinuity(&mut self, output_index: usize) -> Option<Discontinuity>;
+
+    /// The binding's current queue generation.
+    fn generation(&self, output_index: usize) -> u64;
+
+    /// Point-in-time per-binding truth.
+    fn statuses(&self) -> Vec<BindingStatus>;
+
+    /// Stop after serving every admitted window.
+    fn finish(&mut self);
+}
+
+impl WindowDelivery for BindingDelivery {
+    fn offer_window(
+        &mut self,
+        output_index: usize,
+        generation: u64,
+        packets: Vec<EncodedPacket>,
+        media_span: Duration,
+        now: Instant,
+    ) -> Result<(), EmissionError> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        let Some(binding) = self.bindings.get(output_index) else {
+            return Err(EmissionError::Admission(OfferError::WrongProgramShape));
+        };
+        if binding.failed {
+            return Err(EmissionError::Admission(OfferError::Closed));
+        }
+        // The queue's generation is authoritative. A stale assembler generation
+        // is not fatal: its own `take_discontinuity` call realigns it, and the
+        // window still has to pass the strict-RAP gate.
+        let _ = generation;
+        match self.admit(output_index, packets, media_span, now) {
+            Ok(_) => Ok(()),
+            Err(rejection) => Err(EmissionError::Admission(match rejection.reason {
+                RejectionReason::InvalidWindow => OfferError::Oversized,
+                RejectionReason::Occupied | RejectionReason::SinkWedged => OfferError::Occupied,
+                RejectionReason::OldestAge => OfferError::OldestAge,
+                RejectionReason::ClockReversed => OfferError::ClockReversed,
+                RejectionReason::NeedsRecoveryPoint => OfferError::NeedsRecoveryPoint,
+                RejectionReason::WrongProgramShape => OfferError::WrongProgramShape,
+            })),
+        }
+    }
+
+    fn report_loss(&mut self, output_index: usize, reason: OfferError) {
+        if let Some(binding) = self.bindings.get_mut(output_index) {
+            binding.queue.report_loss(reason);
+            binding.rejected_batches = binding.rejected_batches.saturating_add(1);
+            binding.last_rejection = Some(RejectionReason::from_offer(reason));
+        }
+    }
+
+    fn take_discontinuity(&mut self, output_index: usize) -> Option<Discontinuity> {
+        self.bindings
+            .get_mut(output_index)
+            .and_then(|binding| binding.queue.take_discontinuity())
+    }
+
+    fn generation(&self, output_index: usize) -> u64 {
+        self.bindings
+            .get(output_index)
+            .map_or(0, |binding| binding.queue.generation())
+    }
+
+    fn statuses(&self) -> Vec<BindingStatus> {
+        BindingDelivery::statuses(self)
+    }
+
+    fn finish(&mut self) {
+        BindingDelivery::finish(self);
+    }
 }
 
 struct Binding {
@@ -201,9 +346,8 @@ struct Binding {
 }
 
 /// Atomic delivery for every binding of one program.
-pub struct BindingDelivery {
+pub(crate) struct BindingDelivery {
     bindings: Vec<Binding>,
-    limits: DeliveryLimits,
 }
 
 impl BindingDelivery {
@@ -216,7 +360,7 @@ impl BindingDelivery {
     /// non-NAL codec is better served by rebuilding the binding than by
     /// guessing.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         policies: Vec<BindingPolicy>,
         limits: DeliveryLimits,
         gate: Option<multiview_output::batch::RecoveryGate>,
@@ -233,7 +377,7 @@ impl BindingDelivery {
                 .spawn(move || {
                     while let Ok(lease) = lease_rx.recv() {
                         for packet in lease.packets() {
-                            if !send_bounded_packet(&packet_tx, packet.clone()) {
+                            if !send_bounded_packet(&packet_tx, packet.clone_shared_ref()) {
                                 // The sink hung up or stopped draining for the
                                 // whole grace: this binding is finished. Drop
                                 // the lease (releasing its reservation) and end
@@ -272,16 +416,7 @@ impl BindingDelivery {
             });
             receivers.push(packet_rx);
         }
-        (
-            Self { bindings, limits },
-            receivers,
-        )
-    }
-
-    /// The admission limits in force (for the run report).
-    #[must_use]
-    pub const fn limits(&self) -> DeliveryLimits {
-        self.limits
+        (Self { bindings }, receivers)
     }
 
     /// Stage one emitted packet group (a tick's video, program audio or discrete
@@ -291,7 +426,7 @@ impl BindingDelivery {
     /// A push binding whose producer-side gate is closed until a post-loss
     /// keyframe simply does not stage the packet — its link status already
     /// records that gate state.
-    pub fn stage(&mut self, packets: &[EncodedPacket]) {
+    pub(crate) fn stage(&mut self, packets: &[EncodedPacket]) {
         if packets.is_empty() {
             return;
         }
@@ -306,7 +441,8 @@ impl BindingDelivery {
                         continue;
                     }
                 }
-                binding.staged.push(packet.clone());
+                // Shared-ref copy: independent AVPacket metadata, ONE coded payload.
+                binding.staged.push(packet.clone_shared_ref());
             }
         }
     }
@@ -314,57 +450,98 @@ impl BindingDelivery {
     /// Atomically admit the staged batch of the **previous** tick to every
     /// binding. Never waits: the only outcome of a full or stale binding is a
     /// whole-batch loss recorded against that binding.
-    pub fn flush_tick(&mut self, now: Instant, media_span: Duration) {
-        for binding in &mut self.bindings {
-            if binding.failed {
-                binding.staged.clear();
+    ///
+    /// This is the pipeline's *direct* path (the bake consumer knows the tick
+    /// boundary itself). An external window assembler uses
+    /// [`WindowDelivery::offer_window`], which funnels into the same single
+    /// admission path — there is exactly one queue and one generation per
+    /// binding either way.
+    pub(crate) fn flush_tick(&mut self, now: Instant, media_span: Duration) {
+        for index in 0..self.bindings.len() {
+            if self.bindings[index].failed {
+                self.bindings[index].staged.clear();
                 continue;
             }
-            if binding.staged.is_empty() {
+            if self.bindings[index].staged.is_empty() {
                 continue;
             }
-            let staged = std::mem::take(&mut binding.staged);
-            let packets = staged.len();
-            let bytes = staged.iter().map(EncodedPacket::len).sum::<usize>();
-            let keyframes: Vec<bool> = staged
-                .iter()
-                .map(|packet| matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe())
-                .collect();
-            match binding.queue.offer_emitted(staged, media_span, now) {
-                Ok(()) => {
-                    binding.admitted_batches = binding.admitted_batches.saturating_add(1);
-                    binding.admitted_packets = binding.admitted_packets.saturating_add(packets as u64);
-                    binding.admitted_bytes = binding.admitted_bytes.saturating_add(bytes as u64);
-                    if let BindingPolicy::Push(link) = &binding.policy {
-                        for keyframe in &keyframes {
-                            link.queued_upstream(*keyframe);
-                        }
-                    }
-                }
-                Err(error) => {
-                    let reason = match error {
-                        EmissionError::InvalidWindow(_) => RejectionReason::InvalidWindow,
-                        EmissionError::Admission(offer) => RejectionReason::from_offer(offer),
-                    };
-                    binding.rejected_batches = binding.rejected_batches.saturating_add(1);
-                    binding.rejected_packets = binding.rejected_packets.saturating_add(packets as u64);
-                    binding.rejected_bytes = binding.rejected_bytes.saturating_add(bytes as u64);
-                    binding.last_rejection = Some(reason);
-                    if let BindingPolicy::Push(link) = &binding.policy {
-                        for _ in &keyframes {
-                            link.shed_upstream();
-                        }
-                    }
-                }
-            }
-            // A wedged pump means this binding is over: report it and stop
-            // offering (its queue keeps draining until the lease expires).
-            if binding.wedged.load(Ordering::Acquire) {
-                binding.failed = true;
-                binding.last_rejection = Some(RejectionReason::SinkWedged);
-            }
-            Self::pump_binding(binding, now);
+            let packets = std::mem::take(&mut self.bindings[index].staged);
+            // Same single admission path an external assembler uses; the
+            // generation argument is advisory (the queue is authoritative).
+            let _ = self.offer_window(index, 0, packets, media_span, now);
         }
+    }
+
+    /// The single admission path for one binding's complete window.
+    ///
+    /// Whole-window atomic: the carrier validates and admits all streams
+    /// together, or rejects the entire window. Never waits.
+    fn admit(
+        &mut self,
+        index: usize,
+        staged: Vec<EncodedPacket>,
+        media_span: Duration,
+        now: Instant,
+    ) -> Result<Admission, WindowRejection> {
+        let packets = staged.len();
+        let bytes = staged.iter().map(EncodedPacket::len).sum::<usize>();
+        let keyframes: Vec<bool> = staged
+            .iter()
+            .map(|packet| matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe())
+            .collect();
+        let binding = &mut self.bindings[index];
+        match binding.queue.offer_emitted(staged, media_span, now) {
+            Ok(()) => {
+                binding.admitted_batches = binding.admitted_batches.saturating_add(1);
+                binding.admitted_packets = binding.admitted_packets.saturating_add(packets as u64);
+                binding.admitted_bytes = binding.admitted_bytes.saturating_add(bytes as u64);
+                if let BindingPolicy::Push(link) = &binding.policy {
+                    for keyframe in &keyframes {
+                        link.queued_upstream(*keyframe);
+                    }
+                }
+            }
+            Err(error) => {
+                let reason = match error {
+                    EmissionError::InvalidWindow(_) => RejectionReason::InvalidWindow,
+                    EmissionError::Admission(offer) => RejectionReason::from_offer(offer),
+                };
+                binding.rejected_batches = binding.rejected_batches.saturating_add(1);
+                binding.rejected_packets = binding.rejected_packets.saturating_add(packets as u64);
+                binding.rejected_bytes = binding.rejected_bytes.saturating_add(bytes as u64);
+                binding.last_rejection = Some(reason);
+                if let BindingPolicy::Push(link) = &binding.policy {
+                    for _ in &keyframes {
+                        link.shed_upstream();
+                    }
+                }
+                // A wedged pump means this binding is over: report it and stop
+                // offering (its queue keeps draining until the lease expires).
+                if binding.wedged.load(Ordering::Acquire) {
+                    binding.failed = true;
+                    binding.last_rejection = Some(RejectionReason::SinkWedged);
+                }
+                let generation = binding.queue.generation();
+                Self::pump_binding(binding, now);
+                return Err(WindowRejection {
+                    output_index: index,
+                    generation,
+                    reason,
+                    packets,
+                    bytes,
+                });
+            }
+        }
+        if binding.wedged.load(Ordering::Acquire) {
+            binding.failed = true;
+            binding.last_rejection = Some(RejectionReason::SinkWedged);
+        }
+        let generation = binding.queue.generation();
+        Self::pump_binding(binding, now);
+        Ok(Admission {
+            output_index: index,
+            generation,
+        })
     }
 
     /// Hand at most one pending lease and then every immediately available
@@ -418,7 +595,7 @@ impl BindingDelivery {
     /// wedged one has already been abandoned), and only then closes the handoff
     /// and joins the pumps. Dropping admitted windows here would be silent
     /// media loss, which the contract forbids.
-    pub fn finish(mut self) {
+    pub(crate) fn finish(&mut self) {
         let deadline = Instant::now() + FINISH_DRAIN_DEADLINE;
         loop {
             let now = Instant::now();
@@ -445,11 +622,27 @@ impl BindingDelivery {
                 let _ = pump.join();
             }
         }
+        // Truthful teardown: after the pumps exit, every admitted window must
+        // have been owned and released. A residue means real media was lost at
+        // close, which must be reported rather than swallowed.
+        for (index, binding) in self.bindings.iter_mut().enumerate() {
+            if !binding.queue.is_drained() {
+                let (packets, bytes) = binding.queue.reserved();
+                binding.rejected_batches = binding.rejected_batches.saturating_add(1);
+                binding.last_rejection = Some(RejectionReason::Occupied);
+                tracing::warn!(
+                    binding = index,
+                    packets,
+                    bytes,
+                    "binding still owned encoded windows at close (counted as a loss)"
+                );
+            }
+        }
     }
 
     /// A status snapshot per binding, in configured output order.
     #[must_use]
-    pub fn statuses(&self) -> Vec<BindingStatus> {
+    pub(crate) fn statuses(&self) -> Vec<BindingStatus> {
         self.bindings
             .iter()
             .map(|binding| {
@@ -472,11 +665,6 @@ impl BindingDelivery {
             .collect()
     }
 
-    /// True when every binding is drained (no queued and no in-flight window).
-    #[must_use]
-    pub fn is_drained(&self) -> bool {
-        self.bindings.iter().all(|binding| binding.queue.is_drained())
-    }
 }
 
 /// Send one packet to a sink, waiting at most [`PUMP_WEDGE_GRACE`] for a slot.

@@ -2327,9 +2327,14 @@ impl<'a> SegmentState<'a> {
             return Ok(());
         };
         if let Some(segment) = state.current.as_mut() {
+            // Shared-ref header copy: the HLS segmenter never mutates coded
+            // payload bytes, so the mux gets independent AVPacket metadata over
+            // the SAME immutable payload the other bindings are muxing. The old
+            // `to_owned_packet()` did `av_packet_ref` + `av_packet_make_writable`,
+            // i.e. one full coded-payload copy per HLS write.
             segment
                 .muxer
-                .write_packet(segment.stream_index, packet.to_owned_packet())
+                .write_packet(segment.stream_index, packet.to_owned_packet_shared_ref())
                 .map_err(ff)?;
             segment.packets = segment.packets.saturating_add(1);
         }
