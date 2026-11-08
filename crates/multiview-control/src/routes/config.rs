@@ -257,7 +257,23 @@ pub(crate) async fn export_config(
 pub(crate) fn compose_running_config(
     state: &AppState,
 ) -> ControlResult<(serde_json::Value, multiview_config::MultiviewConfig)> {
-    let document = compose_document_unredacted(state)?;
+    validate_composed(compose_document_unredacted(state)?)
+}
+
+/// Compose and validate from the accepted envelope (review R3-01), exactly
+/// like [`compose_running_config`] except the resource sections come from
+/// [`compose_accepted_document`]. Used ONLY by [`promote_to_boot`] — promote
+/// writes "what was accepted" to the boot file, which must stay truthful even
+/// after a store projection write failed post-commit.
+pub(crate) fn compose_accepted_running_config(
+    state: &AppState,
+) -> ControlResult<(serde_json::Value, multiview_config::MultiviewConfig)> {
+    validate_composed(compose_accepted_document(state)?)
+}
+
+fn validate_composed(
+    document: serde_json::Value,
+) -> ControlResult<(serde_json::Value, multiview_config::MultiviewConfig)> {
     let config: multiview_config::MultiviewConfig = serde_path_to_error::deserialize(&document)
         .map_err(|err| {
             let path = err.path().to_string();
@@ -275,30 +291,39 @@ pub(crate) fn compose_running_config(
 }
 
 /// Compose the export JSON document: the loaded base configuration (when one
-/// was installed) overlaid with everything the live stores own — the working
-/// layout's canvas/layout/cells and the source/output/overlay/probe
-/// collections. **Secrets are redacted** (the export is outward-facing); for
-/// the secrets-intact Running snapshot use [`compose_running_config`].
+/// was installed) overlaid with the ACCEPTED envelope's resource sections
+/// (review R3-01) — the working layout's canvas/layout/cells and the
+/// source/output/overlay/probe collections. **Secrets are redacted** (the
+/// export is outward-facing); for the secrets-intact Running snapshot use
+/// [`compose_running_config`].
 fn compose_export_document(state: &AppState) -> ControlResult<serde_json::Value> {
     Ok(crate::support_bundle::redact_config_for_export(
-        &compose_document_unredacted(state)?,
+        &compose_accepted_document(state)?,
     ))
 }
 
-/// Compose the running JSON document from `base_document` + the live stores,
-/// **without** redaction and **without** validation. The shared composition
-/// behind the redacted export ([`compose_export_document`]), the secrets-intact
-/// Running snapshot ([`compose_running_config`]), and the adopted-state persist
-/// (`boot_model::persist_running_now`, which overrides sources/overlays with the
-/// adopted snapshot BEFORE validating — the live store can transiently fail
-/// whole-document validation, e.g. a cell referencing a just-deleted but still
-/// running source).
-pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<serde_json::Value> {
-    // The working layout carries { canvas, layout, cells }. Prefer the
-    // designated working layout (set at seed time); fall back to the id-sorted
-    // first layout document that declares a canvas (store-only deployments).
+/// The `{ canvas, layout, cells }` document the running config carries. On a
+/// modeled run that is accepted intent, or the adopted config before the first
+/// commit, so a failed or legacy layout repository can neither fail nor stale
+/// this composition. A store-only run prefers its designated working layout (set
+/// at seed time), then the id-sorted first layout document that declares a canvas.
+fn working_document(state: &AppState) -> ControlResult<serde_json::Value> {
+    if let Some(model) = &state.boot_model {
+        // Review R3-03: the in-memory accepted snapshot, not a fresh
+        // `desired.json` read-parse-validate on every export/promote compose.
+        let desired = model
+            .accepted()
+            .map_err(crate::error::ControlError::Repository)?;
+        let config =
+            desired.map_or_else(|| model.adopted_config(), |desired| desired.config.clone());
+        return Ok(serde_json::json!({
+            "canvas": config.canvas,
+            "layout": config.layout,
+            "cells": config.cells,
+        }));
+    }
     let layouts = state.repository.list_layouts()?;
-    let working = state
+    state
         .working_layout_id
         .as_deref()
         .and_then(|id| {
@@ -313,19 +338,56 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
                 .map(|v| &v.layout)
                 .find(|layout| layout.body.get("canvas").is_some())
         })
+        .map(|layout| layout.body.clone())
         .ok_or_else(|| {
             crate::error::ControlError::Validation(
                 "no working layout (a layout body carrying `canvas`) to export".to_owned(),
             )
-        })?;
+        })
+}
 
-    let collect = |repo: &std::sync::Arc<dyn crate::resource_store::ResourceRepository>|
+/// Compose the running JSON document from `base_document` + the live stores,
+/// **without** redaction and **without** validation. The shared composition
+/// behind the redacted export ([`compose_export_document`]), the secrets-intact
+/// Running snapshot ([`compose_running_config`]), and the adopted-state persist
+/// (`boot_model::persist_running_now`, which overrides sources/overlays with the
+/// adopted snapshot BEFORE validating — the live store can transiently fail
+/// whole-document validation, e.g. a cell referencing a just-deleted but still
+/// running source).
+pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<serde_json::Value> {
+    compose_document(state, false)
+}
+
+/// Compose the SAME document shape as [`compose_document_unredacted`], but
+/// from the accepted envelope's resource sections rather than the live
+/// stores (review R3-01). Used ONLY by [`compose_export_document`] and
+/// [`promote_to_boot`]'s composition — both are "what was accepted", which
+/// must stay truthful even when a store projection write failed after its
+/// durable commit. `revert_to_start`/`boot_model_status`/
+/// `persist_running_now` need the LIVE engine-facing state instead (a shed
+/// REST mutation keeps the store at REQUESTED state deliberately, ADR-W018)
+/// and must keep calling [`compose_document_unredacted`].
+pub(crate) fn compose_accepted_document(state: &AppState) -> ControlResult<serde_json::Value> {
+    compose_document(state, true)
+}
+
+fn compose_document(state: &AppState, accepted: bool) -> ControlResult<serde_json::Value> {
+    let working = working_document(state)?;
+
+    // Review R3-01 (`accepted = true` only): the accepted envelope when one
+    // exists, never straight from a store whose projection write can fail
+    // after a durable commit. `accepted_family` returns the envelope's
+    // resources (falling back to the live store only when no envelope exists
+    // yet, e.g. a store-only run or the pre-first-commit window).
+    let collect = |key: &str,
+                   repo: &std::sync::Arc<dyn crate::resource_store::ResourceRepository>|
      -> ControlResult<Vec<serde_json::Value>> {
-        Ok(repo
-            .list()?
-            .into_iter()
-            .map(|v| v.resource.body)
-            .collect())
+        let entries = if accepted {
+            crate::boot_model::accepted_family(state, key, repo)?
+        } else {
+            repo.list()?
+        };
+        Ok(entries.into_iter().map(|v| v.resource.body).collect())
     };
 
     // Start from the loaded configuration document (so authored sections the
@@ -347,7 +409,6 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     doc.insert(
         "canvas".to_owned(),
         working
-            .body
             .get("canvas")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
@@ -355,7 +416,6 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     doc.insert(
         "layout".to_owned(),
         working
-            .body
             .get("layout")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
@@ -363,26 +423,25 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     doc.insert(
         "cells".to_owned(),
         working
-            .body
             .get("cells")
             .cloned()
             .unwrap_or_else(|| serde_json::json!([])),
     );
     doc.insert(
         "sources".to_owned(),
-        serde_json::Value::Array(collect(&state.sources)?),
+        serde_json::Value::Array(collect("sources", &state.sources)?),
     );
     doc.insert(
         "outputs".to_owned(),
-        serde_json::Value::Array(collect(&state.outputs)?),
+        serde_json::Value::Array(collect("outputs", &state.outputs)?),
     );
     doc.insert(
         "overlays".to_owned(),
-        serde_json::Value::Array(collect(&state.overlays)?),
+        serde_json::Value::Array(collect("overlays", &state.overlays)?),
     );
     doc.insert(
         "probes".to_owned(),
-        serde_json::Value::Array(collect(&state.probes)?),
+        serde_json::Value::Array(collect("probes", &state.probes)?),
     );
     // Managed devices + sync groups (ADR-M008): config-as-code is the durable
     // source, so a device or sync group adopted at runtime via the API must
@@ -391,11 +450,11 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     // here, so live status never leaks into the desired-state document.
     doc.insert(
         "devices".to_owned(),
-        serde_json::Value::Array(collect(&state.devices)?),
+        serde_json::Value::Array(collect("devices", &state.devices)?),
     );
     doc.insert(
         "sync_groups".to_owned(),
-        serde_json::Value::Array(collect(&state.sync_groups)?),
+        serde_json::Value::Array(collect("sync_groups", &state.sync_groups)?),
     );
     // The store-backed singletons/collections that overlay the base document —
     // `audio`, `salvos`, `tally_profiles` — are composed FROM their stores
@@ -403,7 +462,7 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
     // the line limit). The whole-document validation below cross-checks routes
     // against the declared sources (the `PUT /api/v1/audio-routing` check
     // intentionally defers).
-    insert_store_backed_sections(doc, state)?;
+    insert_store_backed_sections(doc, state, accepted)?;
     // The composition is returned with secrets INTACT. The redaction for the
     // outward-facing export happens in `compose_export_document`; the Running
     // snapshot (`compose_running_config`) keeps the real credentials so a
@@ -415,8 +474,11 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
 /// `tally_profiles` — onto the composed document FROM their stores.
 ///
 /// * **`audio`** overlays the `audio` key when an operator (or the seeded
-///   config) configured it; otherwise the base document's authored block (if
-///   any) is left untouched.
+///   config) configured it. Under the accepted envelope (`accepted = true`,
+///   used by export/promote) a `None` is accepted intent that CLEARED the
+///   routing, so the inherited base-document block is REMOVED; with no envelope
+///   yet (a store-only run, or the pre-first-commit window) a `None` store
+///   leaves the base document's authored block untouched.
 /// * **`salvos` + `tally_profiles`** (ADR-W024 round 6 / F1) are runtime-mutable
 ///   through their definition routes (`PUT/DELETE /salvos/{id}`, `PUT/DELETE
 ///   /tally/profiles/{id}`) — a pure control-plane store edit with NO engine
@@ -430,8 +492,44 @@ pub(crate) fn compose_document_unredacted(state: &AppState) -> ControlResult<ser
 fn insert_store_backed_sections(
     doc: &mut serde_json::Map<String, serde_json::Value>,
     state: &AppState,
+    accepted: bool,
 ) -> ControlResult<()> {
-    let (audio, _) = state.audio_routing.snapshot();
+    // Review R3-01 (`accepted = true` only, used by export/promote): the SAME
+    // accepted envelope GET serves (`accepted_audio`/`accepted_salvos`/
+    // `accepted_profiles`), not straight from a store whose projection write
+    // can fail after a durable commit. Each helper falls back to the live
+    // store only while no envelope exists yet (store-only run, or before the
+    // first commit). `revert_to_start`/`boot_model_status`/
+    // `persist_running_now` (`accepted = false`) need the LIVE store instead.
+    let (audio, salvos, profiles) = if accepted {
+        (
+            crate::boot_model::accepted_audio(state)?.0,
+            crate::boot_model::accepted_salvos(state)?
+                .into_iter()
+                .map(|v| v.salvo)
+                .collect::<Vec<_>>(),
+            crate::boot_model::accepted_profiles(state)?
+                .into_iter()
+                .map(|v| v.profile)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            state.audio_routing.snapshot().0,
+            state
+                .salvos
+                .list()?
+                .into_iter()
+                .map(|v| v.salvo)
+                .collect::<Vec<_>>(),
+            state
+                .tally_profiles
+                .list()?
+                .into_iter()
+                .map(|v| v.profile)
+                .collect::<Vec<_>>(),
+        )
+    };
     if let Some(routing) = audio {
         doc.insert(
             "audio".to_owned(),
@@ -441,36 +539,46 @@ fn insert_store_backed_sections(
                 ))
             })?,
         );
+    } else if accepted && has_accepted_envelope(state)? {
+        // The accepted envelope owns `audio` (a versioned config section): a
+        // `None` there is accepted intent that CLEARED the routing, not an
+        // unconfigured store. The boot-authored `[audio]` block inherited from
+        // `base_document` is therefore stale — drop it so export and promote
+        // represent the accepted envelope instead of resurrecting a section the
+        // envelope removed (review R3-01). With NO envelope yet (store-only run,
+        // or before the first commit) the store is still the fallback and the
+        // base document's authored block stays authoritative, exactly as before.
+        doc.remove("audio");
     }
     doc.insert(
         "salvos".to_owned(),
-        serde_json::to_value(
-            state
-                .salvos
-                .list()?
-                .into_iter()
-                .map(|v| v.salvo)
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| {
+        serde_json::to_value(salvos).map_err(|e| {
             crate::error::ControlError::Repository(format!("serializing the salvos: {e}"))
         })?,
     );
     doc.insert(
         "tally_profiles".to_owned(),
-        serde_json::to_value(
-            state
-                .tally_profiles
-                .list()?
-                .into_iter()
-                .map(|v| v.profile)
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| {
+        serde_json::to_value(profiles).map_err(|e| {
             crate::error::ControlError::Repository(format!("serializing the tally profiles: {e}"))
         })?,
     );
     Ok(())
+}
+
+/// Whether this modeled run has published an authoritative accepted envelope —
+/// the same predicate [`crate::boot_model::accepted_audio`] and the other
+/// `accepted_*` helpers use to choose the envelope over the legacy store.
+/// `Ok(false)` is a store-only run or the pre-first-commit window, where the
+/// live store is still the fallback and a boot-authored section in
+/// `base_document` remains authoritative.
+fn has_accepted_envelope(state: &AppState) -> ControlResult<bool> {
+    let Some(model) = state.boot_model.as_ref() else {
+        return Ok(false);
+    };
+    Ok(model
+        .accepted()
+        .map_err(crate::error::ControlError::Repository)?
+        .is_some())
 }
 
 /// `GET /api/v1/config/watch-status` — the config-file watch status
@@ -540,6 +648,9 @@ pub struct BootModelBody {
     pub active_path: Option<String>,
     /// Unix milliseconds of the last successful `active.toml` write this run.
     pub active_written_at_ms: Option<i64>,
+    /// Health of the saved-layout projection of the accepted envelope.
+    #[serde(default)]
+    pub layout_projection: crate::layout_projection::LayoutProjectionStatus,
 }
 
 impl BootModelBody {
@@ -556,6 +667,7 @@ impl BootModelBody {
             boot_file_error: None,
             active_path: None,
             active_written_at_ms: None,
+            layout_projection: crate::layout_projection::LayoutProjectionStatus::default(),
         }
     }
 }
@@ -637,6 +749,12 @@ pub(crate) async fn boot_model_status(
         }
         Err(reason) => (None, Some(reason)),
     };
+    // A repository error can name any layout, so only a global principal reads
+    // it (BOLA). The flag itself discloses no object.
+    let mut layout_projection = state.layout_projection.status();
+    if !principal.is_global() {
+        layout_projection.last_error = None;
+    }
     Ok(Json(BootModelBody {
         modeled: true,
         boot_path: Some(model.boot_path().display().to_string()),
@@ -648,6 +766,7 @@ pub(crate) async fn boot_model_status(
         boot_file_error,
         active_path: Some(model.active_path().display().to_string()),
         active_written_at_ms: model.active_written_ms(),
+        layout_projection,
     }))
 }
 
@@ -727,6 +846,10 @@ pub struct RevertToStartBody {
         ),
     )
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "revert commits intent and reports shed engine commands atomically"
+)]
 pub(crate) async fn revert_to_start(
     State(state): State<AppState>,
     principal: Principal,
@@ -769,7 +892,7 @@ pub(crate) async fn revert_to_start(
     // promote must never commit a document a concurrent revert has already
     // replaced). Compose AFTER acquiring it.
     let _mutation = state.lock_config_mutation().await;
-    let (_document, running) = match compose_running_config(&state) {
+    let (_document, mut running) = match compose_running_config(&state) {
         Ok(composed) => composed,
         Err(refusal) => {
             // Nothing was applied: release the reservation so a corrected
@@ -778,7 +901,57 @@ pub(crate) async fn revert_to_start(
             return Err(refusal);
         }
     };
+    // The engine, not accepted intent, decides what a revert must still apply: a
+    // shed revert has already committed Loaded, yet its layout never landed.
+    (running.canvas, running.layout, running.cells) = model.adopted_layout();
     let diff = multiview_config::ConfigDiff::between(&running, model.loaded());
+    let before_outputs = match state.outputs.list() {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|entry| {
+                let resource = entry.resource;
+                (
+                    resource.id,
+                    crate::ResourceInput {
+                        name: resource.name,
+                        body: resource.body,
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            state.idempotency.release(idem.0.as_deref(), &op);
+            return Err(error);
+        }
+    };
+    // Revert changes accepted intent too, even when the live document already
+    // equals Loaded. Commit the full desired envelope before touching stores or
+    // the command bus; a failed commit must leave the reservation retryable.
+    let desired_commit = (|| {
+        let layouts = crate::boot_model::layout_library(&state)?;
+        let output_ids = crate::boot_model::output_ids_for_config(&state, model.loaded())?;
+        let selected = crate::boot_model::selected_layout_id(&state, model.loaded(), &layouts)?;
+        Ok::<_, ControlError>((layouts, output_ids, selected))
+    })();
+    let (layouts, output_ids, selected) = match desired_commit {
+        Ok(parts) => parts,
+        Err(error) => {
+            state.idempotency.release(idem.0.as_deref(), &op);
+            return Err(error);
+        }
+    };
+    if let Err(error) = crate::boot_model::commit_desired_document(
+        &state,
+        model.loaded().clone(),
+        layouts,
+        selected,
+        output_ids,
+    )
+    .await
+    {
+        state.idempotency.release(idem.0.as_deref(), &op);
+        return Err(error);
+    }
     if diff.is_empty() {
         // Running already equals Loaded. A previously shed revert's warning
         // clears too: any interim edits that re-converged the stores rode the
@@ -810,6 +983,7 @@ pub(crate) async fn revert_to_start(
     // lets a later completed revert clear exactly this instance.
     if outcome.shed > 0 {
         crate::config_watch::resync_all_stores(&state, &principal.key_id, &running);
+        crate::config_watch::restore_output_store(&state, &principal.key_id, &before_outputs);
         model.note_revert_incomplete();
         state
             .engine
@@ -980,7 +1154,11 @@ pub(crate) async fn promote_to_boot(
     // bank-token + write + confirm happen without a concurrent promote
     // interleaving the watcher's suppression token (C2).
     let _mutation = state.lock_config_mutation().await;
-    let (document, running) = compose_running_config(&state).map_err(release_and)?;
+    // Review R3-01: promote writes "what was accepted" to the boot file, so
+    // it composes from the accepted envelope, not the live store — a failed
+    // store projection write after a durable commit must never let promote
+    // persist a stale body the envelope (and GET) has already moved past.
+    let (document, running) = compose_accepted_running_config(&state).map_err(release_and)?;
     let toml = running
         .to_toml()
         .map_err(|e| release_and(ControlError::Repository(format!("TOML render failed: {e}"))))?;

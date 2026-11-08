@@ -37,6 +37,32 @@ describe('LayoutEditor', () => {
     expect(alert.textContent).toContain('at least one cell');
   });
 
+  it('explains the difference between saving and applying live', () => {
+    renderWithProviders(
+      <LayoutEditor
+        initial={namedLayout()}
+        sources={SOURCES}
+        overlays={[]}
+        onSave={vi.fn()}
+        onSaveAndApply={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/Save stores this layout for later use/)).toBeInTheDocument();
+    expect(screen.getByText(/Saved layouts are not separate live renderers/)).toBeInTheDocument();
+  });
+
+  it('warns when a bound source is no longer available', () => {
+    renderWithProviders(
+      <LayoutEditor
+        initial={namedLayout()}
+        sources={[]}
+        overlays={[]}
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('alert').textContent).toContain('Missing source: cam-1');
+  });
+
   it('enables Save for a valid layout and emits the serialized body', async () => {
     const user = userEvent.setup();
     const onSave = vi.fn<(p: LayoutSavePayload) => void>();
@@ -58,7 +84,7 @@ describe('LayoutEditor', () => {
     expect(payload?.body).toMatchObject({
       schema_version: 1,
       layout: { kind: 'absolute' },
-      canvas: { fps: '30/1' },
+      canvas: { fps: '30000/1001' }, // new layouts default to 29.97 (NTSC exact)
     });
     const cells = (payload?.body as { cells: unknown[] }).cells;
     expect(cells).toHaveLength(1);

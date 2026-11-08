@@ -198,6 +198,8 @@ pub struct DemuxOptions {
     /// [`Demuxer::open`]); the interrupt callback is still installed but stays
     /// disarmed, so behaviour matches a bare open.
     rw_timeout: Option<Duration>,
+    /// Extra libav open options, `(key, value)`, applied after `rw_timeout`.
+    extra: &'static [(&'static str, &'static str)],
 }
 
 impl DemuxOptions {
@@ -215,10 +217,24 @@ impl DemuxOptions {
         self
     }
 
+    /// Set extra libav open options (e.g. `seg_max_retry`), replacing any set
+    /// before.
+    #[must_use]
+    pub const fn with_options(mut self, extra: &'static [(&'static str, &'static str)]) -> Self {
+        self.extra = extra;
+        self
+    }
+
     /// The configured read/write timeout, if any.
     #[must_use]
     pub fn rw_timeout(&self) -> Option<Duration> {
         self.rw_timeout
+    }
+
+    /// The extra libav open options, in insertion order.
+    #[must_use]
+    pub const fn extra(&self) -> &'static [(&'static str, &'static str)] {
+        self.extra
     }
 }
 
@@ -303,7 +319,8 @@ impl Demuxer {
             deadline.arm(timeout);
         }
 
-        let input = open_input_with_interrupt(path, deadline.as_ref(), rw_timeout)?;
+        let input =
+            open_input_with_interrupt(path, deadline.as_ref(), rw_timeout, options.extra())?;
         deadline.disarm();
 
         let registration = register_format_context(&input);
@@ -326,6 +343,12 @@ impl Demuxer {
     #[must_use]
     pub fn format_ctx_ptr(&self) -> usize {
         format_context_addr(&self.input)
+    }
+
+    /// The opened path or URL.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     /// Snapshot every stream's parameters.
@@ -801,6 +824,7 @@ mod ffi_open {
         path: &std::path::Path,
         deadline: &ReadDeadline,
         rw_timeout: Option<Duration>,
+        extra: &[(&'static str, &'static str)],
     ) -> Result<ffmpeg::format::context::Input> {
         let source = path.display().to_string();
         let curl = CString::new(source.as_str())
@@ -838,6 +862,17 @@ mod ffi_open {
                     ffi::avformat_close_input(&raw mut ps_io);
                 }
                 return Err(open_err(&source, "av_dict_set(rw_timeout) failed"));
+            }
+        }
+
+        for (key, value) in extra {
+            if set_option(&mut opts, key, value).is_err() {
+                // SAFETY: as above, both are still owned here.
+                unsafe {
+                    ffi::av_dict_free(&raw mut opts);
+                    ffi::avformat_close_input(&raw mut ps_io);
+                }
+                return Err(open_err(&source, "av_dict_set(open option) failed"));
             }
         }
 
@@ -882,8 +917,17 @@ mod ffi_open {
         opts: &mut *mut ffi::AVDictionary,
         micros: u64,
     ) -> core::result::Result<(), ()> {
-        let to_key = CString::new("rw_timeout").map_err(|_| ())?;
-        let to_val = CString::new(micros.to_string()).map_err(|_| ())?;
+        set_option(opts, "rw_timeout", &micros.to_string())
+    }
+
+    /// Set one option in the caller's dict.
+    fn set_option(
+        opts: &mut *mut ffi::AVDictionary,
+        key: &str,
+        value: &str,
+    ) -> core::result::Result<(), ()> {
+        let to_key = CString::new(key).map_err(|_| ())?;
+        let to_val = CString::new(value).map_err(|_| ())?;
         // SAFETY: `opts` is the caller's dict slot (null or live); av_dict_set
         // allocates/links the entry. The caller frees the dict on every path.
         let r = unsafe { ffi::av_dict_set(opts, to_key.as_ptr(), to_val.as_ptr(), 0) };

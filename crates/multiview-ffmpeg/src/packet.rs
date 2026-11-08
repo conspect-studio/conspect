@@ -44,6 +44,9 @@ pub enum StreamKind {
     Video,
     /// The mixed program audio.
     Audio,
+    /// A discrete (pre-mix) audio track, by its 0-based index in the run's
+    /// declared track list (#152). Muxed as an extra audio PID.
+    AudioTrack(u16),
 }
 
 /// One encoded packet, movable across threads and copyable per consumer.
@@ -78,6 +81,13 @@ impl EncodedPacket {
             packet,
             kind: StreamKind::Audio,
         }
+    }
+
+    /// Wrap an encoded packet with an explicit stream `kind` (e.g. a discrete
+    /// [`StreamKind::AudioTrack`]).
+    #[must_use]
+    pub fn with_kind(packet: codec::packet::Packet, kind: StreamKind) -> Self {
+        Self { packet, kind }
     }
 
     /// Which elementary stream this packet belongs to (video or audio).
@@ -188,6 +198,8 @@ impl std::fmt::Debug for EncodedPacket {
 /// so it is safe to move across threads and outlives the encoder.
 pub struct StreamCodecParameters {
     parameters: codec::Parameters,
+    configured_bit_rate: Option<u64>,
+    video_dimensions: Option<(u32, u32)>,
 }
 
 impl StreamCodecParameters {
@@ -200,6 +212,8 @@ impl StreamCodecParameters {
     pub fn from_encoder(encoder: &crate::encode::VideoEncoder) -> Self {
         Self {
             parameters: encoder.codec_parameters(),
+            configured_bit_rate: encoder.configured_bit_rate(),
+            video_dimensions: Some(encoder.dimensions()),
         }
     }
 
@@ -208,6 +222,31 @@ impl StreamCodecParameters {
     pub fn from_audio_encoder(encoder: &crate::encode::AudioEncoder) -> Self {
         Self {
             parameters: encoder.codec_parameters(),
+            configured_bit_rate: encoder.configured_bit_rate(),
+            video_dimensions: None,
+        }
+    }
+
+    /// Configured encoder bitrate in bits per second, if specified.
+    #[must_use]
+    pub fn bit_rate(&self) -> Option<u64> {
+        self.configured_bit_rate
+    }
+
+    /// Configured video dimensions, if this is a video stream.
+    #[must_use]
+    pub fn video_dimensions(&self) -> Option<(u32, u32)> {
+        self.video_dimensions
+    }
+
+    /// RFC 6381 codec identifier only when the actual parameters identify it
+    /// without a profile guess. Unknown codecs omit the optional CODECS attribute.
+    #[must_use]
+    pub fn hls_codec(&self) -> Option<&'static str> {
+        match self.parameters.id() {
+            ffmpeg::codec::Id::MPEG2VIDEO => Some("mp2v"),
+            ffmpeg::codec::Id::AAC => Some("mp4a.40.2"),
+            _ => None,
         }
     }
 
@@ -223,6 +262,8 @@ impl Clone for StreamCodecParameters {
     fn clone(&self) -> Self {
         Self {
             parameters: self.parameters.clone(),
+            configured_bit_rate: self.configured_bit_rate,
+            video_dimensions: self.video_dimensions,
         }
     }
 }
@@ -232,6 +273,8 @@ impl std::fmt::Debug for StreamCodecParameters {
         f.debug_struct("StreamCodecParameters")
             .field("medium", &self.parameters.medium())
             .field("codec_id", &self.parameters.id())
+            .field("configured_bit_rate", &self.configured_bit_rate)
+            .field("video_dimensions", &self.video_dimensions)
             .finish()
     }
 }

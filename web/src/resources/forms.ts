@@ -357,8 +357,12 @@ export const CAPTION_MODES: readonly CaptionsMode[] = [
   'teletext_page',
   'track',
   'embedded_cc',
-  'sidecar',
 ];
+
+/** Keep a stored unsupported sidecar readable without offering new sidecars. */
+export function captionModesForValue(value: CaptionsMode): readonly CaptionsMode[] {
+  return value === 'sidecar' ? [...CAPTION_MODES, 'sidecar'] : CAPTION_MODES;
+}
 
 /** The wall-clock verb (schema `WallClockUse`), plus 'default' = omit. */
 export type WallClockChoice = 'default' | 'use' | 'discard';
@@ -819,7 +823,7 @@ export function sourceFormFromRecord(record: ResourceRecord): SourceFormState | 
   const captionsMode: CaptionsMode =
     captions === undefined
       ? 'none'
-      : (CAPTION_MODES.find((mode) => mode === asString(captions.mode)) ?? 'none');
+      : (captionModesForValue('sidecar').find((mode) => mode === asString(captions.mode)) ?? 'none');
 
   return {
     ...empty,

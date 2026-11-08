@@ -116,16 +116,18 @@ export async function postWhepOffer(
  * Never throws: failure is fine (the server-side idle GC is the authoritative
  * reaper, ADR-0048).
  */
-export function deleteWhepSession(sessionUrl: string, fetchImpl: typeof fetch = fetch): void {
+export function releaseWhepSession(sessionUrl: string, fetchImpl: typeof fetch = fetch): Promise<void> {
   try {
-    void fetchImpl(sessionUrl, {
+    return fetchImpl(sessionUrl, {
       method: 'DELETE',
       headers: bearerHeader(),
       keepalive: true,
-    }).catch(() => {
-      // Best-effort teardown; the idle GC reaps anything we miss.
-    });
+    }).then(() => undefined, () => undefined);
   } catch {
-    // Synchronous throw (e.g. a bad URL) is equally non-fatal.
+    return Promise.resolve();
   }
+}
+
+export function deleteWhepSession(sessionUrl: string, fetchImpl: typeof fetch = fetch): void {
+  void releaseWhepSession(sessionUrl, fetchImpl);
 }

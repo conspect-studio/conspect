@@ -30,7 +30,7 @@ use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use multiview_config::{ConfigDiff, MultiviewConfig, StartMode};
 use multiview_control::boot_model::{
-    finish_running_persist, load_resume_config, persist_loaded, persist_running_now,
+    finish_running_persist, load_desired, load_resume_config, persist_loaded, persist_running_now,
     spawn_running_persist, write_active_serialized, write_atomic, BootModel,
 };
 use multiview_control::config_watch::{
@@ -92,6 +92,24 @@ path = "/tmp/boot-config-model.m3u8"
 codec = "mpeg2video"
 segment_ms = 1000
 "##;
+
+/// An `[audio]` block appended to [`BOOT_DOC`]: one route over the `in_a`
+/// source (the boot-authored routing the base document carries). Used by the
+/// cleared-audio regression to give `base_document` a routing block the
+/// accepted envelope can later drop.
+const BOOT_AUDIO_SECTION: &str = r#"
+[audio]
+sample_rate_hz = 48000
+
+[[audio.routes]]
+input_id = "in_a"
+target_track = "in_a-clean"
+include_in_program_bus = true
+gain_db = -3.0
+
+[audio.routes.channels]
+kind = "stereo"
+"#;
 
 /// The whole rig: a temp config dir holding the boot file, the shared
 /// control-plane state (stores seeded from the boot doc + the boot model),
@@ -211,6 +229,316 @@ async fn recolor_in_a(r: &Rig, color: &str) {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK, "the live edit must land");
+}
+
+/// A refused atomic write preserves the old source version and the live bus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_desired_write_does_not_publish_source_or_command() {
+    let mut r = rig(BOOT_DOC);
+    let before = send(&r.router, get("/api/v1/sources/in_a", OPERATOR_TOKEN)).await;
+    let etag = support::etag(&before).expect("ETag");
+    let state_dir = r.boot_path.parent().expect("parent").join(".multiview");
+    std::fs::create_dir_all(&state_dir).expect("state dir");
+    std::fs::create_dir(state_dir.join("desired.json"))
+        .expect("block atomic rename with directory");
+    let response = send(
+        &r.router,
+        put_json(
+            "/api/v1/sources/in_a",
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &serde_json::json!({ "name": "in_a", "body": {
+            "id": "in_a", "kind": "solid", "color": "#919191" } }),
+        ),
+    )
+    .await;
+    assert!(
+        response.status().is_server_error(),
+        "a failed disk write is not acknowledged"
+    );
+    // The failed atomic write must not have replaced the obstruction: it is
+    // still a directory at this exact path. `canonicalize()` resolves the
+    // platform temp root's symlinks (e.g. macOS's `/var` -> `/private/var`),
+    // so comparing its canonicalized form against the un-canonicalized
+    // `desired_obstruction` is wrong on any such host — it previously failed
+    // CI on `macos-latest` for that reason, not because the obstruction had
+    // moved. `symlink_metadata` (no canonicalization) + `is_dir()` verifies
+    // the same "still a directory here" fact without that false mismatch.
+    let desired_obstruction = state_dir.join("desired.json");
+    assert!(
+        desired_obstruction
+            .symlink_metadata()
+            .expect("obstruction still exists")
+            .is_dir(),
+        "a failed atomic rename must not replace the obstruction"
+    );
+    std::fs::remove_dir(&desired_obstruction).expect("remove the test obstruction");
+    let after = send(&r.router, get("/api/v1/sources/in_a", OPERATOR_TOKEN)).await;
+    assert_eq!(support::etag(&after).as_deref(), Some(etag.as_str()));
+    assert_eq!(stored_color(&r.state).as_deref(), Some("#101418"));
+    assert!(
+        r.commands.try_drain().is_empty(),
+        "no live source command on write failure"
+    );
+}
+
+/// A prospective output cannot select an audio track absent from routing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_track_cross_reference_fails_before_etag_or_desired_commit() {
+    let r = rig(BOOT_DOC);
+    let prior = send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await;
+    let etag = support::etag(&prior).expect("ETag");
+    let mut original = body_json(prior).await;
+    original["body"]["audio"] = serde_json::json!({ "mode": "tracks", "tracks": ["ghost"] });
+    let response = send(
+        &r.router,
+        put_json(
+            "/api/v1/outputs/output-0",
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &serde_json::json!({ "name": "hls", "body": original["body"] }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let after = send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await;
+    assert_eq!(support::etag(&after).as_deref(), Some(etag.as_str()));
+    assert!(load_desired(&r.boot_path)
+        .expect("desired lookup")
+        .is_none());
+}
+
+/// Output identities chosen by the API remain stable through a file-watch edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_preserves_arbitrary_output_identity_and_revert_preserves_it() {
+    let r = rig(BOOT_DOC);
+    let mut body =
+        body_json(send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await).await
+            ["body"]
+            .clone();
+    body["path"] = serde_json::json!("/tmp/custom-config-model.m3u8");
+    let created = send(
+        &r.router,
+        support::post_json(
+            "/api/v1/outputs/custom-hls",
+            OPERATOR_TOKEN,
+            &serde_json::json!({"name":"hls","body":body}),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let original = send(&r.router, get("/api/v1/outputs/output-0", OPERATOR_TOKEN)).await;
+    let etag = support::etag(&original).expect("output ETag");
+    let delete = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/outputs/output-0")
+        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+        .header(header::IF_MATCH, etag)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        send(&r.router, delete).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        load_desired(&r.boot_path).unwrap().unwrap().output_ids,
+        ["custom-hls"]
+    );
+
+    let (options, mut poll) = WatchOptions::default().with_manual_poll();
+    let watch = spawn_watch(
+        r.boot_path.clone(),
+        r.config.clone(),
+        r.state.clone(),
+        options,
+    );
+    settle_initial(&mut poll, &r.state).await;
+    external_edit(
+        &r.boot_path,
+        &BOOT_DOC.replace(
+            "/tmp/boot-config-model.m3u8",
+            "/tmp/edited-config-model.m3u8",
+        ),
+    );
+    drive_polls(&mut poll, 2).await;
+    assert_eq!(r.state.outputs.list().unwrap()[0].resource.id, "custom-hls");
+    assert_eq!(
+        load_desired(&r.boot_path).unwrap().unwrap().output_ids,
+        ["custom-hls"]
+    );
+    let reverted = send(
+        &r.router,
+        post_idem("/api/v1/config/revert-to-start", OPERATOR_TOKEN, None),
+    )
+    .await;
+    assert_eq!(reverted.status(), StatusCode::ACCEPTED);
+    assert_eq!(r.state.outputs.list().unwrap()[0].resource.id, "custom-hls");
+    assert_eq!(
+        load_desired(&r.boot_path).unwrap().unwrap().output_ids,
+        ["custom-hls"]
+    );
+    watch.stop();
+}
+
+/// A saved layout edit without apply keeps the selected snapshot unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_layout_edit_without_apply_retains_selected_body() {
+    let r = rig(BOOT_DOC);
+    recolor_in_a(&r, "#909090").await;
+    let selected = r.state.working_layout_id.clone().expect("working layout");
+    let path = format!("/api/v1/layouts/{selected}");
+    let response = send(&r.router, get(&path, OPERATOR_TOKEN)).await;
+    let etag = support::etag(&response).expect("ETag");
+    let old = load_desired(&r.boot_path)
+        .expect("load")
+        .expect("committed");
+    let mut edited = old
+        .layouts
+        .iter()
+        .find(|layout| layout.id == selected)
+        .expect("saved layout")
+        .body
+        .clone();
+    edited["cells"][0]["source"]["input_id"] = serde_json::json!("in_b");
+    let response = send(
+        &r.router,
+        put_json(
+            &path,
+            OPERATOR_TOKEN,
+            Some(&etag),
+            &serde_json::json!({ "name": selected, "body": edited }),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored = load_desired(&r.boot_path)
+        .expect("load")
+        .expect("committed");
+    assert_eq!(restored.selected_body, old.selected_body);
+    assert_ne!(restored.layouts[0].body, restored.selected_body);
+}
+
+/// Layout reads and preconditions use the durable record even when the
+/// SQLite-like projection is missing or contains a different document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn layout_envelope_remains_authoritative_when_projection_drifts() {
+    let r = rig(BOOT_DOC);
+    recolor_in_a(&r, "#909090").await;
+    let selected = r.state.working_layout_id.clone().expect("working layout");
+    let path = format!("/api/v1/layouts/{selected}");
+    let before = send(&r.router, get(&path, OPERATOR_TOKEN)).await;
+    assert_eq!(before.status(), StatusCode::OK);
+    let initial_etag = support::etag(&before).expect("initial ETag");
+    let accepted = body_json(before).await;
+
+    r.state
+        .repository
+        .delete_layout(&selected)
+        .expect("drop projection row");
+    let missing_projection = send(&r.router, get(&path, OPERATOR_TOKEN)).await;
+    assert_eq!(missing_projection.status(), StatusCode::OK);
+    assert_eq!(
+        support::etag(&missing_projection),
+        Some(initial_etag.clone())
+    );
+    assert_eq!(body_json(missing_projection).await, accepted);
+
+    let renamed = serde_json::json!({ "name": "Saved edit", "body": accepted["body"] });
+    let updated = send(
+        &r.router,
+        put_json(&path, OPERATOR_TOKEN, Some(&initial_etag), &renamed),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let next_etag = support::etag(&updated).expect("new ETag");
+    assert_ne!(next_etag, initial_etag);
+    assert_eq!(
+        r.state
+            .repository
+            .get_layout(&selected)
+            .expect("projection repaired")
+            .layout
+            .name,
+        "Saved edit"
+    );
+
+    r.state
+        .repository
+        .update_layout(
+            &selected,
+            multiview_control::LayoutInput {
+                name: "projection only".into(),
+                body: serde_json::json!({"invalid": true}),
+            },
+        )
+        .expect("drift projection");
+    let observed = send(&r.router, get(&path, OPERATOR_TOKEN)).await;
+    assert_eq!(support::etag(&observed), Some(next_etag.clone()));
+    assert_eq!(body_json(observed).await["name"], "Saved edit");
+    let stale = send(
+        &r.router,
+        put_json(&path, OPERATOR_TOKEN, Some(&initial_etag), &renamed),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    let listed = send(&r.router, get("/api/v1/layouts", OPERATOR_TOKEN)).await;
+    assert_eq!(body_json(listed).await[0]["name"], "Saved edit");
+}
+
+/// A deleted layout does not reappear from a stale projection. A recreated
+/// identity cannot accept a pre-delete `ETag`, including across a new router.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn layout_delete_recreate_preserves_version_tombstone() {
+    let r = rig(BOOT_DOC);
+    recolor_in_a(&r, "#909090").await;
+    let path = "/api/v1/layouts/secondary";
+    let payload = serde_json::json!({"name": "Secondary", "body": {"canvas": {}, "cells": []}});
+    let created = send(
+        &r.router,
+        support::post_json(path, OPERATOR_TOKEN, &payload),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let old_etag = support::etag(&created).expect("created ETag");
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+        .header(header::IF_MATCH, &old_etag)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        send(&r.router, request).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    r.state
+        .repository
+        .create_layout(
+            "secondary",
+            multiview_control::LayoutInput {
+                name: "ghost projection".into(),
+                body: serde_json::json!({}),
+            },
+        )
+        .expect("add stale projection");
+    assert_eq!(
+        send(&r.router, get(path, OPERATOR_TOKEN)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let recreated = send(
+        &r.router,
+        support::post_json(path, OPERATOR_TOKEN, &payload),
+    )
+    .await;
+    assert_eq!(recreated.status(), StatusCode::CREATED);
+    let new_etag = support::etag(&recreated).expect("recreated ETag");
+    assert_ne!(old_etag, new_etag);
+    let stale = send(
+        &r.router,
+        put_json(path, OPERATOR_TOKEN, Some(&old_etag), &payload),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
 }
 
 /// The stored colour of `in_a` in the sources store.
@@ -444,6 +772,13 @@ async fn revert_after_a_file_watch_apply_returns_to_loaded() {
     );
     assert_eq!(stored_color(&r.state).as_deref(), Some("#f0f0f0"));
     let _ = r.commands.try_drain();
+    let watched_desired = load_desired(&r.boot_path)
+        .unwrap()
+        .expect("watcher committed intent");
+    assert_eq!(
+        serde_json::to_value(&watched_desired.config.sources[0]).unwrap()["color"],
+        "#f0f0f0"
+    );
 
     // Revert: Running goes back to the LOADED snapshot (#101418), even though
     // the boot file on disk now says #f0f0f0.
@@ -457,6 +792,14 @@ async fn revert_after_a_file_watch_apply_returns_to_loaded() {
         stored_color(&r.state).as_deref(),
         Some("#101418"),
         "revert must target Loaded, not the edited boot file"
+    );
+    let reverted_desired = load_desired(&r.boot_path)
+        .unwrap()
+        .expect("revert committed intent");
+    assert_eq!(
+        serde_json::to_value(&reverted_desired.config.sources[0]).unwrap()["color"],
+        "#101418",
+        "revert must commit Loaded, not leave the watcher edit in desired.json"
     );
     let drained = r.commands.try_drain();
     assert!(
@@ -545,6 +888,75 @@ async fn promote_writes_running_to_the_boot_file_and_versions_it() {
         loaded_divergence.contains(&serde_json::json!("sources")),
         "the Loaded snapshot still differs (promote does not move Loaded)"
     );
+}
+
+/// A watched ADR-W020 edit that DROPS `[audio]` clears the accepted envelope's
+/// routing. Export and promote compose "what was accepted" (review R3-01), so
+/// neither may resurrect the boot-authored `[audio]` block the inherited
+/// `base_document` still carries: a `None` accepted audio means the envelope
+/// cleared it, and the envelope — not the startup document — is authoritative
+/// for a versioned config section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cleared_audio_block_is_not_resurrected_by_export_or_promote() {
+    let doc = format!("{BOOT_DOC}{BOOT_AUDIO_SECTION}");
+    let r = rig(&doc);
+    // Guard the guard: the boot document really authors `[audio]` (so the
+    // base document carries a block that could be resurrected).
+    assert!(r.config.audio.is_some(), "the boot doc authors [audio]");
+
+    let (options, mut poll) = WatchOptions::default()
+        .with_poll_interval(TEST_POLL)
+        .with_manual_poll();
+    let watch = spawn_watch(
+        r.boot_path.clone(),
+        r.config.clone(),
+        r.state.clone(),
+        options,
+    );
+    settle_initial(&mut poll, &r.state).await;
+
+    // The operator saves the boot file WITHOUT `[audio]`: the watcher commits
+    // the reloaded document as accepted intent, so the envelope's audio is
+    // `None` while the live store deliberately keeps its last value until
+    // restart (`resync_audio`).
+    external_edit(&r.boot_path, BOOT_DOC);
+    drive_polls(&mut poll, 2).await;
+    assert_eq!(
+        r.state.config_watch.snapshot().applied_count,
+        1,
+        "dropping [audio] is a real external edit the watcher applies"
+    );
+
+    // Export composes from the accepted envelope: no `[audio]`, never the base
+    // document's boot-authored block.
+    let resp = send(&r.router, get("/api/v1/config/export", VIEWER_TOKEN)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = core::str::from_utf8(&body).unwrap();
+    let exported: MultiviewConfig = toml::from_str(text).expect("export parses");
+    assert!(
+        exported.audio.is_none(),
+        "export resurrected the cleared boot-authored [audio]:\n{text}"
+    );
+
+    // Promote writes the accepted envelope to the boot file: the cleared
+    // `[audio]` must not come back there either.
+    let resp = send(
+        &r.router,
+        post_idem("/api/v1/config/promote", OPERATOR_TOKEN, None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let promoted_text = std::fs::read_to_string(&r.boot_path).expect("read promoted boot file");
+    let promoted = MultiviewConfig::load_from_toml(&promoted_text).expect("promoted file parses");
+    assert!(
+        promoted.audio.is_none(),
+        "promote resurrected the cleared boot-authored [audio]:\n{promoted_text}"
+    );
+
+    watch.stop();
 }
 
 /// A replayed `Idempotency-Key` answers without rewriting the file or
@@ -931,7 +1343,7 @@ async fn the_running_persister_writes_active_toml_on_audited_changes() {
         .expect("read state dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "active.toml" && n != "loaded.toml")
+        .filter(|n| n != "active.toml" && n != "loaded.toml" && n != "desired.json")
         .collect();
     assert!(
         residue.is_empty(),
@@ -1004,7 +1416,7 @@ async fn finish_running_persist_captures_changes_younger_than_the_debounce() {
         .expect("read state dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "active.toml" && n != "loaded.toml")
+        .filter(|n| n != "active.toml" && n != "loaded.toml" && n != "desired.json")
         .collect();
     assert!(
         residue.is_empty(),
@@ -1187,6 +1599,12 @@ async fn the_persist_gate_clears_when_a_shed_edit_reverts_to_adopted() {
     // from the watcher poll), so it is awaited briefly.
     std::fs::write(&r.boot_path, BOOT_DOC.replace("#101418", "#7b7b7b")).expect("edit to B");
     drive_polls(&mut poll, 2).await;
+    assert_eq!(
+        serde_json::to_value(&load_desired(&r.boot_path).unwrap().unwrap().config.sources[0])
+            .unwrap()["color"],
+        "#7b7b7b",
+        "accepted file intent is durable even while its live command is shed"
+    );
     assert!(
         wait_until(SETTLE, || has_active_warning(
             &r.warnings,
@@ -1213,6 +1631,12 @@ async fn the_persist_gate_clears_when_a_shed_edit_reverts_to_adopted() {
     // `running_changed`, so the persister re-converges active.toml to A.
     std::fs::write(&r.boot_path, BOOT_DOC).expect("edit back to A");
     drive_polls(&mut poll, 2).await;
+    assert_eq!(
+        serde_json::to_value(&load_desired(&r.boot_path).unwrap().unwrap().config.sources[0])
+            .unwrap()["color"],
+        "#101418",
+        "abandoned shed intent must not survive after the file returns to A"
+    );
     assert!(
         wait_until(SETTLE, || {
             std::fs::read_to_string(&active_path)
@@ -2075,8 +2499,14 @@ async fn shed_delete_then_unrelated_landed_mutation_keeps_the_running_source() {
     let resp = send(&r.router, req).await;
     assert_eq!(
         resp.status(),
-        StatusCode::NO_CONTENT,
-        "the delete succeeds (store)"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a referenced source cannot be removed from the accepted configuration"
+    );
+    assert!(
+        load_desired(&r.boot_path)
+            .expect("desired lookup")
+            .is_none(),
+        "a rejected cross-reference cannot commit desired state"
     );
 
     // Drain the bus so the next, UNRELATED mutation lands live.
@@ -3467,4 +3897,51 @@ async fn a_file_watch_source_reorder_is_reported_restart_pending() {
         drained.is_empty(),
         "a source reorder submits NO engine command, got {drained:?}"
     );
+}
+
+/// A watcher resync moves a store version only for an item whose content
+/// changed, so every served tag is one the envelope holds: a restart at any
+/// point returns the same tags, and an unrelated edit cannot make a tag repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_resync_never_raises_a_version_the_envelope_lacks() {
+    let overlays = "\n[[overlays]]\nid = \"ov_edit\"\nkind = \"clock\"\ntarget = \"canvas\"\n\
+                    z = 0\n[[overlays]]\nid = \"ov_keep\"\nkind = \"clock\"\n\
+                    target = \"canvas\"\nz = 1\n";
+    let doc = format!("{BOOT_DOC}{overlays}");
+    let r = rig(&doc);
+    let layouts = multiview_control::boot_model::layout_library(&r.state).unwrap();
+    multiview_control::boot_model::commit_desired(&r.state, r.config.clone(), layouts)
+        .await
+        .unwrap();
+    let (options, mut poll) = WatchOptions::default()
+        .with_poll_interval(TEST_POLL)
+        .with_manual_poll();
+    let watch = spawn_watch(
+        r.boot_path.clone(),
+        r.config.clone(),
+        r.state.clone(),
+        options,
+    );
+    settle_initial(&mut poll, &r.state).await;
+    let edited = doc.replace(
+        "id = \"ov_edit\"\nkind = \"clock\"\ntarget = \"canvas\"\nz = 0",
+        "id = \"ov_edit\"\nkind = \"clock\"\ntarget = \"canvas\"\nz = 5",
+    );
+    assert_ne!(edited, doc);
+    external_edit(&r.boot_path, &edited);
+    drive_polls(&mut poll, 2).await;
+    assert_eq!(r.state.config_watch.snapshot().applied_count, 1);
+
+    let versions = |id: &str| r.state.overlays.get(id).unwrap().version.get();
+    assert_eq!(versions("ov_keep"), 1, "an unchanged item was rewritten");
+    assert_eq!(versions("ov_edit"), 2);
+    assert_eq!(r.state.sources.get("in_a").unwrap().version.get(), 1);
+    assert_eq!(r.state.outputs.list().unwrap()[0].version.get(), 1);
+
+    // The restart view: the envelope's counters equal every served store tag.
+    let desired = load_desired(&r.boot_path).unwrap().unwrap();
+    let counters = &desired.resource_versions["overlays"];
+    assert_eq!(counters["ov_keep"], versions("ov_keep"));
+    assert_eq!(counters["ov_edit"], versions("ov_edit"));
+    watch.stop();
 }

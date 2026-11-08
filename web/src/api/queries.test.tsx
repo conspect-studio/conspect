@@ -41,6 +41,13 @@ const server = setupServer(
     return HttpResponse.json(created, { status: 201, headers: { ETag: '"v1"' } });
   }),
 
+  // READ ONE — spec: GET /api/v1/layouts/{id} returns the current ETag
+  http.get(`${BASE}/api/v1/layouts/:id`, ({ params }) => {
+    const found = store.find((l) => l.id === String(params.id));
+    return found === undefined
+      ? HttpResponse.json({ title: 'not found', status: 404 }, { status: 404 })
+      : HttpResponse.json(found, { headers: { ETag: 'W/"7"' } });
+  }),
   // UPDATE — spec: PUT /api/v1/layouts/{id}
   http.put(`${BASE}/api/v1/layouts/:id`, async ({ request, params }) => {
     lastIfMatch = request.headers.get('If-Match');
@@ -145,6 +152,36 @@ describe('useSaveLayout', () => {
     await result.current.mutateAsync({ id: 'a', input: { name: 'Renamed', body: {} } });
     expect(lastIfMatch).toBe('"v1"');
     expect(readEtags(qc).a).toBe('"v2"');
+  });
+
+  it('updates an existing layout whose ETag is not cached (after a reload) using the server ETag', async () => {
+    // A fresh session: the layout exists on the server (listed) but this
+    // client never wrote it, so no ETag is cached. Save must UPDATE with the
+    // server's current ETag as If-Match — never POST (422 "already exists") and
+    // never PUT without If-Match (428).
+    const qc = newClient();
+    store = [{ id: 'b', name: 'Old', body: {} }];
+    qc.setQueryData(queryKeys.layouts, store);
+    const api = createApiClient({ baseUrl: BASE });
+    const { result } = renderHook(() => useSaveLayout({ api }), {
+      wrapper: wrapper(qc),
+    });
+    const saved = await result.current.mutateAsync({ id: 'b', input: { name: 'Renamed', body: {} } });
+    expect(saved.name).toBe('Renamed');
+    expect(lastIfMatch).toBe('W/"7"');
+    expect(readEtags(qc).b).toBe('"v2"');
+  });
+
+  it('still creates a brand-new id that the server does not know', async () => {
+    const qc = newClient();
+    qc.setQueryData(queryKeys.layouts, []);
+    const api = createApiClient({ baseUrl: BASE });
+    const { result } = renderHook(() => useSaveLayout({ api }), {
+      wrapper: wrapper(qc),
+    });
+    const saved = await result.current.mutateAsync({ id: 'fresh', input: { name: 'N', body: {} } });
+    expect(saved.id).toBe('fresh');
+    expect(readEtags(qc).fresh).toBe('"v1"');
   });
 
   it('rolls back the optimistic list when the server rejects the save', async () => {

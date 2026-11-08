@@ -134,6 +134,13 @@ fn staged_fixture() -> (tempfile::TempDir, tempfile::TempDir, MultiviewConfig) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one end-to-end CORS contract (reflected Origin, preflight, \
+              no-Origin pass-through, ranged CORS, sanitized mount, API \
+              isolation) over a single bound listener; splitting it would \
+              scatter the shared addr/config setup across helpers"
+)]
 async fn control_listener_serves_hls_outputs_with_cors() {
     let (_program_dir, _aux_dir, config) = staged_fixture();
     let publisher = Arc::new(EnginePublisher::<EngineStateSnapshot, Event>::new(64));
@@ -155,6 +162,7 @@ async fn control_listener_serves_hls_outputs_with_cors() {
         multiview_control::LiveApplyCaps::default(),
         multiview_control::LiveSourceCapability::synthetic_only(),
         None, // boot_model (ADR-W024)
+        None, // source_events
         async move {
             let _ = shutdown_rx.await;
         },

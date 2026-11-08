@@ -18,6 +18,8 @@ import { Button } from '../components/ui/button';
 import { whepAvailable } from './capabilities';
 import type { PreviewCapabilities, PreviewScope } from './capabilities';
 import { useJpegPreview } from './useJpegPreview';
+import { PreviewDiagnostics } from './PreviewDiagnostics';
+import type { PreviewDiagnostics as Diagnostics } from './diagnostics';
 import { WhepPlayer } from './WhepPlayer';
 import type { PeerConnectionFactory } from './pcFactory';
 
@@ -88,7 +90,11 @@ function JpegRung({
             </Button>
           ) : null}
         </div>
-      ) : null}
+      ) : (
+        <p data-testid="still-preview-label" className="px-3 py-2 text-xs text-muted-foreground">
+          <Trans>Still preview (~1 fps) — live video is unavailable for this preview.</Trans>
+        </p>
+      )}
     </div>
   );
 }
@@ -108,6 +114,8 @@ export function PreviewSurface({
   pcFactory,
   rtcConfig,
   fetchImpl,
+  onSessionReleased,
+  onLeaseState,
 }: {
   readonly scope: PreviewScope;
   /** The WHEP endpoint for this scope (e.g. `/api/v1/preview/program/whep`). */
@@ -122,16 +130,29 @@ export function PreviewSurface({
   readonly pcFactory?: PeerConnectionFactory | undefined;
   readonly rtcConfig?: RTCConfiguration | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
+  readonly onSessionReleased?: (() => void) | undefined;
+  readonly onLeaseState?: ((state: 'negotiating' | 'active' | 'released') => void) | undefined;
 }): JSX.Element {
   // A monotonically-increasing attempt id: bumping it remounts <WhepPlayer> for
   // a fresh negotiation (the "retry live preview" affordance). `degraded` flips
   // to JPEG-with-badge on a fatal error and clears on a retry.
   const [attempt, setAttempt] = useState(0);
   const [degraded, setDegraded] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<Diagnostics>();
+  const [busy, setBusy] = useState(false);
+  const [released, setReleased] = useState(true);
 
   const canWhep = whepAvailable(capabilities, scope);
 
   // No WebRTC for this scope/build: JPEG is the honest primary — NO badge.
+  // This applies to every scope, including `input`: a build with no WebRTC at
+  // all (the LGPL-clean/GPU-free default, `webrtc: false`) must still offer
+  // the always-available ~1 fps still preview, not an "unavailable" dead end
+  // (capabilities.ts's `whepAvailable` doc, and the module header above, both
+  // say this is the deployment's honest primary — not a degradation). Only
+  // the `degraded` branch below (a WHEP attempt that was actually made and
+  // failed/was busy) keeps the explicit "Live input preview failed" state for
+  // `input`, per the real WHEP-failure case this distinction exists for.
   if (!canWhep) {
     return <JpegRung jpegPath={jpegPath} label={label} degraded={false} className={className} />;
   }
@@ -139,17 +160,21 @@ export function PreviewSurface({
   // WHEP was attempted and failed: degrade to JPEG with the honest badge + a
   // retry that re-arms a fresh WHEP attempt.
   if (degraded) {
+    if (scope === 'input') {
+      return <div role="alert" className="px-3 py-2 text-sm" data-testid="input-preview-unavailable">{busy ? <Trans>Live input preview is busy. Another viewer has the session.</Trans> : <Trans>Live input preview failed.</Trans>}{released ? <Button type="button" onClick={(): void => { setBusy(false); setDegraded(false); setAttempt((n) => n + 1); }}>Retry live preview</Button> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</div>;
+    }
     return (
-      <JpegRung
+      <><JpegRung
         jpegPath={jpegPath}
         label={label}
         degraded
         className={className}
-        onRetry={(): void => {
+        {...(released ? { onRetry: (): void => {
+          setBusy(false);
           setDegraded(false);
           setAttempt((n) => n + 1);
-        }}
-      />
+        } } : {})}
+      />{busy ? <p role="alert"><Trans>Live preview is busy. Another viewer has the session.</Trans></p> : null}{diagnostics ? <PreviewDiagnostics diagnostics={diagnostics} /> : null}</>
     );
   }
 
@@ -163,7 +188,14 @@ export function PreviewSurface({
       {...(pcFactory !== undefined ? { pcFactory } : {})}
       {...(rtcConfig !== undefined ? { rtcConfig } : {})}
       {...(fetchImpl !== undefined ? { fetchImpl } : {})}
-      onFatal={(): void => {
+      onSessionReleased={onSessionReleased}
+      onLeaseState={(state): void => {
+        setReleased(state === 'released');
+        onLeaseState?.(state);
+      }}
+      onBusy={(): void => { setBusy(true); }}
+      onFatal={(details): void => {
+        setDiagnostics(details);
         setDegraded(true);
       }}
     />

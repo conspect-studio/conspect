@@ -264,6 +264,11 @@ pub struct NdiSystemConfig {
     pub accepted_at: Option<String>,
 }
 
+/// Maximum source registry cardinality (including runtime live admissions).
+/// Membership intent holds at most one entry per source and never sheds an edit
+/// or removal; source validation and API admission both enforce this bound.
+pub const MAX_ADMITTED_SOURCES: usize = 1024;
+
 /// A complete Multiview configuration document (config-as-code).
 ///
 /// This is the whole-engine declarative state: canvas, layout strategy,
@@ -498,6 +503,11 @@ impl MultiviewConfig {
         }
 
         self.validate_unique_ids()?;
+        if self.sources.len() > MAX_ADMITTED_SOURCES {
+            return Err(ConfigError::Validation(format!(
+                "sources exceeds the live source capacity of {MAX_ADMITTED_SOURCES}"
+            )));
+        }
         self.validate_sources()?;
         self.validate_cell_bindings()?;
         self.validate_outputs()?;

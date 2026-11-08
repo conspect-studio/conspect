@@ -51,6 +51,18 @@ pub const CAST_SAVE_SCOPED_TOKEN: &str = "cast-save-key.cast-save-secret-pqr";
 /// Used by the whole-system guard tests: a principal restricted on the discovery
 /// axis alone must still be denied whole-system artifacts.
 pub const DISCOVERY_SCOPED_TOKEN: &str = "disco-scoped-key.disco-scoped-secret-stu";
+/// An operator scoped to the object allowlist `["tile:2", "main-profile",
+/// "in-cell"]` for the tally per-object-authz BOLA tests (SEC-xx): it owns the
+/// tally target `tile:2` (the `target_key` form an override/mirror row is
+/// checked against), the profile id `main-profile`, and the cell `in-cell` an
+/// `index_cells` rule may reference — exercising all three object ids a tally
+/// request can carry.
+pub const TALLY_SCOPED_TOKEN: &str = "tally-scoped-key.tally-scoped-secret-yz1";
+/// An **admin**, scoped to the same allowlist as [`TALLY_SCOPED_TOKEN`], for
+/// `DELETE /tally/profiles/{id}` BOLA tests (that route requires
+/// [`Role::Administer`], which a plain `Operator` can never reach regardless
+/// of scope).
+pub const TALLY_SCOPED_ADMIN_TOKEN: &str = "tally-scoped-admin-key.tally-scoped-admin-secret-yz2";
 
 /// A fixed, deterministic acknowledgement timestamp used in tests.
 pub const ACK_NANOS: i64 = 1_700_000_000_000_000_000;
@@ -165,7 +177,49 @@ pub fn seeded_keys() -> ApiKeyStore {
             scoped_discovery_domains: Some(vec!["site-a".to_owned()]),
         },
     );
+    register_tally_scoped_keys(&mut keys);
     keys
+}
+
+/// Register the tally per-object-authz BOLA test keys (split out of
+/// [`seeded_keys`] to keep that function under the line-count lint).
+///
+/// Both keys share the object allowlist `["tile:2", "main-profile",
+/// "in-cell"]`: `tally-scoped-key` is a plain `Operator` (for
+/// read/write-gated routes), and `tally-scoped-admin-key` is an `Admin` scoped
+/// to the SAME allowlist (so `DELETE /tally/profiles/{id}`, which requires
+/// `Administer`, can prove the object-authz check rather than just the role
+/// gate a plain Operator would also fail on).
+fn register_tally_scoped_keys(keys: &mut ApiKeyStore) {
+    let allowlist = || {
+        vec![
+            "tile:2".to_owned(),
+            "main-profile".to_owned(),
+            "in-cell".to_owned(),
+        ]
+    };
+    keys.register(
+        "tally-scoped-key",
+        "tally-scoped-secret-yz1",
+        Principal {
+            key_id: "tally-scoped-key".to_owned(),
+            role: Role::Operator,
+            scoped_object_ids: Some(allowlist()),
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        },
+    );
+    keys.register(
+        "tally-scoped-admin-key",
+        "tally-scoped-admin-secret-yz2",
+        Principal {
+            key_id: "tally-scoped-admin-key".to_owned(),
+            role: Role::Admin,
+            scoped_object_ids: Some(allowlist()),
+            scoped_output_ids: None,
+            scoped_discovery_domains: None,
+        },
+    );
 }
 
 /// Build a fresh harness with a small command-bus capacity (so overflow is

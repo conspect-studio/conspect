@@ -362,6 +362,82 @@ segment_ms = 1000
     )
 }
 
+/// Decode all samples from program audio as mono `f32` at 48 kHz.
+fn output_audio_samples(path: &Path) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map", "a:0", "-f", "f32le", "-ac", "1", "-ar", "48000", "pipe:1",
+        ])
+        .output()
+        .expect("decode program audio samples");
+    assert!(
+        out.status.success(),
+        "ffmpeg failed to decode program audio"
+    );
+    out.stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// File output keeps most of a long file through decode bursts and EOF.
+#[tokio::test]
+async fn finite_file_audio_preserves_coverage_through_eof() {
+    if !ffmpeg_cli_available() {
+        eprintln!("ffmpeg CLI unavailable; skipping finite file continuity test");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clip = dir.path().join("four-seconds.ts");
+    build_av_fixture(&clip, 4.0);
+    let out_dir = dir.path().join("out");
+    let playlist = out_dir.join("index.m3u8");
+    let config = MultiviewConfig::load_from_toml(&file_source_config_text(&clip, &playlist))
+        .expect("parse config");
+    config.validate().expect("config validates");
+    let mut pipeline = Pipeline::build(&config).expect("build pipeline");
+    pipeline.enable_program_audio();
+    let report = pipeline
+        .run_for(100)
+        .await
+        .expect("four second file render");
+    assert_eq!(report.frames, 100);
+    assert!(!report.faltered);
+
+    let samples = output_audio_samples(&out_dir.join("program.ts"));
+    let expected = 4 * 48_000_usize;
+    let mut present = vec![false; expected];
+    for (i, sample) in samples.iter().take(expected).enumerate() {
+        present[i] = sample.abs() > 1e-5;
+    }
+    let covered = present.iter().filter(|&&v| v).count();
+    assert!(
+        covered >= expected * 98 / 100,
+        "coverage {covered}/{expected}"
+    );
+    let dominant_hz = output_audio_dominant_hz(&out_dir.join("program.ts"));
+    assert!(
+        (990.0..=1_010.0).contains(&dominant_hz),
+        "finite file tone frequency {dominant_hz} Hz"
+    );
+    let max_gap = present
+        .iter()
+        .fold((0usize, 0usize), |(longest, run), &heard| {
+            if heard {
+                (longest.max(run), 0)
+            } else {
+                (longest, run + 1)
+            }
+        })
+        .0;
+    assert!(
+        max_gap <= 1_920,
+        "largest internal silence gap is {max_gap} samples"
+    );
+}
+
 /// The load-bearing AUD-2 proof: a source whose container carries a real audio
 /// tone, decoded on its own thread into the per-source `AudioStore`, routed onto
 /// the program bus, mixed per tick, and AAC-encoded into the output — so the
@@ -539,5 +615,100 @@ async fn bars_source_program_audio_is_a_1khz_tone() {
     assert!(
         (hz - 1000.0).abs() < 120.0,
         "bars program audio dominant frequency {hz} Hz must be the ~1 kHz line-up tone"
+    );
+}
+
+/// #101 (AUD-8 / SW-14) end-to-end: a real pipeline run with program audio
+/// publishes bounded-rate `audio.meter` frames (program bus + per-input) onto the
+/// engine's event stream that the server's realtime hub subscribes to, while a
+/// subscriber that NEVER reads (stalled, tiny drop-oldest ring) cannot delay the
+/// output clock: the run still produces exactly N frames for N ticks and does not
+/// falter (inv #1 / #10).
+#[tokio::test]
+async fn audio_meter_frames_are_bounded_rate_and_a_stalled_subscriber_never_delays_ticks() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use multiview_engine::{EnginePublisher, TryRecvError};
+    use multiview_events::Event;
+
+    const TICKS: u64 = 50; // 2.0 s @ 25 fps.
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let playlist = dir.path().join("out").join("index.m3u8");
+    let config =
+        MultiviewConfig::load_from_toml(&bars_source_config_text(&playlist)).expect("parse config");
+    config.validate().expect("config validates");
+    let mut pipeline = Pipeline::build(&config).expect("build real pipeline");
+    pipeline.enable_program_audio();
+
+    // Tiny ring so the stalled subscriber is guaranteed to lag (drop-oldest).
+    let publisher: EnginePublisher<multiview_control::EngineStateSnapshot, Event> =
+        EnginePublisher::new(16);
+    let mut stalled = publisher.subscribe();
+    let mut live = publisher.subscribe();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_rx = Arc::clone(&done);
+    let drain = std::thread::spawn(move || {
+        let mut program = 0_u32;
+        let mut input = 0_u32;
+        let mut input_ids: Vec<String> = Vec::new();
+        loop {
+            match live.try_recv() {
+                Ok(ev) => {
+                    if let Event::AudioMeter(m) = &*ev.event {
+                        if m.track == 0 {
+                            program += 1;
+                        } else {
+                            input += 1;
+                            if let Some(id) = &m.input_id {
+                                if !input_ids.contains(id) {
+                                    input_ids.push(id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(_) => {
+                    if done_rx.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        (program, input, input_ids)
+    });
+
+    let report = pipeline
+        .run_for_publishing(TICKS, &publisher)
+        .await
+        .expect("bounded run");
+    done.store(true, Ordering::Release);
+    let (program, input, input_ids) = drain.join().expect("drain thread");
+
+    assert_eq!(
+        report.frames, TICKS,
+        "a stalled subscriber must not drop ticks"
+    );
+    assert!(
+        !report.faltered,
+        "a stalled subscriber must not falter output"
+    );
+    // ~30 Hz conflated over ~2 s => at most ~62; far fewer than a per-block flood.
+    assert!(
+        (15..=65).contains(&program),
+        "program-bus meter frames should be bounded (~<=30 Hz), got {program}"
+    );
+    assert!(input > 0, "per-input meter frames must be emitted");
+    assert_eq!(
+        input_ids,
+        vec!["in_a".to_owned()],
+        "per-input frames carry the source id"
+    );
+    assert!(
+        matches!(stalled.try_recv(), Err(TryRecvError::Lagged(_))),
+        "the stalled subscriber loses its own frames (drop-oldest)"
     );
 }

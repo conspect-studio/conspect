@@ -66,6 +66,8 @@ pub enum MediaType {
     Subtitles,
     /// `TYPE=CLOSED-CAPTIONS` — in-band CEA-608/708 (no separate `URI`).
     ClosedCaptions,
+    /// Vendor `TYPE=DATA` rendition (e.g. `scte_35` or `timed_id3`).
+    Data,
     /// A `TYPE` value this parser does not model.
     Other,
 }
@@ -81,6 +83,8 @@ impl MediaType {
             Self::Subtitles
         } else if value.eq_ignore_ascii_case("CLOSED-CAPTIONS") {
             Self::ClosedCaptions
+        } else if value.eq_ignore_ascii_case("DATA") {
+            Self::Data
         } else {
             Self::Other
         }
@@ -125,6 +129,26 @@ pub struct VariantStream {
     /// pick the variant nearest the displayed tile height
     /// (decode-at-display-resolution, invariant #6).
     pub resolution_height: Option<u32>,
+    /// `AUDIO="group"` — the audio rendition group this variant uses, if any.
+    pub audio_group: Option<String>,
+    /// `CODECS` — the declared codec list (e.g. `avc1.4d4028,mp4a.40.2`).
+    pub codecs: Option<String>,
+}
+
+impl VariantStream {
+    /// Whether the variant's `CODECS` declares an audio codec (AAC, AC-3,
+    /// E-AC-3, Opus, MP3, FLAC). `None` when no `CODECS` attribute is present
+    /// (unknown — the caller decides).
+    #[must_use]
+    pub fn declares_audio(&self) -> Option<bool> {
+        let codecs = self.codecs.as_deref()?;
+        Some(codecs.split(',').map(str::trim).any(|c| {
+            let c = c.to_ascii_lowercase();
+            ["mp4a", "ac-3", "ec-3", "opus", "mp3", "flac"]
+                .iter()
+                .any(|p| c.starts_with(p))
+        }))
+    }
 }
 
 /// A parsed HLS master playlist: its renditions and variant streams.
@@ -182,6 +206,8 @@ impl MasterPlaylist {
                     bandwidth: attr_value(attrs, "BANDWIDTH").and_then(|v| v.parse().ok()),
                     resolution_height: attr_value(attrs, "RESOLUTION")
                         .and_then(|v| parse_resolution_height(&v)),
+                    audio_group: attr_value(attrs, "AUDIO"),
+                    codecs: attr_value(attrs, "CODECS"),
                 });
             } else if line.starts_with('#') {
                 // Any other tag — ignore, but do not consume a pending variant.
@@ -191,6 +217,8 @@ impl MasterPlaylist {
                     subtitles_group: pending.subtitles_group,
                     bandwidth: pending.bandwidth,
                     resolution_height: pending.resolution_height,
+                    audio_group: pending.audio_group,
+                    codecs: pending.codecs,
                 });
             }
             // A bare URI with no pending STREAM-INF is ignored (not a variant).
@@ -259,6 +287,54 @@ impl MasterPlaylist {
             .or_else(|| self.variants.first())
     }
 
+    /// Pick the ONE media playlist URI an **audio-only** decode should open.
+    ///
+    /// Opening a master hands libav every variant: it then downloads every
+    /// variant's segments (an N-rung ABR ladder fetches N× the data per segment),
+    /// and on a slow or ad-inserting origin that serial fetch outruns the segment
+    /// duration — the audio decode starves and the source cuts in and out. One
+    /// media playlist fetches one segment per segment.
+    ///
+    /// * A variant that references an `AUDIO="group"` with a matching
+    ///   `TYPE=AUDIO` rendition carrying a `URI` → that rendition's URI (the
+    ///   `DEFAULT=YES` one if several) — audio lives in its own playlist.
+    /// * Otherwise the **highest-`BANDWIDTH`** variant whose `CODECS` declares an
+    ///   audio codec (or declares no `CODECS` at all — unknown is kept), so
+    ///   a video-only rung is never picked.
+    /// * `None` when the playlist has no variants (already a media playlist) or no
+    ///   variant can carry audio — the caller then opens the URL unchanged.
+    #[must_use]
+    pub fn pick_audio_uri(&self) -> Option<&str> {
+        let grouped = self
+            .variants
+            .iter()
+            .filter_map(|v| v.audio_group.as_deref());
+        let mut rendition: Option<&MediaRendition> = None;
+        for group in grouped {
+            for r in self.renditions.iter().filter(|r| {
+                r.media_type == MediaType::Audio && r.group_id == group && r.uri.is_some()
+            }) {
+                if rendition.is_none() || (r.default && !rendition.is_some_and(|c| c.default)) {
+                    rendition = Some(r);
+                }
+            }
+        }
+        if let Some(uri) = rendition.and_then(|r| r.uri.as_deref()) {
+            return Some(uri);
+        }
+        let mut best: Option<&VariantStream> = None;
+        for v in self
+            .variants
+            .iter()
+            .filter(|v| v.declares_audio() != Some(false))
+        {
+            if best.is_none_or(|b| v.bandwidth.unwrap_or(0) > b.bandwidth.unwrap_or(0)) {
+                best = Some(v);
+            }
+        }
+        best.map(|v| v.uri.as_str())
+    }
+
     /// Iterate the `TYPE=SUBTITLES` renditions.
     pub fn subtitle_renditions(&self) -> impl Iterator<Item = &MediaRendition> {
         self.renditions
@@ -325,7 +401,10 @@ impl MasterPlaylist {
                 MediaType::Subtitles => StreamKind::Subtitle,
                 // VIDEO renditions are the libav-decoded variant; CLOSED-CAPTIONS
                 // and any other type are not separate routable renditions here.
-                MediaType::Video | MediaType::ClosedCaptions | MediaType::Other => continue,
+                MediaType::Video
+                | MediaType::ClosedCaptions
+                | MediaType::Data
+                | MediaType::Other => continue,
             };
             let key = (rendition.media_type, rendition.group_id.clone());
             let ordinal = ordinals.entry(key).or_insert(0);
@@ -404,6 +483,10 @@ struct PendingVariant {
     bandwidth: Option<u64>,
     /// The `h` of `RESOLUTION=wxh`, if declared.
     resolution_height: Option<u32>,
+    /// `AUDIO="group"`, if declared.
+    audio_group: Option<String>,
+    /// `CODECS`, if declared.
+    codecs: Option<String>,
 }
 
 /// Parse the vertical resolution (the `h`) from a `RESOLUTION=wxh` attribute value
@@ -483,6 +566,274 @@ fn split_kv(attr: &str) -> Option<(&str, &str)> {
         .and_then(|inner| inner.strip_suffix('"'))
         .unwrap_or(value);
     Some((key.trim(), unquoted))
+}
+
+/// Maximum accepted cue tag size, checked before attribute allocation.
+const MAX_CUE_TAG_BYTES: usize = 16_384;
+const MAX_CUE_ATTRIBUTES: usize = 64;
+const MAX_CUE_OBSERVATIONS: usize = 1024;
+
+/// A vendor DATA declaration, preserving unknown extension attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataRendition {
+    /// Quote-stripped attribute pairs in declaration order.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// Playlist location only: proximity to this segment does not prove an ad boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueSegmentContext {
+    /// Zero-based segment index in this snapshot.
+    pub segment_index: usize,
+    /// Absolute media sequence, or unknown after malformed/overflowing context.
+    pub media_sequence: Option<u64>,
+    /// Discontinuity sequence, or unknown after malformed/overflowing context.
+    pub discontinuity_sequence: Option<u64>,
+}
+
+/// Transport evidence, deliberately not normalized into splice start/end events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CueMetadata {
+    /// DATERANGE carrying at least one SCTE35 attribute; all attributes retained.
+    /// Hex syntax is checked, but SCTE section CRC/semantics are not decoded here.
+    DateRange {
+        /// Quote-stripped attribute pairs, including ID, dates and duration hints.
+        attributes: Vec<(String, String)>,
+    },
+    /// Asset identity is not break identity, nor proof that the next segment is an ad.
+    Asset {
+        /// Original quote-stripped CAID, without hex normalization.
+        raw_caid: String,
+        /// Hex decoded only when every byte is printable ASCII (or safe plain text).
+        decoded_label: Option<String>,
+    },
+}
+
+/// One observation in document order. Unbound trailing tags remain available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistCueObservation {
+    /// The raw transport evidence.
+    pub metadata: CueMetadata,
+    /// Next segment's context, if a segment actually follows the tag.
+    pub segment: Option<CueSegmentContext>,
+}
+
+/// Bounded metadata snapshot. Marker absence/expiry NEVER implies break end.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlaylistCueMetadata {
+    /// Up to 1024 observations in document order; no CAID-based deduplication.
+    pub observations: Vec<PlaylistCueObservation>,
+    /// Malformed or over-size cue tags rejected before interpretation.
+    pub rejected: usize,
+    /// Valid observations omitted after the snapshot budget was exhausted.
+    pub dropped: usize,
+}
+
+// Strict metadata parsing is separate from the legacy tolerant rendition parser.
+fn cue_attributes(list: &str) -> Option<Vec<(String, String)>> {
+    if list.len() > MAX_CUE_TAG_BYTES || list.contains(['\r', '\n']) {
+        return None;
+    }
+    let mut attrs = Vec::new();
+    let mut quoted = false;
+    let mut start = 0;
+    for (i, c) in list
+        .char_indices()
+        .chain(std::iter::once((list.len(), ',')))
+    {
+        if c == '"' {
+            quoted = !quoted;
+        } else if c == ',' && !quoted {
+            if attrs.len() == MAX_CUE_ATTRIBUTES {
+                return None;
+            }
+            let (key, raw) = list.get(start..i)?.trim().split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return None;
+            }
+            let raw = raw.trim();
+            let value = if raw.starts_with('"') {
+                raw.strip_prefix('"')?.strip_suffix('"')?
+            } else {
+                raw
+            };
+            if value.is_empty()
+                || value.contains('"')
+                || value.chars().any(char::is_control)
+                || attrs
+                    .iter()
+                    .any(|(k, _): &(String, String)| k.eq_ignore_ascii_case(key))
+            {
+                return None;
+            }
+            attrs.push((key.to_owned(), value.to_owned()));
+            start = i.saturating_add(1);
+        }
+    }
+    if quoted {
+        None
+    } else {
+        Some(attrs)
+    }
+}
+
+fn cue_attr<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.as_str())
+}
+
+fn cue_hex(value: &str) -> Option<&str> {
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
+    if hex.is_empty() || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        None
+    } else {
+        Some(hex)
+    }
+}
+
+fn asset_label(raw: &str) -> Option<String> {
+    if raw.starts_with("0x") || raw.starts_with("0X") {
+        let hex = cue_hex(raw)?;
+        let mut decoded = String::new();
+        for pair in hex.as_bytes().chunks_exact(2) {
+            let [high, low] = pair else { return None };
+            let high = char::from(*high).to_digit(16)?;
+            let low = char::from(*low).to_digit(16)?;
+            let byte = u8::try_from(high * 16 + low).ok()?;
+            if !(0x20..=0x7e).contains(&byte) {
+                return None;
+            }
+            decoded.push(char::from(byte));
+        }
+        Some(decoded)
+    } else if raw.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        Some(raw.to_owned())
+    } else {
+        None
+    }
+}
+
+fn cue_lines(text: &str) -> Result<impl Iterator<Item = &str>, HlsError> {
+    // Count even leading blank lines (unlike legacy parsers).
+    if text.lines().take(MAX_LINES + 1).count() > MAX_LINES {
+        return Err(HlsError::TooLarge(MAX_LINES));
+    }
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    if lines.next() != Some("#EXTM3U") {
+        return Err(HlsError::NotAPlaylist);
+    }
+    Ok(lines)
+}
+
+impl MasterPlaylist {
+    /// Preserve bounded vendor DATA declarations without changing existing structs.
+    /// Invalid declarations are skipped; at most 1024 declarations are returned.
+    ///
+    /// # Errors
+    /// Returns an error for a missing EXTM3U header or excessive line count.
+    pub fn parse_data_renditions(text: &str) -> Result<Vec<DataRendition>, HlsError> {
+        let mut data = Vec::new();
+        for line in cue_lines(text)? {
+            if let Some(attrs) = line.strip_prefix("#EXT-X-MEDIA:").and_then(cue_attributes) {
+                if cue_attr(&attrs, "TYPE").is_some_and(|v| v.eq_ignore_ascii_case("DATA")) {
+                    data.push(DataRendition { attributes: attrs });
+                    if data.len() == MAX_CUE_OBSERVATIONS {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(data)
+    }
+}
+
+impl MediaPlaylist {
+    /// Extract bounded cue evidence independently of PDT validation and runtime I/O.
+    /// DATERANGE location is proximity only: START-DATE/SCTE timing takes precedence
+    /// in any future timing adapter. No lifecycle or expiry is inferred here.
+    ///
+    /// # Errors
+    /// Returns an error for a missing EXTM3U header or excessive line count.
+    pub fn parse_cue_metadata(text: &str) -> Result<PlaylistCueMetadata, HlsError> {
+        let mut result = PlaylistCueMetadata::default();
+        let mut media_sequence = Some(0u64);
+        let mut discontinuity_sequence = Some(0u64);
+        let mut segment_index = 0usize;
+        let mut pending_from = 0usize;
+        for line in cue_lines(text)? {
+            let cue = if let Some(attrs) = line.strip_prefix("#EXT-X-DATERANGE:") {
+                Some((attrs, true))
+            } else {
+                line.strip_prefix("#EXT-X-ASSET:")
+                    .map(|attrs| (attrs, false))
+            };
+            if let Some((raw, daterange)) = cue {
+                let Some(attrs) = cue_attributes(raw) else {
+                    result.rejected += 1;
+                    continue;
+                };
+                let metadata = if daterange {
+                    let scte: Vec<_> = attrs
+                        .iter()
+                        .filter(|(k, _)| {
+                            ["SCTE35-CMD", "SCTE35-OUT", "SCTE35-IN"]
+                                .iter()
+                                .any(|key| k.eq_ignore_ascii_case(key))
+                        })
+                        .collect();
+                    if scte.is_empty() {
+                        continue;
+                    }
+                    if cue_attr(&attrs, "ID").is_none()
+                        || scte.iter().any(|(_, v)| cue_hex(v).is_none())
+                    {
+                        result.rejected += 1;
+                        continue;
+                    }
+                    CueMetadata::DateRange { attributes: attrs }
+                } else {
+                    let Some(caid) = cue_attr(&attrs, "CAID") else {
+                        continue;
+                    };
+                    CueMetadata::Asset {
+                        raw_caid: caid.to_owned(),
+                        decoded_label: asset_label(caid),
+                    }
+                };
+                if result.observations.len() < MAX_CUE_OBSERVATIONS {
+                    result.observations.push(PlaylistCueObservation {
+                        metadata,
+                        segment: None,
+                    });
+                } else {
+                    result.dropped += 1;
+                }
+            } else if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                media_sequence = value.trim().parse().ok();
+            } else if let Some(value) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+                discontinuity_sequence = value.trim().parse().ok();
+            } else if line == "#EXT-X-DISCONTINUITY" {
+                discontinuity_sequence = discontinuity_sequence.and_then(|n| n.checked_add(1));
+            } else if !line.starts_with('#') {
+                for observation in result.observations.iter_mut().skip(pending_from) {
+                    observation.segment = Some(CueSegmentContext {
+                        segment_index,
+                        media_sequence,
+                        discontinuity_sequence,
+                    });
+                }
+                pending_from = result.observations.len();
+                segment_index += 1;
+                media_sequence = media_sequence.and_then(|n| n.checked_add(1));
+            }
+        }
+        Ok(result)
+    }
 }
 
 // ───────────────────────── media playlist + PROGRAM-DATE-TIME ─────────────────
@@ -934,6 +1285,67 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// cnn-na (MediaTailor): four muxed A/V rungs. An audio decode must open ONE
+    /// of them (the best audio), never the master (which fetches all four).
+    #[test]
+    fn audio_pick_takes_one_muxed_variant_not_the_whole_ladder() {
+        let m = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=1020588,RESOLUTION=640x360\n",
+            "a/0.m3u8\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=4715744,RESOLUTION=1920x1080\n",
+            "a/3.m3u8\n",
+            "#EXT-X-STREAM-INF:CODECS=\"avc1.4d4028,mp4a.40.2\",BANDWIDTH=2657019,RESOLUTION=1280x720\n",
+            "a/2.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(m.pick_audio_uri(), Some("a/3.m3u8"));
+    }
+
+    /// A video-only rung (cnn-usa's `tracks-v1`) is never the audio pick.
+    #[test]
+    fn audio_pick_skips_a_video_only_variant() {
+        let m = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS=\"hvc1.2.2.L120.90\"\n",
+            "tracks-v1/mono.m3u8\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1390000,CODECS=\"hvc1.2.2.L120.90,mp4a.40.2\"\n",
+            "tracks-v1a1/mono.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(m.pick_audio_uri(), Some("tracks-v1a1/mono.m3u8"));
+        let video_only = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=9000000,CODECS=\"avc1.640028\"\n",
+            "v.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(video_only.pick_audio_uri(), None);
+    }
+
+    /// Audio in a separate `EXT-X-MEDIA` rendition: open that rendition (the
+    /// DEFAULT one), not a (video) variant.
+    #[test]
+    fn audio_pick_prefers_the_default_audio_rendition() {
+        let m = MasterPlaylist::parse(concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"es\",URI=\"tracks-a2/mono.m3u8\"\n",
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"tracks-a1/mono.m3u8\"\n",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1390000,CODECS=\"hvc1.2.2.L120.90,mp4a.40.2\",AUDIO=\"aud\"\n",
+            "tracks-v1/mono.m3u8\n",
+        ))
+        .unwrap();
+        assert_eq!(m.pick_audio_uri(), Some("tracks-a1/mono.m3u8"));
+    }
+
+    /// A media playlist (no variants) has nothing to pin.
+    #[test]
+    fn audio_pick_on_a_media_playlist_is_none() {
+        let m = MasterPlaylist::parse("#EXTM3U\n#EXTINF:6.0,\nseg1.ts\n").unwrap();
+        assert_eq!(m.pick_audio_uri(), None);
+    }
+
     use super::*;
 
     /// A representative Apple-style master playlist with audio + a subtitles

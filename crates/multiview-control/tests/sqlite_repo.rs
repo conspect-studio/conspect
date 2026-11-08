@@ -125,3 +125,33 @@ async fn sqlite_alarm_store_upserts_acks_and_filters_with_versioning() {
     let ids: Vec<&str> = majors.iter().map(|v| v.record.id.as_str()).collect();
     assert_eq!(ids, vec!["a"], "only the Critical alarm 'a' is >= Major");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_layouts_survive_reopening_the_same_file() {
+    // A process restart reopens the same database file: a layout saved before
+    // must be listed after (the operator lost every layout on restart, #176).
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("layouts.db").display()
+    );
+    {
+        let repo = SqliteRepository::connect(&url).await.unwrap();
+        repo.create_layout(
+            "news",
+            LayoutInput {
+                name: "NewsOne".to_owned(),
+                body: serde_json::json!({ "schema_version": 1 }),
+            },
+        )
+        .unwrap();
+    }
+    let reopened = SqliteRepository::connect(&url).await.unwrap();
+    let names: Vec<String> = reopened
+        .list_layouts()
+        .unwrap()
+        .into_iter()
+        .map(|l| l.layout.name)
+        .collect();
+    assert_eq!(names, vec!["NewsOne".to_owned()]);
+}

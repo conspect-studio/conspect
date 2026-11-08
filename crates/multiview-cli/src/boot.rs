@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use multiview_config::{MultiviewConfig, StartMode};
-use multiview_control::boot_model::{load_resume_config, BootModel};
+use multiview_control::boot_model::{load_desired, load_resume_config, BootModel};
 
 /// The resolved starting state of a run: the document the engine is built
 /// from (**Running**), the immutable boot snapshot (**Loaded**), and what the
@@ -46,6 +46,8 @@ pub struct StartConfig {
     pub resumed: bool,
     /// Why a `start = "resume"` run fell back to boot, if it did.
     pub resume_fallback: Option<String>,
+    /// Accepted layout library and selected identity from the atomic record.
+    pub desired: Option<multiview_control::boot_model::DesiredState>,
 }
 
 impl StartConfig {
@@ -116,27 +118,50 @@ fn splice_storeless_sections(
 /// `tracing::warn!` and the reason recorded in
 /// [`StartConfig::resume_fallback`]. The default `boot` policy never reads
 /// `active.toml`.
-#[must_use]
+/// # Errors
+/// A corrupt accepted record or incompatible boot splice prevents startup.
 pub fn resolve_start_config(
     boot: MultiviewConfig,
     boot_text: String,
     boot_path: &Path,
-) -> StartConfig {
+) -> Result<StartConfig, String> {
+    // Accepted intent outranks the observational active snapshot, including
+    // when the boot file selected its normal boot policy.
+    match load_desired(boot_path) {
+        Ok(Some(desired)) => {
+            let running = splice_storeless_sections(desired.config.clone(), &boot);
+            running
+                .validate()
+                .map_err(|error| format!("accepted desired state cannot be resumed: {error}"))?;
+            return Ok(StartConfig {
+                running,
+                loaded: boot,
+                boot_text,
+                start: StartMode::Resume,
+                resumed: true,
+                resume_fallback: None,
+                desired: Some(desired),
+            });
+        }
+        Ok(None) => {}
+        Err(error) => return Err(format!("accepted desired state cannot be read: {error}")),
+    }
     let start = boot
         .control
         .as_ref()
         .map_or(StartMode::Boot, |control| control.start);
     if start != StartMode::Resume {
-        return StartConfig {
+        return Ok(StartConfig {
             running: boot.clone(),
             loaded: boot,
             boot_text,
             start,
             resumed: false,
             resume_fallback: None,
-        };
+            desired: None,
+        });
     }
-    match load_resume_config(boot_path) {
+    Ok(match load_resume_config(boot_path) {
         Ok(active) => {
             let running = splice_storeless_sections(active, &boot);
             match running.validate() {
@@ -155,6 +180,7 @@ pub fn resolve_start_config(
                         start,
                         resumed: true,
                         resume_fallback: None,
+                        desired: None,
                     }
                 }
                 Err(error) => {
@@ -175,6 +201,7 @@ pub fn resolve_start_config(
                         start,
                         resumed: false,
                         resume_fallback: Some(reason),
+                        desired: None,
                     }
                 }
             }
@@ -193,7 +220,8 @@ pub fn resolve_start_config(
                 start,
                 resumed: false,
                 resume_fallback: Some(reason),
+                desired: None,
             }
         }
-    }
+    })
 }

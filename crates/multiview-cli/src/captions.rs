@@ -50,6 +50,16 @@ use multiview_input::hls::MasterPlaylist;
 /// [`CaptionCue`] model. The reader thread writes it; the overlay baker samples it.
 pub type CueStore = CaptionCueStore<CaptionCue>;
 
+/// Atomic source-bound cue-store registry, updated outside the output clock.
+pub type LiveCaptionStores =
+    Arc<multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, Arc<CueStore>>>>>;
+/// Selected video picture cursor for an isolated rendition reader.
+pub type DisplayCursor =
+    Arc<multiview_framestore::SwapCell<Option<Arc<multiview_framestore::tile::SourceFrameTime>>>>;
+/// Atomic cursor registry, modified only on a source change.
+pub type DisplayCursors =
+    Arc<multiview_framestore::SwapCell<Arc<std::collections::HashMap<String, DisplayCursor>>>>;
+
 /// RT-10b: a [`multiview_overlay::CueSource`] adapter over a per-source
 /// [`CueStore`], exposing its **text** cues as the routable subtitle unit a
 /// [`SubtitleLayer`](multiview_overlay::SubtitleLayer) samples and can be
@@ -177,9 +187,13 @@ impl SubtitleRouteHandle {
 /// [`SubtitleRouteHandle`], drained at the start of each [`sample`](Self::sample).
 #[cfg(feature = "overlay")]
 pub struct SubtitleRouter {
+    /// Live source map published off-clock by the source spawner.
+    registry: LiveCaptionStores,
     /// One re-pointable subtitle layer per source-bound caption store, keyed by the
     /// source id it renders into (the tile target). Sampled (`&mut`) each tick.
     layers: std::collections::HashMap<String, multiview_overlay::SubtitleLayer>,
+    /// Current cue source of each tile; breakaway may differ from its video source.
+    routes: std::collections::HashMap<String, String>,
     /// The per-source cue stores, so a re-point can resolve a target source id to
     /// its [`CueSource`]. Shared by `Arc` with the readers; a lock-free read only.
     stores: std::collections::HashMap<String, Arc<CueStore>>,
@@ -205,11 +219,22 @@ impl SubtitleRouter {
                 (id.clone(), multiview_overlay::SubtitleLayer::new(source))
             })
             .collect();
+        let routes = stores.keys().map(|id| (id.clone(), id.clone())).collect();
+        let registry = Arc::new(multiview_framestore::SwapCell::from_pointee(stores.clone()));
         Self {
+            registry,
             layers,
+            routes,
             stores,
             pending: Arc::new(multiview_framestore::SwapCell::from_pointee(Vec::new())),
         }
+    }
+
+    /// Share the live source registry with an off-clock source spawner.
+    #[must_use]
+    pub fn with_registry(mut self, registry: LiveCaptionStores) -> Self {
+        self.registry = registry;
+        self
     }
 
     /// A wait-free, `Arc`-shareable handle to request re-points into this router
@@ -236,17 +261,71 @@ impl SubtitleRouter {
     /// unchanged. Called once per output tick on the bake consumer (off the hot
     /// loop): a non-blocking RCU drain + lock-free `active_at` reads.
     pub fn sample(&mut self, now: MediaTime) -> std::collections::HashMap<String, Vec<String>> {
+        let times = self
+            .stores
+            .iter()
+            .map(|(id, store)| {
+                (
+                    id.clone(),
+                    multiview_framestore::tile::SourceFrameTime {
+                        pts: now,
+                        generation: store.generation(),
+                        event_clock: None,
+                    },
+                )
+            })
+            .collect();
+        self.sample_selected(&times)
+    }
+
+    /// Sample cue windows at the media time of each actually displayed picture.
+    /// Missing or mismatched frame metadata hides captions rather than drifting.
+    pub fn sample_selected(
+        &mut self,
+        times: &std::collections::HashMap<String, multiview_framestore::tile::SourceFrameTime>,
+    ) -> std::collections::HashMap<String, Vec<String>> {
         // Sample-boundary apply: take the pending re-points (publish an empty vec in
         // their place) and apply each. Re-pointing is `&self` on the layer, so this
         // is sound while we hold `&mut self`. Empty (the common case) is a cheap
         // pointer load + `is_empty` check — no allocation, no work.
+        let latest = self.registry.load();
+        for (id, store) in latest.iter() {
+            let replaced = self
+                .stores
+                .get(id)
+                .is_none_or(|old| !Arc::ptr_eq(old, store));
+            if replaced {
+                self.stores.insert(id.clone(), Arc::clone(store));
+                let source: Arc<dyn multiview_overlay::CueSource> =
+                    Arc::new(CueStoreSource::new(Arc::clone(store)));
+                self.layers
+                    .insert(id.clone(), multiview_overlay::SubtitleLayer::new(source));
+                self.routes.insert(id.clone(), id.clone());
+            }
+        }
+        self.layers.retain(|id, _| latest.contains_key(id));
+        self.stores.retain(|id, _| latest.contains_key(id));
+        self.routes
+            .retain(|id, source| latest.contains_key(id) && latest.contains_key(source));
         let pending = self.pending.swap(Arc::new(Vec::new()));
         for rp in pending.iter() {
             self.repoint(&rp.layer_id, &rp.source_id);
         }
         let mut out = std::collections::HashMap::new();
         for (id, layer) in &mut self.layers {
-            if let Some(cue) = layer.sample(now) {
+            let Some(source_id) = self.routes.get(id) else {
+                continue;
+            };
+            let Some(selected) = times.get(source_id) else {
+                continue;
+            };
+            let Some(store) = self.stores.get(source_id) else {
+                continue;
+            };
+            if store.generation() != selected.generation {
+                continue;
+            }
+            if let Some(cue) = layer.sample(selected.pts) {
                 if !cue.lines.is_empty() {
                     out.insert(id.clone(), cue.lines);
                 }
@@ -260,7 +339,7 @@ impl SubtitleRouter {
     /// [`sample`](Self::sample) (CLEAR-on-switch at the seam). An unknown
     /// `layer_id` or `source_id` is a logged no-op (never a panic), so a stale
     /// route can never break the run.
-    pub fn repoint(&self, layer_id: &str, source_id: &str) {
+    pub fn repoint(&mut self, layer_id: &str, source_id: &str) {
         let Some(layer) = self.layers.get(layer_id) else {
             tracing::warn!(
                 layer = %layer_id,
@@ -279,6 +358,8 @@ impl SubtitleRouter {
         let source: Arc<dyn multiview_overlay::CueSource> =
             Arc::new(CueStoreSource::new(Arc::clone(store)));
         layer.repoint(source);
+        self.routes
+            .insert(layer_id.to_owned(), source_id.to_owned());
     }
 }
 
@@ -297,6 +378,12 @@ pub struct CaptionPlan {
     /// rendition plays out once and then stops. HLS sources are live (mirrors the
     /// video [`IngestPlan::live`] derivation). See [`caption_loop`].
     pub live: bool,
+    /// Lifecycle token supplied by the video source this rendition belongs to.
+    pub generation: u64,
+    /// Latest source PTS of the selected video picture, published by the drive.
+    pub displayed_time: Arc<
+        multiview_framestore::SwapCell<Option<Arc<multiview_framestore::tile::SourceFrameTime>>>,
+    >,
 }
 
 /// Resolve a rendition's (possibly relative) `URI` against the master playlist's
@@ -309,6 +396,11 @@ pub struct CaptionPlan {
 /// * Otherwise the relative reference is joined onto the master's **base
 ///   directory** (the master URL with its last path segment — the filename —
 ///   stripped), with any query/fragment on the master dropped.
+///
+/// The joined path then has its `.`/`..` segments removed (RFC 3986 §5.2.4):
+/// CDNs such as `CloudFront` reject a literal `..` (HTTP 400), and ad-insertion
+/// origins (AWS `MediaTailor`) emit variant URIs like `../../../manifest/…`.
+/// The rendition's own query string is kept unchanged.
 ///
 /// A master URL with no recognizable `scheme://authority` (e.g. a bare local
 /// path) falls back to a simple directory join so a `file:`-less local master
@@ -327,11 +419,12 @@ pub fn resolve_rendition_uri(master_url: &str, rendition_uri: &str) -> String {
     let (origin, path) = split_origin(master_base);
 
     // A root-relative rendition path replaces the master's path entirely.
-    if let Some(abs_path) = rendition_uri.strip_prefix('/') {
+    if rendition_uri.starts_with('/') {
+        let normalised = remove_dot_segments(rendition_uri);
         return match origin {
-            Some(origin) => format!("{origin}/{abs_path}"),
+            Some(origin) => format!("{origin}{normalised}"),
             // No origin (a bare local master): treat as a filesystem-absolute path.
-            None => format!("/{abs_path}"),
+            None => normalised,
         };
     }
 
@@ -340,7 +433,7 @@ pub fn resolve_rendition_uri(master_url: &str, rendition_uri: &str) -> String {
         Some(idx) => path.get(..=idx).unwrap_or(""),
         None => "",
     };
-    let joined = format!("{dir}{rendition_uri}");
+    let joined = remove_dot_segments(&format!("{dir}{rendition_uri}"));
     match origin {
         Some(origin) => format!("{origin}{joined}"),
         None => joined,
@@ -560,9 +653,18 @@ fn parse_cc_field(field: &str) -> Option<multiview_ffmpeg::CcChannel> {
 /// wall-clock pacing needed). The store is the lock-free hand-off the
 /// off-hot-path baker samples per tick (#1/#10).
 pub fn publish_window_cues(store: &CueStore, cues: Vec<CaptionCue>) {
+    publish_window_cues_for_generation(store, store.generation(), cues);
+}
+
+/// Publish only when a cue's decoder still owns the selected source lifecycle.
+pub fn publish_window_cues_for_generation(
+    store: &CueStore,
+    generation: u64,
+    cues: Vec<CaptionCue>,
+) {
     for cue in cues {
         let (start, end) = (cue.start(), cue.end());
-        store.publish(start, end, cue);
+        store.publish_for_generation(generation, start, end, cue);
     }
 }
 
@@ -733,6 +835,8 @@ fn resolve_caption_plan(
         // `live = true` for `SourceKind::Hls`), so its caption rendition is
         // supervised-reconnected.
         live: true,
+        generation: 1,
+        displayed_time: Arc::new(multiview_framestore::SwapCell::empty()),
     })
 }
 
@@ -895,7 +999,7 @@ pub fn caption_loop(plan: &CaptionPlan, stop: &AtomicBool) {
     let mut attempt: u32 = 0;
     let mut jitter = crate::pipeline::JitterRng::seeded(&plan.id);
     loop {
-        if stop.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
             return;
         }
         let started = std::time::Instant::now();
@@ -963,15 +1067,9 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
     let mut decoder = CaptionDecoder::from_parameters(CaptionSource::WebVtt, params, time_base)
         .map_err(|e| e.to_string())?;
 
-    // Pace each decoded cue's publish to wall-clock by its start PTS (invariant
-    // #4 — a VOD-as-live rendition is paced by PTS, never slurped). Without this
-    // the unpaced reader would drain the whole VOD into the bounded drop-oldest
-    // store in seconds, evicting the early cues before the output clock samples
-    // them; pacing keeps the store window aligned with output media time so the
-    // baker's per-tick `active_at(pts)` lands on the right cue. The pacer only
-    // ever *delays the writer*; it never blocks the reader of the store, so it
-    // cannot pace or stall the output clock (#1/#10).
-    let mut pacer = CuePacer::new();
+    // Bound rendition decode-ahead by the actual selected video source time.
+    // This isolated reader may wait; the output clock only publishes a cursor.
+    let mut pending = PendingCues::default();
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -986,7 +1084,7 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
                 // A decode error on one packet is logged and skipped — captions
                 // are intermittent and a malformed cue must never stall ingest.
                 match decoder.decode(&packet) {
-                    Ok(cues) => publish_cues(plan, &mut pacer, cues, stop),
+                    Ok(cues) => publish_cues(plan, &mut pending, cues, stop),
                     Err(e) => {
                         tracing::debug!(source = %plan.id, error = %e, "caption packet decode error");
                     }
@@ -998,64 +1096,164 @@ fn read_captions(plan: &CaptionPlan, stop: &AtomicBool) -> Result<(), String> {
     }
 }
 
-/// Publish each decoded cue into the store using its own `[start, end)` window,
-/// paced to wall-clock by the cue's start PTS so the bounded store window tracks
-/// output media time.
+/// Hard caps for decoded cues retained between packets. A single libav decode
+/// can still allocate its own vector before this function receives it.
+const PENDING_CUE_CAP: usize = 16;
+const PENDING_BYTES_CAP: usize = 256 * 1024;
+const CUE_AHEAD_NS: i64 = 2_000_000_000;
+const CUE_FUTURE_NS: i64 = 120_000_000_000;
+
+#[derive(Default)]
+struct PendingCues {
+    cues: Vec<CaptionCue>,
+    bytes: usize,
+    dropped: u64,
+    reported_at: Option<std::time::Instant>,
+}
+
+fn cue_bytes(cue: &CaptionCue) -> usize {
+    match cue {
+        CaptionCue::Text { text, .. } => text
+            .lines
+            .iter()
+            .fold(0_usize, |n, line| n.saturating_add(line.len())),
+        CaptionCue::Bitmap { bitmap, .. } => bitmap.rgba.len(),
+        _ => usize::MAX, // Unknown future cue shapes are not retained.
+    }
+}
+
+impl PendingCues {
+    fn push(&mut self, cue: CaptionCue, cursor: Option<MediaTime>) {
+        let size = cue_bytes(&cue);
+        let too_far = cursor
+            .is_some_and(|at| cue.start().as_nanos() > at.as_nanos().saturating_add(CUE_FUTURE_NS));
+        let stale = cursor.is_some_and(|at| cue.end() <= at);
+        if size > PENDING_BYTES_CAP || too_far || stale {
+            self.dropped = self.dropped.saturating_add(1);
+            return;
+        }
+        let pos = self
+            .cues
+            .partition_point(|entry| entry.start() <= cue.start());
+        self.cues.insert(pos, cue);
+        self.bytes = self.bytes.saturating_add(size);
+        while self.cues.len() > PENDING_CUE_CAP || self.bytes > PENDING_BYTES_CAP {
+            // Keep the active/next earliest cue when a malicious packet carries
+            // many future cues. Drop farthest-future first.
+            if let Some(removed) = self.cues.pop() {
+                self.bytes = self.bytes.saturating_sub(cue_bytes(&removed));
+                self.dropped = self.dropped.saturating_add(1);
+            }
+        }
+    }
+
+    fn flush(&mut self, plan: &CaptionPlan) {
+        let Some(displayed) = plan.displayed_time.load() else {
+            return;
+        };
+        if displayed.generation != plan.generation {
+            return;
+        }
+        let horizon = displayed.pts.as_nanos().saturating_add(CUE_AHEAD_NS);
+        while self
+            .cues
+            .first()
+            .is_some_and(|cue| cue.start().as_nanos() <= horizon)
+        {
+            let cue = self.cues.remove(0);
+            self.bytes = self.bytes.saturating_sub(cue_bytes(&cue));
+            if cue.end() <= displayed.pts {
+                self.dropped = self.dropped.saturating_add(1);
+            } else {
+                plan.store
+                    .publish_for_generation(plan.generation, cue.start(), cue.end(), cue);
+            }
+        }
+    }
+
+    fn report_drops(&mut self, id: &str) {
+        if self.dropped > 0
+            && self
+                .reported_at
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5))
+        {
+            tracing::warn!(source = %id, dropped = self.dropped, "caption cues discarded by bounded reader window");
+            self.dropped = 0;
+            self.reported_at = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// Keep decoded cue history near the selected picture. This runs only on the
+/// isolated reader; the output clock never waits on an input or this queue.
 fn publish_cues(
     plan: &CaptionPlan,
-    pacer: &mut CuePacer,
+    pending: &mut PendingCues,
     cues: Vec<CaptionCue>,
     stop: &AtomicBool,
 ) {
+    if stop.load(Ordering::Acquire) || plan.store.generation() != plan.generation {
+        return;
+    }
+    let cursor = plan
+        .displayed_time
+        .load()
+        .filter(|t| t.generation == plan.generation)
+        .map(|t| t.pts);
     for cue in cues {
-        let (start, end) = (cue.start(), cue.end());
-        pacer.wait_for(start, stop);
-        if stop.load(Ordering::Acquire) {
-            return;
+        pending.push(cue, cursor);
+    }
+    pending.flush(plan);
+    pending.report_drops(&plan.id);
+    while !stop.load(Ordering::Acquire)
+        && plan.store.generation() == plan.generation
+        && !pending.cues.is_empty()
+    {
+        pending.flush(plan);
+        if pending.cues.is_empty() {
+            break;
         }
-        plan.store.publish(start, end, cue);
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
-/// A wall-clock pacer keyed on a cue's start PTS (invariant #4): the first cue
-/// anchors `base_instant = now` to `base_pts = start`; each later cue is held
-/// until `now - base_instant >= start - base_pts`. A backwards PTS re-anchors so
-/// a discontinuity never stalls the reader for long.
-struct CuePacer {
-    anchor: Option<(std::time::Instant, MediaTime)>,
-}
-
-impl CuePacer {
-    fn new() -> Self {
-        Self { anchor: None }
-    }
-
-    /// Block (in `stop`-checked slices) until wall-clock reaches `pts`'s release
-    /// instant. The first call anchors the timeline and returns immediately.
-    fn wait_for(&mut self, pts: MediaTime, stop: &AtomicBool) {
-        let Some((base_instant, base_pts)) = self.anchor else {
-            self.anchor = Some((std::time::Instant::now(), pts));
-            return;
-        };
-        if pts < base_pts {
-            self.anchor = Some((std::time::Instant::now(), pts));
-            return;
-        }
-        let delta = pts.saturating_sub(base_pts);
-        let target_ns = u64::try_from(delta.as_nanos()).unwrap_or(0);
-        let target = base_instant + std::time::Duration::from_nanos(target_ns);
-        loop {
-            if stop.load(Ordering::Acquire) {
-                return;
+/// RFC 3986 §5.2.4 `remove_dot_segments` on a path, leaving any `?query` /
+/// `#fragment` suffix untouched. `..` above the root stops at the root.
+fn remove_dot_segments(path_and_rest: &str) -> String {
+    let split = path_and_rest
+        .find(['?', '#'])
+        .unwrap_or(path_and_rest.len());
+    let (path, rest) = path_and_rest.split_at(split);
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    let mut trailing_dir = false;
+    for (i, seg) in segments.iter().enumerate() {
+        match *seg {
+            "." => trailing_dir = i == last,
+            ".." => {
+                // Never pop the leading empty segment of an absolute path.
+                if out.len() > usize::from(absolute) {
+                    out.pop();
+                }
+                trailing_dir = i == last;
             }
-            let now = std::time::Instant::now();
-            if now >= target {
-                return;
+            "" if i == 0 && absolute => out.push(""),
+            other => {
+                out.push(other);
+                trailing_dir = false;
             }
-            let remaining = target.saturating_duration_since(now);
-            std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
         }
     }
+    let mut joined = out.join("/");
+    if absolute && joined.is_empty() {
+        joined.push('/');
+    }
+    if trailing_dir && !joined.ends_with('/') {
+        joined.push('/');
+    }
+    format!("{joined}{rest}")
 }
 
 #[cfg(test)]
@@ -1094,6 +1292,44 @@ mod tests {
         let master = "https://host.example/a/master.m3u8?token=xyz#frag";
         let got = resolve_rendition_uri(master, "subs/index.m3u8");
         assert_eq!(got, "https://host.example/a/subs/index.m3u8");
+    }
+
+    #[test]
+    fn dot_dot_segments_are_removed_rfc3986() {
+        // AWS MediaTailor masters (e.g. CNN FAST) list variants as
+        // `../../../manifest/...`; CloudFront rejects a literal `..` with 400,
+        // so the joined path must have its dot-segments removed (RFC 3986 §5.2.4).
+        let master = "https://d.example/v1/master/acct/chan/CNNFAST_GB.m3u8";
+        let got = resolve_rendition_uri(master, "../../../manifest/acct/chan/sess/3.m3u8");
+        assert_eq!(got, "https://d.example/v1/manifest/acct/chan/sess/3.m3u8");
+    }
+
+    #[test]
+    fn single_dot_and_excess_dot_dot_segments_are_normalised() {
+        let master = "https://h.example/a/b/master.m3u8";
+        assert_eq!(
+            resolve_rendition_uri(master, "./v/./index.m3u8"),
+            "https://h.example/a/b/v/index.m3u8"
+        );
+        // More `..` than path depth stops at the root (RFC 3986 §5.2.4).
+        assert_eq!(
+            resolve_rendition_uri(master, "../../../../x/index.m3u8"),
+            "https://h.example/x/index.m3u8"
+        );
+        // A rendition query string survives normalisation.
+        assert_eq!(
+            resolve_rendition_uri(master, "../v/index.m3u8?sid=1&a=..%2F"),
+            "https://h.example/a/v/index.m3u8?sid=1&a=..%2F"
+        );
+    }
+
+    #[test]
+    fn root_relative_dot_segments_are_normalised() {
+        let master = "https://h.example/a/master.m3u8";
+        assert_eq!(
+            resolve_rendition_uri(master, "/x/../y/index.m3u8"),
+            "https://h.example/y/index.m3u8"
+        );
     }
 
     #[test]
@@ -1580,6 +1816,276 @@ input_id = "cam_b"
         .expect("valid text cue");
         store.publish(cue.start(), cue.end(), cue);
         store
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn huge_batches_and_repeated_bursts_keep_earliest_relevant_cue_bounded() {
+        let mut pending = PendingCues::default();
+        let cursor = MediaTime::from_nanos(1_500_000_000);
+        for burst in 0..8 {
+            for n in (0..300).rev() {
+                let start = MediaTime::from_nanos(i64::from(n) * 1_000_000_000);
+                let end = MediaTime::from_nanos(start.as_nanos() + 2_000_000_000);
+                let text = format!("cue-{burst}-{n}");
+                pending.push(
+                    CaptionCue::try_text(start, end, vec![text], None).unwrap(),
+                    Some(cursor),
+                );
+                assert!(pending.cues.len() <= PENDING_CUE_CAP);
+                assert!(pending.bytes <= PENDING_BYTES_CAP);
+            }
+        }
+        assert!(pending
+            .cues
+            .iter()
+            .any(|cue| cue.start() <= cursor && cursor < cue.end()));
+        assert!(pending.dropped > 0);
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn one_huge_decoded_batch_keeps_the_active_cue_without_retaining_the_batch() {
+        use multiview_framestore::tile::SourceFrameTime;
+        let store = Arc::new(CueStore::new());
+        let cursor = Arc::new(multiview_framestore::SwapCell::new(Some(Arc::new(
+            SourceFrameTime {
+                pts: MediaTime::from_nanos(1_500_000_000),
+                generation: 1,
+                event_clock: None,
+            },
+        ))));
+        let plan = CaptionPlan {
+            id: "huge-batch".to_owned(),
+            rendition_url: String::new(),
+            store: Arc::clone(&store),
+            live: false,
+            generation: 1,
+            displayed_time: cursor,
+        };
+        let cues: Vec<_> = (0..800)
+            .rev()
+            .map(|second| {
+                let start = MediaTime::from_nanos(i64::from(second) * 1_000_000_000);
+                CaptionCue::try_text(
+                    start,
+                    MediaTime::from_nanos(start.as_nanos() + 2_000_000_000),
+                    vec!["payload".repeat(512)],
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut pending = PendingCues::default();
+        publish_cues(&plan, &mut pending, cues, &AtomicBool::new(true));
+        assert!(
+            pending.cues.is_empty(),
+            "stop discards untrusted decoder batch"
+        );
+        let cues: Vec<_> = (0..800)
+            .rev()
+            .map(|second| {
+                let start = MediaTime::from_nanos(i64::from(second) * 1_000_000_000);
+                CaptionCue::try_text(
+                    start,
+                    MediaTime::from_nanos(start.as_nanos() + 2_000_000_000),
+                    vec!["payload".repeat(512)],
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| publish_cues(&plan, &mut pending, cues, &stop));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while store
+                .active_at(MediaTime::from_nanos(1_500_000_000))
+                .is_none()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(store
+                .active_at(MediaTime::from_nanos(1_500_000_000))
+                .is_some());
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+        });
+        assert!(pending.cues.len() <= PENDING_CUE_CAP);
+        assert!(pending.bytes <= PENDING_BYTES_CAP);
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn seek_and_new_epoch_refuse_old_pending_cues_and_recover_new_cue() {
+        use multiview_framestore::tile::SourceFrameTime;
+        let store = Arc::new(CueStore::new());
+        let cursor = Arc::new(multiview_framestore::SwapCell::new(Some(Arc::new(
+            SourceFrameTime {
+                pts: MediaTime::from_nanos(50_000_000_000),
+                generation: 1,
+                event_clock: None,
+            },
+        ))));
+        let mut pending = PendingCues::default();
+        let old = CaptionCue::try_text(
+            MediaTime::from_nanos(51_000_000_000),
+            MediaTime::from_nanos(53_000_000_000),
+            vec!["old".to_owned()],
+            None,
+        )
+        .unwrap();
+        pending.push(old, Some(MediaTime::from_nanos(50_000_000_000)));
+        store.begin_generation(2);
+        cursor.store(Some(Arc::new(SourceFrameTime {
+            pts: MediaTime::from_nanos(1_000_000_000),
+            generation: 2,
+            event_clock: None,
+        })));
+        let fresh = CaptionCue::try_text(
+            MediaTime::ZERO,
+            MediaTime::from_nanos(3_000_000_000),
+            vec!["fresh".to_owned()],
+            None,
+        )
+        .unwrap();
+        let plan = CaptionPlan {
+            id: "seek".to_owned(),
+            rendition_url: String::new(),
+            store: Arc::clone(&store),
+            live: false,
+            generation: 2,
+            displayed_time: Arc::clone(&cursor),
+        };
+        let stop = AtomicBool::new(false);
+        publish_cues(&plan, &mut PendingCues::default(), vec![fresh], &stop);
+        assert!(store
+            .active_at_generation(MediaTime::from_nanos(1_000_000_000), 2)
+            .is_some());
+        assert!(store
+            .active_at_generation(MediaTime::from_nanos(51_000_000_000), 1)
+            .is_none());
+        assert_eq!(
+            pending.cues.len(),
+            1,
+            "old reader pending remains isolated from the new plan"
+        );
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn buffered_picture_over_twelve_seconds_does_not_evict_its_caption() {
+        use multiview_framestore::tile::SourceFrameTime;
+        let store = Arc::new(CueStore::new());
+        let cursor = Arc::new(multiview_framestore::SwapCell::new(Some(Arc::new(
+            SourceFrameTime {
+                pts: MediaTime::from_nanos(1_500_000_000),
+                generation: 1,
+                event_clock: None,
+            },
+        ))));
+        let plan = CaptionPlan {
+            id: "buffered".to_owned(),
+            rendition_url: String::new(),
+            store: Arc::clone(&store),
+            live: false,
+            generation: 1,
+            displayed_time: Arc::clone(&cursor),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            let cues = (1..=28)
+                .map(|second| {
+                    let start = MediaTime::from_nanos(i64::from(second) * 1_000_000_000);
+                    let end = MediaTime::from_nanos(start.as_nanos() + 1_000_000_000);
+                    CaptionCue::try_text(start, end, vec![format!("cue-{second}")], None).unwrap()
+                })
+                .collect();
+            publish_cues(&plan, &mut PendingCues::default(), cues, &writer_stop);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while store
+            .active_at(MediaTime::from_nanos(1_500_000_000))
+            .is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(store
+            .active_at(MediaTime::from_nanos(1_500_000_000))
+            .is_some());
+        // Wall time may advance >12 s while the selected picture stays at 1.5 s.
+        // Simulate those output ticks without a real sleep: the reader cannot
+        // drain future cues into the 16-entry drop-oldest window.
+        for _ in 0..350 {
+            assert!(store
+                .active_at(MediaTime::from_nanos(1_500_000_000))
+                .is_some());
+        }
+        assert!(
+            !writer.is_finished(),
+            "future caption decode waits for selected picture"
+        );
+        cursor.store(Some(Arc::new(SourceFrameTime {
+            pts: MediaTime::from_nanos(13_500_000_000),
+            generation: 1,
+            event_clock: None,
+        })));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while store
+            .active_at(MediaTime::from_nanos(13_500_000_000))
+            .is_none()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(store
+            .active_at(MediaTime::from_nanos(13_500_000_000))
+            .is_some());
+        stop.store(true, Ordering::Release);
+        writer.join().unwrap();
+    }
+
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn selected_video_time_holds_caption_and_replacement_clears_it() {
+        use multiview_framestore::tile::SourceFrameTime;
+        let store = text_store(1_000, 5_000, "frame cue");
+        let mut router = SubtitleRouter::from_stores([("cam".to_owned(), Arc::clone(&store))]);
+        let selected = |pts, generation| {
+            std::collections::HashMap::from([(
+                "cam".to_owned(),
+                SourceFrameTime {
+                    pts: MediaTime::from_nanos(pts),
+                    generation,
+                    event_clock: None,
+                },
+            )])
+        };
+        assert_eq!(
+            router.sample_selected(&selected(2_000, 1)).get("cam"),
+            Some(&vec!["frame cue".to_owned()])
+        );
+        // Output ticks advance, but the selected picture does not.
+        assert_eq!(
+            router.sample_selected(&selected(2_000, 1)).get("cam"),
+            Some(&vec!["frame cue".to_owned()])
+        );
+        assert!(router.sample_selected(&selected(5_000, 1)).is_empty());
+        store.begin_generation(2);
+        assert!(router.sample_selected(&selected(2_000, 1)).is_empty());
+        assert!(router.sample_selected(&selected(2_000, 2)).is_empty());
+        let stale = CaptionCue::try_text(
+            MediaTime::from_nanos(1_000),
+            MediaTime::from_nanos(5_000),
+            vec!["stale".to_owned()],
+            None,
+        )
+        .unwrap();
+        store.publish_for_generation(1, stale.start(), stale.end(), stale);
+        assert!(router.sample_selected(&selected(2_000, 2)).is_empty());
     }
 
     /// RT-10b: with one layer per source bound to its OWN store and no re-point,

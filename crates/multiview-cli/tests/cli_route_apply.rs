@@ -247,14 +247,12 @@ segment_ms = 1000
 }
 
 /// A native caption cue store carrying one text cue over `[start, end)` seconds.
-fn caption_store(start_s: f64, end_s: f64, line: &str) -> Arc<CueStore> {
-    let store = Arc::new(CueStore::new());
+fn publish_cue(store: &CueStore, start_s: f64, end_s: f64, line: &str) {
     let start = MediaTime::from_nanos((start_s * 1e9) as i64);
     let end = MediaTime::from_nanos((end_s * 1e9) as i64);
     let cue =
         CaptionCue::try_text(start, end, vec![line.to_owned()], None).expect("valid text cue");
     store.publish(start, end, cue);
-    store
 }
 
 /// Build a pipeline for `name` whose cell is bound to `cell_source`, returning it
@@ -302,7 +300,10 @@ async fn run_capturing(
         config.clone(),
         Arc::clone(&publisher),
         subtitle_slot,
+        pipeline.audio_route_slot(),
         pipeline.overlay_apply_slot(),
+        pipeline.tile_spec_apply_slot(),
+        pipeline.audio_free_sources_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
     );
@@ -372,7 +373,7 @@ async fn route_video_repoints_the_cell_in_the_running_pipeline() {
         cell: "cell_a".to_owned(),
         source: StreamRef::best("in_bright", StreamKind::Video),
     };
-    let cap = run_capturing(&mut pipeline, &config, command).await;
+    let cap = Box::pin(run_capturing(&mut pipeline, &config, command)).await;
 
     let before = centre_luma(&cap.before);
     let after = centre_luma(&cap.after);
@@ -401,7 +402,7 @@ async fn swap_source_back_compat_still_repoints_the_cell() {
         tile: "cell_a".to_owned(),
         source: "in_bright".to_owned(),
     };
-    let cap = run_capturing(&mut pipeline, &config, command).await;
+    let cap = Box::pin(run_capturing(&mut pipeline, &config, command)).await;
 
     assert!(
         centre_luma(&cap.before) < 80.0,
@@ -434,7 +435,10 @@ async fn run_command_to_hls(pipeline: &mut Pipeline, config: &MultiviewConfig, c
         config.clone(),
         Arc::clone(&publisher),
         subtitle_slot,
+        pipeline.audio_route_slot(),
         pipeline.overlay_apply_slot(),
+        pipeline.tile_spec_apply_slot(),
+        pipeline.audio_free_sources_slot(),
         live_hub.handle(),
         pipeline.player_mailboxes(),
     );
@@ -483,7 +487,8 @@ async fn route_subtitle_repoints_the_layer_in_the_running_pipeline() {
 
     // The displayed source (in_dark, the dark slate — a clean band to render onto)
     // carries a wide active cue; the spare has none.
-    pipeline.attach_caption_store("in_dark", caption_store(0.0, 8.0, "BEFORE REPOINT"));
+    let store = pipeline.attach_caption_store("in_dark", Arc::new(CueStore::new()));
+    publish_cue(&store, 0.0, 8.0, "BEFORE REPOINT");
     pipeline.attach_caption_store("spare", Arc::new(CueStore::new()));
 
     let command = Command::RouteSubtitle {
@@ -491,7 +496,7 @@ async fn route_subtitle_repoints_the_layer_in_the_running_pipeline() {
         layer: "in_dark".to_owned(),
         source: StreamRef::best("spare", StreamKind::Subtitle),
     };
-    run_command_to_hls(&mut pipeline, &config, command).await;
+    Box::pin(run_command_to_hls(&mut pipeline, &config, command)).await;
 
     // A clean baseline run (no caption store at all) — the empty-band reference.
     let (mut clean, clean_playlist) = build_pipeline(dir.path(), "sub_clean", "in_dark");

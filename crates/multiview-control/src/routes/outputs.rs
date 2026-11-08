@@ -21,6 +21,22 @@ use crate::resource_store::{Resource, ResourceInput, VersionedResource, OUTPUT_K
 use crate::state::AppState;
 use crate::typed_resources::{validated_body, with_apply_restart, TypedCollection};
 
+/// Read accepted intent rather than a lagging, fallible SQLite projection.
+fn accepted_outputs(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
+    crate::boot_model::accepted_resources(state, "outputs")?
+        .map_or_else(|| state.outputs.list(), Ok)
+}
+
+fn accepted_output(state: &AppState, id: &str) -> ControlResult<VersionedResource> {
+    accepted_outputs(state)?
+        .into_iter()
+        .find(|entry| entry.resource.id == id)
+        .ok_or_else(|| crate::error::ControlError::NotFound {
+            kind: OUTPUT_KIND,
+            id: id.into(),
+        })
+}
+
 /// Attach the resource's `ETag` to a successful response carrying an output.
 fn output_response(status: StatusCode, versioned: &VersionedResource) -> Response {
     let etag = versioned.version.to_etag();
@@ -55,9 +71,8 @@ pub(crate) async fn list_outputs(
     // rows outside the allowlist — exactly as `list_devices` does. THEN redact an
     // embedded out-of-scope `device_ref` on a surviving in-scope row. Both are
     // no-ops for an unscoped principal.
-    let outputs = state
-        .outputs
-        .list()?
+    let outputs = crate::boot_model::accepted_resources(&state, "outputs")?
+        .map_or_else(|| state.outputs.list(), Ok)?
         .into_iter()
         .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
         .map(|v| {
@@ -93,7 +108,7 @@ pub(crate) async fn get_output(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let mut versioned = state.outputs.get(&id)?;
+    let mut versioned = accepted_output(&state, &id)?;
     // Redact an embedded out-of-scope `device_ref` (BOLA visibility,
     // ADR-W005/ADR-W025): the output itself is in scope, but its device-projection
     // link must not leak a device id the principal could not `GET`. No-op when
@@ -132,7 +147,34 @@ pub(crate) async fn create_output(
         name: input.name,
         body: validated_body(TypedCollection::Outputs, &id, &input.body)?,
     };
-    let versioned = state.outputs.create(&id, input)?;
+    let _mutation = state.lock_config_mutation().await;
+    if accepted_outputs(&state)?
+        .iter()
+        .any(|entry| entry.resource.id == id)
+    {
+        return Err(crate::error::ControlError::Validation(format!(
+            "output {id:?} already exists"
+        )));
+    }
+    crate::boot_model::commit_resource(
+        &state,
+        "outputs",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.outputs.create(&id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(output = %id, %error, "accepted output committed; store projection failed");
+    }
+    let versioned = accepted_output(&state, &id).map_err(|error| {
+        crate::error::ControlError::CommitIndeterminate(format!(
+            "output {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
+        ))
+    })?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -176,13 +218,32 @@ pub(crate) async fn update_output(
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
-    let current = state.outputs.get(&id)?;
+    let _mutation = state.lock_config_mutation().await;
+    let current = accepted_output(&state, &id)?;
     if_match.require(OUTPUT_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
         body: validated_body(TypedCollection::Outputs, &id, &input.body)?,
     };
-    let versioned = state.outputs.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "outputs",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.outputs.update(&id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(output = %id, %error, "accepted output committed; store projection failed");
+    }
+    let versioned = accepted_output(&state, &id).map_err(|error| {
+        crate::error::ControlError::CommitIndeterminate(format!(
+            "output {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
+        ))
+    })?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -221,9 +282,16 @@ pub(crate) async fn delete_output(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Administer)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let current = state.outputs.get(&id)?;
+    let _mutation = state.lock_config_mutation().await;
+    let current = accepted_output(&state, &id)?;
     if_match.require(OUTPUT_KIND, &id, current.version)?;
-    state.outputs.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "outputs", &id, None, None).await?;
+    if let Err(error) = state.outputs.delete(&id) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(output = %id, %error, "accepted output deletion committed; store projection failed");
+    }
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

@@ -19,6 +19,8 @@
 #   FFMPEG_VERSION   FFmpeg release to build               (default 8.1.1)
 #   FFMPEG_SHA256    SHA-256 of ffmpeg-${FFMPEG_VERSION}.tar.xz  (REQUIRED)
 #   FFMPEG_GPG_KEY   FFmpeg release signing key fingerprint (default below)
+#   FFMPEG_GIT_COMMIT upstream commit of tag n${FFMPEG_VERSION}; fallback source
+#                    used only when ffmpeg.org is unreachable (content-pinned)
 #   FF_LICENSE       lgpl (default) | gpl                  (gpl adds x264/x265)
 #   FF_HWACCEL       nvidia (NVENC/NVDEC/cuvid/scale_cuda) | vaapi (VAAPI/QSV)
 #   FF_PREFIX        install prefix                        (default /opt/multiview-ffmpeg)
@@ -187,37 +189,17 @@ trap 'rm -rf "${WORK}"' EXIT
 cd "${WORK}"
 
 # -----------------------------------------------------------------------------
-# 1. Fetch + verify the pinned source tarball (GPG signature AND SHA-256).
+# 1. Verified source. The Docker build pre-fetches it in a separate cached stage
+#    (FFMPEG_SRC_DIR); standalone runs fetch it here. Both paths go through
+#    ffmpeg-fetch-source.sh: SHA-256 pin AND GPG signature, or the pinned
+#    upstream git commit when ffmpeg.org is unreachable.
 # -----------------------------------------------------------------------------
-TARBALL="ffmpeg-${FFMPEG_VERSION}.tar.xz"
-BASE_URL="https://ffmpeg.org/releases"
-
-curl -fsSL -o "${TARBALL}"       "${BASE_URL}/${TARBALL}"
-curl -fsSL -o "${TARBALL}.asc"   "${BASE_URL}/${TARBALL}.asc"
-
-# SHA-256 (defense-in-depth pin).
-echo "${FFMPEG_SHA256}  ${TARBALL}" | sha256sum -c -
-
-# GPG detached-signature verification against the pinned FFmpeg release key.
-export GNUPGHOME="${WORK}/gnupg"
-mkdir -p "${GNUPGHOME}"
-chmod 700 "${GNUPGHOME}"
-gpg_recv_ok=0
-for ks in hkps://keyserver.ubuntu.com hkps://keys.openpgp.org hkps://pgp.mit.edu; do
-  if gpg --batch --keyserver "${ks}" --recv-keys "${FFMPEG_GPG_KEY}"; then
-    gpg_recv_ok=1
-    break
-  fi
-  echo "ffmpeg-build: keyserver ${ks} failed, trying next" >&2
-done
-if [ "${gpg_recv_ok}" -ne 1 ]; then
-  echo "ffmpeg-build: could not retrieve FFmpeg signing key ${FFMPEG_GPG_KEY} from any keyserver." >&2
-  exit 3
-fi
-gpg --batch --verify "${TARBALL}.asc" "${TARBALL}"
-
-tar -xJf "${TARBALL}"
 SRC="${WORK}/ffmpeg-${FFMPEG_VERSION}"
+if [ -n "${FFMPEG_SRC_DIR:-}" ]; then
+  cp -a "${FFMPEG_SRC_DIR}/ffmpeg-${FFMPEG_VERSION}" "${SRC}"
+else
+  "$(dirname "$(readlink -f "$0")")/ffmpeg-fetch-source.sh" "${WORK}"
+fi
 
 # -----------------------------------------------------------------------------
 # 2. nv-codec-headers (NVIDIA path only) — install the NVENC/NVDEC headers from
@@ -256,6 +238,10 @@ CONFIGURE_ARGS=(
   --enable-filter=scale,format,aformat,aresample,anull,null,fps,setpts,asetpts
   --enable-swscale --enable-swresample --enable-avfilter
   --enable-libopus --enable-libsrt --enable-gnutls
+  # zlib: HTTP gzip Content-Encoding — some HLS origins gzip their playlists;
+  # without it libav fails the fetch ("need zlib with gzip support"). zlib is
+  # zlib-licensed (permissive), so the build stays LGPL-clean.
+  --enable-zlib
 )
 
 # Hardware acceleration — both branches are LGPL-clean.

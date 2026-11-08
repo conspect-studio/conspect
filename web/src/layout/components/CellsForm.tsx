@@ -311,6 +311,19 @@ function CellRow({
             </Select>
           </div>
         </div>
+        {cell.sourceId !== undefined &&
+        !sources.some((source) => source.id === cell.sourceId) ? (
+          <p role="alert" className="text-sm text-destructive">
+            <Trans>Missing source:</Trans> <code>{cell.sourceId}</code>
+          </p>
+        ) : cell.sourceId !== undefined ? (
+          <p className="text-sm text-muted-foreground">
+            <Trans>Bound source:</Trans>{' '}
+            <span lang="" dir="auto">
+              {sources.find((source) => source.id === cell.sourceId)?.name}
+            </span>
+          </p>
+        ) : null}
 
         <CellPropertiesPanel
           idPrefix={cell.id}

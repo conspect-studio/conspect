@@ -72,6 +72,11 @@ pub enum ControlError {
     #[error("engine command bus at capacity; request shed")]
     EngineBusy,
 
+    /// The atomic rename became visible, but directory durability could not be
+    /// confirmed. The caller must read the authoritative record before retrying.
+    #[error("desired-state commit status is indeterminate: {0}")]
+    CommitIndeterminate(String),
+
     /// A persistence/repository fault.
     #[error("repository error: {0}")]
     Repository(String),
@@ -114,6 +119,14 @@ impl ControlError {
             }
             Self::EngineBusy => Problem::new(503, "engine-busy", "Engine command bus at capacity")
                 .with_detail("the control command queue is full; retry shortly"),
+            Self::CommitIndeterminate(msg) => Problem::new(
+                503,
+                "commit-indeterminate",
+                "Desired-state commit status is indeterminate",
+            )
+            .with_detail(format!(
+                "{msg}; read the current resource and its ETag before a retry"
+            )),
             Self::Repository(msg) => {
                 Problem::new(500, "repository", "Internal repository error").with_detail(msg)
             }

@@ -9,9 +9,11 @@
 pub mod alarm;
 pub mod color;
 pub mod error;
+pub mod event_overlay;
 pub mod frame;
 pub mod layout;
 pub mod pixel;
+pub mod source_event;
 pub mod stream;
 pub mod tally;
 pub mod time;

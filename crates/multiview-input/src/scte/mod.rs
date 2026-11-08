@@ -22,7 +22,10 @@ pub mod scte104;
 pub mod splice35;
 
 pub use scte104::Scte104Message;
-pub use splice35::{SpliceCommand, SpliceInfoSection, SpliceInsert, TimeSignal};
+pub use splice35::{
+    NormalizedCueEvent, SegmentationDescriptor, SegmentationUpid, SpliceCommand, SpliceInfoSection,
+    SpliceInsert, TimeSignal,
+};
 
 /// Errors raised while parsing a SCTE-35 / SCTE-104 cue message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

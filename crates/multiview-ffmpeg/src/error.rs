@@ -45,6 +45,18 @@ pub enum FfmpegError {
         timeout_ms: u64,
     },
 
+    /// A live input keeps delivering packets but none for any audio stream: the
+    /// source lost its audio mid-connection. Reconnect to pick up whatever it
+    /// carries now; waiting would ride silence with no error.
+    #[cfg(feature = "ffmpeg")]
+    #[error("input {path:?} delivered {packets} packets with no audio")]
+    AudioStarved {
+        /// The input path or URL.
+        path: String,
+        /// Consecutive packets read without any audio.
+        packets: u32,
+    },
+
     /// A small text resource (an HLS caption master/rendition playlist) could
     /// not be fetched over libav I/O — a disallowed scheme, an open/read error,
     /// an oversize body, or a non-UTF-8 body.

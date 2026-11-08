@@ -75,6 +75,8 @@ pub struct VideoEncodeTarget {
 pub struct VideoEncoder {
     encoder: encoder::video::Encoder,
     time_base: Rational,
+    configured_bit_rate: Option<u64>,
+    dimensions: (u32, u32),
     /// Armed by [`Self::force_next_keyframe`] (the ADR-0049 force-keyframe
     /// seam): the next frame sent is encoded as an intra/IDR picture. One-shot —
     /// cleared by the send that consumes it.
@@ -176,6 +178,8 @@ impl VideoEncoder {
         Ok(Self {
             encoder,
             time_base: target.time_base,
+            configured_bit_rate: u64::try_from(target.bit_rate).ok().filter(|rate| *rate > 0),
+            dimensions: (target.width, target.height),
             force_keyframe: false,
             hw_device,
         })
@@ -218,6 +222,18 @@ impl VideoEncoder {
     #[must_use]
     pub const fn time_base(&self) -> Rational {
         self.time_base
+    }
+
+    /// Configured target bitrate, if explicitly set.
+    #[must_use]
+    pub const fn configured_bit_rate(&self) -> Option<u64> {
+        self.configured_bit_rate
+    }
+
+    /// Configured output dimensions.
+    #[must_use]
+    pub const fn dimensions(&self) -> (u32, u32) {
+        self.dimensions
     }
 
     /// Whether this encoder is pinned to a specific CUDA device (Tier-2 P1a) —
@@ -313,6 +329,7 @@ pub struct AudioEncodeTarget {
 pub struct AudioEncoder {
     encoder: encoder::audio::Encoder,
     time_base: Rational,
+    configured_bit_rate: Option<u64>,
     frame_size: u32,
     /// The sample format the encoder accepts (used to build input frames).
     format: Sample,
@@ -386,6 +403,7 @@ impl AudioEncoder {
         Ok(Self {
             encoder,
             time_base,
+            configured_bit_rate: u64::try_from(target.bit_rate).ok().filter(|rate| *rate > 0),
             frame_size,
             format: target.format,
             channel_layout: target.channel_layout,
@@ -403,6 +421,12 @@ impl AudioEncoder {
     #[must_use]
     pub const fn time_base(&self) -> Rational {
         self.time_base
+    }
+
+    /// Configured target bitrate, if explicitly set.
+    #[must_use]
+    pub const fn configured_bit_rate(&self) -> Option<u64> {
+        self.configured_bit_rate
     }
 
     /// The encoder's required samples-per-frame, or `0` if it accepts any

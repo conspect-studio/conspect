@@ -31,6 +31,54 @@ fn parse_stored_source(body: &serde_json::Value) -> Option<multiview_config::Sou
     serde_json::from_value(body.clone()).ok()
 }
 
+/// Compare media configuration without cloning arbitrary source documents.
+/// Only EPG and IPTV presentation metadata may bypass the engine command path.
+fn guide_only_change(previous: &serde_json::Value, next: &serde_json::Value) -> bool {
+    let (Some(previous), Some(next)) = (previous.as_object(), next.as_object()) else {
+        return false;
+    };
+    if previous == next {
+        // An unchanged body is not a guide edit; it keeps the canonical path.
+        return false;
+    }
+    let media_field = |key: &str| key != "epg" && key != "playlist_metadata";
+    previous
+        .iter()
+        .filter(|(key, _)| media_field(key))
+        .eq(next.iter().filter(|(key, _)| media_field(key)))
+}
+
+#[cfg(test)]
+mod guide_change_tests {
+    use super::guide_only_change;
+    use serde_json::json;
+
+    #[test]
+    fn guide_changes_do_not_change_media_identity() {
+        let source = json!({"id":"news", "kind":"hls", "url":"https://example.com/live"});
+        let mut next = source.clone();
+        next["epg"] =
+            json!({"mode":"manual", "url":"https://example.com/guide", "channel_id":"42"});
+        next["playlist_metadata"] = json!({"name":"News"});
+        assert!(guide_only_change(&source, &next));
+        assert!(guide_only_change(&next, &source));
+        next["url"] = json!("https://example.com/other");
+        assert!(!guide_only_change(&source, &next));
+    }
+
+    #[test]
+    fn other_source_changes_still_require_canonical_apply() {
+        let source = json!({"id":"news", "kind":"hls"});
+        for key in ["captions", "auth", "display_name", "wallclock"] {
+            let mut next = source.clone();
+            next[key] = json!("changed");
+            assert!(!guide_only_change(&source, &next));
+        }
+        assert!(!guide_only_change(&json!(null), &json!(null)));
+        assert!(!guide_only_change(&source, &source));
+    }
+}
+
 /// Apply a stored source mutation to the **running** engine where the engine
 /// can take it live (ADR-W018, invariant #11), returning the apply semantics
 /// the response must declare.
@@ -60,6 +108,17 @@ fn live_apply_upsert(
         return ApplyMode::Restart;
     };
     if state.live_sources.is_live(&source.kind) {
+        // The running registry, not merely the durable source collection,
+        // defines live admission. A stored restart-only source may already be
+        // outside the adopted set. Never report `live` for an over-cap add.
+        if let Some(model) = state.boot_model.as_ref() {
+            let adopted = model.adopted_sources();
+            if !adopted.iter().any(|entry| entry.id == source.id)
+                && adopted.len() >= multiview_config::MAX_ADMITTED_SOURCES
+            {
+                return ApplyMode::Restart;
+            }
+        }
         let submitted = state
             .commands
             .try_submit(Command::UpsertSource {
@@ -134,6 +193,22 @@ fn live_apply_remove(state: &AppState, id: &str) -> ApplyMode {
     }
 }
 
+/// Read accepted intent rather than a lagging, fallible SQLite projection.
+fn accepted_sources(state: &AppState) -> ControlResult<Vec<VersionedResource>> {
+    crate::boot_model::accepted_resources(state, "sources")?
+        .map_or_else(|| state.sources.list(), Ok)
+}
+
+fn accepted_source(state: &AppState, id: &str) -> ControlResult<VersionedResource> {
+    accepted_sources(state)?
+        .into_iter()
+        .find(|entry| entry.resource.id == id)
+        .ok_or_else(|| crate::error::ControlError::NotFound {
+            kind: SOURCE_KIND,
+            id: id.into(),
+        })
+}
+
 /// Attach the resource's `ETag` to a successful response carrying a source.
 fn source_response(status: StatusCode, versioned: &VersionedResource) -> Response {
     let etag = versioned.version.to_etag();
@@ -169,9 +244,8 @@ pub(crate) async fn list_sources(
     // embedded out-of-scope `device_ref` on a surviving in-scope row (its
     // device-projection link may point to a device the principal cannot `GET`).
     // Both are no-ops for an unscoped principal.
-    let sources = state
-        .sources
-        .list()?
+    let sources = crate::boot_model::accepted_resources(&state, "sources")?
+        .map_or_else(|| state.sources.list(), Ok)?
         .into_iter()
         .filter(|v| crate::auth::authorize_object(&principal, &v.resource.id).is_ok())
         .map(|v| {
@@ -207,7 +281,7 @@ pub(crate) async fn get_source(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let mut versioned = state.sources.get(&id)?;
+    let mut versioned = accepted_source(&state, &id)?;
     // Redact an embedded out-of-scope `device_ref` (BOLA visibility,
     // ADR-W005/ADR-W025): the source itself is in scope (authorized above), but
     // its device-projection link must not leak a device id the principal could
@@ -251,7 +325,39 @@ pub(crate) async fn create_source(
     // takes the same lock) can never compose mid-mutation and the adopted
     // snapshot advances atomically with the engine submit.
     let _mutation = state.lock_config_mutation().await;
-    let versioned = state.sources.create(&id, input)?;
+    if accepted_sources(&state)?.len() >= multiview_config::MAX_ADMITTED_SOURCES {
+        return Err(crate::error::ControlError::Validation(format!(
+            "sources exceeds the live source capacity of {}",
+            multiview_config::MAX_ADMITTED_SOURCES
+        )));
+    }
+    if accepted_sources(&state)?
+        .iter()
+        .any(|entry| entry.resource.id == id)
+    {
+        return Err(crate::error::ControlError::Validation(format!(
+            "source {id:?} already exists"
+        )));
+    }
+    crate::boot_model::commit_resource(
+        &state,
+        "sources",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.sources.create(&id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
+    }
+    let versioned = accepted_source(&state, &id).map_err(|error| {
+        crate::error::ControlError::CommitIndeterminate(format!(
+            "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
+        ))
+    })?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -300,14 +406,32 @@ pub(crate) async fn update_source(
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
-    let current = state.sources.get(&id)?;
+    let current = accepted_source(&state, &id)?;
     if_match.require(SOURCE_KIND, &id, current.version)?;
     let input = ResourceInput {
         name: input.name,
         body: validated_body(TypedCollection::Sources, &id, &input.body)?,
     };
     let previous = parse_stored_source(&current.resource.body);
-    let versioned = state.sources.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "sources",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    if let Err(error) = state.sources.update(&id, input) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted source committed; store projection failed");
+    }
+    let versioned = accepted_source(&state, &id).map_err(|error| {
+        crate::error::ControlError::CommitIndeterminate(format!(
+            "source {id:?} was committed, but its accepted representation could not be reread; GET before retrying: {error}"
+        ))
+    })?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -315,11 +439,19 @@ pub(crate) async fn update_source(
         &id,
         Some(versioned.resource.body.clone()),
     );
-    let mode = live_apply_upsert(
-        &state,
-        parse_stored_source(&versioned.resource.body),
-        previous.as_ref(),
-    );
+    let next = parse_stored_source(&versioned.resource.body);
+    let mode = if guide_only_change(&current.resource.body, &versioned.resource.body) {
+        // Guide/presentation edits must not restart a decoder. Preserve the
+        // adopted media identity, but carry its new metadata into resume state.
+        if let (Some(model), Some(next)) = (state.boot_model.as_ref(), next.as_ref()) {
+            if model.adopted_sources().iter().any(|source| source.id == id) {
+                model.adopt_source(next.clone());
+            }
+        }
+        ApplyMode::Live
+    } else {
+        live_apply_upsert(&state, next, previous.as_ref())
+    };
     Ok(with_apply(
         mode,
         source_response(StatusCode::OK, &versioned),
@@ -354,9 +486,15 @@ pub(crate) async fn delete_source(
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // precondition → store-delete → submit → adopt-snapshot sequence.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.sources.get(&id)?;
+    let current = accepted_source(&state, &id)?;
     if_match.require(SOURCE_KIND, &id, current.version)?;
-    state.sources.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "sources", &id, None, None).await?;
+    if let Err(error) = state.sources.delete(&id) {
+        if state.boot_model.is_none() {
+            return Err(error);
+        }
+        tracing::warn!(source = %id, %error, "accepted source deletion committed; store projection failed");
+    }
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

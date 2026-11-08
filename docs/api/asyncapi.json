@@ -653,6 +653,10 @@
             "description": "Whether any channel clipped in this window.",
             "type": "boolean"
           },
+          "input_id": {
+            "description": "Source/input id of a per-input sample; absent on the program bus (track 0).",
+            "type": "string"
+          },
           "overflow": {
             "description": "Whether the meter pipeline overflowed (dropped windows).",
             "type": "boolean"
@@ -679,7 +683,7 @@
             "type": "integer"
           },
           "track": {
-            "description": "Track index.",
+            "description": "Track index: 0 is the program bus; 1.. are per-input tracks.",
             "format": "uint32",
             "type": "integer"
           }

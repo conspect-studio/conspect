@@ -135,7 +135,7 @@ describe("AudioPage", () => {
     // toast — the region is announced by AT and visible next to the button).
     const status = screen.getByRole("status");
     await waitFor(() => {
-      expect(status).toHaveTextContent(/stored\. it goes live via config export/i);
+      expect(status).toHaveTextContent(/stored, not applied live: this change needs a restart/i);
     });
     expect(lastPut).toBeDefined();
     expect(lastPut?.ifMatch).toBe('W/"7"');
@@ -152,5 +152,24 @@ describe("AudioPage", () => {
         },
       ],
     });
+  });
+
+  it("reports a live-applied save without asking for a restart", async () => {
+    server.use(
+      http.put("*/api/v1/audio-routing", () =>
+        HttpResponse.json(
+          { ...ROUTING, configured: true },
+          { headers: { ETag: 'W/"8"', "X-Multiview-Apply": "live" } },
+        ),
+      ),
+    );
+    renderAudio();
+    await screen.findByLabelText(/sample rate/i);
+    await userEvent.click(screen.getByTestId("audio-save"));
+    const status = screen.getByRole("status");
+    await waitFor(() => {
+      expect(status).toHaveTextContent(/applied live/i);
+    });
+    expect(status).not.toHaveTextContent(/restart/i);
   });
 });

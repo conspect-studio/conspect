@@ -78,6 +78,94 @@ const fn ns_timebase() -> Rational {
     Rational::new(1, 1_000_000_000)
 }
 
+/// Immutable mapping from a real input PTS to the internal media timeline.
+///
+/// This value is independent of the normalizer: projecting announcements never
+/// advances video state. It carries no source identity or epoch. Callers must
+/// associate it with their source/epoch and discard saved copies on discontinuity,
+/// reconnect or source replacement; an existing copy cannot be revoked.
+#[derive(Debug, Clone, Copy)]
+pub struct PtsMappingSnapshot {
+    raw: i64,
+    timebase: Rational,
+    media_ns: i64,
+    generation: u64,
+}
+
+impl PtsMappingSnapshot {
+    /// Mapping generation within this normalizer's lifetime, not a source epoch.
+    /// Compare with [`PtsNormalizer::mapping_generation`] before reusing a copy.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Project an event using its own timebase and wrap width (for SCTE-35,
+    /// `1/90000` and [`WrapBits::Mpeg33`]), without touching video state.
+    ///
+    /// Wrapped values must be in `[0, modulus)`. The nearest wrap occurrence
+    /// relative to the anchor is selected; exactly half a modulus is ambiguous
+    /// and rejected. The caller must guarantee the event is less than half a
+    /// wrap period from this anchor: more distant occurrences are unknowable.
+    /// Nanoseconds round to nearest, ties away from zero, using checked integer
+    /// arithmetic. Returns `None` for invalid/non-positive timebases, ambiguous
+    /// wraps, or arithmetic/result overflow; never saturates or fabricates time.
+    #[must_use]
+    pub fn project(&self, raw: i64, timebase: Rational, wrap: WrapBits) -> Option<MediaTime> {
+        if timebase.num <= 0 || timebase.den <= 0 {
+            return None;
+        }
+        // Exact delta in event ticks; do not quantize the anchor to event ticks.
+        let denominator = i128::from(self.timebase.den).checked_mul(i128::from(timebase.num))?;
+        let anchor = i128::from(self.raw)
+            .checked_mul(i128::from(self.timebase.num))?
+            .checked_mul(i128::from(timebase.den))?;
+        let mut delta = i128::from(raw)
+            .checked_mul(denominator)?
+            .checked_sub(anchor)?;
+        if let Some(modulus) = wrap.modulus() {
+            if !(0..modulus).contains(&raw) {
+                return None;
+            }
+            let period = i128::from(modulus).checked_mul(denominator)?;
+            delta = delta.rem_euclid(period);
+            let half = period / 2;
+            if delta == half {
+                return None;
+            }
+            if delta > half {
+                delta = delta.checked_sub(period)?;
+            }
+        }
+        // Cancel the event numerator algebraically before conversion to ns.
+        let numerator = delta.checked_mul(1_000_000_000)?;
+        let divisor = i128::from(self.timebase.den).checked_mul(i128::from(timebase.den))?;
+        let ns = checked_round(numerator, divisor)?;
+        let media_ns = i128::from(self.media_ns).checked_add(ns)?;
+        Some(MediaTime::from_nanos(i64::try_from(media_ns).ok()?))
+    }
+}
+
+fn checked_round(numerator: i128, denominator: i128) -> Option<i128> {
+    let half = denominator / 2;
+    let rounded = if numerator < 0 {
+        numerator.checked_sub(half)?
+    } else {
+        numerator.checked_add(half)?
+    };
+    rounded.checked_div(denominator)
+}
+
+fn checked_raw_ns(raw: i64, timebase: Rational) -> Option<i64> {
+    if timebase.num <= 0 || timebase.den <= 0 {
+        return None;
+    }
+    let numerator = i128::from(raw)
+        .checked_mul(i128::from(timebase.num))?
+        .checked_mul(1_000_000_000)?;
+    i64::try_from(checked_round(numerator, i128::from(timebase.den))?).ok()
+}
+
 /// Per-input timestamp normalizer.
 ///
 /// Construct one per input with [`PtsNormalizer::new`], then feed every decoded
@@ -110,6 +198,10 @@ pub struct PtsNormalizer {
     last_media_ns: Option<i64>,
     /// Whether a discontinuity has been explicitly flagged for the next frame.
     pending_discontinuity: bool,
+    /// Latest usable real-PTS anchor; genpts never creates a mapping.
+    mapping: Option<PtsMappingSnapshot>,
+    /// None permanently disables mapping after generation exhaustion.
+    mapping_generation: Option<u64>,
 }
 
 impl PtsNormalizer {
@@ -143,6 +235,8 @@ impl PtsNormalizer {
             offset: 0,
             last_media_ns: None,
             pending_discontinuity: false,
+            mapping: None,
+            mapping_generation: Some(0),
         }
     }
 
@@ -166,6 +260,36 @@ impl PtsNormalizer {
     /// smoothly forward from the last emitted instant.
     pub fn mark_discontinuity(&mut self) {
         self.pending_discontinuity = true;
+        self.invalidate_mapping();
+    }
+
+    fn invalidate_mapping(&mut self) {
+        self.mapping = None;
+        self.mapping_generation = self.mapping_generation.and_then(|g| g.checked_add(1));
+    }
+
+    /// Current mapping generation, initially zero, even without a raw anchor.
+    ///
+    /// Advances immediately on explicit discontinuity and on detected raw jumps,
+    /// but not on ordinary timestamp wrap or frames. Compare this token after
+    /// normalization to retire pending cues from the previous mapping. Tokens
+    /// are local to this normalizer; source/reconnect epochs remain caller-owned.
+    /// `None` means the counter exhausted: mappings stay unavailable permanently,
+    /// and callers must retire pending cues rather than reuse the last token.
+    #[must_use]
+    pub const fn mapping_generation(&self) -> Option<u64> {
+        self.mapping_generation
+    }
+
+    /// Copy the latest valid real-PTS mapping for non-mutating event projection.
+    ///
+    /// Unavailable before a valid raw anchor or after a discontinuity until a
+    /// real timestamp reanchors it. Genpts-only frames cannot establish it.
+    /// Saved copies belong to the caller's source epoch and must be discarded
+    /// when that epoch ends; this normalizer does not manage source lifecycles.
+    #[must_use]
+    pub const fn mapping_snapshot(&self) -> Option<PtsMappingSnapshot> {
+        self.mapping
     }
 
     /// Normalize one frame's raw timestamp (reclock-to-house: anchor the first
@@ -229,8 +353,16 @@ impl PtsNormalizer {
         // (1) genpts fallback: synthesize a raw_ns by continuing the previous
         // emitted instant forward by one frame period. We compute directly in
         // the raw-ns space so discontinuity logic stays consistent.
+        let mut mapping_raw = None;
         let raw_ns = if let Some(value) = raw {
             let unwrapped = self.unwrap(value);
+            let in_range = self.wrap.modulus().is_none_or(|m| (0..m).contains(&value));
+            if in_range
+                && value.checked_add(self.accumulated_wrap) == Some(unwrapped)
+                && checked_raw_ns(unwrapped, self.timebase).is_some()
+            {
+                mapping_raw = Some(unwrapped);
+            }
             // Rebase the raw value into ns on the input's own (raw) timeline.
             rescale(unwrapped, self.timebase, ns_timebase())
         } else {
@@ -246,6 +378,9 @@ impl PtsNormalizer {
             || self
                 .last_raw_ns
                 .is_some_and(|prev| (raw_ns.saturating_sub(prev)).abs() > self.discontinuity_ns);
+        if discontinuity && !self.pending_discontinuity {
+            self.invalidate_mapping();
+        }
         self.pending_discontinuity = false;
 
         let media_ns = if is_first {
@@ -282,6 +417,19 @@ impl PtsNormalizer {
             _ => media_ns,
         };
 
+        if discontinuity {
+            self.mapping = None;
+        }
+        if raw.is_some() {
+            self.mapping = mapping_raw
+                .zip(self.mapping_generation)
+                .map(|(raw, generation)| PtsMappingSnapshot {
+                    raw,
+                    timebase: self.timebase,
+                    media_ns: guarded,
+                    generation,
+                });
+        }
         self.last_raw_ns = Some(raw_ns);
         self.last_media_ns = Some(guarded);
         Ok(MediaTime::from_nanos(guarded))
@@ -307,5 +455,27 @@ impl PtsNormalizer {
         }
         self.last_raw = Some(raw);
         raw.saturating_add(self.accumulated_wrap)
+    }
+}
+
+#[cfg(test)]
+mod mapping_generation_tests {
+    use super::{PtsNormalizer, Rational, WrapBits};
+
+    #[test]
+    fn generation_exhaustion_permanently_disables_snapshots() {
+        let mut n = PtsNormalizer::new(WrapBits::None, Rational::new(1, 90_000), Rational::FPS_25);
+        n.mapping_generation = Some(u64::MAX);
+        assert!(n.normalize(Some(0), 0).is_ok());
+        assert!(n.mapping_snapshot().is_some());
+        n.mark_discontinuity();
+        assert_eq!(n.mapping_generation(), None);
+        assert!(n.mapping_snapshot().is_none());
+        assert!(n.normalize(Some(1), 0).is_ok());
+        assert!(n.mapping_snapshot().is_none());
+        assert!(n.normalize(Some(90_000 * 60), 0).is_ok());
+        n.mark_discontinuity();
+        assert_eq!(n.mapping_generation(), None);
+        assert!(n.mapping_snapshot().is_none());
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "multiview-weather"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+chrono = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+quick-xml = { version = "0.41", features = ["serialize", "encoding"] }
+
+[lints]
+workspace = true

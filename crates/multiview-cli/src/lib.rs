@@ -68,6 +68,7 @@ pub fn log_ring() -> Option<std::sync::Arc<multiview_telemetry::LogRing>> {
 /// software/CPU adapter (the silent CPU fallback) and emit a latched, actionable
 /// `gpu-present-no-vulkan-adapter` warning through the engine's drop-oldest
 /// publisher. A thin seam over the pure hal cross-check + the control emit helper.
+pub mod av_sync;
 pub mod boot;
 pub mod capability_warn;
 pub mod cli;
@@ -76,6 +77,7 @@ pub mod cli;
 /// the Web/API uses; an invalid file changes nothing (warn + health event).
 pub mod config_watch;
 pub mod control;
+pub mod hls_event_observer;
 /// The Conspect entitlement-plane wiring for the cli (CONSPECT-2b/10, ADR-0050):
 /// the shared lease store, the published [`licence::WatermarkSignal`] the engine
 /// bake samples lock-free (S3), and the sampled [`multiview_licence::EnforcementLevel`]
@@ -92,6 +94,9 @@ pub mod live_sources;
 /// back-pressure the engine (inv #10). Always compiled (the pure meter is
 /// GPU/FFmpeg-free); the bake-consumer wiring lives behind the `ffmpeg` pipeline.
 pub mod loudness_telemetry;
+/// Off-hot-path program-bus peak/RMS meter telemetry (`audio.meter`, ~30 Hz,
+/// conflated + drop-oldest; inv #10) published from the bake consumer.
+pub mod meter_telemetry;
 /// The CONSPECT local-metrics retention feed (engine-seam S5; ADR-0052 §3): an
 /// off-hot-loop, read-only subscriber that mirrors live engine events
 /// (utilisation / per-input reconnect / incident markers) into the
@@ -118,6 +123,11 @@ pub mod outputs;
 pub mod placement;
 pub mod preview;
 pub mod run;
+pub mod source_event_hls_bridge;
+pub mod source_event_ingest;
+pub mod source_event_packet;
+pub mod source_event_runtime;
+pub mod source_event_service;
 /// Map the HAL probe + compiled features + resolved compositor adapter onto the
 /// [`multiview_control::system::SystemCapabilities`] DTO for
 /// `GET /api/v1/system/capabilities` (ADR-W030). A static startup snapshot
@@ -181,6 +191,12 @@ pub mod player;
 /// `gpl-codecs` on top.
 #[cfg(feature = "ffmpeg")]
 pub mod pipeline;
+
+/// Live HLS segment fetcher: parallel byte-range segment downloads served to
+/// the libav demuxer from memory over loopback, so a source whose single TCP
+/// flow delivers below real time still plays. Behind the `ffmpeg` feature.
+#[cfg(feature = "ffmpeg")]
+pub mod hls_fetch;
 
 /// Per-source **runtime audio ingest** (AUD-2): the audio peer of the video
 /// decode thread. Opens + decodes each file/URL source's audio on its own

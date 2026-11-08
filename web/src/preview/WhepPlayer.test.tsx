@@ -22,10 +22,12 @@ class FakeMediaStream {
 class FakePeerConnection extends EventTarget {
   iceGatheringState: RTCIceGatheringState = 'complete';
   connectionState: RTCPeerConnectionState = 'new';
+  iceConnectionState: RTCIceConnectionState = 'checking';
   localDescription: RTCSessionDescription | null = null;
   remoteSdp: string | undefined;
   closed = false;
   statsBytes = 0;
+  statsRows: Record<string, unknown>[] | undefined;
 
   ontrack: ((event: RTCTrackEvent) => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
@@ -57,6 +59,7 @@ class FakePeerConnection extends EventTarget {
   }
 
   getStats(): Promise<RTCStatsReport> {
+    if (this.statsRows) return Promise.resolve(new Map(this.statsRows.map((row, i) => [String(i), row])));
     const map = new Map<string, unknown>();
     map.set('in', {
       id: 'in',
@@ -78,8 +81,8 @@ class FakePeerConnection extends EventTarget {
   }
 
   /** Test helper: deliver an inbound track. */
-  emitTrack(): void {
-    const event = { track: { kind: 'video' } } as unknown as RTCTrackEvent;
+  emitTrack(kind: 'audio' | 'video' = 'video'): void {
+    const event = { track: { kind } } as unknown as RTCTrackEvent;
     this.ontrack?.(event);
   }
 }
@@ -119,6 +122,100 @@ afterEach(() => {
 });
 
 describe('<WhepPlayer>', () => {
+  it('reports an ICE failure immediately and stops callbacks after cleanup', async () => {
+    const onFatal = vi.fn();
+    const { unmount } = renderWithProviders(<WhepPlayer endpoint="/private-token" label="Input" pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection} fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))} onFatal={onFatal} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const pc = FakePeerConnection.last!;
+    act(() => { pc.iceConnectionState = 'failed'; pc.dispatchEvent(new Event('iceconnectionstatechange')); });
+    expect(onFatal).toHaveBeenCalledWith(expect.objectContaining({ stage: 'ice-failed', httpStatus: 201 }));
+    unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
+    expect(onFatal).toHaveBeenCalledTimes(1);
+    expect(pc.closed).toBe(true);
+  });
+
+  it('reports connection timeout without claiming blocked UDP', async () => {
+    const onFatal = vi.fn();
+    renderWithProviders(<WhepPlayer endpoint="/private-token" label="Input" pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection} fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))} onFatal={onFatal} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(16000); });
+    expect(onFatal).toHaveBeenCalledWith(expect.objectContaining({ stage: 'ice-timeout', httpStatus: 201, ice: 'checking' }));
+    expect(JSON.stringify(onFatal.mock.calls)).not.toMatch(/private-token|blocked|sessions/);
+  });
+
+  it.each([
+    ['dtls-failed', [{ type: 'transport', dtlsState: 'failed' }]],
+    ['video-no-rtp', [{ type: 'inbound-rtp', kind: 'video', bytesReceived: 0, framesDecoded: 0 }]],
+    ['video-no-decode', [{ type: 'inbound-rtp', kind: 'video', bytesReceived: 100, framesDecoded: 0 }]],
+    ['media-unknown', []],
+  ] as const)('reports %s from safe mocked stats', async (stage, rows) => {
+    const onFatal = vi.fn();
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+    renderWithProviders(<WhepPlayer endpoint="/private-token" label="Input" pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection} fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))} onFatal={onFatal} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const pc = FakePeerConnection.last!;
+    pc.statsRows = [...rows];
+    if (stage !== 'dtls-failed') act(() => { pc.emitConnectionState('connected'); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(8000); });
+    expect(onFatal).toHaveBeenCalledWith(expect.objectContaining({ stage }));
+    play.mockRestore();
+  });
+
+  it('reports playback rejection without exposing the browser error', async () => {
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockRejectedValue(new Error('secret SDP'));
+    const onFatal = vi.fn();
+    renderWithProviders(<WhepPlayer endpoint="/private-token" label="Input" pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection} fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))} onFatal={onFatal} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); FakePeerConnection.last?.emitConnectionState('connected'); });
+    expect(onFatal).toHaveBeenCalledWith(expect.objectContaining({ stage: 'media-play-error' }));
+    expect(JSON.stringify(onFatal.mock.calls)).not.toContain('secret');
+    play.mockRestore();
+  });
+
+  it.each((['checking', 'connected', 'completed'] as const).flatMap((ice) => ['connecting', 'unknown', 'failed'].map((dtls) => ({ ice, dtls }))))('classifies timeout with ICE $ice and DTLS $dtls truthfully', async ({ ice, dtls }) => {
+    const onFatal = vi.fn();
+    renderWithProviders(<WhepPlayer endpoint="/preview" label="Input" pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection} fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))} onFatal={onFatal} />);
+    FakePeerConnection.last!.iceConnectionState = ice;
+    FakePeerConnection.last!.statsRows = [{ type: 'transport', dtlsState: dtls }];
+    await act(async () => { await vi.advanceTimersByTimeAsync(16000); });
+    expect(onFatal).toHaveBeenCalledWith(expect.objectContaining({ stage: dtls === 'failed' ? 'dtls-failed' : ice === 'checking' ? 'ice-timeout' : 'connection-timeout' }));
+  });
+
+  it('rejects stale preconnect stats and keeps only one request outstanding', async () => {
+    const onFatal = vi.fn();
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+    const { unmount } = renderWithProviders(<WhepPlayer endpoint="/preview" label="Input" pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection} fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))} onFatal={onFatal} />);
+    const pc = FakePeerConnection.last!;
+    let resolve: ((report: RTCStatsReport) => void) | undefined;
+    const stats = vi.spyOn(pc, 'getStats').mockImplementation(() => new Promise((done) => { resolve = done; }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(stats).toHaveBeenCalledTimes(1);
+    act(() => { pc.emitConnectionState('connected'); });
+    await act(async () => { resolve?.(new Map([['transport', { type: 'transport', dtlsState: 'failed' }]])); await Promise.resolve(); });
+    expect(onFatal).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(stats).toHaveBeenCalledTimes(2);
+    unmount();
+    await act(async () => { resolve?.(new Map([['transport', { type: 'transport', dtlsState: 'failed' }]])); await vi.advanceTimersByTimeAsync(10000); });
+    expect(onFatal).not.toHaveBeenCalled();
+    expect(stats).toHaveBeenCalledTimes(2);
+    play.mockRestore();
+  });
+
+  it.each(['frozen', 'advancing', 'absent'] as const)('handles %s decoded counters while RTP grows', async (mode) => {
+    const onFatal = vi.fn();
+    const play = vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue();
+    renderWithProviders(<WhepPlayer endpoint="/preview" label="Input" pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection} fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))} onFatal={onFatal} />);
+    const pc = FakePeerConnection.last!;
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); pc.emitConnectionState('connected'); });
+    for (let i = 1; i <= 9; i++) {
+      pc.statsRows = [{ type: 'inbound-rtp', kind: 'video', bytesReceived: i * 100, ...(mode === 'absent' ? {} : { framesDecoded: mode === 'frozen' ? 1 : i }) }];
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    }
+    if (mode === 'frozen') expect(onFatal).toHaveBeenCalledWith(expect.objectContaining({ stage: 'video-stalled' }));
+    else expect(onFatal).not.toHaveBeenCalled();
+    play.mockRestore();
+  });
+
   it('negotiates: POSTs the gathered offer, applies the answer, reaches playing', async () => {
     const fetchImpl = makeFetch(() => sdpResponse(201, 'sessions/abc'));
     const onStatus = vi.fn();
@@ -131,9 +228,9 @@ describe('<WhepPlayer>', () => {
         onStatus={onStatus}
       />,
     );
-    // Let the negotiate microtasks settle (createOffer → POST → setRemote).
+    // Settle negotiation without advancing the new 15-second connection deadline.
     await act(async () => {
-      await vi.runOnlyPendingTimersAsync();
+      await vi.advanceTimersByTimeAsync(0);
     });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     const init = fetchImpl.mock.calls[0]?.[1];
@@ -149,6 +246,83 @@ describe('<WhepPlayer>', () => {
     });
     expect(getByTestId('whep-player').getAttribute('data-status')).toBe('playing');
     expect(onStatus).toHaveBeenCalledWith('playing');
+  });
+
+  it.each([['video', 'audio'], ['audio', 'video']] as const)(
+    'keeps video attached when %s arrives before %s on separate streams',
+    (first, second) => {
+      const { container } = renderWithProviders(
+        <WhepPlayer
+          endpoint="/api/v1/preview/inputs/au-abc-news/whep"
+          label="Input au-abc-news"
+          pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection}
+          fetchImpl={makeFetch(() => sdpResponse(201, 'sessions/abc'))}
+        />,
+      );
+      const video = container.querySelector('video');
+      const pc = FakePeerConnection.last;
+      expect(video).not.toBeNull();
+      act(() => { pc?.emitTrack(first); });
+      const attached = video?.srcObject as unknown as FakeMediaStream;
+      expect(attached).toBeInstanceOf(FakeMediaStream);
+      act(() => { pc?.emitTrack(second); });
+      expect(video?.srcObject).toBe(attached);
+      expect(attached.tracks.map((track) => track.kind)).toEqual([first, second]);
+    },
+  );
+
+  it('waits for program DELETE before it signals the next focus', async () => {
+    let finishDelete: ((response: Response) => void) | undefined;
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) =>
+      init?.method === 'DELETE'
+        ? new Promise<Response>((resolve) => { finishDelete = resolve; })
+        : Promise.resolve(sdpResponse(201, 'sessions/abc')),
+    );
+    const onSessionReleased = vi.fn();
+    const { unmount } = renderWithProviders(
+      <WhepPlayer
+        endpoint="/api/v1/preview/program/whep"
+        label="Program"
+        pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={fetchImpl}
+        onSessionReleased={onSessionReleased}
+      />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    unmount();
+    expect(fetchImpl.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(true);
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await act(async () => { finishDelete?.(sdpResponse(204)); await Promise.resolve(); });
+    expect(onSessionReleased).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not release focus until a late POST has its DELETE response', async () => {
+    let finishPost: ((response: Response) => void) | undefined;
+    let finishDelete: ((response: Response) => void) | undefined;
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation((_url, init) =>
+      init?.method === 'DELETE'
+        ? new Promise<Response>((resolve) => { finishDelete = resolve; })
+        : new Promise<Response>((resolve) => { finishPost = resolve; }),
+    );
+    const onSessionReleased = vi.fn();
+    const { unmount } = renderWithProviders(
+      <WhepPlayer
+        endpoint="/api/v1/preview/program/whep"
+        label="Program"
+        pcFactory={() => new FakePeerConnection() as unknown as RTCPeerConnection}
+        fetchImpl={fetchImpl}
+        onSessionReleased={onSessionReleased}
+      />,
+    );
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+    expect(fetchImpl.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    unmount();
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await act(async () => { finishPost?.(sdpResponse(201, 'sessions/late')); await Promise.resolve(); });
+    expect(fetchImpl.mock.calls.filter(([, init]) => init?.method === 'DELETE')).toHaveLength(1);
+    expect(onSessionReleased).not.toHaveBeenCalled();
+    await act(async () => { finishDelete?.(sdpResponse(204)); await Promise.resolve(); });
+    expect(onSessionReleased).toHaveBeenCalledTimes(1);
   });
 
   it('calls onFatal when the connection state goes to failed', async () => {
@@ -172,8 +346,8 @@ describe('<WhepPlayer>', () => {
     expect(onFatal).toHaveBeenCalledTimes(1);
   });
 
-  it('calls onFatal when the WHEP POST is rejected (non-2xx)', async () => {
-    const fetchImpl = makeFetch(() => sdpResponse(503));
+  it.each([503, 401, 500])('reports safe HTTP status %s on WHEP rejection', async (status) => {
+    const fetchImpl = makeFetch(() => sdpResponse(status));
     const onFatal = vi.fn();
     renderWithProviders(
       <WhepPlayer
@@ -191,6 +365,7 @@ describe('<WhepPlayer>', () => {
       await Promise.resolve();
     });
     expect(onFatal).toHaveBeenCalledTimes(1);
+    expect(onFatal).toHaveBeenCalledWith(expect.objectContaining({ httpStatus: status, stage: status === 503 ? 'http-capacity' : 'http-error' }));
   });
 
   it('fails when inbound bytes never advance (the stats stall watchdog)', async () => {

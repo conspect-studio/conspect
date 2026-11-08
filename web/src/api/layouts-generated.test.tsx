@@ -33,6 +33,13 @@ let lastCreatedId: string | null = null;
 // error (the server is strict), confirming the test is genuinely red.
 const server = setupServer(
   http.get(`${BASE}/api/v1/layouts`, () => HttpResponse.json(store)),
+  // READ ONE — a save with no cached ETag asks the server first; an unknown id is 404.
+  http.get(`${BASE}/api/v1/layouts/:id`, ({ params }) => {
+    const found = store.find((l) => l.id === String(params.id));
+    return found === undefined
+      ? HttpResponse.json({ title: 'not found', status: 404 }, { status: 404 })
+      : HttpResponse.json(found, { headers: { ETag: '"v1"' } });
+  }),
 
   // CREATE — spec: POST /api/v1/layouts/{id}  (id supplied by the caller)
   http.post(`${BASE}/api/v1/layouts/:id`, async ({ request, params }) => {

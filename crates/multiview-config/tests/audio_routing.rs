@@ -285,3 +285,35 @@ fn programmatic_construction_validates() {
     sel.validate("out0", &["prog", "trk_a"])
         .expect("a known-track selection validates");
 }
+
+#[test]
+fn auto_mode_parses_validates_and_resolves_program_plus_every_track() {
+    let doc = BASE.replace(
+        "mode = \"tracks\"\ntracks = [\"prog\", \"trk_a\", \"trk_b\"]",
+        "mode = \"auto\"",
+    );
+    let cfg = parse(&doc);
+    cfg.validate().expect("auto mode validates");
+    let sel = cfg.outputs[0].audio().expect("audio block");
+    assert_eq!(sel.mode, OutputAudioMode::Auto);
+    assert_eq!(
+        sel.discrete_track_count(),
+        0,
+        "auto never fails the capability gate"
+    );
+    assert_eq!(
+        sel.resolve(&["trk_a", "trk_b"]),
+        (true, vec!["trk_a", "trk_b"])
+    );
+}
+
+#[test]
+fn resolve_honours_program_and_tracks_modes() {
+    let tracks: OutputAudio =
+        serde_json::from_value(serde_json::json!({ "mode": "tracks", "tracks": ["trk_b"] }))
+            .expect("tracks selection");
+    assert_eq!(tracks.resolve(&["trk_a", "trk_b"]), (false, vec!["trk_b"]));
+    let program: OutputAudio =
+        serde_json::from_value(serde_json::json!({ "mode": "program" })).expect("program");
+    assert_eq!(program.resolve(&["trk_a"]), (true, Vec::<&str>::new()));
+}

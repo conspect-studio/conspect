@@ -77,6 +77,12 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "blocking",
 ], optional = true }
+# The live HLS segment fetcher (`hls_fetch`): a small blocking rustls client for
+# parallel byte-range segment GETs over lossy/high-RTT paths, plus URI
+# resolution. Optional, pulled in only by `ffmpeg` (off by default, like
+# `ffmpeg-next`), both already in the workspace lock.
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"], optional = true }
+url = { version = "2", optional = true }
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 thiserror = { workspace = true }
@@ -175,11 +181,25 @@ serde_json = { workspace = true }
 # and output-anchored stamp monotonicity across loop laps. Matches the
 # workspace proptest pin used by multiview-core/config/etc.
 proptest = "1.5.0"
+# Test-only zlib/DEFLATE for the in-process PNG artifact the full-timer-readout
+# overlay test writes (crates/multiview-cli/src/synth.rs). The `overlay`
+# feature-gated clippy/test leg runs on a bare runner with NO `ffmpeg` binary
+# (docs: .github/workflows/ci.yml "feature-gated clippy" matrix), so the test
+# must encode its PNG itself rather than shelling out to `ffmpeg`. `flate2` is
+# already allowlisted (MIT/Apache-2.0, deny.toml) and already in the workspace
+# graph transitively via `xtask`'s `ureq`; pulling it here as a direct dev-dep
+# adds no new license/advisory surface.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # The pipeline-ingest integration test needs the `ffmpeg` feature (a libav*
 # build + the `ffmpeg`/`ffprobe` CLIs at runtime).
 [[test]]
 name = "pipeline_ingest"
+required-features = ["ffmpeg"]
+
+# Audio routing applies live to the running program bus (no restart).
+[[test]]
+name = "live_audio_routing_http"
 required-features = ["ffmpeg"]
 
 # The streaming-encode behavioural tests (ADR-0025) drive the bounded
@@ -311,6 +331,10 @@ qsv = ["multiview-hal/qsv"]
 # build can serve the full management UI: `run --features web,overlay`.
 web = ["multiview-control/embed-web"]
 
+# Persist stored layouts to `<config-dir>/.multiview/layouts.db` (SQLite) so they
+# survive a restart. Off by default; on in the platform presets.
+sqlite = ["multiview-control/sqlite"]
+
 # Control-plane TLS termination (TLS-0, ADR-W029): serve the management plane
 # (API + docs + web UI) over HTTPS with an operator-managed cert/key when the
 # config carries `[control.tls]`. Forwards `multiview-control/tls` (axum-server +
@@ -425,6 +449,8 @@ ptp = ["multiview-engine/ptp"]
 ffmpeg = [
     "dep:ffmpeg-next",
     "dep:tempfile",
+    "dep:ureq",
+    "dep:url",
     # `test-fixtures` (⊇ `multiview-ffmpeg/ffmpeg`) exposes the libav-built `dvbsub`
     # MPEG-TS fixture generator the DVB-sub end-to-end test needs (the FFmpeg CLI
     # cannot transcode text → bitmap subtitle). It is forwarded via the `ffmpeg`
@@ -523,6 +549,7 @@ nvidia = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "sqlite",
     # The cli's OWN `ffmpeg` feature — gates the run/pipeline path itself; without
     # it `multiview run` has no ingest/encode pipeline at all (GPU-6b: the presets
     # forwarded the dependency crates' ffmpeg but not the cli's, so a `--features
@@ -586,6 +613,7 @@ apple = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "sqlite",
     "ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped Apple deploy image
@@ -614,6 +642,7 @@ linux-vaapi = [
     # Control-plane HTTPS (TLS-0, ADR-W029): the shipped image can terminate TLS
     # on the management listener with an operator cert (`[control.tls]`).
     "tls",
+    "sqlite",
     "ffmpeg",
     # Native overlay / caption burn-in (see the `nvidia` preset note). GPU-free,
     # LGPL-clean pure-Rust text engine; without it the shipped VAAPI deploy image

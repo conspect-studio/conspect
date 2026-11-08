@@ -15,12 +15,14 @@ import { getStoredToken } from '../api/token';
  * refreshed every `refreshMs`. Returns `undefined` until a frame arrives (the
  * endpoint answers 503 when the engine has produced none yet).
  */
-export function useJpegPreview(path: string, refreshMs: number): string | undefined {
-  const [url, setUrl] = useState<string | undefined>(undefined);
+export function useJpegPreview(path: string, refreshMs: number, enabled = true): string | undefined {
+  const [frame, setFrame] = useState<{ path: string; url: string }>();
   const current = useRef<string | undefined>(undefined);
 
   useEffect(() => {
-    let cancelled = false;
+    if (!enabled) return;
+    let inFlight = false;
+    let controller: AbortController | undefined;
 
     const revoke = (): void => {
       if (current.current !== undefined) {
@@ -30,37 +32,54 @@ export function useJpegPreview(path: string, refreshMs: number): string | undefi
     };
 
     const tick = async (): Promise<void> => {
+      if (inFlight || document.visibilityState === 'hidden') {
+        return;
+      }
+      inFlight = true;
+      const requestController = new AbortController();
+      controller = requestController;
       const headers: Record<string, string> = {};
       const token = getStoredToken();
       if (token !== undefined) {
         headers.Authorization = `Bearer ${token}`;
       }
       try {
-        const resp = await fetch(path, { headers, cache: 'no-store' });
+        const resp = await fetch(path, {
+          headers,
+          cache: 'no-store',
+          signal: requestController.signal,
+        });
         if (!resp.ok) {
           return;
         }
         const blob = await resp.blob();
-        if (cancelled) {
+        const next = URL.createObjectURL(blob);
+        if (controller !== requestController) {
+          URL.revokeObjectURL(next);
           return;
         }
-        const next = URL.createObjectURL(blob);
         revoke();
         current.current = next;
-        setUrl(next);
+        setFrame({ path, url: next });
       } catch {
         // Best-effort preview; a failed fetch just keeps the last frame.
+      } finally {
+        if (controller === requestController) {
+          controller = undefined;
+          inFlight = false;
+        }
       }
     };
 
     void tick();
     const handle = window.setInterval(() => void tick(), refreshMs);
     return (): void => {
-      cancelled = true;
       window.clearInterval(handle);
+      controller?.abort();
+      controller = undefined;
       revoke();
     };
-  }, [path, refreshMs]);
+  }, [path, refreshMs, enabled]);
 
-  return url;
+  return frame?.path === path ? frame.url : undefined;
 }

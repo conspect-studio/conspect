@@ -59,6 +59,8 @@ fn nvenc_gets_ull_zerolatency_cbr_and_forced_idr() {
         expect(&[
             ("g", "30"),
             ("bf", "0"),
+            ("profile", "baseline"),
+            ("level", "3.1"),
             ("tune", "ull"),
             ("zerolatency", "1"),
             ("delay", "0"),
@@ -76,6 +78,8 @@ fn vaapi_gets_cbr_rate_control() {
         expect(&[
             ("g", "30"),
             ("bf", "0"),
+            ("profile", "constrained_baseline"),
+            ("level", "3.1"),
             ("rc_mode", "CBR"),
             ("async_depth", "1"),
         ])
@@ -90,6 +94,8 @@ fn videotoolbox_gets_realtime() {
         expect(&[
             ("g", "30"),
             ("bf", "0"),
+            ("profile", "baseline"),
+            ("level", "3.1"),
             ("realtime", "1"),
             ("prio_speed", "1"),
         ])
@@ -104,6 +110,8 @@ fn libx264_gets_zerolatency_tune_and_forced_idr() {
         expect(&[
             ("g", "30"),
             ("bf", "0"),
+            ("profile", "baseline"),
+            ("level", "3.1"),
             ("tune", "zerolatency"),
             ("forced-idr", "1"),
         ])

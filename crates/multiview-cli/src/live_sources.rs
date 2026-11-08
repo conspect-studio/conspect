@@ -201,6 +201,12 @@ pub trait IngestSpawner: Send + Sync {
     /// `None` when the spawn failed (logged by the implementation; the tile
     /// rides the slate honestly).
     fn spawn(&self, spawn: SourceSpawn, registry: &StopRegistry) -> Option<SpawnedProducer>;
+
+    /// A source now running without decoded audio. Hub worker only.
+    fn source_without_audio(&self, _id: &str) {}
+
+    /// A source left the run. Hub worker only.
+    fn source_removed(&self, _id: &str) {}
 }
 
 /// A request travelling from the frame-boundary drain to the hub worker.
@@ -390,6 +396,9 @@ fn worker_loop(
                 // producer first, then spawn the replacement into the SAME
                 // store (the drain reused it, so the tile holds last-good).
                 teardown(&spawn.id, &mut owned, registry);
+                if let Some(ingest) = ingest {
+                    ingest.source_without_audio(&spawn.id);
+                }
                 spawn_synth(spawn, &mut owned, registry, preview);
             }
             HubRequest::SpawnSource(spawn) => {
@@ -401,6 +410,9 @@ fn worker_loop(
             }
             HubRequest::Teardown { id } => {
                 teardown(&id, &mut owned, registry);
+                if let Some(ingest) = ingest {
+                    ingest.source_removed(&id);
+                }
                 preview_remove(preview, &id);
             }
             HubRequest::Shutdown => break,
@@ -481,6 +493,8 @@ fn spawn_synth(
         preview_insert(preview, &id, &store);
         return;
     }
+    #[cfg(feature = "ffmpeg")]
+    let lifecycle = crate::pipeline::begin_live_lifecycle(&id);
     let stop = Arc::new(AtomicBool::new(false));
     let exited = register_stop(registry, &id, &stop);
     // ExitGuard built BEFORE spawn: its Drop flips `exited` on thread exit OR if
@@ -490,9 +504,23 @@ fn spawn_synth(
     preview_insert(preview, &id, &store);
     let thread_stop = Arc::clone(&stop);
     let thread_store = Arc::clone(&store);
+    #[cfg(feature = "ffmpeg")]
+    let thread_id = id.clone();
     let builder = std::thread::Builder::new().name(format!("multiview-synth-live-{id}"));
     match builder.spawn(move || {
         let _exit = exit_guard;
+        #[cfg(feature = "ffmpeg")]
+        crate::synth::generator_loop_fenced(
+            kind,
+            &thread_store,
+            width,
+            height,
+            canvas,
+            cadence,
+            &thread_stop,
+            Some((&thread_id, lifecycle)),
+        );
+        #[cfg(not(feature = "ffmpeg"))]
         crate::synth::generator_loop(
             kind,
             &thread_store,

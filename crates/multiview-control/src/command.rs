@@ -636,6 +636,19 @@ impl CommandSender {
         }
     }
 
+    /// Reserve a bounded queue slot before a durable control-plane commit.
+    /// The engine never awaits this reservation; a saturated bus sheds now.
+    ///
+    /// # Errors
+    /// A full or closed bus rejects the reservation without enqueueing.
+    pub fn try_reserve(&self) -> Result<tokio::sync::mpsc::Permit<'_, Command>, SubmitError> {
+        match self.tx.try_reserve() {
+            Ok(permit) => Ok(permit),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => Err(SubmitError::Full),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => Err(SubmitError::Closed),
+        }
+    }
+
     /// The bounded queue depth (the maximum number of un-drained commands).
     #[must_use]
     pub fn capacity(&self) -> usize {

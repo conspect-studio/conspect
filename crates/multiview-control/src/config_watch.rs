@@ -880,6 +880,15 @@ async fn watch_loop(
                 // sections the engine actually applied LIVE, so a shed left it at
                 // the adopted state — there is no global gate to unstick.
                 let _mutation = state.lock_config_mutation().await;
+                if let Err(error) = commit_watched_desired(&state, &baseline).await {
+                    reject(
+                        &state,
+                        &path,
+                        &format!("restoring desired state: {error}"),
+                        &mut invalid_active,
+                    );
+                    continue;
+                }
                 resync_all_stores(&state, ACTOR, &baseline);
                 clear_apply_incomplete(&state, &path, &mut incomplete_active);
                 state.running_changed.notify_one();
@@ -977,6 +986,15 @@ async fn watch_loop(
                 // adoption already kept it at the adopted state through the
                 // shed).
                 let _mutation = state.lock_config_mutation().await;
+                if let Err(error) = commit_watched_desired(&state, &baseline).await {
+                    reject(
+                        &state,
+                        &path,
+                        &format!("restoring desired state: {error}"),
+                        &mut invalid_active,
+                    );
+                    continue;
+                }
                 resync_all_stores(&state, ACTOR, &baseline);
                 clear_apply_incomplete(&state, &path, &mut incomplete_active);
                 state.running_changed.notify_one();
@@ -1001,6 +1019,7 @@ async fn watch_loop(
                 &mut invalid_active,
                 &mut incomplete_active,
             )
+            .await
         };
         match apply_result {
             ApplyResult::Settled => {
@@ -1075,7 +1094,7 @@ enum ApplyResult {
 /// diff, apply through the one machinery, advance the baseline — unless a
 /// command was shed, in which case NOTHING advances and the apply is retried
 /// on a later poll (review M1).
-fn apply_change(
+async fn apply_change(
     path: &Path,
     text: &str,
     baseline: &mut MultiviewConfig,
@@ -1098,6 +1117,15 @@ fn apply_change(
         // the stores may have followed the abandoned content — re-converge
         // them to the file before clearing the interim warning.
         if *incomplete_active {
+            if let Err(error) = commit_watched_desired(state, &next).await {
+                reject(
+                    state,
+                    path,
+                    &format!("restoring desired state: {error}"),
+                    invalid_active,
+                );
+                return ApplyResult::Retry;
+            }
             resync_all_stores(state, ACTOR, &next);
             clear_apply_incomplete(state, path, incomplete_active);
         }
@@ -1116,6 +1144,18 @@ fn apply_change(
         state.running_changed.notify_one();
         tracing::debug!(path = %path.display(), "config file rewritten with identical content");
         return ApplyResult::Settled;
+    }
+    // The file is external intent. Publish its whole validated envelope before
+    // any control store or command changes, so an I/O refusal leaves state intact.
+    // A shed command does not undo accepted intent; the poll retries its live apply.
+    if let Err(error) = commit_watched_desired(state, &next).await {
+        reject(
+            state,
+            path,
+            &format!("committing desired state: {error}"),
+            invalid_active,
+        );
+        return ApplyResult::Retry;
     }
     let outcome = apply_document_diff(state, ACTOR, &diff, &next);
     // The document is valid either way — the invalid latch clears even when
@@ -1141,23 +1181,10 @@ fn apply_change(
             ),
         );
         publish_apply_incomplete(state, path, outcome.shed, incomplete_active);
-        // MAJOR-B round 4: a command was SHED — the engine did NOT adopt this
-        // document, so the adopted snapshot is left UNCHANGED (it still reflects
-        // the last fully-adopted document). The idempotent retry on a later poll
-        // adopts it when it lands. active.toml therefore never captures the
-        // mid-retry store state.
         return ApplyResult::Retry;
     }
     *baseline = next;
     clear_apply_incomplete(state, path, incomplete_active);
-    // MAJOR-B round 5: the apply landed completely. The adopted snapshot was
-    // ALREADY advanced PER-SECTION inside `apply_document_diff` for exactly the
-    // sections the engine applied LIVE (synthetic sources via UpsertSource,
-    // layout via ApplyLayout) — restart-only sections (a non-synthetic source,
-    // a Class-2 canvas/layout, outputs/probes/devices/sync_groups/audio) applied
-    // NOTHING to the snapshot, so they never leak into `active.toml`. No
-    // wholesale adoption here (that was the round-4 over-adoption). Re-fire so
-    // the debounced persister captures the per-section-updated snapshot.
     state.running_changed.notify_one();
     state
         .config_watch
@@ -1166,17 +1193,27 @@ fn apply_change(
         state
             .config_watch
             .add_restart_pending(outcome.restart.iter().cloned());
-        // Warn with the LATCHED union (every section pending since start), so
-        // the single coalesced warning entry stays complete.
         let pending = state.config_watch.snapshot().restart_pending;
         publish_requires_restart(state, &pending);
     }
-    tracing::info!(
-        path = %path.display(),
-        summary = %outcome.summary,
-        "applied an external config-file change (ADR-W020)"
-    );
+    tracing::info!(path = %path.display(), summary = %outcome.summary, "applied an external config-file change (ADR-W020)");
     ApplyResult::Settled
+}
+
+/// Commit file intent before changing live state. The selected identity and
+/// output map come from the authoritative envelope, never the stale store.
+async fn commit_watched_desired(
+    state: &AppState,
+    next: &MultiviewConfig,
+) -> crate::ControlResult<()> {
+    if state.boot_model.is_none() {
+        return Ok(());
+    }
+    let layouts = crate::boot_model::layout_library(state)?;
+    let output_ids = crate::boot_model::output_ids_for_config(state, next)?;
+    let selected = crate::boot_model::selected_layout_id(state, next, &layouts)?;
+    crate::boot_model::commit_desired_document(state, next.clone(), layouts, selected, output_ids)
+        .await
 }
 
 /// What one document apply did: the human summary, the restart-only sections,
@@ -1310,7 +1347,7 @@ pub fn apply_document_diff(
         }
         restart.insert((*section).to_owned());
         match *section {
-            "outputs" => resync_store(state, actor, &state.outputs, &desired_outputs(next)),
+            "outputs" => resync_outputs(state, actor, next),
             "probes" => resync_store(state, actor, &state.probes, &desired_probes(next)),
             "devices" => {
                 resync_store(state, actor, &state.devices, &desired_devices(next));
@@ -1712,14 +1749,25 @@ fn working_layout_body(config: &MultiviewConfig) -> Option<serde_json::Value> {
 /// Update (or recreate) the working layout in the layouts repository so the
 /// UI layout editor reflects the file immediately.
 fn reseed_working_layout(state: &AppState, actor: &str, id: &str, body: &serde_json::Value) {
+    // A modeled run commits before it applies, so the library is the envelope's.
+    // A row written here would be a projection drift, not an accepted layout.
+    if state.boot_model.is_some() {
+        return;
+    }
     let input = LayoutInput {
         name: id.to_owned(),
         body: body.clone(),
     };
-    let updated = state
-        .repository
-        .update_layout(id, input.clone())
-        .or_else(|_| state.repository.create_layout(id, input));
+    // An operator's saved definition is not the working canvas. A file watch
+    // must not overwrite an existing library ID merely because its old seed
+    // happened to share the same name.
+    let updated = match state.repository.get_layout(id) {
+        Ok(_) => return,
+        Err(crate::error::ControlError::NotFound { .. }) => {
+            state.repository.create_layout(id, input)
+        }
+        Err(error) => Err(error),
+    };
     match updated {
         Ok(_) => {
             state.audit(
@@ -1749,16 +1797,40 @@ fn resync_store(
     store: &Arc<dyn ResourceRepository>,
     desired: &[(String, ResourceInput)],
 ) {
-    let existing: Vec<String> = match store.list() {
-        Ok(list) => list.into_iter().map(|v| v.resource.id).collect(),
+    let entries = match store.list() {
+        Ok(list) => list,
         Err(error) => {
             tracing::warn!(kind = store.kind(), error = %error, "config-file resync: list failed");
             return;
         }
     };
+    let existing: Vec<String> = entries.iter().map(|v| v.resource.id.clone()).collect();
     for (id, input) in desired {
-        let result = if existing.iter().any(|e| e == id) {
-            store.update(id, input.clone()).map(|_| AuditAction::Update)
+        // An unchanged item keeps its version and API name. A write here would
+        // raise the store above the envelope with no matching commit, and a
+        // restart would hand that tag out again for a different body.
+        let current = entries.iter().find(|entry| entry.resource.id == *id);
+        if current.is_some_and(|entry| {
+            crate::boot_model::same_resource_body(store.kind(), &entry.resource.body, &input.body)
+        }) {
+            continue;
+        }
+        let result = if let Some(entry) = current {
+            // A name set over REST lives only in the envelope, so a file edit
+            // keeps it unless the file changed its own display name.
+            let authored = |body: &serde_json::Value| body.get("display_name").cloned();
+            let keep = state.boot_model.is_some()
+                && authored(&entry.resource.body) == authored(&input.body);
+            let name = if keep {
+                entry.resource.name.clone()
+            } else {
+                input.name.clone()
+            };
+            let input = ResourceInput {
+                name,
+                body: input.body.clone(),
+            };
+            store.update(id, input).map(|_| AuditAction::Update)
         } else {
             store.create(id, input.clone()).map(|_| AuditAction::Create)
         };
@@ -1792,6 +1864,9 @@ fn resync_audio(state: &AppState, actor: &str, next: &MultiviewConfig) {
         );
         return;
     };
+    if state.audio_routing.snapshot().0.as_ref() == Some(&routing) {
+        return;
+    }
     let mut version = state.audio_routing.version();
     for _ in 0_u8..4 {
         match state.audio_routing.replace_if(version, routing.clone()) {
@@ -1821,15 +1896,19 @@ fn resync_audio(state: &AppState, actor: &str, next: &MultiviewConfig) {
 /// restart-pending set, but the durable definition follows the file at once.
 fn resync_salvos(state: &AppState, actor: &str, next: &MultiviewConfig) {
     use crate::salvo_store::SALVO_KIND;
-    let existing: Vec<String> = match state.salvos.list() {
-        Ok(list) => list.into_iter().map(|v| v.salvo.id).collect(),
+    let entries = match state.salvos.list() {
+        Ok(list) => list,
         Err(error) => {
             tracing::warn!(error = %error, "config-file resync: listing salvos failed");
             return;
         }
     };
+    let existing: Vec<String> = entries.iter().map(|v| v.salvo.id.clone()).collect();
     for salvo in &next.salvos {
         let id = salvo.id.clone();
+        if entries.iter().any(|entry| entry.salvo == *salvo) {
+            continue;
+        }
         let result = if existing.iter().any(|e| e == &id) {
             state.salvos.update(&id, salvo.clone())
         } else {
@@ -1866,15 +1945,19 @@ fn resync_salvos(state: &AppState, actor: &str, next: &MultiviewConfig) {
 /// command), so the store IS the adopted state composed into `active.toml`.
 fn resync_tally_profiles(state: &AppState, actor: &str, next: &MultiviewConfig) {
     use crate::tally_state::TALLY_PROFILE_KIND;
-    let existing: Vec<String> = match state.tally_profiles.list() {
-        Ok(list) => list.into_iter().map(|v| v.profile.id).collect(),
+    let entries = match state.tally_profiles.list() {
+        Ok(list) => list,
         Err(error) => {
             tracing::warn!(error = %error, "config-file resync: listing tally profiles failed");
             return;
         }
     };
+    let existing: Vec<String> = entries.iter().map(|v| v.profile.id.clone()).collect();
     for profile in &next.tally_profiles {
         let id = profile.id.clone();
+        if entries.iter().any(|entry| entry.profile == *profile) {
+            continue;
+        }
         match state.tally_profiles.put(profile.clone()) {
             Ok(versioned) => state.audit(
                 actor,
@@ -1920,26 +2003,41 @@ fn desired_sources(config: &MultiviewConfig) -> Vec<(String, ResourceInput)> {
         .collect()
 }
 
-/// The outputs store's desired contents: stable index-derived `output-{n}`
-/// ids in config order, named by the `kind` tag (mirrors `seed_resources`).
-fn desired_outputs(config: &MultiviewConfig) -> Vec<(String, ResourceInput)> {
-    config
-        .outputs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, output)| {
-            let body = to_body(output)?;
-            let kind = body
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("output")
-                .to_owned();
-            Some((
-                format!("output-{index}"),
-                ResourceInput { name: kind, body },
-            ))
-        })
-        .collect()
+/// Match output bodies to the accepted identity map. File edits may add or
+/// reorder outputs, and API-created IDs need not have an `output-{n}` shape.
+fn desired_outputs(
+    state: &AppState,
+    config: &MultiviewConfig,
+) -> Option<Vec<(String, ResourceInput)>> {
+    let ids = match crate::boot_model::output_ids_for_config(state, config) {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, "cannot resolve accepted output identities for store resync");
+            return None;
+        }
+    };
+    Some(
+        config
+            .outputs
+            .iter()
+            .zip(ids)
+            .filter_map(|(output, id)| {
+                let body = to_body(output)?;
+                let name = body
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("output")
+                    .to_owned();
+                Some((id, ResourceInput { name, body }))
+            })
+            .collect(),
+    )
+}
+
+fn resync_outputs(state: &AppState, actor: &str, config: &MultiviewConfig) {
+    if let Some(desired) = desired_outputs(state, config) {
+        resync_store(state, actor, &state.outputs, &desired);
+    }
 }
 
 /// The overlays store's desired contents (id-named, mirrors `seed_resources`).
@@ -2151,9 +2249,20 @@ fn apply_incomplete_warning(path: &Path, shed: u32, since: i64, active: bool) ->
 /// passes the requesting principal to roll the stores back to the pre-revert
 /// Running document so a shed revert applies nothing durable and its retry's
 /// diff is non-empty again. Idempotent.
+/// Restore exact pre-apply output identities after a shed revert. The accepted
+/// document may already have Loaded's output map, while runtime must retain
+/// the pre-revert store until the operator retries.
+pub(crate) fn restore_output_store(
+    state: &AppState,
+    actor: &str,
+    before: &[(String, ResourceInput)],
+) {
+    resync_store(state, actor, &state.outputs, before);
+}
+
 pub(crate) fn resync_all_stores(state: &AppState, actor: &str, config: &MultiviewConfig) {
     resync_store(state, actor, &state.sources, &desired_sources(config));
-    resync_store(state, actor, &state.outputs, &desired_outputs(config));
+    resync_outputs(state, actor, config);
     resync_store(state, actor, &state.overlays, &desired_overlays(config));
     resync_store(state, actor, &state.probes, &desired_probes(config));
     resync_store(state, actor, &state.devices, &desired_devices(config));

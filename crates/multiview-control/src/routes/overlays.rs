@@ -156,9 +156,7 @@ pub(crate) async fn list_overlays(
     // rows outside the allowlist — exactly as `list_devices` does. An overlay
     // carries no embedded device_ref, so the row filter alone is complete; it is
     // a no-op for an unscoped principal.
-    let overlays = state
-        .overlays
-        .list()?
+    let overlays = crate::boot_model::accepted_family(&state, "overlays", &state.overlays)?
         .into_iter()
         .map(|v| v.resource)
         .filter(|resource| crate::auth::authorize_object(&principal, &resource.id).is_ok())
@@ -189,7 +187,7 @@ pub(crate) async fn get_overlay(
 ) -> ControlResult<Response> {
     principal.role.require(Action::Read)?;
     crate::auth::authorize_object(&principal, &id)?;
-    let versioned = state.overlays.get(&id)?;
+    let versioned = crate::boot_model::accepted_item(&state, "overlays", &state.overlays, &id)?;
     Ok(overlay_response(StatusCode::OK, &versioned))
 }
 
@@ -225,7 +223,26 @@ pub(crate) async fn create_overlay(
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // store-write → submit → adopt-snapshot sequence.
     let _mutation = state.lock_config_mutation().await;
-    let versioned = state.overlays.create(&id, input)?;
+    // Review H1: the durable desired envelope is the single source of truth.
+    // Check the store precondition, commit the prospective document, THEN
+    // project into the store (the same order as sources/outputs).
+    crate::boot_model::require_absent(
+        crate::boot_model::accepted_item(&state, "overlays", &state.overlays, &id),
+        OVERLAY_KIND,
+        &id,
+    )?;
+    crate::boot_model::commit_resource(
+        &state,
+        "overlays",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "overlays", &state.overlays, &id, || {
+            state.overlays.create(&id, input)
+        })?;
     state.audit(
         &principal.key_id,
         AuditAction::Create,
@@ -273,7 +290,7 @@ pub(crate) async fn update_overlay(
     // Preconditions are evaluated before request content (RFC 9110 §13.2.2):
     // a stale `If-Match` (or a missing resource) is reported even when the
     // submitted body is itself invalid.
-    let current = state.overlays.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "overlays", &state.overlays, &id)?;
     if_match.require(OVERLAY_KIND, &id, current.version)?;
     // The document this edit replaces: if the running renderer drew it, the
     // edit is live-visible even when the NEW body renders nothing (the old
@@ -283,7 +300,18 @@ pub(crate) async fn update_overlay(
         name: input.name,
         body: validated_body(TypedCollection::Overlays, &id, &input.body)?,
     };
-    let versioned = state.overlays.update(&id, input)?;
+    crate::boot_model::commit_resource(
+        &state,
+        "overlays",
+        &id,
+        Some(input.body.clone()),
+        Some(input.name.clone()),
+    )
+    .await?;
+    let versioned =
+        crate::boot_model::project_upsert(&state, "overlays", &state.overlays, &id, || {
+            state.overlays.update(&id, input)
+        })?;
     state.audit(
         &principal.key_id,
         AuditAction::Update,
@@ -330,10 +358,11 @@ pub(crate) async fn delete_overlay(
     // ADR-W024 MAJOR-B round 4: hold the config-mutation lock across the whole
     // precondition → store-delete → submit → adopt-snapshot sequence.
     let _mutation = state.lock_config_mutation().await;
-    let current = state.overlays.get(&id)?;
+    let current = crate::boot_model::accepted_item(&state, "overlays", &state.overlays, &id)?;
     if_match.require(OVERLAY_KIND, &id, current.version)?;
     let previous = parse_stored_overlay(&current.resource.body);
-    state.overlays.delete(&id)?;
+    crate::boot_model::commit_resource(&state, "overlays", &id, None, None).await?;
+    crate::boot_model::project_delete(&state, "overlays", &state.overlays, &id)?;
     state.audit(
         &principal.key_id,
         AuditAction::Delete,

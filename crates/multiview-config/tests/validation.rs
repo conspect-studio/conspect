@@ -84,6 +84,23 @@ fn base_document_is_valid() {
 }
 
 #[test]
+fn source_capacity_is_validated_without_silent_truncation() {
+    let mut cfg = MultiviewConfig::load_from_toml(BASE).unwrap();
+    let exemplar = cfg.sources[0].clone();
+    while cfg.sources.len() < multiview_config::MAX_ADMITTED_SOURCES {
+        let mut source = exemplar.clone();
+        source.id = format!("admitted-{}", cfg.sources.len());
+        cfg.sources.push(source);
+    }
+    cfg.validate().expect("exact source capacity accepted");
+    let mut excess = exemplar;
+    excess.id = "over-capacity".to_owned();
+    cfg.sources.push(excess);
+    let error = cfg.validate().expect_err("source above capacity rejected");
+    assert!(error.to_string().contains("source capacity"), "{error}");
+}
+
+#[test]
 fn dangling_cell_source_input_id_is_rejected() {
     let bad = BASE.replace(r#"input_id = "in_d""#, r#"input_id = "in_NOPE""#);
     let cfg = MultiviewConfig::load_from_toml(&bad).unwrap();

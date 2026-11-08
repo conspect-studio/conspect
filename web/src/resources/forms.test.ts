@@ -7,6 +7,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  CAPTION_MODES,
+  captionModesForValue,
   emptyOutputForm,
   emptyOverlayForm,
   emptySourceForm,
@@ -173,6 +175,17 @@ describe('sourceFormToBody', () => {
     expect(body.captions).toEqual({ mode: 'teletext_page', page: 801 });
     expect(body.gpu_pin).toEqual({ vendor: 'nvidia', stable_id: 'GPU-uuid-1' });
     expect(body.wallclock).toEqual({ use: 'use' });
+  });
+
+  it('does not offer an unsupported sidecar for new sources but preserves stored values', () => {
+    expect(CAPTION_MODES).not.toContain('sidecar');
+    expect(captionModesForValue('none')).not.toContain('sidecar');
+    expect(captionModesForValue('sidecar')).toContain('sidecar');
+    const stored = sourceFormFromRecord({ id: 'legacy', name: 'Legacy', body: {
+      kind: 'hls', url: 'https://example.com/x.m3u8', captions: { mode: 'sidecar', path: '/subs/legacy.vtt' },
+    } });
+    expect(stored?.captionsMode).toBe('sidecar');
+    expect(sourceFormToBody(defined(stored)).captions).toEqual({ mode: 'sidecar', path: '/subs/legacy.vtt' });
   });
 
   it('maps every caption mode onto its tagged payload', () => {

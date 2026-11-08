@@ -28,6 +28,165 @@ fn touch_segment(dir: &std::path::Path, name: &str) -> PathBuf {
     path
 }
 
+#[test]
+fn sibling_manifest_pins_retired_segment_until_sibling_retires() {
+    let dir = tempfile::tempdir().unwrap();
+    let sibling = dir.path().join("audio-program-g0.m3u8");
+    std::fs::write(&sibling, "#EXTM3U\nvideo-0.ts\n").unwrap();
+    let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
+    for index in 0..10 {
+        let name = format!("video-{index}.ts");
+        let path = touch_segment(dir.path(), &name);
+        live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
+            .unwrap();
+    }
+    assert!(dir.path().join("video-0.ts").is_file());
+    assert!(!dir.path().join("video-1.ts").exists());
+    // The sink's sequence reaper collects this deferred TS after retirement.
+    // The local driver must never unlink it while the sibling references it.
+    assert!(sibling.exists());
+}
+
+#[test]
+fn query_fragment_and_encoded_sibling_uris_pin_exact_retired_segments() {
+    for (uri, pinned) in [
+        ("video-0.ts?token=x", "video-0.ts"),
+        ("video-0.ts#fragment", "video-0.ts"),
+        ("video%2D0.ts?token=x#fragment", "video-0.ts"),
+        ("video%20old.ts", "video old.ts"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("audio-program-g0.m3u8"),
+            format!("#EXTM3U\n{uri}\n"),
+        )
+        .unwrap();
+        let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
+        for index in 0..10 {
+            let name = if index == 0 {
+                pinned.to_owned()
+            } else {
+                format!("video-{index}.ts")
+            };
+            let path = touch_segment(dir.path(), &name);
+            live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
+                .unwrap();
+        }
+        assert!(dir.path().join(pinned).exists(), "URI {uri} lost {pinned}");
+        assert!(
+            !dir.path().join("video-1.ts").exists(),
+            "URI {uri} blocked safe GC"
+        );
+    }
+}
+
+#[test]
+fn malformed_sibling_uri_cannot_traverse_or_authorize_pruning() {
+    let dir = tempfile::tempdir().unwrap();
+    for uri in [
+        "../video-0.ts",
+        "/video-0.ts",
+        "https://example.test/video-0.ts",
+        "video%2F0.ts",
+        "video%252F0.ts",
+        "%2E%2E%2Fvideo-0.ts",
+        "video-%ZZ.ts",
+        "video-0.ts?token=%ZZ",
+        "video-0.ts#fragment%ZZ",
+    ] {
+        std::fs::write(
+            dir.path().join("audio-program-g0.m3u8"),
+            format!("#EXTM3U\n{uri}\n"),
+        )
+        .unwrap();
+        let mut live = LivePlaylist::new(dir.path().join("video-g0.m3u8"), 2);
+        for index in 0..10 {
+            let name = format!("video-{index}.ts");
+            let path = touch_segment(dir.path(), &name);
+            live.push_closed_segment(name, path, 1.0, index * 1_000_000_000)
+                .unwrap();
+        }
+        assert!(
+            dir.path().join("video-0.ts").is_file(),
+            "URI {uri} allowed GC"
+        );
+    }
+}
+
+#[test]
+fn failed_publish_preserves_previous_manifest_and_all_its_segments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = dir.path().join("index.m3u8");
+    let mut live = LivePlaylist::new(manifest.clone(), 2);
+    for index in 0..4 {
+        let name = format!("seg{index}.ts");
+        let path = touch_segment(dir.path(), &name);
+        live.push_closed_segment(name, path, 2.0, index * 2_000_000_000)
+            .expect("publish");
+    }
+    let original = std::fs::read_to_string(&manifest).expect("original manifest");
+    // The same-directory temp name is a directory: File::create fails before rename.
+    std::fs::create_dir(manifest.with_file_name("index.m3u8.tmp")).expect("inject failure");
+    let next = touch_segment(dir.path(), "seg4.ts");
+    assert!(live
+        .push_closed_segment("seg4.ts", next, 2.0, 8_000_000_000)
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&manifest).unwrap(), original);
+    for uri in original
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        assert!(
+            dir.path().join(uri).is_file(),
+            "published URI {uri} must exist"
+        );
+    }
+    std::fs::remove_dir(manifest.with_file_name("index.m3u8.tmp")).unwrap();
+    let next = touch_segment(dir.path(), "seg5.ts");
+    live.push_closed_segment("seg5.ts", next, 2.0, 10_000_000_000)
+        .expect("publish after recovery");
+    let current = std::fs::read_to_string(&manifest).unwrap();
+    assert!(current.contains("seg5.ts"));
+    assert!(!current.contains("seg4.ts"));
+    for uri in current
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        assert!(
+            dir.path().join(uri).is_file(),
+            "published URI {uri} must exist"
+        );
+    }
+}
+
+#[test]
+fn restarted_audio_and_video_playlists_advance_together_with_discontinuity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for name in ["index.m3u8", "audio-program.m3u8", "audio-track0.m3u8"] {
+        let mut playlist = LivePlaylist::new(dir.path().join(name), 2);
+        playlist.set_media_sequence(17);
+        playlist.set_initial_discontinuity();
+        for index in 17..20 {
+            let segment = touch_segment(dir.path(), &format!("{name}-{index}.ts"));
+            playlist
+                .push_closed_segment(
+                    segment.file_name().unwrap().to_string_lossy(),
+                    segment.clone(),
+                    1.0,
+                    index * 1_000_000_000,
+                )
+                .expect("publish");
+        }
+        let text = std::fs::read_to_string(dir.path().join(name)).expect("manifest");
+        assert!(text.contains("#EXT-X-MEDIA-SEQUENCE:18"), "{text}");
+        assert!(text.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"), "{text}");
+        assert!(
+            dir.path().join(format!("{name}-17.ts")).exists(),
+            "client grace keeps the old segment"
+        );
+    }
+}
+
 /// Feeding N > window segment closes into the rolling driver must leave an
 /// on-disk playlist that lists exactly `window` segments, advances
 /// `EXT-X-MEDIA-SEQUENCE` to `N - window`, carries NO `EXT-X-ENDLIST` while the
@@ -35,7 +194,7 @@ fn touch_segment(dir: &std::path::Path, name: &str) -> PathBuf {
 #[test]
 fn rolling_live_playlist_windows_publishes_and_prunes() {
     const WINDOW: usize = 6;
-    const TOTAL: usize = 10;
+    const TOTAL: usize = 16;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let playlist_path = dir.path().join("multiview.m3u8");
@@ -71,7 +230,7 @@ fn rolling_live_playlist_windows_publishes_and_prunes() {
         WINDOW,
         "the live playlist must list exactly the window size, got {listed:?}"
     );
-    // The window holds the most recent WINDOW segments: seg4.ts..seg9.ts.
+    // The window holds the most recent WINDOW segments.
     let expected: Vec<String> = (TOTAL - WINDOW..TOTAL)
         .map(|i| format!("seg{i}.ts"))
         .collect();
@@ -94,10 +253,10 @@ fn rolling_live_playlist_windows_publishes_and_prunes() {
         "a live (unfinished) playlist must NOT carry #EXT-X-ENDLIST; playlist was:\n{text}"
     );
 
-    // Evicted `.ts` files (the first N - window) must be deleted from disk; the
-    // windowed ones must remain.
+    // A complete previous window remains available for clients that hold its
+    // manifest; older segments expire, keeping disk bounded to two windows.
     for (i, path) in seg_paths.iter().enumerate() {
-        if i < TOTAL - WINDOW {
+        if i < TOTAL - 2 * WINDOW {
             assert!(
                 !path.exists(),
                 "evicted segment {} must be deleted from disk (bounded disk)",
