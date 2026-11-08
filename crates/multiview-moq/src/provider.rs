@@ -192,6 +192,20 @@ struct State {
     ready: AtomicBool,
     shutdown: watch::Sender<bool>,
 }
+struct SubscriptionCleanup {
+    state: Arc<State>,
+    token: String,
+    fence: Arc<Fence>,
+}
+impl Drop for SubscriptionCleanup {
+    fn drop(&mut self) {
+        self.fence.revoke();
+        if let Ok(mut entries) = self.state.entries.lock() {
+            entries.remove(&self.token);
+        }
+    }
+}
+
 /// Listener is ready only after a successful bind; no default synthetic feeds.
 pub struct Runtime {
     state: Arc<State>,
@@ -369,8 +383,13 @@ impl Runtime {
             generation: feed.generation,
             protocol: self.protocol.clone(),
         };
-        let state = self.state.clone();
+        let cleanup = SubscriptionCleanup {
+            state: self.state.clone(),
+            token,
+            fence: fence.clone(),
+        };
         tokio::spawn(async move {
+            let _cleanup = cleanup;
             let mut cancel = fence.cancel.subscribe();
             let expiry =
                 tokio::time::sleep(ttl.clamp(Duration::from_secs(1), Duration::from_secs(60)));
@@ -388,9 +407,6 @@ impl Runtime {
             }
             fence.revoke();
             adapter.revoke();
-            if let Ok(mut entries) = state.entries.lock() {
-                entries.remove(&token);
-            }
             drop((feed, catalog, broadcast, origin));
         });
         Ok(result)
@@ -400,6 +416,48 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancellation_and_unwind_remove_subscription_ticket() {
+        for panic in [false, true] {
+            let state = Arc::new(State {
+                entries: Mutex::new(HashMap::new()),
+                ready: AtomicBool::new(true),
+                shutdown: watch::channel(false).0,
+            });
+            let (fence, _rx) = Fence::channel(1);
+            let origin = moq_tokio::origin::spawn();
+            state.entries.lock().unwrap().insert(
+                "test".into(),
+                Entry {
+                    origin: origin.consume(),
+                    fence: fence.clone(),
+                    used: false,
+                },
+            );
+            let cleanup = SubscriptionCleanup {
+                state: state.clone(),
+                token: "test".into(),
+                fence: fence.clone(),
+            };
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _cleanup = cleanup;
+                let _ = started.send(());
+                if panic {
+                    panic!("intentional cleanup regression");
+                }
+                std::future::pending::<()>().await;
+            });
+            ready.await.unwrap();
+            if !panic {
+                task.abort();
+            }
+            assert!(task.await.is_err());
+            assert!(state.entries.lock().unwrap().is_empty());
+            assert!(*fence.cancel.borrow());
+        }
+    }
+
     #[tokio::test]
     async fn expiry_removes_ticket_and_releases_source_demand() {
         struct Guard(Arc<AtomicBool>);
