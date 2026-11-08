@@ -721,10 +721,9 @@ impl Muxer {
     /// MPEG-TS/HLS segment-rotation primitive (see the module doc).
     ///
     /// This is the direct analogue of `libavformat/hlsenc.c`'s segment cut: it
-    /// [`flush`](Muxer::flush)es, then closes the current `AVIOContext` (same
-    /// as `ff_format_io_close` — a no-op the first time, when no segment has
-    /// been written to this muxer yet), opens a fresh one at `path`
-    /// (`avio_open`, write mode), and — for the `mpegts` muxer specifically —
+    /// [`flush`](Muxer::flush)es, opens a fresh `AVIOContext` at `path`
+    /// (`avio_open`, write mode), then closes the old one and installs the new
+    /// handle. A failed open leaves the old handle intact. For `mpegts`, it
     /// sets the `mpegts_flags=resend_headers` `AVOption` on the format's
     /// private data so the very next packet re-emits PAT/PMT/SDT (making the
     /// new file self-contained/independently decodable) without touching any
@@ -756,25 +755,38 @@ impl Muxer {
         let cpath = CString::new(path_str).map_err(|_| nul_err())?;
         // SAFETY: `self.output.as_mut_ptr()` is the live, owned output
         // `AVFormatContext` (we hold `&mut self`; the header has been
-        // written and `self.flush()` above already landed every buffered
-        // byte on the OLD `pb`). `avio_closep` is null-safe (a no-op on a
-        // null `pb`, i.e. the very first call) and nulls the slot it is
-        // handed; `avio_open` then allocates a fresh write-mode `AVIOContext`
-        // into the same slot. `cpath` is a valid NUL-terminated C string that
-        // outlives the call.
+        // written and `self.flush()` landed every old byte). `avio_open`
+        // initializes only the local `next_pb`, and `avio_closep` closes and
+        // nulls its argument. We transfer the owned new handle to `ctx.pb`
+        // only after the old handle closes. `cpath` outlives both calls.
+        // Open first: a missing directory or exhausted descriptor table must
+        // not strand the old segment with a null `pb`. If closing the old file
+        // fails, close the new handle too; never leave an unowned AVIO context.
         let rc = unsafe {
             let ctx = self.output.as_mut_ptr();
-            ffmpeg::ffi::avio_closep(&raw mut (*ctx).pb);
-            ffmpeg::ffi::avio_open(
-                &raw mut (*ctx).pb,
+            let mut next_pb = std::ptr::null_mut();
+            let opened = ffmpeg::ffi::avio_open(
+                &raw mut next_pb,
                 cpath.as_ptr(),
                 ffmpeg::ffi::AVIO_FLAG_WRITE,
-            )
+            );
+            if opened < 0 {
+                opened
+            } else {
+                let closed = ffmpeg::ffi::avio_closep(&raw mut (*ctx).pb);
+                if closed < 0 {
+                    ffmpeg::ffi::avio_closep(&raw mut next_pb);
+                    closed
+                } else {
+                    (*ctx).pb = next_pb;
+                    0
+                }
+            }
         };
         if rc < 0 {
             return Err(FfmpegError::Mux(ffmpeg::Error::from(rc)));
         }
-        // mpegts-only: ask the still-open inner context to re-emit PAT/PMT/SDT
+        // Ask the still-open inner context to re-emit PAT/PMT/SDT
         // before the next packet (the segment-start self-containment libav's own
         // HLS muxer gets via the identical `mpegts_flags=resend_headers`
         // `AVOption`, set on `oc->priv_data` in `hlsenc.c`). A non-mpegts muxer

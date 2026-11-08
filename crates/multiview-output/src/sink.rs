@@ -1850,6 +1850,12 @@ struct SegmentState<'a> {
     done: Vec<(PathBuf, f64)>,
     /// PTS of the most recently written packet (the running segment edge).
     last_pts: MediaTime,
+    /// A failed live muxer is discarded. Resume only at a video keyframe.
+    recovering: bool,
+    /// Consecutive failed reopen attempts; terminal errors reach the supervisor.
+    recovery_failures: u8,
+    /// A close/playlist publication failure must reach the caller, not hide.
+    publication_failed: bool,
     stats: EncodeStats,
     /// The optional rolling **live** playlist driver (HLS-0/1, ADR-0032). `None`
     /// is the historical **batch** behaviour: segments mux in place and the
@@ -1952,6 +1958,9 @@ impl<'a> SegmentState<'a> {
             current: None,
             done: Vec::new(),
             last_pts: MediaTime::ZERO,
+            recovering: false,
+            recovery_failures: 0,
+            publication_failed: false,
             stats: EncodeStats::default(),
             live: None,
             seg_index: 0,
@@ -2339,60 +2348,123 @@ impl<'a> SegmentState<'a> {
     /// File and a Segment sink fed the SAME packets produce the SAME media.
     fn drive_from_packets<P: PacketSource>(&mut self, source: &mut P) -> Result<()> {
         while let Some(packet) = source.next_packet()? {
+            // A damaged muxer cannot be reused. Drain the source until a fresh
+            // decoder-ready video access point; never publish its partial TS.
+            if self.recovering && !(packet.kind() == StreamKind::Video && packet.is_keyframe()) {
+                continue;
+            }
             let pts = pts_from_packet(packet.pts(), self.stats.packets, self.time_base);
-            match packet.kind() {
-                StreamKind::Video => {
-                    // Only a VIDEO keyframe rotates a segment (the GOP boundary —
-                    // invariant #7); the first packet is always a keyframe.
-                    let is_key = packet.is_keyframe();
-                    if is_key {
-                        self.start_segment(pts)?;
-                    }
-                    self.write_audio_rendition(&packet)?;
-                    let owned = packet.into_owned_packet();
-                    let (muxer, index) = self.current_muxer()?;
-                    muxer.write_packet(index, owned).map_err(ff)?;
-                    self.record(is_key, pts);
+            let boundary = packet.kind() == StreamKind::Video && packet.is_keyframe();
+            if let Err(error) = self.write_source_packet(packet, pts) {
+                // A segment-boundary failure can be a playlist publication or
+                // file-system fault, not a damaged muxer. Let the supervisor
+                // handle it rather than silently hide a stale live playlist.
+                if self.live.is_none() || self.publication_failed {
+                    self.abandon_incomplete_segments();
+                    return Err(error);
                 }
-                StreamKind::AudioTrack(track) => {
-                    self.write_audio_rendition(&packet)?;
-                    // A discrete track joins the current segment like program
-                    // audio; a track this sink does not carry is dropped.
-                    let index = self
-                        .current
-                        .as_ref()
-                        .and_then(|s| track_stream_index(&s.track_indices, track));
-                    let Some(index) = index else {
-                        continue;
-                    };
-                    let owned = packet.into_owned_packet();
-                    if let Some(segment) = self.current.as_mut() {
-                        segment.muxer.write_packet(index, owned).map_err(ff)?;
+                self.abandon_incomplete_segments();
+                if self.recovering && boundary {
+                    self.recovery_failures = self.recovery_failures.saturating_add(1);
+                    if self.recovery_failures >= 3 {
+                        return Err(error);
                     }
-                    self.record(false, pts);
                 }
-                StreamKind::Audio => {
-                    self.write_audio_rendition(&packet)?;
-                    // Audio never rotates a segment — it joins the current one.
-                    // Audio that arrives before the first video keyframe (no
-                    // segment open yet) or for a video-only run (no audio stream
-                    // registered) is skipped rather than mis-routed.
-                    let audio_index = self.current.as_ref().and_then(|s| s.audio_index);
-                    let Some(audio_index) = audio_index else {
-                        continue;
-                    };
-                    let owned = packet.into_owned_packet();
-                    if let Some(segment) = self.current.as_mut() {
-                        segment.muxer.write_packet(audio_index, owned).map_err(ff)?;
-                    }
-                    self.record(false, pts);
-                }
-                // `StreamKind` is `#[non_exhaustive]`: skip a future kind this
-                // segmenter registers no stream for rather than mis-route it.
-                _ => {}
+                self.recovering = true;
+            } else if self.recovering {
+                self.recovering = false;
+                self.recovery_failures = 0;
             }
         }
         Ok(())
+    }
+
+    fn write_source_packet(&mut self, packet: EncodedPacket, pts: MediaTime) -> Result<()> {
+        match packet.kind() {
+            StreamKind::Video => {
+                // Only a VIDEO keyframe rotates a segment (the GOP boundary —
+                // invariant #7); the first packet is always a keyframe.
+                let is_key = packet.is_keyframe();
+                if is_key {
+                    self.start_segment(pts)?;
+                }
+                self.write_audio_rendition(&packet)?;
+                let owned = packet.into_owned_packet();
+                let (muxer, index) = self.current_muxer()?;
+                muxer.write_packet(index, owned).map_err(ff)?;
+                self.record(is_key, pts);
+            }
+            StreamKind::AudioTrack(track) => {
+                self.write_audio_rendition(&packet)?;
+                // A discrete track joins the current segment like program
+                // audio; a track this sink does not carry is dropped.
+                let index = self
+                    .current
+                    .as_ref()
+                    .and_then(|s| track_stream_index(&s.track_indices, track));
+                let Some(index) = index else {
+                    return Ok(());
+                };
+                let owned = packet.into_owned_packet();
+                if let Some(segment) = self.current.as_mut() {
+                    segment.muxer.write_packet(index, owned).map_err(ff)?;
+                }
+                self.record(false, pts);
+            }
+            StreamKind::Audio => {
+                self.write_audio_rendition(&packet)?;
+                // Audio never rotates a segment — it joins the current one.
+                // Audio that arrives before the first video keyframe (no
+                // segment open yet) or for a video-only run (no audio stream
+                // registered) is skipped rather than mis-routed.
+                let audio_index = self.current.as_ref().and_then(|s| s.audio_index);
+                let Some(audio_index) = audio_index else {
+                    return Ok(());
+                };
+                let owned = packet.into_owned_packet();
+                if let Some(segment) = self.current.as_mut() {
+                    segment.muxer.write_packet(audio_index, owned).map_err(ff)?;
+                }
+                self.record(false, pts);
+            }
+            // `StreamKind` is `#[non_exhaustive]`: skip a future kind this
+            // segmenter registers no stream for rather than mis-route it.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Drop every damaged in-flight file and muxer before reopening at a RAP.
+    /// Never put a partial segment into any media playlist.
+    fn abandon_incomplete_segments(&mut self) {
+        if let Some(segment) = self.current.take() {
+            let is_unpublished = segment.write_path != segment.path;
+            let write_path = segment.write_path.clone();
+            drop(segment);
+            if is_unpublished {
+                let _ = std::fs::remove_file(write_path);
+            }
+        }
+        if let Some(renditions) = self.renditions.as_mut() {
+            for state in renditions
+                .states
+                .iter_mut()
+                .chain(std::iter::once(&mut renditions.video))
+            {
+                if let Some(segment) = state.current.take() {
+                    let is_unpublished = segment.write_path != segment.path;
+                    let write_path = segment.write_path.clone();
+                    drop(segment);
+                    if is_unpublished {
+                        let _ = std::fs::remove_file(write_path);
+                    }
+                }
+                state.live.set_initial_discontinuity();
+            }
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.set_initial_discontinuity();
+        }
     }
 
     /// Best-effort finalize of the currently-open segment on the error path: the
@@ -2423,7 +2495,10 @@ impl<'a> SegmentState<'a> {
     /// later call redirects it in place — see [`SegmentState`]'s doc for why
     /// this is the continuity-counter fix, not an optimization.
     fn start_segment(&mut self, start_pts: MediaTime) -> Result<()> {
-        self.close_current(start_pts)?;
+        if let Err(error) = self.close_current(start_pts) {
+            self.publication_failed = true;
+            return Err(error);
+        }
         // Filename index: the live flavour uses a monotonic counter (so a name is
         // never reused even though older segments are pruned from the window),
         // while the batch flavour keeps its historical `done.len()` (byte-identical
@@ -2637,6 +2712,11 @@ impl<'a> SegmentState<'a> {
             return Ok(());
         };
         self.done.push((segment.path.clone(), duration));
+        // Live media history lives in the bounded playlist, not this batch
+        // report. Keep at most one manifest window here for a finite result.
+        if let Some(live) = self.live.as_ref() {
+            bound_live_report(&mut self.done, live.window_size());
+        }
         Ok(())
     }
 
@@ -2689,6 +2769,12 @@ impl<'a> SegmentState<'a> {
     fn into_segment_paths(self) -> Vec<PathBuf> {
         self.done.into_iter().map(|(path, _)| path).collect()
     }
+}
+
+/// Keep the finite run report bounded while the live playlist owns media history.
+fn bound_live_report(done: &mut Vec<(PathBuf, f64)>, window: usize) {
+    let excess = done.len().saturating_sub(window);
+    done.drain(..excess);
 }
 
 fn current_renditions_ready(renditions: &AudioRenditions<'_>) -> bool {
@@ -2902,14 +2988,26 @@ mod tests {
     use multiview_ffmpeg::{DecodedVideoFrame, StreamVideoDecoder};
 
     use super::{
-        prune_prior_live_segments, prune_prior_rendition_manifests_inactive, AudioEncodeConfig,
-        EncodeConfig, Result, SegmentSink, VideoFrameSource, SEED_ENCODER_BUILDS,
-        SEGMENT_FINALIZES,
+        bound_live_report, prune_prior_live_segments, prune_prior_rendition_manifests_inactive,
+        AudioEncodeConfig, EncodeConfig, Result, SegmentSink, VideoFrameSource,
+        SEED_ENCODER_BUILDS, SEGMENT_FINALIZES,
     };
     use crate::error::Error;
 
     const WIDTH: u32 = 160;
     const HEIGHT: u32 = 120;
+
+    #[test]
+    fn live_report_stays_bounded_across_many_segment_cuts() {
+        let mut done = Vec::new();
+        for index in 0..10_000 {
+            done.push((format!("seg{index}.ts").into(), 1.0));
+            bound_live_report(&mut done, 6);
+            assert!(done.len() <= 6);
+        }
+        assert_eq!(done.len(), 6);
+        assert_eq!(done[0].0, Path::new("seg9994.ts"));
+    }
 
     #[test]
     fn prior_rendition_retirement_and_ts_reaper_preserve_uri_references() {

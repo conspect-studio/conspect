@@ -488,6 +488,22 @@ fn hls_segments_carry_no_cc_discontinuity_across_boundaries() {
     // for the whole run, invariant #7) — otherwise the cross-segment PID set
     // below would be meaningless.
     let pmt_pid = pmt_pid_for_segment[0].expect("first segment has a PMT pid");
+    let mut sdt_payload_per_segment = Vec::new();
+    for packets in &segment_packets {
+        sdt_payload_per_segment.push(
+            packets
+                .iter()
+                .filter(|packet| {
+                    let header = parse_ts_header(packet);
+                    header.pid == SDT_PID && header.has_payload
+                })
+                .count(),
+        );
+    }
+    assert!(
+        sdt_payload_per_segment.iter().all(|count| *count > 0),
+        "PID 17 (SDT) must recur in every independently decodable segment: {sdt_payload_per_segment:?}"
+    );
     for (i, pid) in pmt_pid_for_segment.iter().enumerate() {
         assert_eq!(
             *pid,
@@ -803,6 +819,144 @@ fn hls_discrete_audio_segments_carry_no_cc_discontinuity_across_boundaries() {
             );
         }
     }
+}
+
+#[test]
+fn hls_mux_reopens_at_next_keyframe_after_missing_segment_path() {
+    run_mux_reopen_fault_test(false);
+}
+
+#[test]
+fn hls_mux_reports_three_consecutive_reopen_failures() {
+    run_mux_reopen_fault_test(true);
+}
+
+fn run_mux_reopen_fault_test(persistent: bool) {
+    use multiview_ffmpeg::{
+        ScaleSpec, Scaler, StreamCodecParameters, VideoEncodeTarget, VideoEncoder,
+    };
+    use multiview_output::sink::{MuxStream, PacketMuxOutcome, PacketMuxSink, PacketSource};
+    use multiview_output::SharedEpoch;
+
+    struct ObstructOnce {
+        packets: std::vec::IntoIter<EncodedPacket>,
+        path: std::path::PathBuf,
+        removed: bool,
+        keyframes: usize,
+        persistent: bool,
+        dir: std::path::PathBuf,
+    }
+    impl PacketSource for ObstructOnce {
+        fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+            let next = self.packets.next();
+            if next.as_ref().is_some_and(EncodedPacket::is_keyframe) {
+                self.keyframes += 1;
+                if self.persistent && (3..=5).contains(&self.keyframes) {
+                    let path = self.dir.join(format!("seg{}.ts.tmp", self.keyframes - 1));
+                    std::fs::create_dir(&path).expect("obstruct only test-owned segment");
+                }
+            }
+            if !self.persistent && !self.removed && self.keyframes >= 3 && self.path.is_dir() {
+                std::fs::remove_dir(&self.path).expect("remove test-owned obstruction");
+                self.removed = true;
+            }
+            Ok(next)
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("test-owned tempdir");
+    let src = dir.path().join("src.ts");
+    generate_clip(&src, 5, 30);
+    let target = VideoEncodeTarget {
+        codec_name: "mpeg2video".to_owned(),
+        width: WIDTH,
+        height: HEIGHT,
+        format: ffmpeg::format::Pixel::YUV420P,
+        time_base: Rational::new(1, 30),
+        bit_rate: 2_000_000,
+        gop: 30,
+        cuda_device: None,
+    };
+    let mut encoder = VideoEncoder::new(&target).expect("video encoder");
+    let time_base = encoder.time_base();
+    let params = StreamCodecParameters::from_encoder(&encoder);
+    let mut decode = DecodeSource::open(&src);
+    let mut scaler: Option<Scaler> = None;
+    let mut packets = Vec::new();
+    let mut tick = 0;
+    while let Some(frame) = decode.next_frame().expect("decode") {
+        let mut video = frame.frame;
+        if video.format() != ffmpeg::format::Pixel::YUV420P {
+            let s = ScaleSpec::new(video.format(), video.width(), video.height());
+            let d = ScaleSpec::new(
+                ffmpeg::format::Pixel::YUV420P,
+                video.width(),
+                video.height(),
+            );
+            video = scaler
+                .get_or_insert_with(|| Scaler::new(s, d).expect("scaler"))
+                .run(&video)
+                .expect("scale");
+        }
+        video.set_pts(Some(tick));
+        encoder.send_frame(&video).expect("encode");
+        while let Some(packet) = encoder.receive_packet().expect("receive") {
+            packets.push(EncodedPacket::from_packet(packet));
+        }
+        tick += 1;
+    }
+    encoder.send_eof().expect("eof");
+    while let Some(packet) = encoder.receive_packet().expect("drain") {
+        packets.push(EncodedPacket::from_packet(packet));
+    }
+    let blocked = dir.path().join("seg1.ts.tmp");
+    std::fs::create_dir(&blocked).expect("block the next mux path");
+    let mut source = ObstructOnce {
+        packets: packets.into_iter(),
+        path: blocked,
+        removed: false,
+        keyframes: 0,
+        persistent,
+        dir: dir.path().to_path_buf(),
+    };
+    let playlist = dir.path().join("index.m3u8");
+    let sink = PacketMuxSink::segment_live(dir.path(), "seg", &playlist, 6, SharedEpoch::new());
+    let outcome = sink.run_av(&mut source, MuxStream::new(&params, time_base), None);
+    if persistent {
+        assert!(
+            outcome.is_err(),
+            "three failed reopen attempts must surface an error"
+        );
+        let text = std::fs::read_to_string(playlist).expect("previous playlist stays valid");
+        assert!(
+            text.contains("seg0.ts"),
+            "committed segment remains published"
+        );
+        assert!(
+            !text.contains("seg1.ts"),
+            "failed segment never enters playlist"
+        );
+        return;
+    }
+    let result = outcome.expect("recover after one failed redirect");
+    let PacketMuxOutcome::Segment(result) = result else {
+        panic!("expected segments")
+    };
+    assert!(source.removed, "fault must be exercised");
+    let text = std::fs::read_to_string(playlist).expect("media playlist");
+    assert!(text.contains("seg0.ts"), "previous segment stays valid");
+    assert!(
+        !text.contains("seg1.ts"),
+        "failed segment is never published"
+    );
+    let recovered = text
+        .find("#EXT-X-DISCONTINUITY\n")
+        .expect("recovery discontinuity");
+    assert!(
+        text[recovered..].contains("seg2.ts"),
+        "resume at a later RAP"
+    );
+    assert!(result.segments.iter().all(|path| path.exists()));
 }
 
 #[cfg(test)]
