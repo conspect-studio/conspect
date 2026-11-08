@@ -116,6 +116,7 @@ pub mod supervisor;
 pub mod switcher;
 pub mod switcher_bus;
 pub mod switcher_control;
+pub mod switcher_hook;
 pub mod switcher_plan;
 pub mod switcher_runtime;
 pub mod sysref;

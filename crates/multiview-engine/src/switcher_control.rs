@@ -278,10 +278,42 @@ impl SwitcherTickDriver {
         });
     }
 
+    /// On a repeat tick the protected engine re-emits the previous canvas;
+    /// never drain or apply commands on that stale picture. A held Cut may
+    /// expire off the clock as a refusal; successful takes wait for a fresh tick.
+    pub fn repeat_tick(&mut self, tick: Tick) {
+        self.last_tick = tick.index;
+        if self
+            .pending_take
+            .as_ref()
+            .is_some_and(|(_, deadline)| tick.index >= *deadline)
+        {
+            if let Some((command, _)) = self.pending_take.take() {
+                self.publish_outcome(
+                    command.operation_id,
+                    tick.index,
+                    false,
+                    Some("take deadline expired while program repeated last-good".into()),
+                );
+            }
+        }
+    }
+
     /// Authoritative post-command selected sources for the same output tick.
     #[must_use]
     pub fn selections(&self) -> (&SourceRef, &SourceRef) {
         (self.machine.program(), self.machine.preview())
+    }
+
+    /// Confirm or reject a pending selection only AFTER a freshly composited
+    /// program frame has actually been published. During repeat/catch-up the
+    /// caller does not invoke this method; no stale canvas gets a false receipt.
+    pub fn confirm_fresh_frame(&mut self, tick: Tick, composed: bool) {
+        if composed {
+            self.commit_composed_tick(tick);
+        } else {
+            self.reject_composed_tick(tick, "program frame did not composite");
+        }
     }
 
     /// Process at most 16 queued commands, then advance the exact-tick machine;

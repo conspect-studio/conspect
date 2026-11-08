@@ -238,6 +238,26 @@ fn no_control_hook() -> impl FnMut(&mut CompositorDrive<Nv12Image>, Tick) {
     |_drive: &mut CompositorDrive<Nv12Image>, _tick: Tick| {}
 }
 
+/// Two-phase frame-boundary control, owned by the output runtime itself.
+/// The `after_compose` callback is invoked only after a FRESH successful
+/// composition, never for a repeated last-good canvas. No client lock/await.
+pub trait FrameControl {
+    /// Stage a command against a real tick before composing it.
+    fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick);
+    /// Confirm that the staged scene really became a fresh output frame.
+    fn after_compose(&mut self, frame: &CompositedFrame);
+    /// A catch-up repeat re-emits old pixels; expire holds but do not apply.
+    fn on_repeat(&mut self, _tick: Tick) {}
+}
+
+struct LegacyControl<F>(F);
+impl<F: FnMut(&mut CompositorDrive<Nv12Image>, Tick)> FrameControl for LegacyControl<F> {
+    fn before_compose(&mut self, drive: &mut CompositorDrive<Nv12Image>, tick: Tick) {
+        (self.0)(drive, tick);
+    }
+    fn after_compose(&mut self, _frame: &CompositedFrame) {}
+}
+
 /// The integrated engine runtime: owns the clock, the drive loop, the outbound
 /// isolation publisher, the time source, and the pacer, and runs the per-tick
 /// loop (invariant #1).
@@ -375,7 +395,7 @@ impl<P: Pacer> EngineRuntime<P> {
             None,
             &mut state_of,
             &mut event_of,
-            &mut no_control,
+            &mut LegacyControl(&mut no_control),
         )
         .await
     }
@@ -405,7 +425,7 @@ impl<P: Pacer> EngineRuntime<P> {
             Some(max_ticks),
             &mut state_of,
             &mut event_of,
-            &mut no_control,
+            &mut LegacyControl(&mut no_control),
         )
         .await
     }
@@ -469,6 +489,34 @@ impl<P: Pacer> EngineRuntime<P> {
         FE: FnMut(&CompositedFrame) -> Option<E>,
         FC: FnMut(&mut CompositorDrive<Nv12Image>, Tick),
     {
+        self.run_with_frame_control(
+            publisher,
+            stop,
+            &mut state_of,
+            &mut event_of,
+            LegacyControl(&mut control),
+        )
+        .await
+    }
+
+    /// A two-phase owned hook that only acknowledges a command AFTER a real
+    /// frame has been composited (never on a repeated last-good tick).
+    ///
+    /// # Errors
+    /// Propagates compositor errors without a false applied receipt.
+    pub async fn run_with_frame_control<S, E, FS, FE, FC>(
+        &mut self,
+        publisher: &EnginePublisher<S, E>,
+        stop: &StopSignal,
+        mut state_of: FS,
+        mut event_of: FE,
+        mut control: FC,
+    ) -> crate::Result<RunOutcome>
+    where
+        FS: FnMut(&CompositedFrame) -> S,
+        FE: FnMut(&CompositedFrame) -> Option<E>,
+        FC: FrameControl,
+    {
         self.run_inner(
             publisher,
             stop,
@@ -530,6 +578,35 @@ impl<P: Pacer> EngineRuntime<P> {
         FE: FnMut(&CompositedFrame) -> Option<E>,
         FC: FnMut(&mut CompositorDrive<Nv12Image>, Tick),
     {
+        self.run_for_with_frame_control(
+            publisher,
+            stop,
+            max_ticks,
+            &mut state_of,
+            &mut event_of,
+            LegacyControl(&mut control),
+        )
+        .await
+    }
+
+    /// Bounded two-phase frame-control path for deterministic cadence tests.
+    ///
+    /// # Errors
+    /// Propagates compositor errors without acknowledging a failed image.
+    pub async fn run_for_with_frame_control<S, E, FS, FE, FC>(
+        &mut self,
+        publisher: &EnginePublisher<S, E>,
+        stop: &StopSignal,
+        max_ticks: u64,
+        mut state_of: FS,
+        mut event_of: FE,
+        mut control: FC,
+    ) -> crate::Result<RunOutcome>
+    where
+        FS: FnMut(&CompositedFrame) -> S,
+        FE: FnMut(&CompositedFrame) -> Option<E>,
+        FC: FrameControl,
+    {
         self.run_inner(
             publisher,
             stop,
@@ -553,7 +630,7 @@ impl<P: Pacer> EngineRuntime<P> {
     where
         FS: FnMut(&CompositedFrame) -> S,
         FE: FnMut(&CompositedFrame) -> Option<E>,
-        FC: FnMut(&mut CompositorDrive<Nv12Image>, Tick),
+        FC: FrameControl,
     {
         let mut emitted: u64 = 0;
         // The last fresh composite, held so the loop can re-emit it (under a fresh
@@ -668,7 +745,7 @@ impl<P: Pacer> EngineRuntime<P> {
                     // being emitted, never a stale or future one.
                     let repeat_tick: Tick = self.clock.tick();
                     if repeats_since_control >= MAX_REPEATS_BETWEEN_CONTROL {
-                        control(&mut self.drive, repeat_tick);
+                        control.on_repeat(repeat_tick);
                         repeats_since_control = 0;
                     }
                     let Some(last) = last_good.as_mut() else {
@@ -702,12 +779,13 @@ impl<P: Pacer> EngineRuntime<P> {
             //     non-blocking queue and applies O(1) `set_layout`/`insert_store`);
             //     it never awaits and never holds a lock a client can fill, so the
             //     output clock cannot be stalled by control (invariants #1 + #10).
-            control(&mut self.drive, tick);
+            control.before_compose(&mut self.drive, tick);
             repeats_since_control = 0;
 
             // 3. Sample + compose exactly one frame (lock-free, never blocks on
             //    an input).
             let frame = self.drive.compose(tick)?;
+            control.after_compose(&frame);
 
             // 4. Publish outward — wait-free state slot + non-blocking drop-oldest
             //    event stream. Neither can be back-pressured by a consumer.
