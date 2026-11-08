@@ -97,7 +97,7 @@ segment_ms = 1000
 /// source (the boot-authored routing the base document carries). Used by the
 /// cleared-audio regression to give `base_document` a routing block the
 /// accepted envelope can later drop.
-const BOOT_AUDIO_SECTION: &str = r##"
+const BOOT_AUDIO_SECTION: &str = r#"
 [audio]
 sample_rate_hz = 48000
 
@@ -109,7 +109,7 @@ gain_db = -3.0
 
 [audio.routes.channels]
 kind = "stereo"
-"##;
+"#;
 
 /// The whole rig: a temp config dir holding the boot file, the shared
 /// control-plane state (stores seeded from the boot doc + the boot model),
