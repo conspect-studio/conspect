@@ -1089,7 +1089,7 @@ mod tests {
                 BindingPolicy::Bounded,
             ],
             DeliveryLimits::default(),
-            Some(gate),
+            vec![Some(gate);3],
         );
         let mut d = RenditionDispatcher::new(cfg(
             vec![binding(0, 0, 1), binding(1, 0, 1), binding(2, 0, 1)],
@@ -1113,9 +1113,9 @@ mod tests {
         for rx in &receivers {
             let first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
             let second = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            assert_eq!(first.kind(), StreamKind::Video);
-            assert_eq!(second.kind(), StreamKind::Audio);
-            pointers.push(first.payload().unwrap().as_ptr());
+            assert_eq!(first.packet.kind(), StreamKind::Video);
+            assert_eq!(second.packet.kind(), StreamKind::Audio);
+            pointers.push(first.packet.payload().unwrap().as_ptr());
         }
         assert_eq!(pointers[0], pointers[1]);
         assert_eq!(pointers[1], pointers[2]);

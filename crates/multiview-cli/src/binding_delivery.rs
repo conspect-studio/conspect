@@ -342,6 +342,13 @@ impl WindowDelivery for BindingDelivery {
     }
 }
 
+/// One packet and the whole-window admission permit. The permit is retained
+/// through the actual sink write, including the last packet in a window.
+pub(crate) struct LeasedPacket {
+    pub(crate) packet: EncodedPacket,
+    pub(crate) permit: Arc<BatchLease>,
+}
+
 struct Binding {
     policy: BindingPolicy,
     queue: BoundedBatchQueue,
@@ -379,12 +386,13 @@ impl BindingDelivery {
     pub(crate) fn new(
         policies: Vec<BindingPolicy>,
         limits: DeliveryLimits,
-        gate: Option<multiview_output::batch::RecoveryGate>,
-    ) -> (Self, Vec<Receiver<EncodedPacket>>) {
+        gates: Vec<Option<multiview_output::batch::RecoveryGate>>,
+    ) -> (Self, Vec<Receiver<LeasedPacket>>) {
+        assert_eq!(policies.len(),gates.len(),"each output must declare a recovery gate");
         let mut bindings = Vec::with_capacity(policies.len());
         let mut receivers = Vec::with_capacity(policies.len());
-        for policy in policies {
-            let (packet_tx, packet_rx) = mpsc::sync_channel::<EncodedPacket>(HANDOFF_PACKETS);
+        for (policy,gate) in policies.into_iter().zip(gates) {
+            let (packet_tx, packet_rx) = mpsc::sync_channel::<LeasedPacket>(HANDOFF_PACKETS);
             let (lease_tx, lease_rx) = mpsc::sync_channel::<BatchLease>(HANDOFF_LEASES);
             let wedged = Arc::new(AtomicBool::new(false));
             let pump_wedged = Arc::clone(&wedged);
@@ -392,12 +400,19 @@ impl BindingDelivery {
                 .name("multiview-binding-pump".to_owned())
                 .spawn(move || {
                     while let Ok(lease) = lease_rx.recv() {
-                        for packet in lease.packets() {
+                        let permit = Arc::new(lease);
+                        for packet in permit.packets() {
                             let Ok(shared) = packet.clone_shared_ref() else {
                                 pump_wedged.store(true, Ordering::Release);
                                 return;
                             };
-                            if !send_bounded_packet(&packet_tx, shared) {
+                            if !send_bounded_packet(
+                                &packet_tx,
+                                LeasedPacket {
+                                    packet: shared,
+                                    permit: Arc::clone(&permit),
+                                },
+                            ) {
                                 // The sink hung up or stopped draining for the
                                 // whole grace: this binding is finished. Drop
                                 // the lease (releasing its reservation) and end
@@ -737,7 +752,7 @@ impl BindingDelivery {
 /// Returns `false` when the sink hung up or stopped draining for the whole
 /// grace. This runs on the binding's own pump thread, so it can never pace the
 /// bake consumer or another binding.
-fn send_bounded_packet(tx: &SyncSender<EncodedPacket>, mut packet: EncodedPacket) -> bool {
+fn send_bounded_packet(tx: &SyncSender<LeasedPacket>, mut packet: LeasedPacket) -> bool {
     let deadline = Instant::now() + PUMP_WEDGE_GRACE;
     loop {
         match tx.try_send(packet) {
@@ -795,12 +810,33 @@ mod tests {
         }
     }
 
-    fn drain(rx: &Receiver<EncodedPacket>) -> Vec<EncodedPacket> {
+    fn drain(rx: &Receiver<super::LeasedPacket>) -> Vec<EncodedPacket> {
         let mut out = Vec::new();
         while let Ok(packet) = rx.recv() {
-            out.push(packet);
+            out.push(packet.packet);
+            drop(packet.permit);
         }
         out
+    }
+
+    #[test]
+    fn last_packet_waiting_in_receiver_keeps_batch_reservation_until_mux_ack() {
+        let now = Instant::now();
+        let (mut delivery, receivers) = BindingDelivery::new(
+            vec![BindingPolicy::Bounded],
+            DeliveryLimits::default(),
+            vec![gate()],
+        );
+        let mut receivers = receivers;
+        let rx = receivers.pop().unwrap();
+        delivery.stage(&[packet(32)]);
+        delivery.flush_tick(now, Duration::from_millis(33));
+        let packet = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // This packet is in the actual sink's hands but no mux write has yet
+        // completed. Its reservation must remain charged until the sink acks.
+        assert_eq!(delivery.statuses()[0].reserved_packets, 1);
+        drop(packet);
+        assert_eq!(delivery.statuses()[0].reserved_packets, 0);
     }
 
     #[test]
@@ -819,7 +855,7 @@ mod tests {
         let (mut delivery, mut receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded],
             DeliveryLimits::default(),
-            None,
+            vec![None],
         );
         let rx = receivers.remove(0);
         // A real sink drains for the whole run; the handoff is only one packet
@@ -842,7 +878,7 @@ mod tests {
     #[test]
     fn oversized_window_is_rejected_whole_and_declares_a_discontinuity() {
         let (mut delivery, receivers) =
-            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(4), None);
+            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(4), vec![None]);
         let span = tick_span(Rational::new(30_000, 1001));
         // Five packets in one window: over the binding's 4-packet cap. The whole
         // window is rejected — never a partial burst.
@@ -864,7 +900,7 @@ mod tests {
         let (mut delivery, mut receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded, BindingPolicy::Bounded],
             limits(64),
-            None,
+            vec![None,None],
         );
         let span = tick_span(Rational::new(30_000, 1001));
         // Binding 0's sink never drains: its pump fills the one-packet handoff
@@ -943,7 +979,7 @@ mod tests {
                 max_bytes: 1024 * 1024,
                 max_age: Duration::from_millis(10),
             },
-            None,
+            vec![None],
         );
         let span = tick_span(Rational::new(30_000, 1001));
         let start = Instant::now();
@@ -974,7 +1010,7 @@ mod tests {
         let (mut delivery, mut receivers) = BindingDelivery::new(
             vec![BindingPolicy::Bounded],
             DeliveryLimits::default(),
-            gate(),
+            vec![gate()],
         );
         let rx = receivers.remove(0);
         let collector = std::thread::spawn(move || drain(&rx));
@@ -1001,7 +1037,7 @@ mod tests {
         // Cap of one packet: a two-packet window is rejected whole, which is a
         // real delivery loss and closes the recovery gate.
         let (mut delivery, mut receivers) =
-            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(1), gate());
+            BindingDelivery::new(vec![BindingPolicy::Bounded], limits(1), vec![gate()]);
         let rx = receivers.remove(0);
         let collector = std::thread::spawn(move || drain(&rx));
         let span = tick_span(Rational::new(30_000, 1001));
