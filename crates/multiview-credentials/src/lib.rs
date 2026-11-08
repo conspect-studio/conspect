@@ -179,6 +179,35 @@ impl Vault {
         );
         serde_json::from_slice(&plain).map_err(|_| VaultError::Unavailable)
     }
+    /// Resume a previously owner-authorized, durably recorded cleanup intent.
+    /// The caller MUST authorize the intent before calling: an absent file cannot
+    /// prove ownership. This is not an unauthenticated deletion endpoint.
+    /// Existing credentials must authenticate successfully; only an actual
+    /// filesystem NotFound is idempotent success. Directory sync also runs on a
+    /// retry, making a previous unlink durable before the caller clears intent.
+    pub fn delete_if_present(&self, owner: &str, reference: &SecretRef) -> Result<(), VaultError> {
+        Self::aad(owner, reference)?;
+        let path = self.path(reference)?;
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if !meta.is_file() {
+                    return Err(VaultError::Unavailable);
+                }
+                self.resolve(owner, reference)?;
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(VaultError::Storage),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(VaultError::Storage),
+        }
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| VaultError::Storage)
+    }
+
     /// Proves owner binding before removal; caller still enforces object ACLs.
     pub fn delete(&self, owner: &str, reference: &SecretRef) -> Result<(), VaultError> {
         self.resolve(owner, reference)?;
@@ -263,6 +292,74 @@ mod tests {
         }
         vault.delete("alice", &reference).unwrap();
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    fn cleanup_fixture() -> (tempfile::TempDir, Vault, SecretRef) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let vault = Vault::open(dir.path(), [7; 32]).unwrap();
+        let reference = vault
+            .store(
+                "alice",
+                &Credential::Bearer {
+                    token: "secret".into(),
+                },
+            )
+            .unwrap();
+        (dir, vault, reference)
+    }
+    #[test]
+    fn cleanup_authorized_delete_and_missing_retry() {
+        let (dir, vault, reference) = cleanup_fixture();
+        vault.delete_if_present("alice", &reference).unwrap();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        // A new process may resume the same durable authorized cleanup intent.
+        let reopened = Vault::open(dir.path(), [7; 32]).unwrap();
+        reopened.delete_if_present("alice", &reference).unwrap();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn cleanup_rejects_other_owner_tamper_and_invalid_reference() {
+        let (_dir, vault, reference) = cleanup_fixture();
+        let path = vault.path(&reference).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(vault.delete_if_present("bob", &reference).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let mut tampered = original;
+        tampered[12] ^= 1;
+        fs::write(&path, &tampered).unwrap();
+        assert!(vault.delete_if_present("alice", &reference).is_err());
+        assert_eq!(fs::read(&path).unwrap(), tampered);
+        assert!(matches!(
+            vault.delete_if_present("alice", &SecretRef("vault:../escape".into())),
+            Err(VaultError::Invalid)
+        ));
+        assert!(matches!(
+            vault.delete_if_present("", &reference),
+            Err(VaultError::Invalid)
+        ));
+    }
+    #[test]
+    fn cleanup_rejects_symlinks_including_dangling_links() {
+        use std::os::unix::fs::symlink;
+        let (dir, vault, reference) = cleanup_fixture();
+        let link_ref = SecretRef(format!("vault:{}", uuid::Uuid::new_v4()));
+        let link_path = vault.path(&link_ref).unwrap();
+        symlink(vault.path(&reference).unwrap(), &link_path).unwrap();
+        assert!(vault.delete_if_present("alice", &link_ref).is_err());
+        assert!(fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(vault.resolve("alice", &reference).is_ok());
+        let dangling_ref = SecretRef(format!("vault:{}", uuid::Uuid::new_v4()));
+        let dangling_path = vault.path(&dangling_ref).unwrap();
+        symlink(dir.path().join("absent"), &dangling_path).unwrap();
+        assert!(vault.delete_if_present("alice", &dangling_ref).is_err());
+        assert!(fs::symlink_metadata(dangling_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
     #[test]
     fn rejects_traversal_and_public_directory() {
