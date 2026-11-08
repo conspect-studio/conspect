@@ -1416,6 +1416,7 @@ pub fn api_router() -> Router<AppState> {
         // preview-WHEP) live in `signalling_router`, which `crate::router` merges
         // **with its CORS layer** so the allow-list applies only to them.
         .route("/preview/program.jpg", get(preview::program_jpeg))
+        .route("/preview/switcher/{me}/preview.jpg", get(preview::switcher_preview_jpeg))
         .route("/preview/inputs", get(preview::list_input_ids))
         .route("/preview/inputs/{id}", get(preview::input_jpeg))
         // Read-only change audit log.

@@ -44,7 +44,7 @@ use multiview_compositor::pipeline::Nv12Image;
 use multiview_config::ProgramSpec;
 pub use multiview_config::{ProgramId, ProgramKind};
 
-use crate::clock::{OutputClock, TimeSource};
+use crate::clock::{OutputClock, Tick, TimeSource};
 use crate::drive::{CompositedFrame, CompositorDrive};
 use crate::error::{Error, Result};
 use crate::isolation::EnginePublisher;
@@ -215,6 +215,28 @@ impl<P: Pacer> MultiviewProgram<P> {
             .await
     }
 
+    /// Tick-aware output-clock adapter for the switcher. The legacy control
+    /// method remains unchanged for all existing single-canvas callers.
+    ///
+    /// # Errors
+    /// Propagates an output compositor error without pausing the clock.
+    pub async fn run_with_tick_control<S, E, FS, FE, FC>(
+        &mut self,
+        publisher: &EnginePublisher<S, E>,
+        state_of: FS,
+        event_of: FE,
+        control: FC,
+    ) -> Result<RunOutcome>
+    where
+        FS: FnMut(&CompositedFrame) -> S,
+        FE: FnMut(&CompositedFrame) -> Option<E>,
+        FC: FnMut(&mut CompositorDrive<Nv12Image>, Tick),
+    {
+        self.runtime
+            .run_with_tick_control(publisher, &self.stop, state_of, event_of, control)
+            .await
+    }
+
     /// Drive the protected per-tick loop for at most `max_ticks` ticks (or until
     /// this program's [`StopSignal`] is raised), applying the per-tick `control`
     /// hook at each frame boundary.
@@ -242,6 +264,30 @@ impl<P: Pacer> MultiviewProgram<P> {
     {
         self.runtime
             .run_for_with_control(
+                publisher, &self.stop, max_ticks, state_of, event_of, control,
+            )
+            .await
+    }
+
+    /// Bounded tick-aware output-clock adapter for switcher integration tests.
+    ///
+    /// # Errors
+    /// Propagates compositor failures without misrepresenting a completed take.
+    pub async fn run_for_with_tick_control<S, E, FS, FE, FC>(
+        &mut self,
+        publisher: &EnginePublisher<S, E>,
+        max_ticks: u64,
+        state_of: FS,
+        event_of: FE,
+        control: FC,
+    ) -> Result<RunOutcome>
+    where
+        FS: FnMut(&CompositedFrame) -> S,
+        FE: FnMut(&CompositedFrame) -> Option<E>,
+        FC: FnMut(&mut CompositorDrive<Nv12Image>, Tick),
+    {
+        self.runtime
+            .run_for_with_tick_control(
                 publisher, &self.stop, max_ticks, state_of, event_of, control,
             )
             .await

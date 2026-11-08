@@ -29,6 +29,12 @@ pub trait PreviewProvider: Send + Sync {
     /// The ids of the inputs that can be previewed (for the UI to enumerate
     /// thumbnails). May be empty.
     fn input_ids(&self) -> Vec<String>;
+
+    /// The actual PVW bus canvas as JPEG; the default is unavailable, NEVER
+    /// program fallback. Encoding belongs off the output clock.
+    fn switcher_preview_jpeg(&self, _quality: u8) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The default provider used when the binary wires no live preview (e.g. the
