@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// One immutable canvas for one named bus on a real output tick.
 #[derive(Debug, Clone)]
 pub struct BusFrame {
-    /// `program` or `preview`; never silently aliased.
+    /// `main` or `preview`; never silently aliased.
     pub bus_id: &'static str,
     /// Exact shared output tick.
     pub tick: Tick,
@@ -177,7 +177,7 @@ impl DualBusDrive {
         };
         Ok(BusFrames {
             program: BusFrame {
-                bus_id: "program",
+                bus_id: "main",
                 tick,
                 canvas: pgm,
             },

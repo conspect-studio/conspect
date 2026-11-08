@@ -79,11 +79,17 @@ pub struct SwitcherStateResponse {
 }
 
 fn engine(state: &AppState) -> ControlResult<&SwitcherControl> {
-    state.switcher.as_ref().ok_or_else(|| {
+    let handle = state.switcher.as_ref().ok_or_else(|| {
         ControlError::Conflict(
             "switcher unavailable: no real Program/Preview output bus is attached".into(),
         )
-    })
+    })?;
+    if !handle.is_ready() {
+        return Err(ControlError::Conflict(
+            "switcher unavailable: no real paired Program/Preview frame has been published".into(),
+        ));
+    }
+    Ok(handle)
 }
 
 /// Authorize the M/E plus every referenced resource independently (BOLA).
@@ -202,6 +208,11 @@ pub(crate) async fn plan_switcher(
     authorize_refs(&principal, &req)?;
     validate_first_slice(&req, &req.action)?;
     let handle = engine(&state)?;
+    if req.action == "auto" && !handle.supports_auto() {
+        return Err(ControlError::Validation(
+            "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
+        ));
+    }
     let version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;
@@ -234,6 +245,11 @@ pub(crate) async fn submit_switcher(
     }
     validate_first_slice(&req, &kind)?;
     let handle = engine(&state)?;
+    if req.action == "auto" && !handle.supports_auto() {
+        return Err(ControlError::Validation(
+            "AUTO requires a same-epoch preview compositor and admitted transition budget".into(),
+        ));
+    }
     let scene_version = handle
         .scene_version()
         .ok_or_else(|| ControlError::Conflict("switcher has no active scene".into()))?;

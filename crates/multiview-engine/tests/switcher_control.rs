@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+use multiview_compositor::pipeline::Nv12Image;
+use multiview_core::color::ColorInfo;
 use multiview_core::layout::{Canvas, Cell, Layout};
 use multiview_core::switcher::{FrameCount, SourceRef};
 use multiview_core::time::MediaTime;
@@ -8,7 +10,32 @@ use multiview_engine::switcher_control::{
     ScenePair, SwitcherCommand, SwitcherControl, SwitcherVerb, COMMAND_CAPACITY,
     MAX_COMMANDS_PER_TICK,
 };
+use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+fn primed_stores() -> HashMap<String, Arc<TileStore<Nv12Image>>> {
+    let thresholds = TileThresholds::from_millis(500, 2_000, 10_000).unwrap();
+    ["a", "b"]
+        .into_iter()
+        .map(|id| {
+            let store = Arc::new(TileStore::new(id, thresholds, NoSignalPolicy::Slate));
+            store.publish(
+                Nv12Image::solid(
+                    64,
+                    64,
+                    128,
+                    128,
+                    128,
+                    ColorInfo::default().resolve_defaults(64, 64),
+                )
+                .unwrap(),
+                MediaTime::ZERO,
+            );
+            (id.to_owned(), store)
+        })
+        .collect()
+}
 
 fn tick(index: u64) -> Tick {
     Tick {
@@ -61,7 +88,10 @@ fn pair() -> (
     SwitcherControl,
     multiview_engine::switcher_control::SwitcherTickDriver,
 ) {
-    SwitcherControl::new(SwitcherState::new(source("a"), source("b"), vec![]))
+    let (handle, mut driver) =
+        SwitcherControl::new(SwitcherState::new(source("a"), source("b"), vec![]));
+    driver.set_prime_stores(primed_stores());
+    (handle, driver)
 }
 
 #[test]

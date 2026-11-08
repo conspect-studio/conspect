@@ -2,16 +2,42 @@
 mod support;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use multiview_compositor::pipeline::Nv12Image;
 use multiview_control::routes::switcher::{authorize_refs, SwitcherRequest};
 use multiview_control::{Principal, Role};
+use multiview_core::color::ColorInfo;
 use multiview_core::layout::{Canvas, Cell, Layout};
 use multiview_core::switcher::SourceRef;
 use multiview_core::time::MediaTime;
 use multiview_engine::clock::Tick;
 use multiview_engine::switcher::SwitcherState;
 use multiview_engine::switcher_control::{ScenePair, SwitcherControl};
+use multiview_framestore::{NoSignalPolicy, TileStore, TileThresholds};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
+fn primed_stores() -> HashMap<String, Arc<TileStore<Nv12Image>>> {
+    let thresholds = TileThresholds::from_millis(500, 2_000, 10_000).unwrap();
+    ["a", "b"]
+        .into_iter()
+        .map(|id| {
+            let store = Arc::new(TileStore::new(id, thresholds, NoSignalPolicy::Slate));
+            store.publish(
+                Nv12Image::solid(
+                    64,
+                    64,
+                    128,
+                    128,
+                    128,
+                    ColorInfo::default().resolve_defaults(64, 64),
+                )
+                .unwrap(),
+                MediaTime::ZERO,
+            );
+            (id.to_owned(), store)
+        })
+        .collect()
+}
 use support::{body_json, harness, harness_with, post_json, send, OPERATOR_TOKEN};
 
 fn request(action: &str, source: Option<&str>) -> serde_json::Value {
@@ -52,6 +78,18 @@ fn runtime() -> (
             preview: scene("b"),
         })
         .unwrap();
+    // Only a real frame publisher may make the REST capability live. Tests
+    // emulating its tick retain the driver so the completion can be verified.
+    let mut driver = driver;
+    driver.set_prime_stores(primed_stores());
+    driver.publish_provider_status(multiview_engine::switcher_control::ProviderStatus {
+        scene_version: 1,
+        last_tick: 0,
+        width: 64,
+        height: 64,
+        fps_num: 25,
+        fps_den: 1,
+    });
     (handle, driver)
 }
 fn post_with_key(path: &str, token: &str, body: serde_json::Value, key: &str) -> Request<Body> {

@@ -9,6 +9,9 @@ use multiview_core::switcher::{FrameCount, SourceRef, TransitionDescriptor};
 use std::sync::Arc;
 
 use crate::switcher_plan::validate_mix;
+use multiview_compositor::pipeline::Nv12Image;
+use multiview_framestore::TileStore;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use crate::clock::Tick;
@@ -80,6 +83,25 @@ pub struct SwitcherControl {
     snapshots: LatestState<SwitcherSnapshot>,
     outcomes: EventStream<SwitcherOutcome>,
     scenes: LatestState<ScenePair>,
+    readiness: LatestState<ProviderStatus>,
+}
+
+/// Actual paired-bus frame capability, published after the rendering provider
+/// has produced a frame at this generation and pinned signal format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderStatus {
+    /// Scene version whose two buses were composited.
+    pub scene_version: u64,
+    /// Real output tick whose frame is available, not an optimistic counter.
+    pub last_tick: u64,
+    /// Canvas width.
+    pub width: u32,
+    /// Canvas height.
+    pub height: u32,
+    /// Exact output fps numerator.
+    pub fps_num: i64,
+    /// Exact output fps denominator.
+    pub fps_den: i64,
 }
 
 /// Versioned, prevalidated render scenes. A command never references mutable
@@ -107,6 +129,7 @@ impl SwitcherControl {
             snapshots,
             outcomes,
             scenes: LatestState::new(),
+            readiness: LatestState::new(),
         };
         let driver = SwitcherTickDriver {
             rx,
@@ -114,8 +137,12 @@ impl SwitcherControl {
             snapshots: handle.snapshots.clone(),
             outcomes: handle.outcomes.clone(),
             scenes: handle.scenes.clone(),
+            readiness: handle.readiness.clone(),
             active_auto: None,
             active_auto_scenes: None,
+            primed_stores: None,
+            pending_take: None,
+            last_tick: 0,
         };
         (handle, driver)
     }
@@ -138,6 +165,14 @@ impl SwitcherControl {
     pub fn set_scenes(&self, pair: ScenePair) -> Result<(), String> {
         pair.program.validate().map_err(|e| e.to_string())?;
         pair.preview.validate().map_err(|e| e.to_string())?;
+        self.readiness.publish(ProviderStatus {
+            scene_version: pair.version,
+            last_tick: 0,
+            width: 0,
+            height: 0,
+            fps_num: 0,
+            fps_den: 0,
+        });
         self.scenes.publish(pair);
         Ok(())
     }
@@ -146,6 +181,31 @@ impl SwitcherControl {
     #[must_use]
     pub fn snapshot(&self) -> Option<std::sync::Arc<SwitcherSnapshot>> {
         self.snapshots.latest()
+    }
+
+    /// Real paired-bus publication status, or `None` before the first frame.
+    /// An invalidated status (`width=0`) never admits a command.
+    #[must_use]
+    pub fn provider_status(&self) -> Option<ProviderStatus> {
+        let status = *self.readiness.latest()?;
+        if status.width == 0 || status.height == 0 || status.fps_num <= 0 || status.fps_den <= 0 {
+            return None;
+        }
+        let scene = self.scenes.latest()?;
+        (status.scene_version == scene.version).then_some(status)
+    }
+
+    /// `true` only after the actual paired compositor published frames.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.provider_status().is_some()
+    }
+
+    /// Never admit an AUTO until a same-epoch precomposed PVW tap and its
+    /// measured admission budget are wired. Cut/Punch remain independently safe.
+    #[must_use]
+    pub fn supports_auto(&self) -> bool {
+        false
     }
 
     /// Scene generation presently available for command admission. This is
@@ -174,9 +234,19 @@ pub struct SwitcherTickDriver {
     scenes: LatestState<ScenePair>,
     active_auto: Option<String>,
     active_auto_scenes: Option<Arc<ScenePair>>,
+    readiness: LatestState<ProviderStatus>,
+    primed_stores: Option<HashMap<String, Arc<TileStore<Nv12Image>>>>,
+    pending_take: Option<(SwitcherCommand, u64)>,
+    last_tick: u64,
 }
 
 impl SwitcherTickDriver {
+    /// Install the shared, already allocated source stores before the clock
+    /// starts. Only `is_primed` is sampled on a tick; ingest remains off-clock.
+    pub fn set_prime_stores(&mut self, stores: HashMap<String, Arc<TileStore<Nv12Image>>>) {
+        self.primed_stores = Some(stores);
+    }
+
     /// Immutable scene pair pinned for the duration of the active AUTO, if any.
     /// The compositor must render this pair rather than a newer authored pair
     /// until the take completes or is interrupted.
@@ -187,11 +257,68 @@ impl SwitcherTickDriver {
             .or_else(|| self.scenes.latest())
     }
 
+    /// Set capability only after paired real program/preview canvases were
+    /// published for this tick; never at config load or before first frame.
+    pub fn publish_provider_status(&self, status: ProviderStatus) {
+        self.readiness.publish(status);
+    }
+
+    /// Invalidate on detach/render failure; no stale last-good capability can
+    /// authorize a fresh command after the real provider stops.
+    pub fn revoke_provider_status(&self) {
+        self.readiness.publish(ProviderStatus {
+            scene_version: 0,
+            last_tick: 0,
+            width: 0,
+            height: 0,
+            fps_num: 0,
+            fps_den: 0,
+        });
+    }
+
+    /// Authoritative post-command selected sources for the same output tick.
+    #[must_use]
+    pub fn selections(&self) -> (&SourceRef, &SourceRef) {
+        (self.machine.program(), self.machine.preview())
+    }
+
     /// Process at most 16 queued commands, then advance the exact-tick machine;
     /// always produces one snapshot even if a client wedges or a command fails.
     /// The caller composes the resulting PGM/PVW scene on this same `tick`.
     pub fn drain_at_tick(&mut self, tick: Tick) -> SwitcherProjection {
+        self.last_tick = tick.index;
         let mut projection = self.machine.sample(tick);
+        if let Some((command, deadline)) = self.pending_take.take() {
+            let selected = self.machine.preview().as_str();
+            let primed = self
+                .primed_stores
+                .as_ref()
+                .and_then(|stores| stores.get(selected))
+                .is_some_and(|store| store.is_primed());
+            if primed {
+                match self.machine.cut() {
+                    Ok(next) => {
+                        projection = next;
+                        self.publish_outcome(command.operation_id, tick.index, true, None);
+                    }
+                    Err(err) => self.publish_outcome(
+                        command.operation_id,
+                        tick.index,
+                        false,
+                        Some(err.to_string()),
+                    ),
+                }
+            } else if tick.index >= deadline {
+                self.publish_outcome(
+                    command.operation_id,
+                    tick.index,
+                    false,
+                    Some("preview source was not primed before bounded take deadline".into()),
+                );
+            } else {
+                self.pending_take = Some((command, deadline));
+            }
+        }
         if projection.completed {
             if let Some(operation_id) = self.active_auto.take() {
                 self.active_auto_scenes = None;
@@ -246,10 +373,23 @@ impl SwitcherTickDriver {
                         }
                     }
                     SwitcherVerb::Cut => {
-                        if scenes.is_some() {
-                            self.machine.cut().map_err(|e| e.to_string())
-                        } else {
+                        if scenes.is_none() {
                             Err("no active PGM/PVW scene provider".into())
+                        } else if self.pending_take.is_some() {
+                            Err("a take is already held waiting for source prime".into())
+                        } else if self
+                            .primed_stores
+                            .as_ref()
+                            .and_then(|stores| stores.get(self.machine.preview().as_str()))
+                            .is_some_and(|store| store.is_primed())
+                        {
+                            self.machine.cut().map_err(|e| e.to_string())
+                        } else if self.primed_stores.is_some() {
+                            self.pending_take =
+                                Some((command.clone(), tick.index.saturating_add(50)));
+                            Ok(self.machine.sample(tick))
+                        } else {
+                            Err("switcher source prime provider is unavailable".into())
                         }
                     }
                     SwitcherVerb::Auto(rate) => {
@@ -271,6 +411,14 @@ impl SwitcherTickDriver {
                 }
             };
             match result {
+                Ok(next)
+                    if self
+                        .pending_take
+                        .as_ref()
+                        .is_some_and(|(held, _)| held.operation_id == command.operation_id) =>
+                {
+                    projection = next; // held: never claim success before prime
+                }
                 Ok(next) => {
                     projection = next;
                     if matches!(command.verb, SwitcherVerb::Auto(_)) && !next.completed {

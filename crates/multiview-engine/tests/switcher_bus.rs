@@ -96,7 +96,7 @@ fn two_buses_share_source_stores_and_tick_without_pgm_fallback() {
         .compose_selected(tick, state.program(), state.preview(), sample)
         .unwrap();
     assert_eq!(frames.program.tick, frames.preview.tick);
-    assert_eq!(frames.program.bus_id, "program");
+    assert_eq!(frames.program.bus_id, "main");
     assert_eq!(frames.preview.bus_id, "preview");
     let y_program = frames.program.canvas.sample(8, 8).unwrap().0;
     let y_preview = frames.preview.canvas.sample(8, 8).unwrap().0;
