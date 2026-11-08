@@ -26,6 +26,7 @@
     "@lingui/core": "^6.5.0",
     "@lingui/react": "^6.5.0",
     "@moq/net": "0.4.7",
+    "@moq/watch": "0.6.6",
     "@radix-ui/react-dialog": "^1.1.19",
     "@radix-ui/react-label": "^2.1.11",
     "@radix-ui/react-select": "^2.3.3",

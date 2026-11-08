@@ -1,4 +1,4 @@
-import { Connection } from '@moq/net';
+import { Connection, type Origin } from '@moq/net';
 
 /**
  * Own an established session separately from its handshake AbortSignal.
@@ -79,10 +79,14 @@ export function ownMoqSession(
 export async function connectMoq(
   url: URL,
   signal: AbortSignal,
+  consume?: Origin.Producer,
+  webtransport?: Connection.WebTransportProps,
 ): Promise<Connection.Established> {
   if (url.protocol !== 'https:') {
     throw new Error('MoQ requires an HTTPS endpoint');
   }
   signal.throwIfAborted();
-  return Connection.connect({ url, websocket: { enabled: false }, signal });
+  return Connection.connect({ url, websocket: { enabled: false }, signal,
+    ...(consume ? { consume } : {}), ...(webtransport ? { webtransport } : {}),
+  });
 }

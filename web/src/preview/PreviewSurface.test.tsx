@@ -10,6 +10,7 @@ import type { PreviewCapabilities } from './capabilities';
 function caps(over: Partial<PreviewCapabilities> = {}): PreviewCapabilities {
   return {
     webrtc: true,
+    moq: false,
     fallback: 'jpeg',
     scopes: {
       program: { whep: true, fidelity: 'real-encoded-output' },
