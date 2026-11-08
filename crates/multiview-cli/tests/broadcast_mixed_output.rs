@@ -171,7 +171,16 @@ include_in_program_bus = false
 /// Decode the selected AAC stream to PCM, not merely inspect headers.
 fn decoded_audio_samples(path: &Path, stream_index: usize) -> Result<usize, String> {
     let output = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-probesize",
+            "2000000",
+            "-analyzeduration",
+            "5000000",
+            "-i",
+        ])
         .arg(path)
         .args(["-map"])
         .arg(format!("0:a:{stream_index}"))
@@ -193,19 +202,22 @@ fn probe_audio_count(path: &Path) -> usize {
             "error",
             "-select_streams",
             "a",
+            "-probesize",
+            "2000000",
+            "-analyzeduration",
+            "5000000",
             "-show_entries",
-            "stream=index",
+            "stream=index,codec_type,codec_name",
             "-of",
-            "csv=p=0",
+            "json",
         ])
         .arg(path)
         .output()
         .expect("probe AAC streams");
     assert!(output.status.success());
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count()
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("ffprobe audio JSON");
+    value["streams"].as_array().map_or(0, Vec::len)
 }
 fn probe_frames(path: &Path) -> (String, Vec<i64>) {
     let output = Command::new("ffprobe")
