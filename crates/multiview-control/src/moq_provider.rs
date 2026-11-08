@@ -29,6 +29,10 @@ pub trait AuthorizedFeedFactory: Send + Sync {
     /// True only when real authorized shared media is available.
     fn available(&self) -> bool;
     /// Check all resolved-object permissions before acquiring source demand.
+    ///
+    /// # Errors
+    /// Returns a rejection when authorization, rendition availability, codec
+    /// support, or bounded subscription admission prevents attaching the feed.
     fn attach(
         &self,
         principal: &Principal,
@@ -84,12 +88,9 @@ impl MoqProvider for WebTransportProvider {
             windows,
             demand: feed.demand,
         };
-        let admitted = match self.runtime.admit(transport, fence.clone(), ttl) {
-            Ok(admitted) => admitted,
-            Err(_) => {
-                fence.revoke();
-                return Err(MoqReject::Unavailable);
-            }
+        let Ok(admitted) = self.runtime.admit(transport, fence.clone(), ttl) else {
+            fence.revoke();
+            return Err(MoqReject::Unavailable);
         };
         Ok((
             MoqLease {
