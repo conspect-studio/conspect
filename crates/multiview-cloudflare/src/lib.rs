@@ -271,6 +271,11 @@ impl Client {
             // total is remaining after cursor filtering, not the original account total.
             // A strict timestamp cursor cannot disambiguate ties at a page boundary.
             let next = page.last().map(|r| r.created.clone());
+            if count == 100 && count < total {
+                // An unseen sibling can share the last timestamp. Strict cursors
+                // would skip it; do not return a falsely complete enumeration.
+                return Err(Error::Response);
+            }
             if count < total
                 && page
                     .windows(2)
@@ -501,6 +506,24 @@ mod tests {
                 Error::Response
             );
         }
+    }
+    #[tokio::test]
+    async fn full_page_hidden_timestamp_sibling_fails_before_next_request() {
+        let mut rows:Vec<_>=(0..99).map(|i|serde_json::json!({"uid":format!("newer-{i}"),"name":"newer","created":format!("2026-11-08T12:{:02}:00Z",99-i)})).collect();
+        rows.push(
+            serde_json::json!({"uid":"tie-a","name":"boundary","created":"2026-11-08T10:00:00Z"}),
+        );
+        // Hidden tie-b shares boundary timestamp; older is the final row.
+        // The one-request server closes: a second request cannot succeed.
+        let body=serde_json::json!({"success":true,"result":rows,"result_info":{"count":100,"total":102}}).to_string();
+        assert_eq!(
+            client(origin_server(Box::leak(body.into_boxed_str())))
+                .await
+                .list()
+                .await
+                .unwrap_err(),
+            Error::Response
+        );
     }
     #[tokio::test]
     async fn relay_list_walks_two_abbreviated_pages() {
