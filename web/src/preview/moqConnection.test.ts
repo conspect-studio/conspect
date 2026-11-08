@@ -21,6 +21,33 @@ describe('established session ownership', () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
+  it('bounds a stalled close and permits retry after transport confirmation', async () => {
+    vi.useFakeTimers();
+    try {
+      let finish!: () => void;
+      const closed = new Promise<null>((resolve) => { finish = () => { resolve(null); }; });
+      const release = vi.fn(() => Promise.resolve());
+      const owned = ownMoqSession({ close: vi.fn(), closed }, new AbortController().signal, release, 50);
+      const failed = expect(owned.close()).rejects.toThrow('closure deadline');
+      await vi.advanceTimersByTimeAsync(50);
+      await failed;
+      expect(release).not.toHaveBeenCalled();
+      finish();
+      await owned.close();
+      expect(release).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('retries failed idempotent lease release without duplicate concurrent requests', async () => {
+    const release = vi.fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error('control unavailable'))
+      .mockResolvedValue(undefined);
+    const owned = ownMoqSession({ close: vi.fn(), closed: Promise.resolve(null) }, new AbortController().signal, release);
+    await expect(owned.released).rejects.toThrow('control unavailable');
+    await Promise.all([owned.close(), owned.close()]);
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
   it('releases after remote termination without waiting for unmount', async () => {
     const close = vi.fn();
     const release = vi.fn(() => Promise.resolve());
@@ -40,6 +67,24 @@ describe('QUIC-only MoQ connection', () => {
     await expect(connectMoq(new URL('https://relay.example/preview'), AbortSignal.timeout(100)))
       .rejects.toThrow();
     expect(websocket).not.toHaveBeenCalled();
+  });
+
+  it('never races WebSocketStream while WebTransport handshake hangs', async () => {
+    const socket = vi.fn(() => { throw new Error('unexpected socket'); });
+    const close = vi.fn();
+    const transport = vi.fn(class {
+      ready = new Promise<void>(() => { /* Deliberately stalled handshake. */ });
+      closed = new Promise<void>(() => { /* Deliberately stalled transport. */ });
+      close = close;
+    });
+    vi.stubGlobal('WebTransport', transport);
+    vi.stubGlobal('WebSocketStream', socket);
+    vi.stubGlobal('WebSocket', socket);
+    await expect(connectMoq(new URL('https://relay.example/hanging'), AbortSignal.timeout(750)))
+      .rejects.toThrow();
+    expect(transport).toHaveBeenCalledOnce();
+    expect(socket).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalled();
   });
 
   it('rejects non-HTTPS endpoints without a dial', async () => {

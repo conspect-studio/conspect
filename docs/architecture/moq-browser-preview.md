@@ -46,7 +46,7 @@ The adapter may transform framing and timestamps for the selected MoQ media mapp
 
 ## Security and protocol decision gates
 
-Candidate ecosystem: moq-dev's `moq-lite` protocol and `hang` media mapping, with Rust `moq-relay` 0.17.14 / `moq-net` 0.3.21 / `moq-tokio` 0.19.34 / `hang` 0.21.22 / `moq-mux` 0.10.22 and browser `@moq/net` 0.4.7 / `@moq/watch` 0.6.6. These are research candidates, not installed dependencies or verified end-to-end interoperability. Pin exact versions after API verification. Do not describe the moq-lite subset as full IETF MoQ Transport feature parity.
+Candidate ecosystem: moq-dev's `moq-lite` protocol and `hang` media mapping, with Rust `moq-relay` 0.17.14 / `moq-net` 0.3.21 / `moq-tokio` 0.19.34 / `hang` 0.21.22 / `moq-mux` 0.10.22 and browser `@moq/net` 0.4.7 / `@moq/watch` 0.6.6. Only `@moq/net` 0.4.7 is installed and pinned, with direct runtime schema peers `zod` and `@zod/mini` 4.6.7. The other packages remain research candidates. Browser/server interoperability is not yet verified. Pin remaining exact versions after API verification. Do not describe the moq-lite subset as full IETF MoQ Transport feature parity.
 
 The upstream [transport documentation](https://doc.moq.dev/concept/transport) states that its browser client restricts WebTransport to Firefox 153+ and currently avoids Safari WebTransport, despite API presence. It also automatically races a WebSocket/qmux fallback. The Conspect adapter must disable that race: TCP qmux is not the requested QUIC-first/WebRTC fallback policy. Verify the pinned client can do this before adoption. Do not advertise browser support from a user-agent table or API presence alone.
 

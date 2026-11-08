@@ -10,25 +10,53 @@ export function ownMoqSession(
   session: Pick<Connection.Established, 'close' | 'closed'>,
   signal: AbortSignal,
   release: () => Promise<void>,
-): { close: () => Promise<void>; released: Promise<void> } {
+  closeTimeoutMs = 3000,
+): { close: () => Promise<void>; readonly released: Promise<void> } {
+  if (!Number.isFinite(closeTimeoutMs) || closeTimeoutMs <= 0) {
+    throw new Error('Invalid MoQ closure deadline');
+  }
   let closing = false;
   let ended = false;
-  const abort = (): void => {
-    if (closing || ended) return;
-    closing = true;
-    session.close();
+  let succeeded = false;
+  let inFlight: Promise<void> | undefined;
+  const confirmed = session.closed.then(() => { ended = true; });
+  const attempt = (): Promise<void> => {
+    if (succeeded) return Promise.resolve();
+    if (inFlight) return inFlight;
+    inFlight = (async (): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          confirmed,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => { reject(new Error('MoQ closure deadline exceeded')); }, closeTimeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+      await release();
+      succeeded = true;
+    })().finally(() => { inFlight = undefined; });
+    void inFlight.catch(() => { /* Owner observes failure; abort must not throw. */ });
+    return inFlight;
   };
-  const released = session.closed.then(async () => {
-    ended = true;
+  const close = (): Promise<void> => {
+    if (!closing && !ended) {
+      closing = true;
+      session.close();
+    }
+    return attempt();
+  };
+  const abort = (): void => { void close(); };
+  const released = confirmed.then(() => {
     signal.removeEventListener('abort', abort);
-    await release();
+    return attempt();
   });
-  // Keep abort-triggered teardown from generating an unhandled rejection;
-  // the original promise remains rejected for the owner to observe.
-  void released.catch(() => { /* The owner observes the original promise. */ });
+  void released.catch(() => { /* Owner observes the original failure. */ });
   signal.addEventListener('abort', abort, { once: true });
   if (signal.aborted) abort();
-  return { close: (): Promise<void> => { abort(); return released; }, released };
+  return { close, get released(): Promise<void> { return succeeded ? Promise.resolve() : (inFlight ?? released); } };
 }
 
 /**
