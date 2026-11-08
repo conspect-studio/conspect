@@ -58,6 +58,29 @@ The canonical Rust Cloudflare request and generated TypeScript both include `mod
 
 Captain relayed that the production factory is not ready and has no ETA. Reported output checkpoint `1bcaaabb` has 27 tests, but production consumer/`StreamEgress` wiring remains pending. Reported dispatcher checkpoint `41410ab9` has six behavior tests and a copy defect under repair. These are owner-reported references, not locally verified integration results. They do not satisfy the factory or production media acceptance criteria above. Preserve typed unavailable; continue standalone Cloudflare management gates without a fake feed.
 
+## Future aggregate PR gate (not executed by the schema-refresh task)
+
+Run only after owners freeze the aggregate SHA and the captain approves the gate. Run from the task worktree, never the root checkout. Check disk capacity first; use one Cargo build lane and the local target directory. The engineering standard requires R3 design/chaos evidence and cross-vendor review for output/isolation risk; command success alone is not release acceptance.
+
+```sh
+# Record the exact frozen revision and available capacity first.
+git rev-parse HEAD
+git status --short
+df -h .
+scripts/classify.sh
+# One full Rust gate, not repeated by each owner.
+cargo fmt --all -- --check &&
+cargo clippy --locked --workspace --all-targets -j2 -- -D warnings &&
+cargo test --locked --workspace -j2 &&
+cargo deny check
+# One web gate after the committed lockfile and translations are stable.
+npm --prefix web ci &&
+npm --prefix web run lint &&
+npm --prefix web run build
+```
+
+The classifier is a floor, not permission to lower the R3 media risk. Do not push or deploy from this command block. Preserve the two-full-suite-per-task budget and retain exact SHA/exit evidence. CI and required independent review still gate any merge. Optional transport acceptance also requires its targeted feature tests and actual production media evidence; a default workspace gate does not enable or prove that transport.
+
 ## Proposed PR summary
 
 Introduce authenticated finite MoQ control leases, generated browser/relay APIs, safe unavailable defaults, optional trusted transport startup, and secure Cloudflare management service wiring. Preserve the production output path and keep MoQ disabled without an authorized real factory.

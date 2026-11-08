@@ -10421,6 +10421,21 @@
           "dual"
         ]
       },
+      "CloudflareRelayConfig": {
+        "type": "object",
+        "properties": {
+          "upstreams": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CloudflareUpstreams"
+              }
+            ]
+          }
+        }
+      },
       "CloudflareRequest": {
         "type": "object",
         "required": [
@@ -10435,6 +10450,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CloudflareRelayConfig",
+                "description": "Whole-object upstream replacement; omitted preserves remote configuration."
+              }
             ]
           },
           "mode": {
@@ -10481,6 +10507,35 @@
         "properties": {
           "data": {
             "description": "Secret-free result. Token values must be persisted before this is returned."
+          }
+        }
+      },
+      "CloudflareUpstream": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "CloudflareUpstreams": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "upstreams"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "upstreams": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CloudflareUpstream"
+            }
           }
         }
       },

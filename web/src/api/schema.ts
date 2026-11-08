@@ -3101,9 +3101,13 @@ export interface components {
          * @enum {string}
          */
         ClockFaceDoc: "analog" | "digital" | "dual";
+        CloudflareRelayConfig: {
+            upstreams?: null | components["schemas"]["CloudflareUpstreams"];
+        };
         CloudflareRequest: {
             account_id: string;
             auth_domain?: string | null;
+            config?: null | components["schemas"]["CloudflareRelayConfig"];
             /** @description auto creates a missing managed relay on reconcile; manual only observes. */
             mode?: string | null;
             name?: string | null;
@@ -3115,6 +3119,13 @@ export interface components {
         CloudflareResult: {
             /** @description Secret-free result. Token values must be persisted before this is returned. */
             data: unknown;
+        };
+        CloudflareUpstream: {
+            url: string;
+        };
+        CloudflareUpstreams: {
+            enabled: boolean;
+            upstreams: components["schemas"]["CloudflareUpstream"][];
         };
         /** @description `OpenAPI` mirror of `multiview_config::ColorOverride` (four color axes). */
         ColorOverrideDoc: {
