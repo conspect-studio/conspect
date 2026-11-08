@@ -27,6 +27,45 @@ use crate::decode::ensure_initialized;
 use crate::error::{FfmpegError, Result};
 use crate::mux_options::MuxOptions;
 
+#[cfg(test)]
+mod mux_packet_test_probe {
+    use ffmpeg_next::codec::packet::Packet;
+    use std::cell::Cell;
+    thread_local! {static EXPECTED:Cell<(*const u8,i64)>=const{Cell::new((std::ptr::null(),0))};}
+    pub(super) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            EXPECTED.with(|slot| slot.set((std::ptr::null(), 0)));
+        }
+    }
+    pub(super) fn expect(pointer: *const u8, pts: i64) -> Guard {
+        EXPECTED.with(|slot| slot.set((pointer, pts)));
+        Guard
+    }
+    pub(super) fn observe(packet: &Packet, index: usize) {
+        EXPECTED.with(|slot| {
+            let (expected, pts) = slot.get();
+            if !expected.is_null() {
+                assert_eq!(
+                    packet.data().map_or(std::ptr::null(), <[u8]>::as_ptr),
+                    expected,
+                    "Muxer::write_packet must reuse coded payload"
+                );
+                assert_eq!(
+                    packet.stream(),
+                    index,
+                    "mux header stream index must be independent"
+                );
+                assert_eq!(
+                    packet.pts(),
+                    Some(pts),
+                    "mux header PTS must be independently stamped"
+                );
+            }
+        });
+    }
+}
+
 /// The typed error for a metadata key/value carrying an interior NUL byte: it
 /// could never become a C string for `av_dict_set`. Mapped onto the muxer's
 /// `InvalidData` (a contradictory request, surfaced not swallowed).
@@ -620,6 +659,8 @@ impl Muxer {
         let src = to_ff_rational(info.encoder_time_base)?;
         let dst = to_ff_rational(info.stream_time_base)?;
         packet.rescale_ts(src, dst);
+        #[cfg(test)]
+        mux_packet_test_probe::observe(&packet, stream_index);
         packet
             .write_interleaved(&mut self.output)
             .map_err(FfmpegError::Mux)
@@ -842,5 +883,84 @@ mod push_ffi {
         // `Output::wrap` adopts it and frees both (`avio_close` +
         // `avformat_free_context`) in its destructor.
         Ok(unsafe { ffmpeg::format::context::Output::wrap(ctx) })
+    }
+}
+
+#[cfg(test)]
+mod shared_mux_input_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::{mux_packet_test_probe, Muxer};
+    use crate::{
+        encode::{VideoEncodeTarget, VideoEncoder},
+        packet::{EncodedPacket, StreamCodecParameters},
+    };
+    use ffmpeg_next::format::Pixel;
+    use ffmpeg_next::util::frame::Video;
+    use multiview_core::time::Rational;
+
+    #[test]
+    fn three_actual_mux_writes_reuse_one_encoded_payload_with_independent_headers() {
+        let mut encoder = VideoEncoder::new(&VideoEncodeTarget {
+            codec_name: "mpeg2video".to_owned(),
+            width: 64,
+            height: 48,
+            format: Pixel::YUV420P,
+            time_base: Rational::new(1, 25),
+            bit_rate: 500_000,
+            gop: 12,
+            cuda_device: None,
+        })
+        .expect("open encoder");
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let mut first = None;
+        for tick in 0..8 {
+            let mut frame = Video::new(Pixel::YUV420P, 64, 48);
+            for plane in 0..frame.planes() {
+                frame.data_mut(plane).fill(128);
+            }
+            frame.set_pts(Some(tick));
+            encoder.send_frame(&frame).expect("submit frame");
+            while let Some(packet) = encoder.receive_packet().expect("receive packet") {
+                if first.is_none() {
+                    first = Some(packet);
+                }
+            }
+        }
+        if first.is_none() {
+            encoder.send_eof().expect("flush encoder");
+            first = encoder.receive_packet().expect("drain packet");
+        }
+        let original = EncodedPacket::from_packet(first.expect("one actual coded frame"));
+        let ptr = original.payload().expect("coded payload").as_ptr();
+        let original_pts = original.pts().expect("coded PTS");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for n in 0..3 {
+            let path = dir.path().join(format!("mux-{n}.ts"));
+            let mut mux = Muxer::create_as(&path, "mpegts").expect("mpegts muxer");
+            let stream = mux
+                .add_stream_from_parameters(&params, Rational::new(1, 25))
+                .expect("stream");
+            mux.write_header().expect("header");
+            let coded = original.clone_shared_ref().expect("shared header");
+            assert_eq!(coded.payload().expect("coded data").as_ptr(), ptr);
+            let mut owned = coded.to_owned_packet_shared_ref().expect("mux header");
+            assert_eq!(owned.data().expect("owned coded data").as_ptr(), ptr);
+            owned.set_pts(Some(original_pts + 25 * i64::from(n)));
+            let _guard =
+                mux_packet_test_probe::expect(ptr, (original_pts + 25 * i64::from(n)) * 3_600);
+            mux.write_packet(stream, owned).expect("actual mux write");
+            mux.finish().expect("trailer");
+            assert!(std::fs::metadata(path).expect("mux artifact").len() > 0);
+        }
+        assert_eq!(
+            original.payload().expect("original still live").as_ptr(),
+            ptr
+        );
+        assert_eq!(original.pts(), Some(original_pts));
     }
 }
