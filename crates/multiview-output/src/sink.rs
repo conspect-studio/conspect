@@ -2392,6 +2392,11 @@ impl<'a> SegmentState<'a> {
                 self.recovery_failures = 0;
             }
         }
+        if self.recovering {
+            return Err(Error::Output(
+                "HLS muxer did not recover before the packet source ended".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -3077,6 +3082,52 @@ mod tests {
         assert!(!playlist.contains("seg0.ts"));
         assert!(playlist.contains("#EXT-X-DISCONTINUITY\n"));
         assert!(playlist.contains("seg1.ts"));
+    }
+
+    #[test]
+    fn source_end_during_recovery_returns_error_instead_of_stale_success() {
+        use super::{PacketSource, SegmentState, StreamSeed};
+        use crate::hls::LivePlaylist;
+        use ffmpeg::codec::packet::{Flags, Packet};
+        use multiview_ffmpeg::{EncodedPacket, StreamCodecParameters, VideoEncoder};
+        struct Packets(std::vec::IntoIter<EncodedPacket>);
+        impl PacketSource for Packets {
+            fn next_packet(&mut self) -> Result<Option<EncodedPacket>> {
+                Ok(self.0.next())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let encoder = VideoEncoder::new(&EncodeConfig::mpeg2(WIDTH, HEIGHT).target()).unwrap();
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let mut state = SegmentState::new(
+            StreamSeed::Params(&params),
+            encoder.time_base(),
+            None,
+            dir.path(),
+            "seg",
+        );
+        state.live = Some(LivePlaylist::new(dir.path().join("index.m3u8"), 3));
+        let mut packet = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+        packet.set_flags(Flags::KEY);
+        packet.set_pts(Some(0));
+        packet.set_dts(Some(0));
+        state
+            .write_source_packet(
+                EncodedPacket::from_packet(packet),
+                multiview_core::time::MediaTime::ZERO,
+            )
+            .unwrap();
+        state.fail_packet_write_once = true;
+        let mut bad = Packet::copy(&[0, 0, 1, 0, 0, 8, 0, 0]);
+        bad.set_pts(Some(1));
+        bad.set_dts(Some(1));
+        let mut source = Packets(vec![EncodedPacket::from_packet(bad)].into_iter());
+        let error = state
+            .drive_from_packets(&mut source)
+            .expect_err("unrecovered source end");
+        assert!(error.to_string().contains("did not recover"));
+        assert!(!dir.path().join("seg0.ts.tmp").exists());
+        assert!(!dir.path().join("index.m3u8").exists());
     }
 
     #[test]
