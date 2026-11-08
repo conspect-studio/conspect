@@ -16994,7 +16994,7 @@
           "discarded_awaiting_keyframe": {
             "type": "integer",
             "format": "int64",
-            "description": "Packets discarded while the session waited for a video keyframe (session\nstart or a post-overflow resync). Expected and benign.",
+            "description": "Packets discarded while a fresh session waited for its first video\nkeyframe. Expected and benign: the link is fine, the decoder is simply\nnot started yet.",
             "minimum": 0
           },
           "discarded_no_client": {
@@ -17012,7 +17012,7 @@
           "dropped_slow_peer": {
             "type": "integer",
             "format": "int64",
-            "description": "Packets dropped on a slow peer's full bounded queue (a real delivery\nfailure).",
+            "description": "Packets lost to a slow peer: its bounded-queue overflow, plus every\npacket held until it is re-admitted on the next video keyframe (audio\nand non-IDR video alike). A real delivery failure.",
             "minimum": 0
           },
           "dropped_upstream": {

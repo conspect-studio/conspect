@@ -2513,11 +2513,13 @@ pub struct OutputLinkDoc {
     /// Packets discarded because no peer was attached (a listener waiting for a
     /// caller, or a caller between sessions). Expected and benign.
     pub discarded_no_client: u64,
-    /// Packets discarded while the session waited for a video keyframe (session
-    /// start or a post-overflow resync). Expected and benign.
+    /// Packets discarded while a fresh session waited for its first video
+    /// keyframe. Expected and benign: the link is fine, the decoder is simply
+    /// not started yet.
     pub discarded_awaiting_keyframe: u64,
-    /// Packets dropped on a slow peer's full bounded queue (a real delivery
-    /// failure).
+    /// Packets lost to a slow peer: its bounded-queue overflow, plus every
+    /// packet held until it is re-admitted on the next video keyframe (audio
+    /// and non-IDR video alike). A real delivery failure.
     pub dropped_slow_peer: u64,
     /// Packets dropped upstream of the distributor (the producer shed a packet
     /// or held its post-loss gate).

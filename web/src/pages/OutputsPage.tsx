@@ -121,9 +121,15 @@ function hasLiveLink(kind: OutputKind): boolean {
  * error from a previous session reads as a fault when the link is healthy. So
  * (1) only `last_error` — current link health — is shown as an alarm;
  * `last_session_error` is muted history from the previous session; and (2) the
- * additive reason counters separate benign discards (no caller, waiting for a
- * keyframe) from real delivery failures (slow peer, upstream shed). Bodies from
- * a server without the reason counters fall back to the one conflated total.
+ * additive reason counters separate benign discards from real delivery
+ * failures. Benign is exactly two things: no caller attached, and a *fresh*
+ * session waiting for its first keyframe (nothing is wrong with the link, the
+ * decoder just has not been handed an IDR). A slow peer's queue overflow, and
+ * every packet held until that peer is re-admitted on the next keyframe — audio
+ * and non-IDR video alike — is delivery loss that peer caused, so it is counted
+ * as slow-peer loss and shown as an alarm (t10 / SRT-STATUS-01: the two causes
+ * share one keyframe gate and were once conflated here). Bodies from a server
+ * without the reason counters fall back to the one conflated total.
  */
 export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element | null {
   const { t } = useLingui();
@@ -177,7 +183,9 @@ export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element |
         <>
           {slowPeerDrops > 0 ? (
             <span className="text-destructive">
-              <Trans>{slowPeerDrops} packets dropped (slow peer)</Trans>
+              <Trans>
+                {slowPeerDrops} packets dropped (slow peer, incl. keyframe resync)
+              </Trans>
             </span>
           ) : null}
           {upstreamDrops > 0 ? (
@@ -195,7 +203,7 @@ export function OutputLinkStatus({ id }: { readonly id: string }): JSX.Element |
           {discardedKeyframe > 0 ? (
             <span className="text-muted-foreground">
               <Trans>
-                {discardedKeyframe} packets discarded waiting for a keyframe
+                {discardedKeyframe} packets discarded waiting for the first keyframe
               </Trans>
             </span>
           ) : null}

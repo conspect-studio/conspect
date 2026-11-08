@@ -96,12 +96,16 @@ pub struct PushLinkStatus {
     /// for a caller, or a caller between sessions). Expected and benign — it is
     /// not a delivery failure. Part of `dropped`.
     discarded_no_client: AtomicU64,
-    /// Packets discarded because the session was **waiting for a video
-    /// keyframe** (a fresh session, or a post-overflow resync). Expected and
-    /// benign. Part of `dropped`.
+    /// Packets discarded because a **fresh session was waiting for its first
+    /// video keyframe**. Expected and benign — the link is fine, the decoder
+    /// has simply not been handed an IDR yet. Part of `dropped`. A session
+    /// re-gated by its own queue overflow is a *slow peer*, not this: those
+    /// held packets count in `dropped_slow_peer` (t10 / SRT-STATUS-01).
     discarded_awaiting_keyframe: AtomicU64,
-    /// Packets dropped because a **peer's bounded queue was full** (a slow
-    /// peer). A real delivery failure. Part of `dropped`.
+    /// Packets lost to a **slow peer**: the packet that overflowed its bounded
+    /// queue, plus every packet held until that peer is re-admitted on the next
+    /// video keyframe (audio and non-IDR video alike). A real delivery failure.
+    /// Part of `dropped`.
     dropped_slow_peer: AtomicU64,
     /// Packets dropped **upstream of the distributor** (the producer shed a
     /// packet or held its post-loss gate). Part of `dropped`.
@@ -153,10 +157,11 @@ pub struct PushLinkSnapshot {
     /// Packets discarded because no peer was attached (benign: a listener
     /// waiting for a caller, or a caller between sessions).
     pub discarded_no_client: u64,
-    /// Packets discarded while the session waited for a video keyframe (benign:
-    /// session start, or a post-overflow resync).
+    /// Packets discarded while a fresh session waited for its first video
+    /// keyframe (benign: the link is fine, the decoder is just not started).
     pub discarded_awaiting_keyframe: u64,
-    /// Packets dropped on a slow peer's full bounded queue (a real failure).
+    /// Packets lost to a slow peer: its bounded-queue overflow, plus everything
+    /// held until it is re-admitted on the next keyframe (a real failure).
     pub dropped_slow_peer: u64,
     /// Packets dropped upstream of the distributor (producer shed / post-loss
     /// gate).
@@ -318,15 +323,17 @@ impl PushLinkStatus {
         self.discarded_no_client.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a packet discarded while a session waits for a video keyframe
-    /// (fresh session or post-overflow resync). Wait-free.
+    /// Count a packet discarded while a **fresh** session waits for its first
+    /// video keyframe (benign). A post-overflow hold is
+    /// [`drop_slow_peer`](Self::drop_slow_peer), never this. Wait-free.
     pub fn discard_awaiting_keyframe(&self) {
         self.add_dropped(1);
         self.discarded_awaiting_keyframe
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a packet dropped on a slow peer's full bounded queue. Wait-free.
+    /// Count a packet lost to a slow peer: its queue overflow, or a packet held
+    /// until that peer is re-admitted on the next keyframe. Wait-free.
     pub fn drop_slow_peer(&self) {
         self.add_dropped(1);
         self.dropped_slow_peer.fetch_add(1, Ordering::Relaxed);

@@ -265,12 +265,59 @@ describe("OutputLinkStatus", () => {
       dropped_upstream: 0,
     });
     expect(await screen.findByText("Connected (1)")).toBeInTheDocument();
-    const slow = screen.getByText("30 packets dropped (slow peer)");
+    const slow = screen.getByText(
+      "30 packets dropped (slow peer, incl. keyframe resync)",
+    );
     expect(slow).toHaveClass("text-destructive");
     expect(
-      screen.getByText("15 packets discarded waiting for a keyframe"),
+      screen.getByText("15 packets discarded waiting for the first keyframe"),
     ).toHaveClass("text-muted-foreground");
     expect(screen.queryByText(/discarded while no caller/)).not.toBeInTheDocument();
+  });
+
+  it("alarms on a slow peer's resync hold, never muting it as benign", async () => {
+    // t10 / SRT-STATUS-01 regression: after an overflow the peer's held packets
+    // (audio and non-IDR video) are loss it caused, so they arrive in
+    // `dropped_slow_peer` and must render as an alarm — not under the muted
+    // "waiting for a keyframe" line they were once conflated with.
+    renderLink({
+      ...link,
+      state: "connected",
+      clients: 1,
+      dropped: 61,
+      discarded_no_client: 0,
+      discarded_awaiting_keyframe: 0,
+      dropped_slow_peer: 61,
+      dropped_upstream: 0,
+    });
+    expect(await screen.findByText("Connected (1)")).toBeInTheDocument();
+    const lost = screen.getByText(
+      "61 packets dropped (slow peer, incl. keyframe resync)",
+    );
+    expect(lost).toHaveClass("text-destructive");
+    expect(lost).not.toHaveClass("text-muted-foreground");
+    expect(
+      screen.queryByText(/waiting for the first keyframe/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a fresh session's first-keyframe wait muted", async () => {
+    renderLink({
+      ...link,
+      state: "connected",
+      clients: 1,
+      dropped: 12,
+      discarded_no_client: 0,
+      discarded_awaiting_keyframe: 12,
+      dropped_slow_peer: 0,
+      dropped_upstream: 0,
+    });
+    const waiting = await screen.findByText(
+      "12 packets discarded waiting for the first keyframe",
+    );
+    expect(waiting).toHaveClass("text-muted-foreground");
+    expect(waiting).not.toHaveClass("text-destructive");
+    expect(screen.queryByText(/slow peer/)).not.toBeInTheDocument();
   });
 
   it("keeps a previous session's error as muted history, not a current alarm", async () => {

@@ -29,6 +29,16 @@
 //!   write blocked past [`WRITE_DEADLINE`] ends the session (the peer is gone),
 //!   which the link thread observes and replaces.
 //!
+//! The keyframe gate has two causes and they are reported differently, because
+//! only one of them is benign. A **fresh session** waiting for its first video
+//! keyframe is expected ([`Gate::Startup`]): nothing is wrong with the link, so
+//! those held packets are counted as discarded-awaiting-keyframe and shown
+//! muted. A session re-gated by its **own** bounded-queue overflow is a slow
+//! peer ([`Gate::LossRecovery`]): every packet held until it is re-admitted —
+//! audio and non-IDR video alike — is delivery loss that peer caused, so it is
+//! counted as slow-peer loss and shown as an alarm. The two must never be
+//! conflated just because the same keyframe gate does the holding.
+//!
 //! Teardown is bounded: at end-of-program the peer queues close, writers get
 //! [`TEARDOWN_GRACE`] to flush their trailer, then the shared stop flag aborts
 //! any libav call still blocked (accept, connect, write) through the interrupt
@@ -123,8 +133,25 @@ struct WriterSpec {
 /// One attached peer as seen by the distributor.
 struct Client {
     tx: SyncSender<EncodedPacket>,
-    /// Waiting for the next video keyframe (new session or after overflow).
-    gated: bool,
+    /// Why this peer's keyframe gate is closed, if it is (see [`Gate`]).
+    gate: Gate,
+}
+
+/// Why a peer's distributor gate is closed.
+///
+/// The mechanism is one keyframe gate, but the *cause* decides how the held
+/// packets are reported (see the module docs): a fresh session waiting for its
+/// first keyframe is expected, while holding after this peer's own queue
+/// overflow is loss the peer caused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Sending normally.
+    Open,
+    /// A fresh session waiting for its first video keyframe: expected, benign.
+    Startup,
+    /// Re-gated by this peer's bounded-queue overflow: the peer is slow, so
+    /// every packet held until it is re-admitted is loss it caused.
+    LossRecovery,
 }
 
 /// State shared by the distributor, the link thread and the writers.
@@ -276,19 +303,33 @@ fn distribute<P: PacketSource>(
 /// Hand `packet` to one peer without blocking. Returns `false` when the peer's
 /// writer has gone (remove it).
 fn deliver(client: &mut Client, packet: &EncodedPacket, link: &PushLinkStatus) -> bool {
-    if client.gated && !(matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe()) {
-        link.discard_awaiting_keyframe();
-        return true;
+    // A closed gate admits only a video keyframe, but the two causes must not be
+    // conflated in the status: waiting for a fresh session's first keyframe is
+    // expected, while holding after this peer's own overflow is loss it caused.
+    let admission = matches!(packet.kind(), StreamKind::Video) && packet.is_keyframe();
+    if !admission {
+        match client.gate {
+            Gate::Startup => {
+                link.discard_awaiting_keyframe();
+                return true;
+            }
+            Gate::LossRecovery => {
+                link.drop_slow_peer();
+                return true;
+            }
+            Gate::Open => {}
+        }
     }
     match client.tx.try_send(packet.clone()) {
         Ok(()) => {
-            client.gated = false;
+            client.gate = Gate::Open;
             true
         }
         Err(TrySendError::Full(_)) => {
             // Slow peer: shed and resync on the next keyframe rather than
-            // splice a hole into the middle of a GOP.
-            client.gated = true;
+            // splice a hole into the middle of a GOP. Everything held until
+            // that keyframe is slow-peer loss, never benign gating.
+            client.gate = Gate::LossRecovery;
             link.drop_slow_peer();
             true
         }
@@ -529,7 +570,10 @@ fn start_session(
         .spawn(move || writer_main(muxer, &rx, &spec, &link, writer_peer.as_deref()));
     match spawned {
         Ok(handle) => {
-            shared.clients().push(Client { tx, gated: true });
+            shared.clients().push(Client {
+                tx,
+                gate: Gate::Startup,
+            });
             tracing::info!("push peer session started");
             Some(handle)
         }
@@ -615,7 +659,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        deliver, distribute, is_srt_listener_url, Client, PacketSource, PushRunReport, Shared,
+        deliver, distribute, is_srt_listener_url, Client, Gate, PacketSource, PushRunReport, Shared,
     };
     use crate::push_link::PushLinkStatus;
     use ffmpeg_next::codec::packet::{Flags, Packet};
@@ -674,7 +718,10 @@ mod tests {
     fn a_session_starts_on_a_video_keyframe_and_overflow_regates_it() {
         let link = PushLinkStatus::new("srt", true, "srt://[::]:9000");
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
-        let mut client = Client { tx, gated: true };
+        let mut client = Client {
+            tx,
+            gate: Gate::Startup,
+        };
         let mut audio = Packet::new(16);
         audio.set_flags(Flags::KEY); // every AAC packet is flagged key
         let audio = EncodedPacket::from_audio_packet(audio);
@@ -686,12 +733,12 @@ mod tests {
         assert_eq!(snap.dropped, 2);
         assert_eq!(
             snap.discarded_awaiting_keyframe, 2,
-            "gating on the first keyframe is its own reason"
+            "a fresh session waiting for its first keyframe is benign"
         );
-        assert_eq!(snap.dropped_slow_peer, 0);
+        assert_eq!(snap.dropped_slow_peer, 0, "no peer has been slow yet");
 
         assert!(deliver(&mut client, &video(true), &link));
-        assert!(!client.gated, "the keyframe opened the gate");
+        assert_eq!(client.gate, Gate::Open, "the keyframe opened the gate");
         assert!(deliver(&mut client, &audio, &link));
         assert!(rx.try_recv().unwrap().is_keyframe(), "first out is the key");
         assert!(rx.try_recv().is_ok(), "audio flows after the gate");
@@ -700,20 +747,86 @@ mod tests {
         assert!(deliver(&mut client, &video(false), &link));
         assert!(deliver(&mut client, &video(false), &link));
         assert!(deliver(&mut client, &video(false), &link));
-        assert!(client.gated, "overflow re-gates on the next keyframe");
+        assert_eq!(
+            client.gate,
+            Gate::LossRecovery,
+            "overflow re-gates on the next keyframe"
+        );
         let snap = link.snapshot();
         assert_eq!(snap.dropped, 3);
         assert_eq!(snap.dropped_slow_peer, 1, "the overflow is a slow peer");
         assert_eq!(
             snap.discarded_awaiting_keyframe, 2,
-            "the two holds before the first keyframe are unchanged"
+            "the two startup holds are unchanged by the overflow"
         );
 
         drop(rx);
-        client.gated = false;
+        client.gate = Gate::Open;
         assert!(
             !deliver(&mut client, &video(true), &link),
             "gone writer is removed"
+        );
+    }
+
+    /// t10 / SRT-STATUS-01: once this peer's own queue overflows, everything
+    /// held until it is re-admitted is loss the peer caused — audio and non-IDR
+    /// video alike — and must never be reported as benign startup gating.
+    #[test]
+    fn post_overflow_holds_are_active_loss_not_startup_gating() {
+        let link = PushLinkStatus::new("srt", true, "srt://[::]:9000");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut client = Client {
+            tx,
+            gate: Gate::Startup,
+        };
+        let mut audio = Packet::new(16);
+        audio.set_flags(Flags::KEY); // every AAC packet is flagged key
+        let audio = EncodedPacket::from_audio_packet(audio);
+
+        // A fresh session is admitted on its first video keyframe; the writer
+        // takes it, so the one-slot queue is empty again.
+        assert!(deliver(&mut client, &video(true), &link));
+        assert!(rx.try_recv().is_ok(), "the writer took the key");
+        assert_eq!(client.gate, Gate::Open);
+        assert_eq!(link.snapshot().discarded_awaiting_keyframe, 0);
+
+        // One packet fits; the next overflows the bounded peer queue.
+        assert!(deliver(&mut client, &video(false), &link));
+        assert!(deliver(&mut client, &video(false), &link));
+        assert_eq!(
+            client.gate,
+            Gate::LossRecovery,
+            "the overflow re-gates the session"
+        );
+        let snap = link.snapshot();
+        assert_eq!(snap.dropped_slow_peer, 1, "the overflow itself is loss");
+        assert_eq!(
+            snap.discarded_awaiting_keyframe, 0,
+            "nothing about this is benign"
+        );
+
+        // Every packet held until the next keyframe is loss this peer caused.
+        for _ in 0..5 {
+            assert!(deliver(&mut client, &video(false), &link));
+        }
+        assert!(deliver(&mut client, &audio, &link), "audio is held too");
+        let snap = link.snapshot();
+        assert_eq!(snap.dropped_slow_peer, 7, "1 overflow + 6 held packets");
+        assert_eq!(
+            snap.discarded_awaiting_keyframe, 0,
+            "no post-overflow hold is reported as waiting"
+        );
+        assert_eq!(snap.dropped, 7, "the total stays the sum of the reasons");
+
+        // The keyframe re-admits the peer and normal traffic resumes.
+        assert!(rx.try_recv().is_ok(), "the writer drains the queued packet");
+        assert!(deliver(&mut client, &video(true), &link));
+        assert_eq!(client.gate, Gate::Open, "the recovery key opened the gate");
+        assert!(rx.try_recv().is_ok(), "the recovery key is queued");
+        assert_eq!(
+            link.snapshot().dropped_slow_peer,
+            7,
+            "recovery itself adds no loss"
         );
     }
 

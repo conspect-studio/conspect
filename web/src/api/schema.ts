@@ -5525,8 +5525,9 @@ export interface components {
             clients: number;
             /**
              * Format: int64
-             * @description Packets discarded while the session waited for a video keyframe (session
-             *     start or a post-overflow resync). Expected and benign.
+             * @description Packets discarded while a fresh session waited for its first video
+             *     keyframe. Expected and benign: the link is fine, the decoder is simply
+             *     not started yet.
              */
             discarded_awaiting_keyframe: number;
             /**
@@ -5543,8 +5544,9 @@ export interface components {
             dropped: number;
             /**
              * Format: int64
-             * @description Packets dropped on a slow peer's full bounded queue (a real delivery
-             *     failure).
+             * @description Packets lost to a slow peer: its bounded-queue overflow, plus every
+             *     packet held until it is re-admitted on the next video keyframe (audio
+             *     and non-IDR video alike). A real delivery failure.
              */
             dropped_slow_peer: number;
             /**
