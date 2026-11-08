@@ -548,6 +548,246 @@ struct AudioState {
     kind: StreamKind,
 }
 
+/// One independently admitted video rendition. Shares the baked canvas with
+/// sibling renditions; it never opens or duplicates a program-audio encoder.
+pub struct VideoRenditionEncoder {
+    encoder: VideoEncoder,
+    converter: FrameConverter,
+    params: StreamCodecParameters,
+    time_base: Rational,
+    tick: i64,
+    finished: bool,
+    no_reorder: bool,
+}
+
+impl VideoRenditionEncoder {
+    /// Open one video-only encoder with the exact requested configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the video encoder is unavailable or invalid.
+    pub fn new(config: &EncodeConfig) -> Result<Self> {
+        config.validate()?;
+        let pairs: &[(&str, &str)] =
+            if config.codec_name == "libx264" || config.codec_name == "libx265" {
+                &[("tune", "zerolatency"), ("bf", "0")]
+            } else if config.codec_name.ends_with("_nvenc") {
+                &[
+                    ("tune", "ull"),
+                    ("zerolatency", "1"),
+                    ("delay", "0"),
+                    ("bf", "0"),
+                ]
+            } else {
+                &[("bf", "0")]
+            };
+        let options = multiview_ffmpeg::CodecOptions::from_pairs(pairs)
+            .map_err(|e| Error::Output(e.to_string()))?;
+        let encoder = VideoEncoder::new_with_options(&config.target(), &options).map_err(ff)?;
+        let params = StreamCodecParameters::from_encoder(&encoder);
+        let time_base = encoder.time_base();
+        let no_reorder = encoder.no_reorder_proven();
+        Ok(Self {
+            encoder,
+            converter: FrameConverter::new(config.format),
+            params,
+            time_base,
+            tick: 0,
+            finished: false,
+            no_reorder,
+        })
+    }
+
+    /// True only when the opened encoder's effective reorder and delay are zero.
+    #[must_use]
+    pub const fn no_reorder_proven(&self) -> bool {
+        self.no_reorder
+    }
+
+    /// Codec parameters for all bindings to this rendition.
+    #[must_use]
+    pub fn codec_params(&self) -> &StreamCodecParameters {
+        &self.params
+    }
+
+    /// The output cadence reciprocal used for encoder timestamps.
+    #[must_use]
+    pub fn time_base(&self) -> Rational {
+        self.time_base
+    }
+
+    /// Encode one immutable baked canvas at the absolute output tick.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid frame or an encoder failure.
+    pub fn encode_frame_at(
+        &mut self,
+        frame: DecodedVideoFrame,
+        tick: u64,
+    ) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Err(Error::Output(
+                "video rendition encoder is finished".to_owned(),
+            ));
+        }
+        let pts = i64::try_from(tick)
+            .map_err(|_| Error::Output("video tick exceeds i64 PTS".to_owned()))?;
+        if pts != self.tick {
+            return Err(Error::Output(format!(
+                "video tick discontinuity: expected {}, got {pts}",
+                self.tick
+            )));
+        }
+        let prepared = self.converter.prepare(frame.frame, pts)?;
+        self.encoder.send_frame(&prepared).map_err(ff)?;
+        self.tick = pts.saturating_add(1);
+        self.drain()
+    }
+
+    /// Flush any delayed coded frames after the last input tick.
+    ///
+    /// # Errors
+    /// Returns an error if encoder EOF or packet receive fails.
+    pub fn finish(&mut self) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        self.encoder.send_eof().map_err(ff)?;
+        self.drain()
+    }
+
+    fn drain(&mut self) -> Result<Vec<EncodedPacket>> {
+        let mut packets = Vec::new();
+        while let Some(packet) = self.encoder.receive_packet().map_err(ff)? {
+            packets.push(EncodedPacket::from_packet(packet));
+        }
+        Ok(packets)
+    }
+}
+
+/// One shared program-audio rendition, independent of all video keys.
+pub struct AudioRenditionEncoder {
+    audio: AudioState,
+    tracks: Vec<AudioState>,
+    config: AudioEncodeConfig,
+    finished: bool,
+}
+
+impl AudioRenditionEncoder {
+    /// Open the program audio exactly once, independent of video rendition count.
+    ///
+    /// # Errors
+    /// Returns an error when its audio codec cannot open.
+    pub fn new(config: &AudioEncodeConfig) -> Result<Self> {
+        Ok(Self {
+            audio: AudioState::open(config, StreamKind::Audio)?,
+            tracks: Vec::new(),
+            config: config.clone(),
+            finished: false,
+        })
+    }
+
+    /// Open separately identified discrete tracks with the shared audio format.
+    ///
+    /// # Errors
+    /// Returns an error when the requested track codec cannot open.
+    pub fn open_tracks(&mut self, count: u16) -> Result<()> {
+        if self.finished || !self.tracks.is_empty() || self.audio.audio_pts != 0 {
+            return Err(Error::Output(
+                "audio tracks must open before encoding".to_owned(),
+            ));
+        }
+        for index in 0..count {
+            self.tracks.push(AudioState::open(
+                &self.config,
+                StreamKind::AudioTrack(index),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Program-audio stream parameters and sample-clock time base.
+    #[must_use]
+    pub fn codec_params(&self) -> &StreamCodecParameters {
+        &self.audio.params
+    }
+
+    /// Program-audio sample-clock time base.
+    #[must_use]
+    pub fn time_base(&self) -> Rational {
+        self.audio.time_base
+    }
+
+    /// Discrete tracks in stable stream-index order.
+    #[must_use]
+    pub fn track_streams(&self) -> Vec<(StreamCodecParameters, Rational)> {
+        self.tracks
+            .iter()
+            .map(|track| (track.params.clone(), track.time_base))
+            .collect()
+    }
+
+    /// Encode a mixed program block once for all video renditions.
+    ///
+    /// # Errors
+    /// Returns an error after finish or if encoder input is invalid.
+    pub fn encode_interleaved(
+        &mut self,
+        samples: &[f32],
+        frames: usize,
+    ) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Err(Error::Output(
+                "audio rendition encoder is finished".to_owned(),
+            ));
+        }
+        self.audio.encode_interleaved(samples, frames)
+    }
+
+    /// Encode one discrete track from a source block or matching silence.
+    ///
+    /// # Errors
+    /// Returns an error after finish, for an unknown track, or encoder failure.
+    pub fn encode_track_interleaved(
+        &mut self,
+        index: usize,
+        samples: Option<&[f32]>,
+        frames: usize,
+    ) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Err(Error::Output(
+                "audio rendition encoder is finished".to_owned(),
+            ));
+        }
+        let track = self
+            .tracks
+            .get_mut(index)
+            .ok_or_else(|| Error::Output(format!("unknown discrete audio track {index}")))?;
+        let needed = frames.saturating_mul(track.fifo.len());
+        if let Some(samples) = samples.filter(|samples| samples.len() >= needed) {
+            track.encode_interleaved(samples, frames)
+        } else {
+            track.encode_interleaved(&vec![0.0; needed], frames)
+        }
+    }
+
+    /// Flush every audio track and the program once.
+    ///
+    /// # Errors
+    /// Returns an error if an audio encoder cannot flush.
+    pub fn finish(&mut self) -> Result<Vec<EncodedPacket>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        self.finished = true;
+        let mut packets = self.audio.finish()?;
+        for track in &mut self.tracks {
+            packets.extend(track.finish()?);
+        }
+        Ok(packets)
+    }
+}
+
 /// The single **encode-once** program producer.
 pub struct ProgramEncoder {
     /// The single video encoder (the one encode of invariant #7).
@@ -2172,9 +2412,17 @@ impl<'a> SegmentState<'a> {
             return Ok(());
         };
         if let Some(segment) = state.current.as_mut() {
+            // Shared-ref header copy: the HLS segmenter never mutates coded
+            // payload bytes, so the mux gets independent AVPacket metadata over
+            // the SAME immutable payload the other bindings are muxing. The old
+            // `to_owned_packet()` did `av_packet_ref` + `av_packet_make_writable`,
+            // i.e. one full coded-payload copy per HLS write.
             segment
                 .muxer
-                .write_packet(segment.stream_index, packet.to_owned_packet())
+                .write_packet(
+                    segment.stream_index,
+                    packet.to_owned_packet_shared_ref().map_err(ff)?,
+                )
                 .map_err(ff)?;
             segment.packets = segment.packets.saturating_add(1);
         }

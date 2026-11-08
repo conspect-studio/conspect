@@ -200,6 +200,24 @@ pub mod outputs;
 /// emits `ShedLoad`, and drives the engine make-before-break crosspoint.
 pub mod placement;
 pub mod preview;
+#[cfg(feature = "ffmpeg")]
+mod binding_delivery;
+/// The runtime-facing rendition-plan seam (broadcast output contract, slice 1):
+/// projects the configured outputs onto shared video/audio renditions using the
+/// build's existing `can_encode` probes. Pure planning only — it opens no
+/// encoder and reserves no session; the `Pipeline::build` wiring is the next
+/// serial unit.
+#[cfg(feature = "ffmpeg")]
+pub mod rendition_plan;
+/// The independently bounded per-rendition encode workers (broadcast output
+/// contract, slice 2): one worker per distinct video rendition key, each with
+/// its own bounded admission queue, emitting typed events with a *proven* DTS
+/// completeness watermark so a window assembler never closes early on a
+/// reordered/delayed encoder.
+#[cfg(feature = "ffmpeg")]
+pub mod rendition_workers;
+#[cfg(feature = "ffmpeg")]
+mod rendition_dispatch;
 pub mod run;
 #[cfg(test)]
 mod source_event_automation_e2e;

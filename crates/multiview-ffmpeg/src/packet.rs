@@ -155,6 +155,44 @@ impl EncodedPacket {
         self.packet.clone()
     }
 
+    /// Make an independently owned `AVPacket` header referencing the same immutable
+    /// coded payload. Unlike ffmpeg-next `Packet::clone`, this does not call
+    /// `av_packet_make_writable` and does not duplicate coded bytes. Muxers may
+    /// change the returned header's stream index and timestamps; never call
+    /// `data_mut` on it or write into its payload.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::FfmpegError::Mux`] on `av_packet_ref` allocation failure.
+    #[allow(unsafe_code)]
+    pub fn to_owned_packet_shared_ref(&self) -> crate::error::Result<codec::packet::Packet> {
+        use ffmpeg::codec::packet::{Mut, Ref};
+        let mut owned = codec::packet::Packet::empty();
+        // SAFETY: Both source and destination AVPacket headers remain owned by
+        // their respective Rust RAII Packet values. `av_packet_ref` initializes
+        // the empty destination with independently owned metadata and an
+        // AVBufferRef to the same immutable coded payload; the destination is
+        // unreferenced by Packet::drop. No mutable access to shared data occurs.
+        let result =
+            unsafe { ffmpeg::ffi::av_packet_ref(owned.as_mut_ptr(), self.packet.as_ptr()) };
+        if result < 0 {
+            return Err(crate::error::FfmpegError::Mux(ffmpeg::Error::from(result)));
+        }
+        Ok(owned)
+    }
+
+    /// Clone only the `AVPacket` header and ref-counted immutable coded payload.
+    /// Each output binding can hold its own header without another encode or
+    /// another payload allocation. Metadata mutations are independent.
+    ///
+    /// # Errors
+    /// Returns an allocation error when libav cannot reference the packet.
+    pub fn clone_shared_ref(&self) -> crate::error::Result<Self> {
+        Ok(Self {
+            packet: self.to_owned_packet_shared_ref()?,
+            kind: self.kind,
+        })
+    }
+
     /// Consume the wrapper, yielding its single owned packet (for the last/only
     /// muxer, avoiding the extra ref-count copy of [`Self::to_owned_packet`]).
     #[must_use]
@@ -318,7 +356,7 @@ impl StreamCodecParameters {
 /// Parse codec-configuration-record framing without borrowing libav state.
 /// avcC stores `lengthSizeMinusOne` in byte 4; hvcC stores it in byte 21.
 /// Unknown or truncated records fail closed instead of guessing Annex-B.
-fn nal_framing_from_config(
+pub(crate) fn nal_framing_from_config(
     id: ffmpeg::codec::Id,
     extradata: &[u8],
 ) -> Option<crate::idr::NalFraming> {
@@ -420,6 +458,55 @@ mod nal_config_tests {
             CodecKind::Hevc,
             NalFraming::AnnexB
         ));
+    }
+}
+
+#[cfg(test)]
+mod shared_packet_ref_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::EncodedPacket;
+    use ffmpeg_next::codec::packet::Packet;
+
+    #[test]
+    fn three_bindings_share_payload_but_not_mutable_packet_metadata() {
+        let mut raw = Packet::copy(&[0, 0, 0, 1, 0x65, 0x88, 0x77]);
+        raw.set_pts(Some(3003));
+        raw.set_dts(Some(3003));
+        let original = EncodedPacket::from_packet(raw);
+        let address = original.payload().unwrap().as_ptr();
+        let a = original.clone_shared_ref().unwrap();
+        let b = original.clone_shared_ref().unwrap();
+        let c = original.clone_shared_ref().unwrap();
+        for peer in [&a, &b, &c] {
+            assert_eq!(peer.payload().unwrap().as_ptr(), address);
+        }
+        let mut mux_a = a.to_owned_packet_shared_ref().unwrap();
+        let mut mux_b = b.to_owned_packet_shared_ref().unwrap();
+        let mux_c = c.to_owned_packet_shared_ref().unwrap();
+        mux_a.set_stream(3);
+        mux_a.set_pts(Some(9009));
+        mux_b.set_stream(7);
+        mux_b.set_dts(Some(1001));
+        assert_eq!(mux_a.stream(), 3);
+        assert_eq!(mux_b.stream(), 7);
+        assert_eq!(mux_a.pts(), Some(9009));
+        assert_eq!(mux_b.pts(), Some(3003));
+        assert_eq!(mux_b.dts(), Some(1001));
+        assert_eq!(mux_c.dts(), Some(3003));
+        assert_eq!(mux_a.data().unwrap().as_ptr(), address);
+        assert_eq!(mux_b.data().unwrap().as_ptr(), address);
+        assert_eq!(mux_c.data().unwrap().as_ptr(), address);
+        drop(original);
+        drop(b);
+        drop(mux_a);
+        drop(a);
+        assert_eq!(c.payload().unwrap(), &[0, 0, 0, 1, 0x65, 0x88, 0x77]);
+        assert_eq!(mux_c.data().unwrap().as_ptr(), address);
     }
 }
 
